@@ -13,16 +13,24 @@
   const MAX_LIGHTS = 6
   // 同屏最多四位访客；多出来的折进灯条的 +N，不往主界面上铺。
   const MAX_GUESTS_ON_SCREEN = 4
+  const MAX_VISIT_RECORDS = 5
+  // 宿主保留最近 3 条提示；客户端只显示最近 20 秒内的，避免旧失败一直挂着。
+  const NOTICE_TTL_MS = 20000
 
   const STYLE = `
 .dsh-lp-root{position:fixed;inset:0;z-index:40;pointer-events:none;user-select:none;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
 .dsh-lp-room{position:absolute;right:18px;bottom:18px;display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:flex-end;gap:12px;max-width:min(calc(100vw - 36px),640px);pointer-events:none}
 .dsh-lp-pet{position:relative;width:96px;height:96px;border-radius:18px;background:rgba(120,160,220,.14);pointer-events:auto;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
 .dsh-lp-pet[draggable="true"]{cursor:grab}
+.dsh-lp-pet[draggable="true"]:active{cursor:grabbing}
+.dsh-lp-pet-out{background:rgba(120,160,220,.07);border:1px dashed rgba(136,153,170,.5);flex-direction:column;gap:2px;cursor:pointer}
+.dsh-lp-out-text{font:600 13px/1.3 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-media{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-name{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px/1.2 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:auto;cursor:default}
 .dsh-lp-guest{width:84px;height:84px;border-radius:16px;background:rgba(150,190,240,.11)}
+.dsh-lp-guest-visiting{background:rgba(126,224,163,.13);box-shadow:0 0 0 1px rgba(126,224,163,.28);cursor:pointer}
 .dsh-lp-name-guest{max-width:96px;pointer-events:none}
+.dsh-lp-visitor-badge{position:absolute;top:-6px;right:-4px;padding:1px 5px;border-radius:999px;background:#2f8f5b;color:#fff;font:9px/1.4 system-ui,sans-serif;pointer-events:none}
 .dsh-lp-note{max-width:260px;padding:6px 10px;border-radius:10px;background:rgba(0,0,0,.06);font:12px/1.45 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none}
 .dsh-lp-prompt{position:absolute;right:150px;bottom:22px;width:min(220px,calc(100vw - 180px));box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.86);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.28);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
 .dsh-lp-prompt-title{display:flex;flex-wrap:wrap;gap:4px;margin:0 20px 8px 0;overflow-wrap:anywhere}
@@ -35,11 +43,32 @@
 .dsh-lp-prompt-close:hover{background:rgba(255,255,255,.12);color:#fff}
 .dsh-lp-prompt-error{margin-top:6px;color:#ffb4a8;font-size:11px}
 .dsh-lp-lights{position:absolute;right:18px;bottom:146px;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;max-width:min(48vw,420px);pointer-events:none}
-.dsh-lp-light{display:flex;align-items:center;gap:6px;max-width:132px;padding:4px 8px;border-radius:999px;background:rgba(20,26,34,.58);color:#eaf1fb;font:11px/1.2 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:none;transition:opacity .8s linear}
+.dsh-lp-light{display:flex;align-items:center;gap:6px;max-width:132px;padding:4px 8px;border-radius:999px;background:rgba(20,26,34,.58);color:#eaf1fb;font:11px/1.2 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:auto;transition:opacity .8s linear,box-shadow .15s ease}
+.dsh-lp-light-drop{box-shadow:0 0 0 2px #7ee0a3,0 2px 8px rgba(0,0,0,.18);background:rgba(20,60,40,.82)}
 .dsh-lp-light-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-lp-dot{width:6px;height:6px;border-radius:50%;background:#7ee0a3;box-shadow:0 0 6px #7ee0a3;flex:0 0 auto}
-.dsh-lp-light-more{padding:4px 6px;background:transparent;box-shadow:none;color:var(--dsw-alias-text-secondary,#8899aa)}
-@media (max-width:760px){.dsh-lp-pet{width:72px;height:72px}.dsh-lp-guest{width:64px;height:64px}.dsh-lp-name{max-width:96px;font-size:10px}}
+.dsh-lp-light-more{padding:4px 6px;background:transparent;box-shadow:none;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none}
+.dsh-lp-notices{position:absolute;left:18px;bottom:18px;display:flex;flex-direction:column;gap:6px;max-width:min(320px,calc(100vw - 150px));pointer-events:none}
+.dsh-lp-notice{padding:7px 10px;border-radius:10px;background:rgba(20,26,34,.82);color:#f2f6fc;font:12px/1.45 system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.2);overflow-wrap:anywhere}
+.dsh-lp-card{position:absolute;right:18px;bottom:200px;width:min(250px,calc(100vw - 36px));max-height:min(42vh,320px);overflow:auto;box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.9);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.3);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
+.dsh-lp-card-head{display:flex;align-items:baseline;justify-content:space-between;gap:8px;margin:0 20px 2px 0;font-weight:600;color:#fff}
+.dsh-lp-card-sub{margin:0 0 8px;color:rgba(234,241,251,.7);font-size:11px;overflow-wrap:anywhere}
+.dsh-lp-card-close{position:absolute;top:6px;right:6px;width:20px;height:20px;padding:0;border:0;border-radius:6px;background:transparent;color:rgba(234,241,251,.7);font:14px/20px system-ui,sans-serif;cursor:pointer}
+.dsh-lp-card-close:hover{background:rgba(255,255,255,.12);color:#fff}
+.dsh-lp-card-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:5px}
+.dsh-lp-card-row{display:grid;grid-template-columns:auto 1fr auto;align-items:baseline;gap:7px;padding:4px 0;border-top:1px solid rgba(255,255,255,.08)}
+.dsh-lp-card-dir{font-size:10px;padding:1px 5px;border-radius:999px;background:rgba(255,255,255,.14);color:#fff}
+.dsh-lp-card-dir[data-dir="out"]{background:#2f5fa8}
+.dsh-lp-card-dir[data-dir="in"]{background:#2f8f5b}
+.dsh-lp-card-who{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dsh-lp-card-meta{color:rgba(234,241,251,.62);font-size:10px;white-space:nowrap}
+.dsh-lp-card-empty{margin:6px 0;color:rgba(234,241,251,.62)}
+.dsh-lp-card-actions{display:flex;gap:8px;margin-top:9px}
+.dsh-lp-card-btn{flex:1 1 auto;padding:6px 8px;border:0;border-radius:9px;background:rgba(255,255,255,.14);color:#eaf1fb;font:12px/1.2 system-ui,sans-serif;cursor:pointer}
+.dsh-lp-card-btn[data-kind="recall"]{background:#a8542f}
+.dsh-lp-card-btn:disabled{opacity:.55;cursor:default}
+.dsh-lp-card-error{margin-top:6px;color:#ffb4a8;font-size:11px}
+@media (max-width:760px){.dsh-lp-pet{width:72px;height:72px}.dsh-lp-guest{width:64px;height:64px}.dsh-lp-name{max-width:96px;font-size:10px}.dsh-lp-card{bottom:170px;width:min(230px,calc(100vw - 36px))}}
 `
 
   window.__ModuleLoader__.load({
@@ -143,12 +172,108 @@
         return guests
       }
 
+      // 本地宠物出门的状态。host 已经校验过；渲染层仍然只接受自己画得出来的形状。
+      function readOut (value) {
+        if (value === null || typeof value !== 'object') return null
+        const deviceId = safeText(value.deviceId, 64)
+        const visitId = safeText(value.visitId, 64)
+        const phase = value.phase === 'active'
+          ? 'active'
+          : value.phase === 'requesting' ? 'requesting' : null
+        const startedAt = Number(value.startedAt)
+        const endsAt = value.endsAt === null ? null : Number(value.endsAt)
+        if (deviceId === '' || visitId === '' || phase === null) return null
+        if (!Number.isFinite(startedAt)) return null
+        if (phase === 'active' && !Number.isFinite(endsAt)) return null
+        return {
+          deviceId,
+          nickname: safeText(value.nickname, 32) || '邻居',
+          visitId,
+          phase,
+          startedAt,
+          endsAt
+        }
+      }
+
+      // 60 秒串门访客：和心跳影子分开读，客户端优先把它画成“来访”。
+      function readVisitors (value) {
+        if (!Array.isArray(value)) return []
+        const visitors = []
+        const seen = new Set()
+        for (const item of value) {
+          if (item === null || typeof item !== 'object') continue
+          const deviceId = safeText(item.deviceId, 64)
+          if (deviceId === '' || seen.has(deviceId)) continue
+          const visitId = safeText(item.visitId, 64)
+          const since = Number(item.since)
+          const endsAt = Number(item.endsAt)
+          if (visitId === '' || !Number.isFinite(since) || !Number.isFinite(endsAt)) continue
+          seen.add(deviceId)
+          visitors.push({
+            deviceId,
+            nickname: safeText(item.nickname, 32) || '邻居',
+            anim: safeAnimName(item.anim),
+            visitId,
+            since,
+            endsAt
+          })
+        }
+        return visitors
+      }
+
+      // 最近五条记录，最新的在前。宿主最多给 5 条，这里再兜一层。
+      function readVisits (value) {
+        if (!Array.isArray(value)) return []
+        const visits = []
+        for (const item of value) {
+          if (item === null || typeof item !== 'object') continue
+          if (item.direction !== 'out' && item.direction !== 'in') continue
+          const nickname = safeText(item.nickname, 32) || '邻居'
+          const startedAt = Number(item.startedAt)
+          const durationMs = Number(item.durationMs)
+          if (!Number.isFinite(startedAt) || !Number.isFinite(durationMs)) continue
+          if (durationMs < 0) continue
+          visits.push({ direction: item.direction, nickname, startedAt, durationMs })
+        }
+        visits.sort((left, right) => right.startedAt - left.startedAt)
+        return visits.slice(0, MAX_VISIT_RECORDS)
+      }
+
+      function readNotices (value) {
+        if (!Array.isArray(value)) return []
+        const notices = []
+        for (const item of value) {
+          if (item === null || typeof item !== 'object') continue
+          const text = safeText(item.text, 256)
+          const at = Number(item.at)
+          if (text === '' || !Number.isFinite(at)) continue
+          notices.push({ text, at })
+        }
+        return notices.slice(0, 3)
+      }
+
+      function formatDuration (ms) {
+        const value = Math.max(0, Number(ms) || 0)
+        if (value < 1000) return '不到 1 秒'
+        if (value < 60000) return Math.round(value / 1000) + ' 秒'
+        return Math.max(1, Math.round(value / 60000)) + ' 分钟'
+      }
+
+      function formatClock (at) {
+        try {
+          return new Date(at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+        } catch {
+          return ''
+        }
+      }
+
       function PetBlob ({ label }) {
         const short = safeText(label, 10) || '宠物'
         return h('svg', {
           className: 'dsh-lp-media',
           viewBox: '0 0 96 96',
           role: 'img',
+          draggable: false,
           'aria-label': label
         },
         h('ellipse', { cx: 48, cy: 54, rx: 33, ry: 29, fill: 'rgba(122,162,232,.88)' }),
@@ -200,6 +325,7 @@
           muted: true,
           playsInline: true,
           preload: 'auto',
+          draggable: false,
           'aria-label': label,
           title: label,
           onError: () => setBroken(true)
@@ -209,15 +335,32 @@
       /**
        * 访客：和本地宠物共用同一套素材路由，但它是本机自己画的影子。
        * 没有动作名时轮播 idle；动作名不认识/视频 404 时退到带昵称的色块。
+       * visiting=true 表示这是 60 秒串门访客（可点开串门卡片）；否则是心跳影子。
        */
-      function GuestPet ({ guest }) {
+      function GuestPet ({ guest, visiting = false, onClick }) {
+        const interactive = typeof onClick === 'function'
         return h('div', {
-          className: 'dsh-lp-pet dsh-lp-guest',
-          'data-testid': 'guest-pet',
+          className: 'dsh-lp-pet dsh-lp-guest' + (visiting ? ' dsh-lp-guest-visiting' : ''),
+          'data-testid': visiting ? 'visitor-pet' : 'guest-pet',
           'data-device-id': guest.deviceId,
-          title: guest.nickname
+          role: interactive ? 'button' : undefined,
+          tabIndex: interactive ? 0 : undefined,
+          title: visiting
+            ? guest.nickname + ' 正在你家串门，点开看记录'
+            : guest.nickname + '，点开看串门记录',
+          onClick: interactive ? () => onClick(guest) : undefined,
+          onKeyDown: interactive
+            ? (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return
+                event.preventDefault()
+                onClick(guest)
+              }
+            : undefined
         },
         h(PetMedia, { pet: { name: guest.nickname, anim: guest.anim }, label: guest.nickname }),
+        visiting
+          ? h('span', { className: 'dsh-lp-visitor-badge', 'aria-hidden': 'true' }, '来访')
+          : null,
         h('span', { className: 'dsh-lp-name dsh-lp-name-guest', title: guest.nickname }, guest.nickname))
       }
 
@@ -243,7 +386,9 @@
         return h('div', { className: 'dsh-lp-note', role: 'status' }, bridgeText(bridge?.reason, pet !== null))
       }
 
-      function LightStrip ({ neighbors, now, extraGuests = 0 }) {
+      function LightStrip ({ neighbors, now, extraGuests = 0, onDropVisit }) {
+        const [overId, setOverId] = React.useState(null)
+        const droppable = typeof onDropVisit === 'function'
         const visible = []
         for (const neighbor of neighbors) {
           if (neighbor === null || typeof neighbor !== 'object') continue
@@ -252,6 +397,7 @@
           const deviceId = safeText(neighbor.deviceId, 64)
           if (deviceId === '') continue
           const nickname = safeText(neighbor.nickname, 32) || '邻居'
+          const status = neighbor.status === 'allowed' ? 'allowed' : 'pending'
           const lastSeen = Number(neighbor.lastSeen)
           const age = Number.isFinite(lastSeen) ? now - lastSeen : NEIGHBOR_TTL_MS
           if (age >= NEIGHBOR_TTL_MS) continue
@@ -259,19 +405,50 @@
             ? 1
             : Math.max(0, (NEIGHBOR_TTL_MS - age) / NEIGHBOR_FADE_MS)
           if (opacity <= 0.02) continue
-          visible.push({ deviceId, nickname, opacity })
+          visible.push({ deviceId, nickname, opacity, status })
         }
         // 客厅里最多四位访客，其余折进这里的 +N；没有灯只有多余访客时也要显示。
         if (visible.length === 0 && extraGuests === 0) return null
+
+        const startOver = (event, deviceId) => {
+          if (!droppable) return
+          event.preventDefault()
+          try {
+            if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+          } catch {
+            // 某些浏览器在 dragover 阶段不允许读/写 dataTransfer
+          }
+          setOverId(deviceId)
+        }
+
+        const drop = (event, deviceId) => {
+          event.preventDefault()
+          setOverId(null)
+          if (!droppable) return
+          let payload = ''
+          try {
+            payload = event.dataTransfer?.getData('text/plain') ?? ''
+          } catch {
+            return
+          }
+          if (payload !== 'local-pet') return
+          onDropVisit(deviceId)
+        }
 
         const shown = visible.slice(0, MAX_LIGHTS)
         const extra = visible.length - shown.length + Math.max(0, extraGuests)
         return h('div', { className: 'dsh-lp-lights', 'aria-label': '邻居' },
           shown.map((neighbor) => h('div', {
             key: neighbor.deviceId,
-            className: 'dsh-lp-light',
+            className: 'dsh-lp-light' + (overId === neighbor.deviceId ? ' dsh-lp-light-drop' : ''),
             style: { opacity: neighbor.opacity },
-            title: neighbor.nickname
+            title: neighbor.status === 'allowed'
+              ? '把宠物拖到这里，让它去「' + neighbor.nickname + '」家'
+              : '先放行「' + neighbor.nickname + '」，才能让宠物过去',
+            onDragOver: (event) => startOver(event, neighbor.deviceId),
+            onDragEnter: (event) => startOver(event, neighbor.deviceId),
+            onDragLeave: () => setOverId(null),
+            onDrop: (event) => drop(event, neighbor.deviceId)
           },
           h('span', { className: 'dsh-lp-dot', 'aria-hidden': 'true' }),
           h('span', { className: 'dsh-lp-light-name' }, neighbor.nickname))),
@@ -358,9 +535,113 @@
           : null)
       }
 
+      /**
+       * 串门卡片：点访客（或出门时的本地宠物）打开，最近五条记录，最新在前。
+       * 这是 ticket 06 唯一新增的、能接收指针事件的元素；整层其余部分仍然点穿。
+       */
+      function VisitCard ({ card, visits, onClose }) {
+        const [busy, setBusy] = React.useState(false)
+        const [failed, setFailed] = React.useState(false)
+
+        if (card === null) return null
+        const canRecall = card.kind === 'self'
+        const canEnd = card.kind === 'visitor' && card.deviceId !== ''
+        const action = canRecall
+          ? { action: 'recall' }
+          : canEnd
+            ? { action: 'end-visit', deviceId: card.deviceId }
+            : null
+
+        const run = async () => {
+          if (action === null || busy) return
+          setBusy(true)
+          setFailed(false)
+          try {
+            const res = await fetch(ACTION_URL, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(action)
+            })
+            if (!res.ok) throw new Error('refused')
+            onClose()
+          } catch {
+            setFailed(true)
+          } finally {
+            setBusy(false)
+          }
+        }
+
+        const subtitle = card.kind === 'self'
+          ? '宠物在「' + card.nickname + '」家，最多待一分钟。'
+          : card.kind === 'visitor'
+            ? '「' + card.nickname + '」正在你家串门。'
+            : '「' + card.nickname + '」在邻居家；这张卡片只显示记录。'
+
+        return h('div', {
+          className: 'dsh-lp-card',
+          'data-testid': 'visit-card',
+          role: 'dialog',
+          'aria-label': '串门记录'
+        },
+        h('button', {
+          type: 'button',
+          className: 'dsh-lp-card-close',
+          title: '收起',
+          'aria-label': '收起串门记录',
+          disabled: busy,
+          onClick: onClose
+        }, '×'),
+        h('div', { className: 'dsh-lp-card-head' }, '串门记录'),
+        h('p', { className: 'dsh-lp-card-sub' }, subtitle),
+        visits.length === 0
+          ? h('p', { className: 'dsh-lp-card-empty' }, '还没有串门记录。')
+          : h('ul', { className: 'dsh-lp-card-list' },
+              visits.map((record, index) => h('li', {
+                key: record.startedAt + ':' + index + ':' + record.nickname,
+                className: 'dsh-lp-card-row'
+              },
+              h('span', {
+                className: 'dsh-lp-card-dir',
+                'data-dir': record.direction
+              }, record.direction === 'out' ? '去' : '来'),
+              h('span', { className: 'dsh-lp-card-who', title: record.nickname }, record.nickname),
+              h('span', { className: 'dsh-lp-card-meta' },
+                formatClock(record.startedAt) + ' · ' + formatDuration(record.durationMs))))),
+        action !== null
+          ? h('div', { className: 'dsh-lp-card-actions' },
+              h('button', {
+                type: 'button',
+                className: 'dsh-lp-card-btn',
+                'data-kind': canRecall ? 'recall' : 'end',
+                disabled: busy,
+                onClick: run
+              }, canRecall ? '召回来' : '结束串门'))
+          : null,
+        failed
+          ? h('div', { className: 'dsh-lp-card-error', role: 'status' }, '没成功，再试一次')
+          : null)
+      }
+
+      /** 失败提示条：只显示最近 20 秒内的 3 条，不接收指针事件。 */
+      function NoticeStack ({ notices, now }) {
+        const visible = notices.filter((notice) => now - notice.at < NOTICE_TTL_MS)
+        if (visible.length === 0) return null
+        return h('div', {
+          className: 'dsh-lp-notices',
+          role: 'status',
+          'aria-live': 'polite'
+        },
+        visible.slice(0, 3).map((notice, index) => h('div', {
+          key: notice.at + ':' + index + ':' + notice.text.slice(0, 8),
+          className: 'dsh-lp-notice',
+          'data-testid': 'notice'
+        }, notice.text)))
+      }
+
       function Room () {
         const snap = useSnapshot()
         const now = useNow(1000)
+        const [card, setCard] = React.useState(null)
         if (!snap) return null
 
         const self = snap.self !== null && typeof snap.self === 'object' ? snap.self : {}
@@ -369,11 +650,40 @@
         const nickname = safeText(self.nickname, 32) || '我'
         const label = (pet !== null ? safeText(pet.name, 64) : '') || nickname
         const neighbors = Array.isArray(snap.neighbors) ? snap.neighbors : []
-        const guests = readGuests(snap.guests)
-        // 同屏最多四位；剩下的只计数，交给灯条的 +N。
-        const shownGuests = guests.slice(0, MAX_GUESTS_ON_SCREEN)
-        const extraGuests = guests.length - shownGuests.length
+        const out = readOut(self.out)
+        const visitors = readVisitors(snap.visitors)
+        const visitRecords = readVisits(snap.visits)
+        const notices = readNotices(snap.notices)
+        const visitorIds = new Set(visitors.map((visitor) => visitor.deviceId))
+        // 串门访客优先画；同一台机器的心跳影子不再重复画一遍。
+        const guests = readGuests(snap.guests).filter((guest) => !visitorIds.has(guest.deviceId))
+        // 同屏最多四位（串门访客 + 心跳影子），剩下的只计数，交给灯条的 +N。
+        const shownVisitors = visitors.slice(0, MAX_GUESTS_ON_SCREEN)
+        const remaining = Math.max(0, MAX_GUESTS_ON_SCREEN - shownVisitors.length)
+        const shownGuests = guests.slice(0, remaining)
+        const extraGuests = visitors.length - shownVisitors.length + guests.length - shownGuests.length
         const prompt = readPrompt(snap.prompt)
+
+        const startVisit = async (deviceId) => {
+          if (typeof deviceId !== 'string' || deviceId === '') return
+          try {
+            await fetch(ACTION_URL, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ action: 'visit', deviceId })
+            })
+          } catch {
+            // 宿主没接住时下一轮快照不会变成“出门了”；失败提示由宿主 notice 给出
+          }
+        }
+
+        const openGuestCard = (guest) => {
+          setCard({
+            kind: visitorIds.has(guest.deviceId) ? 'visitor' : 'guest',
+            deviceId: guest.deviceId,
+            nickname: guest.nickname
+          })
+        }
 
         const rename = async () => {
           if (typeof window === 'undefined' || typeof window.prompt !== 'function') return
@@ -397,23 +707,70 @@
           }
         }
 
-        return h('div', { className: 'dsh-lp-root' },
-          h(LightStrip, { neighbors, now, extraGuests }),
-          prompt !== null ? h(PromptCard, { key: prompt.deviceId, prompt }) : null,
-          h('div', { className: 'dsh-lp-room' },
-            shownGuests.map((guest) => h(GuestPet, { key: guest.deviceId, guest })),
-            pet !== null
-              ? h('div', { className: 'dsh-lp-pet', 'data-testid': 'local-pet' },
-                h(PetMedia, { pet, label }),
-                h('span', {
-                  className: 'dsh-lp-name',
-                  title: '双击改昵称 · 邻居看到：' + nickname,
-                  onDoubleClick: (event) => {
-                    event?.stopPropagation?.()
-                    rename()
+        const localPet = out !== null
+          ? h('div', {
+              className: 'dsh-lp-pet dsh-lp-pet-out',
+              'data-testid': 'local-pet-out',
+              title: out.phase === 'active'
+                ? '在「' + out.nickname + '」家串门，点开看记录'
+                : '正在去「' + out.nickname + '」家',
+              onClick: () => setCard({ kind: 'self', deviceId: '', nickname: out.nickname })
+            },
+            h('span', { className: 'dsh-lp-out-text' }, out.phase === 'active' ? '出门了' : '出门中…'),
+            h('span', { className: 'dsh-lp-name' }, out.phase === 'active'
+              ? '在「' + out.nickname + '」家'
+              : '去「' + out.nickname + '」家'))
+          : pet !== null
+            ? h('div', {
+                className: 'dsh-lp-pet',
+                'data-testid': 'local-pet',
+                draggable: true,
+                title: '把宠物拖到邻居灯上，让它出门串门',
+                onDragStart: (event) => {
+                  try {
+                    event.dataTransfer?.setData('text/plain', 'local-pet')
+                    if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+                  } catch {
+                    // 浏览器不让写 dataTransfer：拖放会自然失败，不影响点击
                   }
-                }, label))
-              : null,
+                }
+              },
+              h(PetMedia, { pet, label }),
+              h('span', {
+                className: 'dsh-lp-name',
+                title: '双击改昵称 · 邻居看到：' + nickname,
+                onDoubleClick: (event) => {
+                  event?.stopPropagation?.()
+                  rename()
+                }
+              }, label))
+            : null
+
+        return h('div', { className: 'dsh-lp-root' },
+          h(LightStrip, { neighbors, now, extraGuests, onDropVisit: startVisit }),
+          h(NoticeStack, { notices, now }),
+          prompt !== null ? h(PromptCard, { key: prompt.deviceId, prompt }) : null,
+          card !== null
+            ? h(VisitCard, {
+                key: card.kind + ':' + (card.deviceId ?? '') + ':' + card.nickname,
+                card,
+                visits: visitRecords,
+                onClose: () => setCard(null)
+              })
+            : null,
+          h('div', { className: 'dsh-lp-room' },
+            shownVisitors.map((visitor) => h(GuestPet, {
+              key: 'visitor:' + visitor.deviceId,
+              guest: visitor,
+              visiting: true,
+              onClick: openGuestCard
+            })),
+            shownGuests.map((guest) => h(GuestPet, {
+              key: 'guest:' + guest.deviceId,
+              guest,
+              onClick: openGuestCard
+            })),
+            localPet,
             h(Note, { pet, bridge })))
       }
 

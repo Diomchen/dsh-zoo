@@ -21,14 +21,22 @@ import {
  *   3. 对来源地址单播一条 beacon-ack（每来源限速，避免回执风暴）。
  *
  * 地址只留在这一层，通过 addressOf(deviceId) 单独取；**绝不进快照**。
- * 出站单播只走 sendTo()：先过 mayTalkTo（ticket 04 的心跳必须走这里），
- * 再按 deviceId 查地址。这一层没有心跳本身。
+ * 出站单播只走 sendTo()：先过 mayTalkTo（ticket 04 的心跳、ticket 05 的
+ * request/ack/recall 必须走这里），再按 deviceId 查地址。sendReply() 是 sendTo
+ * 之外唯一能发给未放行来源的应用层出口，只给 visit-deny 用（发现层对 beacon
+ * 的自动回执是既有例外，与本条无关）。
+ * 这一层没有心跳本身。
  * 广播地址与端口都可注入，测试因此可以用回环上的真实 socket 对，不依赖外网。
  */
 const INBOUND_WINDOW_MS = 10000
 const INBOUND_MAX = 20
 const ACK_WINDOW_MS = 4500
 const ACK_MAX = 1
+// visit-deny 是应用层唯一允许发给“还没放行”的来源的报文：它是对方请求的直接回应，
+// 否则未放行的发起方只能等到超时，分不清“被拒绝”和“没人理”。每来源 2 次 / 5 秒，
+// 不给反射放大留空间；其余应用层出站仍然必须过 mayTalkTo（sendTo）。
+const REPLY_WINDOW_MS = 5000
+const REPLY_MAX = 2
 
 export function createDiscovery ({
   identity,
@@ -62,6 +70,12 @@ export function createDiscovery ({
   const ackLimiter = createRateLimiter({
     windowMs: ACK_WINDOW_MS,
     max: ACK_MAX,
+    maxSources: 128,
+    now
+  })
+  const replyLimiter = createRateLimiter({
+    windowMs: REPLY_WINDOW_MS,
+    max: REPLY_MAX,
     maxSources: 128,
     now
   })
@@ -190,6 +204,23 @@ export function createDiscovery ({
     return true
   }
 
+  /**
+   * 除发现层对合法 beacon 的自动回执外，唯一一个绕过 mayTalkTo 的应用层单播出口，
+   * 只给 `visit-deny` 用：对方发来串门请求但本机没放行它时，它必须收到一句明确的
+   * “不行”，而不是等到超时。仍然是同一条 socket、同一个地址表、同样的 4 KiB 上限，
+   * 并且每来源 2 次 / 5 秒限速。它永远不用于心跳、ack、recall 或任何主动报文。
+   */
+  function sendReply (deviceId, data) {
+    if (disposed || !started || socket === null) return false
+    if (typeof deviceId !== 'string' || deviceId === '') return false
+    if (!(data instanceof Uint8Array) || data.length === 0 || data.length > MAX_PACKET_BYTES) return false
+    const endpoint = endpoints.get(deviceId)
+    if (endpoint === undefined) return false
+    if (!replyLimiter.allow(deviceId, now())) return false
+    sendPacket(data, endpoint.port, endpoint.address)
+    return true
+  }
+
   function onMessage (buffer, rinfo) {
     if (disposed || !started) return
     const source = rinfo?.address
@@ -306,6 +337,7 @@ export function createDiscovery ({
     }
     inbound.clear()
     ackLimiter.clear()
+    replyLimiter.clear()
     endpoints.clear()
     if (socket !== null) {
       try {
@@ -325,6 +357,7 @@ export function createDiscovery ({
     address,
     addressOf,
     sendTo,
+    sendReply,
     dispose
   }
 }

@@ -398,3 +398,56 @@ test('心跳没有 port：刷新地址时不覆盖已知服务端口，心跳先
   await waitFor(() => room.snapshot().guests.some((guest) => guest.deviceId === earlyId))
   assert.deepEqual(discovery.addressOf(earlyId), { address: '127.0.0.1', port: peerPort })
 })
+
+test('sendReply 只给 visit-deny 用：未放行也能回执，但每来源 2 次 / 5 秒', async (t) => {
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.address().port
+  const box = inbox(peer)
+  const room = createRoom()
+  const identity = { deviceId: randomUUID(), nickname: '甲' }
+  const discovery = createDiscovery({
+    identity,
+    port: 0,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
+    onPeer: (packet) => room.observeBeacon(packet),
+    log: { warn () {} }
+  })
+  t.after(() => discovery.dispose())
+  await discovery.start()
+  const myPort = discovery.address().port
+  await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon')
+
+  const neighborId = randomUUID()
+  peer.send(beaconPayload({ deviceId: neighborId, nickname: '乙', port: peerPort }), myPort, '127.0.0.1')
+  await waitFor(() => room.snapshot().neighbors.length === 1)
+  assert.equal(room.mayTalkTo(neighborId), false)
+
+  const first = Buffer.from('visit-deny-1', 'utf8')
+  const second = Buffer.from('visit-deny-2', 'utf8')
+  const third = Buffer.from('visit-deny-3', 'utf8')
+
+  // 普通出口仍然被门控挡住；例外出口只回应一次请求。
+  assert.equal(discovery.sendTo(neighborId, first), false)
+  assert.equal(discovery.sendReply(neighborId, first), true)
+  assert.equal((await box.next((entry) => entry.message.equals(first))).rinfo.port, myPort)
+
+  assert.equal(discovery.sendReply(neighborId, second), true)
+  await box.next((entry) => entry.message.equals(second))
+
+  // 限速：同一来源 5 秒内第 3 条不发。
+  assert.equal(discovery.sendReply(neighborId, third), false)
+  await assert.rejects(
+    box.next((entry) => entry.message.equals(third), 200),
+    /timeout/
+  )
+
+  // 非法载荷 / 没地址的来源都不会发。
+  assert.equal(discovery.sendReply(neighborId, 'not-a-buffer'), false)
+  assert.equal(discovery.sendReply(neighborId, Buffer.alloc(0)), false)
+  assert.equal(discovery.sendReply(neighborId, Buffer.alloc(MAX_PACKET_BYTES + 1)), false)
+  assert.equal(discovery.sendReply(randomUUID(), first), false)
+})

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,11 +8,11 @@ import test from 'node:test'
 
 import { IDENTITY_FILE, defaultNickname } from '../src/identity.js'
 import { PEERS_FILE } from '../src/peers.js'
-import { isDeviceId, normalizeNickname } from '../src/protocol.js'
+import { VISIT_TTL_MS, isDeviceId, normalizeNickname } from '../src/protocol.js'
 import { createService } from '../src/service.js'
+import { VISITS_FILE } from '../src/visits.js'
 
-function fakeCtx () {
-  const routes = []
+function fakeCtx () {  const routes = []
   const warnings = []
   return {
     ctx: {
@@ -36,6 +36,24 @@ async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-service-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
+}
+
+function delay (ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitForVisits (dir, predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      const raw = JSON.parse(await readFile(join(dir, VISITS_FILE), 'utf8'))
+      if (predicate(raw)) return raw
+    } catch {
+      // 文件还没写出来 / 正写到一半：下一轮再读
+    }
+    await delay(15)
+  }
+  throw new Error('waitForVisits timeout')
 }
 
 async function listen (server) {
@@ -145,7 +163,7 @@ test('昵称可以通过本地 action 修改并落盘；坏 action 明确失败'
 
   const unknown = await call(service, '/local-pet/action', {
     method: 'POST',
-    body: { action: 'visit' }
+    body: { action: 'unknown' }
   })
   assert.equal(unknown.status, 409)
   assert.equal(unknown.body.error, 'not-implemented')
@@ -394,4 +412,73 @@ test('损坏的 peers.json 不影响启动，第一次放行仍然可用', async
   assert.equal(admitted.status, 200)
   assert.equal(admitted.body.persisted, true)
   assert.deepEqual(JSON.parse(await readFile(join(dir, PEERS_FILE), 'utf8')).allowed[deviceId].nickname, '甲')
+})
+
+test('损坏的 visits.json 不影响启动与串门；完成后的记录会重新写成合法文件', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, VISITS_FILE), '{ oops', 'utf8')
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+
+  assert.ok(service.warnings.some((line) => /串门记录/.test(line)))
+  assert.deepEqual(service.snapshot().visits, [])
+
+  const deviceId = randomUUID()
+  const visitId = randomUUID()
+  const now = Date.now()
+  service.room.setTrust({ allowed: { [deviceId]: { nickname: '甲' } } })
+  assert.equal(service.room.beginVisit(deviceId, { visitId, at: now }).ok, true)
+  assert.equal(service.room.observeVisitAck({ deviceId, visitId }, now + 100).ok, true)
+  service.room.tick(now + 100 + VISIT_TTL_MS)
+  // 内存里的记录立即出现；磁盘上还是损坏文件，直到 service 把队列交出去。
+  assert.equal(service.snapshot().visits.length, 1)
+  assert.equal(service.snapshot().visits[0].direction, 'out')
+
+  // dispose 会先把完成记录交给 visits.json；损坏的旧文件被合法文件覆盖。
+  service.dispose()
+  const raw = await waitForVisits(dir, (parsed) => parsed.visits.length === 1)
+  assert.equal(raw.visits[0].direction, 'out')
+  assert.equal(raw.visits[0].nickname, '甲')
+  assert.equal(raw.visits[0].durationMs, VISIT_TTL_MS)
+})
+
+test('visits.json 不可写：串门照常完成，记录留在内存且只告警一次', async (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip('以 root 运行时 chmod 不可靠')
+    return
+  }
+  const dir = await tempDir(t)
+  await writeFile(join(dir, VISITS_FILE), JSON.stringify({ version: 1, visits: [] }), 'utf8')
+  await chmod(join(dir, VISITS_FILE), 0o400)
+  t.after(async () => {
+    await chmod(join(dir, VISITS_FILE), 0o600).catch(() => {})
+  })
+
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+  assert.deepEqual(service.warnings, [])
+
+  const deviceId = randomUUID()
+  const visitId = randomUUID()
+  const now = Date.now()
+  service.room.setTrust({ allowed: { [deviceId]: { nickname: '甲' } } })
+  assert.equal(service.room.beginVisit(deviceId, { visitId, at: now }).ok, true)
+  assert.equal(service.room.observeVisitAck({ deviceId, visitId }, now + 100).ok, true)
+  service.room.tick(now + 100 + VISIT_TTL_MS)
+  assert.equal(service.snapshot().visits.length, 1)
+
+  service.dispose()
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline && !service.warnings.some((line) => /串门记录写不进去/.test(line))) {
+    await delay(15)
+  }
+  assert.ok(service.warnings.some((line) => /串门记录写不进去/.test(line)))
+  const raw = JSON.parse(await readFile(join(dir, VISITS_FILE), 'utf8'))
+  assert.deepEqual(raw.visits, [])
 })
