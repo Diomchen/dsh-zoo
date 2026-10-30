@@ -6,6 +6,7 @@ import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
+import { createSettingsStore } from './settings.js'
 import {
   HEARTBEAT_INTERVAL_MS,
   VISIT_TTL_MS,
@@ -38,6 +39,7 @@ export const VISIT_TIMER_TICK_MS = 200
  * I/O 都在这个薄壳里：
  * - identity 落盘（src/identity.js）
  * - 放行/拒绝名单落盘（src/peers.js）
+ * - 客厅开关落盘（src/settings.js）
  * - 串门记录落盘（src/visits.js）
  * - dsh-pet 轮询（src/pet-bridge.js）
  * - UDP 发现（src/discovery.js）
@@ -67,6 +69,7 @@ export function createService (ctx, options = {}) {
   let discovery = null
   let peers = null
   let visits = null
+  let settings = null
   let bridge = null
   let tickTimer = null
   let heartbeatTimer = null
@@ -146,6 +149,16 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'dismiss', deviceId, prompt: result.prompt }
     }
 
+    // 客厅开关（用户故事 22）：只挡入站串门请求，落盘在 settings.json。
+    // 显式传 enabled，客户端按当前快照取反；非布尔值明确失败，不做隐式 toggle。
+    if (action === 'accept-visits') {
+      if (settings === null) return { ok: false, error: 'starting' }
+      if (typeof body?.enabled !== 'boolean') return { ok: false, error: 'bad-enabled' }
+      const persisted = await settings.setAcceptVisits(body.enabled)
+      const acceptVisits = room.setAcceptVisits(body.enabled)
+      return { ok: true, action: 'accept-visits', acceptVisits, persisted }
+    }
+
     // 串门（ticket 05）：只接受本地页面发来的 UUID。出门状态在 room，
     // 重试与超时计时在 service；两者都用同一条已放行的 UDP 单播出口。
     if (action === 'visit') {
@@ -223,7 +236,7 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'rename', nickname: saved }
     }
 
-    return room.action(body)
+    return { ok: false, error: 'not-implemented', action }
   }
 
   async function start () {
@@ -232,6 +245,16 @@ export function createService (ctx, options = {}) {
       peers = await createPeerStore(dir, { log })
       if (disposed) return
       room.setTrust(peers.trust())
+
+      // 客厅开关也是本机状态：读不出来就按默认“允许串门”，客厅照常可用。
+      try {
+        settings = await createSettingsStore(dir, { log })
+        room.setAcceptVisits(settings.acceptVisits)
+      } catch (error) {
+        settings = null
+        warn(ctx, '客厅开关初始化失败，本次按“允许串门”运行：' + message(error))
+      }
+      if (disposed) return
 
       // 串门记录是“锦上添花”：读写失败只降级成空记录，绝不让客厅起不来。
       try {
@@ -454,11 +477,11 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  /** 收到请求：放行 → ack；未放行 → deny（走 sendReply 例外，明确可读）。 */
+  /** 收到请求：放行且开关开 → ack；否则 deny（带理由，走 sendReply 例外）。 */
   function handleVisitRequest (packet) {
     const result = room.observeVisitRequest(packet)
     if (result.reply === 'ack') sendVisitAck(result.deviceId, result.visitId)
-    else if (result.reply === 'deny') sendVisitDeny(result.deviceId, result.visitId)
+    else if (result.reply === 'deny') sendVisitDeny(result.deviceId, result.visitId, result.reason)
   }
 
   function sendVisitAck (deviceId, visitId) {
@@ -470,10 +493,10 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  function sendVisitDeny (deviceId, visitId) {
+  function sendVisitDeny (deviceId, visitId, reason) {
     if (disposed || discovery === null || identity === null) return false
     try {
-      return discovery.sendReply(deviceId, encodeVisitDeny({ deviceId: identity.deviceId, visitId }))
+      return discovery.sendReply(deviceId, encodeVisitDeny({ deviceId: identity.deviceId, visitId, reason }))
     } catch {
       return false
     }

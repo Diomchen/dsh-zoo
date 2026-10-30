@@ -43,6 +43,14 @@ export const PACKET_TYPES = Object.freeze([
   'visit-recall'
 ])
 const VISIT_TYPES = new Set(['visit-request', 'visit-ack', 'visit-deny', 'visit-recall'])
+/**
+ * visit-deny 的理由是固定枚举，不是自由文本：
+ * - not-admitted：本机没放行这位邻居（默认，也兼容不带 reason 的旧报文）
+ * - visits-off：本机客厅的“允许串门”开关被关掉了
+ * 发起方据此给出不同的人话提示，但不能借这个字段传任意内容。
+ */
+export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off'])
+const DENY_REASON_SET = new Set(VISIT_DENY_REASONS)
 
 const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -80,6 +88,11 @@ export function isVisitId (value) {
   return isDeviceId(value)
 }
 
+/** visit-deny 的 reason 只能是固定枚举；其余值整包丢弃，不做自由文本转发。 */
+export function isVisitDenyReason (value) {
+  return typeof value === 'string' && DENY_REASON_SET.has(value)
+}
+
 export function isPort (value) {
   return Number.isInteger(value) && value > 0 && value <= 65535
 }
@@ -112,13 +125,15 @@ export function resolvePort (env = process.env) {
  *   beacon / beacon-ack     → { v, type, deviceId, nickname, port }
  *   heartbeat               → { v, type, deviceId, anim }
  *   visit-request           → { v, type, deviceId, visitId, nickname, anim }
- *   visit-ack / visit-recall / visit-deny → { v, type, deviceId, visitId }
+ *   visit-ack / visit-recall → { v, type, deviceId, visitId }
+ *   visit-deny              → { v, type, deviceId, visitId, reason }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
- * deviceId / visitId / port 是本地代码传进来的，非法即抛（这是程序错误，不是网络输入）。
+ * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
+ * （这是程序错误，不是网络输入）。
  * 本机动画名非法时不抛：降级成 null，让对端自己放待机。
  */
-export function encodePacket ({ type, deviceId, nickname, port, anim, visitId } = {}) {
+export function encodePacket ({ type, deviceId, nickname, port, anim, visitId, reason } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
   if (!isDeviceId(deviceId)) throw new Error('protocol: invalid deviceId')
 
@@ -140,6 +155,12 @@ export function encodePacket ({ type, deviceId, nickname, port, anim, visitId } 
       nickname: safeNickname,
       anim: normalizeAnimation(anim)
     }
+  } else if (type === 'visit-deny') {
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    // 本机没填理由时按“没放行”编码：这是最常见也最保守的拒绝理由。
+    const safeReason = reason === undefined ? 'not-admitted' : reason
+    if (!isVisitDenyReason(safeReason)) throw new Error('protocol: invalid deny reason')
+    packet = { ...base, visitId: visitId.toLowerCase(), reason: safeReason }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -169,8 +190,8 @@ export function encodeVisitAck ({ deviceId, visitId } = {}) {
   return encodePacket({ type: 'visit-ack', deviceId, visitId })
 }
 
-export function encodeVisitDeny ({ deviceId, visitId } = {}) {
-  return encodePacket({ type: 'visit-deny', deviceId, visitId })
+export function encodeVisitDeny ({ deviceId, visitId, reason } = {}) {
+  return encodePacket({ type: 'visit-deny', deviceId, visitId, reason })
 }
 
 export function encodeVisitRecall ({ deviceId, visitId } = {}) {
@@ -248,7 +269,24 @@ export function parsePacket (input) {
     }
   }
 
-  // ack / deny / recall 只关联一次串门：除了 id 什么都不接受。
+  // visit-deny 多一个固定枚举理由；旧报文没带 reason 时按 not-admitted 处理。
+  if (raw.type === 'visit-deny') {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    const reason = raw.reason === undefined ? 'not-admitted' : raw.reason
+    if (!isVisitDenyReason(reason)) return fail('deny-reason')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase(),
+        reason
+      }
+    }
+  }
+
+  // ack / recall 只关联一次串门：除了 id 什么都不接受。
   if (VISIT_TYPES.has(raw.type)) {
     if (!isVisitId(raw.visitId)) return fail('visit-id')
     return {

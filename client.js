@@ -1,5 +1,6 @@
 ;(() => {
-  // 浏览器半边：只负责画。所有判断都在宿主，这里读一份快照、渲染、上报改名动作。
+  // 浏览器半边：只负责画。判断尽量留在宿主的快照里；视图自己的逻辑
+  //（素材 404 降级、访客淡出、弹层开合）只能写在这里，见 SPEC 的 Testing Decisions。
   // 这个文件是被当作普通脚本加载的，不能 import；宿主只提供 /plugins/<包名>/client.js 一个文件。
 
   const STYLE_ID = 'dsh-local-pet-style'
@@ -10,6 +11,8 @@
   const IDLE_ROTATE_MS = 4500
   const NEIGHBOR_TTL_MS = 30000
   const NEIGHBOR_FADE_MS = 6000
+  // 心跳影子到期前最后 2.5 秒淡出；Host 仍然在 30 秒 TTL 到点时移除。
+  const GUEST_FADE_MS = 2500
   const MAX_LIGHTS = 6
   // 同屏最多四位访客；多出来的折进灯条的 +N，不往主界面上铺。
   const MAX_GUESTS_ON_SCREEN = 4
@@ -27,7 +30,7 @@
 .dsh-lp-out-text{font:600 13px/1.3 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-media{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-name{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px/1.2 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:auto;cursor:default}
-.dsh-lp-guest{width:84px;height:84px;border-radius:16px;background:rgba(150,190,240,.11)}
+.dsh-lp-guest{width:84px;height:84px;border-radius:16px;background:rgba(150,190,240,.11);transition:opacity .9s linear}
 .dsh-lp-guest-visiting{background:rgba(126,224,163,.13);box-shadow:0 0 0 1px rgba(126,224,163,.28);cursor:pointer}
 .dsh-lp-name-guest{max-width:96px;pointer-events:none}
 .dsh-lp-visitor-badge{position:absolute;top:-6px;right:-4px;padding:1px 5px;border-radius:999px;background:#2f8f5b;color:#fff;font:9px/1.4 system-ui,sans-serif;pointer-events:none}
@@ -43,11 +46,17 @@
 .dsh-lp-prompt-close:hover{background:rgba(255,255,255,.12);color:#fff}
 .dsh-lp-prompt-error{margin-top:6px;color:#ffb4a8;font-size:11px}
 .dsh-lp-lights{position:absolute;right:18px;bottom:146px;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;max-width:min(48vw,420px);pointer-events:none}
-.dsh-lp-light{display:flex;align-items:center;gap:6px;max-width:132px;padding:4px 8px;border-radius:999px;background:rgba(20,26,34,.58);color:#eaf1fb;font:11px/1.2 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:auto;transition:opacity .8s linear,box-shadow .15s ease}
+.dsh-lp-light{display:flex;align-items:center;gap:6px;max-width:132px;padding:4px 8px;border-radius:999px;background:rgba(20,26,34,.58);color:#eaf1fb;font:11px/1.2 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:auto;cursor:pointer;transition:opacity .8s linear,box-shadow .15s ease}
 .dsh-lp-light-drop{box-shadow:0 0 0 2px #7ee0a3,0 2px 8px rgba(0,0,0,.18);background:rgba(20,60,40,.82)}
 .dsh-lp-light-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-lp-dot{width:6px;height:6px;border-radius:50%;background:#7ee0a3;box-shadow:0 0 6px #7ee0a3;flex:0 0 auto}
-.dsh-lp-light-more{padding:4px 6px;background:transparent;box-shadow:none;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none}
+.dsh-lp-light-more{padding:4px 6px;background:transparent;box-shadow:none;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none;cursor:default}
+.dsh-lp-door{padding:3px 8px;border:1px solid rgba(136,153,170,.35);border-radius:999px;background:rgba(20,26,34,.5);color:#cfdae8;font:10px/1.4 system-ui,sans-serif;cursor:pointer;pointer-events:auto;transition:background .15s ease,color .15s ease}
+.dsh-lp-door[data-on="false"]{background:rgba(120,40,40,.58);border-color:rgba(255,140,120,.5);color:#ffd9d0}
+.dsh-lp-door:disabled{opacity:.55;cursor:default}
+.dsh-lp-pop{position:absolute;right:18px;bottom:196px;width:min(200px,calc(100vw - 36px));box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.9);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.3);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
+.dsh-lp-pop-name{font-weight:600;color:#fff;overflow-wrap:anywhere}
+.dsh-lp-pop-sub{margin:4px 0 0;color:rgba(234,241,251,.7);font-size:11px;overflow-wrap:anywhere}
 .dsh-lp-notices{position:absolute;left:18px;bottom:18px;display:flex;flex-direction:column;gap:6px;max-width:min(320px,calc(100vw - 150px));pointer-events:none}
 .dsh-lp-notice{padding:7px 10px;border-radius:10px;background:rgba(20,26,34,.82);color:#f2f6fc;font:12px/1.45 system-ui,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.2);overflow-wrap:anywhere}
 .dsh-lp-card{position:absolute;right:18px;bottom:200px;width:min(250px,calc(100vw - 36px));max-height:min(42vh,320px);overflow:auto;box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.9);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.3);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
@@ -163,10 +172,12 @@
           const deviceId = safeText(item.deviceId, 64)
           if (deviceId === '' || seen.has(deviceId)) continue
           seen.add(deviceId)
+          const expiresAt = Number(item.expiresAt)
           guests.push({
             deviceId,
             nickname: safeText(item.nickname, 32) || '邻居',
-            anim: safeAnimName(item.anim)
+            anim: safeAnimName(item.anim),
+            expiresAt: Number.isFinite(expiresAt) ? expiresAt : null
           })
         }
         return guests
@@ -295,29 +306,43 @@
         }, short))
       }
 
+      /**
+       * 素材降级链（本地宠物、访客、邻居访客共用）：
+       *   已知动作 → 那段素材；它 404/坏了 → 一段待机素材；待机也取不到 → 带名字的色块。
+       * 只认第一段 404 就画色块会让一个缺失的动作跳过本来可用的待机素材。
+       */
       function PetMedia ({ pet, label }) {
         const anim = pet ? safeAnimName(pet.anim) : null
         const [idleIndex, setIdleIndex] = React.useState(0)
-        const [broken, setBroken] = React.useState(false)
+        const [idleFailures, setIdleFailures] = React.useState(0)
+        const [animFailed, setAnimFailed] = React.useState(false)
+        const [blob, setBlob] = React.useState(false)
 
         React.useEffect(() => {
-          setBroken(false)
+          // 动作一变就从头再试：404 只属于刚才那一段素材。
+          setAnimFailed(false)
+          setIdleIndex(0)
+          setIdleFailures(0)
+          setBlob(false)
         }, [anim])
 
         React.useEffect(() => {
           // 没有“被点播过”的动作时，轮播几段真实存在的待机素材。
-          if (anim || broken) return undefined
+          // 已经在降级路径上时不再轮播，专心把剩下的待机素材试完。
+          if (anim || blob || animFailed || idleFailures > 0) return undefined
           const timer = setInterval(() => setIdleIndex((index) => index + 1), IDLE_ROTATE_MS)
           return () => clearInterval(timer)
-        }, [anim, broken])
+        }, [anim, animFailed, blob, idleFailures])
 
-        if (broken) return h(PetBlob, { label })
+        if (blob) return h(PetBlob, { label })
 
-        const clip = anim || IDLE_CLIPS[idleIndex % IDLE_CLIPS.length]
+        const usingAnim = anim !== null && !animFailed
+        const clip = usingAnim ? anim : IDLE_CLIPS[idleIndex % IDLE_CLIPS.length]
         const src = thumbUrl(clip)
         if (src === null) return h(PetBlob, { label })
         return h('video', {
-          key: src,
+          // 同一段素材也要能重新挂载（例如动作名恰好等于待机片段）：key 带降级阶段。
+          key: src + ':' + (usingAnim ? 'anim' : 'idle-' + idleIndex + '-' + idleFailures),
           className: 'dsh-lp-media',
           src,
           autoPlay: true,
@@ -328,21 +353,40 @@
           draggable: false,
           'aria-label': label,
           title: label,
-          onError: () => setBroken(true)
+          onError: () => {
+            if (usingAnim) {
+              setAnimFailed(true)
+              setIdleIndex(0)
+              setIdleFailures(0)
+              return
+            }
+            // 待机素材最多试 IDLE_CLIPS.length 段；全都取不到才画色块。
+            const next = idleFailures + 1
+            if (next >= IDLE_CLIPS.length) {
+              setBlob(true)
+              return
+            }
+            setIdleIndex(idleIndex + 1)
+            setIdleFailures(next)
+          }
         })
       }
 
       /**
        * 访客：和本地宠物共用同一套素材路由，但它是本机自己画的影子。
-       * 没有动作名时轮播 idle；动作名不认识/视频 404 时退到带昵称的色块。
+       * 没有动作名时轮播 idle；动作名不认识/视频 404 时先退到 idle，仍取不到才画带昵称的色块。
        * visiting=true 表示这是 60 秒串门访客（可点开串门卡片）；否则是心跳影子。
+       * 心跳影子带宿主给的 expiresAt，最后 2.5 秒在本机淡出。
        */
-      function GuestPet ({ guest, visiting = false, onClick }) {
+      function GuestPet ({ guest, visiting = false, onClick, now }) {
         const interactive = typeof onClick === 'function'
+        const remaining = Number.isFinite(guest.expiresAt) ? guest.expiresAt - now : Infinity
+        const opacity = visiting ? 1 : Math.max(0, Math.min(1, remaining / GUEST_FADE_MS))
         return h('div', {
           className: 'dsh-lp-pet dsh-lp-guest' + (visiting ? ' dsh-lp-guest-visiting' : ''),
           'data-testid': visiting ? 'visitor-pet' : 'guest-pet',
           'data-device-id': guest.deviceId,
+          style: { opacity },
           role: interactive ? 'button' : undefined,
           tabIndex: interactive ? 0 : undefined,
           title: visiting
@@ -386,9 +430,10 @@
         return h('div', { className: 'dsh-lp-note', role: 'status' }, bridgeText(bridge?.reason, pet !== null))
       }
 
-      function LightStrip ({ neighbors, now, extraGuests = 0, onDropVisit }) {
+      function LightStrip ({ neighbors, now, extraGuests = 0, onDropVisit, onOpenNeighbor }) {
         const [overId, setOverId] = React.useState(null)
         const droppable = typeof onDropVisit === 'function'
+        const openable = typeof onOpenNeighbor === 'function'
         const visible = []
         for (const neighbor of neighbors) {
           if (neighbor === null || typeof neighbor !== 'object') continue
@@ -442,9 +487,20 @@
             key: neighbor.deviceId,
             className: 'dsh-lp-light' + (overId === neighbor.deviceId ? ' dsh-lp-light-drop' : ''),
             style: { opacity: neighbor.opacity },
+            role: openable ? 'button' : undefined,
+            tabIndex: openable ? 0 : undefined,
+            'aria-label': neighbor.nickname,
             title: neighbor.status === 'allowed'
-              ? '把宠物拖到这里，让它去「' + neighbor.nickname + '」家'
-              : '先放行「' + neighbor.nickname + '」，才能让宠物过去',
+              ? '点开可以派宠物去「' + neighbor.nickname + '」家，也可以直接把宠物拖到这里'
+              : '先放行「' + neighbor.nickname + '」，才能让宠物过去；点开可以看看',
+            onClick: openable ? () => onOpenNeighbor(neighbor) : undefined,
+            onKeyDown: openable
+              ? (event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') return
+                  event.preventDefault()
+                  onOpenNeighbor(neighbor)
+                }
+              : undefined,
             onDragOver: (event) => startOver(event, neighbor.deviceId),
             onDragEnter: (event) => startOver(event, neighbor.deviceId),
             onDragLeave: () => setOverId(null),
@@ -536,8 +592,38 @@
       }
 
       /**
+       * 点邻居灯打开的小弹层：昵称 + 去串门 + 取消。
+       * 「去串门」和拖到灯上走同一个宿主 action；弹层是少数几个 opt-in 指针事件的元素。
+       */
+      function NeighborPopover ({ neighbor, onVisit, onClose }) {
+        const allowed = neighbor.status === 'allowed'
+        return h('div', {
+          className: 'dsh-lp-pop',
+          'data-testid': 'neighbor-popover',
+          role: 'dialog',
+          'aria-label': '邻居 ' + neighbor.nickname
+        },
+        h('div', { className: 'dsh-lp-pop-name', title: neighbor.nickname }, neighbor.nickname),
+        h('p', { className: 'dsh-lp-pop-sub' },
+          allowed
+            ? '把宠物派到「' + neighbor.nickname + '」家，最多待一分钟。'
+            : '先放行「' + neighbor.nickname + '」，宠物才能过去。'),
+        h('div', { className: 'dsh-lp-card-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dsh-lp-card-btn',
+            onClick: onVisit
+          }, '去串门'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-lp-card-btn',
+            onClick: onClose
+          }, '取消')))
+      }
+
+      /**
        * 串门卡片：点访客（或出门时的本地宠物）打开，最近五条记录，最新在前。
-       * 这是 ticket 06 唯一新增的、能接收指针事件的元素；整层其余部分仍然点穿。
+       * 和邻居弹层、串门开关一样，是少数几个 opt-in 指针事件的元素；其余仍点穿。
        */
       function VisitCard ({ card, visits, onClose }) {
         const [busy, setBusy] = React.useState(false)
@@ -642,6 +728,8 @@
         const snap = useSnapshot()
         const now = useNow(1000)
         const [card, setCard] = React.useState(null)
+        const [neighborCard, setNeighborCard] = React.useState(null)
+        const [savingAccept, setSavingAccept] = React.useState(false)
         if (!snap) return null
 
         const self = snap.self !== null && typeof snap.self === 'object' ? snap.self : {}
@@ -650,6 +738,8 @@
         const nickname = safeText(self.nickname, 32) || '我'
         const label = (pet !== null ? safeText(pet.name, 64) : '') || nickname
         const neighbors = Array.isArray(snap.neighbors) ? snap.neighbors : []
+        // 宿主没给这个字段时按“允许串门”画，兼容旧快照。
+        const acceptVisits = snap.acceptVisits !== false
         const out = readOut(self.out)
         const visitors = readVisitors(snap.visitors)
         const visitRecords = readVisits(snap.visits)
@@ -678,11 +768,44 @@
         }
 
         const openGuestCard = (guest) => {
+          setNeighborCard(null)
           setCard({
             kind: visitorIds.has(guest.deviceId) ? 'visitor' : 'guest',
             deviceId: guest.deviceId,
             nickname: guest.nickname
           })
+        }
+
+        // 点邻居灯：打开小弹层；和串门记录卡片互斥，避免两块浮层叠在一起。
+        const openNeighbor = (neighbor) => {
+          setCard(null)
+          setNeighborCard({
+            deviceId: neighbor.deviceId,
+            nickname: neighbor.nickname,
+            status: neighbor.status
+          })
+        }
+
+        const visitNeighbor = () => {
+          const target = neighborCard
+          setNeighborCard(null)
+          if (target !== null) startVisit(target.deviceId)
+        }
+
+        const toggleAcceptVisits = async () => {
+          if (savingAccept) return
+          setSavingAccept(true)
+          try {
+            await fetch(ACTION_URL, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ action: 'accept-visits', enabled: !acceptVisits })
+            })
+          } catch {
+            // 下一轮快照会告诉我们开关没变；不弹错误层
+          } finally {
+            setSavingAccept(false)
+          }
         }
 
         const rename = async () => {
@@ -714,7 +837,10 @@
               title: out.phase === 'active'
                 ? '在「' + out.nickname + '」家串门，点开看记录'
                 : '正在去「' + out.nickname + '」家',
-              onClick: () => setCard({ kind: 'self', deviceId: '', nickname: out.nickname })
+              onClick: () => {
+                setNeighborCard(null)
+                setCard({ kind: 'self', deviceId: '', nickname: out.nickname })
+              }
             },
             h('span', { className: 'dsh-lp-out-text' }, out.phase === 'active' ? '出门了' : '出门中…'),
             h('span', { className: 'dsh-lp-name' }, out.phase === 'active'
@@ -747,9 +873,23 @@
             : null
 
         return h('div', { className: 'dsh-lp-root' },
-          h(LightStrip, { neighbors, now, extraGuests, onDropVisit: startVisit }),
+          h(LightStrip, {
+            neighbors,
+            now,
+            extraGuests,
+            onDropVisit: startVisit,
+            onOpenNeighbor: openNeighbor
+          }),
           h(NoticeStack, { notices, now }),
           prompt !== null ? h(PromptCard, { key: prompt.deviceId, prompt }) : null,
+          neighborCard !== null
+            ? h(NeighborPopover, {
+                key: 'neighbor:' + neighborCard.deviceId,
+                neighbor: neighborCard,
+                onVisit: visitNeighbor,
+                onClose: () => setNeighborCard(null)
+              })
+            : null,
           card !== null
             ? h(VisitCard, {
                 key: card.kind + ':' + (card.deviceId ?? '') + ':' + card.nickname,
@@ -759,15 +899,29 @@
               })
             : null,
           h('div', { className: 'dsh-lp-room' },
+            h('button', {
+              type: 'button',
+              className: 'dsh-lp-door',
+              'data-testid': 'accept-visits',
+              'data-on': acceptVisits ? 'true' : 'false',
+              'aria-pressed': acceptVisits,
+              disabled: savingAccept,
+              title: acceptVisits
+                ? '允许邻居把宠物派过来；点一下关掉（邻居仍然看得见、心跳照常）'
+                : '串门已关：邻居仍然可见，但宠物进不来；点一下重新打开',
+              onClick: toggleAcceptVisits
+            }, acceptVisits ? '允许串门' : '串门已关'),
             shownVisitors.map((visitor) => h(GuestPet, {
               key: 'visitor:' + visitor.deviceId,
               guest: visitor,
+              now,
               visiting: true,
               onClick: openGuestCard
             })),
             shownGuests.map((guest) => h(GuestPet, {
               key: 'guest:' + guest.deviceId,
               guest,
+              now,
               onClick: openGuestCard
             })),
             localPet,

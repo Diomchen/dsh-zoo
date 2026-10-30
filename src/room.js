@@ -11,6 +11,13 @@ import {
   normalizeNickname,
   sanitizeLabel
 } from './protocol.js'
+import {
+  MAX_VISIT_RECORD_MS,
+  VISIT_RECORD_LIMIT,
+  normalizeVisitRecord
+} from './visit-record.js'
+
+export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
 
 /**
  * 客厅的领域状态：我是谁、有哪些邻居、谁在我家、谁出门了、最近串了几次门。
@@ -30,11 +37,12 @@ import {
  *              startedAt, endsAt } | null   // 本地宠物出门了
  *     },
  *     neighbors: [ { deviceId, nickname, status: 'pending'|'allowed'|'denied', lastSeen, port } ],
- *     guests:    [ { deviceId, nickname, anim, since } ],          // 30 秒心跳影子
+ *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子
  *     visitors:  [ { deviceId, nickname, anim, visitId, since, endsAt } ], // 60 秒串门访客
  *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs } ],
  *     prompt:    { deviceId, nickname } | null,   // 放行 FIFO 的队首；其余排队等待
- *     notices:   [ { text, at } ]
+ *     notices:   [ { text, at } ],
+ *     acceptVisits: true                          // 本机客厅是否接受入站串门
  *   }
  *
  * 已知限制（ticket 01）：`dsh-pet` 不上报随机待机动画，所以 `self.pet.anim`
@@ -65,6 +73,11 @@ import {
  *   落盘由 service 调用 drainVisitRecords() 后交给 src/visits.js，room 自己不碰磁盘。
  * - 记录最多保留 VISIT_RECORD_LIMIT 条，丢掉最旧的；快照只给最近 5 条。
  * - 记录损坏/不可写时，visits.json 由 store 降级；这里始终有一份内存记录可用。
+ *
+ * 客厅开关（ticket 02 用户故事 22）：
+ * - acceptVisits 只挡**入站串门请求**：关掉时回一条带 visits-off 理由的 deny，
+ *   不创建访客；发现、邻居灯、心跳和本机出门都不受影响。
+ * - 这是本机动作，落盘由 service 交给 src/settings.js；UDP 报文永远改不了它。
  */
 
 export const MAX_PROMPTS = 8
@@ -76,11 +89,8 @@ export const MAX_GUESTS = 8
  */
 export const MAX_VISITORS = MAX_NEIGHBORS
 export const MAX_NOTICES = 10
-export const VISIT_RECORD_LIMIT = 200
 /** 点“稍后再说”后，同一位邻居至少安静这么久再问（它消失后重新出现则立刻重问）。 */
 export const PROMPT_SNOOZE_MS = 10 * 60 * 1000
-/** 记录里的时长上限：文件可手改，读进来的异常值不能变成无限大。 */
-export const MAX_VISIT_RECORD_MS = 24 * 60 * 60 * 1000
 
 const BRIDGE_REASONS = new Set(['starting', 'not-installed', 'unreachable', 'no-pet', 'error'])
 const IDLE_BRIDGE = Object.freeze({ ok: false, reason: 'starting' })
@@ -102,7 +112,8 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     prompts: [],
     promptSet: new Set(),
     snoozed: new Map(),
-    notices: []
+    notices: [],
+    acceptVisits: true
   }
 
   function nowMs () {
@@ -241,6 +252,9 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     if (reason === 'denied') {
       return `「${name}」没有放行你，宠物没能进门。`
     }
+    if (reason === 'visits-off') {
+      return `「${name}」关掉了串门，宠物这次没能进去。`
+    }
     if (reason === 'already-out') {
       return `宠物已经在「${name}」家了，先召回来再说。`
     }
@@ -312,7 +326,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     if (out.phase !== 'requesting') return { ok: false, error: 'already-there' }
     const now = stampOf(at)
     state.out = null
-    const code = reason === 'peer-offline' || reason === 'timeout' || reason === 'denied'
+    const code = reason === 'peer-offline' || reason === 'timeout' || reason === 'denied' || reason === 'visits-off'
       ? reason
       : 'peer-offline'
     const notice = pushNotice(failureText(code, out.nickname), now)
@@ -377,12 +391,15 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
           deviceId: guest.deviceId,
           nickname: guest.nickname,
           anim: guest.anim,
-          since: guest.since
+          since: guest.since,
+          // 心跳影子的到期时刻：客户端据此在最后 ~2.5 秒淡出；Host 仍然按 TTL 移除。
+          expiresAt: guest.lastSeen + GUEST_TTL_MS
         })),
         visitors: [...state.visitors.values()].map(copyVisitor),
         visits: state.visits.slice(0, 5).map(copyRecord),
         prompt: currentPrompt(),
-        notices: state.notices.slice(0, 3).map((notice) => ({ ...notice }))
+        notices: state.notices.slice(0, 3).map((notice) => ({ ...notice })),
+        acceptVisits: state.acceptVisits
       }
     },
 
@@ -423,6 +440,15 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       }
       const safeReason = BRIDGE_REASONS.has(reason) ? reason : 'unreachable'
       state.self.bridge = { ok: false, reason: safeReason }
+    },
+
+    /**
+     * 本机“允许串门”开关（来自 src/settings.js，默认开）。
+     * 只影响入站 visit-request；发现、邻居灯、心跳与本机出门都不变。
+     */
+    setAcceptVisits (enabled) {
+      if (typeof enabled === 'boolean') state.acceptVisits = enabled
+      return state.acceptVisits
     },
 
     /**
@@ -649,7 +675,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       return { ok: true, visit: copyOutbound(out) }
     },
 
-    /** 收到 visit-deny：请求中 → 明确失败，写一条“对方没放行你”的 notice。 */
+    /** 收到 visit-deny：请求中 → 明确失败；理由决定提示文案（没放行 / 关掉了串门）。 */
     observeVisitDeny (peer, at = clock()) {
       const deviceId = normalizeDeviceId(peer?.deviceId)
       const visitId = normalizeVisitId(peer?.visitId)
@@ -658,7 +684,8 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       if (out === null || out.deviceId !== deviceId || out.visitId !== visitId) {
         return { ok: false, error: 'no-visit' }
       }
-      return failOutbound('denied', at)
+      const reason = peer?.reason === 'visits-off' ? 'visits-off' : 'denied'
+      return failOutbound(reason, at)
     },
 
     /**
@@ -719,9 +746,10 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     },
 
     /**
-     * 收到 visit-request。只有放行过的来源会得到 ack；其余回 deny（明确失败），
-     * 但都不创建访客、不写记录。同一来源的重复请求（重试）按 visitId 幂等处理：
-     * 原地刷新 id/动作，不重置 60 秒计时，也绝不多写一条记录。
+     * 收到 visit-request。本机“允许串门”关着时一律回 visits-off；只有放行过的
+     * 来源会得到 ack，其余回 not-admitted（明确失败）。deny 都不创建访客、不写记录。
+     * 同一来源的重复请求（重试）按 visitId 幂等处理：原地刷新 id/动作，
+     * 不重置 60 秒计时，也绝不多写一条记录。
      */
     observeVisitRequest (peer, at = clock()) {
       if (peer === null || typeof peer !== 'object') {
@@ -732,9 +760,13 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       if (deviceId === null || visitId === null) {
         return { reply: 'ignore', error: 'bad-visit' }
       }
+      // 开关先于信任判断：关掉时连已放行的邻居也进不来，理由对发起方是明确的。
+      if (!state.acceptVisits) {
+        return { reply: 'deny', deviceId, visitId, reason: 'visits-off' }
+      }
       if (!canTalkTo(deviceId)) {
         // 未知/未放行/已拒绝：给发起方一句明确的 deny，不创建任何本机状态。
-        return { reply: 'deny', deviceId, visitId }
+        return { reply: 'deny', deviceId, visitId, reason: 'not-admitted' }
       }
 
       const now = stampOf(at)
@@ -760,7 +792,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
         }
       }
       if (state.visitors.size >= MAX_VISITORS) {
-        return { reply: 'deny', deviceId, visitId }
+        return { reply: 'deny', deviceId, visitId, reason: 'not-admitted' }
       }
 
       const visitor = {
@@ -844,7 +876,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       const list = []
       if (Array.isArray(records)) {
         for (const raw of records) {
-          const record = normalizeRecord(raw)
+          const record = normalizeVisitRecord(raw)
           if (record !== null) list.push(record)
         }
       }
@@ -889,11 +921,6 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       return removed
     },
 
-    /** 客厅自己的动作（改名等由 service 处理，因为要落盘）。 */
-    async action (body) {
-      return { ok: false, error: 'not-implemented', action: body?.action ?? null }
-    },
-
     dispose () {
       state.neighbors.clear()
       state.guests.clear()
@@ -908,6 +935,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       state.promptSet.clear()
       state.snoozed.clear()
       state.notices.length = 0
+      state.acceptVisits = true
       state.self.pet = null
       state.self.bridge = { ...IDLE_BRIDGE }
     }
@@ -925,21 +953,6 @@ function normalizeVisitId (value) {
   if (typeof value !== 'string') return null
   const id = value.trim()
   return isVisitId(id) ? id.toLowerCase() : null
-}
-
-function normalizeRecord (raw) {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-  if (raw.direction !== 'out' && raw.direction !== 'in') return null
-  const nickname = normalizeNickname(raw.nickname)
-  if (nickname === null) return null
-  if (!Number.isFinite(raw.startedAt) || raw.startedAt < 0) return null
-  if (!Number.isFinite(raw.durationMs) || raw.durationMs < 0) return null
-  return {
-    direction: raw.direction,
-    nickname,
-    startedAt: raw.startedAt,
-    durationMs: Math.min(raw.durationMs, MAX_VISIT_RECORD_MS)
-  }
 }
 
 /** 只读 deviceId → 昵称；忽略非法键，昵称非法时退到“邻居”。 */

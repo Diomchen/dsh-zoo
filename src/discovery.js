@@ -33,8 +33,9 @@ const INBOUND_MAX = 20
 const ACK_WINDOW_MS = 4500
 const ACK_MAX = 1
 // visit-deny 是应用层唯一允许发给“还没放行”的来源的报文：它是对方请求的直接回应，
-// 否则未放行的发起方只能等到超时，分不清“被拒绝”和“没人理”。每来源 2 次 / 5 秒，
-// 不给反射放大留空间；其余应用层出站仍然必须过 mayTalkTo（sendTo）。
+// 否则未放行的发起方只能等到超时，分不清“被拒绝”和“没人理”。每来源（UDP 源地址，
+// 不是可轮换的 deviceId）2 次 / 5 秒，不给反射放大留空间；其余应用层出站仍然必须
+// 过 mayTalkTo（sendTo）。
 const REPLY_WINDOW_MS = 5000
 const REPLY_MAX = 2
 
@@ -208,7 +209,8 @@ export function createDiscovery ({
    * 除发现层对合法 beacon 的自动回执外，唯一一个绕过 mayTalkTo 的应用层单播出口，
    * 只给 `visit-deny` 用：对方发来串门请求但本机没放行它时，它必须收到一句明确的
    * “不行”，而不是等到超时。仍然是同一条 socket、同一个地址表、同样的 4 KiB 上限，
-   * 并且每来源 2 次 / 5 秒限速。它永远不用于心跳、ack、recall 或任何主动报文。
+   * 并且按 UDP 源地址每 2 次 / 5 秒限速（不按可轮换的 deviceId）。
+   * 它永远不用于心跳、ack、recall 或任何主动报文。
    */
   function sendReply (deviceId, data) {
     if (disposed || !started || socket === null) return false
@@ -216,7 +218,9 @@ export function createDiscovery ({
     if (!(data instanceof Uint8Array) || data.length === 0 || data.length > MAX_PACKET_BYTES) return false
     const endpoint = endpoints.get(deviceId)
     if (endpoint === undefined) return false
-    if (!replyLimiter.allow(deviceId, now())) return false
+    // 按 UDP 源地址限速，而不是按报文里的 deviceId：deviceId 可以每次换一个，
+    // 地址换不了，否则“每来源 2 次 / 5 秒”就形同虚设。
+    if (!replyLimiter.allow(endpoint.address, now())) return false
     sendPacket(data, endpoint.port, endpoint.address)
     return true
   }

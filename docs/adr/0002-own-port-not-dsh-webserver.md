@@ -12,12 +12,24 @@ DSH 的 `ctx.webServer` 可以把路由挂到 GUI 同一个端口上，而且它
 
 ## 决定
 
-插件 Host 半边自己监听一个端口（UDP 用于发现和心跳，TCP 用于串门请求），与 DSH 的 webserver 完全无关。它有自己的信任模型（首次见面放行），自己的速率限制，自己的关闭开关。
+插件 Host 半边自己监听一个 UDP 端口，发现、心跳和串门（`visit-request` / `visit-ack` / `visit-deny` / `visit-recall`）全部复用这一条 socket；它不依赖 DSH 的 webserver，也不另开 TCP 监听。它有自己的信任模型（首次见面放行），自己的速率限制，自己的关闭开关。
 
 ## 考虑过的选项
 
 - **挂 `/local-pet/*` 到 DSH webserver**：零新增端口、零新增生命周期，但把宠物开关和会话访问权绑在一起。放弃。
 - **走 DSH 的 Peer/principal 模型**：`ctx.remoteAccess` 确实已经能表达"非 owner 的 principal"。但它服务的是"浏览器访问本机 DSH"，不是"两台机器平级对话"，套上去反而更重。
+
+## 修订（ticket 05 实现时）
+
+原文写的是"UDP 用于发现和心跳，TCP 用于串门请求"。实现时改成了**复用现有 UDP socket**：请求带 `visitId` 发出，接收方回 `visit-ack` 或 `visit-deny`，任一方可发 `visit-recall`；请求按约 600ms 间隔发 **3 次（首次 + 两次重试）**，约 1.8 秒没有 ack 就明确失败。
+
+原因：
+
+- 第二个 TCP 监听端口意味着第二个要在广播里广告的端口、第二条要单独维护的信任/限速/地址路径；而我们已经有了一条经过校验、经过 `mayTalkTo` 门控的 UDP 单播出口。
+- UDP 没有连接状态，但"到底到没到"仍然是确定的：收到 ack 才算抵达，收不到就明确报超时，失败是一句可读的话。
+- 代价（ack 可能丢）用幂等请求兜住：`visit-request` 按 `visitId` 幂等，接收方按 `deviceId` 去重，重复请求不重置 60 秒，也不重复写记录。
+
+"一个端口、一条信任路径、仍然有确定性 ack"是这次修订真正要守住的边界。
 
 ## 一处必要的细分
 

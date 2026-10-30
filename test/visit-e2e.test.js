@@ -388,6 +388,45 @@ test('接收方提前结束：发 recall，发起方立即回家，双方各留�
   assert.match(a.snapshot().notices[0].text, /结束了这次串门/)
 })
 
+test('接收方关掉串门：请求被 visits-off 拒绝，发起方看到明确原因，重新打开后又能进', async (t) => {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  const [portA, portB] = await distinctPorts(2)
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA))
+  await b.ready
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+
+  // B 一键关掉串门；邻居与心跳都还在，只有入站串门被拒。
+  const off = await callAction(b, { action: 'accept-visits', enabled: false })
+  assert.equal(off.status, 200)
+  assert.equal(off.body.acceptVisits, false)
+  assert.equal(b.snapshot().acceptVisits, false)
+  assert.equal(a.snapshot().neighbors.length, 1)
+
+  const denied = await callAction(a, { action: 'visit', deviceId: bId })
+  assert.equal(denied.status, 200)
+  await waitFor(() => a.snapshot().notices.some((notice) => /关掉了串门/.test(notice.text)))
+  assert.equal(a.snapshot().self.out, null)
+  assert.deepEqual(a.snapshot().visits, [])
+  assert.deepEqual(b.snapshot().visitors, [])
+  assert.deepEqual(b.snapshot().visits, [])
+  assert.doesNotMatch(a.snapshot().notices[0].text, /没有放行你/)
+
+  // 重新打开后，同一个邻居可以正常进门。
+  assert.equal((await callAction(b, { action: 'accept-visits', enabled: true })).status, 200)
+  const started = await callAction(a, { action: 'visit', deviceId: bId })
+  assert.equal(started.status, 200)
+  await waitFor(() => a.snapshot().self.out?.phase === 'active' && b.snapshot().visitors.length === 1)
+  assert.equal(b.snapshot().visitors[0].deviceId, aId)
+})
+
 test('visits.json 损坏时串门仍然成功；记录只丢历史，不影响客厅', async (t) => {
   const dirA = await tempDir(t)
   const dirB = await tempDir(t)

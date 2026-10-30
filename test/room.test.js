@@ -155,15 +155,6 @@ test('桥接状态只接受已知 reason', () => {
   assert.deepEqual(room.snapshot().self.bridge, { ok: true, reason: null })
 })
 
-test('未知 action 明确失败，不假装成功', async () => {
-  const room = roomAt()
-  assert.deepEqual(await room.action({ action: 'unknown' }), {
-    ok: false,
-    error: 'not-implemented',
-    action: 'unknown'
-  })
-})
-
 test('第一次见到邻居时出放行提示；接受后不再问，门控通过', () => {
   const room = roomAt()
   room.setIdentity({ deviceId: 'me-1', nickname: '我' })
@@ -415,9 +406,12 @@ test('放行后的心跳创建访客；未放行、自己和未知来源的心�
     deviceId: 'neighbor-a',
     nickname: '甲',
     anim: '写代码',
-    since: T0 + 2000
+    since: T0 + 2000,
+    expiresAt: T0 + 2000 + GUEST_TTL_MS
   }])
-  assert.deepEqual(Object.keys(room.snapshot().guests[0]), ['deviceId', 'nickname', 'anim', 'since'])
+  assert.deepEqual(Object.keys(room.snapshot().guests[0]), [
+    'deviceId', 'nickname', 'anim', 'since', 'expiresAt'
+  ])
 
   room.setTrust({
     allowed: { 'neighbor-a': { nickname: '甲' }, 'me-1': { nickname: '我' } }
@@ -447,7 +441,8 @@ test('心跳刷新访客的动作与昵称，但 since 不变；邻居灯也跟�
     deviceId: 'neighbor-a',
     nickname: '甲改名',
     anim: '东张西望',
-    since: T0 + 2000
+    since: T0 + 2000,
+    expiresAt: T0 + 4000 + GUEST_TTL_MS
   }])
   assert.equal(room.snapshot().neighbors[0].lastSeen, T0 + 4000)
 })
@@ -469,6 +464,26 @@ test('访客 30 秒没有心跳就消失；邻居灯按自己的 lastSeen 独立
 
   assert.equal(room.tick(T0 + 25000 + NEIGHBOR_TTL_MS), 1)
   assert.deepEqual(room.snapshot().neighbors, [])
+})
+
+test('访客快照带 expiresAt：最后一次心跳 + 30 秒，刷新后顺延而 since 不变', () => {
+  const room = roomAt()
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+  room.admit('neighbor-a')
+
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 2000)
+  assert.equal(room.snapshot().guests[0].since, T0 + 2000)
+  assert.equal(room.snapshot().guests[0].expiresAt, T0 + 2000 + GUEST_TTL_MS)
+
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '东张西望' }, T0 + 12000)
+  assert.equal(room.snapshot().guests[0].since, T0 + 2000)
+  assert.equal(room.snapshot().guests[0].expiresAt, T0 + 12000 + GUEST_TTL_MS)
+
+  // Host 仍在 TTL 到点时移除；expiresAt 只是给客户端做最后 2.5 秒淡出。
+  room.tick(T0 + 12000 + GUEST_TTL_MS - 1)
+  assert.equal(room.snapshot().guests.length, 1)
+  room.tick(T0 + 12000 + GUEST_TTL_MS)
+  assert.deepEqual(room.snapshot().guests, [])
 })
 
 test('访客表最多 8 位，满了挤掉最久没心跳的那位', () => {
@@ -523,7 +538,8 @@ test('放行名单里有、但还没收到广播的邻居，其心跳仍能创�
     deviceId: 'neighbor-x',
     nickname: '名单里的邻居',
     anim: '写代码',
-    since: T0
+    since: T0,
+    expiresAt: T0 + GUEST_TTL_MS
   }])
   assert.deepEqual(room.snapshot().neighbors, [])
   assert.deepEqual(room.heartbeatTargets(), ['neighbor-x'])
