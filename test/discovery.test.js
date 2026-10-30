@@ -88,6 +88,16 @@ function beaconPayload (overrides = {}) {
   }), 'utf8')
 }
 
+function heartbeatPayload (overrides = {}) {
+  return Buffer.from(JSON.stringify({
+    v: PROTOCOL_VERSION,
+    type: 'heartbeat',
+    deviceId: randomUUID(),
+    anim: null,
+    ...overrides
+  }), 'utf8')
+}
+
 async function freeUdpPort () {
   const socket = dgram.createSocket('udp4')
   await new Promise((resolve, reject) => {
@@ -332,4 +342,59 @@ test('单播出口先过放行门控，再按 deviceId 找地址', async (t) => 
   assert.equal(discovery.sendTo(neighborId, 'not-a-buffer'), false)
   assert.equal(discovery.sendTo(neighborId, Buffer.alloc(0)), false)
   assert.equal(discovery.sendTo(neighborId, Buffer.alloc(MAX_PACKET_BYTES + 1)), false)
+})
+
+test('心跳没有 port：刷新地址时不覆盖已知服务端口，心跳先到也能回程', async (t) => {
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.address().port
+  const box = inbox(peer)
+  const room = createRoom()
+  const identity = { deviceId: randomUUID(), nickname: '甲' }
+  const discovery = createDiscovery({
+    identity,
+    port: 0,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
+    onPeer: (packet) => {
+      if (packet.type === 'heartbeat') room.observeHeartbeat(packet)
+      else room.observeBeacon(packet)
+    },
+    log: { warn () {} }
+  })
+  t.after(() => discovery.dispose())
+  await discovery.start()
+  const myPort = discovery.address().port
+  await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon')
+
+  // 先由 beacon 记下服务端口，再由心跳刷新地址：端口不能被心跳覆盖成 undefined。
+  const neighborId = randomUUID()
+  peer.send(beaconPayload({
+    deviceId: neighborId,
+    nickname: '乙',
+    port: peerPort
+  }), myPort, '127.0.0.1')
+  await waitFor(() => room.snapshot().neighbors.length === 1)
+  room.admit(neighborId)
+  assert.deepEqual(discovery.addressOf(neighborId), { address: '127.0.0.1', port: peerPort })
+
+  peer.send(heartbeatPayload({ deviceId: neighborId, anim: '写代码' }), myPort, '127.0.0.1')
+  await waitFor(() => room.snapshot().guests.length === 1)
+  assert.deepEqual(discovery.addressOf(neighborId), { address: '127.0.0.1', port: peerPort })
+
+  // 心跳之后仍然可以单播回去。
+  const payload = Buffer.from('still-reachable', 'utf8')
+  assert.equal(discovery.sendTo(neighborId, payload), true)
+  const delivered = await box.next((entry) => entry.message.equals(payload))
+  assert.equal(delivered.rinfo.address, '127.0.0.1')
+  assert.equal(delivered.rinfo.port, myPort)
+
+  // 心跳先于任何 beacon 到达（例如重启后）：退回 UDP 源端口，回程不丢。
+  const earlyId = randomUUID()
+  room.setTrust({ allowed: { [earlyId]: { nickname: '早到的' } } })
+  peer.send(heartbeatPayload({ deviceId: earlyId, anim: null }), myPort, '127.0.0.1')
+  await waitFor(() => room.snapshot().guests.some((guest) => guest.deviceId === earlyId))
+  assert.deepEqual(discovery.addressOf(earlyId), { address: '127.0.0.1', port: peerPort })
 })

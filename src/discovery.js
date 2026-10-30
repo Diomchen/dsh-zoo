@@ -8,6 +8,7 @@ import {
   createRateLimiter,
   encodePacket,
   isDeviceId,
+  isPort,
   parsePacket
 } from './protocol.js'
 
@@ -134,12 +135,21 @@ export function createDiscovery ({
   /**
    * 每次合法报文都刷新一条地址记录；以插入顺序当作最近活跃顺序，
    * 超过邻居上限就丢最久没刷新的，保证内存有界。
+   *
+   * beacon / beacon-ack 带 `port`（对方广告的服务端口）；heartbeat 没有 `port`，
+   * 所以保留已知端口，不能把记录覆盖成 undefined——否则心跳一到，回程就断了。
+   * 万一心跳先于任何 beacon 到达，退回 UDP 源端口（同一颗 socket）。
    */
-  function rememberEndpoint (packet, address) {
+  function rememberEndpoint (packet, address, sourcePort) {
+    const existing = endpoints.get(packet.deviceId)
+    const port = isPort(packet.port)
+      ? packet.port
+      : existing?.port ?? sourcePort
+    if (!isPort(port)) return
     endpoints.delete(packet.deviceId)
     endpoints.set(packet.deviceId, {
       address,
-      port: packet.port,
+      port,
       seenAt: now()
     })
     while (endpoints.size > MAX_NEIGHBORS) {
@@ -203,7 +213,7 @@ export function createDiscovery ({
     if (identity?.deviceId !== undefined && packet.deviceId === identity.deviceId) return
 
     // 先记地址：即便 onPeer 把包丢掉（例如邻居表满），后续单播仍然找得到它。
-    rememberEndpoint(packet, source)
+    rememberEndpoint(packet, source, sourcePort)
 
     try {
       onPeer?.(packet)

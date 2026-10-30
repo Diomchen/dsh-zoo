@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { MAX_NEIGHBORS, NEIGHBOR_TTL_MS } from '../src/protocol.js'
-import { MAX_PROMPTS, PROMPT_SNOOZE_MS, createRoom } from '../src/room.js'
+import { GUEST_TTL_MS, MAX_NEIGHBORS, NEIGHBOR_TTL_MS } from '../src/protocol.js'
+import { MAX_GUESTS, MAX_PROMPTS, PROMPT_SNOOZE_MS, createRoom } from '../src/room.js'
 
 const T0 = 1_700_000_000_000
 
@@ -397,4 +397,176 @@ test('对未知 deviceId 的接受/拒绝明确失败，不留下半截状态', 
   assert.deepEqual(room.reject(42), { ok: false, error: 'bad-device-id' })
   assert.deepEqual(room.dismissPrompt('ghost'), { ok: false, error: 'not-prompt' })
   assert.equal(room.mayTalkTo('ghost'), false)
+})
+
+test('放行后的心跳创建访客；未放行、自己和未知来源的心跳都不创建', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '我' })
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+
+  assert.equal(room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 100), false)
+  assert.deepEqual(room.snapshot().guests, [])
+
+  assert.equal(room.admit('neighbor-a').ok, true)
+  assert.equal(room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 2000), true)
+  assert.deepEqual(room.snapshot().guests, [{
+    deviceId: 'neighbor-a',
+    nickname: '甲',
+    anim: '写代码',
+    since: T0 + 2000
+  }])
+  assert.deepEqual(Object.keys(room.snapshot().guests[0]), ['deviceId', 'nickname', 'anim', 'since'])
+
+  room.setTrust({
+    allowed: { 'neighbor-a': { nickname: '甲' }, 'me-1': { nickname: '我' } }
+  })
+  assert.equal(room.observeHeartbeat({ deviceId: 'me-1', anim: '写代码' }, T0 + 3000), false)
+  assert.equal(room.observeHeartbeat({ deviceId: 'ghost', anim: '写代码' }, T0 + 3000), false)
+  assert.equal(room.observeHeartbeat(null, T0 + 3000), false)
+  assert.equal(room.observeHeartbeat({ deviceId: '', anim: '写代码' }, T0 + 3000), false)
+
+  // 非法动画名降级成 null，不清掉访客。
+  assert.equal(room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '../secret' }, T0 + 4000), true)
+  assert.equal(room.snapshot().guests.length, 1)
+  assert.equal(room.snapshot().guests[0].anim, null)
+  assert.equal(room.snapshot().guests[0].since, T0 + 2000)
+})
+
+test('心跳刷新访客的动作与昵称，但 since 不变；邻居灯也跟着续命', () => {
+  const room = roomAt()
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+  room.admit('neighbor-a')
+
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 2000)
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲改名', port: 40001 }, T0 + 3000)
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '东张西望' }, T0 + 4000)
+
+  assert.deepEqual(room.snapshot().guests, [{
+    deviceId: 'neighbor-a',
+    nickname: '甲改名',
+    anim: '东张西望',
+    since: T0 + 2000
+  }])
+  assert.equal(room.snapshot().neighbors[0].lastSeen, T0 + 4000)
+})
+
+test('访客 30 秒没有心跳就消失；邻居灯按自己的 lastSeen 独立到期', () => {
+  const room = roomAt()
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+  room.admit('neighbor-a')
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 20000)
+  // 之后只有广播、没有心跳：灯续命到 T0+55000，访客只到 T0+50000。
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0 + 25000)
+
+  assert.equal(room.tick(T0 + 20000 + GUEST_TTL_MS - 1), 0)
+  assert.equal(room.snapshot().guests.length, 1)
+
+  assert.equal(room.tick(T0 + 20000 + GUEST_TTL_MS), 0)
+  assert.deepEqual(room.snapshot().guests, [])
+  assert.equal(room.snapshot().neighbors.length, 1)
+
+  assert.equal(room.tick(T0 + 25000 + NEIGHBOR_TTL_MS), 1)
+  assert.deepEqual(room.snapshot().neighbors, [])
+})
+
+test('访客表最多 8 位，满了挤掉最久没心跳的那位', () => {
+  const room = roomAt()
+  for (let index = 0; index < MAX_GUESTS; index += 1) {
+    room.observeBeacon({ deviceId: 'dev-' + index, nickname: '邻居' + index, port: 40000 }, T0)
+    room.admit('dev-' + index)
+    room.observeHeartbeat({ deviceId: 'dev-' + index, anim: null }, T0 + 1000 + index)
+  }
+  assert.equal(room.snapshot().guests.length, MAX_GUESTS)
+
+  // 刷新 dev-0，让 dev-1 成为最久没心跳的那位。
+  room.observeHeartbeat({ deviceId: 'dev-0', anim: '写代码' }, T0 + 2000)
+  room.observeBeacon({ deviceId: 'dev-new', nickname: '新来的', port: 40000 }, T0 + 2000)
+  room.admit('dev-new')
+  room.observeHeartbeat({ deviceId: 'dev-new', anim: null }, T0 + 2001)
+
+  const ids = room.snapshot().guests.map((guest) => guest.deviceId)
+  assert.equal(ids.length, MAX_GUESTS)
+  assert.equal(ids.includes('dev-new'), true)
+  assert.equal(ids.includes('dev-0'), true)
+  assert.equal(ids.includes('dev-1'), false)
+})
+
+test('拒绝立即清掉访客；放行名单收紧时也立即清掉', () => {
+  const room = roomAt()
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+  room.admit('neighbor-a')
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 2000)
+  assert.equal(room.snapshot().guests.length, 1)
+
+  assert.equal(room.reject('neighbor-a').status, 'denied')
+  assert.deepEqual(room.snapshot().guests, [])
+  assert.equal(room.mayTalkTo('neighbor-a'), false)
+
+  // 重新放行后心跳又能创建；名单被手改收紧时立即离开，不等 TTL。
+  room.admit('neighbor-a')
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: '写代码' }, T0 + 4000)
+  assert.equal(room.snapshot().guests.length, 1)
+  room.setTrust({ allowed: {}, denied: {} })
+  assert.deepEqual(room.snapshot().guests, [])
+  assert.equal(room.snapshot().neighbors[0].status, 'pending')
+})
+
+test('放行名单里有、但还没收到广播的邻居，其心跳仍能创建访客', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '我' })
+  room.setTrust({ allowed: { 'neighbor-x': { nickname: '名单里的邻居' } } })
+
+  assert.equal(room.observeHeartbeat({ deviceId: 'neighbor-x', anim: '写代码' }, T0), true)
+  assert.deepEqual(room.snapshot().guests, [{
+    deviceId: 'neighbor-x',
+    nickname: '名单里的邻居',
+    anim: '写代码',
+    since: T0
+  }])
+  assert.deepEqual(room.snapshot().neighbors, [])
+  assert.deepEqual(room.heartbeatTargets(), ['neighbor-x'])
+})
+
+test('heartbeatTargets 只列出放行名单；pending/denied/自己都不在其中', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '我' })
+  room.setTrust({
+    allowed: { 'allowed-b': { nickname: '乙' }, 'me-1': { nickname: '我' } },
+    denied: { 'denied-c': { nickname: '丙' } }
+  })
+  room.observeBeacon({ deviceId: 'pending-a', nickname: '甲', port: 40001 }, T0)
+  room.observeBeacon({ deviceId: 'allowed-b', nickname: '乙', port: 40002 }, T0)
+  room.observeBeacon({ deviceId: 'denied-c', nickname: '丙', port: 40003 }, T0)
+
+  assert.deepEqual(room.heartbeatTargets(), ['allowed-b'])
+  assert.equal(room.mayTalkTo('pending-a'), false)
+  assert.equal(room.mayTalkTo('denied-c'), false)
+})
+
+test('心跳只影响访客表：不改本地影子、名字、信任或邻居昵称', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '我' })
+  room.setSelfPet({ name: '蓝毛小女仆', anim: '写代码' })
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+  room.admit('neighbor-a')
+  const before = room.snapshot().self
+
+  room.observeHeartbeat({
+    deviceId: 'neighbor-a',
+    anim: '东张西望',
+    nickname: '伪造的名字',
+    name: '伪造的名字',
+    self: { nickname: '被篡改' },
+    path: '/etc/passwd',
+    command: 'rm -rf /',
+    allowed: true,
+    port: 1,
+    coordinates: { x: 1, y: 2 }
+  }, T0 + 2000)
+
+  const snap = room.snapshot()
+  assert.deepEqual(snap.self, before)
+  assert.equal(snap.guests[0].nickname, '甲')
+  assert.equal(snap.guests[0].anim, '东张西望')
+  assert.equal(room.mayTalkTo('neighbor-a'), true)
 })
