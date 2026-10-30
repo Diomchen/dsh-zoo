@@ -40,6 +40,27 @@
 - **身份**：`deviceId` 是持久化在 `<dataDir>/identity.json` 的随机 UUID；
   昵称默认取本机宠物名，没有则取主机名，可以双击宠物名字修改（或直接编辑该文件）。
 
+## 安装
+
+```sh
+node scripts/install.mjs            # 默认装进 ~/.dsh/profiles/desktop
+node scripts/install.mjs --dry-run  # 先看它会改什么
+node scripts/install.mjs --profile web
+```
+
+它只做两件事：在 profile 的 `node_modules` 里放一个指向本仓库的符号链接（`link:` 依赖），
+把这个包名登记进 profile 的 `dsh.profile.bundles`。改 `package.json` 之前会留一份 `.bak`。
+
+**装完要重启 DSH**：宿主半边是新代码，不会热加载。重启后打开 GUI，右下角应该出现客厅。
+
+卸载：
+
+```sh
+node scripts/uninstall.mjs          # 摘掉登记与链接；<DSH_HOME>/local-pet/ 的用户数据保留
+```
+
+如果 DSH 自己被卡住，把 profile 的 `package.json` 从 `.bak` 还原即可。
+
 ## 端口与防火墙
 
 - 发现/服务端口默认 **45871**（UDP），可用环境变量 `LOCAL_PET_PORT` 覆盖。

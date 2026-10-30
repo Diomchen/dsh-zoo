@@ -4,7 +4,7 @@
 
 **Blocked by:** 04
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] 拖到邻居灯上即触发出门，不需要二次确认
 - [ ] 出门后我这边的本地影子显示"出门了"，并从客厅消失或变暗
