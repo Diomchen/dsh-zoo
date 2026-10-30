@@ -7,11 +7,12 @@ export const inject = ['webServer']
 
 /**
  * 入口。整段包在 try/catch 里：插件坏掉时应该是一行日志，而不是让 DSH 起不来。
+ * 第二个参数只给测试用（关掉网络/桥接、指定临时 dataDir）；DSH 只传 ctx。
  */
-export function apply (ctx) {
+export function apply (ctx, options = {}) {
   let service
   try {
-    service = createService(ctx)
+    service = createService(ctx, options)
   } catch (error) {
     warn(ctx, '初始化失败，客厅不会出现：' + describe(error))
     return
