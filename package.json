@@ -18,7 +18,9 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check client.js && node --test test/*.test.js"
+    "check": "node --check client.js && node --test test/*.test.js",
+    "install:profile": "node scripts/install.mjs",
+    "uninstall:profile": "node scripts/uninstall.mjs"
   },
   "engines": {
     "node": ">=22.12.0"

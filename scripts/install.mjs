@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+// 把本插件装进某个 DSH profile。
+//
+// 为什么手写而不是走 pnpm：这条机器上没有 pnpm 在 PATH 上，而这里要做的其实只有两件事——
+// 在 node_modules 里放一个指向本仓库的符号链接（pnpm 的 link: 依赖也是这么干的），
+// 以及把这个包名登记进 profile 的 bundles 层栈。
+//
+// 用法：node scripts/install.mjs [--profile desktop] [--home <DSH_HOME>] [--dry-run]
+//
+// 安全：改 profile 的 package.json 之前先写一份 .bak；任何一步失败都会回滚并报错。
+// 卸载：node scripts/uninstall.mjs（同一个 profile 参数）。
+
+import { copyFile, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const PKG = 'dsh-local-pet'
+const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+const args = parseArgs(process.argv.slice(2))
+const home = args.home ?? process.env.DSH_HOME ?? join(homedir(), '.dsh')
+const profile = args.profile ?? 'desktop'
+const profileDir = join(home, 'profiles', profile)
+const manifestPath = join(profileDir, 'package.json')
+const linkPath = join(profileDir, 'node_modules', PKG)
+
+main().catch((error) => {
+  console.error('[install] 失败：' + (error instanceof Error ? error.message : String(error)))
+  process.exitCode = 1
+})
+
+async function main () {
+  if (!existsSync(manifestPath)) {
+    throw new Error(`找不到 profile 清单：${manifestPath}（用 --profile 指定另一个 profile）`)
+  }
+
+  const raw = await readFile(manifestPath, 'utf8')
+  const manifest = JSON.parse(raw)
+  const before = { deps: { ...(manifest.dependencies ?? {}) }, bundles: [...(manifest.dsh?.profile?.bundles ?? [])] }
+
+  manifest.dependencies = manifest.dependencies ?? {}
+  manifest.dependencies[PKG] = 'link:' + REPO
+  manifest.dsh = manifest.dsh ?? {}
+  manifest.dsh.profile = manifest.dsh.profile ?? {}
+  const bundles = manifest.dsh.profile.bundles ?? []
+  if (!bundles.includes(PKG)) bundles.push(PKG)
+  manifest.dsh.profile.bundles = bundles
+
+  console.log(`[install] profile : ${profileDir}`)
+  console.log(`[install] 依赖     : ${PKG} -> link:${REPO}`)
+  console.log(`[install] bundles  : ${bundles.join(' → ')}`)
+
+  if (args['dry-run']) {
+    console.log(JSON.stringify({ before, after: manifest.dsh.profile.bundles }, null, 2))
+    console.log('[install] dry-run，什么都没改')
+    return
+  }
+
+  const backup = manifestPath + '.bak'
+  await copyFile(manifestPath, backup)
+  try {
+    await mkdir(dirname(linkPath), { recursive: true })
+    await rm(linkPath, { force: true, recursive: false })
+    await symlink(REPO, linkPath, 'dir')
+    await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8')
+  } catch (error) {
+    await writeFile(manifestPath, raw, 'utf8')
+    await rm(linkPath, { force: true }).catch(() => {})
+    throw error
+  }
+
+  console.log('[install] 装好了。')
+  console.log('[install] 下一步：重启 DSH（新插件的宿主半边需要重新加载），然后打开 GUI 看右下角。')
+  console.log(`[install] 反悔：node scripts/uninstall.mjs --profile ${profile}${args.home ? ' --home ' + args.home : ''}`)
+}
+
+function parseArgs (argv) {
+  const out = {}
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i]
+    if (!token.startsWith('--')) continue
+    const key = token.slice(2)
+    const next = argv[i + 1]
+    if (next && !next.startsWith('--')) {
+      out[key] = next
+      i += 1
+    } else {
+      out[key] = true
+    }
+  }
+  return out
+}
