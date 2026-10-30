@@ -3,8 +3,9 @@ import { hostname } from 'node:os'
 import { createDiscovery } from './discovery.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
+import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
-import { normalizeNickname, resolvePort } from './protocol.js'
+import { isDeviceId, normalizeNickname, resolvePort } from './protocol.js'
 import { createRoom } from './room.js'
 
 export const ROUTE_PREFIX = '/local-pet'
@@ -17,6 +18,7 @@ export const NEIGHBOR_TICK_MS = 1000
  *
  * I/O 都在这个薄壳里：
  * - identity 落盘（src/identity.js）
+ * - 放行/拒绝名单落盘（src/peers.js）
  * - dsh-pet 轮询（src/pet-bridge.js）
  * - UDP 发现（src/discovery.js）
  * 它们只把结果翻译成 room 的方法调用；room 保持纯。
@@ -31,6 +33,7 @@ export function createService (ctx, options = {}) {
 
   let identity = null
   let discovery = null
+  let peers = null
   let bridge = null
   let tickTimer = null
   let disposed = false
@@ -64,6 +67,36 @@ export function createService (ctx, options = {}) {
     if (disposed) return { ok: false, error: 'disposed' }
     const action = typeof body?.action === 'string' ? body.action : null
 
+    // 放行/拒绝只接受本地页面发来的 UUID；远端 UDP 永远走不到这个分支。
+    // room 只改内存并返回决定，落盘交给 src/peers.js（唯一允许的额外写入）。
+    if (action === 'admit' || action === 'reject') {
+      if (peers === null) return { ok: false, error: 'starting' }
+      const deviceId = actionDeviceId(body?.deviceId)
+      if (deviceId === null) return { ok: false, error: 'bad-device-id' }
+      const decision = action === 'admit' ? room.admit(deviceId) : room.reject(deviceId)
+      if (!decision.ok) return decision
+      const persisted = action === 'admit'
+        ? await peers.admit({ deviceId, nickname: decision.nickname, at: decision.at })
+        : await peers.reject({ deviceId, nickname: decision.nickname, at: decision.at })
+      return {
+        ok: true,
+        action,
+        deviceId,
+        nickname: decision.nickname,
+        status: decision.status,
+        persisted
+      }
+    }
+
+    // “稍后再说”：只让队列前进，不改变任何信任状态，也不落盘。
+    if (action === 'dismiss') {
+      const deviceId = actionDeviceId(body?.deviceId)
+      if (deviceId === null) return { ok: false, error: 'bad-device-id' }
+      const result = room.dismissPrompt(deviceId)
+      if (!result.ok) return result
+      return { ok: true, action: 'dismiss', deviceId, prompt: result.prompt }
+    }
+
     // 昵称是 ticket 02 的身份字段：只接受本地页面发来的改名，远端永远碰不到。
     if (action === 'rename') {
       if (identity === null) return { ok: false, error: 'starting' }
@@ -82,6 +115,11 @@ export function createService (ctx, options = {}) {
 
   async function start () {
     try {
+      // 先把放行/拒绝名单读进内存，再开始发现：重启后第一次广播就不会再问。
+      peers = await createPeerStore(dir, { log })
+      if (disposed) return
+      room.setTrust(peers.trust())
+
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
@@ -94,6 +132,8 @@ export function createService (ctx, options = {}) {
         discovery = createDiscovery({
           identity,
           port,
+          // 出站单播（ticket 04 的心跳）在发现层里也只走这一个门控。
+          mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
           onPeer (packet) {
             // 远端字段到这里只剩：更新邻居表、让客户端画一盏灯。
             if (!disposed) room.observeBeacon(packet)
@@ -150,6 +190,11 @@ export function createService (ctx, options = {}) {
     room,
     ready,
     snapshot: () => room.snapshot(),
+    /** ticket 04 的心跳/串门发送必须走这一个门控。 */
+    mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
+    /** ticket 04 的窄口：地址只从这里出，单播只从这里发（内部先过 mayTalkTo）。 */
+    addressOf: (deviceId) => discovery?.addressOf(deviceId) ?? null,
+    sendTo: (deviceId, data) => discovery?.sendTo(deviceId, data) ?? false,
     dispose () {
       if (disposed) return
       disposed = true
@@ -204,6 +249,13 @@ function dshPetOrigin (ctx) {
 function register (ctx, options) {
   const dispose = ctx.webServer.register(options)
   return typeof dispose === 'function' ? dispose : () => {}
+}
+
+/** 本机页面发来的 deviceId：必须是协议里的 UUID 形状，统一小写。 */
+function actionDeviceId (value) {
+  if (typeof value !== 'string') return null
+  const id = value.trim()
+  return isDeviceId(id) ? id.toLowerCase() : null
 }
 
 function makeLogger (ctx) {
