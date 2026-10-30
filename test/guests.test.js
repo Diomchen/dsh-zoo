@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { PROTOCOL_VERSION, parsePacket } from '../src/protocol.js'
+import { GUEST_TTL_MS, PROTOCOL_VERSION, parsePacket } from '../src/protocol.js'
 import { createService } from '../src/service.js'
 
 function delay (ms) {
@@ -217,7 +217,8 @@ test('放行前不发心跳；放行后心跳只带四个字段，对方心跳�
   assert.equal(guest.nickname, '乙')
   assert.equal(guest.anim, '东张西望')
   assert.equal(Number.isFinite(guest.since), true)
-  assert.deepEqual(Object.keys(guest), ['deviceId', 'nickname', 'anim', 'since'])
+  assert.equal(guest.expiresAt, guest.since + GUEST_TTL_MS)
+  assert.deepEqual(Object.keys(guest), ['deviceId', 'nickname', 'anim', 'since', 'expiresAt'])
   assert.equal(JSON.stringify(service.snapshot()).includes('127.0.0.1'), false)
   assert.equal(JSON.stringify(service.snapshot()).includes('"coordinates"'), false)
 

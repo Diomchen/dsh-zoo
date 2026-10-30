@@ -1,7 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { normalizeNickname } from './protocol.js'
+import { VISIT_RECORD_LIMIT, normalizeVisitRecord } from './visit-record.js'
 
 /**
  * 串门记录：<dataDir>/visits.json。
@@ -27,9 +27,8 @@ import { normalizeNickname } from './protocol.js'
  * 把 drainVisitRecords() 交给 append()，写入量有界（≤200 条，单次整文件）。
  */
 export const VISITS_FILE = 'visits.json'
-export const MAX_VISIT_RECORDS = 200
+export const MAX_VISIT_RECORDS = VISIT_RECORD_LIMIT
 export const VISITS_FILE_VERSION = 1
-const MAX_DURATION_MS = 24 * 60 * 60 * 1000
 
 export async function createVisitStore (dir, {
   log,
@@ -87,7 +86,7 @@ class VisitStore {
     const records = []
     let dropped = 0
     for (const item of list) {
-      const record = normalizeRecord(item)
+      const record = normalizeVisitRecord(item)
       if (record === null) {
         dropped += 1
         continue
@@ -115,7 +114,7 @@ class VisitStore {
    * 返回是否写进了文件（false 表示只在内存里，重启后丢）。
    */
   async append (record) {
-    const clean = normalizeRecord(record)
+    const clean = normalizeVisitRecord(record)
     if (clean === null) return false
     this.#records.unshift(clean)
     if (this.#records.length > this.#maxRecords) this.#records.length = this.#maxRecords
@@ -152,21 +151,6 @@ class VisitStore {
     } catch {
       // 日志不能反过来把插件搞崩
     }
-  }
-}
-
-function normalizeRecord (raw) {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-  if (raw.direction !== 'out' && raw.direction !== 'in') return null
-  const nickname = normalizeNickname(raw.nickname)
-  if (nickname === null) return null
-  if (!Number.isFinite(raw.startedAt) || raw.startedAt < 0) return null
-  if (!Number.isFinite(raw.durationMs) || raw.durationMs < 0) return null
-  return {
-    direction: raw.direction,
-    nickname,
-    startedAt: Math.floor(raw.startedAt),
-    durationMs: Math.min(Math.floor(raw.durationMs), MAX_DURATION_MS)
   }
 }
 

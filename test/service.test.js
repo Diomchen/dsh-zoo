@@ -10,6 +10,7 @@ import { IDENTITY_FILE, defaultNickname } from '../src/identity.js'
 import { PEERS_FILE } from '../src/peers.js'
 import { VISIT_TTL_MS, isDeviceId, normalizeNickname } from '../src/protocol.js'
 import { createService } from '../src/service.js'
+import { DEFAULT_ACCEPT_VISITS, SETTINGS_FILE, SETTINGS_VERSION } from '../src/settings.js'
 import { VISITS_FILE } from '../src/visits.js'
 
 function fakeCtx () {  const routes = []
@@ -167,6 +168,65 @@ test('昵称可以通过本地 action 修改并落盘；坏 action 明确失败'
   })
   assert.equal(unknown.status, 409)
   assert.equal(unknown.body.error, 'not-implemented')
+})
+
+test('客厅开关默认开；关掉后落盘，重启仍是关，重新打开也落盘', async (t) => {
+  const dir = await tempDir(t)
+  const first = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await first.ready
+  assert.equal(DEFAULT_ACCEPT_VISITS, true)
+  assert.equal(first.snapshot().acceptVisits, true)
+
+  const off = await call(first, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'accept-visits', enabled: false }
+  })
+  assert.equal(off.status, 200)
+  assert.deepEqual(off.body, {
+    ok: true,
+    action: 'accept-visits',
+    acceptVisits: false,
+    persisted: true
+  })
+  assert.equal(first.snapshot().acceptVisits, false)
+  assert.deepEqual(JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8')), {
+    version: SETTINGS_VERSION,
+    acceptVisits: false
+  })
+
+  // 非布尔值明确失败，不隐式 toggle。
+  const bad = await call(first, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'accept-visits', enabled: 'false' }
+  })
+  assert.equal(bad.status, 409)
+  assert.deepEqual(bad.body, { ok: false, error: 'bad-enabled' })
+  assert.equal(first.snapshot().acceptVisits, false)
+
+  first.dispose()
+
+  const second = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await second.ready
+  assert.equal(second.snapshot().acceptVisits, false)
+
+  const on = await call(second, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'accept-visits', enabled: true }
+  })
+  assert.equal(on.status, 200)
+  assert.equal(on.body.acceptVisits, true)
+  assert.equal(on.body.persisted, true)
+  assert.equal(second.snapshot().acceptVisits, true)
+  assert.equal(
+    JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8')).acceptVisits,
+    true
+  )
 })
 
 test('通过 webServer.getOrigin() 找到回环 dsh-pet，并把 anim 放进快照', async (t) => {

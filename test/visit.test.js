@@ -173,7 +173,12 @@ test('未放行的请求得到 deny，不创建访客、不写记录', () => {
     anim: null
   }, T0)
 
-  assert.deepEqual(replied, { reply: 'deny', deviceId: PEER, visitId: VISIT_A })
+  assert.deepEqual(replied, {
+    reply: 'deny',
+    deviceId: PEER,
+    visitId: VISIT_A,
+    reason: 'not-admitted'
+  })
   assert.deepEqual(room.snapshot().visitors, [])
   assert.deepEqual(room.snapshot().visits, [])
   assert.deepEqual(room.drainVisitRecords(), [])
@@ -186,6 +191,58 @@ test('未放行的请求得到 deny，不创建访客、不写记录', () => {
     anim: null
   }, T0).reply, 'deny')
   assert.deepEqual(room.snapshot().visitors, [])
+})
+
+test('关掉串门：已放行的请求也得到 visits-off 的 deny，不建访客；发起方提示与“没放行”不同', () => {
+  const receiver = makeRoom({ identity: 'me-2', nickname: '乙' })
+  assert.equal(receiver.snapshot().acceptVisits, true)
+  assert.equal(receiver.setAcceptVisits(false), false)
+  assert.equal(receiver.snapshot().acceptVisits, false)
+
+  const replied = receiver.observeVisitRequest({
+    deviceId: PEER,
+    visitId: VISIT_A,
+    nickname: PEER_NAME,
+    anim: null
+  }, T0)
+  assert.deepEqual(replied, {
+    reply: 'deny',
+    deviceId: PEER,
+    visitId: VISIT_A,
+    reason: 'visits-off'
+  })
+  assert.deepEqual(receiver.snapshot().visitors, [])
+  assert.deepEqual(receiver.snapshot().visits, [])
+  assert.deepEqual(receiver.drainVisitRecords(), [])
+
+  // 开关只挡串门：邻居灯、心跳影子、本机出门都不受影响。
+  receiver.observeBeacon({ deviceId: PEER, nickname: PEER_NAME, port: 40001 }, T0 + 1000)
+  receiver.admit(PEER)
+  assert.equal(receiver.observeHeartbeat({ deviceId: PEER, anim: '写代码' }, T0 + 2000), true)
+  assert.equal(receiver.snapshot().guests.length, 1)
+  assert.equal(receiver.beginVisit(PEER, { at: T0 + 3000, visitId: VISIT_B }).ok, true)
+
+  // 发起方收到 visits-off 的 deny：文案必须能区分“对方关掉了串门”。
+  const sender = makeRoom()
+  sender.beginVisit(PEER, { at: T0, visitId: VISIT_A })
+  const denied = sender.observeVisitDeny({
+    deviceId: PEER,
+    visitId: VISIT_A,
+    reason: 'visits-off'
+  }, T0 + 300)
+  assert.equal(denied.ok, true)
+  assert.equal(denied.error, 'visits-off')
+  assert.equal(sender.snapshot().self.out, null)
+  assert.deepEqual(sender.snapshot().visits, [])
+  assert.match(lastNotice(sender), /关掉了串门/)
+  assert.doesNotMatch(lastNotice(sender), /没有放行你/)
+
+  // 没带 reason 的 deny（旧报文/普通拒绝）仍然是原来的“没有放行你”。
+  const generic = makeRoom()
+  generic.beginVisit(PEER, { at: T0, visitId: VISIT_A })
+  generic.observeVisitDeny({ deviceId: PEER, visitId: VISIT_A }, T0 + 300)
+  assert.match(lastNotice(generic), /没有放行你/)
+  assert.notEqual(lastNotice(generic), lastNotice(sender))
 })
 
 test('本地召回：立即清掉出门状态、写 out 记录并排 recall；接收方收到后立即清场', () => {

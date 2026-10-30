@@ -438,10 +438,25 @@ test('sendReply 只给 visit-deny 用：未放行也能回执，但每来源 2 �
   assert.equal(discovery.sendReply(neighborId, second), true)
   await box.next((entry) => entry.message.equals(second))
 
-  // 限速：同一来源 5 秒内第 3 条不发。
+  // 限速：同一来源 5 秒内第 3 条不发。限速键是 UDP 源地址，不是可轮换的 deviceId：
+  // 换一个 deviceId 从同一个 socket 发来，仍然共用同一个桶。
   assert.equal(discovery.sendReply(neighborId, third), false)
   await assert.rejects(
     box.next((entry) => entry.message.equals(third), 200),
+    /timeout/
+  )
+
+  const otherId = randomUUID()
+  peer.send(beaconPayload({
+    deviceId: otherId,
+    nickname: '丙',
+    port: peerPort
+  }), myPort, '127.0.0.1')
+  await waitFor(() => room.snapshot().neighbors.length === 2)
+  const fourth = Buffer.from('visit-deny-4', 'utf8')
+  assert.equal(discovery.sendReply(otherId, fourth), false)
+  await assert.rejects(
+    box.next((entry) => entry.message.equals(fourth), 200),
     /timeout/
   )
 

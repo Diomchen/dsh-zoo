@@ -222,9 +222,11 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         ? ['v', 'type', 'deviceId', 'anim']
         : type === 'visit-request'
           ? ['v', 'type', 'deviceId', 'visitId', 'nickname', 'anim']
-          : type.startsWith('visit-')
-            ? ['v', 'type', 'deviceId', 'visitId']
-            : ['v', 'type', 'deviceId', 'nickname', 'port']
+          : type === 'visit-deny'
+            ? ['v', 'type', 'deviceId', 'visitId', 'reason']
+            : type.startsWith('visit-')
+              ? ['v', 'type', 'deviceId', 'visitId']
+              : ['v', 'type', 'deviceId', 'nickname', 'port']
     )
   }
 })
@@ -271,26 +273,26 @@ test('串门请求只写 v/type/deviceId/visitId/nickname/anim', () => {
   assert.equal(parsePacket(idle).packet.anim, null)
 })
 
-test('visit-ack / visit-deny / visit-recall 只关联串门 id，多余字段被丢弃', () => {
+test('visit-ack / visit-recall 只关联串门 id，visit-deny 多一个固定枚举 reason', () => {
   const deviceId = randomUUID()
   const visitId = randomUUID()
   const cases = [
-    ['visit-ack', encodeVisitAck({ deviceId, visitId })],
-    ['visit-deny', encodeVisitDeny({ deviceId, visitId })],
-    ['visit-recall', encodeVisitRecall({ deviceId, visitId })]
+    ['visit-ack', encodeVisitAck({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId']],
+    ['visit-recall', encodeVisitRecall({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId']],
+    ['visit-deny', encodeVisitDeny({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId', 'reason']],
+    ['visit-deny', encodeVisitDeny({ deviceId, visitId, reason: 'visits-off' }), 'visits-off', ['v', 'type', 'deviceId', 'visitId', 'reason']]
   ]
-  for (const [type, data] of cases) {
+  for (const [type, data, expectedReason, expectedKeys] of cases) {
     const raw = JSON.parse(data.toString('utf8'))
-    assert.deepEqual(Object.keys(raw), ['v', 'type', 'deviceId', 'visitId'])
+    assert.deepEqual(Object.keys(raw), expectedKeys)
     assert.equal(raw.type, type)
+    if (type === 'visit-deny') assert.equal(raw.reason, expectedReason)
     const parsed = parsePacket(data)
     assert.equal(parsed.ok, true)
-    assert.deepEqual(parsed.packet, {
-      v: PROTOCOL_VERSION,
-      type,
-      deviceId,
-      visitId
-    })
+    assert.deepEqual(Object.keys(parsed.packet), expectedKeys)
+    assert.equal(parsed.packet.deviceId, deviceId)
+    assert.equal(parsed.packet.visitId, visitId)
+    if (type === 'visit-deny') assert.equal(parsed.packet.reason, expectedReason)
 
     // 敌意附加字段（昵称、端口、坐标、未知字段）不会进入解析结果。
     const hostile = parsePacket(encodeJson({
@@ -305,8 +307,25 @@ test('visit-ack / visit-deny / visit-recall 只关联串门 id，多余字段被
       y: 2,
       coordinates: { x: 3, y: 4 }
     }))
-    assert.deepEqual(hostile.packet, { v: PROTOCOL_VERSION, type, deviceId, visitId })
+    assert.deepEqual(Object.keys(hostile.packet), expectedKeys)
+    assert.equal(hostile.packet.nickname, undefined)
   }
+})
+
+test('visit-deny 的 reason 只接受固定枚举；缺失按 not-admitted，坏值整包丢弃', () => {
+  const deviceId = randomUUID()
+  const visitId = randomUUID()
+  const base = { v: PROTOCOL_VERSION, type: 'visit-deny', deviceId, visitId }
+
+  const missing = parsePacket(encodeJson(base))
+  assert.equal(missing.ok, true)
+  assert.equal(missing.packet.reason, 'not-admitted')
+
+  assert.equal(parsePacket(encodeJson({ ...base, reason: 'visits-off' })).packet.reason, 'visits-off')
+  for (const reason of ['closed', 'visits_off', '', 42, null, ['visits-off'], { reason: 'visits-off' }]) {
+    assert.equal(parsePacket(encodeJson({ ...base, reason })).reason, 'deny-reason', String(reason))
+  }
+  assert.throws(() => encodeVisitDeny({ deviceId, visitId, reason: 'closed' }), /deny reason/)
 })
 
 test('串门报文的 visitId 必须是 UUID；版本、deviceId、4 KiB 同样校验', () => {
