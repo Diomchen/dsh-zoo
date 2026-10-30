@@ -10,10 +10,16 @@ import {
   MAX_PACKET_BYTES,
   PACKET_TYPES,
   PROTOCOL_VERSION,
+  VISIT_TTL_MS,
   createRateLimiter,
   encodeHeartbeat,
   encodePacket,
+  encodeVisitAck,
+  encodeVisitDeny,
+  encodeVisitRecall,
+  encodeVisitRequest,
   isSafeAnimationName,
+  isVisitId,
   normalizeNickname,
   parsePacket,
   resolvePort
@@ -144,13 +150,18 @@ test('心跳同样接受版本、deviceId、4 KiB 的校验', () => {
   assert.equal(parsePacket(Buffer.alloc(MAX_PACKET_BYTES + 1, 0x61)).reason, 'too-large')
 })
 
-test('任何报文都不含坐标字段', () => {
+test('任何报文都不含坐标字段（包括串门报文）', () => {
   const deviceId = randomUUID()
+  const visitId = randomUUID()
   const packets = [
     encodePacket({ type: 'beacon', deviceId, nickname: '甲', port: 45871 }),
     encodePacket({ type: 'beacon-ack', deviceId, nickname: '甲', port: 45871 }),
     encodeHeartbeat({ deviceId, anim: '写代码' }),
-    encodeHeartbeat({ deviceId, anim: null })
+    encodeHeartbeat({ deviceId, anim: null }),
+    encodeVisitRequest({ deviceId, visitId, nickname: '甲', anim: '写代码' }),
+    encodeVisitAck({ deviceId, visitId }),
+    encodeVisitDeny({ deviceId, visitId }),
+    encodeVisitRecall({ deviceId, visitId })
   ]
   const coordinateKeys = ['x', 'y', 'pos', 'position', 'coordinates', 'coord', 'lat', 'lng']
 
@@ -165,17 +176,229 @@ test('任何报文都不含坐标字段', () => {
   }
 
   // 敌意报文里的坐标在解析时被丢弃，不会流进 room / 快照。
-  for (const type of ['beacon', 'beacon-ack', 'heartbeat']) {
-    const raw = type === 'heartbeat'
-      ? { v: PROTOCOL_VERSION, type, deviceId, anim: '写代码', x: 1, y: 2, coordinates: { x: 3, y: 4 } }
-      : { v: PROTOCOL_VERSION, type, deviceId, nickname: '甲', port: 45871, x: 1, y: 2, coordinates: { x: 3, y: 4 } }
+  for (const type of PACKET_TYPES) {
+    let raw
+    if (type === 'heartbeat') {
+      raw = { v: PROTOCOL_VERSION, type, deviceId, anim: '写代码', x: 1, y: 2, coordinates: { x: 3, y: 4 } }
+    } else if (type === 'visit-request') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        visitId,
+        nickname: '甲',
+        anim: null,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type.startsWith('visit-')) {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        visitId,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        nickname: '甲',
+        port: 45871,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    }
     const parsed = parsePacket(encodeJson(raw))
     assert.equal(parsed.ok, true)
     assert.deepEqual(
       Object.keys(parsed.packet),
-      type === 'heartbeat' ? ['v', 'type', 'deviceId', 'anim'] : ['v', 'type', 'deviceId', 'nickname', 'port']
+      type === 'heartbeat'
+        ? ['v', 'type', 'deviceId', 'anim']
+        : type === 'visit-request'
+          ? ['v', 'type', 'deviceId', 'visitId', 'nickname', 'anim']
+          : type.startsWith('visit-')
+            ? ['v', 'type', 'deviceId', 'visitId']
+            : ['v', 'type', 'deviceId', 'nickname', 'port']
     )
   }
+})
+
+test('串门请求只写 v/type/deviceId/visitId/nickname/anim', () => {
+  const deviceId = randomUUID()
+  const visitId = randomUUID()
+  const data = encodeVisitRequest({
+    deviceId: deviceId.toUpperCase(),
+    visitId: visitId.toUpperCase(),
+    nickname: '  隔壁  ',
+    anim: ' 东张西望 ',
+    // 下面这些都不该出现在请求里。
+    port: 1234,
+    x: 1,
+    y: 2,
+    coordinates: { x: 3, y: 4 }
+  })
+  const raw = JSON.parse(data.toString('utf8'))
+  assert.deepEqual(Object.keys(raw), ['v', 'type', 'deviceId', 'visitId', 'nickname', 'anim'])
+  assert.deepEqual(raw, {
+    v: PROTOCOL_VERSION,
+    type: 'visit-request',
+    deviceId: deviceId.toLowerCase(),
+    visitId: visitId.toLowerCase(),
+    nickname: '隔壁',
+    anim: '东张西望'
+  })
+  assert.deepEqual(parsePacket(data), {
+    ok: true,
+    packet: {
+      v: PROTOCOL_VERSION,
+      type: 'visit-request',
+      deviceId: deviceId.toLowerCase(),
+      visitId: visitId.toLowerCase(),
+      nickname: '隔壁',
+      anim: '东张西望'
+    }
+  })
+
+  // 本机动画名坏掉时降级成 null，而不是把整个请求丢掉。
+  const idle = encodeVisitRequest({ deviceId, visitId, nickname: '甲', anim: '../secret' })
+  assert.equal(JSON.parse(idle.toString('utf8')).anim, null)
+  assert.equal(parsePacket(idle).packet.anim, null)
+})
+
+test('visit-ack / visit-deny / visit-recall 只关联串门 id，多余字段被丢弃', () => {
+  const deviceId = randomUUID()
+  const visitId = randomUUID()
+  const cases = [
+    ['visit-ack', encodeVisitAck({ deviceId, visitId })],
+    ['visit-deny', encodeVisitDeny({ deviceId, visitId })],
+    ['visit-recall', encodeVisitRecall({ deviceId, visitId })]
+  ]
+  for (const [type, data] of cases) {
+    const raw = JSON.parse(data.toString('utf8'))
+    assert.deepEqual(Object.keys(raw), ['v', 'type', 'deviceId', 'visitId'])
+    assert.equal(raw.type, type)
+    const parsed = parsePacket(data)
+    assert.equal(parsed.ok, true)
+    assert.deepEqual(parsed.packet, {
+      v: PROTOCOL_VERSION,
+      type,
+      deviceId,
+      visitId
+    })
+
+    // 敌意附加字段（昵称、端口、坐标、未知字段）不会进入解析结果。
+    const hostile = parsePacket(encodeJson({
+      v: PROTOCOL_VERSION,
+      type,
+      deviceId,
+      visitId,
+      nickname: '伪造',
+      port: 1,
+      anim: '写代码',
+      x: 1,
+      y: 2,
+      coordinates: { x: 3, y: 4 }
+    }))
+    assert.deepEqual(hostile.packet, { v: PROTOCOL_VERSION, type, deviceId, visitId })
+  }
+})
+
+test('串门报文的 visitId 必须是 UUID；版本、deviceId、4 KiB 同样校验', () => {
+  const deviceId = randomUUID()
+  const visitId = randomUUID()
+  for (const badVisitId of ['visit-1', '', 42, null, randomUUID() + 'x']) {
+    assert.equal(
+      parsePacket(encodeJson({ v: PROTOCOL_VERSION, type: 'visit-ack', deviceId, visitId: badVisitId })).reason,
+      'visit-id',
+      String(badVisitId)
+    )
+    assert.equal(
+      parsePacket(encodeJson({
+        v: PROTOCOL_VERSION,
+        type: 'visit-request',
+        deviceId,
+        visitId: badVisitId,
+        nickname: '甲',
+        anim: null
+      })).reason,
+      'visit-id',
+      String(badVisitId)
+    )
+  }
+
+  // 请求必须显式带 anim（null 或安全动画名）和可读昵称。
+  assert.equal(parsePacket(encodeJson({
+    v: PROTOCOL_VERSION,
+    type: 'visit-request',
+    deviceId,
+    visitId,
+    nickname: '甲'
+  })).reason, 'anim')
+  assert.equal(parsePacket(encodeJson({
+    v: PROTOCOL_VERSION,
+    type: 'visit-request',
+    deviceId,
+    visitId,
+    nickname: 42,
+    anim: null
+  })).reason, 'nickname')
+  assert.equal(parsePacket(encodeJson({
+    v: PROTOCOL_VERSION,
+    type: 'visit-request',
+    deviceId,
+    visitId,
+    nickname: '甲',
+    anim: '../secret'
+  })).reason, 'anim')
+
+  assert.equal(parsePacket(encodeJson({
+    v: 2,
+    type: 'visit-recall',
+    deviceId,
+    visitId
+  })).reason, 'version')
+  assert.equal(parsePacket(encodeJson({
+    v: PROTOCOL_VERSION,
+    type: 'visit-recall',
+    deviceId: 'not-a-uuid',
+    visitId
+  })).reason, 'device-id')
+  assert.equal(parsePacket(Buffer.alloc(MAX_PACKET_BYTES + 1, 0x61)).reason, 'too-large')
+
+  assert.equal(isVisitId(visitId), true)
+  assert.equal(isVisitId(visitId.toUpperCase()), true)
+  assert.equal(isVisitId('visit-1'), false)
+  assert.equal(isVisitId(null), false)
+})
+
+test('串门的本地字段非法在编码阶段就失败', () => {
+  const deviceId = randomUUID()
+  assert.throws(
+    () => encodeVisitRequest({ deviceId, visitId: 'visit-1', nickname: '甲', anim: null }),
+    /visitId/
+  )
+  assert.throws(
+    () => encodeVisitRequest({ deviceId, visitId: randomUUID(), nickname: '', anim: null }),
+    /nickname/
+  )
+  assert.throws(
+    () => encodeVisitAck({ deviceId, visitId: 'nope' }),
+    /visitId/
+  )
+  assert.throws(
+    () => encodeVisitRecall({ deviceId: 'not-a-uuid', visitId: randomUUID() }),
+    /deviceId/
+  )
+  assert.throws(
+    () => encodePacket({ type: 'visit', deviceId, visitId: randomUUID() }),
+    /type/
+  )
 })
 
 test('超过 4 KiB 的报文直接丢，不解析', () => {
@@ -253,12 +476,21 @@ test('环境变量只在合法时覆盖默认端口', () => {
   assert.equal(resolvePort({ LOCAL_PET_PORT: 'abc' }), DEFAULT_PORT)
 })
 
-test('默认的发现参数是 5 秒 / 45871；心跳 2 秒、访客 30 秒', () => {
+test('默认的发现参数是 5 秒 / 45871；心跳 2 秒、访客 30 秒、串门 60 秒', () => {
   assert.equal(BEACON_INTERVAL_MS, 5000)
   assert.equal(DEFAULT_PORT, 45871)
   assert.equal(HEARTBEAT_INTERVAL_MS, 2000)
   assert.equal(GUEST_TTL_MS, 30000)
-  assert.deepEqual(PACKET_TYPES, ['beacon', 'beacon-ack', 'heartbeat'])
+  assert.equal(VISIT_TTL_MS, 60000)
+  assert.deepEqual(PACKET_TYPES, [
+    'beacon',
+    'beacon-ack',
+    'heartbeat',
+    'visit-request',
+    'visit-ack',
+    'visit-deny',
+    'visit-recall'
+  ])
 })
 
 test('每来源限速：窗口内超限丢弃，窗口后恢复', () => {

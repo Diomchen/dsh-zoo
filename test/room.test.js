@@ -17,10 +17,12 @@ test('初始快照保持 v1 形状，并带上降级状态', () => {
     deviceId: null,
     nickname: '我',
     pet: null,
-    bridge: { ok: false, reason: 'starting' }
+    bridge: { ok: false, reason: 'starting' },
+    out: null
   })
   assert.deepEqual(snap.neighbors, [])
   assert.deepEqual(snap.guests, [])
+  assert.deepEqual(snap.visitors, [])
   assert.deepEqual(snap.visits, [])
   assert.equal(snap.prompt, null)
   assert.deepEqual(snap.notices, [])
@@ -155,10 +157,10 @@ test('桥接状态只接受已知 reason', () => {
 
 test('未知 action 明确失败，不假装成功', async () => {
   const room = roomAt()
-  assert.deepEqual(await room.action({ action: 'visit' }), {
+  assert.deepEqual(await room.action({ action: 'unknown' }), {
     ok: false,
     error: 'not-implemented',
-    action: 'visit'
+    action: 'unknown'
   })
 })
 

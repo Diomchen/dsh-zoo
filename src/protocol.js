@@ -4,8 +4,9 @@
  * 这里的每一个字节都来自局域网，必须当成敌意输入：
  * - 单包上限 4 KiB，超过直接丢；
  * - 只认本文件列出的字段，多余的字段在重建对象时被丢弃；
- * - 版本、类型、deviceId、port 逐项校验，昵称清洗 + 截断，动画名只允许安全文件名；
- * - 每种报文只写自己那几个字段：beacon/beacon-ack 是身份，heartbeat 是动作意图；
+ * - 版本、类型、deviceId、visitId、port 逐项校验，昵称清洗 + 截断，动画名只允许安全文件名；
+ * - 每种报文只写自己那几个字段：beacon/beacon-ack 是身份，heartbeat 是动作意图，
+ *   visit-request/ack/deny/recall 是一次串门的生命周期；
  * - 任何校验失败都只返回 `{ ok: false }`，不抛异常、不写盘、不读本机状态。
  *
  * 协议本身不传素材、不传坐标、不传项目或会话信息（ADR-0003）。
@@ -23,7 +24,25 @@ export const NEIGHBOR_TTL_MS = 30000
 export const HEARTBEAT_INTERVAL_MS = 2000
 /** 30 秒没有心跳，访客从客厅消失；与邻居灯共用同一条 tick 时间线。 */
 export const GUEST_TTL_MS = 30000
-export const PACKET_TYPES = Object.freeze(['beacon', 'beacon-ack', 'heartbeat'])
+/**
+ * 一次串门的硬 TTL：发起方到点主动召回，接收方到点**自己**清理。
+ * 双方各跑各的计时器，谁都不能假设对面还活着（ticket 05）。
+ */
+export const VISIT_TTL_MS = 60000
+/**
+ * 串门走现有 UDP socket，不另开 TCP 监听（见 docs/protocol.md 的“为什么是 UDP”）。
+ * 类型集按生命周期固定：请求 → ack/deny，任一方可发 recall。
+ */
+export const PACKET_TYPES = Object.freeze([
+  'beacon',
+  'beacon-ack',
+  'heartbeat',
+  'visit-request',
+  'visit-ack',
+  'visit-deny',
+  'visit-recall'
+])
+const VISIT_TYPES = new Set(['visit-request', 'visit-ack', 'visit-deny', 'visit-recall'])
 
 const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -51,6 +70,14 @@ export function normalizeNickname (value) {
 
 export function isDeviceId (value) {
   return typeof value === 'string' && value.length <= 64 && UUID_RE.test(value)
+}
+
+/**
+ * 串门 id 与 deviceId 用同一种 UUID 形状：它不是设备身份，只是一次串门的关联键。
+ * 形状校验让它可以安全地出现在快照与日志里，也让胡乱构造的 id 在协议层就被丢掉。
+ */
+export function isVisitId (value) {
+  return isDeviceId(value)
 }
 
 export function isPort (value) {
@@ -82,14 +109,16 @@ export function resolvePort (env = process.env) {
 
 /**
  * 构造一个只含白名单字段的报文。字段顺序与字段集按类型固定，便于测试和抓包对照：
- *   beacon / beacon-ack → { v, type, deviceId, nickname, port }
- *   heartbeat          → { v, type, deviceId, anim }
+ *   beacon / beacon-ack     → { v, type, deviceId, nickname, port }
+ *   heartbeat               → { v, type, deviceId, anim }
+ *   visit-request           → { v, type, deviceId, visitId, nickname, anim }
+ *   visit-ack / visit-recall / visit-deny → { v, type, deviceId, visitId }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
- * deviceId / port 是本地代码传进来的，非法即抛（这是程序错误，不是网络输入）。
+ * deviceId / visitId / port 是本地代码传进来的，非法即抛（这是程序错误，不是网络输入）。
  * 本机动画名非法时不抛：降级成 null，让对端自己放待机。
  */
-export function encodePacket ({ type, deviceId, nickname, port, anim } = {}) {
+export function encodePacket ({ type, deviceId, nickname, port, anim, visitId } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
   if (!isDeviceId(deviceId)) throw new Error('protocol: invalid deviceId')
 
@@ -101,6 +130,19 @@ export function encodePacket ({ type, deviceId, nickname, port, anim } = {}) {
   let packet
   if (type === 'heartbeat') {
     packet = { ...base, anim: normalizeAnimation(anim) }
+  } else if (type === 'visit-request') {
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    const safeNickname = normalizeNickname(nickname)
+    if (safeNickname === null) throw new Error('protocol: invalid nickname')
+    packet = {
+      ...base,
+      visitId: visitId.toLowerCase(),
+      nickname: safeNickname,
+      anim: normalizeAnimation(anim)
+    }
+  } else if (VISIT_TYPES.has(type)) {
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    packet = { ...base, visitId: visitId.toLowerCase() }
   } else {
     if (!isPort(port)) throw new Error('protocol: invalid port')
     const safeNickname = normalizeNickname(nickname)
@@ -116,6 +158,23 @@ export function encodePacket ({ type, deviceId, nickname, port, anim } = {}) {
 /** ticket 04 的窄入口：调用方无法往心跳里塞昵称、端口或坐标。 */
 export function encodeHeartbeat ({ deviceId, anim } = {}) {
   return encodePacket({ type: 'heartbeat', deviceId, anim })
+}
+
+/** ticket 05 的窄入口：串门请求只带昵称、动作和串门 id。 */
+export function encodeVisitRequest ({ deviceId, visitId, nickname, anim } = {}) {
+  return encodePacket({ type: 'visit-request', deviceId, visitId, nickname, anim })
+}
+
+export function encodeVisitAck ({ deviceId, visitId } = {}) {
+  return encodePacket({ type: 'visit-ack', deviceId, visitId })
+}
+
+export function encodeVisitDeny ({ deviceId, visitId } = {}) {
+  return encodePacket({ type: 'visit-deny', deviceId, visitId })
+}
+
+export function encodeVisitRecall ({ deviceId, visitId } = {}) {
+  return encodePacket({ type: 'visit-recall', deviceId, visitId })
 }
 
 function fail (reason) {
@@ -166,6 +225,39 @@ export function parsePacket (input) {
         type: raw.type,
         deviceId: raw.deviceId.toLowerCase(),
         anim: raw.anim === null ? null : raw.anim.trim()
+      }
+    }
+  }
+
+  // 串门请求带昵称与动作名；昵称仍要清洗，动作名非法整包丢（与心跳一致）。
+  if (raw.type === 'visit-request') {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    const nickname = normalizeNickname(raw.nickname)
+    if (nickname === null) return fail('nickname')
+    if (raw.anim !== null && !isSafeAnimationName(raw.anim)) return fail('anim')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase(),
+        nickname,
+        anim: raw.anim === null ? null : raw.anim.trim()
+      }
+    }
+  }
+
+  // ack / deny / recall 只关联一次串门：除了 id 什么都不接受。
+  if (VISIT_TYPES.has(raw.type)) {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase()
       }
     }
   }

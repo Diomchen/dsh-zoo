@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 
 import { createDiscovery } from './discovery.js'
@@ -7,15 +8,27 @@ import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
 import {
   HEARTBEAT_INTERVAL_MS,
+  VISIT_TTL_MS,
   encodeHeartbeat,
+  encodeVisitAck,
+  encodeVisitDeny,
+  encodeVisitRecall,
+  encodeVisitRequest,
   isDeviceId,
   normalizeNickname,
   resolvePort
 } from './protocol.js'
 import { createRoom } from './room.js'
+import { createVisitStore } from './visits.js'
 
 export const ROUTE_PREFIX = '/local-pet'
 export const NEIGHBOR_TICK_MS = 1000
+/** 串门请求发三次（首次 + 两次重试），间隔约 600ms；拿不到 ack 就明确超时。 */
+export const VISIT_REQUEST_ATTEMPTS = 3
+export const VISIT_REQUEST_RETRY_MS = 600
+export const VISIT_REQUEST_TIMEOUT_MS = 1800
+/** 重试/超时计时器的检查粒度；测试可以调更快。 */
+export const VISIT_TIMER_TICK_MS = 200
 
 /**
  * 把客厅接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -25,6 +38,7 @@ export const NEIGHBOR_TICK_MS = 1000
  * I/O 都在这个薄壳里：
  * - identity 落盘（src/identity.js）
  * - 放行/拒绝名单落盘（src/peers.js）
+ * - 串门记录落盘（src/visits.js）
  * - dsh-pet 轮询（src/pet-bridge.js）
  * - UDP 发现（src/discovery.js）
  * 它们只把结果翻译成 room 的方法调用；room 保持纯。
@@ -34,15 +48,31 @@ export function createService (ctx, options = {}) {
   const dir = options.dataDir ?? dataDir(env)
   const configPath = options.petConfigPath ?? dshPetConfigPath(env)
   const log = makeLogger(ctx)
-  const room = createRoom({ dir, log })
+  const room = createRoom({
+    dir,
+    log,
+    visitTtlMs: positiveOption(options.visitTtlMs, VISIT_TTL_MS, 100)
+  })
   const disposers = []
+  const visitRetryMs = positiveOption(options.visitRetryMs, VISIT_REQUEST_RETRY_MS, 10)
+  const visitTimeoutMs = positiveOption(
+    options.visitTimeoutMs,
+    VISIT_REQUEST_TIMEOUT_MS,
+    visitRetryMs * 2
+  )
+  const visitAttempts = integerOption(options.visitAttempts, VISIT_REQUEST_ATTEMPTS, 1, 8)
+  const visitTickMs = positiveOption(options.visitTickMs, VISIT_TIMER_TICK_MS, 10)
 
   let identity = null
   let discovery = null
   let peers = null
+  let visits = null
   let bridge = null
   let tickTimer = null
   let heartbeatTimer = null
+  let visitTimer = null
+  // 当前出门请求的重试状态；只活在 service，room 只记“在请求中/已抵达”。
+  let request = null
   let disposed = false
 
   disposers.push(register(ctx, {
@@ -71,6 +101,16 @@ export function createService (ctx, options = {}) {
   }))
 
   async function handleAction (body) {
+    try {
+      return await handleActionInner(body)
+    } finally {
+      // 任何 action 都可能间接触发一次串门完成（拒绝清场、召回、到期）：
+      // 统一在出口把内存记录交给 visits.json，并补发需要发的 visit-recall。
+      flushRoomEffects()
+    }
+  }
+
+  async function handleActionInner (body) {
     if (disposed) return { ok: false, error: 'disposed' }
     const action = typeof body?.action === 'string' ? body.action : null
 
@@ -106,6 +146,70 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'dismiss', deviceId, prompt: result.prompt }
     }
 
+    // 串门（ticket 05）：只接受本地页面发来的 UUID。出门状态在 room，
+    // 重试与超时计时在 service；两者都用同一条已放行的 UDP 单播出口。
+    if (action === 'visit') {
+      const deviceId = actionDeviceId(body?.deviceId)
+      if (deviceId === null) return { ok: false, error: 'bad-device-id' }
+      const visitId = randomUUID()
+      const begun = room.beginVisit(deviceId, { visitId })
+      if (!begun.ok) return begun
+      if (!sendVisitRequest(visitId)) {
+        request = null
+        const failed = room.failOutboundVisit('peer-offline')
+        return {
+          ok: false,
+          error: 'peer-offline',
+          deviceId,
+          notice: failed.ok ? failed.notice : null
+        }
+      }
+      const now = Date.now()
+      request = {
+        deviceId,
+        visitId,
+        attempts: 1,
+        nextAt: now + visitRetryMs,
+        deadline: now + visitTimeoutMs
+      }
+      return {
+        ok: true,
+        action: 'visit',
+        deviceId,
+        visitId,
+        phase: 'requesting',
+        nickname: begun.visit.nickname
+      }
+    }
+
+    // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
+    if (action === 'recall') {
+      const result = room.recallOutbound()
+      if (!result.ok) return result
+      request = null
+      return {
+        ok: true,
+        action: 'recall',
+        cancelled: result.cancelled === true,
+        visit: result.visit,
+        record: result.record
+      }
+    }
+
+    // 接收方提前结束一次入站串门：写 in 记录，并尽力通知对方回家。
+    if (action === 'end-visit') {
+      const deviceId = actionDeviceId(body?.deviceId)
+      if (deviceId === null) return { ok: false, error: 'bad-device-id' }
+      const result = room.endInboundVisit(deviceId)
+      if (!result.ok) return result
+      return {
+        ok: true,
+        action: 'end-visit',
+        deviceId,
+        record: result.record
+      }
+    }
+
     // 昵称是 ticket 02 的身份字段：只接受本地页面发来的改名，远端永远碰不到。
     if (action === 'rename') {
       if (identity === null) return { ok: false, error: 'starting' }
@@ -129,6 +233,16 @@ export function createService (ctx, options = {}) {
       if (disposed) return
       room.setTrust(peers.trust())
 
+      // 串门记录是“锦上添花”：读写失败只降级成空记录，绝不让客厅起不来。
+      try {
+        visits = await createVisitStore(dir, { log })
+      } catch (error) {
+        visits = null
+        warn(ctx, '串门记录初始化失败，本次只在内存里保留记录：' + message(error))
+      }
+      if (disposed) return
+      room.setVisitRecords(visits?.records() ?? [])
+
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
@@ -150,9 +264,25 @@ export function createService (ctx, options = {}) {
           mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
           onPeer (packet) {
             if (disposed) return
-            // 远端字段到这里只剩两种效果：更新邻居/访客表，让客户端画出来。
-            if (packet.type === 'heartbeat') room.observeHeartbeat(packet)
-            else room.observeBeacon(packet)
+            // 远端字段到这里只剩三种效果：更新邻居/访客/串门表，让客户端画出来，
+            // 以及一次串门完成时写一条有界记录。这里不读本机文件、不回传本机状态。
+            if (packet.type === 'heartbeat') {
+              room.observeHeartbeat(packet)
+            } else if (packet.type === 'visit-request') {
+              handleVisitRequest(packet)
+            } else if (packet.type === 'visit-ack') {
+              const result = room.observeVisitAck(packet)
+              if (result.ok) clearRequest(packet.visitId)
+            } else if (packet.type === 'visit-deny') {
+              const result = room.observeVisitDeny(packet)
+              if (result.ok) clearRequest(packet.visitId)
+            } else if (packet.type === 'visit-recall') {
+              const result = room.observeVisitRecall(packet)
+              if (result.ok) clearRequest(packet.visitId)
+            } else {
+              room.observeBeacon(packet)
+            }
+            flushRoomEffects()
           },
           log
         })
@@ -188,13 +318,17 @@ export function createService (ctx, options = {}) {
 
       if (!disposed && options.network !== false) {
         startNeighborTick()
+        startVisitTimer()
       }
     } catch (error) {
       if (disposed) return
       warn(ctx, '启动失败，客厅会降级：' + message(error))
       room.setBridge({ ok: false, reason: 'error' })
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
-      if (options.network !== false) startNeighborTick()
+      if (options.network !== false) {
+        startNeighborTick()
+        startVisitTimer()
+      }
     }
   }
 
@@ -247,8 +381,137 @@ export function createService (ctx, options = {}) {
 
   function startNeighborTick () {
     if (tickTimer !== null || disposed) return
-    tickTimer = setInterval(() => room.tick(), NEIGHBOR_TICK_MS)
+    const interval = positiveOption(options.tickIntervalMs, NEIGHBOR_TICK_MS, 10)
+    tickTimer = setInterval(() => {
+      room.tick()
+      // tick 可能让一次串门到期：记录交给 visits.json，recall 交给 socket。
+      flushRoomEffects()
+    }, interval)
     tickTimer.unref?.()
+  }
+
+  function startVisitTimer () {
+    if (visitTimer !== null || disposed || discovery === null) return
+    visitTimer = setInterval(runVisitTimers, visitTickMs)
+    visitTimer.unref?.()
+  }
+
+  /**
+   * 串门请求的重试与超时。只在“请求中”阶段工作：
+   * 首次发送后约 600ms / 1200ms 各补发一次；约 1800ms 还没 ack 就明确超时。
+   * ack/deny/recall/本地召回都会把 request 清掉，不会在已经抵达后继续重发。
+   */
+  function runVisitTimers () {
+    if (disposed) return
+    if (request !== null) {
+      const out = room.outboundVisit()
+      if (out === null || out.visitId !== request.visitId || out.phase !== 'requesting') {
+        request = null
+      } else {
+        const now = Date.now()
+        if (now >= request.deadline) {
+          room.failOutboundVisit('timeout', now)
+          request = null
+        } else {
+          while (request.attempts < visitAttempts && now >= request.nextAt) {
+            sendVisitRequest(request.visitId)
+            request.attempts += 1
+            request.nextAt += visitRetryMs
+          }
+        }
+      }
+    }
+    flushRoomEffects()
+  }
+
+  function clearRequest (visitId) {
+    if (request !== null && request.visitId === visitId) request = null
+  }
+
+  /**
+   * 发一次 visit-request。只走 discovery.sendTo()：先过 mayTalkTo，
+   * 再按 deviceId 查地址；没地址（刚离线）返回 false，由调用方明确报 peer-offline。
+   */
+  function sendVisitRequest (visitId) {
+    if (disposed || discovery === null || identity === null) return false
+    const out = room.outboundVisit()
+    if (out === null || out.visitId !== visitId) return false
+    let data
+    try {
+      data = encodeVisitRequest({
+        deviceId: identity.deviceId,
+        visitId,
+        nickname: identity.nickname,
+        anim: room.snapshot().self.pet?.anim ?? null
+      })
+    } catch {
+      return false
+    }
+    try {
+      return discovery.sendTo(out.deviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  /** 收到请求：放行 → ack；未放行 → deny（走 sendReply 例外，明确可读）。 */
+  function handleVisitRequest (packet) {
+    const result = room.observeVisitRequest(packet)
+    if (result.reply === 'ack') sendVisitAck(result.deviceId, result.visitId)
+    else if (result.reply === 'deny') sendVisitDeny(result.deviceId, result.visitId)
+  }
+
+  function sendVisitAck (deviceId, visitId) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendTo(deviceId, encodeVisitAck({ deviceId: identity.deviceId, visitId }))
+    } catch {
+      return false
+    }
+  }
+
+  function sendVisitDeny (deviceId, visitId) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendReply(deviceId, encodeVisitDeny({ deviceId: identity.deviceId, visitId }))
+    } catch {
+      return false
+    }
+  }
+
+  function sendVisitRecall (deviceId, visitId) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendTo(deviceId, encodeVisitRecall({ deviceId: identity.deviceId, visitId }))
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 把 room 里完成但未落盘的串门记录交给 visits.json，并补发待发的 recall。
+   * 记录失败只影响历史，不回滚客厅状态；这是 ticket 06 的“记录不能拖垮串门”。
+   */
+  function flushRoomEffects () {
+    const records = room.drainVisitRecords()
+    if (visits !== null) {
+      for (const record of records) {
+        try {
+          const pending = visits.append(record)
+          if (pending !== null && typeof pending?.catch === 'function') pending.catch(() => {})
+        } catch {
+          // 磁盘坏掉只丢这一条历史，不抛到 socket/tick 循环里
+        }
+      }
+    }
+    for (const recall of room.drainVisitRecalls()) {
+      try {
+        sendVisitRecall(recall.deviceId, recall.visitId)
+      } catch {
+        // 对方已经离线：它自己的 TTL 会清理
+      }
+    }
+    return records.length
   }
 
   const ready = start()
@@ -262,10 +525,14 @@ export function createService (ctx, options = {}) {
     /** ticket 04 的窄口：地址只从这里出，单播只从这里发（内部先过 mayTalkTo）。 */
     addressOf: (deviceId) => discovery?.addressOf(deviceId) ?? null,
     sendTo: (deviceId, data) => discovery?.sendTo(deviceId, data) ?? false,
+    /** 应用层唯一例外（发现层的 beacon 回执另算）：只给 visit-deny 用，内部限速。 */
+    replyTo: (deviceId, data) => discovery?.sendReply(deviceId, data) ?? false,
     /** 手动补发一轮心跳（测试与 ticket 05 的“立刻让对方看见我”可复用）。 */
     sendHeartbeats,
     dispose () {
       if (disposed) return
+      // 卸载前把已经完成的记录尽量落盘；recall 发不出去也无妨，对方会自己到期。
+      flushRoomEffects()
       disposed = true
       if (tickTimer !== null) {
         clearInterval(tickTimer)
@@ -275,6 +542,11 @@ export function createService (ctx, options = {}) {
         clearInterval(heartbeatTimer)
         heartbeatTimer = null
       }
+      if (visitTimer !== null) {
+        clearInterval(visitTimer)
+        visitTimer = null
+      }
+      request = null
       discovery?.dispose()
       discovery = null
       bridge?.dispose()
@@ -387,4 +659,15 @@ function readJson (req, limit) {
 
 function message (error) {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** 测试注入用：非数字/小于下限时静默回落到默认值，坏配置不能把计时器拖死。 */
+function positiveOption (value, fallback, min = 1) {
+  const num = Number(value)
+  return Number.isFinite(num) && num >= min ? num : fallback
+}
+
+function integerOption (value, fallback, min, max) {
+  const num = Number(value)
+  return Number.isInteger(num) && num >= min && num <= max ? num : fallback
 }
