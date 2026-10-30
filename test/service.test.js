@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { hostname, tmpdir } from 'node:os'
@@ -6,6 +7,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { IDENTITY_FILE, defaultNickname } from '../src/identity.js'
+import { PEERS_FILE } from '../src/peers.js'
 import { isDeviceId, normalizeNickname } from '../src/protocol.js'
 import { createService } from '../src/service.js'
 
@@ -230,4 +232,166 @@ test('重复 dispose 安全；快照在卸载后仍然可读', async (t) => {
   service.dispose()
   assert.equal(service.snapshot().version, 1)
   assert.equal(normalizeNickname(service.snapshot().self.nickname) !== null, true)
+})
+
+test('第一次见面放行/拒绝都落盘；重启后不再询问', async (t) => {
+  const dir = await tempDir(t)
+  const allowedId = randomUUID()
+  const deniedId = randomUUID()
+  const now = Date.now()
+
+  const first = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await first.ready
+
+  first.room.observeBeacon({ deviceId: allowedId, nickname: '甲', port: 40001 }, now)
+  first.room.observeBeacon({ deviceId: deniedId, nickname: '乙', port: 40002 }, now)
+  assert.deepEqual(first.snapshot().prompt, { deviceId: allowedId, nickname: '甲' })
+  assert.equal(first.mayTalkTo(allowedId), false)
+  assert.equal(first.mayTalkTo(deniedId), false)
+
+  const admitted = await call(first, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'admit', deviceId: allowedId }
+  })
+  assert.equal(admitted.status, 200)
+  assert.equal(admitted.body.ok, true)
+  assert.equal(admitted.body.action, 'admit')
+  assert.equal(admitted.body.status, 'allowed')
+  assert.equal(admitted.body.nickname, '甲')
+  assert.equal(admitted.body.persisted, true)
+  assert.equal(first.mayTalkTo(allowedId), true)
+  assert.deepEqual(first.snapshot().prompt, { deviceId: deniedId, nickname: '乙' })
+
+  const rejected = await call(first, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'reject', deviceId: deniedId }
+  })
+  assert.equal(rejected.status, 200)
+  assert.equal(rejected.body.status, 'denied')
+  assert.equal(rejected.body.persisted, true)
+  assert.equal(first.mayTalkTo(deniedId), false)
+  assert.equal(first.snapshot().prompt, null)
+
+  const raw = JSON.parse(await readFile(join(dir, PEERS_FILE), 'utf8'))
+  assert.deepEqual(Object.keys(raw.allowed), [allowedId])
+  assert.equal(raw.allowed[allowedId].nickname, '甲')
+  assert.equal(Number.isFinite(raw.allowed[allowedId].allowedAt), true)
+  assert.deepEqual(Object.keys(raw.denied), [deniedId])
+  assert.equal(raw.denied[deniedId].nickname, '乙')
+  assert.equal(Number.isFinite(raw.denied[deniedId].deniedAt), true)
+
+  first.dispose()
+
+  const second = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await second.ready
+  second.room.observeBeacon({ deviceId: allowedId, nickname: '甲', port: 40001 }, Date.now())
+  second.room.observeBeacon({ deviceId: deniedId, nickname: '乙', port: 40002 }, Date.now())
+
+  const neighbors = second.snapshot().neighbors
+  assert.deepEqual(neighbors.map((neighbor) => [neighbor.deviceId, neighbor.status]), [
+    [allowedId, 'allowed'],
+    [deniedId, 'denied']
+  ])
+  assert.equal(second.snapshot().prompt, null)
+  assert.equal(second.mayTalkTo(allowedId), true)
+  assert.equal(second.mayTalkTo(deniedId), false)
+
+  const state = await call(second, '/local-pet/state')
+  assert.equal(state.status, 200)
+  assert.deepEqual(state.body.neighbors.map((neighbor) => neighbor.status), ['allowed', 'denied'])
+  assert.equal(state.body.prompt, null)
+  // 地址永远不进口径：快照里没有任何邻居地址字段。
+  assert.equal(JSON.stringify(state.body).includes('127.0.0.1'), false)
+})
+
+test('dismiss action 只让队列前进，不改变信任', async (t) => {
+  const dir = await tempDir(t)
+  const firstId = randomUUID()
+  const secondId = randomUUID()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+
+  const now = Date.now()
+  service.room.observeBeacon({ deviceId: firstId, nickname: '甲', port: 40001 }, now)
+  service.room.observeBeacon({ deviceId: secondId, nickname: '乙', port: 40002 }, now)
+  assert.deepEqual(service.snapshot().prompt, { deviceId: firstId, nickname: '甲' })
+
+  const dismissed = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'dismiss', deviceId: firstId }
+  })
+  assert.equal(dismissed.status, 200)
+  assert.equal(dismissed.body.ok, true)
+  assert.deepEqual(dismissed.body.prompt, { deviceId: secondId, nickname: '乙' })
+  assert.deepEqual(service.snapshot().prompt, { deviceId: secondId, nickname: '乙' })
+  assert.equal(service.mayTalkTo(firstId), false)
+  assert.deepEqual(service.snapshot().neighbors.map((neighbor) => neighbor.status), [
+    'pending',
+    'pending'
+  ])
+
+  const state = await call(service, '/local-pet/state')
+  assert.deepEqual(state.body.prompt, { deviceId: secondId, nickname: '乙' })
+})
+
+test('坏的 deviceId / 未知邻居明确失败，不留下半截状态', async (t) => {
+  const dir = await tempDir(t)
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+
+  const bad = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'admit', deviceId: 'not-a-uuid' }
+  })
+  assert.equal(bad.status, 409)
+  assert.deepEqual(bad.body, { ok: false, error: 'bad-device-id' })
+
+  const unknown = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'reject', deviceId: randomUUID() }
+  })
+  assert.equal(unknown.status, 409)
+  assert.deepEqual(unknown.body, { ok: false, error: 'unknown-neighbor' })
+
+  const badDismiss = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'dismiss', deviceId: randomUUID() }
+  })
+  assert.equal(badDismiss.status, 409)
+  assert.deepEqual(badDismiss.body, { ok: false, error: 'not-prompt' })
+})
+
+test('损坏的 peers.json 不影响启动，第一次放行仍然可用', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, PEERS_FILE), '{ oops', 'utf8')
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+
+  assert.ok(service.warnings.some((line) => /放行名单/.test(line)))
+
+  const deviceId = randomUUID()
+  service.room.observeBeacon({ deviceId, nickname: '甲', port: 40001 }, Date.now())
+  assert.deepEqual(service.snapshot().prompt, { deviceId, nickname: '甲' })
+  const admitted = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'admit', deviceId }
+  })
+  assert.equal(admitted.status, 200)
+  assert.equal(admitted.body.persisted, true)
+  assert.deepEqual(JSON.parse(await readFile(join(dir, PEERS_FILE), 'utf8')).allowed[deviceId].nickname, '甲')
 })

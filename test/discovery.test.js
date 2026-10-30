@@ -4,7 +4,12 @@ import dgram from 'node:dgram'
 import test from 'node:test'
 
 import { createDiscovery } from '../src/discovery.js'
-import { DEFAULT_PORT, PROTOCOL_VERSION, parsePacket } from '../src/protocol.js'
+import {
+  DEFAULT_PORT,
+  MAX_PACKET_BYTES,
+  PROTOCOL_VERSION,
+  parsePacket
+} from '../src/protocol.js'
 import { createRoom } from '../src/room.js'
 
 function delay (ms) {
@@ -149,6 +154,13 @@ test('发现服务在回环上广播、记录邻居并单播回执；敌意包�
   assert.equal(neighbor.status, 'pending')
   assert.equal(neighbor.port, peerPort)
 
+  // 地址只留在发现层，通过窄查询取；快照里没有地址。
+  assert.deepEqual(discovery.addressOf(neighborId), { address: '127.0.0.1', port: peerPort })
+  assert.equal(discovery.addressOf(identity.deviceId), null)
+  assert.equal(discovery.addressOf(randomUUID()), null)
+  assert.equal(discovery.addressOf(null), null)
+  assert.equal(JSON.stringify(room.snapshot()).includes('127.0.0.1'), false)
+
   // 版本不匹配：不产生邻居，只记一条日志。
   peer.send(beaconPayload({ v: 2 }), myPort, '127.0.0.1')
   await delay(40)
@@ -166,6 +178,22 @@ test('发现服务在回环上广播、记录邻居并单播回执；敌意包�
   peer.send(beaconPayload({ deviceId: identity.deviceId, nickname: '冒名' }), myPort, '127.0.0.1')
   await delay(60)
   assert.equal(room.snapshot().neighbors.length, 1)
+
+  // 合法报文每次都会刷新地址；服务端口以报文里的 port 为准。
+  const refreshedPort = peerPort >= 65535 ? 65534 : peerPort + 1
+  peer.send(beaconPayload({
+    deviceId: neighborId,
+    nickname: '乙',
+    port: refreshedPort
+  }), myPort, '127.0.0.1')
+  await waitFor(() => room.snapshot().neighbors[0].port === refreshedPort)
+  assert.deepEqual(discovery.addressOf(neighborId), {
+    address: '127.0.0.1',
+    port: refreshedPort
+  })
+
+  discovery.dispose()
+  assert.equal(discovery.addressOf(neighborId), null)
 })
 
 test('两个发现实例在回环上互相看见，不需要知道对方地址', async (t) => {
@@ -251,4 +279,57 @@ test('同一个来源在回执窗口内只回执一次，但邻居仍会刷新',
   )
   await waitFor(() => room.snapshot().neighbors[0].nickname === '乙改名')
   assert.ok(room.snapshot().neighbors[0].lastSeen >= firstSeen)
+})
+
+test('单播出口先过放行门控，再按 deviceId 找地址', async (t) => {
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.address().port
+  const box = inbox(peer)
+  const room = createRoom()
+  const identity = { deviceId: randomUUID(), nickname: '甲' }
+  const discovery = createDiscovery({
+    identity,
+    port: 0,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
+    onPeer: (packet) => room.observeBeacon(packet),
+    log: { warn () {} }
+  })
+  t.after(() => discovery.dispose())
+
+  await discovery.start()
+  const myPort = discovery.address().port
+  await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon')
+
+  const neighborId = randomUUID()
+  peer.send(beaconPayload({
+    deviceId: neighborId,
+    nickname: '乙',
+    port: peerPort
+  }), myPort, '127.0.0.1')
+  await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon-ack')
+  await waitFor(() => room.snapshot().neighbors.length === 1)
+
+  const payload = Buffer.from('local-pet-heartbeat', 'utf8')
+  assert.equal(room.mayTalkTo(neighborId), false)
+  assert.equal(discovery.sendTo(neighborId, payload), false)
+  await assert.rejects(
+    box.next((entry) => entry.message.equals(payload), 200),
+    /timeout/
+  )
+
+  room.admit(neighborId)
+  assert.equal(room.mayTalkTo(neighborId), true)
+  assert.equal(discovery.sendTo(neighborId, payload), true)
+  const delivered = await box.next((entry) => entry.message.equals(payload))
+  assert.equal(delivered.rinfo.address, '127.0.0.1')
+
+  // 已放行但没地址 / 非法载荷 / 未知邻居都不会发包。
+  assert.equal(discovery.sendTo(randomUUID(), payload), false)
+  assert.equal(discovery.sendTo(neighborId, 'not-a-buffer'), false)
+  assert.equal(discovery.sendTo(neighborId, Buffer.alloc(0)), false)
+  assert.equal(discovery.sendTo(neighborId, Buffer.alloc(MAX_PACKET_BYTES + 1)), false)
 })

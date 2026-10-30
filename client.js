@@ -20,6 +20,16 @@
 .dsh-lp-media{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-name{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px/1.2 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:auto;cursor:default}
 .dsh-lp-note{max-width:260px;padding:6px 10px;border-radius:10px;background:rgba(0,0,0,.06);font:12px/1.45 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none}
+.dsh-lp-prompt{position:absolute;right:150px;bottom:22px;width:min(220px,calc(100vw - 180px));box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.86);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.28);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
+.dsh-lp-prompt-title{display:flex;flex-wrap:wrap;gap:4px;margin:0 20px 8px 0;overflow-wrap:anywhere}
+.dsh-lp-prompt-name{font-weight:600;color:#fff}
+.dsh-lp-prompt-actions{display:flex;gap:8px}
+.dsh-lp-prompt-btn{flex:1 1 auto;padding:6px 8px;border:0;border-radius:9px;background:rgba(255,255,255,.14);color:#eaf1fb;font:12px/1.2 system-ui,sans-serif;cursor:pointer}
+.dsh-lp-prompt-btn[data-kind="accept"]{background:#3b74d8;color:#fff}
+.dsh-lp-prompt-btn:disabled{opacity:.55;cursor:default}
+.dsh-lp-prompt-close{position:absolute;top:4px;right:6px;width:20px;height:20px;padding:0;border:0;border-radius:6px;background:transparent;color:rgba(234,241,251,.7);font:14px/20px system-ui,sans-serif;cursor:pointer}
+.dsh-lp-prompt-close:hover{background:rgba(255,255,255,.12);color:#fff}
+.dsh-lp-prompt-error{margin-top:6px;color:#ffb4a8;font-size:11px}
 .dsh-lp-lights{position:absolute;right:18px;bottom:146px;display:flex;flex-wrap:wrap;justify-content:flex-end;gap:6px;max-width:min(48vw,420px);pointer-events:none}
 .dsh-lp-light{display:flex;align-items:center;gap:6px;max-width:132px;padding:4px 8px;border-radius:999px;background:rgba(20,26,34,.58);color:#eaf1fb;font:11px/1.2 system-ui,sans-serif;box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:none;transition:opacity .8s linear}
 .dsh-lp-light-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -91,6 +101,13 @@
           // 孤立代理项等非法字符串不能把 render 弄崩
           return null
         }
+      }
+
+      function readPrompt (value) {
+        if (value === null || typeof value !== 'object') return null
+        const deviceId = safeText(value.deviceId, 64)
+        if (deviceId === '') return null
+        return { deviceId, nickname: safeText(value.nickname, 32) || '邻居' }
       }
 
       function PetBlob ({ label }) {
@@ -182,6 +199,8 @@
         const visible = []
         for (const neighbor of neighbors) {
           if (neighbor === null || typeof neighbor !== 'object') continue
+          // 拒绝过的邻居不再出现在客厅里（包括灯）；放行之前仍然要看得见。
+          if (neighbor.status === 'denied') continue
           const deviceId = safeText(neighbor.deviceId, 64)
           if (deviceId === '') continue
           const nickname = safeText(neighbor.nickname, 32) || '邻居'
@@ -212,6 +231,84 @@
             : null)
       }
 
+      function PromptCard ({ prompt }) {
+        const [busy, setBusy] = React.useState(false)
+        const [hidden, setHidden] = React.useState(false)
+        const [failed, setFailed] = React.useState(false)
+
+        if (prompt === null || hidden) return null
+
+        const post = (action) => fetch(ACTION_URL, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action, deviceId: prompt.deviceId })
+        })
+
+        const decide = async (action) => {
+          if (busy) return
+          setBusy(true)
+          setFailed(false)
+          try {
+            const res = await post(action)
+            if (!res.ok) throw new Error('refused')
+            setHidden(true)
+          } catch {
+            setFailed(true)
+          } finally {
+            setBusy(false)
+          }
+        }
+
+        const dismiss = () => {
+          setHidden(true)
+          try {
+            post('dismiss')
+              .then((res) => {
+                // 宿主没接住（例如这一位刚好消失）就把卡片放回来，别假装已经收起。
+                if (!res.ok) setHidden(false)
+              })
+              .catch(() => setHidden(false))
+          } catch {
+            // fetch 不可用：本机先收起，不改任何信任状态
+          }
+        }
+
+        return h('div', {
+          className: 'dsh-lp-prompt',
+          role: 'dialog',
+          'aria-label': '放行邻居'
+        },
+        h('button', {
+          type: 'button',
+          className: 'dsh-lp-prompt-close',
+          title: '稍后再说',
+          'aria-label': '稍后再说',
+          disabled: busy,
+          onClick: dismiss
+        }, '×'),
+        h('div', { className: 'dsh-lp-prompt-title' },
+          h('span', { className: 'dsh-lp-prompt-name' }, prompt.nickname),
+          h('span', null, '想进来看看')),
+        h('div', { className: 'dsh-lp-prompt-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dsh-lp-prompt-btn',
+            'data-kind': 'accept',
+            disabled: busy,
+            onClick: () => decide('admit')
+          }, '接受'),
+          h('button', {
+            type: 'button',
+            className: 'dsh-lp-prompt-btn',
+            'data-kind': 'reject',
+            disabled: busy,
+            onClick: () => decide('reject')
+          }, '拒绝')),
+        failed
+          ? h('div', { className: 'dsh-lp-prompt-error', role: 'status' }, '没成功，再试一次')
+          : null)
+      }
+
       function Room () {
         const snap = useSnapshot()
         const now = useNow(1000)
@@ -223,6 +320,7 @@
         const nickname = safeText(self.nickname, 32) || '我'
         const label = (pet !== null ? safeText(pet.name, 64) : '') || nickname
         const neighbors = Array.isArray(snap.neighbors) ? snap.neighbors : []
+        const prompt = readPrompt(snap.prompt)
 
         const rename = async () => {
           if (typeof window === 'undefined' || typeof window.prompt !== 'function') return
@@ -248,6 +346,7 @@
 
         return h('div', { className: 'dsh-lp-root' },
           h(LightStrip, { neighbors, now }),
+          prompt !== null ? h(PromptCard, { key: prompt.deviceId, prompt }) : null,
           h('div', { className: 'dsh-lp-room' },
             pet !== null
               ? h('div', { className: 'dsh-lp-pet', 'data-testid': 'local-pet' },
