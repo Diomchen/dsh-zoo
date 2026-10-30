@@ -5,7 +5,13 @@ import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
-import { isDeviceId, normalizeNickname, resolvePort } from './protocol.js'
+import {
+  HEARTBEAT_INTERVAL_MS,
+  encodeHeartbeat,
+  isDeviceId,
+  normalizeNickname,
+  resolvePort
+} from './protocol.js'
 import { createRoom } from './room.js'
 
 export const ROUTE_PREFIX = '/local-pet'
@@ -36,6 +42,7 @@ export function createService (ctx, options = {}) {
   let peers = null
   let bridge = null
   let tickTimer = null
+  let heartbeatTimer = null
   let disposed = false
 
   disposers.push(register(ctx, {
@@ -78,6 +85,8 @@ export function createService (ctx, options = {}) {
       const persisted = action === 'admit'
         ? await peers.admit({ deviceId, nickname: decision.nickname, at: decision.at })
         : await peers.reject({ deviceId, nickname: decision.nickname, at: decision.at })
+      // 放行后立刻补一发心跳：对方不用等满 2 秒才第一次看见我。
+      if (action === 'admit') sendHeartbeats()
       return {
         ok: true,
         action,
@@ -132,11 +141,18 @@ export function createService (ctx, options = {}) {
         discovery = createDiscovery({
           identity,
           port,
-          // 出站单播（ticket 04 的心跳）在发现层里也只走这一个门控。
+          // 下面几项只为测试注入：回环上跑两个实例，不依赖真实广播域。
+          targetPort: options.targetPort,
+          bindAddress: options.bindAddress,
+          broadcastAddress: options.broadcastAddress,
+          beaconIntervalMs: options.beaconIntervalMs,
+          // 出站单播（心跳/串门）在发现层里也只走这一个门控。
           mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
           onPeer (packet) {
-            // 远端字段到这里只剩：更新邻居表、让客户端画一盏灯。
-            if (!disposed) room.observeBeacon(packet)
+            if (disposed) return
+            // 远端字段到这里只剩两种效果：更新邻居/访客表，让客户端画出来。
+            if (packet.type === 'heartbeat') room.observeHeartbeat(packet)
+            else room.observeBeacon(packet)
           },
           log
         })
@@ -150,6 +166,7 @@ export function createService (ctx, options = {}) {
         }
       }
       if (disposed) return
+      startHeartbeat()
 
       if (options.petBridge !== false) {
         bridge = createPetBridge({
@@ -160,6 +177,9 @@ export function createService (ctx, options = {}) {
             if (disposed) return
             room.setSelfPet(result.pet)
             room.setBridge(result.bridge)
+            // 动作变了就立刻补发心跳，不等下一次 2 秒节拍：
+            // 对方客厅里的访客因此能尽快跟着换动作。
+            sendHeartbeats()
           }
         })
         // 首轮失败不会 reject；它只是把 room 降级成一行说明。
@@ -176,6 +196,53 @@ export function createService (ctx, options = {}) {
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
       if (options.network !== false) startNeighborTick()
     }
+  }
+
+  /**
+   * 心跳只承载本机宠物的当前动作名。编码器按类型只写
+   * `{ v, type, deviceId, anim }`，昵称、端口、坐标都没有入口。
+   */
+  function heartbeatData () {
+    if (identity === null) return null
+    const anim = room.snapshot().self.pet?.anim ?? null
+    try {
+      return encodeHeartbeat({ deviceId: identity.deviceId, anim })
+    } catch {
+      // 本机身份坏了只停心跳，不影响邻居灯和本地影子。
+      return null
+    }
+  }
+
+  /**
+   * 向所有已放行的邻居发一次心跳。返回实际交给 socket 的条数。
+   * discovery.sendTo 会再过一遍 mayTalkTo 和地址表，所以未放行/没地址的
+   * 邻居在这一层不会被发到。
+   */
+  function sendHeartbeats () {
+    if (disposed || discovery === null) return 0
+    const data = heartbeatData()
+    if (data === null) return 0
+    let sent = 0
+    for (const deviceId of room.heartbeatTargets()) {
+      try {
+        if (discovery.sendTo(deviceId, data)) sent += 1
+      } catch {
+        // 一个坏地址不能挡住其他邻居的心跳
+      }
+    }
+    return sent
+  }
+
+  function startHeartbeat () {
+    if (heartbeatTimer !== null || disposed || discovery === null) return
+    const configured = options.heartbeatIntervalMs
+    const interval = Number.isFinite(configured) && configured >= 100
+      ? configured
+      : HEARTBEAT_INTERVAL_MS
+    // 启动时先发一轮；此时通常还没有 allowed 邻居，不产生任何包。
+    sendHeartbeats()
+    heartbeatTimer = setInterval(sendHeartbeats, interval)
+    heartbeatTimer.unref?.()
   }
 
   function startNeighborTick () {
@@ -195,12 +262,18 @@ export function createService (ctx, options = {}) {
     /** ticket 04 的窄口：地址只从这里出，单播只从这里发（内部先过 mayTalkTo）。 */
     addressOf: (deviceId) => discovery?.addressOf(deviceId) ?? null,
     sendTo: (deviceId, data) => discovery?.sendTo(deviceId, data) ?? false,
+    /** 手动补发一轮心跳（测试与 ticket 05 的“立刻让对方看见我”可复用）。 */
+    sendHeartbeats,
     dispose () {
       if (disposed) return
       disposed = true
       if (tickTimer !== null) {
         clearInterval(tickTimer)
         tickTimer = null
+      }
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer)
+        heartbeatTimer = null
       }
       discovery?.dispose()
       discovery = null

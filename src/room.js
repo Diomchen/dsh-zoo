@@ -1,9 +1,11 @@
 import {
+  GUEST_TTL_MS,
   MAX_LABEL,
   MAX_NEIGHBORS,
   NEIGHBOR_TTL_MS,
   isPort,
   isSafeAnimationName,
+  normalizeAnimation,
   normalizeNickname,
   sanitizeLabel
 } from './protocol.js'
@@ -39,9 +41,17 @@ import {
  * - dismissPrompt() 只让队列前进，并让该邻居安静 PROMPT_SNOOZE_MS，不改变信任。
  * - mayTalkTo(deviceId) 是心跳与串门请求的**唯一**门控：只有 allowed 为真。
  * - 邻居的 IP 地址不在这里，也不在快照里；见 discovery.addressOf()。
+ *
+ * ticket 04（访客）的边界：
+ * - 只有 mayTalkTo 为真的邻居心跳才会创建/刷新 guests；pending/denied 的心跳只被丢弃。
+ * - 访客 30 秒没有心跳由 tick() 清掉；被拒绝或邻居从邻居表移除时立刻清掉。
+ * - 访客表上限 MAX_GUESTS，超出时挤掉最久没有心跳的那位（新来的留下）。
+ * - 心跳只带 anim；访客昵称来自邻居表或放行名单，绝不来自心跳。
  */
 
 export const MAX_PROMPTS = 8
+/** 同时出现在客厅里的访客上限；其余由客户端折进灯条的 +N。 */
+export const MAX_GUESTS = 8
 /** 点“稍后再说”后，同一位邻居至少安静这么久再问（它消失后重新出现则立刻重问）。 */
 export const PROMPT_SNOOZE_MS = 10 * 60 * 1000
 
@@ -109,6 +119,27 @@ export function createRoom ({ dir, log, clock = () => Date.now() } = {}) {
     return null
   }
 
+  /** 唯一的出站/入站门控：本机放行、未被拒绝、且不是自己。 */
+  function canTalkTo (rawDeviceId) {
+    const deviceId = normalizeDeviceId(rawDeviceId)
+    if (deviceId === null) return false
+    if (state.self.deviceId !== null && deviceId === state.self.deviceId) return false
+    return state.trust.allowed.has(deviceId) && !state.trust.denied.has(deviceId)
+  }
+
+  /** 访客表满了：挤掉最久没有心跳的那位；新来的留在表里。 */
+  function evictStalestGuest () {
+    let oldestId
+    let oldestAt = Infinity
+    for (const [deviceId, guest] of state.guests) {
+      if (guest.lastSeen < oldestAt) {
+        oldestAt = guest.lastSeen
+        oldestId = deviceId
+      }
+    }
+    if (oldestId !== undefined) state.guests.delete(oldestId)
+  }
+
   /** 本地决定：只改内存，返回给 service 落盘的东西。 */
   function decide (rawDeviceId, status) {
     const deviceId = normalizeDeviceId(rawDeviceId)
@@ -129,6 +160,8 @@ export function createRoom ({ dir, log, clock = () => Date.now() } = {}) {
     removePrompt(deviceId)
     state.snoozed.delete(deviceId)
     if (neighbor !== undefined) neighbor.status = status
+    // 拒绝是即时的：不用等 30 秒 TTL，那位访客现在就离开客厅。
+    if (status === 'denied') state.guests.delete(deviceId)
 
     return {
       ok: true,
@@ -150,7 +183,12 @@ export function createRoom ({ dir, log, clock = () => Date.now() } = {}) {
           bridge: { ...state.self.bridge }
         },
         neighbors: [...state.neighbors.values()].map((neighbor) => ({ ...neighbor })),
-        guests: [...state.guests.values()].map((guest) => ({ ...guest })),
+        guests: [...state.guests.values()].map((guest) => ({
+          deviceId: guest.deviceId,
+          nickname: guest.nickname,
+          anim: guest.anim,
+          since: guest.since
+        })),
         visits: state.visits.slice(0, 5),
         prompt: currentPrompt(),
         notices: state.notices.slice(0, 3)
@@ -223,6 +261,10 @@ export function createRoom ({ dir, log, clock = () => Date.now() } = {}) {
           enqueuePrompt(deviceId)
         }
       }
+      // 手改名单收紧后，已经不在 allowed 里的访客立即离开客厅。
+      for (const deviceId of state.guests.keys()) {
+        if (!allowed.has(deviceId) || denied.has(deviceId)) state.guests.delete(deviceId)
+      }
       purgePrompts()
     },
 
@@ -261,6 +303,39 @@ export function createRoom ({ dir, log, clock = () => Date.now() } = {}) {
     },
 
     /**
+     * 收到一条通过协议校验的邻居心跳。心跳只带 anim；昵称从邻居表或放行名单取，
+     * 所以远端无法用心跳改名字、改信任或改本地影子。
+     *
+     * 未放行/已拒绝/自己的心跳直接丢弃。放行的心跳创建或刷新访客，
+     * 同时刷新邻居的 lastSeen（心跳也证明它还活着）。返回是否被接受。
+     */
+    observeHeartbeat (peer, at = clock()) {
+      if (peer === null || typeof peer !== 'object') return false
+      const deviceId = normalizeDeviceId(peer.deviceId)
+      if (deviceId === null || !canTalkTo(deviceId)) return false
+
+      const neighbor = state.neighbors.get(deviceId)
+      const nickname = normalizeNickname(neighbor?.nickname ?? state.trust.allowed.get(deviceId))
+      if (nickname === null) return false
+      const anim = normalizeAnimation(peer.anim)
+      const lastSeen = Number.isFinite(at) ? at : clock()
+
+      const existing = state.guests.get(deviceId)
+      if (existing !== undefined) {
+        existing.nickname = nickname
+        existing.anim = anim
+        existing.lastSeen = lastSeen
+      } else {
+        if (state.guests.size >= MAX_GUESTS) evictStalestGuest()
+        state.guests.set(deviceId, { deviceId, nickname, anim, since: lastSeen, lastSeen })
+      }
+
+      // 心跳证明这位邻居还在线：邻居灯不用等下一次 5 秒广播才续命。
+      if (neighbor !== undefined && lastSeen > neighbor.lastSeen) neighbor.lastSeen = lastSeen
+      return true
+    },
+
+    /**
      * 本地接受/拒绝。只改内存并返回一条决定；service 拿它去写 peers.json。
      * 只按 deviceId 认，不看 IP；拒绝会覆盖之前的放行，反之亦然。
      */
@@ -287,22 +362,32 @@ export function createRoom ({ dir, log, clock = () => Date.now() } = {}) {
      * ticket 04 的心跳发送必须调用它；本文件不实现心跳。
      */
     mayTalkTo (deviceId) {
-      const id = normalizeDeviceId(deviceId)
-      if (id === null) return false
-      if (state.self.deviceId !== null && id === state.self.deviceId) return false
-      return state.trust.allowed.has(id) && !state.trust.denied.has(id)
+      return canTalkTo(deviceId)
     },
 
     /**
-     * 30 秒没有新报文的邻居直接消失（灯和名字一起）。
-     * 由 host 每秒喂一次；ticket 04 的访客淡出也会复用这条时间线。
+     * 心跳收件人：放行名单里的所有 deviceId。地址不在这一层，
+     * discovery.sendTo() 会再查一次地址并把没有地址的（还没发现/已离线）静默丢掉。
+     */
+    heartbeatTargets () {
+      return [...state.trust.allowed.keys()].filter((deviceId) => canTalkTo(deviceId))
+    },
+
+    /**
+     * 30 秒没有新报文/心跳的邻居直接消失（灯和名字一起）；访客按自己的
+     * 30 秒心跳 TTL 到期移除，邻居离开时也立刻一起清掉。
+     * 由 host 每秒喂一次。返回被移除的邻居数（访客删除不计数）。
      */
     tick (at = clock()) {
       const now = Number.isFinite(at) ? at : clock()
+      for (const [deviceId, guest] of state.guests) {
+        if (now - guest.lastSeen >= GUEST_TTL_MS) state.guests.delete(deviceId)
+      }
       let removed = 0
       for (const [deviceId, neighbor] of state.neighbors) {
         if (now - neighbor.lastSeen >= NEIGHBOR_TTL_MS) {
           state.neighbors.delete(deviceId)
+          state.guests.delete(deviceId)
           // 这位邻居已经离开：下次再出现时重新询问，不受“稍后再说”影响。
           state.snoozed.delete(deviceId)
           removed += 1

@@ -11,14 +11,18 @@
   const NEIGHBOR_TTL_MS = 30000
   const NEIGHBOR_FADE_MS = 6000
   const MAX_LIGHTS = 6
+  // 同屏最多四位访客；多出来的折进灯条的 +N，不往主界面上铺。
+  const MAX_GUESTS_ON_SCREEN = 4
 
   const STYLE = `
 .dsh-lp-root{position:fixed;inset:0;z-index:40;pointer-events:none;user-select:none;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
-.dsh-lp-room{position:absolute;right:18px;bottom:18px;display:flex;align-items:flex-end;gap:12px;pointer-events:none}
+.dsh-lp-room{position:absolute;right:18px;bottom:18px;display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:flex-end;gap:12px;max-width:min(calc(100vw - 36px),640px);pointer-events:none}
 .dsh-lp-pet{position:relative;width:96px;height:96px;border-radius:18px;background:rgba(120,160,220,.14);pointer-events:auto;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
 .dsh-lp-pet[draggable="true"]{cursor:grab}
 .dsh-lp-media{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-name{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px/1.2 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:auto;cursor:default}
+.dsh-lp-guest{width:84px;height:84px;border-radius:16px;background:rgba(150,190,240,.11)}
+.dsh-lp-name-guest{max-width:96px;pointer-events:none}
 .dsh-lp-note{max-width:260px;padding:6px 10px;border-radius:10px;background:rgba(0,0,0,.06);font:12px/1.45 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none}
 .dsh-lp-prompt{position:absolute;right:150px;bottom:22px;width:min(220px,calc(100vw - 180px));box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.86);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.28);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
 .dsh-lp-prompt-title{display:flex;flex-wrap:wrap;gap:4px;margin:0 20px 8px 0;overflow-wrap:anywhere}
@@ -35,6 +39,7 @@
 .dsh-lp-light-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .dsh-lp-dot{width:6px;height:6px;border-radius:50%;background:#7ee0a3;box-shadow:0 0 6px #7ee0a3;flex:0 0 auto}
 .dsh-lp-light-more{padding:4px 6px;background:transparent;box-shadow:none;color:var(--dsw-alias-text-secondary,#8899aa)}
+@media (max-width:760px){.dsh-lp-pet{width:72px;height:72px}.dsh-lp-guest{width:64px;height:64px}.dsh-lp-name{max-width:96px;font-size:10px}}
 `
 
   window.__ModuleLoader__.load({
@@ -110,6 +115,34 @@
         return { deviceId, nickname: safeText(value.nickname, 32) || '邻居' }
       }
 
+      // 动画名会被拼进 URL：和宿主一样只接受普通名字，坏名字退到待机/色块。
+      function safeAnimName (value) {
+        if (typeof value !== 'string') return null
+        const name = value.trim()
+        if (name === '' || name.length > 64 || name === '.' || name === '..') return null
+        if (/[\\/\u0000-\u001f\u007f]/.test(name)) return null
+        return name
+      }
+
+      // 快照是宿主的契约，但渲染层仍然只读自己认识的字段；重复 deviceId 只画一次。
+      function readGuests (value) {
+        if (!Array.isArray(value)) return []
+        const guests = []
+        const seen = new Set()
+        for (const item of value) {
+          if (item === null || typeof item !== 'object') continue
+          const deviceId = safeText(item.deviceId, 64)
+          if (deviceId === '' || seen.has(deviceId)) continue
+          seen.add(deviceId)
+          guests.push({
+            deviceId,
+            nickname: safeText(item.nickname, 32) || '邻居',
+            anim: safeAnimName(item.anim)
+          })
+        }
+        return guests
+      }
+
       function PetBlob ({ label }) {
         const short = safeText(label, 10) || '宠物'
         return h('svg', {
@@ -138,7 +171,7 @@
       }
 
       function PetMedia ({ pet, label }) {
-        const anim = pet && typeof pet.anim === 'string' ? pet.anim : null
+        const anim = pet ? safeAnimName(pet.anim) : null
         const [idleIndex, setIdleIndex] = React.useState(0)
         const [broken, setBroken] = React.useState(false)
 
@@ -173,6 +206,21 @@
         })
       }
 
+      /**
+       * 访客：和本地宠物共用同一套素材路由，但它是本机自己画的影子。
+       * 没有动作名时轮播 idle；动作名不认识/视频 404 时退到带昵称的色块。
+       */
+      function GuestPet ({ guest }) {
+        return h('div', {
+          className: 'dsh-lp-pet dsh-lp-guest',
+          'data-testid': 'guest-pet',
+          'data-device-id': guest.deviceId,
+          title: guest.nickname
+        },
+        h(PetMedia, { pet: { name: guest.nickname, anim: guest.anim }, label: guest.nickname }),
+        h('span', { className: 'dsh-lp-name dsh-lp-name-guest', title: guest.nickname }, guest.nickname))
+      }
+
       function bridgeText (reason, hasPet) {
         if (reason === 'starting') return '正在找 dsh-pet…'
         if (reason === 'not-installed') {
@@ -195,7 +243,7 @@
         return h('div', { className: 'dsh-lp-note', role: 'status' }, bridgeText(bridge?.reason, pet !== null))
       }
 
-      function LightStrip ({ neighbors, now }) {
+      function LightStrip ({ neighbors, now, extraGuests = 0 }) {
         const visible = []
         for (const neighbor of neighbors) {
           if (neighbor === null || typeof neighbor !== 'object') continue
@@ -213,10 +261,11 @@
           if (opacity <= 0.02) continue
           visible.push({ deviceId, nickname, opacity })
         }
-        if (visible.length === 0) return null
+        // 客厅里最多四位访客，其余折进这里的 +N；没有灯只有多余访客时也要显示。
+        if (visible.length === 0 && extraGuests === 0) return null
 
         const shown = visible.slice(0, MAX_LIGHTS)
-        const extra = visible.length - shown.length
+        const extra = visible.length - shown.length + Math.max(0, extraGuests)
         return h('div', { className: 'dsh-lp-lights', 'aria-label': '邻居' },
           shown.map((neighbor) => h('div', {
             key: neighbor.deviceId,
@@ -320,6 +369,10 @@
         const nickname = safeText(self.nickname, 32) || '我'
         const label = (pet !== null ? safeText(pet.name, 64) : '') || nickname
         const neighbors = Array.isArray(snap.neighbors) ? snap.neighbors : []
+        const guests = readGuests(snap.guests)
+        // 同屏最多四位；剩下的只计数，交给灯条的 +N。
+        const shownGuests = guests.slice(0, MAX_GUESTS_ON_SCREEN)
+        const extraGuests = guests.length - shownGuests.length
         const prompt = readPrompt(snap.prompt)
 
         const rename = async () => {
@@ -345,9 +398,10 @@
         }
 
         return h('div', { className: 'dsh-lp-root' },
-          h(LightStrip, { neighbors, now }),
+          h(LightStrip, { neighbors, now, extraGuests }),
           prompt !== null ? h(PromptCard, { key: prompt.deviceId, prompt }) : null,
           h('div', { className: 'dsh-lp-room' },
+            shownGuests.map((guest) => h(GuestPet, { key: guest.deviceId, guest })),
             pet !== null
               ? h('div', { className: 'dsh-lp-pet', 'data-testid': 'local-pet' },
                 h(PetMedia, { pet, label }),
