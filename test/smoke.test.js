@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import { apply, inject, name } from '../index.js'
@@ -17,14 +20,29 @@ function fakeCtx () {
   }
 }
 
+async function tempDir (t) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-smoke-'))
+  t.after(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    await rm(dir, { recursive: true, force: true })
+  })
+  return dir
+}
+
 test('插件声明了宿主需要的能力', () => {
   assert.equal(name, 'local-pet')
   assert.deepEqual(inject, ['webServer'])
 })
 
-test('挂载后注册了快照接口，且快照形状稳定', async () => {
+test('挂载后注册了快照接口，且快照形状稳定', async (t) => {
+  const dir = await tempDir(t)
   const { ctx, routes } = fakeCtx()
-  apply(ctx)
+  apply(ctx, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    petBridge: false
+  })
 
   const state = routes.find((route) => route.path === '/local-pet/state')
   assert.ok(state, '应该注册 /local-pet/state')
@@ -35,6 +53,8 @@ test('挂载后注册了快照接口，且快照形状稳定', async () => {
   assert.ok(Array.isArray(res.body.neighbors))
   assert.ok(Array.isArray(res.body.guests))
   assert.ok(res.body.self && typeof res.body.self.nickname === 'string')
+  assert.equal(res.body.self.pet, null)
+  assert.ok(res.body.self.bridge)
 })
 
 test('坏掉的 webServer 不会把宿主拖下水', () => {
