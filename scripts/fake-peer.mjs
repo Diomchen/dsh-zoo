@@ -34,7 +34,10 @@ import {
 const args = parseArgs(process.argv.slice(2))
 const port = Number(args.port ?? DEFAULT_PORT + 1)
 const targetPort = Number(args.target ?? DEFAULT_PORT)
-const host = args.host ?? '127.0.0.1'
+// --bind：本机哪张网卡；--to：往哪儿发（默认发给本机回环）。
+// 想让另一台机器上的插件看见你：--bind <本机 LAN IP> --to <本机 LAN 广播地址>
+const bindAddress = args.bind ?? '127.0.0.1'
+const destHost = args.to ?? bindAddress
 
 let nickname = clean(args.name ?? '隔壁的小鲸鱼', 32)
 let anim = args.anim ? clean(args.anim, 64) : null
@@ -64,10 +67,16 @@ socket.on('error', (error) => {
   shutdown(1)
 })
 
-socket.bind(port, host, () => {
-  console.log(`[假邻居] 我是「${nickname}」，在 ${host}:${port} 上听着，去找 ${host}:${targetPort} 的插件。`)
+socket.bind(port, bindAddress, () => {
+  console.log(`[假邻居] 我是「${nickname}」，在 ${bindAddress}:${port} 上听着，去找 ${destHost}:${targetPort} 的插件。`)
   console.log(`[假邻居] 现在去 GUI 客厅：等那盏灯亮，点「接受」，然后 ${nickname} 的宠物就会走进来。`)
   console.log('[假邻居] 键盘：v=让它来串门  a <动画名>=换动作  n <新名字>=改名  q=退出')
+  // 发往广播地址必须先开 SO_BROADCAST，否则 macOS 直接 EACCES，而且错误会被静默吞掉。
+  try {
+    socket.setBroadcast(true)
+  } catch (error) {
+    console.error('[假邻居] 打不开发广播开关：' + error.message)
+  }
   sendBeacon()
   timers.push(setInterval(sendBeacon, BEACON_INTERVAL_MS))
   timers.push(setInterval(sendHeartbeat, HEARTBEAT_INTERVAL_MS))
@@ -124,7 +133,7 @@ function handle (packet, rinfo) {
 function sendBeacon () {
   try {
     const data = encodePacket({ type: 'beacon', deviceId, nickname, port })
-    send(data, host, targetPort)
+    send(data, destHost, targetPort)
   } catch (error) {
     console.error('[假邻居] 广播编码失败：' + error.message)
   }
