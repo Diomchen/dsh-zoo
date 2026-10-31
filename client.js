@@ -28,7 +28,7 @@
 .dsh-lp-pet[draggable="true"]:active{cursor:grabbing}
 .dsh-lp-pet-out{background:rgba(120,160,220,.07);border:1px dashed rgba(136,153,170,.5);flex-direction:column;gap:2px;cursor:pointer}
 .dsh-lp-out-text{font:600 13px/1.3 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa)}
-.dsh-lp-media{width:100%;height:100%;object-fit:contain;display:block;pointer-events:none;color:var(--dsw-alias-text-secondary,#8899aa)}
+.dsh-lp-media{width:100%;height:100%;object-fit:cover;display:block;pointer-events:none;color:var(--dsw-alias-text-secondary,#8899aa)}
 .dsh-lp-name{position:absolute;left:50%;bottom:-17px;transform:translateX(-50%);max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font:11px/1.2 system-ui,sans-serif;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:auto;cursor:default}
 .dsh-lp-guest{width:84px;height:84px;border-radius:16px;background:rgba(150,190,240,.11);transition:opacity .9s linear}
 .dsh-lp-guest-visiting{background:rgba(126,224,163,.13);box-shadow:0 0 0 1px rgba(126,224,163,.28);cursor:pointer}
@@ -53,6 +53,9 @@
 .dsh-lp-light-more{padding:4px 6px;background:transparent;box-shadow:none;color:var(--dsw-alias-text-secondary,#8899aa);pointer-events:none;cursor:default}
 .dsh-lp-door{padding:3px 8px;border:1px solid rgba(136,153,170,.35);border-radius:999px;background:rgba(20,26,34,.5);color:#cfdae8;font:10px/1.4 system-ui,sans-serif;cursor:pointer;pointer-events:auto;transition:background .15s ease,color .15s ease}
 .dsh-lp-door[data-on="false"]{background:rgba(120,40,40,.58);border-color:rgba(255,140,120,.5);color:#ffd9d0}
+.dsh-lp-door::before{content:'●';margin-right:4px;font-size:8px;vertical-align:1px}
+.dsh-lp-door[data-on="true"]::before{color:#7ee0a3}
+.dsh-lp-door[data-on="false"]::before{color:#ff9b86}
 .dsh-lp-door:disabled{opacity:.55;cursor:default}
 .dsh-lp-pop{position:absolute;right:18px;bottom:196px;width:min(200px,calc(100vw - 36px));box-sizing:border-box;padding:10px 12px;border-radius:14px;background:rgba(20,26,34,.9);color:#eaf1fb;box-shadow:0 8px 24px rgba(0,0,0,.3);pointer-events:auto;font:12px/1.4 system-ui,sans-serif}
 .dsh-lp-pop-name{font-weight:600;color:#fff;overflow-wrap:anywhere}
@@ -313,13 +316,20 @@
        */
       function PetMedia ({ pet, label }) {
         const anim = pet ? safeAnimName(pet.anim) : null
-        const [idleIndex, setIdleIndex] = React.useState(0)
+        // 每只从随机一段开始：不然四只同时停在第一段，看起来是复制粘贴的。
+        const [idleIndex, setIdleIndex] = React.useState(() => Math.floor(Math.random() * IDLE_CLIPS.length))
         const [idleFailures, setIdleFailures] = React.useState(0)
         const [animFailed, setAnimFailed] = React.useState(false)
         const [blob, setBlob] = React.useState(false)
 
+        // 挂载时不要重置：那样四只宠物的随机起点会被抹平，看起来像复制粘贴。
+        // 只在动作**真的变了**之后从头再试——404 只属于刚才那一段素材。
+        const mounted = React.useRef(false)
         React.useEffect(() => {
-          // 动作一变就从头再试：404 只属于刚才那一段素材。
+          if (!mounted.current) {
+            mounted.current = true
+            return
+          }
           setAnimFailed(false)
           setIdleIndex(0)
           setIdleFailures(0)
