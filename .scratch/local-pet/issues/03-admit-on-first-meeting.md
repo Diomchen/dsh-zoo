@@ -4,7 +4,7 @@
 
 **Blocked by:** 02
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] 第一次见到某个 `deviceId` 时出现放行提示，带对方昵称
 - [ ] 接受后重启 DSH 仍记得，不再询问

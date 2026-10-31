@@ -4,7 +4,7 @@
 
 **Blocked by:** 05
 
-**Status:** ready-for-agent
+**Status:** done
 
 - [ ] 一次串门在发起方与接收方各产生一条记录
 - [ ] 记录含对方昵称、方向、开始时间、停留时长
