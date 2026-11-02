@@ -14,19 +14,23 @@
  *   - 窗口 = 主显示器工作区，因此窗口局部坐标也就是工作区局部坐标。
  *
  * 场景 v2 的分工（ticket 08）：
- *   - 宿主只决定「有谁、叫什么、在播什么」（items 的 id/role/label/anim/color），位置只在**新宠物
- *     出生**时用 item 的 x/y 作种子；
+ *   - 宿主只决定「有谁、叫什么、在播什么」（items 的 id/role/label/anim/color）以及
+ *     「能点哪些控件、为什么不能点」（controls，ticket 11），位置只在**新宠物出生**时用
+ *     item 的 x/y 作种子；
  *   - 渲染端在本地模拟位置与速度，逐帧把自己的命中矩形报给主进程（ipc `local-pet:rects`）；
+ *     弹层/放行卡/召回胶囊的命中矩形走另一条 `local-pet:overlay-rects`；
  *   - 主进程不猜渲染端的位置：命中判定只用渲染端最近上报的矩形（过期就 fail-closed 回穿透）；
  *   - `reset: true` 让渲染端把每只宠物按 item 的 x/y 重新出生一次，用于 helper 重启/强制对账。
  *
  * 安全约定（这一层是点击穿透的「否决权」所在，见 ADR-0005）：
  *   `shouldBeInteractive()` 只在以下两种情况下返回 true：
- *     a) 渲染端拿着输入租约（`busy`，最近 `BUSY_LEASE_MS` 内有心跳）——拖拽时宠物会落后于
- *        光标，位置判定必须让位，否则窗口翻回穿透，pointermove/pointerup 全断；
+ *     a) 渲染端拿着输入租约（`busy`，最近 `BUSY_LEASE_MS` 内有心跳，且没有超过 `BUSY_MAX_MS`
+ *        的连续持有上限）——拖拽时宠物会落后于光标、弹层与宠物之间有间隙，位置判定必须让位，
+ *        否则窗口翻回穿透，pointermove/pointerup/按钮点击全断；
  *     b) 主进程按真实光标位置算出在渲染端上报的命中矩形内，并且渲染端最近 `maxAgeMs` 内确认过
  *        inside（心跳，不是一次性事件）；渲染端完全没消息时按停留时长兜底。
- *   租约总会过期：渲染端崩了/卡了/失联，最多 BUSY_LEASE_MS 后自动恢复穿透。
+ *   租约总会过期：渲染端崩了/卡了/失联，最多 BUSY_LEASE_MS 后自动恢复穿透；硬上限保证
+ *   一个活着但关不掉弹层的渲染端也不能永久占住桌面。
  */
 
 ;(function (root, factory) {
@@ -45,6 +49,8 @@
   const MAX_ANIM_LENGTH = 64
   const MAX_PATH_LENGTH = 1024
   const MAX_ERROR_LENGTH = 500
+  const MAX_NOTICE_LENGTH = 200
+  const MAX_REASON_LENGTH = 80
   const MAX_DISPLAYS = 8
   const MAX_COORD = 1e6
   const MAX_ITEM_SIZE = 10000
@@ -75,14 +81,21 @@
   const RENDERER_RECT_MAX_AGE_MS = 900
   /** 场景刚更新、渲染端还没上报矩形时的兜底：只用出生矩形，最多这么久。 */
   const SCENE_RECT_FALLBACK_MS = 800
-  /** 拖拽输入租约：渲染端每 BUSY_HEARTBEAT_MS 续一次，主进程超过 BUSY_LEASE_MS 没收到就释放。 */
-  const BUSY_HEARTBEAT_MS = 400
-  const BUSY_LEASE_MS = 1500
+  /** 拖拽/弹层输入租约：渲染端每 BUSY_HEARTBEAT_MS 续一次，主进程超过 BUSY_LEASE_MS 没收到就释放。 */
+  const BUSY_HEARTBEAT_MS = 300
+  const BUSY_LEASE_MS = 1200
+  /**
+   * 一条租约连续持有的硬上限。渲染端还活着、却因为 bug 一直续租（例如弹层关不掉）时，
+   * 这是主进程最后的 fail-closed 出口：到点收回租约并要求渲染端先显式放手/重新悬停。
+   */
+  const BUSY_MAX_MS = 30000
 
   const DEFAULT_COLOR = '#3b74d8'
   const ITEM_KINDS = ['pet', 'card']
   const PET_ROLES = ['self', 'guest', 'visitor']
   const SCENE_VERSION = 2
+  /** 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。 */
+  const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss']
 
   /** 宠物色板：self 固定第一格，客人按 deviceId 散列到其余颜色。 */
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
@@ -221,6 +234,79 @@
    * 以及整包的 `reset`（渲染端重新出生所有宠物）。未知字段、未知 kind、重复 id 一律丢掉；
    * items 数量有上限，保证一条消息不会超行。
    */
+  /**
+   * 桌面控件（ticket 11）的宿主 → 渲染端状态。它描述「能点哪些按钮」以及按钮为什么置灰，
+   * 不描述宠物的位置/物理；动作本身仍然只是**申请**，结果和场景由宿主回灌。
+   *
+   * control 的字段刻意保持扁平：
+   *   visit    { enabled, reason }        串门按钮（reason 只在置灰时出现，必须是给人看的一句话）
+   *   recall   { enabled, nickname }      召回入口（自己出门时桌面没有 self，需要常驻小胶囊）
+   *   visitors [{ deviceId, label }]      可以送客的访客（item id 是 visitor:<deviceId>）
+   *   prompt   { deviceId, nickname }     放行卡队首；null 表示没有待决定的新邻居
+   *   notice   { text, at }               最近一条人话提示（异步失败也靠它冒泡）
+   */
+  function emptyControls () {
+    return {
+      visit: { enabled: false, reason: null },
+      recall: { enabled: false, nickname: null },
+      visitors: [],
+      prompt: null,
+      notice: null
+    }
+  }
+
+  function normalizeControls (raw) {
+    const controls = emptyControls()
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return controls
+
+    const visit = raw.visit
+    if (visit !== null && typeof visit === 'object' && !Array.isArray(visit)) {
+      controls.visit.enabled = visit.enabled === true
+      controls.visit.reason = controls.visit.enabled
+        ? null
+        : normalizeText(visit.reason, null, MAX_REASON_LENGTH)
+    }
+
+    const recall = raw.recall
+    if (recall !== null && typeof recall === 'object' && !Array.isArray(recall)) {
+      controls.recall.enabled = recall.enabled === true
+      controls.recall.nickname = controls.recall.enabled
+        ? normalizeLabel(recall.nickname, '邻居')
+        : null
+    }
+
+    const seenVisitors = new Set()
+    if (Array.isArray(raw.visitors)) {
+      for (const candidate of raw.visitors) {
+        if (controls.visitors.length >= MAX_SCENE_ITEMS) break
+        if (candidate === null || typeof candidate !== 'object') continue
+        const deviceId = normalizeId(candidate.deviceId)
+        if (deviceId === null || seenVisitors.has(deviceId)) continue
+        seenVisitors.add(deviceId)
+        controls.visitors.push({ deviceId, label: normalizeLabel(candidate.label, '邻居') })
+      }
+    }
+
+    const prompt = raw.prompt
+    if (prompt !== null && typeof prompt === 'object' && !Array.isArray(prompt)) {
+      const deviceId = normalizeId(prompt.deviceId)
+      if (deviceId !== null) {
+        controls.prompt = { deviceId, nickname: normalizeLabel(prompt.nickname, '邻居') }
+      }
+    }
+
+    const notice = raw.notice
+    if (notice !== null && typeof notice === 'object' && !Array.isArray(notice)) {
+      const text = normalizeText(notice.text, null, MAX_NOTICE_LENGTH)
+      const at = Number(notice.at)
+      if (text !== null && Number.isFinite(at) && at >= 0) {
+        controls.notice = { text, at: clampNumber(at, 0, Number.MAX_SAFE_INTEGER) }
+      }
+    }
+
+    return controls
+  }
+
   function normalizeScene (raw) {
     const items = []
     if (raw !== null && typeof raw === 'object' && Array.isArray(raw.items)) {
@@ -233,11 +319,16 @@
         items.push(item)
       }
     }
-    return { version: SCENE_VERSION, reset: raw !== null && typeof raw === 'object' && raw.reset === true, items }
+    return {
+      version: SCENE_VERSION,
+      reset: raw !== null && typeof raw === 'object' && raw.reset === true,
+      items,
+      controls: normalizeControls(raw !== null && typeof raw === 'object' ? raw.controls : null)
+    }
   }
 
   function emptyScene () {
-    return { version: SCENE_VERSION, reset: false, items: [] }
+    return { version: SCENE_VERSION, reset: false, items: [], controls: emptyControls() }
   }
 
   function normalizeArea (area) {
@@ -282,7 +373,7 @@
    *
    * @param {Array<{id:string,role?:string,label?:string,anim?:string|null,color?:string}>} pets
    * @param {{x?:number,y?:number,width:number,height:number}} workArea
-   * @param {{size?:number,reset?:boolean}} [options]
+   * @param {{size?:number,reset?:boolean,controls?:object}} [options]
    */
   function petScene (pets, workArea, options = {}) {
     const area = normalizeArea(workArea)
@@ -339,7 +430,7 @@
         color: pet.color
       }
     })
-    return { version: SCENE_VERSION, reset: options.reset === true, items }
+    return { version: SCENE_VERSION, reset: options.reset === true, items, controls: normalizeControls(options.controls) }
   }
 
   /** 截图/冒烟用的固定演示场景：自己的 + 两位客人，走真实素材。 */
@@ -492,6 +583,19 @@
           return { ok: false, error: 'bad-scene' }
         }
         return { ok: true, command: { type, id, scene: normalizeScene(raw.scene) } }
+      case 'action-result': {
+        if (id === null || typeof raw.id !== 'string') return { ok: false, error: 'bad-id' }
+        return {
+          ok: true,
+          command: {
+            type,
+            id,
+            ok: raw.ok === true,
+            notice: normalizeText(raw.notice, null, MAX_NOTICE_LENGTH),
+            error: normalizeLabel(raw.error, null)
+          }
+        }
+      }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
@@ -519,7 +623,7 @@
         return { ok: true, command: { type, id } }
       case 'debug-dispatch': {
         const phase = typeof raw.phase === 'string' ? raw.phase.trim().toLowerCase() : ''
-        if (!['down', 'move', 'up', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
+        if (!['down', 'move', 'up', 'click', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
         const point = normalizePoint(raw)
         if (point === null) return { ok: false, error: 'bad-point' }
         return { ok: true, command: { type, id, point, phase } }
@@ -528,6 +632,12 @@
         return { ok: true, command: { type, id, frozen: raw.frozen !== false } }
       case 'debug-freeze-busy':
         return { ok: true, command: { type, id, frozen: raw.frozen !== false } }
+      case 'debug-busy-max': {
+        const ms = Number(raw.ms)
+        // 0 = 恢复默认；其余允许 200ms..60s，方便冒烟在几秒内验证硬上限。
+        if (!Number.isFinite(ms) || ms < 0 || ms > 60000) return { ok: false, error: 'bad-ms' }
+        return { ok: true, command: { type, id, ms: ms >= 200 ? Math.round(ms) : 0 } }
+      }
       case 'debug-lock-input':
         return { ok: true, command: { type, id, locked: raw.locked !== false } }
       default:
@@ -551,10 +661,17 @@
       hoverFrozen: raw.hoverFrozen === true,
       busy: raw.busy === true,
       busyAgeMs: isFiniteNumber(raw.busyAgeMs) && raw.busyAgeMs >= 0 ? raw.busyAgeMs : null,
+      busyHeldMs: isFiniteNumber(raw.busyHeldMs) && raw.busyHeldMs >= 0 ? raw.busyHeldMs : null,
+      busyBlocked: raw.busyBlocked === true,
+      busyCapMs: isFiniteNumber(raw.busyCapMs) && raw.busyCapMs >= 0 ? raw.busyCapMs : null,
       busyFrozen: raw.busyFrozen === true,
       rendererRects: Number.isInteger(raw.rendererRects) && raw.rendererRects >= 0 ? raw.rendererRects : 0,
       rendererRectsAgeMs: isFiniteNumber(raw.rendererRectsAgeMs) && raw.rendererRectsAgeMs >= 0
         ? raw.rendererRectsAgeMs
+        : null,
+      overlayRects: Number.isInteger(raw.overlayRects) && raw.overlayRects >= 0 ? raw.overlayRects : 0,
+      overlayRectsAgeMs: isFiniteNumber(raw.overlayRectsAgeMs) && raw.overlayRectsAgeMs >= 0
+        ? raw.overlayRectsAgeMs
         : null,
       visible: raw.visible === true,
       focused: raw.focused === true,
@@ -652,6 +769,15 @@
             message: normalizeText(raw.message, 'unknown error', MAX_ERROR_LENGTH)
           }
         }
+      case 'action': {
+        const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+        if (!CONTROL_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
+        if (id === null) return { ok: false, error: 'bad-id' }
+        const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
+        const deviceId = needsDevice ? normalizeId(raw.deviceId) : null
+        if (needsDevice && deviceId === null) return { ok: false, error: 'bad-device-id' }
+        return { ok: true, event: { type, id, action, deviceId } }
+      }
       case 'pong':
         return { ok: true, event: { type, id } }
       case 'status':
@@ -912,13 +1038,13 @@
    * 点击穿透的唯一裁定（主进程直接照做）。
    *
    * 优先级：
-   *   0. busy 租约新鲜：拖拽中，位置判定不参与（宠物落后于光标，光标可能已在矩形外）；
+   *   0. busy 租约新鲜且没有超过连续持有上限：拖拽/弹层期间，位置判定不参与；
    *   1. 光标在命中矩形内 + 渲染端最近 maxAgeMs 内确认过 inside（正常路径）；
    *   2. 光标在命中矩形内 + 渲染端完全没消息但停留满 fallbackDwellMs（macOS 兜底）；
    *   3. 其余一律穿透。
    *
-   * `rects` 优先于 `scene`：主进程传入渲染端上报的实时矩形，测试/旧调用方可以继续传 scene。
-   * 矩形为空永远是 false，busy 过期也永远不再翻案。
+   * `rects` 优先于 `scene`：主进程传入渲染端上报的实时矩形（宠物 + 控件），测试/旧调用方可以继续传 scene。
+   * 矩形为空永远是 false，busy 过期或超过 busyMaxMs 也永远不再翻案。
    *
    * @returns {{interactive:boolean, reason:'busy-lease'|'no-scene'|'outside'|'waiting-for-confirmation'|'stale-renderer-confirmation'|'hovering'|'main-fallback'}}
    */
@@ -928,7 +1054,15 @@
     const lease = Number.isFinite(options.busyLeaseMs) && options.busyLeaseMs > 0
       ? options.busyLeaseMs
       : BUSY_LEASE_MS
-    if (options.busy === true && busyAt > 0 && now - busyAt <= lease && now - busyAt >= 0) {
+    const busySince = Number.isFinite(options.busySince) && options.busySince > 0
+      ? options.busySince
+      : busyAt
+    const busyMax = Number.isFinite(options.busyMaxMs) && options.busyMaxMs > 0
+      ? options.busyMaxMs
+      : BUSY_MAX_MS
+    const leaseFresh = busyAt > 0 && now - busyAt <= lease && now - busyAt >= 0
+    const underCap = busySince <= 0 || now - busySince <= busyMax
+    if (options.busy === true && leaseFresh && underCap) {
       return { interactive: true, reason: 'busy-lease' }
     }
 
@@ -974,6 +1108,8 @@
     MAX_ANIM_LENGTH,
     MAX_PATH_LENGTH,
     MAX_ERROR_LENGTH,
+    MAX_NOTICE_LENGTH,
+    MAX_REASON_LENGTH,
     MAX_DISPLAYS,
     HOVER_HEARTBEAT_MS,
     HOVER_CONFIRM_MAX_AGE_MS,
@@ -983,10 +1119,12 @@
     SCENE_RECT_FALLBACK_MS,
     BUSY_HEARTBEAT_MS,
     BUSY_LEASE_MS,
+    BUSY_MAX_MS,
     DEFAULT_COLOR,
     ITEM_KINDS,
     PET_ROLES,
     SCENE_VERSION,
+    CONTROL_ACTIONS,
     PET_COLORS,
     IDLE_CLIPS,
     PHYSICS,
@@ -1000,9 +1138,11 @@
     normalizePoint,
     normalizeRects,
     normalizeScene,
+    normalizeControls,
     normalizeHostCommand,
     normalizeHelperEvent,
     emptyScene,
+    emptyControls,
     encodeMessage,
     parseLine,
     createLineParser,

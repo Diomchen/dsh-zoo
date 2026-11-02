@@ -18,7 +18,7 @@
  * 安全底线（ADR-0005：一个置顶全屏窗如果把点击吃掉，等于把整台机器卡死）：
  *   - 唯一翻转出口是 setIgnore()，初始状态永远是穿透；
  *   - 主进程每 100ms 用真实光标位置独立复核一次；命中矩形只信渲染端最近上报的那份，过期即无；
- *   - 渲染端必须持续心跳，超过 1.2s 没确认就恢复穿透；busy 租约超过 1.5s 没续也自动释放；
+ *   - 渲染端必须持续心跳，超过 1.2s 没确认就恢复穿透；busy 租约超过 1.2s 没续也自动释放；
  *   - 显示配置变化、窗口失焦/隐藏、宿主失联、进程退出，统统先恢复穿透并收回租约；
  *   - 进程被 kill -9 时窗口随进程消失，操作系统不会留下一个吃点击的窗。
  */
@@ -116,10 +116,20 @@ const hover = { inside: false, lastAt: 0, frozen: false }
 let rendererRects = []
 let rendererRectsAt = 0
 /**
- * 输入租约：渲染端在拖拽/弹层期间持有。位置判定不参与，但租约必须持续续期；
- * allow=false 表示上一次 forceIgnore 之后还没收到「渲染端已放手」的确认，新的 busy 先不信。
+ * 控件（弹层/放行卡/召回胶囊）的命中矩形。单独一条通道，因为它们的生命周期跟宠物物理无关；
+ * 同样只信最近的快照，过期即无（fail-closed）。宠物矩形排在后面，重叠时宠物优先。
  */
-const busy = { active: false, at: 0, frozen: false, allow: true }
+let overlayRects = []
+let overlayRectsAt = 0
+/**
+ * 输入租约：渲染端在拖拽/弹层期间持有。位置判定不参与，但租约必须持续续期；
+ * allow=false 表示上一次 forceIgnore（失焦/隐藏/超时收回）之后还没收到「渲染端已放手」的确认，
+ * 新的 busy 先不信；since 是这一条租约开始的时间，用于 BUSY_MAX_MS 的硬上限。
+ * blocked=true 是硬上限触发后的粘滞状态：只认一次显式 busy:false，连悬停也不能把它复活。
+ */
+const busy = { active: false, at: 0, since: 0, frozen: false, allow: true, blocked: false }
+/** 硬上限可被调试命令临时缩短（冒烟几秒内验证 fail-closed）；生产永远是 BUSY_MAX_MS。 */
+let busyCapMs = shared.BUSY_MAX_MS
 /** 主进程第一次看见光标进入「某个命中矩形」的时刻（离开即清零），兜底通道的停留计时。 */
 let insideSince = 0
 /** 调试用：用固定屏幕坐标替代 screen.getCursorScreenPoint()（冒烟脚本注入）。 */
@@ -245,8 +255,18 @@ function createWindow () {
   setIgnore(true, 'initial')
   win.webContents.on('did-finish-load', () => {
     rendererReady = true
+    // 新渲染端 = 上一份租约/命中矩形全部作废；否则旧租约可能把新页面按住 1.2s。
+    busy.active = false
+    busy.at = 0
+    busy.since = 0
     busy.allow = true
+    busy.blocked = false
+    rendererRects = []
+    rendererRectsAt = 0
+    overlayRects = []
+    overlayRectsAt = 0
     sceneAt = Date.now()
+    setIgnore(true, 'renderer-loaded')
     sendScene()
     if (isShotMode) {
       showWindow()
@@ -432,15 +452,40 @@ function forceIgnore (reason) {
   hover.lastAt = 0
   busy.active = false
   busy.at = 0
+  busy.since = 0
   // 收回租约后，新的 busy 必须等渲染端先确认一次「放开」或重新悬停，才重新被相信。
   busy.allow = false
+  busy.blocked = false
   insideSince = 0
   setIgnore(true, reason)
 }
 
 function busyFresh (now) {
-  return busy.active === true && busy.at > 0 && now - busy.at >= 0 &&
-    now - busy.at <= shared.BUSY_LEASE_MS
+  if (busy.active !== true || !(busy.at > 0) || busy.blocked === true) return false
+  const age = now - busy.at
+  if (age < 0 || age > shared.BUSY_LEASE_MS) return false
+  const total = busy.since > 0 ? now - busy.since : age
+  return total <= busyCapMs
+}
+
+/**
+ * 收回过期/超上限的租约。这是主进程的硬性 fail-closed：
+ * 渲染端还活着但一直续租（例如弹层关不掉）时，超过 BUSY_MAX_MS 也必须把桌面交还。
+ * 收回后 allow=false：普通超时可以由一次显式 false 或新的悬停确认恢复；硬上限触发时
+ * 额外置 blocked=true，只认显式 false（悬停不能复活），避免有 bug 的弹层周期性占住桌面。
+ */
+function revokeStaleBusy (now) {
+  if (busy.active !== true) return false
+  if (busyFresh(now)) return false
+  const capped = busy.since > 0 && (now - busy.since) > busyCapMs
+  busy.active = false
+  busy.at = 0
+  busy.since = 0
+  busy.allow = false
+  // 硬上限触发的收回是粘滞的：只认一次显式 busy:false（渲染端真的关掉了控件），
+  // 悬停心跳不能把它复活，否则一个有 bug 的弹层可以每 30s 重新占住整个桌面。
+  if (capped) busy.blocked = true
+  return true
 }
 
 /**
@@ -455,6 +500,7 @@ function applyDecision (reason) {
   }
   const local = localCursor()
   const now = Date.now()
+  revokeStaleBusy(now)
   const rects = liveRects(now)
   const inside = local !== null && shared.hitTestRects(rects, local) !== null
   if (inside) {
@@ -469,6 +515,7 @@ function applyDecision (reason) {
     insideSince,
     busy: busy.active === true,
     busyAt: busy.at,
+    busySince: busy.since,
     // 调试里 freeze 表示「渲染端已经死了」：这时连兜底也必须停，验证 fail-closed。
     allowMainFallback: hover.frozen !== true,
     now
@@ -476,16 +523,27 @@ function applyDecision (reason) {
   setIgnore(!decision.interactive, decision.reason || reason)
 }
 
-/** 渲染端最近上报的矩形优先；刚更新场景、渲染端还没报时，用出生矩形兜底最多 800ms。 */
+/**
+ * 主进程眼里的命中区 = 控件矩形 + 宠物矩形。
+ * 宠物排在后面，两者重叠时 hitTestRects 倒序优先宠物（“光标在宠物身上”这个诊断不会变成 ui:*）。
+ * 控件矩形同样只看最近 RENDERER_RECT_MAX_AGE_MS；过期即无，渲染端卡死时不会留下一个僵尸按钮。
+ */
 function liveRects (now) {
+  let pets
   if (rendererRectsAt > 0 && now - rendererRectsAt <= shared.RENDERER_RECT_MAX_AGE_MS) {
-    return rendererRects
+    pets = rendererRects
+  } else if (rendererRectsAt === 0 && sceneAt > 0 && now - sceneAt <= shared.SCENE_RECT_FALLBACK_MS && scene.items.length > 0) {
+    // 只在渲染端**从未**上报过矩形时用出生矩形兜底；一旦它报过，过期就回穿透（fail-closed）。
+    pets = shared.rectsOfScene(scene)
+  } else {
+    pets = []
   }
-  // 只在渲染端**从未**上报过矩形时用出生矩形兜底；一旦它报过，过期就回穿透（fail-closed）。
-  if (rendererRectsAt === 0 && sceneAt > 0 && now - sceneAt <= shared.SCENE_RECT_FALLBACK_MS && scene.items.length > 0) {
-    return shared.rectsOfScene(scene)
-  }
-  return []
+  const overlays = overlayRectsAt > 0 && now - overlayRectsAt <= shared.RENDERER_RECT_MAX_AGE_MS
+    ? overlayRects
+    : []
+  if (overlays.length === 0) return pets
+  if (pets.length === 0) return overlays
+  return overlays.concat(pets)
 }
 
 function startPointerWatchdog () {
@@ -543,7 +601,12 @@ function emitHit (reason) {
 ipcMain.on('local-pet:renderer-ready', (event) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   rendererReady = true
+  busy.active = false
+  busy.at = 0
+  busy.since = 0
   busy.allow = true
+  overlayRects = []
+  overlayRectsAt = 0
   sceneAt = Date.now()
   sendScene()
   applyDecision('renderer-ready')
@@ -557,20 +620,49 @@ ipcMain.on('local-pet:rects', (event, payload) => {
   applyDecision('renderer-rects')
 })
 
+ipcMain.on('local-pet:overlay-rects', (event, payload) => {
+  if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
+  overlayRects = shared.normalizeRects(payload)
+  overlayRectsAt = Date.now()
+  // 弹层/卡片自己也是命中区：光标压上去时主进程要接管鼠标，不必等悬停心跳。
+  applyDecision('renderer-overlays')
+})
+
 ipcMain.on('local-pet:busy', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   if (busy.frozen) return
   const next = payload !== null && typeof payload === 'object' && payload.busy === true
   if (next) {
-    if (busy.allow !== true) return
+    if (busy.allow !== true || busy.blocked === true) return
+    const now = Date.now()
+    if (busy.active !== true || !(busy.since > 0)) busy.since = now
     busy.active = true
-    busy.at = Date.now()
+    busy.at = now
   } else {
     busy.active = false
     busy.at = 0
+    busy.since = 0
     busy.allow = true
+    busy.blocked = false
   }
   applyDecision(next ? 'renderer-busy' : 'renderer-idle')
+})
+
+ipcMain.on('local-pet:action', (event, payload) => {
+  if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
+  if (!rendererReady) return
+  const id = shared.normalizeId(payload?.id)
+  const action = typeof payload?.action === 'string' ? payload.action.trim().toLowerCase() : ''
+  if (id === null || !shared.CONTROL_ACTIONS.includes(action)) return
+  const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
+  const deviceId = needsDevice ? shared.normalizeId(payload?.deviceId) : null
+  if (needsDevice && deviceId === null) {
+    sendActionResult({ id, ok: false, notice: '这个操作缺少对象，稍后再试。', error: 'bad-device-id' })
+    return
+  }
+  // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
+  const written = writeEvent({ type: 'action', id, action, deviceId })
+  if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
 
 ipcMain.on('local-pet:hover', (event, payload) => {
@@ -580,7 +672,8 @@ ipcMain.on('local-pet:hover', (event, payload) => {
   hover.inside = inside
   hover.lastAt = inside ? Date.now() : 0
   // 渲染端重新看见光标停在命中区 = 它活着且能接指针：允许重新申请输入租约。
-  if (inside) busy.allow = true
+  // 但硬上限触发的 blocked 只认 busy:false，悬停不能把它复活。
+  if (inside && busy.blocked !== true) busy.allow = true
   // 立即翻转（不用等 100ms 轮询）；主进程仍会用自己的光标位置复核。
   applyDecision(inside ? 'renderer-hover' : 'renderer-leave')
 })
@@ -591,6 +684,17 @@ function sendScene () {
     win.webContents.send('local-pet:scene', scene)
   } catch {
     // 渲染进程正在重启：下一次 did-finish-load 会重发
+  }
+}
+
+/** 把宿主对某次控件申请的答复交回渲染端；失败也必须有 notice，渲染端才能冒泡。 */
+function sendActionResult (result) {
+  if (win === null || win.isDestroyed()) return false
+  try {
+    win.webContents.send('local-pet:action-result', result)
+    return true
+  } catch {
+    return false
   }
 }
 
@@ -657,12 +761,25 @@ function applyCommand (command) {
       scene = command.scene
       sceneAt = Date.now()
       pruneRendererRects()
+      if (command.scene.reset === true) {
+        // 整包重出生：旧控件的矩形对新场景没有意义，先作废，等渲染端重建后再报。
+        overlayRects = []
+        overlayRectsAt = 0
+      }
       // **不要**在这里作废悬停确认：宿主只在宠物集合/动作变化时更新场景，位置是渲染端逐帧
       // 上报的。主进程每一拍都用**新场景 + 新矩形**复核真实光标位置，光标不在命中区就恢复穿透。
       applyDecision('scene-updated')
       sendScene()
       return
     }
+    case 'action-result':
+      sendActionResult({
+        id: command.id,
+        ok: command.ok === true,
+        notice: command.notice,
+        error: command.error
+      })
+      return
     case 'show':
       showWindow()
       busy.allow = true
@@ -730,6 +847,12 @@ function applyCommand (command) {
       // 结冰只是不再接受续期：已有租约按自己的时间戳自然过期（用来验 timeout）。
       if (!busy.frozen) busy.allow = true
       applyDecision('debug-freeze-busy')
+      return
+    case 'debug-busy-max':
+      if (!debugEnabled) return
+      // 0 = 恢复默认；只影响硬上限，不改变正常租约/心跳判定。
+      busyCapMs = command.ms > 0 ? command.ms : shared.BUSY_MAX_MS
+      applyDecision('debug-busy-max')
       return
     case 'debug-lock-input':
       if (!debugEnabled) return
@@ -850,9 +973,14 @@ function statusEvent (id) {
     hoverFrozen: hover.frozen,
     busy: busyFresh(now),
     busyAgeMs: busy.at > 0 ? now - busy.at : null,
+    busyHeldMs: busy.since > 0 ? now - busy.since : null,
+    busyBlocked: busy.blocked,
+    busyCapMs,
     busyFrozen: busy.frozen,
     rendererRects: rendererRects.length,
     rendererRectsAgeMs: rendererRectsAt > 0 ? now - rendererRectsAt : null,
+    overlayRects: overlayRects.length,
+    overlayRectsAgeMs: overlayRectsAt > 0 ? now - overlayRectsAt : null,
     visible: win !== null && !win.isDestroyed() && win.isVisible(),
     focused: win !== null && !win.isDestroyed() && win.isFocused(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
@@ -951,6 +1079,8 @@ async function shotSidecar (image) {
     renderer: await rendererDebug(),
     pointer: pointerOverride ?? safeCursorPoint(),
     ignoring: ignoreState.ignoring !== false,
+    busy: busyFresh(Date.now()),
+    overlayRects: overlayRects.length,
     debug: debugEnabled,
     shotMode: isShotMode
   }

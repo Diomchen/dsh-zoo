@@ -3,7 +3,7 @@ import { hostname } from 'node:os'
 
 import shared from '../desktop/shared.js'
 import { createDesktop } from './desktop.js'
-import { petsFromSnapshot } from './desktop-pets.js'
+import { controlsFromSnapshot, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
@@ -429,6 +429,10 @@ export function createService (ctx, options = {}) {
             // 也算“有人在用这台机器”。helper 只在穿透翻转时发 hit，所以这是粗粒度信号；
             // 它够用来防止“人明明在电脑前，宠物却因为没敲 DSH 而不出门”。
             noteActivity('pointer')
+          } else if (event?.type === 'action') {
+            // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
+            // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。
+            void handleDesktopAction(event, manager)
           }
         }
       })
@@ -482,11 +486,14 @@ export function createService (ctx, options = {}) {
    */
   function syncDesktop ({ reset = false } = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
-    const pets = petsFromSnapshot(room.snapshot())
-    const signature = JSON.stringify(pets)
+    const snapshot = room.snapshot()
+    const pets = petsFromSnapshot(snapshot)
+    const controls = controlsFromSnapshot(snapshot)
+    // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
+    const signature = JSON.stringify({ pets, controls })
     if (!reset && signature === desktopSceneSignature) return false
     desktopSceneSignature = signature
-    const scene = shared.petScene(pets, desktopWorkArea, { reset })
+    const scene = shared.petScene(pets, desktopWorkArea, { reset, controls })
     try {
       if (reset && typeof desktop.resync === 'function') return desktop.resync(scene)
       return desktop.update(scene)
@@ -494,6 +501,55 @@ export function createService (ctx, options = {}) {
       // 桌面层写管道失败只影响这一帧；下一次巡检会再试。
       return false
     }
+  }
+
+  /**
+   * 桌面控件动作的唯一入口。白名单之外一律拒绝；动作本身走 handleAction，
+   * 所以串门/召回/送客/放行和 HTTP 路径共享同一套 room 状态与错误文案。
+   *
+   * 无论成功失败都回一条 action-result——渲染端靠它把失败冒泡，不允许静默。
+   */
+  async function handleDesktopAction (event, manager) {
+    if (disposed) return
+    let result
+    try {
+      result = await handleAction({
+        action: event.action,
+        deviceId: event.deviceId ?? undefined
+      })
+    } catch (error) {
+      warn(ctx, '桌面控件动作失败（' + event.action + '）：' + message(error))
+      result = { ok: false, error: 'action-failed' }
+    }
+    if (disposed) return
+    const notice = result?.ok === true
+      ? null
+      : (typeof result?.notice === 'string' && result.notice.trim() !== ''
+          ? result.notice
+          : desktopActionNotice(result?.error))
+    try {
+      const target = desktop ?? manager
+      if (target !== null && typeof target.actionResult === 'function') {
+        target.actionResult(event.id, {
+          ok: result?.ok === true,
+          notice,
+          error: typeof result?.error === 'string' ? result.error : null
+        })
+      }
+    } catch {
+      // 回话失败只影响这一次气泡；渲染端自己的超时会兜底
+    }
+    // 动作可能改变访客/出门状态；flushRoomEffects 已经同步一次，这里再补一次确保及时。
+    syncDesktop()
+  }
+
+  /** 失败动作的兜底人话：room 通常已经给了 notice，这里只处理协议层的坏请求。 */
+  function desktopActionNotice (error) {
+    if (error === 'starting') return '桌面还在准备中，稍等一下再试。'
+    if (error === 'bad-device-id' || error === 'unknown-neighbor') return '这位邻居已经不在桌面上了。'
+    if (error === 'disposed') return '桌面正在关闭，这次操作没有完成。'
+    if (error === 'not-implemented') return '这个操作暂不支持。'
+    return '这次操作没有完成，稍后再试。'
   }
 
   function startDesktopSync () {

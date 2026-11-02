@@ -107,6 +107,79 @@ test('场景 v2 归一化：role/anim/reset 保留，未知字段、未知 kind�
   assert.equal(shared.normalizeScene(many).items.length, shared.MAX_SCENE_ITEMS)
 })
 
+test('场景 v2 controls：置灰理由/召回/可送客/放行卡/notice 归一化，坏条目丢弃', () => {
+  const deviceId = '33333333-3333-4333-8333-333333333333'
+  const scene = shared.normalizeScene({
+    items: [],
+    controls: {
+      visit: { enabled: false, reason: '  还没有人放行你  ' },
+      recall: { enabled: true, nickname: '  阿蟹  ' },
+      visitors: [
+        { deviceId, label: '阿蟹' },
+        { deviceId, label: '重复' },
+        { deviceId: 'bad id', label: '坏 id' }
+      ],
+      prompt: { deviceId, nickname: '  泡泡  ' },
+      notice: { text: '「阿蟹」没有回应，宠物先留在家里了。', at: 1234 }
+    }
+  })
+  assert.deepEqual(scene.controls.visit, { enabled: false, reason: '还没有人放行你' })
+  assert.deepEqual(scene.controls.recall, { enabled: true, nickname: '阿蟹' })
+  assert.deepEqual(scene.controls.visitors, [{ deviceId, label: '阿蟹' }])
+  assert.deepEqual(scene.controls.prompt, { deviceId, nickname: '泡泡' })
+  assert.equal(scene.controls.notice.text, '「阿蟹」没有回应，宠物先留在家里了。')
+  assert.equal(scene.controls.notice.at, 1234)
+
+  // enabled 时不信任调用方给的 reason；null/坏形状回落成空控件。
+  const enabled = shared.normalizeScene({
+    items: [],
+    controls: { visit: { enabled: true, reason: '不应该显示' }, notice: { text: 'x', at: Number.NaN } }
+  })
+  assert.deepEqual(enabled.controls.visit, { enabled: true, reason: null })
+  assert.equal(enabled.controls.notice, null)
+  assert.deepEqual(shared.normalizeScene({ items: [], controls: 'nope' }).controls, shared.emptyControls())
+})
+
+test('helper 动作：白名单 + id + deviceId 校验；坏动作/缺 id/缺 deviceId 整条丢弃', () => {
+  const deviceId = '33333333-3333-4333-8333-333333333333'
+  const visit = shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action: 'visit' })
+  assert.equal(visit.ok, true)
+  assert.deepEqual(visit.event, { type: 'action', id: 'act-1', action: 'visit', deviceId: null })
+
+  const end = shared.normalizeHelperEvent({ type: 'action', id: 'act-2', action: 'end-visit', deviceId })
+  assert.equal(end.ok, true)
+  assert.equal(end.event.deviceId, deviceId)
+
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-3', action: 'quit' }).ok, false)
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', action: 'visit' }).ok, false)
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-4', action: 'admit' }).ok, false)
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-5', action: 'admit', deviceId: 'bad id' }).ok, false)
+})
+
+test('宿主命令 action-result：id 必填，notice 截断到可显示长度', () => {
+  const result = shared.normalizeHostCommand({
+    type: 'action-result',
+    id: 'act-1',
+    ok: false,
+    notice: '还没有人放行你，宠物出不了门。',
+    error: 'no-admitted'
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.command.ok, false)
+  assert.equal(result.command.notice, '还没有人放行你，宠物出不了门。')
+  assert.equal(result.command.error, 'no-admitted')
+  assert.equal(shared.normalizeHostCommand({ type: 'action-result', ok: true }).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'action-result', id: 7, ok: true }).ok, false, 'action-result 的 id 必须是字符串')
+
+  const long = shared.normalizeHostCommand({
+    type: 'action-result',
+    id: 'act-2',
+    ok: false,
+    notice: '坏'.repeat(shared.MAX_NOTICE_LENGTH + 50)
+  })
+  assert.equal(long.command.notice.length, shared.MAX_NOTICE_LENGTH)
+})
+
 test('宿主命令：update/show/hide/quit/ping/shot/pointer 白名单，未知与坏字段拒绝', () => {
   assert.equal(shared.normalizeHostCommand({ type: 'show' }).command.type, 'show')
   assert.equal(shared.normalizeHostCommand({ type: 'quit' }).command.type, 'quit')
@@ -120,6 +193,10 @@ test('宿主命令：update/show/hide/quit/ping/shot/pointer 白名单，未知�
   assert.equal(shared.normalizeHostCommand({ type: 'pointer', x: Number.NaN, y: 2 }).ok, false)
   assert.equal(shared.normalizeHostCommand({ type: 'debug-freeze-hover', frozen: true }).command.frozen, true)
   assert.equal(shared.normalizeHostCommand({ type: 'debug-freeze-busy', frozen: true }).command.frozen, true)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-busy-max', ms: 700 }).command.ms, 700)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-busy-max', ms: 0 }).command.ms, 0)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-busy-max', ms: -1 }).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-busy-max', ms: 60001 }).ok, false)
   assert.equal(shared.normalizeHostCommand({ type: 'debug-renderer' }).command.type, 'debug-renderer')
   assert.equal(
     shared.normalizeHostCommand({ type: 'debug-dispatch', phase: 'down', x: 5, y: 6 }).command.phase,
@@ -183,6 +260,13 @@ test('helper 事件：ready/hit/shot/error/status 归一化，长错误消息不
     sceneItems: 2,
     hoverInside: true,
     hoverFrozen: true,
+    busy: true,
+    busyHeldMs: 5000,
+    busyBlocked: true,
+    busyCapMs: 700,
+    rendererRects: 2,
+    overlayRects: 3,
+    overlayRectsAgeMs: 12,
     visible: true,
     focused: false,
     bounds: { x: 0, y: 30, width: 1000, height: 700 },
@@ -191,6 +275,11 @@ test('helper 事件：ready/hit/shot/error/status 归一化，长错误消息不
   assert.equal(status.event.status.ignoring, false)
   assert.equal(status.event.status.hoverFrozen, true)
   assert.equal(status.event.status.focused, false)
+  assert.equal(status.event.status.busyBlocked, true)
+  assert.equal(status.event.status.busyHeldMs, 5000)
+  assert.equal(status.event.status.busyCapMs, 700)
+  assert.equal(status.event.status.overlayRects, 3)
+  assert.equal(status.event.status.overlayRectsAgeMs, 12)
   assert.equal(shared.normalizeHelperEvent({ type: 'unknown' }).ok, false)
 })
 
@@ -510,6 +599,46 @@ test('manager：spawn 参数正确、ready 后补场景、update/shot/status 走
   assert.equal(shot.width, 2000)
 })
 
+test('manager：控件 action 事件透传给宿主，actionResult 把 ok/notice 原样写回 stdin', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const events = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(3000 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    onEvent: (event) => events.push(event),
+    pingMs: 100000
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 3000, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  await new Promise((resolve) => setTimeout(resolve, 5))
+
+  const deviceId = '33333333-3333-4333-8333-333333333333'
+  children[0].emitLine({ type: 'action', id: 'act-7', action: 'end-visit', deviceId })
+  const received = events.find((event) => event.type === 'action')
+  assert.ok(received, 'manager 把渲染端的控件申请透传给宿主观察者')
+  assert.equal(received.action, 'end-visit')
+  assert.equal(received.deviceId, deviceId)
+
+  assert.equal(manager.actionResult('act-7', { ok: false, notice: '这位客人已经不在桌面上了。', error: 'no-visitor' }), true)
+  const result = children[0].parsedLines().at(-1)
+  assert.equal(result.type, 'action-result')
+  assert.equal(result.id, 'act-7')
+  assert.equal(result.ok, false)
+  assert.equal(result.notice, '这位客人已经不在桌面上了。')
+  assert.equal(manager.actionResult('', { ok: true }), false, '空 id 不写管道')
+})
+
 test('manager：崩溃退避重启、N 次后熔断、dispose 先 quit 再 kill', async (t) => {
   const clock = fakeClock()
   const children = []
@@ -802,6 +931,78 @@ test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作�
 
   service.room.observeHeartbeat({ deviceId: guestId, anim: '东张西望' })
   await waitFor(() => updates.at(-1).items.some((item) => item.role === 'visitor' && item.anim === '东张西望'), 1500)
+  assert.deepEqual(warnings, [])
+})
+
+test('service：桌面控件申请走同一套 action 并回 action-result；失败一定带人话 notice', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-actions-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const updates = []
+  const results = []
+  let captured = null
+  const factory = (options) => {
+    captured = options
+    return {
+      start () { return { ok: true, pid: 9100 } },
+      update (scene) { updates.push(scene); return true },
+      resync (scene) { updates.push(scene); return true },
+      actionResult (id, result) { results.push({ id, ...result }) },
+      dispose () {}
+    }
+  }
+  const { ctx, warnings } = fakeCtx()
+  const service = createService(ctx, {
+    network: false,
+    petBridge: false,
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: factory,
+    desktopSyncMs: 20
+  })
+  t.after(() => service.dispose())
+  await service.ready
+  captured.onEvent({ type: 'ready', pid: 9100, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  await waitFor(() => updates.length > 0, 500)
+
+  // 场景里已经带上了控件状态：没有可串门邻居 → 置灰 + 理由。
+  assert.equal(updates.at(-1).controls.visit.enabled, false)
+  assert.match(updates.at(-1).controls.visit.reason, /还没有人放行你/)
+
+  // “召回”在家：走同一个 handleAction，失败 notice 原样回给 helper。
+  captured.onEvent({ type: 'action', id: 'act-recall', action: 'recall', deviceId: null })
+  await waitFor(() => results.some((result) => result.id === 'act-recall'), 1500)
+  const recall = results.find((result) => result.id === 'act-recall')
+  assert.equal(recall.ok, false)
+  assert.match(recall.notice, /在家|不用召回/)
+
+  // “串门”没有目标：失败也必须有可读提示，不能静默。
+  captured.onEvent({ type: 'action', id: 'act-visit', action: 'visit', deviceId: null })
+  await waitFor(() => results.some((result) => result.id === 'act-visit'), 1500)
+  const visit = results.find((result) => result.id === 'act-visit')
+  assert.equal(visit.ok, false)
+  assert.match(visit.notice, /还没有人放行你/)
+  assert.equal(visit.error, 'no-admitted')
+
+  // 有客人时“送客”成功：action-result ok，场景立刻少一只，控件名单也清空。
+  const guestId = '88888888-8888-4888-8888-888888888888'
+  service.room.setTrust({ allowed: { [guestId]: { nickname: '阿蟹' } } })
+  service.room.observeHeartbeat({ deviceId: guestId, anim: '螃蟹走路' })
+  const replied = service.room.observeVisitRequest({
+    deviceId: guestId,
+    visitId: '99999999-9999-4999-8999-999999999999',
+    nickname: '阿蟹',
+    anim: '螃蟹走路'
+  })
+  assert.equal(replied.reply, 'ack')
+  await waitFor(() => updates.at(-1).controls.visitors.length === 1, 1500)
+  assert.equal(updates.at(-1).controls.visitors[0].deviceId, guestId)
+  captured.onEvent({ type: 'action', id: 'act-end', action: 'end-visit', deviceId: guestId })
+  await waitFor(() => results.some((result) => result.id === 'act-end'), 1500)
+  const end = results.find((result) => result.id === 'act-end')
+  assert.equal(end.ok, true)
+  assert.equal(end.notice, null)
+  await waitFor(() => updates.at(-1).items.every((item) => item.role !== 'visitor'), 1500)
+  assert.deepEqual(updates.at(-1).controls.visitors, [])
   assert.deepEqual(warnings, [])
 })
 

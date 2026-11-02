@@ -1,13 +1,16 @@
-# 桌面 helper（ticket 07 + 08）
+# 桌面 helper（ticket 07–11）
 
 宿主是 `ELECTRON_RUN_AS_NODE=1` 的纯 Node，拿不到 `BrowserWindow`。这个目录是另起的
 Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与宿主只通过 stdin/stdout 的 JSON 行
 通信，不开端口、不走 HTTP。
 
 - `main.js` — Electron 主进程：窗口、点击穿透裁定、输入租约、`localpet://` 素材协议、stdio、截图
-- `preload.js` — 渲染端唯一桥：`ready` / `reportHover` / `reportRects` / `setBusy` / `onScene`
-- `index.html` + `renderer.js` — 透明画布；每只宠物一个 DOM 节点，60fps 本地物理
-- `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v2、物理、命中判定、穿透裁定
+- `preload.js` — 渲染端唯一桥：`ready` / `reportHover` / `reportRects` / `reportOverlayRects` /
+  `setBusy` / `requestAction` / `onActionResult` / `onScene`
+- `index.html` + `renderer.js` — 透明画布；每只宠物一个 DOM 节点，60fps 本地物理；
+  悬停/点击控件（串门/召回/送客/放行卡/提示气泡）也在这里
+- `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v2（含 `controls`）、物理、
+  命中判定、穿透裁定
 
 ## 怎么跑
 
@@ -39,12 +42,15 @@ env -u ELECTRON_RUN_AS_NODE /Users/gensean/.dsh/electron/Electron.app/Contents/M
 
 ```bash
 npm run smoke:desktop
-LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/notes/08-*.png
+LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/notes/08-*.png、11-*.png
 ```
 
 它用 `capturePage()` 抓图并用 zlib 自己解/编码 PNG：断言背景透明、每只宠物的媒体区和昵称条
 有像素、`localpet://` 真的加载了 WebM；再跑点击穿透两条通道、输入租约（含超时）、拖拽/投掷、
 场景增删/reset、素材缺失时的 SVG 降级、崩溃重启、dispose、宿主被 SIGKILL 后 helper 自行退出。
+ticket 11 又加了：悬停 → 弹层、弹层打开期间租约续期、按钮点击真的把 `action` 写给宿主、失败
+`notice` 冒泡、放行卡接受/拒绝、送客、自己出门时的召回胶囊，以及两条 fail-closed 路径：
+租约超时（冻住心跳）和连续持有硬上限（心跳仍在续租，`debug-busy-max` 缩短到 700ms）。
 
 ## 宿主 → helper 命令
 
@@ -54,7 +60,8 @@ LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/n
 | --- | --- | --- |
 | `show` | — | `showInactive()` 显示；不抢焦点 |
 | `hide` | — | 先恢复穿透并入租约再隐藏 |
-| `update` | `scene` | 替换整个场景 v2；按新场景 + 渲染端矩形重新复核光标 |
+| `update` | `scene` | 替换整个场景 v2（含 `controls`）；按新场景 + 渲染端矩形重新复核光标 |
+| `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
 | `shot` | `id?`, `path`（绝对路径） | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
@@ -67,10 +74,11 @@ LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/n
 | `pointer` | `x`,`y` 屏幕 DIP；或 `clear:true` | 用固定光标替代 `screen.getCursorScreenPoint()`（不动真实鼠标） |
 | `debug-move` | `x`,`y` | 设光标 + 向渲染端 `sendInputEvent` 一条合成 mousemove |
 | `debug-input` | `x`,`y`,`action:'move'\|'down'\|'up'` | 合成鼠标事件（走真实输入管线；会被真实光标干扰，拖拽冒烟优先用 `debug-dispatch`） |
-| `debug-dispatch` | `x`,`y`,`phase:'down'\|'move'\|'up'\|'blur'` | 在渲染端派发合成 `PointerEvent` / blur（走同一套处理器） |
-| `debug-renderer` | `id?` | 回 `renderer-state` 事件：渲染端探针（宠物位置/速度/素材/拖拽态） |
+| `debug-dispatch` | `x`,`y`,`phase:'down'\|'move'\|'up'\|'click'\|'blur'` | 在渲染端派发合成 `PointerEvent` / blur（走同一套处理器）；`click` 先在屏幕坐标做 `elementFromPoint`，再点按钮或宠物 |
+| `debug-renderer` | `id?` | 回 `renderer-state` 事件：渲染端探针（宠物位置/速度/素材/拖拽态/控件/overlay 矩形） |
 | `debug-freeze-hover` | `frozen` | 模拟渲染端死亡：忽略 hover 消息、清掉最近确认、**同时关掉主进程兜底** |
 | `debug-freeze-busy` | `frozen` | 模拟渲染端卡死：不再接受 busy 续期，已有租约按时间戳自然过期 |
+| `debug-busy-max` | `ms`（0 = 恢复默认） | 调试/冒烟：临时缩短连续租约硬上限（200ms..60s），用来几秒内验证 fail-closed |
 | `debug-lock-input` | `locked` | 调试/冒烟：锁住真实鼠标/焦点事件，只接受 `debug-dispatch` 的合成输入（同时清掉悬停与租约） |
 
 ## helper → 宿主事件
@@ -79,11 +87,12 @@ LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/n
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
+| `action` | `id`, `action`, `deviceId?` | 渲染端控件申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态** |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
 | `pong` | `id?` | 对 `ping` |
-| `status` | `id?`, `status` | 含 `ignoring` / `sceneItems` / `busy` / `rendererRects` / `hoverInside` / `bounds` / `pointer` 等 |
+| `status` | `id?`, `status` | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` 等 |
 
 `ready` 里的 `workArea` 是**主屏**工作区（DIP）。窗口 bounds 永远等于它；场景坐标是窗口局部
 CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿主/测试，换算成了屏幕坐标。
@@ -109,17 +118,36 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
       "color": "#3b74d8"
     },
     {
-      "id": "guest:6f1c…",
+      "id": "visitor:6f1c…",
       "kind": "pet",
-      "role": "guest",
+      "role": "visitor",
       "anim": null,
       "x": 1181, "y": 1201, "width": 169, "height": 201,
       "label": "阿蟹",
       "color": "#2f8f5b"
     }
-  ]
+  ],
+  "controls": {
+    "visit": { "enabled": true, "reason": null },
+    "recall": { "enabled": false, "nickname": null },
+    "visitors": [{ "deviceId": "6f1c…", "label": "阿蟹" }],
+    "prompt": { "deviceId": "9a2b…", "nickname": "泡泡" },
+    "notice": { "text": "「阿蟹」没有回应，宠物先留在家里了。", "at": 1762000000000 }
+  }
 }
 ```
+
+`controls` 是 ticket 11 的宿主权威状态（全部可缺省，缺省即“没有控件”）：
+
+- `visit`：串门按钮；`enabled:false` 时 `reason` 必须是能直接显示给人看的一句话。
+- `recall`：自己出门时桌面没有 `self`，渲染端用一个常驻「召回」胶囊代替；
+  `nickname` 用来显示“在「阿蟹」家”。
+- `visitors`：当前可送客的访客；`item.id` 是 `visitor:<deviceId>`，两边按 deviceId 对上。
+- `prompt`：放行 FIFO 队首；渲染端在宠物旁边画 接受 / 拒绝 / 稍后再说，绝不遮挡宠物本体。
+- `notice`：最近一条人话提示。异步失败（超时、对方失联、被送客）不经过 `action-result`，
+  渲染端靠 `notice.at` 变化冒泡；超过 30s 的旧 notice 不会在 helper 重启后重新弹出。
+
+位置仍是渲染端拥有；`controls` 只描述“能点什么、为什么不能点”，点击只发 `action` 申请。
 
 - **谁是权威**：宿主只决定「有谁 / 叫什么 / 在播什么」（`id`/`role`/`label`/`anim`/`color`）。
 - **位置**：只把 `x`/`y` 当**出生点**。已经在场的宠物由渲染端保留自己的位置/速度；宿主改
@@ -140,16 +168,26 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 1. 渲染端每次物理步进后用 `local-pet:rects` 上报所有宠物矩形（移动 ~30Hz，静止 300ms 心跳，
    窗口局部 DIP）。矩形带 `id`；主进程按 `id` 把场景里已经删掉的宠物立刻从命中区移除。
-2. 主进程的 `shouldBeInteractive()` **只认**这份矩形（超过 `RENDERER_RECT_MAX_AGE_MS` 就当作
+2. 控件（弹层、放行卡、召回胶囊、按钮）用另一条 `local-pet:overlay-rects` 上报，同样带
+   时间戳、同样 900ms 过期。它们不参与物理，但决定了“光标压在按钮上”时窗口是否接管鼠标；
+   **宠物矩形排在控件矩形后面**，重叠时宠物优先（`hit.itemId` 不会变成 `ui:*`）。
+3. 主进程的 `shouldBeInteractive()` **只认**这些矩形（超过 `RENDERER_RECT_MAX_AGE_MS` 就当作
    没有命中区）。场景刚更新、渲染端还没上报时，用出生矩形兜底最多 800ms。
-3. 光标位置仍由主进程用自己的 `screen.getCursorScreenPoint()` 独立复核；渲染端只能申请，
+4. 光标位置仍由主进程用自己的 `screen.getCursorScreenPoint()` 独立复核；渲染端只能申请，
    不能单方面把窗口变成可交互。
-4. 拖拽时渲染端通过 `local-pet:busy` 持有**输入租约**：宠物落后于光标、光标已经离开矩形，
-   窗口也必须保持可交互，否则 `pointermove`/`pointerup` 全断（ticket 07 的坑）。
-5. 租约每 `BUSY_HEARTBEAT_MS`（400ms）续期一次，主进程超过 `BUSY_LEASE_MS`（1500ms）没收到
+5. 拖拽和**打开的弹层**都会让渲染端通过 `local-pet:busy` 持有**输入租约**：宠物落后于光标、
+   光标跨过宠物与弹层之间的 8px 间隙时位置判定已经失效，窗口也必须保持可交互，否则
+   `pointermove`/`pointerup` 与按钮点击全断（ticket 07 的坑）。弹层关闭（点按钮/移开/失焦/
+   12s 超时/场景 reset）立刻交还租约。
+6. 租约每 `BUSY_HEARTBEAT_MS`（300ms）续期一次，主进程超过 `BUSY_LEASE_MS`（1200ms）没收到
    就自动释放；`pointerup`/`pointercancel`/window `blur`/页面隐藏/2.5s 无移动也会主动释放。
+   另外还有一条 `BUSY_MAX_MS`（30s）的**连续持有硬上限**：即使渲染端活着且一直续租，
+   到点也必须收回；硬上限触发的收回是粘滞的，只认一次显式 `busy:false`（普通超时可由新的
+   悬停确认恢复）。
    `forceIgnore()`（隐藏、失焦、显示器变化、宿主失联、退出）会收回租约并要求渲染端重新确认。
-   **窗口失焦/渲染端死掉时，最多 1.5s 就恢复穿透。**
+   **窗口失焦/渲染端死掉时，最多 1.2s + 一个 100ms 轮询就恢复穿透。**
+7. 放行卡/召回胶囊是常驻控件，**不持有租约**（否则桌面会一直被整窗接管）；它们靠
+   `overlay-rects` 在光标真正压上去时接管鼠标，并用“宠物 + 控件”的桥接矩形盖住间隙。
 
 ## 素材协议 `localpet://`
 
@@ -181,10 +219,15 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 ## 已知限制
 
-- `focusable: false`：没有键盘输入；ticket 11 的「送客」按钮只能是鼠标点击。
+- `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/放行卡）都是鼠标点击，没有
+  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。
+- 悬停弹层依赖渲染端收到 `pointermove`；macOS 上 `forward: true` 失效时，主进程仍能靠 300ms
+  兜底让弹层打开后的按钮可点，但“悬停即出现”本身可能延迟到兜底接管。
+- 控件位置每 100ms 跟一次宠物；宠物被快速拖动时弹层会有一点跟手延迟（不影响点击）。
 - macOS 上 `forward: true` 依赖 Electron 的鼠标转发钩子；hook 失效时靠主进程 300ms 兜底接管。
 - `setVisibleOnAllWorkspaces` + `focusable:false` 在「全屏应用/台前调度」下的实际层级没有真机
   验证；置顶层级用 `floating`，不压截图。
 - 宠物之间没有物理碰撞（SPEC v2 out of scope）；同屏数量不设产品上限，但场景协议单条消息
   最多 64 个 item（渲染上限），且每个宠物一个 `<video>`，客人非常多时解码开销线性增长。
-- 截图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）。
+- 截图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）；合成输入走
+  `debug-dispatch`/`debug-lock-input`，没有用真实鼠标点过这些按钮。
