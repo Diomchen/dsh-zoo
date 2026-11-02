@@ -109,6 +109,8 @@ export function createDesktop (options = {}) {
   let workArea = null
   let lastScene = null
   let lastEvent = null
+  /** 最近一次 helper 的 status 回执；里面带渲染端上报的当前 clip / failed，用于诊断。 */
+  let lastStatus = null
   let lastError = null
   let helperErrors = 0
   let restartTimer = null
@@ -397,6 +399,7 @@ export function createDesktop (options = {}) {
       // 这里刻意去掉 reset：新渲染端本来就会按 x/y 出生；显示器变化时保留现场位置更自然。
       if (lastScene !== null) send({ type: 'update', scene: { ...lastScene, reset: false } })
     } else if (event.type === 'shot' || event.type === 'status') {
+      if (event.type === 'status') lastStatus = event
       settleReply(event)
     } else if (event.type === 'pong') {
       notePong()
@@ -592,6 +595,7 @@ export function createDesktop (options = {}) {
       lastError,
       helperErrors,
       lastEvent,
+      lastStatus,
       assetRoots: assetRoots.slice(),
       stderr: stderrLines.slice(),
       debug: debugLines.slice()

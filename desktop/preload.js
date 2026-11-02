@@ -34,6 +34,15 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
   setBusy (busy) {
     ipcRenderer.send('local-pet:busy', { busy: busy === true })
   },
+  /** 素材诊断：当前在播哪一段、失败集合；只进主进程内存，供宿主排查用。 */
+  reportMedia (payload) {
+    if (payload === null || typeof payload !== 'object') return
+    ipcRenderer.send('local-pet:media', {
+      clip: typeof payload.clip === 'string' ? payload.clip : null,
+      source: typeof payload.source === 'string' ? payload.source : null,
+      failed: Array.isArray(payload.failed) ? payload.failed : []
+    })
+  },
   requestAction (payload) {
     if (payload === null || typeof payload !== 'object') return
     ipcRenderer.send('local-pet:action', {

@@ -1275,6 +1275,7 @@
     pet.media.clip = null
     pet.media.source = 'svg'
     pet.media.gaveUp = true
+    reportMedia(pet, null, 'svg')
   }
 
   function playClip (pet, clip) {
@@ -1301,6 +1302,21 @@
     video.load()
     const played = video.play()
     if (played !== null && typeof played.catch === 'function') played.catch(() => {})
+    reportMedia(pet, key, 'loading')
+  }
+
+  /** 把当前片段与失败集合报给主进程；只进内存几条记录，不影响播放。 */
+  function reportMedia (pet, clip, source) {
+    if (typeof api?.reportMedia !== 'function') return
+    try {
+      api.reportMedia({
+        clip,
+        source,
+        failed: [...pet.media.failed].slice(-16)
+      })
+    } catch {
+      // 诊断坏了不能影响播放
+    }
   }
 
   /**

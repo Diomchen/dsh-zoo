@@ -119,6 +119,9 @@ let renameSeq = 0
 let workArea = null
 let scene = shared.emptyScene()
 let sceneAt = 0
+/** 渲染端上报的当前素材与失败集合；只用于诊断（宿主 /local-pet/desktop 能读到）。 */
+let lastMedia = null
+const mediaHistory = []
 let rendererReady = false
 let quitting = false
 let readySent = false
@@ -672,6 +675,23 @@ ipcMain.on('local-pet:renderer-ready', (event) => {
   sceneAt = Date.now()
   sendScene()
   applyDecision('renderer-ready')
+})
+
+// 渲染端的素材诊断：当前在播哪一段、哪些片段已经失败。只进内存，不落盘。
+ipcMain.on('local-pet:media', (event, payload) => {
+  if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
+  if (payload === null || typeof payload !== 'object') return
+  const entry = {
+    clip: typeof payload.clip === 'string' ? payload.clip.slice(0, 64) : null,
+    source: typeof payload.source === 'string' ? payload.source.slice(0, 16) : null,
+    failed: Array.isArray(payload.failed)
+      ? payload.failed.filter((item) => typeof item === 'string').slice(-16)
+      : [],
+    at: Date.now()
+  }
+  lastMedia = entry
+  mediaHistory.push(entry)
+  while (mediaHistory.length > 20) mediaHistory.shift()
 })
 
 ipcMain.on('local-pet:rects', (event, payload) => {
@@ -1298,6 +1318,8 @@ function statusEvent (id) {
     busyFrozen: busy.frozen,
     rendererRects: rendererRects.length,
     rendererRectsAgeMs: rendererRectsAt > 0 ? now - rendererRectsAt : null,
+    media: lastMedia,
+    mediaHistory: mediaHistory.slice(),
     overlayRects: overlayRects.length,
     overlayRectsAgeMs: overlayRectsAt > 0 ? now - overlayRectsAt : null,
     visible: win !== null && !win.isDestroyed() && win.isVisible(),

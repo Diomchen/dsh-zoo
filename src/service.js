@@ -192,6 +192,24 @@ export function createService (ctx, options = {}) {
     }
   }))
 
+  // 桌面 helper 的诊断出口：当前在播哪一段、失败集合、场景项数。
+  // 只读、只在本机回环上；没有桌面层时返回 running:false。
+  disposers.push(register(ctx, {
+    kind: 'exact',
+    path: ROUTE_PREFIX + '/desktop',
+    handler: async (req, res) => {
+      if (req.method !== 'GET') return sendJson(res, 405, { error: 'method-not-allowed' })
+      if (desktop === null) return sendJson(res, 200, { running: false })
+      let status = null
+      try {
+        status = typeof desktop.status === 'function' ? desktop.status() : null
+      } catch {
+        status = null
+      }
+      sendJson(res, 200, { running: true, status })
+    }
+  }))
+
   async function handleAction (body) {
     try {
       return await handleActionInner(body)
