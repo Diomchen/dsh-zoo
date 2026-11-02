@@ -8,29 +8,32 @@ import test from 'node:test'
 
 import { IDENTITY_FILE, defaultNickname } from '../src/identity.js'
 import { PEERS_FILE } from '../src/peers.js'
-import { VISIT_TTL_MS, isDeviceId, normalizeNickname } from '../src/protocol.js'
+import { PEER_LOST_MS, isDeviceId, normalizeNickname } from '../src/protocol.js'
 import { createService } from '../src/service.js'
-import { DEFAULT_ACCEPT_VISITS, SETTINGS_FILE, SETTINGS_VERSION } from '../src/settings.js'
+import { DEFAULT_ACCEPT_VISITS, DEFAULT_AUTO_VISITS, SETTINGS_FILE, SETTINGS_VERSION } from '../src/settings.js'
 import { VISITS_FILE } from '../src/visits.js'
 
-function fakeCtx () {  const routes = []
+function fakeCtx () {
+  const routes = []
   const warnings = []
-  return {
-    ctx: {
-      webServer: {
-        register (options) {
-          routes.push(options)
-          return () => {}
-        }
-      },
-      logger: {
-        info () {},
-        warn (line) { warnings.push(line) }
+  const handlers = new Map()
+  const ctx = {
+    webServer: {
+      register (options) {
+        routes.push(options)
+        return () => {}
       }
     },
-    routes,
-    warnings
+    logger: {
+      info () {},
+      warn (line) { warnings.push(line) }
+    },
+    on (name, fn, options) {
+      handlers.set(name, { fn, options })
+      return () => handlers.delete(name)
+    }
   }
+  return { ctx, routes, warnings, handlers }
 }
 
 async function tempDir (t) {
@@ -100,7 +103,7 @@ async function call (service, path, { method = 'GET', body } = {}) {
 }
 
 function makeService (t, options = {}) {
-  const { ctx, routes, warnings } = fakeCtx()
+  const { ctx, routes, warnings, handlers } = fakeCtx()
   const service = createService(ctx, {
     network: false,
     petBridge: false,
@@ -108,6 +111,7 @@ function makeService (t, options = {}) {
   })
   service.routes = routes
   service.warnings = warnings
+  service.handlers = handlers
   t.after(() => service.dispose())
   return service
 }
@@ -194,7 +198,8 @@ test('客厅开关默认开；关掉后落盘，重启仍是关，重新打开�
   assert.equal(first.snapshot().acceptVisits, false)
   assert.deepEqual(JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8')), {
     version: SETTINGS_VERSION,
-    acceptVisits: false
+    acceptVisits: false,
+    autoVisits: false
   })
 
   // 非布尔值明确失败，不隐式 toggle。
@@ -492,7 +497,7 @@ test('损坏的 visits.json 不影响启动与串门；完成后的记录会重�
   service.room.setTrust({ allowed: { [deviceId]: { nickname: '甲' } } })
   assert.equal(service.room.beginVisit(deviceId, { visitId, at: now }).ok, true)
   assert.equal(service.room.observeVisitAck({ deviceId, visitId }, now + 100).ok, true)
-  service.room.tick(now + 100 + VISIT_TTL_MS)
+  service.room.tick(now + 100 + PEER_LOST_MS)
   // 内存里的记录立即出现；磁盘上还是损坏文件，直到 service 把队列交出去。
   assert.equal(service.snapshot().visits.length, 1)
   assert.equal(service.snapshot().visits[0].direction, 'out')
@@ -502,7 +507,7 @@ test('损坏的 visits.json 不影响启动与串门；完成后的记录会重�
   const raw = await waitForVisits(dir, (parsed) => parsed.visits.length === 1)
   assert.equal(raw.visits[0].direction, 'out')
   assert.equal(raw.visits[0].nickname, '甲')
-  assert.equal(raw.visits[0].durationMs, VISIT_TTL_MS)
+  assert.equal(raw.visits[0].durationMs, PEER_LOST_MS)
 })
 
 test('visits.json 不可写：串门照常完成，记录留在内存且只告警一次', async (t) => {
@@ -530,7 +535,7 @@ test('visits.json 不可写：串门照常完成，记录留在内存且只告�
   service.room.setTrust({ allowed: { [deviceId]: { nickname: '甲' } } })
   assert.equal(service.room.beginVisit(deviceId, { visitId, at: now }).ok, true)
   assert.equal(service.room.observeVisitAck({ deviceId, visitId }, now + 100).ok, true)
-  service.room.tick(now + 100 + VISIT_TTL_MS)
+  service.room.tick(now + 100 + PEER_LOST_MS)
   assert.equal(service.snapshot().visits.length, 1)
 
   service.dispose()
@@ -541,4 +546,190 @@ test('visits.json 不可写：串门照常完成，记录留在内存且只告�
   assert.ok(service.warnings.some((line) => /串门记录写不进去/.test(line)))
   const raw = JSON.parse(await readFile(join(dir, VISITS_FILE), 'utf8'))
   assert.deepEqual(raw.visits, [])
+})
+
+
+test('自动出门默认关；auto-visits action 落盘，重启后保持', async (t) => {
+  const dir = await tempDir(t)
+  const first = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await first.ready
+
+  assert.equal(DEFAULT_AUTO_VISITS, false)
+  assert.equal(first.snapshot().autoVisit.enabled, false)
+  assert.equal(first.snapshot().autoVisit.activitySource, 'none')
+
+  const bad = await call(first, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'auto-visits', enabled: 'false' }
+  })
+  assert.equal(bad.status, 409)
+  assert.deepEqual(bad.body, { ok: false, error: 'bad-enabled' })
+  assert.equal(first.snapshot().autoVisit.enabled, false)
+
+  const on = await call(first, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'auto-visits', enabled: true }
+  })
+  assert.equal(on.status, 200)
+  assert.deepEqual(on.body, {
+    ok: true,
+    action: 'auto-visits',
+    autoVisits: true,
+    persisted: true
+  })
+  assert.equal(first.snapshot().autoVisit.enabled, true)
+  assert.equal(JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8')).autoVisits, true)
+
+  first.dispose()
+  const second = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await second.ready
+  assert.equal(second.snapshot().autoVisit.enabled, true)
+  assert.equal(second.snapshot().acceptVisits, DEFAULT_ACCEPT_VISITS)
+})
+
+test('老 settings.json 没有 autoVisits：按默认关运行，不告警', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, SETTINGS_FILE), JSON.stringify({
+    version: SETTINGS_VERSION,
+    acceptVisits: false
+  }), 'utf8')
+
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+  assert.equal(service.snapshot().acceptVisits, false)
+  assert.equal(service.snapshot().autoVisit.enabled, false)
+  assert.deepEqual(service.warnings, [])
+})
+
+test('session/event 是主活动信号：订阅带 global，任何事件都刷新 lastActivityAt', async (t) => {
+  const service = makeService(t, {
+    dataDir: await tempDir(t),
+    petConfigPath: join(await tempDir(t), 'missing.jsonc')
+  })
+  await service.ready
+
+  const entry = service.handlers.get('session/event')
+  assert.ok(entry, '应该订阅 session/event')
+  assert.deepEqual(entry.options, { global: true })
+  assert.equal(service.snapshot().autoVisit.activitySource, 'none')
+
+  entry.fn({ id: 'session-1' }, { type: 'user/message' })
+  const first = service.snapshot().autoVisit
+  assert.equal(first.activitySource, 'session')
+  assert.equal(Number.isFinite(first.lastActivityAt), true)
+
+  entry.fn({ id: 'session-1' }, { type: 'turn/start' })
+  assert.ok(service.snapshot().autoVisit.lastActivityAt >= first.lastActivityAt)
+
+  service.dispose()
+  assert.equal(service.handlers.has('session/event'), false, 'dispose 要退订')
+})
+
+test('session/event 不可用时退回桌面指针：光标进入宠物才算活动，离开不算', async (t) => {
+  const dir = await tempDir(t)
+  let captured = null
+  const factory = (options) => {
+    captured = options
+    return {
+      start () { return { ok: true, pid: 123 } },
+      update () { return true },
+      resync () { return true },
+      dispose () {}
+    }
+  }
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: factory
+  })
+  await service.ready
+  assert.ok(captured, '桌面层应该被创建')
+  captured.onEvent({ type: 'ready', pid: 123, workArea: { x: 0, y: 0, width: 1000, height: 700 } })
+  assert.equal(service.snapshot().autoVisit.activitySource, 'none')
+
+  captured.onEvent({ type: 'hit', inside: true, point: { x: 10, y: 20 }, reason: 'hovering' })
+  const pointer = service.snapshot().autoVisit
+  assert.equal(pointer.activitySource, 'pointer')
+  assert.equal(Number.isFinite(pointer.lastActivityAt), true)
+
+  // 光标离开宠物不算“有活动”；session/event 的事件更近时又切回主信号。
+  captured.onEvent({ type: 'hit', inside: false, point: { x: 10, y: 20 }, reason: 'outside' })
+  assert.equal(service.snapshot().autoVisit.lastActivityAt, pointer.lastActivityAt)
+  service.handlers.get('session/event').fn({ id: 's' }, { type: 'turn/start' })
+  assert.equal(service.snapshot().autoVisit.activitySource, 'session')
+})
+
+test('手动串门不带 deviceId：随机挑在线已放行邻居；没有目标时给可读原因', async (t) => {
+  const dir = await tempDir(t)
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+
+  // 一个都没放行：明确说“还没有人放行你”，不是含糊的超时。
+  const none = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'visit' }
+  })
+  assert.equal(none.status, 409)
+  assert.equal(none.body.error, 'no-admitted')
+  assert.match(none.body.notice, /还没有人放行你/)
+
+  // 放行了、也收到了广播，但对方还没有心跳 = 还不确定对方放行了我：不指向它。
+  const deviceId = randomUUID()
+  service.room.observeBeacon({ deviceId, nickname: '甲', port: 40001 }, Date.now())
+  assert.equal((await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'admit', deviceId }
+  })).status, 200)
+  const noEvidence = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'visit' }
+  })
+  assert.equal(noEvidence.status, 409)
+  assert.equal(noEvidence.body.error, 'no-online')
+  assert.match(noEvidence.body.notice, /都不在线/)
+
+  // 收到对方心跳后（证明对方放行了我），随机挑中了它；但发现层没有地址（network:false），
+  // 所以明确报 peer-offline，而不是含糊的超时。
+  assert.equal(service.room.observeHeartbeat({ deviceId, anim: null }, Date.now()), true)
+
+  const offline = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'visit' }
+  })
+  assert.equal(offline.status, 409)
+  assert.equal(offline.body.error, 'peer-offline')
+  assert.equal(offline.body.deviceId, deviceId)
+  assert.match(offline.body.notice, /好像不在线/)
+  assert.equal(service.snapshot().self.out, null)
+  assert.deepEqual(service.snapshot().visits, [])
+})
+
+test('坏 deviceId 仍然明确失败；不带 deviceId 才是“随机挑一个”', async (t) => {
+  const dir = await tempDir(t)
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc')
+  })
+  await service.ready
+
+  for (const deviceId of ['', 'not-a-uuid', 42]) {
+    const result = await call(service, '/local-pet/action', {
+      method: 'POST',
+      body: { action: 'visit', deviceId }
+    })
+    assert.equal(result.status, 409)
+    assert.deepEqual(result.body, { ok: false, error: 'bad-device-id' })
+  }
 })

@@ -126,7 +126,8 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   `x`/`y` 不会让它瞬移。`reset: true` 才会让渲染端按 `x`/`y` 重新出生全部宠物
   （`src/desktop.js` 的 `manager.resync(scene)`）。
 - **尺寸**：`width`/`height` 是整只宠物的命中矩形；渲染端用同一个矩形做物理边界和上报。
-- **谁在画**：`role` 目前是 `self` / `guest` / `visitor`；`kind` 留了 `card` 给 ticket 11。
+- **谁在画**：宿主目前只下发 `self` / `visitor`（心跳影子不下发，它不是客人）；
+  场景协议仍接受 `guest` 给截图/演示用。`kind` 留了 `card` 给 ticket 11。
 - **动作降级**：`anim` 是 dsh-pet 动画名；渲染端先试它，404/解码失败退到内置待机片段轮播，
   全失败才画带昵称的 SVG 色块。
 - `items` 上限 64；重复 `id`、未知 `kind`、非正尺寸、非 `#rrggbb` 颜色都会被丢弃/回落。
@@ -184,6 +185,6 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - macOS 上 `forward: true` 依赖 Electron 的鼠标转发钩子；hook 失效时靠主进程 300ms 兜底接管。
 - `setVisibleOnAllWorkspaces` + `focusable:false` 在「全屏应用/台前调度」下的实际层级没有真机
   验证；置顶层级用 `floating`，不压截图。
-- 宠物之间没有物理碰撞（SPEC v2 out of scope）；同屏数量不设上限，但每个宠物一个 `<video>`，
-  客人非常多时解码开销会线性增长。
+- 宠物之间没有物理碰撞（SPEC v2 out of scope）；同屏数量不设产品上限，但场景协议单条消息
+  最多 64 个 item（渲染上限），且每个宠物一个 `<video>`，客人非常多时解码开销线性增长。
 - 截图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）。

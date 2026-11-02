@@ -372,30 +372,39 @@ test('petsFromSnapshot：自己的宠物优先；没装 dsh-pet 时用昵称+色
   assert.deepEqual(away, [], '出门期间本机桌面不显示自己（ticket 09 依赖这一条）')
 })
 
-test('petsFromSnapshot：心跳影子 + 串门访客都画出来；同一位邻居串门优先，访客画在最后', () => {
+test('petsFromSnapshot：只画串门访客；心跳影子不是客人，不画', () => {
   const guestId = '22222222-2222-4222-8222-222222222222'
   const visitorId = '33333333-3333-4333-8333-333333333333'
-  const pets = petsFromSnapshot(snapshotWith({
+  const snapshot = snapshotWith({
     guests: [
       { deviceId: guestId, nickname: '阿蟹', anim: '螃蟹走路', since: 1, expiresAt: 2 },
       { deviceId: visitorId, nickname: '泡泡', anim: '原地漂浮踏步', since: 1, expiresAt: 2 },
       { deviceId: 'not-a-uuid/', nickname: '坏家伙', anim: null }
     ],
     visitors: [
-      { deviceId: visitorId, nickname: '泡泡', anim: '东张西望', visitId: 'v', since: 1, endsAt: 2 }
+      {
+        deviceId: visitorId,
+        nickname: '泡泡',
+        anim: '东张西望',
+        visitId: 'v',
+        since: 1,
+        lastSeen: 1,
+        endsAt: null
+      }
     ]
-  }))
-  assert.deepEqual(pets.map((pet) => pet.id), [
-    'self',
-    'guest:' + guestId,
-    'visitor:' + visitorId
-  ])
-  assert.deepEqual(pets.map((pet) => pet.role), ['self', 'guest', 'visitor'])
-  assert.equal(pets[1].label, '阿蟹')
-  assert.equal(pets[2].label, '泡泡')
-  assert.equal(pets[2].anim, '东张西望')
+  })
+  const pets = petsFromSnapshot(snapshot)
+  assert.deepEqual(pets.map((pet) => pet.id), ['self', 'visitor:' + visitorId])
+  assert.deepEqual(pets.map((pet) => pet.role), ['self', 'visitor'])
+  assert.equal(pets[1].label, '泡泡')
+  assert.equal(pets[1].anim, '东张西望')
   assert.notEqual(pets[1].color, shared.PET_COLORS[0])
-  assert.notEqual(pets[2].color, shared.PET_COLORS[0])
+
+  // 只有心跳影子、没有 visitors：桌面上只有自己——否则“串门”会变成邻居一直待着。
+  assert.deepEqual(
+    petsFromSnapshot(snapshotWith({ guests: snapshot.guests })).map((pet) => pet.id),
+    ['self']
+  )
 })
 
 test('petsFromSnapshot：坏快照不抛、重复 deviceId 只画一次、最多 MAX_SCENE_ITEMS', () => {
@@ -403,7 +412,7 @@ test('petsFromSnapshot：坏快照不抛、重复 deviceId 只画一次、最多
   assert.deepEqual(petsFromSnapshot({}), [])
   const id = '44444444-4444-4444-8444-444444444444'
   const duplicated = petsFromSnapshot(snapshotWith({
-    guests: [
+    visitors: [
       { deviceId: id, nickname: 'A', anim: null },
       { deviceId: id, nickname: 'B', anim: null }
     ]
