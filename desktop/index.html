@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!-- 这个页面不联网、不加载远程资源：只允许同目录脚本，连 img 都只放行 data:。 -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    />
+    <title>dsh-local-pet</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        user-select: none;
+        -webkit-user-select: none;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      }
+      #stage {
+        position: fixed;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      /*
+       * 命中区就是道具自己的矩形：窗口默认整窗穿透，只有光标进入矩形时才由主进程接管鼠标。
+       * pointer-events:auto 只在「已经接管鼠标」时才有意义（拖拽/点卡片，ticket 08）。
+       */
+      .lp-item {
+        position: absolute;
+        box-sizing: border-box;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6px;
+        border-radius: 22%;
+        overflow: hidden;
+        pointer-events: auto;
+        color: #f4f8ff;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        text-align: center;
+        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+        box-shadow:
+          inset 0 0 0 1px rgba(255, 255, 255, 0.35),
+          0 6px 18px rgba(0, 0, 0, 0.18);
+      }
+      .lp-item[data-kind='card'] {
+        align-items: flex-start;
+        justify-content: flex-start;
+        border-radius: 12px;
+        background: rgba(20, 26, 34, 0.92) !important;
+        color: #eaf1fb;
+        font-weight: 400;
+        text-align: left;
+      }
+      .lp-item[data-kind='placeholder'] {
+        cursor: default;
+      }
+      .lp-item-label {
+        pointer-events: none;
+        overflow-wrap: anywhere;
+      }
+      /* 截图/调试标识：占位方块右下角的锚点，肉眼就能看出窗口坐标系的原点方向 */
+      .lp-item[data-kind='placeholder']::after {
+        content: '';
+        position: absolute;
+        right: 8px;
+        bottom: 8px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: rgba(255, 255, 255, 0.75);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script src="shared.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
