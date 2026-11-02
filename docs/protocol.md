@@ -50,9 +50,19 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
-| `anim` | `heartbeat`、`visit-request` | 本机宠物当前动作名，或 `null`；必须是安全文件名（无路径分隔符/控制字符，≤64）。这是唯一上网的动作意图 |
+| `anim` | `heartbeat`、`visit-request` | 本机宠物当前动作名，或 `null`；必须是安全文件名（无路径分隔符/控制字符，≤64）。旧端只读它 |
+| `action` | `heartbeat`、`visit-request` | 本机宠物当前动作的**语义名**（自由字符串，≤64）；缺省时消费端回退到 `anim`。和 `anim` 相同时不必重复发 |
+| `semantic` | `heartbeat`、`visit-request` | 动作的固定语义标签：`working` / `eating` / `sleeping` / `idle` / `other`；不认识的动作靠它画通用表情 |
+| `say` | `heartbeat`、`visit-request` | `{ text, until }`：气泡文本（清洗、≤80 码点）与过期时刻；`until` 最多 `now + 30s`，过期不显示 |
+| `skinPort` | `beacon`、`beacon-ack`、`heartbeat`、`visit-request` | 本机素材源端口（1..65535）；没有素材源就不带 |
+| `skinId` | 同上 | 素材源 id（`[A-Za-z0-9_-]{1,32}`）；缺省用 `deviceId` |
 | `visitId` | `visit-*` | 一次串门的随机 UUID；与 `deviceId` 同一种形状，但只用于关联这一次串门 |
 | `reason` | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
+
+**兼容口径（v 仍为 1）**：以上新字段全部可选。旧端解析时会丢弃未知字段，行为不变；
+新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
+`say` 过期或形状不对就整条不显示。任何新字段非法都只丢那一个字段，不整包失败——
+`anim` 仍然必发，所以新旧两端始终能至少对上动作名。
 
 `port` 不代表“发现端口可以变”：发现端口仍是固定的 45871。`heartbeat` **没有**
 `nickname` 和 `port`：访客的昵称来自邻居表或放行名单，心跳不能改名字；

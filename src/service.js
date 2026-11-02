@@ -12,6 +12,8 @@ import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
+import { resolveSkinPort, startSkinServer } from './skin-server.js'
+import { loadSkinSources } from './skin-sources.js'
 import {
   HEARTBEAT_INTERVAL_MS,
   PEER_LOST_MS,
@@ -109,6 +111,9 @@ export function createService (ctx, options = {}) {
   let desktopHelperPid = null
   let desktopSceneSignature = null
   let desktopSyncTimer = null
+  // 对外素材源（ticket 15）：端口与源 id 随 beacon/心跳广告；起不来就是 null。
+  let skinServer = null
+  let skinRef = null
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
@@ -336,6 +341,9 @@ export function createService (ctx, options = {}) {
       if (disposed) return
 
       if (options.network !== false) {
+        // 先起素材源，再起发现：beacon 的第一拍就能带上 skinPort。
+        await startSkinSource()
+        if (disposed) return
         const port = options.port ?? resolvePort(env)
         discovery = createDiscovery({
           identity,
@@ -347,6 +355,8 @@ export function createService (ctx, options = {}) {
           bindAddress: options.bindAddress,
           broadcastAddress: options.broadcastAddress,
           beaconIntervalMs: options.beaconIntervalMs,
+          // 素材源端口可能晚起/没起：每次现取，取不到就不带。
+          skin: () => skinRef,
           // 出站单播（心跳/串门）在发现层里也只走这一个门控。
           mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
           onPeer (packet) {
@@ -431,6 +441,39 @@ export function createService (ctx, options = {}) {
         startVisitTimer()
         startAutoVisitTimer()
       }
+    }
+  }
+
+  /**
+   * 对外素材源（ticket 15）：把本机注册表里的源挂到一个只读 HTTP 端口上。
+   * 起不来只影响「访客能不能拿我的素材」，不影响发现/串门/桌面。
+   */
+  async function startSkinSource () {
+    if (options.skinServer === false) return
+    try {
+      const loaded = await loadSkinSources({ dataDir: dir, env })
+      for (const warning of loaded.warnings) {
+        log.warn('素材源：' + warning.code + (warning.detail === undefined ? '' : '（' + warning.detail + '）'))
+      }
+      if (loaded.sources.length === 0) {
+        log.info('没有可对外的素材源：访客先用本机素材，没有就画通用小人')
+        return
+      }
+      const requested = Number.isInteger(options.skinPort) ? options.skinPort : resolveSkinPort(env)
+      skinServer = await startSkinServer({
+        sources: loaded.sources,
+        port: requested,
+        host: '0.0.0.0',
+        log
+      })
+      if (skinServer === null) {
+        log.warn('素材源端口没起来：访客先用本机素材，没有就画通用小人')
+        return
+      }
+      skinRef = { port: skinServer.port, id: loaded.sources[0].id }
+      log.info('素材源已对外：' + skinRef.id + ' @ ' + skinRef.port)
+    } catch (error) {
+      log.warn('素材源没起来（不影响串门）：' + message(error))
     }
   }
 
@@ -645,9 +688,19 @@ export function createService (ctx, options = {}) {
    */
   function heartbeatData () {
     if (identity === null) return null
-    const anim = room.snapshot().self.pet?.anim ?? null
+    const pet = room.snapshot().self.pet
+    const anim = pet?.anim ?? null
     try {
-      return encodeHeartbeat({ deviceId: identity.deviceId, anim })
+      return encodeHeartbeat({
+        deviceId: identity.deviceId,
+        anim,
+        // 只有宿主真的知道一个独立动作名时才发 action；等于 anim 时不必重复占字节。
+        action: pet?.action ?? null,
+        semantic: pet?.semantic ?? null,
+        say: pet?.say ?? null,
+        skinPort: skinRef?.port,
+        skinId: skinRef?.id
+      })
     } catch {
       // 本机身份坏了只停心跳，不影响邻居灯和本地影子。
       return null
@@ -906,13 +959,19 @@ export function createService (ctx, options = {}) {
     if (disposed || discovery === null || identity === null) return false
     const out = room.outboundVisit()
     if (out === null || out.visitId !== visitId) return false
+    const pet = room.snapshot().self.pet
     let data
     try {
       data = encodeVisitRequest({
         deviceId: identity.deviceId,
         visitId,
         nickname: identity.nickname,
-        anim: room.snapshot().self.pet?.anim ?? null
+        anim: pet?.anim ?? null,
+        action: pet?.action ?? null,
+        semantic: pet?.semantic ?? null,
+        say: pet?.say ?? null,
+        skinPort: skinRef?.port,
+        skinId: skinRef?.id
       })
     } catch {
       return false
@@ -1074,6 +1133,9 @@ export function createService (ctx, options = {}) {
         autoVisitTimer = null
       }
       stopDesktopSync()
+      try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }
+      skinServer = null
+      skinRef = null
       request = null
       recalls.clear()
       discovery?.dispose()

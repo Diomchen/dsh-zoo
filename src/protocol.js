@@ -9,7 +9,8 @@
  *   visit-request/ack/deny/recall 是一次串门的生命周期；
  * - 任何校验失败都只返回 `{ ok: false }`，不抛异常、不写盘、不读本机状态。
  *
- * 协议本身不传素材、不传坐标、不传项目或会话信息（ADR-0003）。
+ * 协议本身不传素材本体、不传坐标、不传项目或会话信息（ADR-0003）。素材只传引用：
+ * `skinPort` / `skinId` 告诉对方去哪儿取，视频本身走 HTTP（ticket 15 起）。
  */
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -17,6 +18,14 @@ export const MAX_PACKET_BYTES = 4 * 1024
 export const MAX_NICKNAME = 32
 export const MAX_LABEL = 64
 export const MAX_ANIMATION = 64
+/** 跨端气泡最多 80 个码点；再长就不像“随口一句”，也给了滥用一个上限。 */
+export const MAX_SAY = 80
+/** 气泡最多活 30 秒；过期就不再显示，避免一条旧话挂在别人桌面上。 */
+export const SAY_MAX_AGE_MS = 30 * 1000
+/** 语义标签是固定小表：不认识的动作名靠它画一个通用表情。 */
+export const SEMANTIC_TAGS = Object.freeze(['working', 'eating', 'sleeping', 'idle', 'other'])
+const SEMANTIC_SET = new Set(SEMANTIC_TAGS)
+const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
 export const MAX_NEIGHBORS = 64
 export const BEACON_INTERVAL_MS = 5000
 export const NEIGHBOR_TTL_MS = 30000
@@ -126,6 +135,29 @@ export function normalizeAnimation (value) {
   return isSafeAnimationName(value) ? value.trim() : null
 }
 
+/** 语义标签只认固定小表；不认识（或旧端没带）一律 null，由调用方回退。 */
+export function normalizeSemantic (value) {
+  return typeof value === 'string' && SEMANTIC_SET.has(value) ? value : null
+}
+
+/** 素材源 id：和 deviceId 一样是短标识符，不是路径。 */
+export function normalizeSkinId (value) {
+  return typeof value === 'string' && SKIN_ID_RE.test(value) ? value : null
+}
+
+/**
+ * 气泡：`{ text, until }`。文本清洗成一行、按码点截断 80；`until` 超过 30 秒封顶；
+ * 过期或形状不对整条丢弃（返回 null），不抛——这是网络输入。
+ */
+export function normalizeSay (value, now = Date.now()) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const text = sanitizeLabel(value.text, MAX_SAY)
+  if (text === null) return null
+  const until = Number(value.until)
+  if (!Number.isFinite(until) || until <= now) return null
+  return { text, until: Math.min(Math.floor(until), now + SAY_MAX_AGE_MS) }
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.LOCAL_PET_PORT
@@ -136,18 +168,32 @@ export function resolvePort (env = process.env) {
 
 /**
  * 构造一个只含白名单字段的报文。字段顺序与字段集按类型固定，便于测试和抓包对照：
- *   beacon / beacon-ack     → { v, type, deviceId, nickname, port }
- *   heartbeat               → { v, type, deviceId, anim }
- *   visit-request           → { v, type, deviceId, visitId, nickname, anim }
+ *   beacon / beacon-ack     → { v, type, deviceId, nickname, port[, skinPort, skinId] }
+ *   heartbeat               → { v, type, deviceId, anim[, action, semantic, say, skinPort, skinId] }
+ *   visit-request           → { v, type, deviceId, visitId, nickname, anim[, action, semantic, say, skinPort, skinId] }
  *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
  * （这是程序错误，不是网络输入）。
- * 本机动画名非法时不抛：降级成 null，让对端自己放待机。
+ * 本机动画名/动作名/气泡非法时不抛：降级成“不带这个字段”，让对端自己放待机。
  */
-export function encodePacket ({ type, deviceId, nickname, port, anim, visitId, reason } = {}) {
+export function encodePacket ({
+  type,
+  deviceId,
+  nickname,
+  port,
+  anim,
+  visitId,
+  reason,
+  action,
+  semantic,
+  say,
+  skinPort,
+  skinId,
+  now = Date.now()
+} = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
   if (!isDeviceId(deviceId)) throw new Error('protocol: invalid deviceId')
 
@@ -156,9 +202,11 @@ export function encodePacket ({ type, deviceId, nickname, port, anim, visitId, r
     type,
     deviceId: deviceId.toLowerCase()
   }
+  const pet = petExtras({ action, semantic, say, now })
+  const skin = skinExtras({ skinPort, skinId })
   let packet
   if (type === 'heartbeat') {
-    packet = { ...base, anim: normalizeAnimation(anim) }
+    packet = { ...base, anim: normalizeAnimation(anim), ...pet, ...skin }
   } else if (type === 'visit-request') {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     const safeNickname = normalizeNickname(nickname)
@@ -167,7 +215,9 @@ export function encodePacket ({ type, deviceId, nickname, port, anim, visitId, r
       ...base,
       visitId: visitId.toLowerCase(),
       nickname: safeNickname,
-      anim: normalizeAnimation(anim)
+      anim: normalizeAnimation(anim),
+      ...pet,
+      ...skin
     }
   } else if (type === 'visit-deny') {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
@@ -182,7 +232,7 @@ export function encodePacket ({ type, deviceId, nickname, port, anim, visitId, r
     if (!isPort(port)) throw new Error('protocol: invalid port')
     const safeNickname = normalizeNickname(nickname)
     if (safeNickname === null) throw new Error('protocol: invalid nickname')
-    packet = { ...base, nickname: safeNickname, port }
+    packet = { ...base, nickname: safeNickname, port, ...skin }
   }
 
   const data = Buffer.from(JSON.stringify(packet), 'utf8')
@@ -190,14 +240,46 @@ export function encodePacket ({ type, deviceId, nickname, port, anim, visitId, r
   return data
 }
 
-/** ticket 04 的窄入口：调用方无法往心跳里塞昵称、端口或坐标。 */
-export function encodeHeartbeat ({ deviceId, anim } = {}) {
-  return encodePacket({ type: 'heartbeat', deviceId, anim })
+/** 心跳/串门请求共用的可选字段；非法值只是不带，不整包失败。 */
+function petExtras ({ action, semantic, say, now }) {
+  const extras = {}
+  const safeAction = normalizeAnimation(action)
+  if (safeAction !== null) extras.action = safeAction
+  const safeSemantic = normalizeSemantic(semantic)
+  if (safeSemantic !== null) extras.semantic = safeSemantic
+  const safeSay = normalizeSay(say, now)
+  if (safeSay !== null) extras.say = safeSay
+  return extras
 }
 
-/** ticket 05 的窄入口：串门请求只带昵称、动作和串门 id。 */
-export function encodeVisitRequest ({ deviceId, visitId, nickname, anim } = {}) {
-  return encodePacket({ type: 'visit-request', deviceId, visitId, nickname, anim })
+function skinExtras ({ skinPort, skinId }) {
+  const extras = {}
+  if (isPort(skinPort)) extras.skinPort = skinPort
+  const safeId = normalizeSkinId(skinId)
+  if (safeId !== null) extras.skinId = safeId
+  return extras
+}
+
+/** ticket 04 的窄入口：调用方无法往心跳里塞昵称、端口或坐标。 */
+export function encodeHeartbeat ({ deviceId, anim, action, semantic, say, skinPort, skinId, now } = {}) {
+  return encodePacket({ type: 'heartbeat', deviceId, anim, action, semantic, say, skinPort, skinId, now })
+}
+
+/** ticket 05 的窄入口：串门请求只带昵称、动作和串门 id（外加可选的 skin/状态）。 */
+export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action, semantic, say, skinPort, skinId, now } = {}) {
+  return encodePacket({
+    type: 'visit-request',
+    deviceId,
+    visitId,
+    nickname,
+    anim,
+    action,
+    semantic,
+    say,
+    skinPort,
+    skinId,
+    now
+  })
 }
 
 export function encodeVisitAck ({ deviceId, visitId } = {}) {
@@ -225,7 +307,7 @@ function fail (reason) {
  * 把 UDP 载荷解析成**新**的、只含白名单字段的对象。
  * 绝不把原始 JSON 对象交给调用方：未知字段到这里就结束了。
  */
-export function parsePacket (input) {
+export function parsePacket (input, { now = Date.now() } = {}) {
   if (typeof input === 'string') {
     if (Buffer.byteLength(input, 'utf8') > MAX_PACKET_BYTES) return fail('too-large')
   } else if (input instanceof Uint8Array) {
@@ -255,6 +337,7 @@ export function parsePacket (input) {
   if (!isDeviceId(raw.deviceId)) return fail('device-id')
 
   // 心跳只承载动作意图：anim 必须显式存在，是 null 或安全动画名。
+  // 新字段（action/semantic/say/skin*）全部可选：非法就只是不带，旧字段仍然有效。
   // nickname / port / 坐标等字段即使出现也不会被读取（下面重建对象）。
   if (raw.type === 'heartbeat') {
     if (raw.anim !== null && !isSafeAnimationName(raw.anim)) return fail('anim')
@@ -264,7 +347,9 @@ export function parsePacket (input) {
         v: PROTOCOL_VERSION,
         type: raw.type,
         deviceId: raw.deviceId.toLowerCase(),
-        anim: raw.anim === null ? null : raw.anim.trim()
+        anim: raw.anim === null ? null : raw.anim.trim(),
+        ...petExtras({ action: raw.action, semantic: raw.semantic, say: raw.say, now }),
+        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
       }
     }
   }
@@ -283,7 +368,9 @@ export function parsePacket (input) {
         deviceId: raw.deviceId.toLowerCase(),
         visitId: raw.visitId.toLowerCase(),
         nickname,
-        anim: raw.anim === null ? null : raw.anim.trim()
+        anim: raw.anim === null ? null : raw.anim.trim(),
+        ...petExtras({ action: raw.action, semantic: raw.semantic, say: raw.say, now }),
+        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
       }
     }
   }
@@ -331,7 +418,8 @@ export function parsePacket (input) {
       type: raw.type,
       deviceId: raw.deviceId.toLowerCase(),
       nickname,
-      port: raw.port
+      port: raw.port,
+      ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
     }
   }
 }

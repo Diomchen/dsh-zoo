@@ -47,7 +47,7 @@ async function tempDir (t) {
 
 function makeService (t, options = {}) {
   const { ctx, routes } = fakeCtx()
-  const service = createService(ctx, { petBridge: false, ...options })
+  const service = createService(ctx, { petBridge: false, skinServer: false, ...options })
   service.routes = routes
   t.after(() => service.dispose())
   return service

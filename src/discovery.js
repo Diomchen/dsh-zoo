@@ -48,6 +48,7 @@ export function createDiscovery ({
   broadcastAddress = '255.255.255.255',
   beaconIntervalMs = BEACON_INTERVAL_MS,
   mayTalkTo = () => false,
+  skin = null,
   onPeer,
   log,
   now = () => Date.now()
@@ -93,11 +94,15 @@ export function createDiscovery ({
   }
 
   function packetFor (type) {
+    // 素材源端口可能比 discovery 晚起来（或压根起不来）：每拍现取，取不到就不带。
+    const current = typeof skin === 'function' ? skin() : skin
     return encodePacket({
       type,
       deviceId: identity?.deviceId,
       nickname: identity?.nickname,
-      port: advertisedPort()
+      port: advertisedPort(),
+      skinPort: current?.port,
+      skinId: current?.id
     })
   }
 

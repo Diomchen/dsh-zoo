@@ -47,7 +47,7 @@ async function tempDir (t) {
 
 function makeService (t, options = {}) {
   const { ctx, routes } = fakeCtx()
-  const service = createService(ctx, { petBridge: false, ...options })
+  const service = createService(ctx, { petBridge: false, skinServer: false, ...options })
   service.routes = routes
   t.after(() => service.dispose())
   return service
@@ -356,6 +356,7 @@ test('本机动作一变就立刻补发心跳，不等 2 秒节拍', async (t) =
     dataDir: dir,
     petConfigPath: configPath,
     network: true,
+    skinServer: false,
     port: servicePort,
     targetPort: peerPort,
     bindAddress: '127.0.0.1',

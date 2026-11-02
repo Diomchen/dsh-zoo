@@ -466,3 +466,33 @@ test('sendReply 只给 visit-deny 用：未放行也能回执，但每来源 2 �
   assert.equal(discovery.sendReply(neighborId, Buffer.alloc(MAX_PACKET_BYTES + 1)), false)
   assert.equal(discovery.sendReply(randomUUID(), first), false)
 })
+
+test('beacon 带上素材源端口与 id；源没起来时就不带', async (t) => {
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.address().port
+  const box = inbox(peer)
+  let skin = null
+
+  const discovery = createDiscovery({
+    identity: { deviceId: randomUUID(), nickname: '甲' },
+    port: 0,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    skin: () => skin,
+    log: { warn () {} }
+  })
+  t.after(() => discovery.dispose())
+  await discovery.start()
+
+  const first = await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon')
+  assert.equal(first.parsed.packet.skinPort, undefined)
+  assert.equal(first.parsed.packet.skinId, undefined)
+
+  skin = { port: 45873, id: 'dsh-pet' }
+  assert.equal(discovery.sendBeacon(), true)
+  const second = await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon')
+  assert.equal(second.parsed.packet.skinPort, 45873)
+  assert.equal(second.parsed.packet.skinId, 'dsh-pet')
+})
