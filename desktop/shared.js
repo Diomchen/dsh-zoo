@@ -770,12 +770,36 @@
     }
   }
 
+  /** 素材诊断：helper 的 status 里带当前 clip 与最近切换记录；这里也走白名单。 */
+  function normalizeMedia (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const clip = normalizeToken(raw.clip)
+    const source = normalizeToken(raw.source)
+    const failed = []
+    if (Array.isArray(raw.failed)) {
+      for (const item of raw.failed.slice(-16)) {
+        const name = normalizeToken(item)
+        if (name !== null) failed.push(name)
+      }
+    }
+    return {
+      clip: clip ?? null,
+      source: source ?? null,
+      failed,
+      at: isFiniteNumber(raw.at) ? raw.at : null
+    }
+  }
+
   function normalizeStatus (raw) {
     const bounds = normalizeRect(raw.bounds)
     const pointer = normalizePoint(raw.pointer)
     return {
       ignoring: raw.ignoring !== false,
       sceneItems: Number.isInteger(raw.sceneItems) && raw.sceneItems >= 0 ? raw.sceneItems : 0,
+      media: normalizeMedia(raw.media),
+      mediaHistory: Array.isArray(raw.mediaHistory)
+        ? raw.mediaHistory.slice(-20).map(normalizeMedia).filter((entry) => entry !== null)
+        : [],
       hoverInside: raw.hoverInside === true,
       lastHoverAgeMs: isFiniteNumber(raw.lastHoverAgeMs) && raw.lastHoverAgeMs >= 0
         ? raw.lastHoverAgeMs
