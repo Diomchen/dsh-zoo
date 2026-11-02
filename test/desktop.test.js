@@ -1014,3 +1014,43 @@ async function waitFor (predicate, timeoutMs) {
   }
   throw new Error('等待超时')
 }
+
+test('LOCAL_PET_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常', async (t) => {
+  for (const value of ['0', 'false', 'off', 'NO']) {
+    const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
+    t.after(() => rm(dir, { recursive: true, force: true }))
+    let spawned = 0
+    const { ctx } = fakeCtx()
+    const service = createService(ctx, {
+      network: false,
+      petBridge: false,
+      dataDir: dir,
+      petConfigPath: join(dir, 'missing.jsonc'),
+      env: { LOCAL_PET_DESKTOP: value },
+      desktopFactory: () => { spawned += 1; return null }
+    })
+    await service.ready
+    assert.equal(spawned, 0, value + ' 应该关掉桌面层')
+    service.dispose()
+  }
+})
+
+test('LOCAL_PET_DESKTOP 为空或其它值时仍然启动桌面层', async (t) => {
+  for (const value of [undefined, '1', 'on']) {
+    const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
+    t.after(() => rm(dir, { recursive: true, force: true }))
+    let spawned = 0
+    const { ctx } = fakeCtx()
+    const service = createService(ctx, {
+      network: false,
+      petBridge: false,
+      dataDir: dir,
+      petConfigPath: join(dir, 'missing.jsonc'),
+      env: value === undefined ? {} : { LOCAL_PET_DESKTOP: value },
+      desktopFactory: () => { spawned += 1; return null }
+    })
+    await service.ready
+    assert.equal(spawned, 1, JSON.stringify(value) + ' 不该关掉桌面层')
+    service.dispose()
+  }
+})

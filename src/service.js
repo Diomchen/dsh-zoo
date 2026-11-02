@@ -392,6 +392,11 @@ export function createService (ctx, options = {}) {
    */
   function startDesktopLayer () {
     if (options.desktop === false) return
+    // 逃生开关：桌面窗是置顶全屏的，万一它在某台机器上行为不对，用户要能不改一行代码就关掉它。
+    if (isDesktopDisabled(options.env ?? process.env)) {
+      log.info('桌面层被 LOCAL_PET_DESKTOP 关闭：宠物不显示，网络与串门仍然工作')
+      return
+    }
     try {
       const factory = typeof options.desktopFactory === 'function' ? options.desktopFactory : createDesktop
       // 素材目录在宿主侧解析（不硬编码 profile 路径）；helper 只收到绝对路径。
@@ -1052,4 +1057,13 @@ function positiveOption (value, fallback, min = 1) {
 function integerOption (value, fallback, min, max) {
   const num = Number(value)
   return Number.isInteger(num) && num >= min && num <= max ? num : fallback
+}
+
+/**
+ * `LOCAL_PET_DESKTOP=0|false|off` 直接关掉桌面层。
+ * 置顶全屏窗如果出了意想不到的问题，这是唯一不需要改配置、也不需要卸载插件的出口。
+ */
+function isDesktopDisabled (env) {
+  const value = String(env?.LOCAL_PET_DESKTOP ?? '').trim().toLowerCase()
+  return value === '0' || value === 'false' || value === 'off' || value === 'no'
 }
