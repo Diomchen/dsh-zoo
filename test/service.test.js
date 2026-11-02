@@ -199,7 +199,8 @@ test('客厅开关默认开；关掉后落盘，重启仍是关，重新打开�
   assert.deepEqual(JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8')), {
     version: SETTINGS_VERSION,
     acceptVisits: false,
-    autoVisits: false
+    autoVisits: false,
+    desktop: true
   })
 
   // 非布尔值明确失败，不隐式 toggle。

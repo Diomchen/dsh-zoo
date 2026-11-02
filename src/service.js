@@ -417,6 +417,10 @@ export function createService (ctx, options = {}) {
       log.info('桌面层被 LOCAL_PET_DESKTOP 关闭：宠物不显示，网络与串门仍然工作')
       return
     }
+    if (settings !== null && settings.desktop === false) {
+      log.info('桌面层在 settings.json 里被关掉（desktop:false）：宠物不显示，网络与串门仍然工作')
+      return
+    }
     try {
       const factory = typeof options.desktopFactory === 'function' ? options.desktopFactory : createDesktop
       // 素材目录在宿主侧解析（不硬编码 profile 路径）；helper 只收到绝对路径。

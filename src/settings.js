@@ -7,6 +7,8 @@ import { join } from 'node:path'
  * 两个开关：
  *   - `acceptVisits`（默认开）：允不允许邻居把宠物派到我家。
  *   - `autoVisits`（默认关）：允不允许我的宠物**自己**偶尔出门串门（ticket 09）。
+ *   - `desktop`（默认开）：桌面层总闸。置顶全屏窗在你这台机器上行为不对时，把它写成 false
+ *     再重启，宠物不显示、其它一切照常——不需要环境变量，也不需要卸载插件。
  *       {
  *         "version": 1,
  *         "acceptVisits": true,
@@ -42,6 +44,7 @@ class SettingsStore {
   #log
   #acceptVisits = DEFAULT_ACCEPT_VISITS
   #autoVisits = DEFAULT_AUTO_VISITS
+  #desktop = true
   #warned = new Set()
   #writeChain = Promise.resolve()
 
@@ -81,6 +84,10 @@ class SettingsStore {
       if (typeof raw.autoVisits === 'boolean') this.#autoVisits = raw.autoVisits
       else this.#warnOnce('shape', '桌面开关形状不对，autoVisits 先按默认值运行')
     }
+    if (raw.desktop !== undefined) {
+      if (typeof raw.desktop === 'boolean') this.#desktop = raw.desktop
+      else this.#warnOnce('shape', '桌面开关形状不对，desktop 先按默认值运行')
+    }
   }
 
   get acceptVisits () {
@@ -89,6 +96,10 @@ class SettingsStore {
 
   get autoVisits () {
     return this.#autoVisits
+  }
+
+  get desktop () {
+    return this.#desktop
   }
 
   /**
@@ -118,6 +129,7 @@ class SettingsStore {
     try {
       await mkdir(this.#dir, { recursive: true, mode: 0o700 })
       const body = JSON.stringify({
+        desktop: this.#desktop,
         version: SETTINGS_VERSION,
         acceptVisits: this.#acceptVisits,
         autoVisits: this.#autoVisits

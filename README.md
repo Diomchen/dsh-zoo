@@ -101,9 +101,13 @@ node scripts/uninstall.mjs          # 摘掉登记与链接；<DSH_HOME>/local-p
 
 桌面窗是**置顶全屏**的。如果它在你的机器上行为不对（挡住点击、位置怪），先关掉它：
 
-```sh
-LOCAL_PET_DESKTOP=0    # 加在 DSH 的环境里，重启 DSH；宠物不显示，网络与串门照常
+```json
+// ~/.dsh/local-pet/settings.json —— 改完重启 DSH
+{ "desktop": false }
 ```
+
+或者给 DSH 加上环境变量 `LOCAL_PET_DESKTOP=0`。两种方式都只停掉桌面层：宠物不显示，
+网络、发现、放行、串门状态机照常工作。
 
 或者直接杀掉那一个进程（窗口随进程消失，宿主会在 300ms 后重启它，最多 5 次）：
 
