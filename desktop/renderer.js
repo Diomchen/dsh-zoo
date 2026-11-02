@@ -1357,15 +1357,9 @@
     }
     const due = media.clip === null || now >= media.nextIdleAt
     if (!due) return
-    let chosen = null
-    for (let offset = 0; offset < pool.length; offset += 1) {
-      const index = (media.idleIndex + offset) % pool.length
-      const candidate = pool[index]
-      if (media.failed.has(candidate)) continue
-      chosen = candidate
-      media.idleIndex = index
-      break
-    }
+    const picked = shared.pickIdleClip(pool, media.idleIndex, media.failed)
+    const chosen = picked.clip
+    media.idleIndex = picked.next
     media.nextIdleAt = now + idleDelay(media)
     if (chosen === null) {
       showSvg(pet)

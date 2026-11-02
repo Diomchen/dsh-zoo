@@ -243,6 +243,23 @@
     return pool.length === 0 ? null : pool
   }
 
+  /**
+   * 从待机池里挑下一段。返回 `{ clip, next }`，`next` 已经前进到选中项的下一格。
+   * 这里必须返回**前进后的游标**：旧实现把游标停在选中项，于是每 8 秒都选中同一段，
+   * 桌面上看起来就像“只会奔跑”。
+   */
+  function pickIdleClip (pool, start, failed) {
+    if (!Array.isArray(pool) || pool.length === 0) return { clip: null, next: 0 }
+    const from = Number.isInteger(start) && start >= 0 ? start % pool.length : 0
+    for (let offset = 0; offset < pool.length; offset += 1) {
+      const index = (from + offset) % pool.length
+      const clip = pool[index]
+      if (failed !== null && failed !== undefined && typeof failed.has === 'function' && failed.has(clip)) continue
+      return { clip, next: (index + 1) % pool.length }
+    }
+    return { clip: null, next: from }
+  }
+
   function normalizeColor (value) {
     return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value) ? value.toLowerCase() : DEFAULT_COLOR
   }
@@ -1274,6 +1291,7 @@
     normalizeSemantic,
     normalizeAssetUrl,
     normalizeIdlePool,
+    pickIdleClip,
     semanticBadge,
     normalizeRect,
     normalizePoint,

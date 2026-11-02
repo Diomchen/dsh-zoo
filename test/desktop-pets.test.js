@@ -710,3 +710,21 @@ test('场景 item 接受本机待机池：去重、过滤非法名', () => {
   })
   assert.deepEqual(scene.items[0].idlePool, ['A', 'B'])
 })
+
+test('待机池轮播：每次选择都前进，不会卡在同一段', () => {
+  const pool = ['A', 'B', 'C']
+  let cursor = 0
+  const seen = []
+  for (let i = 0; i < 4; i += 1) {
+    const picked = shared.pickIdleClip(pool, cursor, new Set())
+    seen.push(picked.clip)
+    cursor = picked.next
+  }
+  assert.deepEqual(seen, ['A', 'B', 'C', 'A'])
+})
+
+test('待机池轮播：跳过加载失败的片段', () => {
+  const picked = shared.pickIdleClip(['A', 'B', 'C'], 0, new Set(['A']))
+  assert.equal(picked.clip, 'B')
+  assert.equal(picked.next, 2)
+})
