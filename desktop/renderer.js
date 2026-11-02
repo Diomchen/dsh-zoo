@@ -33,7 +33,7 @@
   const uiLayer = document.getElementById('ui-layer')
   if (!shared || !stage || !uiLayer) return
 
-  const IDLE_ROTATE_MS = 4500
+  const IDLE_ROTATE_MS = 8000
   /** 宠物在动时的矩形上报节拍；静止时降到心跳，避免无意义 IPC。 */
   const RECT_REPORT_MS = 33
   const RECT_HEARTBEAT_MS = 300
@@ -422,6 +422,8 @@
         idleIndex: shared.hashString(item.id) % shared.IDLE_CLIPS.length,
         nextIdleAt: 0,
         clipStartedAt: 0,
+        durationMs: 0,
+        poolKey: '',
         gaveUp: false
       }
     }
@@ -1175,7 +1177,10 @@
     video.draggable = false
     video.addEventListener('loadeddata', () => {
       // 只认当前这一段：切片段之后旧 load 的 loadeddata 不能把 source 改回去。
-      if (video.dataset.clip === pet.media.clip) pet.media.source = 'video'
+      if (video.dataset.clip === pet.media.clip) {
+        pet.media.source = 'video'
+        pet.media.durationMs = Number.isFinite(video.duration) ? video.duration * 1000 : 0
+      }
     })
     video.addEventListener('error', () => {
       const failedClip = typeof video.dataset.clip === 'string' && video.dataset.clip !== ''
@@ -1306,17 +1311,29 @@
     const media = pet.media
     const anim = pet.item.anim
     const src = pet.item.src ?? null
+    // 本机素材池由宿主下发（dsh-pet 的全部动作）；没有就退回内置 3 段。
+    const pool = Array.isArray(pet.item.idlePool) && pet.item.idlePool.length > 0
+      ? pet.item.idlePool
+      : shared.IDLE_CLIPS
+    const poolKey = pool.join('\u0000')
+    if (media.poolKey !== poolKey) {
+      media.poolKey = poolKey
+      media.clip = null
+      media.idleIndex = shared.hashString(pet.id) % pool.length
+      media.nextIdleAt = now + IDLE_ROTATE_MS
+      media.gaveUp = false
+    }
     if (media.src !== src) {
       media.src = src
       media.clip = null
-      media.idleIndex = shared.hashString(pet.id) % shared.IDLE_CLIPS.length
+      media.idleIndex = shared.hashString(pet.id) % pool.length
       media.nextIdleAt = now + IDLE_ROTATE_MS
       media.gaveUp = false
     }
     if (media.anim !== anim) {
       media.anim = anim
       media.clip = null
-      media.idleIndex = shared.hashString(pet.id) % shared.IDLE_CLIPS.length
+      media.idleIndex = shared.hashString(pet.id) % pool.length
       media.nextIdleAt = now + IDLE_ROTATE_MS
       media.gaveUp = false
     }
@@ -1341,20 +1358,26 @@
     const due = media.clip === null || now >= media.nextIdleAt
     if (!due) return
     let chosen = null
-    for (let offset = 0; offset < shared.IDLE_CLIPS.length; offset += 1) {
-      const index = (media.idleIndex + offset) % shared.IDLE_CLIPS.length
-      const candidate = shared.IDLE_CLIPS[index]
+    for (let offset = 0; offset < pool.length; offset += 1) {
+      const index = (media.idleIndex + offset) % pool.length
+      const candidate = pool[index]
       if (media.failed.has(candidate)) continue
       chosen = candidate
       media.idleIndex = index
       break
     }
-    media.nextIdleAt = now + IDLE_ROTATE_MS
+    media.nextIdleAt = now + idleDelay(media)
     if (chosen === null) {
       showSvg(pet)
       return
     }
     if (chosen !== media.clip || media.source === 'svg') playClip(pet, chosen)
+  }
+
+  /** 待机片段尽量放完再换：4–12 秒，按视频时长自适应，避免总是把长动作拦腰截断。 */
+  function idleDelay (media) {
+    const duration = Number.isFinite(media.durationMs) && media.durationMs > 0 ? media.durationMs : IDLE_ROTATE_MS
+    return Math.min(12000, Math.max(4000, duration))
   }
 
   // -------------------------------------------------------------------------

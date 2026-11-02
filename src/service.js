@@ -120,6 +120,9 @@ export function createService (ctx, options = {}) {
   // 拉取是异步的，syncDesktop 只读这一份结果，绝不在同步路径上等网络。
   let skinFetcher = null
   const visitorSkins = new Map()
+  // 本机宠物的待机池：dsh-pet 那一整套动作名；桌面只拿它轮播，不猜、不点播。
+  // 测试可以注入 options.skinPool；生产由 startSkinSource 从注册表填。
+  let skinPool = Array.isArray(options.skinPool) ? options.skinPool.slice() : []
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
@@ -489,16 +492,18 @@ export function createService (ctx, options = {}) {
    * 起不来只影响「访客能不能拿我的素材」，不影响发现/串门/桌面。
    */
   async function startSkinSource () {
-    if (options.skinServer === false) return
     try {
       const loaded = await loadSkinSources({ dataDir: dir, env })
       for (const warning of loaded.warnings) {
         log.warn('素材源：' + warning.code + (warning.detail === undefined ? '' : '（' + warning.detail + '）'))
       }
+      // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
+      skinPool = loaded.sources.length > 0 ? Object.keys(loaded.sources[0].actions).sort() : []
       if (loaded.sources.length === 0) {
         log.info('没有可对外的素材源：访客先用本机素材，没有就画通用小人')
         return
       }
+      if (options.skinServer === false) return
       const requested = Number.isInteger(options.skinPort) ? options.skinPort : resolveSkinPort(env)
       skinServer = await startSkinServer({
         sources: loaded.sources,
@@ -663,6 +668,10 @@ export function createService (ctx, options = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
     const snapshot = room.snapshot()
     const pets = petsFromSnapshot(snapshot).map((pet) => {
+      // 本机宠物：把 dsh-pet 的一整套动作名交给渲染端轮播，不再只轮 3 段待机。
+      if (pet.role === 'self') {
+        return skinPool.length === 0 ? pet : { ...pet, idlePool: skinPool }
+      }
       if (pet.role !== 'visitor') return pet
       const key = pet.id.startsWith('visitor:') ? pet.id.slice('visitor:'.length) : null
       const skin = key === null ? undefined : visitorSkins.get(key)
@@ -1222,6 +1231,7 @@ export function createService (ctx, options = {}) {
       skinRef = null
       skinFetcher = null
       visitorSkins.clear()
+      skinPool = []
       request = null
       recalls.clear()
       discovery?.dispose()

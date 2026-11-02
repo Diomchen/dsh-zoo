@@ -694,3 +694,19 @@ test('helper argv 带 cacheRoot：只接受绝对路径', () => {
   )
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', cacheRoot: 'relative' }), ['/h'])
 })
+
+test('场景 item 接受本机待机池：去重、过滤非法名', () => {
+  const scene = shared.normalizeScene({
+    v: 2,
+    items: [{
+      id: 'self',
+      kind: 'pet',
+      role: 'self',
+      label: '我',
+      idlePool: ['A', 'A', '../x', 'B', 42, ''],
+      x: 0, y: 0, width: 100, height: 100
+    }],
+    reset: false
+  })
+  assert.deepEqual(scene.items[0].idlePool, ['A', 'B'])
+})

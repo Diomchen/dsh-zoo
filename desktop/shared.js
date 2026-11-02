@@ -129,6 +129,8 @@
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
   /** dsh-pet 不上报随机待机动作；没有动作时轮播这几段真实存在的素材。 */
   const IDLE_CLIPS = ['东张西望', '原地漂浮踏步', '原地小憩沉眠']
+  /** 本机素材池的上限：场景一条消息装得下，也防止宿主误传一个超大数组。 */
+  const MAX_IDLE_POOL = 128
   /** 远端素材只接受 helper 的 cache 协议 URL；本机素材仍走 `localpet://asset/<名字>`。 */
   const CACHE_ASSET_RE = /^localpet:\/\/cache\/[0-9a-f]{64}\.webm$/
   /** 语义标签是固定小表：不认识的动作靠它画一个通用表情。 */
@@ -228,6 +230,19 @@
     return Object.prototype.hasOwnProperty.call(SEMANTIC_BADGES, value) ? SEMANTIC_BADGES[value] : ''
   }
 
+  /** 本机待机池：只收安全动画名、去重、保持宿主给的顺序；空/非法返回 null。 */
+  function normalizeIdlePool (value) {
+    if (!Array.isArray(value)) return null
+    const pool = []
+    for (const item of value) {
+      const name = normalizeAnim(item)
+      if (name === null || pool.includes(name)) continue
+      pool.push(name)
+      if (pool.length >= MAX_IDLE_POOL) break
+    }
+    return pool.length === 0 ? null : pool
+  }
+
   function normalizeColor (value) {
     return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value) ? value.toLowerCase() : DEFAULT_COLOR
   }
@@ -268,6 +283,7 @@
     const isPet = raw.kind === 'pet'
     const src = isPet ? normalizeAssetUrl(raw.src) : null
     const fallback = isPet ? normalizeSemantic(raw.fallback) : null
+    const idlePool = isPet ? normalizeIdlePool(raw.idlePool) : null
     return {
       id,
       kind: raw.kind,
@@ -276,6 +292,7 @@
       // 只有真的用得上时才带这两个字段：旧场景形状保持不变，测试/日志不无故多两个 null。
       ...(src === null ? {} : { src }),
       ...(fallback === null ? {} : { fallback }),
+      ...(idlePool === null ? {} : { idlePool }),
       x: rect.x,
       y: rect.y,
       width: rect.width,
@@ -1256,6 +1273,7 @@
     normalizeRole,
     normalizeSemantic,
     normalizeAssetUrl,
+    normalizeIdlePool,
     semanticBadge,
     normalizeRect,
     normalizePoint,
