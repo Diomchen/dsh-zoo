@@ -42,6 +42,11 @@ const destHost = args.to ?? bindAddress
 
 let nickname = clean(args.name ?? '隔壁的小鲸鱼', 32)
 let anim = args.anim ? clean(args.anim, 64) : null
+// --skin-port / --skin-id：让这个假邻居也能广告一个素材源（配合 --action / --say 验跨插件链路）。
+const skinPort = args['skin-port'] === undefined ? undefined : Number(args['skin-port'])
+const skinId = args['skin-id'] === undefined ? undefined : cleanId(args['skin-id'])
+const semantic = args.semantic ? clean(args.semantic, 16) : undefined
+let sayText = args.say ? clean(args.say, 80) : null
 const deviceId = randomUUID()
 const autoVisit = args['auto-visit'] === undefined ? null : Number(args['auto-visit'])
 
@@ -71,7 +76,7 @@ socket.on('error', (error) => {
 socket.bind(port, bindAddress, () => {
   console.log(`[假邻居] 我是「${nickname}」，在 ${bindAddress}:${port} 上听着，去找 ${destHost}:${targetPort} 的插件。`)
   console.log(`[假邻居] 现在去 /local-pet/state 看 neighbors，用 /local-pet/action 的 admit 放行我；然后按 v 让${nickname}来串门。`)
-  console.log('[假邻居] 键盘：v=让它来串门  a <动画名>=换动作  n <新名字>=改名  q=退出')
+  console.log('[假邻居] 键盘：v=让它来串门  a <动画名>=换动作  s <一句话>=换气泡  n <新名字>=改名  q=退出')
   // 发往广播地址必须先开 SO_BROADCAST，否则 macOS 直接 EACCES，而且错误会被静默吞掉。
   try {
     socket.setBroadcast(true)
@@ -135,17 +140,31 @@ function handle (packet, rinfo) {
 
 function sendBeacon () {
   try {
-    const data = encodePacket({ type: 'beacon', deviceId, nickname, port })
+    const data = encodePacket({ type: 'beacon', deviceId, nickname, port, ...skinFields() })
     send(data, destHost, targetPort)
   } catch (error) {
     console.error('[假邻居] 广播编码失败：' + error.message)
   }
 }
 
+function skinFields () {
+  const fields = {}
+  if (Number.isInteger(skinPort) && skinPort > 0) fields.skinPort = skinPort
+  if (skinId !== undefined) fields.skinId = skinId
+  return fields
+}
+
+function petFields () {
+  const fields = { action: anim, ...skinFields() }
+  if (semantic !== undefined) fields.semantic = semantic
+  if (sayText !== null) fields.say = { text: sayText, until: Date.now() + 8000 }
+  return fields
+}
+
 function sendHeartbeat () {
   if (state.endpoint === null) return
   try {
-    send(encodeHeartbeat({ deviceId, anim }), state.endpoint.address, state.endpoint.port)
+    send(encodeHeartbeat({ deviceId, anim, ...petFields() }), state.endpoint.address, state.endpoint.port)
   } catch {
     // 假的，不必较真
   }
@@ -169,6 +188,12 @@ function startInput () {
       console.log('[假邻居] 动作换成「' + anim + '」，下一拍心跳就发出去。')
       return
     }
+    if (command === 's') {
+      const next = rest.join(' ').trim()
+      sayText = next === '' ? null : clean(next, 80)
+      console.log('[假邻居] 气泡换成「' + (sayText ?? '（不说）') + '」，下一拍心跳就带出去。')
+      return
+    }
     if (command === 'n') {
       const next = rest.join(' ').trim()
       if (next === '') return console.log('[假邻居] 用法：n 新名字')
@@ -178,7 +203,7 @@ function startInput () {
       return
     }
     if (command === '?') {
-      return console.log('[假邻居] v=让它来串门  a <动画名>=换动作  n <新名字>=改名  q=退出')
+      return console.log('[假邻居] v=让它来串门  a <动画名>=换动作  s <一句话>=换气泡  n <新名字>=改名  q=退出')
     }
     console.log('[假邻居] 不认识的命令，按 ? 看帮助。')
   })
@@ -193,7 +218,7 @@ function outboundVisit () {
   }
   const visitId = randomUUID()
   send(
-    encodeVisitRequest({ deviceId, visitId, nickname, anim }),
+    encodeVisitRequest({ deviceId, visitId, nickname, anim, ...petFields() }),
     state.endpoint.address,
     state.endpoint.port
   )
@@ -204,6 +229,11 @@ function reasonText (reason) {
   if (reason === 'visits-off') return '你关掉了串门开关（accept-visits=false），先打开它。'
   if (reason === 'not-admitted') return '你还没放行这个邻居。'
   return reason ?? '未知原因'
+}
+
+function cleanId (value) {
+  const cleaned = String(value).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32)
+  return cleaned === '' ? 'fake-peer' : cleaned
 }
 
 function clean (value, max) {

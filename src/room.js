@@ -10,6 +10,8 @@ import {
   isVisitId,
   normalizeAnimation,
   normalizeNickname,
+  normalizeSay,
+  normalizeSemantic,
   sanitizeLabel
 } from './protocol.js'
 import {
@@ -129,6 +131,8 @@ export function createRoom ({
   const lostMs = positiveMs(peerLostMs, PEER_LOST_MS)
   const state = {
     self: { deviceId: null, nickname: '我', pet: null, bridge: { ...IDLE_BRIDGE } },
+    // 本机插件通过 POST /local-pet/self-state 推来的状态；30 秒内不被 dsh-pet 轮询覆盖。
+    selfState: { action: null, semantic: null, say: null, at: 0 },
     neighbors: new Map(),
     guests: new Map(),
     visitors: new Map(),
@@ -153,6 +157,21 @@ export function createRoom ({
   function nowMs () {
     const stamp = clock()
     return Number.isFinite(stamp) ? stamp : Date.now()
+  }
+
+  /** 30 秒内的 self-state 覆盖 dsh-pet 轮询来的 anim/动作；过期就回到轮询结果。 */
+  const SELF_STATE_TTL_MS = 30000
+
+  function selfPetView () {
+    if (state.self.pet === null) return null
+    const pet = { ...state.self.pet }
+    const pushed = state.selfState
+    if (pushed.at > 0 && nowMs() - pushed.at <= SELF_STATE_TTL_MS) {
+      if (pushed.action !== null) pet.action = pushed.action
+      if (pushed.semantic !== null) pet.semantic = pushed.semantic
+      if (pushed.say !== null) pet.say = pushed.say
+    }
+    return pet
   }
 
   function stampOf (value) {
@@ -470,7 +489,7 @@ export function createRoom ({
         self: {
           deviceId: state.self.deviceId,
           nickname: state.self.nickname,
-          pet: state.self.pet === null ? null : { ...state.self.pet },
+          pet: selfPetView(),
           bridge: { ...state.self.bridge },
           out: copyOutbound(state.out)
         },
@@ -532,6 +551,19 @@ export function createRoom ({
       const name = normalizeNickname(pet.name)
       const anim = isSafeAnimationName(pet.anim) ? pet.anim.trim() : null
       state.self.pet = name === null && anim === null ? null : { name, anim }
+    },
+
+    /**
+     * 本机宠物插件推来的「我现在在干嘛」。只接受安全动作名、固定语义枚举、
+     * ≤80 字且 30 秒内过期的气泡；全非法就不写，返回 false。
+     */
+    setSelfState ({ action, semantic, say } = {}) {
+      const safeAction = isSafeAnimationName(action) ? action.trim() : null
+      const safeSemantic = normalizeSemantic(semantic)
+      const safeSay = normalizeSay(say, nowMs())
+      if (safeAction === null && safeSemantic === null && safeSay === null) return false
+      state.selfState = { action: safeAction, semantic: safeSemantic, say: safeSay, at: nowMs() }
+      return true
     },
 
     /** dsh-pet 桥的可用性；只用于 UI 那一行降级说明。 */

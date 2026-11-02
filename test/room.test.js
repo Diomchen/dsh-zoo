@@ -653,3 +653,33 @@ test('场景放不下访客时提醒一次：不静默丢宠物，拥挤解除�
   room.noteSceneOverflow(null, T0 + 2000)
   assert.doesNotThrow(() => room.noteSceneOverflow(undefined, T0))
 })
+
+test('self-state：推来的动作/语义/气泡进入快照，30 秒后过期', () => {
+  let now = T0
+  const room = createRoom({ clock: () => now })
+  room.setSelfPet({ name: '小蓝', anim: '待机呼吸休闲' })
+
+  assert.equal(room.setSelfState({
+    action: '写代码',
+    semantic: 'working',
+    say: { text: '在写代码', until: T0 + 5000 }
+  }), true)
+
+  assert.deepEqual(room.snapshot().self.pet, {
+    name: '小蓝',
+    anim: '待机呼吸休闲',
+    action: '写代码',
+    semantic: 'working',
+    say: { text: '在写代码', until: T0 + 5000 }
+  })
+
+  now = T0 + 30001
+  assert.deepEqual(room.snapshot().self.pet, { name: '小蓝', anim: '待机呼吸休闲' })
+})
+
+test('self-state：全非法返回 false，不覆盖已有快照', () => {
+  const room = roomAt()
+  room.setSelfPet({ name: '小蓝', anim: null })
+  assert.equal(room.setSelfState({ action: '../x', semantic: 'nope', say: { text: '', until: T0 + 1 } }), false)
+  assert.deepEqual(room.snapshot().self.pet, { name: '小蓝', anim: null })
+})

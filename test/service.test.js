@@ -902,3 +902,27 @@ test('dsh-pet 装着但不通：改名明确失败，不回退成只改本地', 
   assert.equal(renamed.body.error, 'dsh-pet-unreachable')
   assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
 })
+
+test('POST /local-pet/self-state：动作进入快照，非法请求 400，非 POST 405', async (t) => {
+  const service = makeService(t)
+  await service.ready
+  service.room.setSelfPet({ name: '小蓝', anim: '待机呼吸休闲' })
+
+  const ok = await call(service, '/local-pet/self-state', {
+    method: 'POST',
+    body: { action: '写代码', semantic: 'working', say: '在写代码' }
+  })
+  assert.equal(ok.status, 200)
+  assert.deepEqual(ok.body, { ok: true })
+  const pet = service.snapshot().self.pet
+  assert.equal(pet.action, '写代码')
+  assert.equal(pet.semantic, 'working')
+  assert.equal(pet.say.text, '在写代码')
+
+  const bad = await call(service, '/local-pet/self-state', { method: 'POST', body: { action: '../x' } })
+  assert.equal(bad.status, 400)
+  assert.equal(bad.body.error, 'bad-state')
+
+  const wrong = await call(service, '/local-pet/self-state')
+  assert.equal(wrong.status, 405)
+})

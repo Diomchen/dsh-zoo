@@ -158,6 +158,37 @@ export function createService (ctx, options = {}) {
     }
   }))
 
+  // 本机宠物插件的状态入口（ticket 18）：只在本机回环上，不经过 UDP。
+  // 没装 dsh-pet 的插件也可以推；推来的动作/气泡 30 秒内优先于桥接轮询。
+  disposers.push(register(ctx, {
+    kind: 'exact',
+    path: ROUTE_PREFIX + '/self-state',
+    handler: async (req, res) => {
+      if (req.method !== 'POST') return sendJson(res, 405, { error: 'method-not-allowed' })
+      let body
+      try {
+        body = await readJson(req, 4 * 1024)
+      } catch (error) {
+        return sendJson(res, 400, { error: 'bad-body', detail: message(error) })
+      }
+      const sayInput = body?.say
+      // 字符串 = 一句短话，默认活 8 秒；对象形态由调用方自己带 until（仍受 30 秒封顶）。
+      const say = typeof sayInput === 'string'
+        ? { text: sayInput, until: Date.now() + 8000 }
+        : sayInput
+      const applied = room.setSelfState({
+        action: typeof body?.action === 'string' ? body.action : null,
+        semantic: typeof body?.semantic === 'string' ? body.semantic : null,
+        say
+      })
+      if (!applied) return sendJson(res, 400, { ok: false, error: 'bad-state' })
+      // 动作/气泡变了就立刻补发心跳，对方桌面不用等 2 秒节拍。
+      sendHeartbeats()
+      syncDesktop()
+      sendJson(res, 200, { ok: true })
+    }
+  }))
+
   async function handleAction (body) {
     try {
       return await handleActionInner(body)
