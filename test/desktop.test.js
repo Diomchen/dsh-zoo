@@ -746,7 +746,7 @@ test('service：桌面工厂抛错只降级成一行告警，服务照常 ready'
   assert.ok(service.snapshot().self.deviceId)
 })
 
-test('service：桌面场景跟着 snapshot 走（客人出现/换动作无需逐帧 update）', async (t) => {
+test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作无需逐帧 update）', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-sync-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const updates = []
@@ -776,18 +776,32 @@ test('service：桌面场景跟着 snapshot 走（客人出现/换动作无需�
   assert.equal(updates.at(-1).items[0].id, 'self')
 
   const guestId = '66666666-6666-4666-8666-666666666666'
+  const visitId = '77777777-7777-4777-8777-777777777777'
   service.room.setTrust({ allowed: { [guestId]: { nickname: '阿蟹' } } })
+
+  // 心跳影子代表“邻居在线”，不是客人：桌面上不应该因此多一只。
   service.room.observeHeartbeat({ deviceId: guestId, anim: '螃蟹走路' })
-  await waitFor(() => updates.some((scene) => scene.items.some((item) => item.role === 'guest')), 1500)
-  const withGuest = updates.at(-1)
-  const guest = withGuest.items.find((item) => item.role === 'guest')
-  assert.ok(guest)
-  assert.equal(guest.label, '阿蟹')
-  assert.equal(guest.anim, '螃蟹走路')
-  assert.equal(guest.id, 'guest:' + guestId)
+  await new Promise((resolve) => setTimeout(resolve, 60))
+  assert.equal(updates.at(-1).items.length, 1)
+
+  // 真正的串门请求才会把客人画到桌面上。
+  const replied = service.room.observeVisitRequest({
+    deviceId: guestId,
+    visitId,
+    nickname: '阿蟹',
+    anim: '螃蟹走路'
+  })
+  assert.equal(replied.reply, 'ack')
+  await waitFor(() => updates.some((scene) => scene.items.some((item) => item.role === 'visitor')), 1500)
+  const withVisitor = updates.at(-1)
+  const visitor = withVisitor.items.find((item) => item.role === 'visitor')
+  assert.ok(visitor)
+  assert.equal(visitor.label, '阿蟹')
+  assert.equal(visitor.anim, '螃蟹走路')
+  assert.equal(visitor.id, 'visitor:' + guestId)
 
   service.room.observeHeartbeat({ deviceId: guestId, anim: '东张西望' })
-  await waitFor(() => updates.at(-1).items.some((item) => item.role === 'guest' && item.anim === '东张西望'), 1500)
+  await waitFor(() => updates.at(-1).items.some((item) => item.role === 'visitor' && item.anim === '东张西望'), 1500)
   assert.deepEqual(warnings, [])
 })
 

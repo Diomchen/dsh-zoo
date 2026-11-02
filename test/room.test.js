@@ -67,7 +67,8 @@ test('邻居首次出现是 pending，并按 deviceId 更新而不是按 IP', ()
     nickname: '隔壁同事',
     status: 'pending',
     lastSeen: T0,
-    port: 40001
+    port: 40001,
+    heartbeatAt: 0
   }])
 
   room.observeBeacon({ deviceId: 'neighbor-a', nickname: '隔壁改名了', port: 40002 }, T0 + 5000)
@@ -541,7 +542,15 @@ test('放行名单里有、但还没收到广播的邻居，其心跳仍能创�
     since: T0,
     expiresAt: T0 + GUEST_TTL_MS
   }])
-  assert.deepEqual(room.snapshot().neighbors, [])
+  // 没收到广播也可以从心跳认识它：心跳本身证明它在线，也证明它放行了我。
+  assert.deepEqual(room.snapshot().neighbors, [{
+    deviceId: 'neighbor-x',
+    nickname: '名单里的邻居',
+    status: 'allowed',
+    lastSeen: T0,
+    port: null,
+    heartbeatAt: T0
+  }])
   assert.deepEqual(room.heartbeatTargets(), ['neighbor-x'])
 })
 

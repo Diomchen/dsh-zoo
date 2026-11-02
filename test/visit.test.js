@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { VISIT_TTL_MS } from '../src/protocol.js'
+import { PEER_LOST_MS, VISIT_MAX_MS } from '../src/protocol.js'
 import { createRoom } from '../src/room.js'
 
 const T0 = 1_700_000_000_000
@@ -47,7 +47,7 @@ function lastNotice (room) {
   return room.snapshot().notices[0]?.text ?? ''
 }
 
-test('出门：请求中 → ack 后 60 秒 TTL，本地影子进入“出门了”状态', () => {
+test('出门：请求中 → ack 后 30 分钟上限，本地影子进入“出门了”状态', () => {
   const room = makeRoom()
   const begun = room.beginVisit(PEER, { at: T0, visitId: VISIT_A })
 
@@ -64,15 +64,19 @@ test('出门：请求中 → ack 后 60 秒 TTL，本地影子进入“出门了
   assert.equal(acked.ok, true)
   assert.equal(acked.visit.phase, 'active')
   assert.equal(acked.visit.startedAt, T0 + 100)
-  assert.equal(acked.visit.endsAt, T0 + 100 + VISIT_TTL_MS)
+  assert.equal(acked.visit.endsAt, T0 + 100 + VISIT_MAX_MS)
   assert.equal(room.snapshot().self.out.phase, 'active')
   assert.deepEqual(room.snapshot().visits, [])
 })
 
-test('出门到点：发起方自己写一条 out 记录、清空状态，并排一条 visit-recall', () => {
+test('出门到点：30 分钟上限写一条 out 记录、清空状态，并排一条 visit-recall', () => {
   const room = makeRoom()
   const active = outboundActive(room)
 
+  // 对方一直有心跳：30 分钟内不会触发失联，只有到点才会回家。
+  for (let at = T0 + 60_000; at < active.endsAt; at += 60_000) {
+    assert.equal(room.observeHeartbeat({ deviceId: PEER, anim: null }, at), true)
+  }
   room.tick(active.endsAt - 1)
   assert.equal(room.snapshot().self.out.phase, 'active')
   assert.deepEqual(room.snapshot().visits, [])
@@ -83,20 +87,20 @@ test('出门到点：发起方自己写一条 out 记录、清空状态，并排
     direction: 'out',
     nickname: PEER_NAME,
     startedAt: active.startedAt,
-    durationMs: VISIT_TTL_MS
+    durationMs: VISIT_MAX_MS
   }])
   assert.deepEqual(room.drainVisitRecords(), [{
     direction: 'out',
     nickname: PEER_NAME,
     startedAt: active.startedAt,
-    durationMs: VISIT_TTL_MS
+    durationMs: VISIT_MAX_MS
   }])
   assert.deepEqual(room.drainVisitRecalls(), [{ deviceId: PEER, visitId: VISIT_A }])
-  // 正常到点回家不是失败，不写失败提示。
+  // 正常到点回家不是失败，不写提示。
   assert.deepEqual(room.snapshot().notices, [])
 })
 
-test('接收方：放行过的请求得到 ack，自己跑 60 秒 TTL，不依赖发起方还在', () => {
+test('接收方：放行过的请求得到 ack；入站访客没有 TTL，只有 2 分钟失联检测', () => {
   const room = makeRoom({ identity: 'me-2', nickname: '乙' })
   const visitor = inboundVisitor(room)
 
@@ -106,30 +110,33 @@ test('接收方：放行过的请求得到 ack，自己跑 60 秒 TTL，不依�
     anim: '写代码',
     visitId: VISIT_A,
     since: T0,
-    endsAt: T0 + VISIT_TTL_MS
+    lastSeen: T0,
+    endsAt: null
   }])
   assert.deepEqual(visitor, room.snapshot().visitors[0])
 
-  // 发起方彻底消失：没有心跳、没有再发任何包，接收方仍然自己到期并记录。
-  room.tick(T0 + VISIT_TTL_MS - 1)
+  // 60 秒、30 分钟都不是入站访客的寿命：没有心跳时只有 2 分钟失联会清场。
+  room.tick(T0 + 60_000)
   assert.equal(room.snapshot().visitors.length, 1)
-  room.tick(T0 + VISIT_TTL_MS)
+  room.tick(T0 + PEER_LOST_MS - 1)
+  assert.equal(room.snapshot().visitors.length, 1)
+  room.tick(T0 + PEER_LOST_MS)
   assert.deepEqual(room.snapshot().visitors, [])
   assert.deepEqual(room.snapshot().visits, [{
     direction: 'in',
     nickname: PEER_NAME,
     startedAt: T0,
-    durationMs: VISIT_TTL_MS
+    durationMs: PEER_LOST_MS
   }])
   assert.deepEqual(room.drainVisitRecords(), [{
     direction: 'in',
     nickname: PEER_NAME,
     startedAt: T0,
-    durationMs: VISIT_TTL_MS
+    durationMs: PEER_LOST_MS
   }])
 })
 
-test('请求重试按 visitId 幂等：不重置 60 秒、不多写记录', () => {
+test('请求重试按 visitId 幂等：不重置 since、刷新 lastSeen、不多写记录', () => {
   const room = makeRoom({ identity: 'me-2', nickname: '乙' })
   inboundVisitor(room)
 
@@ -143,7 +150,8 @@ test('请求重试按 visitId 幂等：不重置 60 秒、不多写记录', () =
   assert.equal(room.snapshot().visitors.length, 1)
   const visitor = room.snapshot().visitors[0]
   assert.equal(visitor.since, T0)
-  assert.equal(visitor.endsAt, T0 + VISIT_TTL_MS)
+  assert.equal(visitor.lastSeen, T0 + 600)
+  assert.equal(visitor.endsAt, null)
   assert.equal(visitor.nickname, PEER_NAME) // 昵称来自放行名单，不来自请求
   assert.equal(visitor.anim, '东张西望')
 
@@ -158,10 +166,16 @@ test('请求重试按 visitId 幂等：不重置 60 秒、不多写记录', () =
   assert.equal(room.snapshot().visitors.length, 1)
   assert.equal(room.snapshot().visitors[0].since, T0)
   assert.equal(room.snapshot().visitors[0].visitId, VISIT_B)
+  assert.equal(room.snapshot().visitors[0].lastSeen, T0 + 1200)
 
-  room.tick(T0 + VISIT_TTL_MS)
-  assert.equal(room.snapshot().visits.length, 1)
-  assert.equal(room.drainVisitRecords().length, 1)
+  // 之后一直有心跳：访客可以待得比旧 TTL（60 秒）久得多，且不会多写记录。
+  for (let at = T0 + 60_000; at <= T0 + 600_000; at += 60_000) {
+    assert.equal(room.observeHeartbeat({ deviceId: PEER, anim: null }, at), true)
+  }
+  room.tick(T0 + 600_000)
+  assert.equal(room.snapshot().visitors.length, 1)
+  assert.deepEqual(room.snapshot().visits, [])
+  assert.deepEqual(room.drainVisitRecords(), [])
 })
 
 test('未放行的请求得到 deny，不创建访客、不写记录', () => {
@@ -399,7 +413,7 @@ test('ack 只接受当前目标的同一个 visitId；错配不会让宠物假�
   assert.equal(room.snapshot().self.out.phase, 'active')
   // 迟到的第二次 ack 不会重置 TTL。
   assert.equal(room.observeVisitAck({ deviceId: PEER, visitId: VISIT_A }, T0 + 5000).ok, false)
-  assert.equal(room.snapshot().self.out.endsAt, T0 + 20 + VISIT_TTL_MS)
+  assert.equal(room.snapshot().self.out.endsAt, T0 + 20 + VISIT_MAX_MS)
 })
 
 test('拒绝或名单收紧时，入站访客立即离开并留下一条 in 记录', () => {
@@ -422,17 +436,27 @@ test('拒绝或名单收紧时，入站访客立即离开并留下一条 in 记�
   assert.deepEqual(tightened.snapshot().visits.map((record) => record.direction), ['in'])
 })
 
-test('心跳能更新串门访客的动作，但不会延长 60 秒 TTL', () => {
+test('心跳更新访客动作与 lastSeen；没有 TTL 可延长，只有失联窗口在滑动', () => {
   const room = makeRoom({ identity: 'me-2', nickname: '乙' })
   inboundVisitor(room)
 
   assert.equal(room.observeHeartbeat({ deviceId: PEER, anim: '东张西望' }, T0 + 30000), true)
   const visitor = room.snapshot().visitors[0]
   assert.equal(visitor.anim, '东张西望')
-  assert.equal(visitor.endsAt, T0 + VISIT_TTL_MS)
+  assert.equal(visitor.lastSeen, T0 + 30000)
+  assert.equal(visitor.endsAt, null)
 
-  room.tick(T0 + VISIT_TTL_MS)
+  // 心跳把失联窗口往后推：原本 T0+120s 该走，现在能留到 T0+150s。
+  room.tick(T0 + 30000 + PEER_LOST_MS - 1)
+  assert.equal(room.snapshot().visitors.length, 1)
+  room.tick(T0 + 30000 + PEER_LOST_MS)
   assert.deepEqual(room.snapshot().visitors, [])
+  assert.deepEqual(room.snapshot().visits, [{
+    direction: 'in',
+    nickname: PEER_NAME,
+    startedAt: T0,
+    durationMs: 30000 + PEER_LOST_MS
+  }])
 })
 
 test('载入的记录按开始时间倒序，快照只给最近 5 条', () => {

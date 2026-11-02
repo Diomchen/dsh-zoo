@@ -166,7 +166,7 @@ function twoInstanceOptions (dir, port, targetPort, overrides = {}) {
     broadcastAddress: '127.0.0.1',
     beaconIntervalMs: 5000,
     heartbeatIntervalMs: 60000,
-    visitTtlMs: 600,
+    visitMaxMs: 600,
     visitRetryMs: 50,
     visitTimeoutMs: 2000,
     visitTickMs: 20,
@@ -289,7 +289,7 @@ test('两个实例：未双向放行时得到明确 deny；放行后串门成功
   assert.deepEqual(b.snapshot().visitors, [])
   assert.deepEqual(b.snapshot().visits, [])
 
-  // 双向放行：A 出门 → B 客厅出现 60 秒访客。
+  // 双向放行：A 出门 → B 桌面出现一位常驻访客。
   assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
   const started = await callAction(a, { action: 'visit', deviceId: bId })
   assert.equal(started.status, 200)
@@ -301,7 +301,8 @@ test('两个实例：未双向放行时得到明确 deny；放行后串门成功
   assert.equal(b.snapshot().visitors[0].deviceId, aId)
   assert.equal(b.snapshot().visitors[0].nickname, '甲')
   assert.equal(b.snapshot().visitors[0].visitId, firstVisitId)
-  assert.equal(Number.isFinite(b.snapshot().visitors[0].endsAt), true)
+  // ticket 10：入站访客没有 TTL，endsAt 固定为 null。
+  assert.equal(b.snapshot().visitors[0].endsAt, null)
   // 地址与坐标都不进快照。
   for (const snap of [a.snapshot(), b.snapshot()]) {
     const text = JSON.stringify(snap)
@@ -319,7 +320,8 @@ test('两个实例：未双向放行时得到明确 deny；放行后串门成功
   assert.equal(b.snapshot().visits[0].nickname, '甲')
   assert.ok(a.snapshot().visits[0].durationMs >= 0)
 
-  // 第二次串门：不发 recall，让双方的 60 秒（测试里 600ms）TTL 自己到点。
+  // 第二次串门：不发 recall，让 A 的 30 分钟上限（测试里 600ms）到点；
+  // A 到点会发 recall，B 收到后清场——B 自己不再有 TTL。
   const second = await callAction(a, { action: 'visit', deviceId: bId })
   assert.equal(second.status, 200)
   const secondVisitId = second.body.visitId
@@ -454,4 +456,140 @@ test('visits.json 损坏时串门仍然成功；记录只丢历史，不影响�
   // A 的记录文件会在下一次 flush 后变成合法文件，B 的一直正常。
   const rawA = await waitForVisits(dirA, (raw) => raw.visits.length === 1)
   assert.equal(rawA.visits[0].direction, 'out')
+})
+
+test('自动出门：没活动绝不出门；有活动且开关打开才出发；送客后双方各留一条真实时长记录', async (t) => {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  const [portA, portB] = await distinctPorts(2)
+
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA))
+  await b.ready
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB, {
+    autoVisitIntervalMs: 30,
+    // 给自动串门留足往返时间，别让 600ms 的测试上限抢在断言前到点。
+    visitMaxMs: 5000
+  }))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+  // 互相放行之后，B 会立刻补发心跳；A 收到心跳才知道“对方也放行了我”，
+  // 这正是自动/手动串门的目标条件。
+  await waitFor(() => a.snapshot().visitTargets.length === 1)
+
+  // 打开总开关，但本机没有任何活动：策略每 30ms 跑一次，仍然绝不出发。
+  const on = await callAction(a, { action: 'auto-visits', enabled: true })
+  assert.equal(on.status, 200)
+  assert.equal(on.body.autoVisits, true)
+  await delay(150)
+  assert.equal(a.snapshot().self.out, null)
+  assert.equal(b.snapshot().visitors.length, 0)
+  assert.equal(a.snapshot().autoVisit.lastDecision.reason, 'no-activity')
+
+  // 有活动之后，同一条策略允许出发；B 的桌面出现 A 的宠物（常驻访客）。
+  a.room.noteActivity('session', Date.now())
+  await waitFor(() => a.snapshot().self.out?.phase === 'active' && b.snapshot().visitors.length === 1)
+  assert.equal(b.snapshot().visitors[0].deviceId, aId)
+  assert.equal(b.snapshot().visitors[0].nickname, a.snapshot().self.nickname)
+  assert.equal(b.snapshot().visitors[0].endsAt, null)
+  assert.ok(['ready', 'already-out'].includes(a.snapshot().autoVisit.lastDecision.reason))
+
+  // 主人点「送客」：B 立即清场并写 in 记录；A 收到 recall 回家并写 out 记录。
+  const startedAt = Date.now()
+  assert.equal((await callAction(b, { action: 'end-visit', deviceId: aId })).status, 200)
+  await waitFor(() => b.snapshot().visitors.length === 0 && a.snapshot().self.out === null)
+  await waitFor(() => b.snapshot().visits.length === 1 && a.snapshot().visits.length === 1)
+  assert.equal(b.snapshot().visits[0].direction, 'in')
+  assert.equal(b.snapshot().visits[0].nickname, a.snapshot().self.nickname)
+  assert.equal(a.snapshot().visits[0].direction, 'out')
+  assert.equal(a.snapshot().visits[0].nickname, b.snapshot().self.nickname)
+  for (const record of [a.snapshot().visits[0], b.snapshot().visits[0]]) {
+    assert.ok(record.durationMs >= 0)
+    assert.ok(record.durationMs < 30 * 60 * 1000 + 1)
+  }
+  assert.ok(Date.now() - startedAt < 5000)
+
+  // 手动「串门」永远可用（不受自动开关/活动窗口影响），不带 deviceId 也能量：
+  // 随机挑到唯一在线的邻居 B。
+  const manual = await callAction(a, { action: 'visit' })
+  assert.equal(manual.status, 200)
+  assert.equal(manual.body.deviceId, bId)
+  await waitFor(() => b.snapshot().visitors.length === 1)
+  assert.equal((await callAction(a, { action: 'recall' })).status, 200)
+  await waitFor(() => b.snapshot().visitors.length === 0 && a.snapshot().self.out === null)
+
+  // 自动开关落盘：重启后仍然是开。
+  const rawSettings = JSON.parse(await readFile(join(dirA, 'settings.json'), 'utf8'))
+  assert.equal(rawSettings.autoVisits, true)
+})
+
+test('对方失联（出门方向）：2 分钟窗口（测试里 300ms）没有心跳 → 回家、写 out、提示失联', async (t) => {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  const [portA, portB] = await distinctPorts(2)
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA))
+  await b.ready
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB, {
+    peerLostMs: 300,
+    tickIntervalMs: 30,
+    visitMaxMs: 5000
+  }))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+  await waitFor(() => a.snapshot().visitTargets.length === 1)
+
+  assert.equal((await callAction(a, { action: 'visit' })).status, 200)
+  await waitFor(() => a.snapshot().self.out?.phase === 'active' && b.snapshot().visitors.length === 1)
+
+  // 对面整个进程消失：没有 recall，也没有心跳。A 必须自己回家并留下失联记录。
+  b.dispose()
+  await waitFor(() => a.snapshot().self.out === null, 3000)
+  await waitFor(() => a.snapshot().visits.length === 1)
+  assert.equal(a.snapshot().visits[0].direction, 'out')
+  assert.equal(a.snapshot().visits[0].nickname, b.snapshot().self.nickname)
+  assert.match(a.snapshot().notices[0].text, /失联/)
+})
+
+test('对方失联（入站方向）：2 分钟窗口（测试里 300ms）没有心跳 → 客人消失、写 in、提示失联', async (t) => {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  const [portA, portB] = await distinctPorts(2)
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA, {
+    peerLostMs: 300,
+    tickIntervalMs: 30,
+    visitMaxMs: 5000
+  }))
+  await b.ready
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+  await waitFor(() => a.snapshot().visitTargets.length === 1)
+
+  assert.equal((await callAction(a, { action: 'visit' })).status, 200)
+  await waitFor(() => a.snapshot().self.out?.phase === 'active' && b.snapshot().visitors.length === 1)
+
+  // 来访者进程消失：B 没有收到 recall，只能靠心跳停掉自己清理。
+  a.dispose()
+  await waitFor(() => b.snapshot().visitors.length === 0, 3000)
+  await waitFor(() => b.snapshot().visits.length === 1)
+  assert.equal(b.snapshot().visits[0].direction, 'in')
+  assert.match(b.snapshot().notices[0].text, /失联/)
+
+  // B 的自动重访不会发生：B 没有打开总开关（默认关）。
+  await delay(150)
+  assert.equal(b.snapshot().self.out, null)
 })

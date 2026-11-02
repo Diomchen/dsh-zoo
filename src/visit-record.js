@@ -1,4 +1,4 @@
-import { normalizeNickname } from './protocol.js'
+import { VISIT_MAX_MS, normalizeNickname } from './protocol.js'
 
 /**
  * 一条串门记录的唯一规范器，room 与 visits.json 共用。
@@ -10,9 +10,10 @@ import { normalizeNickname } from './protocol.js'
  * 规则：
  *   - 方向只能是 out / in，昵称必须清洗后可读；
  *   - startedAt / durationMs 必须是有限的非负数，向下取整（存储是毫秒整数）；
- *   - durationMs 上限 24 小时，防止手改文件写出无限大的“停留时间”。
+ *   - durationMs 上限 30 分钟：出门本身到点就回家，入站客人虽然可以待更久，
+ *     记录里的“停留时长”也封顶 30 分钟，避免手改文件写出无限大的值。
  */
-export const MAX_VISIT_RECORD_MS = 24 * 60 * 60 * 1000
+export const MAX_VISIT_RECORD_MS = VISIT_MAX_MS
 export const VISIT_RECORD_LIMIT = 200
 
 export function normalizeVisitRecord (raw) {

@@ -9,8 +9,9 @@ import {
   HEARTBEAT_INTERVAL_MS,
   MAX_PACKET_BYTES,
   PACKET_TYPES,
+  PEER_LOST_MS,
   PROTOCOL_VERSION,
-  VISIT_TTL_MS,
+  VISIT_MAX_MS,
   createRateLimiter,
   encodeHeartbeat,
   encodePacket,
@@ -495,12 +496,13 @@ test('环境变量只在合法时覆盖默认端口', () => {
   assert.equal(resolvePort({ LOCAL_PET_PORT: 'abc' }), DEFAULT_PORT)
 })
 
-test('默认的发现参数是 5 秒 / 45871；心跳 2 秒、访客 30 秒、串门 60 秒', () => {
+test('默认参数：发现 5 秒、心跳 2 秒、心跳影子 30 秒、出门上限 30 分钟、失联 2 分钟', () => {
   assert.equal(BEACON_INTERVAL_MS, 5000)
   assert.equal(DEFAULT_PORT, 45871)
   assert.equal(HEARTBEAT_INTERVAL_MS, 2000)
   assert.equal(GUEST_TTL_MS, 30000)
-  assert.equal(VISIT_TTL_MS, 60000)
+  assert.equal(VISIT_MAX_MS, 30 * 60 * 1000)
+  assert.equal(PEER_LOST_MS, 2 * 60 * 1000)
   assert.deepEqual(PACKET_TYPES, [
     'beacon',
     'beacon-ack',

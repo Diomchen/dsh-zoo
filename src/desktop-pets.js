@@ -4,6 +4,12 @@
  * 这是宿主对宠物身份/动作的唯一权威：渲染端只按这个列表增删宠物、切换素材。
  * 坐标不在这里（ADR-0003 不变）；桌面位置由 helper 的渲染端本地模拟。
  *
+ * ticket 09/10 的边界：
+ * - 自己的宠物出门（self.out 非 null）时从本机桌面消失；
+ * - 桌面上只画**串门访客**（snapshot.visitors），不画 30 秒心跳影子（snapshot.guests）——
+ *   心跳只说明“这位邻居在线、并且放行了我”，不代表它在我家。把心跳影子画出来会让
+ *   “串门”变成“所有邻居一直待在桌面上”，也会让「送客」无从谈起。
+ *
  * 纯函数：只读快照对象，不碰时钟/磁盘/网络，便于单测。
  */
 
@@ -33,7 +39,7 @@ function selfDescriptor (self) {
   }
 }
 
-function guestDescriptor (raw, role) {
+function visitorDescriptor (raw) {
   if (raw === null || typeof raw !== 'object') return null
   const deviceId = deviceIdOf(raw.deviceId)
   if (deviceId === null) return null
@@ -41,8 +47,8 @@ function guestDescriptor (raw, role) {
   const palette = shared.PET_COLORS.slice(1)
   const color = palette[shared.hashString(deviceId) % palette.length]
   return {
-    id: role + ':' + deviceId,
-    role,
+    id: 'visitor:' + deviceId,
+    role: 'visitor',
     label: shared.normalizeLabel(raw.nickname, '邻居'),
     anim: shared.normalizeAnim(raw.anim),
     color
@@ -51,7 +57,7 @@ function guestDescriptor (raw, role) {
 
 /**
  * @param {object} snapshot room.snapshot()
- * @returns {Array<{id:string,role:'self'|'guest'|'visitor',label:string,anim:string|null,color:string}>}
+ * @returns {Array<{id:string,role:'self'|'visitor',label:string,anim:string|null,color:string}>}
  */
 export function petsFromSnapshot (snapshot) {
   const pets = []
@@ -60,30 +66,12 @@ export function petsFromSnapshot (snapshot) {
   const self = selfDescriptor(snapshot.self)
   if (self !== null) pets.push(self)
 
-  const guests = Array.isArray(snapshot.guests) ? snapshot.guests : []
+  // 只有 visitors 是“此刻在我家串门的宠物”。guests 是心跳影子，刻意不画。
   const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
-
-  // 同一位邻居既可能有 30 秒心跳影子、又真的在串门：串门记录优先，只画一只。
-  const visitorIds = new Set()
-  for (const visitor of visitors) {
-    const deviceId = visitor !== null && typeof visitor === 'object' ? deviceIdOf(visitor.deviceId) : null
-    if (deviceId !== null) visitorIds.add(deviceId)
-  }
-
   const seen = new Set()
-  for (const guest of guests) {
-    if (pets.length >= shared.MAX_SCENE_ITEMS) return pets
-    const deviceId = guest !== null && typeof guest === 'object' ? deviceIdOf(guest.deviceId) : null
-    if (deviceId === null || visitorIds.has(deviceId)) continue
-    const pet = guestDescriptor(guest, 'guest')
-    if (pet === null || seen.has(pet.id)) continue
-    seen.add(pet.id)
-    pets.push(pet)
-  }
-  // 串门访客后画（场景顺序 = DOM 顺序 = 画在最上层）。
   for (const visitor of visitors) {
-    if (pets.length >= shared.MAX_SCENE_ITEMS) return pets
-    const pet = guestDescriptor(visitor, 'visitor')
+    if (pets.length >= shared.MAX_SCENE_ITEMS) break
+    const pet = visitorDescriptor(visitor)
     if (pet === null || seen.has(pet.id)) continue
     seen.add(pet.id)
     pets.push(pet)

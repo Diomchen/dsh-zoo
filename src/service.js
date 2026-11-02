@@ -13,7 +13,8 @@ import { createPetBridge, readPetConfig } from './pet-bridge.js'
 import { createSettingsStore } from './settings.js'
 import {
   HEARTBEAT_INTERVAL_MS,
-  VISIT_TTL_MS,
+  PEER_LOST_MS,
+  VISIT_MAX_MS,
   encodeHeartbeat,
   encodeVisitAck,
   encodeVisitDeny,
@@ -36,16 +37,23 @@ export const VISIT_REQUEST_TIMEOUT_MS = 1800
 export const VISIT_TIMER_TICK_MS = 200
 /** 桌面场景的巡检节拍：guest 出现/消失、对方动作变化最迟这么久后反映到桌面上。 */
 export const DESKTOP_SYNC_MS = 500
+/**
+ * 自发串门策略的评估节拍：不追求秒级，30 秒足够让“最近有活动 + 冷却结束”的宠物
+ * 在合理时间内出门，也不会让日志和定时器太吵。
+ */
+export const AUTO_VISIT_INTERVAL_MS = 30 * 1000
+/** 同一条“为什么没出门”的日志最多每 5 分钟重复一次，避免刷屏。 */
+export const AUTO_VISIT_LOG_INTERVAL_MS = 5 * 60 * 1000
 
 /**
- * 把客厅接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
+ * 把桌面接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
  * 不需要跨域、不需要第二个口令。局域网上的串门流量**不走**这里（见 ADR-0002），
  * 这里的路由只服务已经打开的 DSH 页面。
  *
  * I/O 都在这个薄壳里：
  * - identity 落盘（src/identity.js）
  * - 放行/拒绝名单落盘（src/peers.js）
- * - 客厅开关落盘（src/settings.js）
+ * - 桌面开关（入站串门 / 自发出门）落盘（src/settings.js）
  * - 串门记录落盘（src/visits.js）
  * - dsh-pet 轮询（src/pet-bridge.js）
  * - UDP 发现（src/discovery.js）
@@ -59,7 +67,14 @@ export function createService (ctx, options = {}) {
   const room = createRoom({
     dir,
     log,
-    visitTtlMs: positiveOption(options.visitTtlMs, VISIT_TTL_MS, 100)
+    // visitMaxMs 是 ticket 09 的名字；visitTtlMs 是 ticket 05 的旧名，保留兼容。
+    visitMaxMs: positiveOption(
+      options.visitMaxMs,
+      positiveOption(options.visitTtlMs, VISIT_MAX_MS, 100),
+      100
+    ),
+    // 测试注入：2 分钟失联窗口可以缩短，但生产默认不动。
+    peerLostMs: positiveOption(options.peerLostMs, PEER_LOST_MS, 100)
   })
   const disposers = []
   const visitRetryMs = positiveOption(options.visitRetryMs, VISIT_REQUEST_RETRY_MS, 10)
@@ -71,6 +86,7 @@ export function createService (ctx, options = {}) {
   const visitAttempts = integerOption(options.visitAttempts, VISIT_REQUEST_ATTEMPTS, 1, 8)
   const visitTickMs = positiveOption(options.visitTickMs, VISIT_TIMER_TICK_MS, 10)
   const desktopSyncMs = positiveOption(options.desktopSyncMs, DESKTOP_SYNC_MS, 20)
+  const autoVisitIntervalMs = positiveOption(options.autoVisitIntervalMs, AUTO_VISIT_INTERVAL_MS, 10)
 
   let identity = null
   let discovery = null
@@ -86,8 +102,12 @@ export function createService (ctx, options = {}) {
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
+  let autoVisitTimer = null
   // 当前出门请求的重试状态；只活在 service，room 只记“在请求中/已抵达”。
   let request = null
+  // 活动信号的可观测性：第一次见到某个来源、以及同一条策略结论的日志节流。
+  const loggedActivitySources = new Set()
+  let lastPolicyLog = { reason: null, at: 0 }
   let disposed = false
 
   disposers.push(register(ctx, {
@@ -161,7 +181,7 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'dismiss', deviceId, prompt: result.prompt }
     }
 
-    // 客厅开关（用户故事 22）：只挡入站串门请求，落盘在 settings.json。
+    // 桌面开关（用户故事 22 + ticket 09）：分别管入站串门和自发出门，落盘在 settings.json。
     // 显式传 enabled，客户端按当前快照取反；非布尔值明确失败，不做隐式 toggle。
     if (action === 'accept-visits') {
       if (settings === null) return { ok: false, error: 'starting' }
@@ -171,40 +191,29 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'accept-visits', acceptVisits, persisted }
     }
 
-    // 串门（ticket 05）：只接受本地页面发来的 UUID。出门状态在 room，
-    // 重试与超时计时在 service；两者都用同一条已放行的 UDP 单播出口。
+    // ticket 09 的总开关：默认关，打开后宠物才可能自己出门。
+    // 关掉不影响手动「串门」；这是本机 action，UDP 报文永远碰不到。
+    if (action === 'auto-visits') {
+      if (settings === null) return { ok: false, error: 'starting' }
+      if (typeof body?.enabled !== 'boolean') return { ok: false, error: 'bad-enabled' }
+      const persisted = await settings.setAutoVisits(body.enabled)
+      const autoVisits = room.setAutoVisits(body.enabled)
+      return { ok: true, action: 'auto-visits', autoVisits, persisted }
+    }
+
+    // 手动「串门」：可以指定 deviceId，也可以不带——后者是 ticket 11 的按钮路径，
+    // 由宿主随机挑一位在线且互相放行的邻居。手动永远不受总开关/活动窗口限制。
     if (action === 'visit') {
-      const deviceId = actionDeviceId(body?.deviceId)
-      if (deviceId === null) return { ok: false, error: 'bad-device-id' }
-      const visitId = randomUUID()
-      const begun = room.beginVisit(deviceId, { visitId })
-      if (!begun.ok) return begun
-      if (!sendVisitRequest(visitId)) {
-        request = null
-        const failed = room.failOutboundVisit('peer-offline')
-        return {
-          ok: false,
-          error: 'peer-offline',
-          deviceId,
-          notice: failed.ok ? failed.notice : null
-        }
+      let deviceId
+      if (body?.deviceId === undefined || body?.deviceId === null) {
+        const target = room.pickVisitTarget()
+        if (target === null) return room.noVisitTarget()
+        deviceId = target.deviceId
+      } else {
+        deviceId = actionDeviceId(body.deviceId)
+        if (deviceId === null) return { ok: false, error: 'bad-device-id' }
       }
-      const now = Date.now()
-      request = {
-        deviceId,
-        visitId,
-        attempts: 1,
-        nextAt: now + visitRetryMs,
-        deadline: now + visitTimeoutMs
-      }
-      return {
-        ok: true,
-        action: 'visit',
-        deviceId,
-        visitId,
-        phase: 'requesting',
-        nickname: begun.visit.nickname
-      }
+      return startOutboundVisit(deviceId)
     }
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
@@ -258,17 +267,18 @@ export function createService (ctx, options = {}) {
       if (disposed) return
       room.setTrust(peers.trust())
 
-      // 客厅开关也是本机状态：读不出来就按默认“允许串门”，客厅照常可用。
+      // 桌面开关也是本机状态：读不出来就按默认值（入站开、自发关），桌面照常可用。
       try {
         settings = await createSettingsStore(dir, { log })
         room.setAcceptVisits(settings.acceptVisits)
+        room.setAutoVisits(settings.autoVisits)
       } catch (error) {
         settings = null
-        warn(ctx, '客厅开关初始化失败，本次按“允许串门”运行：' + message(error))
+        warn(ctx, '桌面开关初始化失败，本次按“允许入站串门、不自动出门”运行：' + message(error))
       }
       if (disposed) return
 
-      // 串门记录是“锦上添花”：读写失败只降级成空记录，绝不让客厅起不来。
+      // 串门记录是“锦上添花”：读写失败只降级成空记录，绝不让桌面起不来。
       try {
         visits = await createVisitStore(dir, { log })
       } catch (error) {
@@ -360,15 +370,17 @@ export function createService (ctx, options = {}) {
       if (!disposed && options.network !== false) {
         startNeighborTick()
         startVisitTimer()
+        startAutoVisitTimer()
       }
     } catch (error) {
       if (disposed) return
-      warn(ctx, '启动失败，客厅会降级：' + message(error))
+      warn(ctx, '启动失败，桌面会降级：' + message(error))
       room.setBridge({ ok: false, reason: 'error' })
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
       if (options.network !== false) {
         startNeighborTick()
         startVisitTimer()
+        startAutoVisitTimer()
       }
     }
   }
@@ -412,6 +424,11 @@ export function createService (ctx, options = {}) {
             desktopHelperPid = pid
             desktopSceneSignature = null
             syncDesktop({ reset: restarted })
+          } else if (event?.type === 'hit' && event.inside === true && event.point !== null) {
+            // ticket 09 的**兜底**活动信号：session/event 没有活动时，光标真的碰到了宠物
+            // 也算“有人在用这台机器”。helper 只在穿透翻转时发 hit，所以这是粗粒度信号；
+            // 它够用来防止“人明明在电脑前，宠物却因为没敲 DSH 而不出门”。
+            noteActivity('pointer')
           }
         }
       })
@@ -558,6 +575,106 @@ export function createService (ctx, options = {}) {
     visitTimer.unref?.()
   }
 
+  function startAutoVisitTimer () {
+    if (autoVisitTimer !== null || disposed || discovery === null) return
+    autoVisitTimer = setInterval(() => {
+      maybeSpontaneousVisit()
+    }, autoVisitIntervalMs)
+    autoVisitTimer.unref?.()
+  }
+
+  /**
+   * 每 30 秒问一次纯策略：开关、活动、冷却、在线邻居四道门都过了才出门。
+   * 每次判定都写进 room 快照（lastDecision），并按 reason 节流打一行日志，
+   * 这样“为什么它没出门”在日志里能直接读到，不用猜。
+   */
+  function maybeSpontaneousVisit () {
+    if (disposed) return null
+    const plan = room.spontaneousVisitPlan()
+    room.notePolicyDecision(plan)
+    if (!plan.go || plan.candidate === null) {
+      logPolicyPlan(plan)
+      return plan
+    }
+
+    const result = startOutboundVisit(plan.candidate.deviceId)
+    // 自动路径没有 action 的 finally：手动同步一次桌面，让本机立刻收起自己。
+    flushRoomEffects()
+    if (!result.ok) {
+      // startOutboundVisit 已经在 room 里写了人话 notice；这里只补一行可检索的日志。
+      log.info('自动串门没能出发（' + plan.candidate.nickname + '）：' + (result.error ?? 'unknown'))
+      return { ...plan, result }
+    }
+    log.info('自动串门：出发去「' + plan.candidate.nickname + '」' + activitySuffix(plan))
+    return { ...plan, result }
+  }
+
+  function logPolicyPlan (plan) {
+    const now = Date.now()
+    const same = lastPolicyLog.reason === plan.reason
+    if (same && now - lastPolicyLog.at < AUTO_VISIT_LOG_INTERVAL_MS) return
+    lastPolicyLog = { reason: plan.reason, at: now }
+    log.info('自动串门：' + policyText(plan) + activitySuffix(plan))
+  }
+
+  function activitySuffix (plan) {
+    const source = plan.activitySource === 'session'
+      ? 'session/event'
+      : plan.activitySource === 'pointer' ? '桌面指针' : '无活动信号'
+    const age = Number.isFinite(plan.activityAgeMs)
+      ? '，最近活动 ' + Math.round(plan.activityAgeMs / 1000) + ' 秒前'
+      : ''
+    const candidates = Number.isInteger(plan.candidates) ? '，可串门邻居 ' + plan.candidates + ' 位' : ''
+    return '（活动信号：' + source + age + candidates + '）'
+  }
+
+  function policyText (plan) {
+    if (plan.reason === 'disabled') return '总开关关着，不自动出门'
+    if (plan.reason === 'already-out') return '宠物已经在外面，等它回家'
+    if (plan.reason === 'no-activity') return '最近 10 分钟没有本机活动，不自动出门'
+    if (plan.reason === 'cooldown') return '距上次出门不到 15 分钟，暂不自动出门'
+    if (plan.reason === 'no-neighbor') return '没有在线且互相放行的邻居，不自动出门'
+    if (plan.reason === 'ready') return '四道门都过了'
+    return '策略跳过（' + String(plan.reason) + '）'
+  }
+
+  /** 记一次本机活动，并在第一次见到某个信号时打一行日志说明用了哪一路。 */
+  function noteActivity (source, at = Date.now()) {
+    const result = room.noteActivity(source, at)
+    if (result === null) return null
+    if (!loggedActivitySources.has(source)) {
+      loggedActivitySources.add(source)
+      log.info('活动信号：' + (source === 'session' ? 'session/event（主信号）' : '桌面指针（兜底）') + ' 已接入')
+    }
+    return result
+  }
+
+  /**
+   * session/event 是 ticket 09 的主活动信号：DSH 里只要有人在用（发消息、跑 turn），
+   * 宠物就知道“本机最近有活动”。拿不到这个能力（web/老宿主/ctx 没有 on）时不报错，
+   * 自动退回桌面指针；两者都没有时策略的 activity 门永远关着。
+   */
+  function subscribeSessionEvents () {
+    if (disposed) return false
+    if (typeof ctx?.on !== 'function') {
+      log.info('活动信号：宿主没有 session/event，自动串门只靠桌面指针活动')
+      return false
+    }
+    try {
+      const dispose = ctx.on('session/event', (session, event) => {
+        if (disposed) return
+        // 任何 session 事件都代表这台机器上有人在用 DSH；事件类型不是安全边界。
+        noteActivity('session')
+      }, { global: true })
+      if (typeof dispose === 'function') disposers.push(dispose)
+      log.info('活动信号：已订阅 session/event')
+      return true
+    } catch (error) {
+      warn(ctx, '订阅 session/event 失败，自动串门退回桌面指针：' + message(error))
+      return false
+    }
+  }
+
   /**
    * 串门请求的重试与超时。只在“请求中”阶段工作：
    * 首次发送后约 600ms / 1200ms 各补发一次；约 1800ms 还没 ack 就明确超时。
@@ -588,6 +705,42 @@ export function createService (ctx, options = {}) {
 
   function clearRequest (visitId) {
     if (request !== null && request.visitId === visitId) request = null
+  }
+
+  /**
+   * 开始一次出门的唯一入口：手动按钮与自发策略共用同一条路径。
+   * 生成 visitId、写 room 状态、发第一包、登记重试计时器；失败时由 room 给一句人话。
+   */
+  function startOutboundVisit (deviceId) {
+    const visitId = randomUUID()
+    const begun = room.beginVisit(deviceId, { visitId })
+    if (!begun.ok) return begun
+    if (!sendVisitRequest(visitId)) {
+      request = null
+      const failed = room.failOutboundVisit('peer-offline')
+      return {
+        ok: false,
+        error: 'peer-offline',
+        deviceId,
+        notice: failed.ok ? failed.notice : null
+      }
+    }
+    const now = Date.now()
+    request = {
+      deviceId,
+      visitId,
+      attempts: 1,
+      nextAt: now + visitRetryMs,
+      deadline: now + visitTimeoutMs
+    }
+    return {
+      ok: true,
+      action: 'visit',
+      deviceId,
+      visitId,
+      phase: 'requesting',
+      nickname: begun.visit.nickname
+    }
   }
 
   /**
@@ -652,7 +805,7 @@ export function createService (ctx, options = {}) {
 
   /**
    * 把 room 里完成但未落盘的串门记录交给 visits.json，并补发待发的 recall。
-   * 记录失败只影响历史，不回滚客厅状态；这是 ticket 06 的“记录不能拖垮串门”。
+   * 记录失败只影响历史，不回滚桌面状态；这是 ticket 06 的“记录不能拖垮串门”。
    */
   function flushRoomEffects () {
     const records = room.drainVisitRecords()
@@ -678,6 +831,8 @@ export function createService (ctx, options = {}) {
     return records.length
   }
 
+  // 先挂上 session 活动信号，再启动：DSH 可能在 start() 的 await 期间就有事件。
+  subscribeSessionEvents()
   const ready = start()
 
   return {
@@ -709,6 +864,10 @@ export function createService (ctx, options = {}) {
       if (visitTimer !== null) {
         clearInterval(visitTimer)
         visitTimer = null
+      }
+      if (autoVisitTimer !== null) {
+        clearInterval(autoVisitTimer)
+        autoVisitTimer = null
       }
       stopDesktopSync()
       request = null

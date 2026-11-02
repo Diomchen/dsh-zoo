@@ -22,13 +22,19 @@ export const BEACON_INTERVAL_MS = 5000
 export const NEIGHBOR_TTL_MS = 30000
 /** 放行后每 2 秒一次心跳；动作变化时 service 会额外立刻补发（见 src/service.js）。 */
 export const HEARTBEAT_INTERVAL_MS = 2000
-/** 30 秒没有心跳，访客从客厅消失；与邻居灯共用同一条 tick 时间线。 */
+/** 30 秒没有心跳，心跳影子从快照里消失；与邻居灯共用同一条 tick 时间线。 */
 export const GUEST_TTL_MS = 30000
 /**
- * 一次串门的硬 TTL：发起方到点主动召回，接收方到点**自己**清理。
- * 双方各跑各的计时器，谁都不能假设对面还活着（ticket 05）。
+ * 一次**出门**的硬上限：30 分钟到点主动回家并写记录（ticket 09）。
+ * 入站串门没有时间上限——客人待到主人点「送客」（ticket 10）。
+ * 这个值同时是单条串门记录的时长上限（见 src/visit-record.js）。
  */
-export const VISIT_TTL_MS = 60000
+export const VISIT_MAX_MS = 30 * 60 * 1000
+/**
+ * 心跳失联阈值：入站访客或出门在外的本机宠物，2 分钟没有对方心跳就判定「对方失联」。
+ * 心跳每 2 秒一次，所以 2 分钟已经是 60 个心跳周期，足够容忍丢包与短暂卡顿。
+ */
+export const PEER_LOST_MS = 2 * 60 * 1000
 /**
  * 串门走现有 UDP socket，不另开 TCP 监听（见 docs/protocol.md 的“为什么是 UDP”）。
  * 类型集按生命周期固定：请求 → ack/deny，任一方可发 recall。

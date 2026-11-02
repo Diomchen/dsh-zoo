@@ -24,7 +24,6 @@ import {
   DEFAULT_PORT,
   HEARTBEAT_INTERVAL_MS,
   MAX_PACKET_BYTES,
-  VISIT_TTL_MS,
   encodeHeartbeat,
   encodePacket,
   encodeVisitAck,
@@ -70,7 +69,7 @@ socket.on('error', (error) => {
 
 socket.bind(port, bindAddress, () => {
   console.log(`[假邻居] 我是「${nickname}」，在 ${bindAddress}:${port} 上听着，去找 ${destHost}:${targetPort} 的插件。`)
-  console.log(`[假邻居] 现在去 /local-pet/state 看 neighbors，用 /local-pet/action 的 admit 放行我；${nickname} 的宠物就会出现在你的桌面上。`)
+  console.log(`[假邻居] 现在去 /local-pet/state 看 neighbors，用 /local-pet/action 的 admit 放行我；然后按 v 让${nickname}来串门。`)
   console.log('[假邻居] 键盘：v=让它来串门  a <动画名>=换动作  n <新名字>=改名  q=退出')
   // 发往广播地址必须先开 SO_BROADCAST，否则 macOS 直接 EACCES，而且错误会被静默吞掉。
   try {
@@ -101,7 +100,7 @@ function handle (packet, rinfo) {
     state.theirAnim = packet.anim
     if (!state.admitted) {
       state.admitted = true
-      console.log('[假邻居] 你放行了 🎉 它现在会作为访客待在桌面上；把鼠标移到它身上就能拖。')
+      console.log('[假邻居] 你放行了 🎉 按 v 让它来串门；来了会一直待到你送客。')
       // 脚本化演示：放行之后自动发一次串门，省得再敲键盘。
       if (autoVisit !== null && Number.isFinite(autoVisit)) {
         setTimeout(outboundVisit, Math.max(0, autoVisit) * 1000)
@@ -113,7 +112,7 @@ function handle (packet, rinfo) {
   if (packet.type === 'visit-request') {
     state.visit = { id: packet.visitId, nickname: packet.nickname }
     send(encodeVisitAck({ deviceId, visitId: packet.visitId }), rinfo.address, rinfo.port)
-    console.log(`[假邻居] 🐾「${packet.nickname}」来串门了（动画：${packet.anim ?? '待机'}），${Math.round(VISIT_TTL_MS / 1000)} 秒后自己走。`)
+    console.log(`[假邻居] 🐾「${packet.nickname}」来串门了（动画：${packet.anim ?? '待机'}），会一直待到你送客。`)
     return
   }
 

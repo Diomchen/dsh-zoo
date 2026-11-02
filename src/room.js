@@ -3,7 +3,8 @@ import {
   MAX_LABEL,
   MAX_NEIGHBORS,
   NEIGHBOR_TTL_MS,
-  VISIT_TTL_MS,
+  PEER_LOST_MS,
+  VISIT_MAX_MS,
   isPort,
   isSafeAnimationName,
   isVisitId,
@@ -16,11 +17,17 @@ import {
   VISIT_RECORD_LIMIT,
   normalizeVisitRecord
 } from './visit-record.js'
+import {
+  eligibleVisitTargets,
+  isVisitPolicyReason,
+  pickVisitTarget as pickPolicyTarget,
+  planSpontaneousVisit as planVisitPolicy
+} from './visit-policy.js'
 
 export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
 
 /**
- * 客厅的领域状态：我是谁、有哪些邻居、谁在我家、谁出门了、最近串了几次门。
+ * 串门的领域状态：我是谁、有哪些邻居、谁在我家、谁出门了、最近串了几次门。
  *
  * 这一层是本项目的主测试缝——它是纯的：喂事件、看快照，不碰 socket、不碰 DOM、不碰磁盘。
  * 网络和磁盘在 src/discovery.js、src/identity.js、src/peers.js、src/visits.js 与
@@ -34,15 +41,25 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *       pet: { name, anim } | null,
  *       bridge: { ok, reason },       // reason: starting|not-installed|unreachable|no-pet|error|null
  *       out: { deviceId, nickname, visitId, phase: 'requesting'|'active',
- *              startedAt, endsAt } | null   // 本地宠物出门了
+ *              startedAt, endsAt } | null   // 本地宠物出门了；active 的 endsAt = 30 分钟上限
  *     },
- *     neighbors: [ { deviceId, nickname, status: 'pending'|'allowed'|'denied', lastSeen, port } ],
+ *     neighbors: [ { deviceId, nickname, status: 'pending'|'allowed'|'denied', lastSeen, port,
+ *                    heartbeatAt } ],
+ *                // heartbeatAt > 0 = 收到过对方心跳 = 对方也放行了我（心跳只发给放行名单）
  *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子
- *     visitors:  [ { deviceId, nickname, anim, visitId, since, endsAt } ], // 60 秒串门访客
+ *     visitors:  [ { deviceId, nickname, anim, visitId, since, lastSeen, endsAt: null } ],
+ *                 // 入站串门访客：没有时间上限，只靠心跳存活与「送客」结束
  *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs } ],
  *     prompt:    { deviceId, nickname } | null,   // 放行 FIFO 的队首；其余排队等待
  *     notices:   [ { text, at } ],
- *     acceptVisits: true                          // 本机客厅是否接受入站串门
+ *     acceptVisits: true,                         // 本机桌面是否接受入站串门
+ *     autoVisit: {                                // ticket 09：自发出门的策略状态
+ *       enabled,                                  // 总开关，默认 false
+ *       activitySource: 'session'|'pointer'|'none',
+ *       lastActivityAt, lastDepartureAt,
+ *       lastDecision: { at, reason, gate, candidate, activitySource, ... } | null
+ *     },
+ *     visitTargets: [ { deviceId, nickname } ]    // 手动「串门」可用的邻居（在线且互相放行）
  *   }
  *
  * 已知限制（ticket 01）：`dsh-pet` 不上报随机待机动画，所以 `self.pet.anim`
@@ -55,39 +72,39 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  * - mayTalkTo(deviceId) 是心跳与串门请求的**唯一**门控：只有 allowed 为真。
  * - 邻居的 IP 地址不在这里，也不在快照里；见 discovery.addressOf()。
  *
- * ticket 04（访客）的边界：
+ * ticket 04（心跳影子）的边界：
  * - 只有 mayTalkTo 为真的邻居心跳才会创建/刷新 guests；pending/denied 的心跳只被丢弃。
- * - 访客 30 秒没有心跳由 tick() 清掉；被拒绝或邻居从邻居表移除时立刻清掉。
- * - 访客表上限 MAX_GUESTS，超出时挤掉最久没有心跳的那位（新来的留下）。
- * - 心跳只带 anim；访客昵称来自邻居表或放行名单，绝不来自心跳。
+ * - 心跳影子 30 秒没有心跳由 tick() 清掉；它只用来表示“这位邻居在线”，不是串门访客。
+ * - 访客昵称来自邻居表或放行名单，绝不来自心跳。
  *
- * ticket 05（串门）的边界：
- * - 出门是一次显式状态（self.out），不是 30 秒心跳影子：请求中/已抵达，60 秒 TTL。
- * - 同一只本机宠物同时只能有一次出门；本机入站访客按 deviceId 去重，一个设备最多一位。
- * - 接收方自己跑 60 秒计时器：对面消失也照样到期、写记录、清人，绝不假设对面守约。
- * - 召回可以由任一方发起：本机召回会排一条 visit-recall 给 service 发；收到 recall 立即回家。
- * - 失败（未放行/离线/超时/被拒绝/已经在串门）只产生一条人话 notice，不抛异常、不写半截状态。
+ * ticket 05 / 09（出门）的边界：
+ * - 出门是一次显式状态（self.out），不是 30 秒心跳影子：请求中/已抵达。
+ * - 同一只本机宠物同时只能有一次出门；active 后 30 分钟到点自己回家并写记录。
+ * - 对方的送客（visit-recall）、本机召回、30 分钟上限、对方失联（2 分钟无心跳）
+ *   是四种结束方式；每种都只写一条记录，durationMs 是真实停留时长。
+ * - 总开关、活动窗口与冷却只影响**自发**出门；手动「串门」永远可用。
+ *
+ * ticket 10（客人常驻）的边界：
+ * - 入站访客没有 TTL，也不设同屏上限；只有主人「送客」或对方失联（2 分钟无心跳）
+ *   才会离开。每次离开都写一条 in 记录。
+ * - 接收方自己检测失联，不假设对方会发 recall；发送方也自己检测，不假设对方守约。
  *
  * ticket 06（记录）的边界：
- * - 一次串门完成（召回/到期/对方结束/被拒绝后清场）时写一条**内存**记录；
- *   落盘由 service 调用 drainVisitRecords() 后交给 src/visits.js，room 自己不碰磁盘。
+ * - 一次串门完成时写一条**内存**记录；落盘由 service 调用 drainVisitRecords()
+ *   后交给 src/visits.js，room 自己不碰磁盘。
  * - 记录最多保留 VISIT_RECORD_LIMIT 条，丢掉最旧的；快照只给最近 5 条。
  * - 记录损坏/不可写时，visits.json 由 store 降级；这里始终有一份内存记录可用。
  *
- * 客厅开关（ticket 02 用户故事 22）：
+ * 桌面开关（ticket 02 用户故事 22）：
  * - acceptVisits 只挡**入站串门请求**：关掉时回一条带 visits-off 理由的 deny，
- *   不创建访客；发现、邻居灯、心跳和本机出门都不受影响。
- * - 这是本机动作，落盘由 service 交给 src/settings.js；UDP 报文永远改不了它。
+ *   不创建访客；发现、心跳和本机出门都不受影响。
+ * - autoVisit 只影响**自发出门**：关掉时手动「串门」照常可用。
+ * - 两个开关都是本机动作，落盘由 service 交给 src/settings.js；UDP 报文永远改不了它们。
  */
 
 export const MAX_PROMPTS = 8
-/** 同时出现在客厅里的访客上限；其余由客户端折进灯条的 +N。 */
+/** 同时出现在桌面上的心跳影子上限；它只是“谁在线”，不是串门访客。 */
 export const MAX_GUESTS = 8
-/**
- * 入站串门访客上限。按 deviceId 去重，一个邻居最多一位；正常场景（六个人在线）
- * 远达不到这个数，上限只用来保证内存有界。
- */
-export const MAX_VISITORS = MAX_NEIGHBORS
 export const MAX_NOTICES = 10
 /** 点“稍后再说”后，同一位邻居至少安静这么久再问（它消失后重新出现则立刻重问）。 */
 export const PROMPT_SNOOZE_MS = 10 * 60 * 1000
@@ -96,9 +113,19 @@ const BRIDGE_REASONS = new Set(['starting', 'not-installed', 'unreachable', 'no-
 const IDLE_BRIDGE = Object.freeze({ ok: false, reason: 'starting' })
 const FALLBACK_NICKNAME = '邻居'
 const DIRECTIONS = new Set(['out', 'in'])
+const ACTIVITY_SOURCES = new Set(['session', 'pointer'])
 
-export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = VISIT_TTL_MS } = {}) {
-  const ttl = Number.isFinite(visitTtlMs) && visitTtlMs > 0 ? visitTtlMs : VISIT_TTL_MS
+export function createRoom ({
+  dir,
+  log,
+  clock = () => Date.now(),
+  visitMaxMs,
+  // 兼容 ticket 05 的旧参数名：它是同一条“出门上限”，不是入站 TTL。
+  visitTtlMs,
+  peerLostMs = PEER_LOST_MS
+} = {}) {
+  const maxVisitMs = positiveMs(visitMaxMs, positiveMs(visitTtlMs, VISIT_MAX_MS))
+  const lostMs = positiveMs(peerLostMs, PEER_LOST_MS)
   const state = {
     self: { deviceId: null, nickname: '我', pet: null, bridge: { ...IDLE_BRIDGE } },
     neighbors: new Map(),
@@ -113,7 +140,11 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     promptSet: new Set(),
     snoozed: new Map(),
     notices: [],
-    acceptVisits: true
+    acceptVisits: true,
+    autoVisits: false,
+    lastDepartureAt: null,
+    activity: { session: null, pointer: null },
+    lastPolicyDecision: null
   }
 
   function nowMs () {
@@ -123,6 +154,47 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
 
   function stampOf (value) {
     return Number.isFinite(value) ? value : nowMs()
+  }
+
+  /** 本机活动的两个来源各自保存“最近一次”；快照里取更近的那个。 */
+  function activityInfo () {
+    const session = state.activity.session
+    const pointer = state.activity.pointer
+    if (session === null && pointer === null) return { at: null, source: 'none' }
+    if (session !== null && (pointer === null || session >= pointer)) {
+      return { at: session, source: 'session' }
+    }
+    return { at: pointer, source: 'pointer' }
+  }
+
+  function currentVisitTargets () {
+    return eligibleVisitTargets([...state.neighbors.values()], { now: nowMs() })
+  }
+
+  function copyCandidate (candidate) {
+    if (candidate === null || typeof candidate !== 'object') return null
+    return {
+      deviceId: typeof candidate.deviceId === 'string' ? candidate.deviceId : '',
+      nickname: normalizeNickname(candidate.nickname) ?? FALLBACK_NICKNAME
+    }
+  }
+
+  function copyDecision (decision) {
+    if (decision === null || typeof decision !== 'object') return null
+    return {
+      at: Number.isFinite(decision.at) ? decision.at : nowMs(),
+      reason: isVisitPolicyReason(decision.reason) ? decision.reason : 'no-activity',
+      gate: typeof decision.gate === 'string' ? decision.gate : null,
+      candidate: copyCandidate(decision.candidate),
+      candidates: Number.isInteger(decision.candidates) && decision.candidates >= 0
+        ? decision.candidates
+        : 0,
+      activitySource: ACTIVITY_SOURCES.has(decision.activitySource) ? decision.activitySource : 'none',
+      activityAgeMs: Number.isFinite(decision.activityAgeMs) ? Math.max(0, decision.activityAgeMs) : null,
+      sinceDepartureMs: Number.isFinite(decision.sinceDepartureMs)
+        ? Math.max(0, decision.sinceDepartureMs)
+        : null
+    }
   }
 
   function enqueuePrompt (deviceId) {
@@ -193,6 +265,31 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     if (neighbor !== undefined && at > neighbor.lastSeen) neighbor.lastSeen = at
   }
 
+  /**
+   * 记录“收到过对方心跳”。心跳只发给自己的放行名单，所以这条记录同时证明
+   * **对方也放行了我**——这正是自发出门/手动串门需要的条件（不是我喜欢它就行）。
+   * 邻居表里没有它时补一条 allowed 邻居（昵称来自我的放行名单，不来自心跳）。
+   */
+  function markPeerHeartbeat (deviceId, nickname, at) {
+    const neighbor = state.neighbors.get(deviceId)
+    if (neighbor !== undefined) {
+      neighbor.heartbeatAt = Number.isFinite(neighbor.heartbeatAt)
+        ? Math.max(neighbor.heartbeatAt, at)
+        : at
+      refreshNeighbor(deviceId, at)
+      return
+    }
+    if (state.neighbors.size >= MAX_NEIGHBORS) return
+    state.neighbors.set(deviceId, {
+      deviceId,
+      nickname: nickname ?? FALLBACK_NICKNAME,
+      status: 'allowed',
+      lastSeen: at,
+      port: null,
+      heartbeatAt: at
+    })
+  }
+
   function copyOutbound (out) {
     if (out === null) return null
     return {
@@ -212,7 +309,9 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       anim: visitor.anim,
       visitId: visitor.visitId,
       since: visitor.since,
-      endsAt: visitor.endsAt
+      // 入站访客没有时间上限：endsAt 固定为 null，客户端不要画倒计时。
+      lastSeen: visitor.lastSeen,
+      endsAt: null
     }
   }
 
@@ -258,8 +357,20 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     if (reason === 'already-out') {
       return `宠物已经在「${name}」家了，先召回来再说。`
     }
+    if (reason === 'no-admitted') {
+      return '还没有人放行你，宠物出不了门。'
+    }
+    if (reason === 'no-online') {
+      return '还没有邻居放行你，或者他们现在都不在线，宠物这次没出门。'
+    }
+    if (reason === 'no-visitor') {
+      return '这位客人已经不在桌面上了。'
+    }
+    if (reason === 'not-out') {
+      return '宠物现在在家，不用召回。'
+    }
     if (reason === 'starting') {
-      return '客厅还在准备中，稍等一下再试。'
+      return '桌面还在准备中，稍等一下再试。'
     }
     return '这次串门没成功，宠物还在家里。'
   }
@@ -359,8 +470,12 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     }
     removePrompt(deviceId)
     state.snoozed.delete(deviceId)
-    if (neighbor !== undefined) neighbor.status = status
-    // 拒绝是即时的：不用等 30 秒 TTL，那位的心跳影子与串门访客现在就离开客厅。
+    if (neighbor !== undefined) {
+      neighbor.status = status
+      // 信任一变，旧的“对方放行了我”就不再可信：等下一次心跳重新证明。
+      neighbor.heartbeatAt = 0
+    }
+    // 拒绝是即时的：不用等 30 秒 TTL，那位的心跳影子与串门访客现在就离开桌面。
     if (status === 'denied') {
       state.guests.delete(deviceId)
       dropInboundVisitor(deviceId, nowMs())
@@ -377,6 +492,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
 
   return {
     snapshot () {
+      const activity = activityInfo()
       return {
         version: 1,
         self: {
@@ -399,7 +515,15 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
         visits: state.visits.slice(0, 5).map(copyRecord),
         prompt: currentPrompt(),
         notices: state.notices.slice(0, 3).map((notice) => ({ ...notice })),
-        acceptVisits: state.acceptVisits
+        acceptVisits: state.acceptVisits,
+        autoVisit: {
+          enabled: state.autoVisits,
+          activitySource: activity.source,
+          lastActivityAt: activity.at,
+          lastDepartureAt: state.lastDepartureAt,
+          lastDecision: copyDecision(state.lastPolicyDecision)
+        },
+        visitTargets: currentVisitTargets()
       }
     },
 
@@ -444,11 +568,83 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
 
     /**
      * 本机“允许串门”开关（来自 src/settings.js，默认开）。
-     * 只影响入站 visit-request；发现、邻居灯、心跳与本机出门都不变。
+     * 只影响入站 visit-request；发现、心跳与本机出门都不变。
      */
     setAcceptVisits (enabled) {
       if (typeof enabled === 'boolean') state.acceptVisits = enabled
       return state.acceptVisits
+    },
+
+    /**
+     * 自发出门的总开关（ticket 09，来自 src/settings.js，默认关）。
+     * 关掉时绝不自动出门；手动「串门」不受影响。
+     */
+    setAutoVisits (enabled) {
+      if (typeof enabled === 'boolean') state.autoVisits = enabled
+      return state.autoVisits
+    },
+
+    /**
+     * 记录一次本机活动。来源只有两种：session（宿主 session/event，主信号）
+     * 与 pointer（桌面 helper 的指针活动，兜底）。同一来源只前进不后退，
+     * 这样时钟回拨/乱序回调不会把“刚刚活动过”抹掉。
+     *
+     * 返回 `{ at, source }`：source 是当前**更近**的那个信号；两个都没有时 at=null。
+     */
+    noteActivity (source, at = clock()) {
+      if (!ACTIVITY_SOURCES.has(source)) return null
+      const stamp = stampOf(at)
+      const current = state.activity[source]
+      if (current === null || stamp > current) state.activity[source] = stamp
+      return activityInfo()
+    },
+
+    /**
+     * 跑一次自发出门策略。纯函数在 src/visit-policy.js；这里只负责把 room 的
+     * 邻居表、活动、上次出门与开关喂进去，并给结果补上活动来源。
+     */
+    spontaneousVisitPlan (random = Math.random) {
+      const activity = activityInfo()
+      const plan = planVisitPolicy({
+        now: nowMs(),
+        enabled: state.autoVisits,
+        lastActivityAt: activity.at,
+        lastDepartureAt: state.lastDepartureAt,
+        neighbors: [...state.neighbors.values()],
+        alreadyOut: state.out !== null,
+        random
+      })
+      return { ...plan, activitySource: activity.source }
+    },
+
+    /** 把最近一次策略判定留在快照里，回答“为什么没出门”。 */
+    notePolicyDecision (plan, at = clock()) {
+      const now = stampOf(at)
+      if (plan === null || typeof plan !== 'object') {
+        state.lastPolicyDecision = null
+        return null
+      }
+      state.lastPolicyDecision = copyDecision({
+        ...plan,
+        at: Number.isFinite(plan.at) ? plan.at : now
+      })
+      return state.lastPolicyDecision
+    },
+
+    /** 手动「串门」可用的邻居：在线且互相放行。顺序稳定（邻居表插入序）。 */
+    visitTargets () {
+      return currentVisitTargets()
+    },
+
+    /** 手动「串门」：从 visitTargets 里随机挑一位；没有返回 null。 */
+    pickVisitTarget (random = Math.random) {
+      return pickPolicyTarget([...state.neighbors.values()], { now: nowMs(), random })
+    },
+
+    /** 手动「串门」但没有目标：区分“没人放行”与“放行了但都不在线”。 */
+    noVisitTarget (at = clock()) {
+      const admitted = [...state.trust.allowed.keys()].some((deviceId) => canTalkTo(deviceId))
+      return failWithNotice(admitted ? 'no-online' : 'no-admitted', null, at)
     },
 
     /**
@@ -470,15 +666,17 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
           state.snoozed.delete(deviceId)
         } else if (denied.has(deviceId)) {
           neighbor.status = 'denied'
+          neighbor.heartbeatAt = 0
           removePrompt(deviceId)
           state.snoozed.delete(deviceId)
         } else if (neighbor.status !== 'pending') {
           // 名单被手改短了：退回待放行，下次广播重新询问。
           neighbor.status = 'pending'
+          neighbor.heartbeatAt = 0
           enqueuePrompt(deviceId)
         }
       }
-      // 手改名单收紧后，已经不在 allowed 里的访客与串门访客立即离开客厅。
+      // 手改名单收紧后，已经不在 allowed 里的心跳影子与串门访客立即离开桌面。
       for (const deviceId of state.guests.keys()) {
         if (!allowed.has(deviceId) || denied.has(deviceId)) state.guests.delete(deviceId)
       }
@@ -509,6 +707,8 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
         existing.nickname = nickname
         existing.lastSeen = lastSeen
         if (port !== null) existing.port = port
+        // 广播只证明“它在线”，不证明“它放行了我”；heartbeatAt 只能由心跳刷新。
+        if (!Number.isFinite(existing.heartbeatAt)) existing.heartbeatAt = 0
         // 队列满时没排上的邻居，等下一次广播再试（不重复入队）。
         if (existing.status === 'pending') enqueuePrompt(deviceId)
         return
@@ -518,7 +718,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       const status = state.trust.allowed.has(deviceId)
         ? 'allowed'
         : state.trust.denied.has(deviceId) ? 'denied' : 'pending'
-      state.neighbors.set(deviceId, { deviceId, nickname, status, lastSeen, port })
+      state.neighbors.set(deviceId, { deviceId, nickname, status, lastSeen, port, heartbeatAt: 0 })
       if (status === 'pending') enqueuePrompt(deviceId)
     },
 
@@ -526,9 +726,10 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
      * 收到一条通过协议校验的邻居心跳。心跳只带 anim；昵称从邻居表或放行名单取，
      * 所以远端无法用心跳改名字、改信任或改本地影子。
      *
-     * 未放行/已拒绝/自己的心跳直接丢弃。放行的心跳创建或刷新访客，
+     * 未放行/已拒绝/自己的心跳直接丢弃。放行的心跳创建或刷新心跳影子，
      * 同时刷新邻居的 lastSeen（心跳也证明它还活着）。返回是否被接受。
-     * 心跳还会顺手更新同名串门访客的动作，但**不会**延长串门的 60 秒 TTL。
+     * 心跳还会顺手更新同名串门访客的动作与 lastSeen，但不延长任何时间上限
+     * （入站访客根本没有上限，出门的上限固定在 30 分钟）。
      */
     observeHeartbeat (peer, at = clock()) {
       if (peer === null || typeof peer !== 'object') return false
@@ -555,10 +756,19 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       if (visiting !== undefined) {
         visiting.nickname = nickname
         visiting.anim = anim
+        // ticket 10 的唯一自动清理依据：2 分钟没有心跳 = 对方失联。
+        // 心跳不延长任何 TTL（入站访客没有 TTL），只证明“它还在”。
+        visiting.lastSeen = lastSeen
       }
 
-      // 心跳证明这位邻居还在线：邻居灯不用等下一次 5 秒广播才续命。
-      refreshNeighbor(deviceId, lastSeen)
+      // 我在对方家时，对方的心跳是“它还在”的唯一证据；ticket 09 的失联回家靠这一行。
+      if (state.out !== null && state.out.deviceId === deviceId) {
+        state.out.lastSeen = lastSeen
+      }
+
+      // 心跳证明这位邻居还在线，也证明它放行了我：邻居灯不用等下一次 5 秒广播，
+      // 串门目标表也不用猜“对方到底放没放行我”。
+      markPeerHeartbeat(deviceId, nickname, lastSeen)
       return true
     },
 
@@ -640,8 +850,12 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
         visitId: visitId.toLowerCase(),
         phase: 'requesting',
         startedAt: now,
-        endsAt: null
+        endsAt: null,
+        lastSeen: now
       }
+      // 冷却从“开始出门”算，而不是从 ack 算：即使这次请求最终失败，
+      // 宠物也已经试过一次，不该在 30 秒后的下一轮策略里再试一次。
+      state.lastDepartureAt = now
       return { ok: true, visit: copyOutbound(state.out) }
     },
 
@@ -654,7 +868,7 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     },
 
     /**
-     * 收到 visit-ack：请求中 → 已抵达，开始 60 秒 TTL。
+     * 收到 visit-ack：请求中 → 已抵达，开始 30 分钟上限。
      * 只接受来自当前出门目标的、同 visitId 的 ack；其余静默。
      */
     observeVisitAck (peer, at = clock()) {
@@ -670,7 +884,8 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       const now = stampOf(at)
       out.phase = 'active'
       out.startedAt = now
-      out.endsAt = now + ttl
+      out.endsAt = now + maxVisitMs
+      out.lastSeen = now
       refreshNeighbor(deviceId, now)
       return { ok: true, visit: copyOutbound(out) }
     },
@@ -727,9 +942,9 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
         }
       }
 
-      // 接收方收到“召回”：对方到点或被召回，访客立即清场并写 in 记录。
+      // 接收方收到“召回”：对方到点/被召回/送客，访客立即清场并写 in 记录。
       // 同一设备只有一位访客，所以按 deviceId 认即可；迟到的 recall（携带旧
-      // visitId）也能立刻清场，不必等 60 秒。不回 recall——对方已经知道了。
+      // visitId）也能立刻清场，不必等 2 分钟失联检测。不回 recall——对方已经知道了。
       const visitor = state.visitors.get(deviceId)
       if (visitor !== undefined) {
         state.visitors.delete(deviceId)
@@ -748,8 +963,8 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     /**
      * 收到 visit-request。本机“允许串门”关着时一律回 visits-off；只有放行过的
      * 来源会得到 ack，其余回 not-admitted（明确失败）。deny 都不创建访客、不写记录。
-     * 同一来源的重复请求（重试）按 visitId 幂等处理：原地刷新 id/动作，
-     * 不重置 60 秒计时，也绝不多写一条记录。
+     * 同一来源的重复请求（重试）按 visitId 幂等处理：原地刷新 id/动作/lastSeen，
+     * 不重置 since，也绝不多写一条记录。
      */
     observeVisitRequest (peer, at = clock()) {
       if (peer === null || typeof peer !== 'object') {
@@ -778,10 +993,12 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
 
       const existing = state.visitors.get(deviceId)
       if (existing !== undefined) {
-        // 重试或“上一次的 ack 丢了”：保留原来的 since/endsAt，不重复计一次串门。
+        // 重试或“上一次的 ack 丢了”：保留原来的 since，不重复计一次串门；
+        // 请求本身证明对方还活着，所以 lastSeen 跟着刷新。
         existing.visitId = visitId
         existing.nickname = nickname
         existing.anim = anim
+        existing.lastSeen = now
         refreshNeighbor(deviceId, now)
         return {
           reply: 'ack',
@@ -791,17 +1008,16 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
           visit: copyVisitor(existing)
         }
       }
-      if (state.visitors.size >= MAX_VISITORS) {
-        return { reply: 'deny', deviceId, visitId, reason: 'not-admitted' }
-      }
 
+      // ticket 10：入站访客没有 TTL、没有同屏上限，来多少留多少，直到主人「送客」
+      // 或对方 2 分钟没有心跳。内存仍有界：只有放行名单里的 deviceId 能走到这里。
       const visitor = {
         deviceId,
         visitId,
         nickname,
         anim,
         since: now,
-        endsAt: now + ttl
+        lastSeen: now
       }
       state.visitors.set(deviceId, visitor)
       refreshNeighbor(deviceId, now)
@@ -809,12 +1025,12 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     },
 
     /**
-     * 本地召回（用户点“召回”，或 service 的 60 秒 tick 调过来）。
+     * 本地召回（用户点“召回”，或 service 的 30 分钟 tick 调过来）。
      * 已抵达 → 写 out 记录并排一条 visit-recall；还在请求中 → 只是取消，不写记录。
      */
     recallOutbound (at = clock()) {
       const out = state.out
-      if (out === null) return { ok: false, error: 'not-out' }
+      if (out === null) return failWithNotice('not-out', null, at)
       const now = stampOf(at)
       const wasRequesting = out.phase === 'requesting'
       const finished = finishOutbound({ at: now, notifyRemote: !wasRequesting })
@@ -827,14 +1043,15 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     },
 
     /**
-     * 本机提前结束一位入站访客（接收方也能召回）。写 in 记录并排一条
-     * visit-recall 让对方也回家；对方收不到也没关系，它的 TTL 会自己到期。
+     * 主人点「送客」：立刻结束一位入站访客（ticket 10）。
+     * 写 in 记录并排一条 visit-recall 让对方也回家；对方收不到也没关系，
+     * 它会靠自己的 2 分钟失联检测或 30 分钟出门上限回来。
      */
     endInboundVisit (rawDeviceId, at = clock()) {
       const deviceId = normalizeDeviceId(rawDeviceId)
       if (deviceId === null) return { ok: false, error: 'bad-device-id' }
       const visitor = state.visitors.get(deviceId)
-      if (visitor === undefined) return { ok: false, error: 'no-visit' }
+      if (visitor === undefined) return failWithNotice('no-visitor', null, at)
 
       const now = stampOf(at)
       state.visitors.delete(deviceId)
@@ -886,21 +1103,36 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
     },
 
     /**
-     * 每秒一次：邻居/心跳影子按各自 TTL 过期；串门访客按自己的 60 秒 TTL 过期，
-     * 已抵达的出门到点主动结束并排 recall。接收方即使对面消失也照样走这里。
+     * 每秒一次。四件互不依赖的清理：
+     * - 已抵达的出门：30 分钟上限到点，或对方 2 分钟没有心跳（失联）；
+     * - 入站访客：对方 2 分钟没有心跳（失联）才离开；没有时间上限；
+     * - 心跳影子：30 秒没有心跳消失；
+     * - 邻居：30 秒没有广播消失。
      * 返回值保持旧契约：被移除的邻居数。
      */
     tick (at = clock()) {
       const now = stampOf(at)
 
-      if (state.out !== null && state.out.phase === 'active' && now >= state.out.endsAt) {
-        finishOutbound({ at: now, notifyRemote: true })
+      if (state.out !== null && state.out.phase === 'active') {
+        if (now >= state.out.endsAt) {
+          // 30 分钟上限：正常到点回家，不是失败，不写提示。
+          finishOutbound({ at: now, notifyRemote: true })
+        } else if (now - state.out.lastSeen >= lostMs) {
+          const nickname = state.out.nickname
+          finishOutbound({
+            at: now,
+            notifyRemote: true,
+            notice: `「${nickname}」失联了，宠物回来了。`
+          })
+        }
       }
 
+      // ticket 10：入站访客没有 TTL，唯一的自动清场是“对方 2 分钟没有心跳”。
       for (const [deviceId, visitor] of state.visitors) {
-        if (now >= visitor.endsAt) {
+        if (now - visitor.lastSeen >= lostMs) {
           state.visitors.delete(deviceId)
           recordVisit('in', visitor.nickname, visitor.since, now)
+          pushNotice(`「${visitor.nickname}」失联了，客人已经离开。`, now)
         }
       }
 
@@ -936,6 +1168,11 @@ export function createRoom ({ dir, log, clock = () => Date.now(), visitTtlMs = V
       state.snoozed.clear()
       state.notices.length = 0
       state.acceptVisits = true
+      state.autoVisits = false
+      state.lastDepartureAt = null
+      state.activity.session = null
+      state.activity.pointer = null
+      state.lastPolicyDecision = null
       state.self.pet = null
       state.self.bridge = { ...IDLE_BRIDGE }
     }
@@ -947,6 +1184,11 @@ function normalizeDeviceId (value) {
   const id = value.trim()
   if (id === '' || id.length > 64) return null
   return id
+}
+
+/** 时长参数：非正/非数字时回落到默认值，坏配置不能把计时器拖死。 */
+function positiveMs (value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback
 }
 
 function normalizeVisitId (value) {
