@@ -99,7 +99,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
-| `action` | `id`, `action`, `deviceId?` | 渲染端控件申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态** |
+| `action` | `id`, `action`, `deviceId?`, `nickname?` | 渲染端控件申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 是唯一带正文的动作（`nickname`），helper 只截长度、清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
@@ -235,6 +235,21 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   桌面上不会留下一个永远不动的窗口。
 - helper 重启后宿主会重新下发生成场景；`pid` 变了说明是新的渲染端，`reset: true` 让它重新出生。
 
+## 改名小窗（ticket 13）
+
+主窗 `focusable: false` 是刻意的（ADR-0005），所以**键盘输入只能单开一扇窗**：
+
+- 悬停自己那只 → 弹层多一项「改名」→ `local-pet:rename-open` → 主进程开一扇
+  `rename.html` 小窗（360×168，无边框、置顶、`focusable: true`，贴在宠物上方，
+  放不下就落到下方，再不行夹在工作区里）。
+- 小窗 `ready` 后主进程发 `local-pet:rename-init { name, maxLength }`；提交走
+  `local-pet:rename-submit`，主进程转成一条 `{type:'action', action:'rename', nickname}` 交给宿主。
+- 宿主回的 `action-result` 按 action id 认领：成功就关窗，失败把 `notice` 发回小窗显示
+  （`local-pet:rename-result`），窗口不关、输入保留。
+- 失焦、Esc、主窗 `hide`、helper 退出都会关掉小窗；10 秒等不到宿主答复就报一句人话。
+- 主窗的穿透/租约状态**完全不受影响**：小窗是另一个 BrowserWindow，关掉它不会改动任何
+  `ignoreState` / `busy`。
+
 ## 多显示器 / 分辨率
 
 窗口只覆盖主屏工作区；其它屏不显示。插入/拔出/改分辨率会重发 `ready`，宿主重算窗口 bounds。
@@ -243,8 +258,8 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 ## 已知限制
 
-- `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/放行卡）都是鼠标点击，没有
-  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。
+- `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/改名/放行卡）都是鼠标点击，没有
+  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是**改名小窗**（见下）。
 - 悬停弹层依赖渲染端收到 `pointermove`；macOS 上 `forward: true` 失效时，主进程仍能靠 300ms
   兜底让弹层打开后的按钮可点，但“悬停即出现”本身可能延迟到兜底接管。
 - 控件位置每 100ms 跟一次宠物；宠物被快速拖动时弹层会有一点跟手延迟（不影响点击）。

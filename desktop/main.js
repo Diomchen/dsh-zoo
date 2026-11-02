@@ -99,6 +99,19 @@ try {
 
 /** 窗口局部/屏幕 DIP 的换算全部靠它；窗口 = 主显示器工作区。 */
 let win = null
+/**
+ * 改名小窗（ticket 13）。它是这套桌宠里**唯一**可聚焦、收键盘的窗口：
+ * 主窗必须保持 focusable:false（ADR-0005 的安全约定），所以输入框只能单开一扇。
+ * 小窗关掉/崩掉都不会改动主窗的任何状态。
+ */
+let renameWin = null
+/** 正在等宿主答复的那次改名（action id）；宿主的 action-result 认这个 id 才交给小窗。 */
+let renamePendingId = null
+let renameTimer = null
+/** 改名申请的流水号，只用于给 action id 起个不重复的名字。 */
+let renameSeq = 0
+/** 主显示器工作区（DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
+let workArea = null
 let scene = shared.emptyScene()
 let sceneAt = 0
 let rendererReady = false
@@ -192,6 +205,7 @@ app.whenReady().then(() => {
 
 function createWindow () {
   const area = screen.getPrimaryDisplay().workArea
+  workArea = area
   win = new BrowserWindow({
     x: area.x,
     y: area.y,
@@ -226,11 +240,19 @@ function createWindow () {
   })
 
   // 'floating' 是 macOS 的置顶层级（dsh-pet 同款）：'screen-saver' 会压过全屏应用和截图。
+  // setVisibleOnAllWorkspaces 只有 macOS/Linux 有实现（Windows 上是空操作），单独判平台，
+  // 免得一个平台不支持的调用把 setAlwaysOnTop 一起带进 catch。
   try {
     win.setAlwaysOnTop(true, process.platform === 'darwin' ? 'floating' : 'screen-saver')
-    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
   } catch {
-    // 老版本/受限环境没有这些开关：置顶已经由构造参数保证
+    // 老版本/受限环境没有这个开关：置顶已经由构造参数保证
+  }
+  if (process.platform !== 'win32') {
+    try {
+      win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true, skipTransformProcessType: true })
+    } catch {
+      // 同上：没有这个开关不是错误
+    }
   }
   win.webContents.setBackgroundThrottling(false)
   win.webContents.on('context-menu', (event) => event.preventDefault())
@@ -691,6 +713,64 @@ ipcMain.on('local-pet:hover', (event, payload) => {
   applyDecision(inside ? 'renderer-hover' : 'renderer-leave')
 })
 
+// ---------------------------------------------------------------------------
+// 改名小窗的 IPC：渲染端只能申请，主进程只转交，真正的写入在宿主那边
+// ---------------------------------------------------------------------------
+
+ipcMain.on('local-pet:rename-open', (event) => {
+  if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
+  // 渲染端还没就绪时开不了窗：它已经把弹层关掉了，这里必须回一句，不能静默。
+  if (!openRenameWindow()) {
+    try {
+      win.webContents.send('local-pet:rename-unavailable')
+    } catch {
+      // 渲染端正在重启：下一次悬停还会再点一次
+    }
+  }
+})
+
+/** 三条改名 IPC 共用的一行守卫：只认小窗自己的 webContents。 */
+function isRenameSender (event) {
+  return renameWin !== null && !renameWin.isDestroyed() && event.sender === renameWin.webContents
+}
+
+ipcMain.on('local-pet:rename-ready', (event) => {
+  if (!isRenameSender(event)) return
+  sendRenameInit()
+})
+
+ipcMain.on('local-pet:rename-cancel', (event) => {
+  if (!isRenameSender(event)) return
+  closeRenameWindow('cancel')
+})
+
+ipcMain.on('local-pet:rename-submit', (event, payload) => {
+  if (!isRenameSender(event)) return
+  if (renamePendingId !== null) return
+  const raw = typeof payload?.nickname === 'string' ? payload.nickname : ''
+  const nickname = raw.slice(0, shared.MAX_ACTION_TEXT)
+  if (nickname.trim() === '') {
+    sendRenameResult({ ok: false, notice: '名字不能是空的。' })
+    return
+  }
+  renameSeq += 1
+  const id = 'rename-' + String(renameSeq) + '-' + Date.now().toString(36)
+  renamePendingId = id
+  clearRenameTimer()
+  renameTimer = setTimeout(() => {
+    if (renamePendingId !== id) return
+    renamePendingId = null
+    sendRenameResult({ ok: false, notice: '桌面宿主没有回应，这次没有改名。' })
+  }, RENAME_TIMEOUT_MS)
+  renameTimer.unref?.()
+  const written = writeEvent({ type: 'action', id, action: 'rename', nickname })
+  if (!written) {
+    clearRenameTimer()
+    renamePendingId = null
+    sendRenameResult({ ok: false, notice: '桌面宿主没有连接，这次没有改名。' })
+  }
+})
+
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
@@ -708,6 +788,161 @@ function sendActionResult (result) {
     return true
   } catch {
     return false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 改名小窗（ticket 13）
+//
+// 主窗 focusable:false 是刻意的（ADR-0005：一个置顶全屏窗绝不能吃掉焦点），
+// 所以输入框只能单开一扇小窗。它只做三件事：显示当前名字、收一个字符串、把
+// `{action:'rename', nickname}` 当**申请**交给宿主；真正的写入在宿主那边。
+// 小窗的任何异常都不许改动主窗的点穿/租约状态。
+// ---------------------------------------------------------------------------
+
+const RENAME_WIDTH = 360
+const RENAME_HEIGHT = 168
+const RENAME_TIMEOUT_MS = 10000
+
+/** 自己那只宠物最近的命中矩形（窗口局部 DIP）；`normalizeRects` 输出的是扁平矩形。 */
+function selfPetRect () {
+  for (const entry of rendererRects) {
+    if (entry !== null && entry.id === 'self' && Number.isFinite(entry.width) && Number.isFinite(entry.height)) {
+      return entry
+    }
+  }
+  return null
+}
+
+/** 贴着宠物开窗；没有命中矩形（宠物刚出门/还没画出来）就落在工作区中央。 */
+function renameBounds () {
+  const area = workArea ?? screen.getPrimaryDisplay().workArea
+  const pet = selfPetRect()
+  if (pet === null) {
+    return {
+      x: Math.round(area.x + (area.width - RENAME_WIDTH) / 2),
+      y: Math.round(area.y + (area.height - RENAME_HEIGHT) / 2)
+    }
+  }
+  const petX = area.x + pet.x
+  const petY = area.y + pet.y
+  const x = Math.round(Math.min(
+    Math.max(area.x + 8, petX + pet.width / 2 - RENAME_WIDTH / 2),
+    area.x + area.width - RENAME_WIDTH - 8
+  ))
+  // 优先在宠物上方；上面放不下就落到下方，再不行就夹在工作区里。
+  const above = petY - RENAME_HEIGHT - 12
+  const below = petY + pet.height + 12
+  const y = Math.round(above >= area.y + 8
+    ? above
+    : Math.min(Math.max(area.y + 8, below), area.y + area.height - RENAME_HEIGHT - 8))
+  return { x, y }
+}
+
+function currentName () {
+  const self = scene.items.find((item) => item.id === 'self')
+  return typeof self?.label === 'string' ? self.label : ''
+}
+
+function openRenameWindow () {
+  if (renameWin !== null && !renameWin.isDestroyed()) {
+    renameWin.focus()
+    return true
+  }
+  if (win === null || win.isDestroyed() || !rendererReady) return false
+  const bounds = renameBounds()
+  const created = new BrowserWindow({
+    ...bounds,
+    width: RENAME_WIDTH,
+    height: RENAME_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: true,
+    // 这扇窗就是要抢焦点：用户点了改名，接下来要打字。
+    focusable: true,
+    acceptFirstMouse: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'rename-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      devTools: debugEnabled,
+      spellcheck: false
+    }
+  })
+  renameWin = created
+  try {
+    created.setAlwaysOnTop(true, process.platform === 'darwin' ? 'floating' : 'screen-saver')
+  } catch {
+    // 置顶已由构造参数保证
+  }
+  created.webContents.on('context-menu', (event) => event.preventDefault())
+  // 只在「拿到过焦点」之后才按失焦关闭：小窗刚建出来时的一次 blur 不该把它直接关掉
+  // （后台拉起、Dock 隐藏等情况下都可能先来一个 blur）。
+  let hadFocus = false
+  created.on('focus', () => { hadFocus = true })
+  created.on('blur', () => {
+    if (hadFocus) closeRenameWindow('blur')
+  })
+  created.on('closed', () => {
+    if (renameWin === created) renameWin = null
+    clearRenameTimer()
+  })
+  created.once('ready-to-show', () => {
+    if (renameWin !== created || created.isDestroyed()) return
+    created.show()
+    created.focus()
+  })
+  created.loadFile(path.join(__dirname, 'rename.html')).catch(() => closeRenameWindow('load-failed'))
+  return true
+}
+
+function closeRenameWindow (reason) {
+  if (reason !== 'submit') renamePendingId = null
+  clearRenameTimer()
+  const target = renameWin
+  renameWin = null
+  if (target === null || target.isDestroyed()) return
+  try {
+    target.destroy()
+  } catch {
+    // 已经没了
+  }
+}
+
+function clearRenameTimer () {
+  if (renameTimer === null) return
+  clearTimeout(renameTimer)
+  renameTimer = null
+}
+
+function sendRenameInit () {
+  if (renameWin === null || renameWin.isDestroyed()) return
+  try {
+    renameWin.webContents.send('local-pet:rename-init', {
+      name: currentName(),
+      maxLength: shared.MAX_NAME_LENGTH
+    })
+  } catch {
+    // 页面还没挂上：ready 会再来一次
+  }
+}
+
+function sendRenameResult (result) {
+  if (renameWin === null || renameWin.isDestroyed()) return
+  try {
+    renameWin.webContents.send('local-pet:rename-result', result)
+  } catch {
+    // 窗口刚被关掉：结果没人接就算了
   }
 }
 
@@ -741,16 +976,41 @@ function startHostLink () {
   }
 
   stdinParser = shared.createLineParser()
-  process.stdin.setEncoding('utf8')
-  process.stdin.on('data', (chunk) => {
+  const input = openHostInput()
+  input.setEncoding('utf8')
+  input.on('data', (chunk) => {
     for (const entry of stdinParser.push(chunk)) {
       if (entry.type === 'line') handleHostLine(entry.line)
     }
   })
-  process.stdin.on('end', () => shutdown(0))
-  process.stdin.on('close', () => shutdown(0))
-  process.stdin.on('error', () => shutdown(0))
-  process.stdin.resume()
+  input.on('end', () => shutdown(0))
+  input.on('close', () => shutdown(0))
+  input.on('error', () => shutdown(0))
+  input.resume()
+}
+
+/**
+ * 宿主 → helper 的输入流。
+ *
+ * **Windows 上不能用 `process.stdin`**：Electron 的 GUI 子系统没有控制台，主进程的
+ * `process.stdin` 是个一启动就已经 EOF 的空壳（`process.stdin.fd` 是 `undefined`），
+ * 于是 startHostLink 刚挂上监听就收到 `end` → 立刻 shutdown(0) → 窗口在 loadFile
+ * 还没完成时被销毁，loadFile 只报一句 `ERR_FAILED (-2)`，看起来像「页面加载失败」。
+ *
+ * 但宿主确实把 pipe 挂在 fd 0 上（`fs.readSync(0, …)` 能读到宿主写的 JSON 行），
+ * 所以这种情况直接从 fd 0 开一条读流。判定收在 shared 里，便于单测（本机没有 Windows）。
+ */
+function openHostInput () {
+  if (shared.shouldReadStdinDirectly(process.platform, process.stdin.fd)) {
+    try {
+      // autoClose: false —— fd 0 是宿主的 pipe，不该由这条流负责关掉。
+      return fs.createReadStream('', { fd: 0, autoClose: false })
+    } catch (error) {
+      // 建流失败等于「没有宿主输入」：进程会紧接着自己退出，所以这句不躲在 debug 后面。
+      process.stderr.write('[local-pet helper] 无法从 fd 0 读取，退回 process.stdin：' + messageOf(error) + '\n')
+    }
+  }
+  return process.stdin
 }
 
 function handleHostLine (line) {
@@ -786,6 +1046,17 @@ function applyCommand (command) {
       return
     }
     case 'action-result':
+      // 改名小窗的答复走另一条路：成功就连窗带状态一起收，失败留在窗里说人话。
+      if (renamePendingId !== null && command.id === renamePendingId) {
+        renamePendingId = null
+        clearRenameTimer()
+        if (command.ok === true) {
+          closeRenameWindow('submit')
+        } else {
+          sendRenameResult({ ok: false, notice: command.notice ?? '改名没有生效。' })
+        }
+        return
+      }
       sendActionResult({
         id: command.id,
         ok: command.ok === true,
@@ -800,6 +1071,7 @@ function applyCommand (command) {
       return
     case 'hide':
       forceIgnore('hide')
+      closeRenameWindow('hide')
       if (win !== null && !win.isDestroyed()) win.hide()
       return
     case 'quit':
@@ -838,6 +1110,12 @@ function applyCommand (command) {
       void rendererDebug().then((state) => {
         writeEvent({ type: 'renderer-state', id: command.id, state })
       })
+      return
+    }
+    case 'debug-rename': {
+      if (!debugEnabled) return
+      if (command.close === true) closeRenameWindow('debug')
+      else openRenameWindow()
       return
     }
     case 'debug-dispatch':
@@ -996,6 +1274,8 @@ function statusEvent (id) {
     overlayRectsAgeMs: overlayRectsAt > 0 ? now - overlayRectsAt : null,
     visible: win !== null && !win.isDestroyed() && win.isVisible(),
     focused: win !== null && !win.isDestroyed() && win.isFocused(),
+    /** 改名小窗是否开着；主窗的 focusable 永远是 false，两者互不影响。 */
+    renameOpen: renameWin !== null && !renameWin.isDestroyed(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
     alwaysOnTop: winFlag((candidate) => candidate.isAlwaysOnTop()),
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
@@ -1175,6 +1455,7 @@ function shutdown (code) {
   quitting = true
   forceIgnore('shutdown')
   stopTimers()
+  closeRenameWindow('shutdown')
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()
   } catch {

@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 
-import { MAX_LABEL, isSafeAnimationName, sanitizeLabel } from './protocol.js'
+import { MAX_NICKNAME, isSafeAnimationName, sanitizeLabel } from './protocol.js'
 
 /**
  * dsh-pet 适配层。它很薄，因为 dsh-pet 的 HTTP 接口是**未承诺接口**：
@@ -69,8 +69,10 @@ export function firstPetConfig (config) {
   const pets = Array.isArray(config?.pets) ? config.pets : []
   for (const pet of pets) {
     if (pet === null || typeof pet !== 'object' || Array.isArray(pet)) continue
-    const name = sanitizeLabel(pet.name, MAX_LABEL)
     const id = typeof pet.id === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(pet.id) ? pet.id : null
+    // 名字与线路上的昵称共用一个上限（32 码点）：否则会出现“桌上写着 40 字、邻居看到 32 字”，
+    // 又变回两个名字。空名按 dsh-pet 自己的规则回落成宠物 id（ADR-0007）。
+    const name = sanitizeLabel(pet.name, MAX_NICKNAME) ?? id
     return { name, id }
   }
   return { name: null, id: null }
@@ -275,6 +277,15 @@ export function createPetBridge ({
     return first
   }
 
+  /**
+   * 配置可能刚被我们（或者用户）改过：清掉 30 秒 TTL，立刻重读一次。
+   * 改名之后用它，桌面标签不用等下一拍。
+   */
+  async function refresh () {
+    configCache = null
+    return pollOnce()
+  }
+
   function dispose () {
     disposed = true
     if (timer !== null) {
@@ -283,7 +294,7 @@ export function createPetBridge ({
     }
   }
 
-  return { start, pollOnce, dispose }
+  return { start, pollOnce, refresh, dispose }
 }
 
 function petFromConfig (petConfig, anim) {

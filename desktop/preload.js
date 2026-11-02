@@ -42,6 +42,29 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
       deviceId: payload.deviceId
     })
   },
+  /**
+   * 打开改名小窗。主窗 `focusable:false`，收不到键盘，所以输入只能单开一扇窗
+   * ——ADR-0005 的安全约定一个字都不动。这里只发一句「请开窗」，开不开由主进程决定。
+   */
+  openRename () {
+    ipcRenderer.send('local-pet:rename-open')
+  },
+  /**
+   * 主进程开不了改名窗时（渲染端还没就绪）的回话。
+   * 没有这条，弹层已经关掉了，用户点了个「改名」什么都不会发生。
+   */
+  onRenameUnavailable (handler) {
+    if (typeof handler !== 'function') return () => {}
+    const listener = () => {
+      try {
+        handler()
+      } catch {
+        // 一个坏处理器不能影响后续提示
+      }
+    }
+    ipcRenderer.on('local-pet:rename-unavailable', listener)
+    return () => ipcRenderer.removeListener('local-pet:rename-unavailable', listener)
+  },
   onActionResult (handler) {
     if (typeof handler !== 'function') return () => {}
     const listener = (_event, result) => {

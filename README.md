@@ -3,11 +3,11 @@
 局域网里的 DSH 宠物：自己的宠物活在桌面上，同一网段里邻居的宠物也会来串门，
 留下串门记录。没有客厅，没有第二块屏幕——整个桌面就是它们待的地方。
 
-当前落地的是 **ticket 01–11**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
+当前落地的是 **ticket 01–13**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
 helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约），宠物自发出门、访客常驻
-与「送客」/失联清理的完整状态机，以及桌面控件：悬停自己弹出「串门 / 召回」、点访客
-弹出「送客」、新邻居的放行卡与失败气泡。同样的动作也可以通过
-`POST /local-pet/action` 完成（见下）。
+与「送客」/失联清理的完整状态机，桌面控件：悬停自己弹出「串门 / 召回 / 改名」、点访客
+弹出「送客」、新邻居的放行卡与失败气泡，以及「一只宠物只有一个名字」（ADR-0007）。
+同样的动作也可以通过 `POST /local-pet/action` 完成（见下）。
 
 ## 它做什么
 
@@ -63,8 +63,11 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
   `durationMs` 是真实停留时长（封顶 30 分钟），存在 `<dataDir>/visits.json`，
   滚动上限 200 条；记录文件损坏或不可写时只丢历史。
 - **身份**：`deviceId` 是持久化在 `<dataDir>/identity.json` 的随机 UUID；
-  昵称默认取本机宠物名，没有则取主机名，可通过 `{"action":"rename","nickname":"…"}` 修改
-  （或直接编辑该文件）。
+  **名字只有一份**（ADR-0007）：它住在 `dsh-pet` 的 `pets[].name` 里，本机的 `nickname`
+  只是它的镜像——配置里改了名，约 30 秒内跟着改并补发一次广播；没装 `dsh-pet` 时它回落到
+  主机名或「我」，并以 `identity.json` 为准。改名用
+  `{"action":"rename","nickname":"…"}`：装了 `dsh-pet` 就写进它的配置（`PUT /config`），
+  写不进去就整个不改，返回 `409`。
 
 ## 安装
 
@@ -78,7 +81,8 @@ node scripts/install.mjs --profile web
 把这个包名登记进 `profile.dsh.profile.bundles`。改 `package.json` 之前会留一份 `.bak`。
 
 **装完要重启 DSH**：宿主半边是新代码，不会热加载。桌面版 DSH 重启后桌面上应该出现宠物；
-web profile / 非 macOS / 没找到 Electron 时只打一行日志，宠物不显示，网络功能照常。
+桌面层支持 **macOS 与 Windows**；web profile / Linux / 没找到 Electron 时只打一行日志，
+宠物不显示，网络功能照常。
 
 卸载：
 
@@ -102,14 +106,20 @@ npm pack          # → dsh-local-pet-<version>.tgz
 ```sh
 # 用 DSH 自带的 pnpm（不需要全局装 pnpm）
 node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs" \
-  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.2.0.tgz --save-exact
+  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.2.1.tgz --save-exact
 
 # 再把 "dsh-local-pet" 加进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
 ```
 
+Windows 上把 pnpm 的路径换成 DSH 安装目录下的同一相对路径
+（`runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs`，反斜杠按 PowerShell 习惯写），
+或者在拷过去的仓库里直接跑 `node scripts/install.mjs`——Windows 上它用 junction，
+不需要管理员或开发者模式。
+
 然后重启 DSH。
 
-**前提**：桌面层需要一个 Electron 运行时。本机已有 `~/.dsh/electron/Electron.app`
+**前提**：桌面层需要一个 Electron 运行时，直接用 dsh-pet 已经下好的那一份：
+macOS 是 `~/.dsh/electron/Electron.app`，Windows 是 `%USERPROFILE%\.dsh\electron\electron.exe`
 （装过 dsh-pet 就会有）。没有的话宠物不显示，但发现、放行、串门照常工作——日志里
 会有一行说明。
 
@@ -120,6 +130,8 @@ node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runt
 - 桌面 helper 与宿主只走 **stdio 的 JSON 行**，不开新端口；素材走 helper 自己注册的
   `localpet://` 协议（本机文件，仅渲染页可读）。
 - macOS 首次监听会弹一次“允许传入连接”，允许后才会收到邻居广播。
+- Windows 首次监听会弹 Defender 防火墙询问（通常是 DSH 所在的 `electron.exe` 或
+  `DeepSeek Harness.exe`），要给**专用网络**放行，否则收不到邻居广播。
 - 广播只走 IPv4；不支持跨网段、NAT 穿透或中继。
 
 ## 出问题时先关掉它

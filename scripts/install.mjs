@@ -63,7 +63,8 @@ async function main () {
   try {
     await mkdir(dirname(linkPath), { recursive: true })
     await rm(linkPath, { force: true, recursive: false })
-    await symlink(REPO, linkPath, 'dir')
+    // Windows 上建目录符号链接需要开发者模式/管理员；junction 不需要，效果一样是「指向本仓库」。
+    await symlink(REPO, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8')
   } catch (error) {
     await writeFile(manifestPath, raw, 'utf8')

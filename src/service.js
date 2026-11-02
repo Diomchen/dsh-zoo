@@ -10,6 +10,7 @@ import { dataDir, dshPetConfigPath } from './paths.js'
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
+import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -255,16 +256,39 @@ export function createService (ctx, options = {}) {
       }
     }
 
-    // 昵称是 ticket 02 的身份字段：只接受本地页面发来的改名，远端永远碰不到。
+    // 名字（ADR-0007）：装了 dsh-pet 时，名字的真相在它的 pets[].name 里——
+    // 光改本地 identity.json 只会让“我看到的”和“邻居看到的”裂开，所以必须写进去才算数；
+    // 没装 dsh-pet 时本地就是唯一去处，语义与 ticket 02 相同。
     if (action === 'rename') {
       if (identity === null) return { ok: false, error: 'starting' }
       const nickname = normalizeNickname(body?.nickname)
       if (nickname === null) return { ok: false, error: 'bad-nickname' }
+
+      const petConfig = await readPetConfig(configPath)
+      if (petConfig.exists) {
+        const written = await writePetName({
+          origin: dshPetOrigin(ctx),
+          petId: petConfig.id,
+          name: nickname
+        })
+        // 原子：写不进去就什么都不改，绝不留下“本地叫 A、dsh-pet 叫 B”的分叉。
+        if (!written.ok) {
+          return { ok: false, error: written.error, ...(written.status ? { status: written.status } : {}) }
+        }
+        // dsh-pet 已经写好了：本机镜像跟上。这里走 identity.rename 是为了**落盘之后**才回 ok；
+        // 磁盘写不进去也不回退——配置才是真相，重启会再对一遍（那种情况才用 mirror 兜底）。
+        const saved = await identity.rename(nickname)
+        const applied = saved ?? identity.mirror(nickname)
+        if (applied === null) return { ok: false, error: 'bad-nickname' }
+        applyNickname(applied)
+        // dsh-pet 的配置变了：作废 30 秒缓存重读一次，桌面标签不用等下一拍。
+        await bridge?.refresh?.()
+        return { ok: true, action: 'rename', nickname: applied }
+      }
+
       const saved = await identity.rename(nickname)
       if (saved === null) return { ok: false, error: 'identity-not-writable' }
-      room.setSelfNickname(saved)
-      // 下一次广播会带上新昵称；立即补一发，让邻居不用等满 5 秒。
-      discovery?.sendBeacon()
+      applyNickname(saved)
       return { ok: true, action: 'rename', nickname: saved }
     }
 
@@ -372,11 +396,16 @@ export function createService (ctx, options = {}) {
         bridge = createPetBridge({
           getOrigin: () => dshPetOrigin(ctx),
           configPath,
+          // 只在测试里缩短：改名后的镜像跟随要能在几百毫秒内被观察到。
+          configTtlMs: options.bridgeConfigTtlMs,
+          pollIntervalMs: options.bridgePollMs,
           log,
           onChange (result) {
             if (disposed) return
             room.setSelfPet(result.pet)
             room.setBridge(result.bridge)
+            // 名字的真相在 dsh-pet：配置里那只换了名字，本机跟着换（ADR-0007）。
+            mirrorPetName(result.pet?.name)
             // 动作变了就立刻补发心跳，不等下一次 2 秒节拍：
             // 对方桌面上的访客因此能尽快跟着换动作。
             sendHeartbeats()
@@ -548,7 +577,9 @@ export function createService (ctx, options = {}) {
     try {
       result = await handleAction({
         action: event.action,
-        deviceId: event.deviceId ?? undefined
+        deviceId: event.deviceId ?? undefined,
+        // 只有改名带正文；其余动作这里是 undefined，与 HTTP 那条路同形。
+        nickname: event.nickname ?? undefined
       })
     } catch (error) {
       warn(ctx, '桌面控件动作失败（' + event.action + '）：' + message(error))
@@ -585,6 +616,11 @@ export function createService (ctx, options = {}) {
     if (error === 'bad-device-id' || error === 'unknown-neighbor') return '这位邻居已经不在桌面上了。'
     if (error === 'disposed') return '桌面正在关闭，这次操作没有完成。'
     if (error === 'not-implemented') return '这个操作暂不支持。'
+    // 改名（ADR-0007）：两种失败都要能说清“为什么没生效”，而不是一句“稍后再试”。
+    if (error === 'bad-nickname') return '这个名字不行：要么是空的，要么太长。'
+    if (error === 'dsh-pet-unreachable') return 'dsh-pet 没有响应，名字没有改（它还开着吗？）。'
+    if (error === 'dsh-pet-write-failed') return 'dsh-pet 没有接受这次改名，名字没有变。'
+    if (error === 'dsh-pet-no-pet') return 'dsh-pet 里还没有宠物，没地方存这个名字。'
     return '这次操作没有完成，稍后再试。'
   }
 
@@ -616,6 +652,25 @@ export function createService (ctx, options = {}) {
       // 本机身份坏了只停心跳，不影响邻居灯和本地影子。
       return null
     }
+  }
+
+  /**
+   * 名字的真相在 dsh-pet（ADR-0007）：配置里那只叫什么，本机就叫什么。
+   * 每轮配置轮询都会经过这里；名字没变就什么都不做。
+   */
+  function mirrorPetName (name) {
+    if (disposed || identity === null) return
+    const clean = normalizeNickname(name)
+    if (clean === null || clean === identity.nickname) return
+    const applied = identity.mirror(clean)
+    if (applied === null) return
+    applyNickname(applied)
+  }
+
+  /** 名字变了之后必须做的两件事：快照跟着变 + 立刻补发广播（邻居不用等 5 秒节拍）。 */
+  function applyNickname (nickname) {
+    room.setSelfNickname(nickname)
+    discovery?.sendBeacon()
   }
 
   /**

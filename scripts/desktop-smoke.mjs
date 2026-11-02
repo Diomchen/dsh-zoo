@@ -897,6 +897,25 @@ async function verifyControls () {
   client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
   await client.waitStatus((status) => status.busy === false, 3000, '关掉置灰弹层并释放租约')
 
+  // 改名（ticket 13）：弹层里的「改名」→ 主进程开一扇可聚焦的小窗；主窗约定一个字不动。
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.popover !== null
+  }, 2500, '改名入口出现')
+  state = await client.rendererState()
+  const renameButton = state.uiRects.find((rect) => rect.id === 'ui:btn:rename')
+  assert(Boolean(renameButton), '「改名」按钮有命中矩形')
+  const renamePoint = rectCenterScreen(renameButton, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: renamePoint.x, y: renamePoint.y })
+  current = await client.waitStatus((status) => status.renameOpen === true, 4000, '改名小窗打开')
+  assert(current.focusable === false, '改名小窗开着时，主窗仍然不可聚焦')
+  client.send({ type: 'debug-rename', close: true })
+  current = await client.waitStatus((status) => status.renameOpen === false, 4000, '改名小窗关闭')
+  assert(current.focusable === false, '关掉小窗后主窗的焦点约定不变')
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await client.waitStatus((status) => status.busy === false, 3000, '改名后弹层收好、没有残留租约')
+
   // 自己出门：桌面没有 self → 常驻「召回」胶囊（否则召回按钮没有锚点）。
   const awayScene = shared.petScene([
     { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }

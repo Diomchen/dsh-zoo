@@ -3,8 +3,9 @@
  *
  * 这一层是纯的（注入 platform/env/exists/now 就能测），src/desktop.js 只负责接线：
  *   - 宿主必须真的是桌面版（Electron 二进制里的 Node，process.versions.electron 存在）；
- *   - 必须在 macOS 上（v1 只保证主屏工作区，其它平台直接降级为「没有桌面层」）；
- *   - Electron 必须是磁盘上已有的那份（~/.dsh/electron），绝不下载、不新增 npm 依赖；
+ *   - 目前只在 macOS 和 Windows 上开桌面层（两者用的是同一套 Electron 窗口能力，Linux 直接降级）；
+ *   - Electron 必须是磁盘上已有的那份（~/.dsh/electron，与 dsh-pet 的落盘约定一致），
+ *     绝不下载、不新增 npm 依赖；
  *   - 崩了最多重启 N 次，指数退避；稳定运行一段时间后计数清零。
  */
 
@@ -12,6 +13,19 @@ import { statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 
 import { dshHome } from './paths.js'
+
+/**
+ * 每个平台在 `$DSH_HOME/electron` 下的可执行文件相对路径，与 dsh-pet 的
+ * `ELECTRON_REL` 完全一致——装过 dsh-pet 的机器不需要再下一份 Electron。
+ * 表里没有的平台 = 桌面层不支持（只打一行日志，网络/串门照常）。
+ */
+const ELECTRON_REL = {
+  darwin: join('Electron.app', 'Contents', 'MacOS', 'Electron'),
+  win32: 'electron.exe'
+}
+
+/** 桌面层支持哪些平台（表里没有的 = 直接降级成「没有桌面层」）。 */
+export const SUPPORTED_PLATFORMS = Object.freeze(Object.keys(ELECTRON_REL))
 
 export const DESKTOP_MAX_RESTARTS = 5
 export const DESKTOP_RESTART_BASE_MS = 300
@@ -43,15 +57,16 @@ export function isDesktopHost (versions = process.versions) {
 /**
  * 候选 Electron 路径，按优先级：
  *   1. LOCAL_PET_ELECTRON（显式覆盖，测试/特殊安装用）；
- *   2. $DSH_HOME/electron/Electron.app/Contents/MacOS/Electron（这台机器上已有的那份）。
+ *   2. $DSH_HOME/electron/<平台可执行文件>（这台机器上已有的那份，dsh-pet 下载的就是它）。
  * 只做候选枚举，不判断存在性。
  */
 export function candidateElectronPaths ({ env = process.env, platform = process.platform } = {}) {
   const candidates = []
   const override = typeof env.LOCAL_PET_ELECTRON === 'string' ? env.LOCAL_PET_ELECTRON.trim() : ''
   if (override !== '') candidates.push(override)
-  if (platform === 'darwin') {
-    candidates.push(join(dshHome(env), 'electron', 'Electron.app', 'Contents', 'MacOS', 'Electron'))
+  const relative = ELECTRON_REL[platform]
+  if (typeof relative === 'string') {
+    candidates.push(join(dshHome(env), 'electron', relative))
   }
   return candidates
 }
@@ -65,11 +80,14 @@ function fileExists (candidate) {
 }
 
 /**
+ * 可执行文件是否存在只相信注入的 exists：win32 上 `statSync` 一个 .exe 和 macOS 上没有区别，
+ * 平台判断留在 ELECTRON_REL 这一张表里。
+ *
  * @returns {{ok:true,path:string,candidates:string[]} | {ok:false,reason:'unsupported-platform'|'electron-missing',platform?:string,candidates:string[]}}
  */
 export function resolveElectronBinary ({ env = process.env, platform = process.platform, exists = fileExists } = {}) {
   const candidates = candidateElectronPaths({ env, platform })
-  if (platform !== 'darwin') {
+  if (typeof ELECTRON_REL[platform] !== 'string') {
     return { ok: false, reason: 'unsupported-platform', platform, candidates }
   }
   for (const candidate of candidates) {
@@ -179,7 +197,8 @@ export function describeUnavailable (result, { helperPath = '' } = {}) {
     return '桌面层跳过：当前宿主不是桌面版（web profile 没有 Electron 运行时），宠物不显示'
   }
   if (result.reason === 'unsupported-platform') {
-    return '桌面层跳过：当前只支持 macOS（' + String(result.platform) + '），宠物不显示'
+    return '桌面层跳过：当前平台不支持（' + String(result.platform) +
+      '，目前只有 macOS / Windows），宠物不显示；发现、放行、串门照常工作'
   }
   const first = Array.isArray(result.candidates) && result.candidates.length > 0
     ? result.candidates[0]

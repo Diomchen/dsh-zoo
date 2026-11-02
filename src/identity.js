@@ -51,7 +51,7 @@ export async function createIdentity (dir, { defaultNickname: fallback, log } = 
     dirty = true
   }
 
-  const identity = new Identity({ dir, deviceId, nickname })
+  const identity = new Identity({ dir, deviceId, nickname, log })
 
   if (dirty) {
     try {
@@ -71,11 +71,13 @@ class Identity {
   #dir
   #deviceId
   #nickname
+  #log
 
-  constructor ({ dir, deviceId, nickname }) {
+  constructor ({ dir, deviceId, nickname, log = null }) {
     this.#dir = dir
     this.#deviceId = deviceId
     this.#nickname = nickname
+    this.#log = log
     this.persisted = false
   }
 
@@ -101,6 +103,27 @@ class Identity {
       this.#nickname = previous
       return null
     }
+  }
+
+  /**
+   * 镜像：名字的真相在 dsh-pet（ADR-0007），这里只是跟着走。
+   *
+   * 和 `rename` 的差别是**失败语义**：镜像的内存值立刻生效（这一次广播就要带上新名字），
+   * 落盘是尽力而为——写不进去只把 `persisted` 记成 false，下次配置变化还会再对一次。
+   * 为了这一刻的磁盘问题，让邻居一直看到旧名字是不划算的。
+   */
+  mirror (nickname) {
+    const clean = normalizeNickname(nickname)
+    if (clean === null) return null
+    if (clean === this.#nickname && this.persisted) return clean
+    this.#nickname = clean
+    this.persisted = false
+    this.persist()
+      .then(() => { this.persisted = true })
+      .catch(() => {
+        warn(this.#log, '身份文件写不进去：名字已经跟着 dsh-pet 改了，但重启后会从配置里重新对一遍')
+      })
+    return clean
   }
 
   async persist () {

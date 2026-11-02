@@ -111,8 +111,19 @@
   const ITEM_KINDS = ['pet', 'card']
   const PET_ROLES = ['self', 'guest', 'visitor']
   const SCENE_VERSION = 2
-  /** 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。 */
-  const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss']
+  /**
+   * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
+   * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
+   * （装了 dsh-pet 就写它的配置，见 ADR-0007）。
+   */
+  const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss', 'rename']
+  /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
+  const MAX_ACTION_TEXT = 64
+  /**
+   * 名字的产品上限（码点）。必须与 `src/protocol.js` 的 `MAX_NICKNAME` 一致：
+   * 显示得比广播长，就等于又造出两个名字（ADR-0007）。
+   */
+  const MAX_NAME_LENGTH = 32
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
@@ -668,6 +679,9 @@
       }
       case 'debug-renderer':
         return { ok: true, command: { type, id } }
+      case 'debug-rename':
+        // 冒烟用：开/关改名小窗（它没有渲染端可点击的关闭按钮，测试只能从这里关）。
+        return { ok: true, command: { type, id, close: raw.close === true } }
       case 'debug-dispatch': {
         const phase = typeof raw.phase === 'string' ? raw.phase.trim().toLowerCase() : ''
         if (!['down', 'move', 'up', 'click', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
@@ -723,6 +737,7 @@
       visible: raw.visible === true,
       focused: raw.focused === true,
       focusable: raw.focusable === true,
+      renameOpen: raw.renameOpen === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -823,7 +838,12 @@
         const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
         const deviceId = needsDevice ? normalizeId(raw.deviceId) : null
         if (needsDevice && deviceId === null) return { ok: false, error: 'bad-device-id' }
-        return { ok: true, event: { type, id, action, deviceId } }
+        // 只有改名带正文：清洗交给宿主（那里有 normalizeNickname），这里只做长度兜底，
+        // 免得渲染端一个粘贴把一行 JSON 撑成几兆。
+        const nickname = action === 'rename' && typeof raw.nickname === 'string'
+          ? raw.nickname.slice(0, MAX_ACTION_TEXT)
+          : null
+        return { ok: true, event: { type, id, action, deviceId, nickname } }
       }
       case 'pong':
         return { ok: true, event: { type, id } }
@@ -1082,6 +1102,20 @@
   }
 
   /**
+   * helper 该不该直接从 fd 0 读宿主输入，而不是用 `process.stdin`。
+   *
+   * **Windows + Electron 的 GUI 子系统没有控制台**：主进程里的 `process.stdin` 是个一启动
+   * 就已经 EOF 的空壳（`fd` 是 `undefined`）。照旧挂监听的话，`end` 立刻到 → helper 自己
+   * `shutdown(0)` → 窗口在 `loadFile` 还没完成时被销毁，只报一句 `ERR_FAILED (-2)`，
+   * 看起来像"页面加载失败"。宿主确实把 pipe 挂在 fd 0 上，所以这种情况改成直接开 fd 0。
+   *
+   * 其它平台，以及 stdin 真有 fd 的场合，一律保持 `process.stdin`（不改变既有行为）。
+   */
+  function shouldReadStdinDirectly (platform, stdinFd) {
+    return platform === 'win32' && typeof stdinFd !== 'number'
+  }
+
+  /**
    * 点击穿透的唯一裁定（主进程直接照做）。
    *
    * 优先级：
@@ -1095,6 +1129,7 @@
    *
    * @returns {{interactive:boolean, reason:'busy-lease'|'no-scene'|'outside'|'waiting-for-confirmation'|'stale-renderer-confirmation'|'hovering'|'main-fallback'}}
    */
+
   function shouldBeInteractive (options = {}) {
     const now = Number.isFinite(options.now) ? options.now : Date.now()
     const busyAt = Number.isFinite(options.busyAt) ? options.busyAt : 0
@@ -1178,6 +1213,8 @@
     PET_ROLES,
     SCENE_VERSION,
     CONTROL_ACTIONS,
+    MAX_ACTION_TEXT,
+    MAX_NAME_LENGTH,
     PET_COLORS,
     IDLE_CLIPS,
     PHYSICS,
@@ -1207,6 +1244,7 @@
     unionRect,
     toLocalPoint,
     toScreenPoint,
+    shouldReadStdinDirectly,
     shouldBeInteractive,
     hashString,
     colorForPet,

@@ -240,3 +240,18 @@ test('有宠物但配置里没有名字时，name 为 null 而不是伪造', asy
     pet: { name: null, anim: '原地小憩沉眠' }
   })
 })
+
+test('配置里没有名字时按 dsh-pet 的规则回落成宠物 id', async (t) => {
+  const dir = await tempDir(t)
+  const path = join(dir, 'no-name.jsonc')
+  await writeFile(path, '{"pets":[{"id":"main"}]}', 'utf8')
+  assert.deepEqual(await readPetConfig(path), { exists: true, name: 'main', id: 'main' })
+})
+
+test('宠物名与线路上的昵称同一个上限：32 码点', async (t) => {
+  const dir = await tempDir(t)
+  const path = join(dir, 'long-name.jsonc')
+  await writeFile(path, JSON.stringify({ pets: [{ id: 'main', name: '喵'.repeat(40) }] }), 'utf8')
+  const config = await readPetConfig(path)
+  assert.equal(config.name.length, 32)
+})

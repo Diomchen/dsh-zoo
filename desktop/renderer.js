@@ -623,6 +623,8 @@
         el.appendChild(why)
       }
       if (scene.controls.recall.enabled === true) el.appendChild(makeButton('召回', 'recall'))
+      // 改名（ticket 13）：名字只有一份，改的是宿主那边 dsh-pet 的配置（ADR-0007）。
+      el.appendChild(makeButton('改名', 'rename', { tone: 'quiet' }))
     } else {
       const deviceId = visitorDeviceId(pet)
       const info = deviceId === null
@@ -1115,6 +1117,20 @@
       requestAction(action, deviceId)
       return
     }
+    if (action === 'rename') {
+      // 输入要靠另一扇可聚焦的小窗：主窗 focusable:false，永远收不到键盘。
+      closePopover('action')
+      if (!api || typeof api.openRename !== 'function') {
+        showNotice('这扇桌面窗口开不了改名框，改用 POST /local-pet/action。')
+        return
+      }
+      try {
+        api.openRename()
+      } catch {
+        showNotice(ACTION_FAILED_NOTICE)
+      }
+      return
+    }
     if (action === 'dismiss') {
       ui.hiddenPromptKey = deviceId ?? ui.prompt?.deviceId ?? null
       hidePrompt({ forget: false })
@@ -1588,6 +1604,9 @@
 
   if (api && typeof api.onScene === 'function') api.onScene(applyScene)
   if (api && typeof api.onActionResult === 'function') api.onActionResult(handleActionResult)
+  if (api && typeof api.onRenameUnavailable === 'function') {
+    api.onRenameUnavailable(() => showNotice('改名窗口还没准备好，稍后再试。'))
+  }
   if (api && typeof api.ready === 'function') api.ready()
   rafId = requestAnimationFrame(frame)
 

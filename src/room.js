@@ -520,13 +520,16 @@ export function createRoom ({
     /**
      * 本地影子的动作。`{ name, anim }` 里的 anim 只可能来自 dsh-pet 的
      * `/state`（本地回环，不是网络）；这里仍然按不可信形状校验一遍。
+     *
+     * 名字和昵称是同一个东西，共用一个上限（`normalizeNickname`，32 码点）——
+     * 显示得比广播长，就等于又造出两个名字。
      */
     setSelfPet (pet) {
       if (pet === null || typeof pet !== 'object') {
         state.self.pet = null
         return
       }
-      const name = sanitizeLabel(pet.name, MAX_LABEL)
+      const name = normalizeNickname(pet.name)
       const anim = isSafeAnimationName(pet.anim) ? pet.anim.trim() : null
       state.self.pet = name === null && anim === null ? null : { name, anim }
     },

@@ -103,12 +103,29 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | action | body | 结果 |
 | --- | --- | --- |
 | `admit` / `reject` / `dismiss` | `deviceId` | 见上 |
-| `rename` | `{ "nickname": "..." }` | 清洗并写回 `identity.json`，立刻补发一次广播；非法昵称 `409 bad-nickname` |
+| `rename` | `{ "nickname": "..." }` | 装了 `dsh-pet` 就写进它的 `pets[].name`（见下），否则写回 `identity.json`；成功后立刻补发一次广播。非法昵称 `409 bad-nickname` |
 | `visit` | `deviceId` 可省略 | 省略时随机挑一位在线且**互相放行**的邻居；没有目标返回 `no-admitted` / `no-online` |
 | `recall` | 无 | 见“串门·召回与结束” |
 | `end-visit` | `deviceId` | 主人「送客」：立即清场、写记录、发 recall |
 | `accept-visits` | `{ "enabled": true\|false }` | 写 `settings.json`；见“串门开关” |
 | `auto-visits` | `{ "enabled": true\|false }` | 自发出门总开关（默认关），写 `settings.json` |
+
+### 名字只有一份（ADR-0007）
+
+一只宠物只有一个名字。它住在 `dsh-pet` 的 `pets[].name` 里，本机的 `identity.json`
+只是它的**镜像**：每次配置轮询（`CONFIG_TTL_MS`，30 秒）发现配置里的名字变了，就跟着改、
+落盘、立刻补发一次广播。`dsh-pet` 缺席时镜像值就是唯一的名字（可改），它回来之后重新覆盖。
+
+`rename` 在装了 `dsh-pet` 的机器上走它的官方接口：`GET /dsh-pet-7340/config` →
+只改正在桥接那只的 `name` → `PUT /dsh-pet-7340/config`（body 是**用户层**的扁平
+`{ "pets": [...] }`，不是 GET 那种按条目聚合的形状）。写成功之后才写镜像并广播。
+
+**写不进去就整个不改**：`dsh-pet` 不可达 `409 dsh-pet-unreachable`、被它拒绝
+`409 dsh-pet-write-failed`（带 `status`），本地昵称、桌面标签、广播内容一个都不动。
+不在错误路径上制造“本地叫 A、`dsh-pet` 叫 B”的分叉。
+
+名字按 32 码点截断（`MAX_NICKNAME`），与线路上的 `nickname` 同一个上限；空名在
+`dsh-pet` 里是合法状态（回落成宠物 `id`），镜像照抄这个语义。
 
 ## 串门开关（用户故事 22，本机状态）
 

@@ -2,7 +2,8 @@
 
 ## Status
 
-accepted
+accepted — §决定 中「不写它的配置」一条已由 ADR-0007 收窄为「不绕过它的 API 直接改文件」；
+「耦合收敛在一处」也随之变成**两处薄模块**：`src/pet-bridge.js` 读、`src/pet-name-write.js` 写
 
 ## 背景
 

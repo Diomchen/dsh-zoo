@@ -3,7 +3,8 @@
  *
  * 这一层最重要的性质是「不可见地失败」：
  *   - 任何一条路径都不许把异常抛进插件的 apply（全部 try/catch + 返回 {ok:false}）；
- *   - 宿主不是桌面版 / 不是 macOS / 找不到 Electron → 只打一行日志，然后当作桌面层不存在；
+ *   - 宿主不是桌面版 / 平台不支持（目前 macOS 与 Windows）/ 找不到 Electron
+ *     → 只打一行日志，然后当作桌面层不存在；
  *   - helper 崩溃只影响宠物显示，DSH 本身和插件的网络/信任逻辑照常；
  *   - dispose 时先 quit 再 SIGTERM，1s 后 SIGKILL；宿主进程退出时同步 SIGKILL。
  *
@@ -21,6 +22,7 @@ import {
   DESKTOP_SHOT_TIMEOUT_MS,
   DESKTOP_STATUS_TIMEOUT_MS,
   DESKTOP_WATCHDOG_TICK_MS,
+  SUPPORTED_PLATFORMS,
   buildHelperArgs,
   createRestartPolicy,
   describeUnavailable,
@@ -132,7 +134,9 @@ export function createDesktop (options = {}) {
     if (options.desktopHost !== true && !isDesktopHost(versions)) {
       return { ok: false, reason: 'not-desktop-host' }
     }
-    if (platform !== 'darwin') return { ok: false, reason: 'unsupported-platform', platform }
+    if (!SUPPORTED_PLATFORMS.includes(platform)) {
+      return { ok: false, reason: 'unsupported-platform', platform }
+    }
     const resolved = resolveElectronBinary({ env, platform, exists })
     if (!resolved.ok) return resolved
     return resolved

@@ -80,3 +80,18 @@ test('目录写不进去时仍然给可用的内存身份，插件不崩', async
   assert.ok(warnings.length >= 1)
   assert.ok(warnings.some((line) => /身份文件写不进去/.test(line)))
 })
+
+test('镜像：内存立刻生效，落盘是尽力而为，非法名字不生效', async (t) => {
+  const dir = await tempDir(t)
+  const identity = await createIdentity(dir, { defaultNickname: '旧名字' })
+
+  assert.equal(identity.mirror('  新 名字 '), '新 名字')
+  assert.equal(identity.nickname, '新 名字', '内存立刻生效，不等待落盘')
+
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '新 名字')
+  assert.equal(identity.persisted, true)
+
+  assert.equal(identity.mirror('\u0000\u0007'), null)
+  assert.equal(identity.nickname, '新 名字')
+})

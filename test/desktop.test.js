@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
+import { MAX_NICKNAME } from '../src/protocol.js'
 import { createDesktop, HELPER_MAIN } from '../src/desktop.js'
 import {
   DESKTOP_MAX_RESTARTS,
@@ -144,16 +145,43 @@ test('helper 动作：白名单 + id + deviceId 校验；坏动作/缺 id/缺 de
   const deviceId = '33333333-3333-4333-8333-333333333333'
   const visit = shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action: 'visit' })
   assert.equal(visit.ok, true)
-  assert.deepEqual(visit.event, { type: 'action', id: 'act-1', action: 'visit', deviceId: null })
+  assert.deepEqual(visit.event, { type: 'action', id: 'act-1', action: 'visit', deviceId: null, nickname: null })
 
   const end = shared.normalizeHelperEvent({ type: 'action', id: 'act-2', action: 'end-visit', deviceId })
   assert.equal(end.ok, true)
   assert.equal(end.event.deviceId, deviceId)
 
+  // 改名是唯一带正文的动作：helper 只截长度，清洗与 32 码点截断交给宿主。
+  const rename = shared.normalizeHelperEvent({
+    type: 'action', id: 'act-6', action: 'rename', nickname: '  新 名字  '
+  })
+  assert.equal(rename.ok, true)
+  assert.equal(rename.event.nickname, '  新 名字  ')
+  assert.equal(rename.event.deviceId, null)
+  const longName = shared.normalizeHelperEvent({
+    type: 'action', id: 'act-7', action: 'rename', nickname: '喵'.repeat(100)
+  })
+  assert.equal(longName.event.nickname.length, shared.MAX_ACTION_TEXT)
+
   assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-3', action: 'quit' }).ok, false)
   assert.equal(shared.normalizeHelperEvent({ type: 'action', action: 'visit' }).ok, false)
   assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-4', action: 'admit' }).ok, false)
   assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-5', action: 'admit', deviceId: 'bad id' }).ok, false)
+})
+
+test('Windows 的 process.stdin 是空壳时才直接从 fd 0 读宿主输入', () => {
+  // Windows + Electron GUI：没有控制台，stdin 一启动就 EOF（fd 是 undefined）→ 走 fd 0。
+  assert.equal(shared.shouldReadStdinDirectly('win32', undefined), true)
+  // 同上但 stdin 真的有 fd（控制台版 / 被正常 spawn）：保持 process.stdin，不改既有行为。
+  assert.equal(shared.shouldReadStdinDirectly('win32', 0), false)
+  // 其它平台永远用 process.stdin。
+  assert.equal(shared.shouldReadStdinDirectly('darwin', undefined), false)
+  assert.equal(shared.shouldReadStdinDirectly('linux', 0), false)
+})
+
+test('改名小窗的上限与线路上的昵称上限是同一个数', () => {
+  // 显示得比广播长，就等于又造出两个名字（ADR-0007）；桌面侧不能自己悄悄改这个数。
+  assert.equal(shared.MAX_NAME_LENGTH, MAX_NICKNAME)
 })
 
 test('宿主命令 action-result：id 必填，notice 截断到可显示长度', () => {
@@ -380,12 +408,32 @@ test('桌面判定：只有 Electron 里的 Node 算桌面宿主；候选路径�
     '/tmp/dsh-home/electron/Electron.app/Contents/MacOS/Electron'
   ])
   assert.deepEqual(candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home' }, platform: 'linux' }), [])
+  // Windows：dsh-pet 把 Electron 落在同一个 $DSH_HOME/electron，只是可执行文件叫 electron.exe。
+  assert.deepEqual(candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home' }, platform: 'win32' }), [
+    '/tmp/dsh-home/electron/electron.exe'
+  ])
+  assert.deepEqual(
+    candidateElectronPaths({
+      env: { DSH_HOME: '/tmp/dsh-home', LOCAL_PET_ELECTRON: 'C:\\electron\\electron.exe' },
+      platform: 'win32'
+    }),
+    ['C:\\electron\\electron.exe', '/tmp/dsh-home/electron/electron.exe']
+  )
 })
 
 test('Electron 解析：平台不符/文件缺失都降级，存在时取第一个候选', () => {
   const env = { DSH_HOME: '/tmp/dsh-home' }
   assert.equal(resolveElectronBinary({ env, platform: 'linux' }).reason, 'unsupported-platform')
   assert.equal(resolveElectronBinary({ env, platform: 'darwin', exists: () => false }).reason, 'electron-missing')
+  // Windows 和 macOS 一样可用：候选是 $DSH_HOME/electron/electron.exe。
+  const onWindows = resolveElectronBinary({
+    env,
+    platform: 'win32',
+    exists: (candidate) => candidate === '/tmp/dsh-home/electron/electron.exe'
+  })
+  assert.equal(onWindows.ok, true)
+  assert.equal(onWindows.path, '/tmp/dsh-home/electron/electron.exe')
+  assert.equal(resolveElectronBinary({ env, platform: 'win32', exists: () => false }).reason, 'electron-missing')
   const resolved = resolveElectronBinary({
     env: { ...env, LOCAL_PET_ELECTRON: '/opt/custom-electron' },
     platform: 'darwin',
@@ -516,6 +564,30 @@ test('manager：不可用时只打一行日志、不 spawn、start 不抛', () =
   assert.equal(warns.length, 0)
   assert.equal(manager.start().ok, false)
   assert.equal(infos.length, 1, '重复 start 不能重复打日志')
+  manager.dispose()
+})
+
+test('manager：Windows 宿主照样起 helper（不再被 darwin-only 的闸门挡掉）', () => {
+  const infos = []
+  const warns = []
+  const spawnCalls = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'win32',
+    env: { DSH_HOME: '/tmp/dsh-home' },
+    exists: (candidate) => candidate === '/tmp/dsh-home/electron/electron.exe',
+    spawn: (command, args, options) => {
+      spawnCalls.push({ command, args, options })
+      return fakeChild(2000)
+    },
+    log: { info: (line) => infos.push(line), warn: (line) => warns.push(line) },
+    pingMs: 100000
+  })
+  const started = manager.start()
+  assert.equal(started.ok, true)
+  assert.equal(spawnCalls.length, 1)
+  assert.equal(spawnCalls[0].command, '/tmp/dsh-home/electron/electron.exe')
+  assert.equal(warns.length, 0)
   manager.dispose()
 })
 

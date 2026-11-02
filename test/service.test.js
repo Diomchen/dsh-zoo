@@ -734,3 +734,171 @@ test('坏 deviceId 仍然明确失败；不带 deviceId 才是“随机挑一个
     assert.deepEqual(result.body, { ok: false, error: 'bad-device-id' })
   }
 })
+
+async function waitFor (predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await delay(20)
+  }
+  throw new Error('waitFor timeout')
+}
+
+/**
+ * 假 dsh-pet：`/state` 常在，`/config` 支持 GET / PUT。
+ * PUT 成功时会像真的一样把名字写回配置文件——桥接读的是磁盘上的 JSONC，
+ * 不写文件的话“改名后桌面标签跟着变”根本测不出来。
+ */
+async function fakeDshPet (t, { name = '蓝毛小女仆', id = 'main', putStatus = 200, configPath = null } = {}) {
+  const state = { name, id, putStatus, puts: [] }
+  const petBody = () => ({
+    id: state.id,
+    name: state.name,
+    size: 462,
+    balanceEnabled: true,
+    display: 'desktop',
+    position: { corner: 'top-right', marginX: 24, marginY: 100 }
+  })
+  const server = createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', async () => {
+      if (req.url === '/dsh-pet-7340/state') {
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ counter: 1, pets: { [state.id]: { anim: { data: { name: '东张西望' } } } } }))
+        return
+      }
+      if (req.url === '/dsh-pet-7340/config') {
+        if (req.method === 'PUT') {
+          const body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+          state.puts.push(body)
+          if (state.putStatus !== 200) {
+            res.statusCode = state.putStatus
+            res.end('nope')
+            return
+          }
+          state.name = body.pets[0].name
+          if (configPath !== null) {
+            await writeFile(configPath, JSON.stringify({ pets: body.pets }, null, 2), 'utf8')
+          }
+          res.setHeader('content-type', 'application/json')
+          res.end(JSON.stringify({ main: { pets: body.pets } }))
+          return
+        }
+        res.setHeader('content-type', 'application/json')
+        res.end(JSON.stringify({ main: { pets: [petBody()] } }))
+        return
+      }
+      res.statusCode = 404
+      res.end('no')
+    })
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+  return { origin, state }
+}
+
+async function petService (t, { dir, configPath, origin, pollMs = 200 }) {
+  const { ctx, routes } = fakeCtx()
+  ctx.webServer.getOrigin = () => origin
+  const service = createService(ctx, {
+    dataDir: dir,
+    petConfigPath: configPath,
+    network: false,
+    petBridge: true,
+    bridgePollMs: pollMs,
+    bridgeConfigTtlMs: 0
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  await service.ready
+  return service
+}
+
+test('名字跟着 dsh-pet 走：配置里改名，本机镜像跟着改并落盘', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+  const pet = await fakeDshPet(t, { configPath })
+  const service = await petService(t, { dir, configPath, origin: pet.origin })
+
+  assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
+
+  // 用户在 dsh-pet 设置页把名字改了：下一次配置轮询就该跟上
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"泡泡"}]}', 'utf8')
+  await waitFor(() => service.snapshot().self.nickname === '泡泡')
+  assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '泡泡')
+})
+
+test('启动时 dsh-pet 的名字覆盖 identity.json 里的旧昵称', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+  await writeFile(
+    join(dir, IDENTITY_FILE),
+    JSON.stringify({ deviceId: randomUUID(), nickname: '旧名字' }),
+    'utf8'
+  )
+  const pet = await fakeDshPet(t, { configPath })
+  const service = await petService(t, { dir, configPath, origin: pet.origin })
+
+  assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
+})
+
+test('改名走 dsh-pet 的 PUT /config：只改 name，三处一起变', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+  const pet = await fakeDshPet(t, { configPath })
+  const service = await petService(t, { dir, configPath, origin: pet.origin })
+
+  const renamed = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'rename', nickname: '  新 名字  ' }
+  })
+  assert.equal(renamed.status, 200)
+  assert.deepEqual(renamed.body, { ok: true, action: 'rename', nickname: '新 名字' })
+
+  // 写进了 dsh-pet，而且只动了名字（其余字段原样带回去）
+  assert.equal(pet.state.puts.length, 1)
+  assert.equal(pet.state.puts[0].pets[0].name, '新 名字')
+  assert.equal(pet.state.puts[0].pets[0].size, 462)
+
+  assert.equal(service.snapshot().self.nickname, '新 名字')
+  assert.equal(service.snapshot().self.pet.name, '新 名字')
+  assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '新 名字')
+})
+
+test('dsh-pet 写不进去时改名整个取消，本地一个字段都不动', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+  const pet = await fakeDshPet(t, { configPath, putStatus: 500 })
+  const service = await petService(t, { dir, configPath, origin: pet.origin })
+
+  const renamed = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'rename', nickname: '新名字' }
+  })
+  assert.equal(renamed.status, 409)
+  assert.deepEqual(renamed.body, { ok: false, error: 'dsh-pet-write-failed', status: 500 })
+
+  assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
+  assert.equal(service.snapshot().self.pet.name, '蓝毛小女仆')
+  assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '蓝毛小女仆')
+})
+
+test('dsh-pet 装着但不通：改名明确失败，不回退成只改本地', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+  const service = await petService(t, { dir, configPath, origin: 'http://127.0.0.1:1' })
+
+  const renamed = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'rename', nickname: '新名字' }
+  })
+  assert.equal(renamed.status, 409)
+  assert.equal(renamed.body.error, 'dsh-pet-unreachable')
+  assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
+})
