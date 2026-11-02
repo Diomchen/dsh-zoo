@@ -111,6 +111,62 @@ function beaconPayload ({ deviceId, nickname, port }) {
   }), 'utf8')
 }
 
+function visitRequestPayload ({ deviceId, visitId, nickname, anim = null }) {
+  return Buffer.from(JSON.stringify({
+    v: PROTOCOL_VERSION,
+    type: 'visit-request',
+    deviceId,
+    visitId,
+    nickname,
+    anim
+  }), 'utf8')
+}
+
+function recallAckPayload ({ deviceId, visitId }) {
+  return Buffer.from(JSON.stringify({
+    v: PROTOCOL_VERSION,
+    type: 'visit-recall-ack',
+    deviceId,
+    visitId
+  }), 'utf8')
+}
+
+/**
+ * 单向 UDP 中继：原样转发到 targetPort，但吞掉前 `dropCount` 包 `dropType`。
+ * 两个真服务之间没有别的注入口，用它才能在回环上真实地模拟“这一包丢了”。
+ */
+async function lossyRelay (t, targetPort, { dropType, dropCount = 1 } = {}) {
+  const socket = dgram.createSocket('udp4')
+  await new Promise((resolve, reject) => {
+    socket.once('error', reject)
+    socket.bind(0, '127.0.0.1', () => {
+      socket.off('error', reject)
+      resolve()
+    })
+  })
+  t.after(() => {
+    try {
+      socket.close()
+    } catch {
+      // 已经关掉了
+    }
+  })
+  let dropped = 0
+  socket.on('message', (message) => {
+    const parsed = parsePacket(message)
+    if (parsed.ok && parsed.packet.type === dropType && dropped < dropCount) {
+      dropped += 1
+      return
+    }
+    socket.send(message, targetPort, '127.0.0.1')
+  })
+  return {
+    socket,
+    port: socket.address().port,
+    dropped: () => dropped
+  }
+}
+
 async function callAction (service, body) {
   const route = service.routes.find((candidate) => candidate.path === '/local-pet/action')
   assert.ok(route, '应该注册 /local-pet/action')
@@ -592,4 +648,110 @@ test('对方失联（入站方向）：2 分钟窗口（测试里 300ms）没有
   // B 的自动重访不会发生：B 没有打开总开关（默认关）。
   await delay(150)
   assert.equal(b.snapshot().self.out, null)
+})
+
+test('送客的 recall 有界重试：丢第一包也会补发，收到 visit-recall-ack 立刻收手（A1）', async (t) => {
+  const dir = await tempDir(t)
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.socket.address().port
+  const servicePort = await freeUdpPort()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: true,
+    port: servicePort,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    heartbeatIntervalMs: 60000,
+    recallRetryMs: 120,
+    recallTimeoutMs: 2000,
+    visitTickMs: 10,
+    tickIntervalMs: 50
+  })
+  await service.ready
+
+  // 一台真的会串门的邻居（裸 socket，能精确控制“哪一包当它丢了”）。
+  const deviceId = randomUUID()
+  peer.socket.send(
+    beaconPayload({ deviceId, nickname: '隔壁', port: peerPort }),
+    servicePort,
+    '127.0.0.1'
+  )
+  await waitFor(() => service.snapshot().neighbors.length === 1)
+  assert.equal((await callAction(service, { action: 'admit', deviceId })).status, 200)
+
+  const visitId = randomUUID()
+  peer.socket.send(
+    visitRequestPayload({ deviceId, visitId, nickname: '隔壁' }),
+    servicePort,
+    '127.0.0.1'
+  )
+  await waitFor(() => service.snapshot().visitors.length === 1)
+  assert.equal(visitEntries(peer.received, 'visit-ack').length, 1)
+
+  // 送客：第一包 recall 当作丢了（peer 不回执、也不清场）。
+  assert.equal((await callAction(service, { action: 'end-visit', deviceId })).status, 200)
+  assert.deepEqual(service.snapshot().visitors, [])
+  await waitFor(() => visitEntries(peer.received, 'visit-recall').length >= 2, 2000)
+  const recalls = visitEntries(peer.received, 'visit-recall')
+  assert.equal(recalls[0].parsed.packet.visitId, visitId)
+  assert.equal(recalls[1].parsed.packet.visitId, visitId, '重发携带同一个 visitId（对方幂等清场）')
+  for (const entry of recalls) {
+    assert.equal(entry.parsed.packet.deviceId, service.snapshot().self.deviceId)
+    assert.deepEqual(Object.keys(entry.parsed.packet), ['v', 'type', 'deviceId', 'visitId'])
+  }
+
+  // 对方回执：不再有第三包。
+  peer.socket.send(recallAckPayload({ deviceId, visitId }), servicePort, '127.0.0.1')
+  await delay(400)
+  assert.equal(visitEntries(peer.received, 'visit-recall').length, 2, '收到回执后停止重试')
+
+  // 重发是幂等的：本机只有一条 in 记录，且没有被重复请求/重发改写。
+  assert.deepEqual(service.snapshot().visits.map((record) => record.direction), ['in'])
+  assert.equal(service.snapshot().visits[0].durationMs >= 0, true)
+})
+
+test('送客的 recall 丢第一包：重发到达后对方立刻回家，记录不是 30 分钟上限（A1）', async (t) => {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  const [portA, portB] = await distinctPorts(2)
+
+  // A 是出门的一方。它的广告端口指向中继：B 发来的 recall 第一包会被吞掉。
+  const relay = await lossyRelay(t, portA, { dropType: 'visit-recall' })
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB, {
+    servicePort: relay.port,
+    visitMaxMs: 60000,
+    recallRetryMs: 60
+  }))
+  await a.ready
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA, { visitMaxMs: 60000 }))
+  await b.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+
+  const started = await callAction(a, { action: 'visit', deviceId: bId })
+  assert.equal(started.status, 200)
+  await waitFor(() => a.snapshot().self.out?.phase === 'active' && b.snapshot().visitors.length === 1)
+  const startedAt = a.snapshot().self.out.startedAt
+
+  // B 送客：第一包 recall 真的丢了。没有重试时 A 要挂到自己的 30 分钟上限。
+  assert.equal((await callAction(b, { action: 'end-visit', deviceId: aId })).status, 200)
+  assert.deepEqual(b.snapshot().visitors, [])
+  await waitFor(() => a.snapshot().self.out === null, 3000)
+  assert.equal(relay.dropped(), 1, '中继确实吞掉了第一包 visit-recall')
+
+  // A 的记录是真实停留时长（几十 ms），不是 60s 的出门上限。
+  const record = a.snapshot().visits[0]
+  assert.equal(record.direction, 'out')
+  assert.ok(record.durationMs < 5000,
+    'recall 到达后立刻回家（' + record.durationMs + 'ms），不是等到上限')
+  assert.ok(record.durationMs <= Date.now() - startedAt)
+  await waitFor(() => b.snapshot().visits.length === 1)
+  assert.equal(b.snapshot().visits[0].direction, 'in')
 })

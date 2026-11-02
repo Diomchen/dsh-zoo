@@ -14,14 +14,14 @@
  */
 
 import shared from '../desktop/shared.js'
+import { isDeviceId } from './protocol.js'
+import { isVisitReason, visitReasonText } from './visit-copy.js'
 
-/** 自己的 deviceId 是身份层生成的 UUID；这里只做形状校验，不信任任何外部输入。 */
-const DEVICE_ID = /^[A-Za-z0-9_-]{1,56}$/
-
+/** 快照里的 deviceId 是身份层生成的 UUID；复用协议层的形状校验，不另写一份。 */
 function deviceIdOf (value) {
   if (typeof value !== 'string') return null
   const id = value.trim()
-  return DEVICE_ID.test(id) ? id : null
+  return isDeviceId(id) ? id : null
 }
 
 function selfDescriptor (self) {
@@ -43,7 +43,7 @@ function visitorDescriptor (raw) {
   if (raw === null || typeof raw !== 'object') return null
   const deviceId = deviceIdOf(raw.deviceId)
   if (deviceId === null) return null
-  // 客人用自己的色板格；避开与 self 相同的蓝色，免得七八只全一个颜色。
+  // 访客用自己的色板格；避开与 self 相同的蓝色，免得七八只全一个颜色。
   const palette = shared.PET_COLORS.slice(1)
   const color = palette[shared.hashString(deviceId) % palette.length]
   return {
@@ -80,6 +80,32 @@ export function petsFromSnapshot (snapshot) {
 }
 
 /**
+ * 因为一次场景放不下（`shared.MAX_SCENE_ITEMS`）而没能画出来的访客数。
+ *
+ * “不设同屏上限”是产品决定，渲染端单包仍有上限；宿主必须知道少画了几位，
+ * 才能给一句人话提示，而不是让宠物静默消失。计数规则和 petsFromSnapshot 一致：
+ * 先按场景顺序校验/去重，再数超出上限的部分。
+ *
+ * @param {object} snapshot room.snapshot()
+ * @returns {number}
+ */
+export function droppedVisitors (snapshot) {
+  if (snapshot === null || typeof snapshot !== 'object') return 0
+  const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
+  const seen = new Set()
+  let valid = 0
+  for (const visitor of visitors) {
+    if (visitor === null || typeof visitor !== 'object') continue
+    const deviceId = deviceIdOf(visitor.deviceId)
+    if (deviceId === null || seen.has(deviceId)) continue
+    seen.add(deviceId)
+    valid += 1
+  }
+  const drawn = petsFromSnapshot(snapshot).filter((pet) => pet.role === 'visitor').length
+  return Math.max(0, valid - drawn)
+}
+
+/**
  * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
  * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
  *
@@ -104,9 +130,15 @@ export function controlsFromSnapshot (snapshot) {
   if (canVisit) {
     controls.visit.reason = null
   } else if (away) {
-    controls.visit.reason = `宠物在「${awayNickname}」家，先召回再串门。`
+    // 和 room 的 already-out notice 是同一句话：按钮和气泡不许各说各的。
+    controls.visit.reason = visitReasonText('already-out', awayNickname)
   } else {
-    controls.visit.reason = '还没有人放行你，宠物出不了门。'
+    // 没有目标时不能一律说“还没有人放行你”：有人放行但都离线是另一句话。
+    // room 在快照里给出原因（no-admitted / no-online），这里只负责翻译。
+    const blocked = isVisitReason(snapshot.visitBlockedReason)
+      ? snapshot.visitBlockedReason
+      : 'no-admitted'
+    controls.visit.reason = visitReasonText(blocked, null)
   }
   controls.recall.enabled = away
   controls.recall.nickname = awayNickname

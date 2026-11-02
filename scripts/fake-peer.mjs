@@ -8,7 +8,7 @@
 //   node scripts/fake-peer.mjs                       # 默认 45872，对端 45871
 //   node scripts/fake-peer.mjs --name 隔壁的小鲸鱼
 //
-// 然后在本地放行它（ticket 11 之前桌面还没有放行卡片，用 /local-pet/action 的 admit），
+// 然后在桌面的放行卡片上点「接受」（或走 /local-pet/action 的 admit），
 // 它的宠物就会出现在你的桌面上。
 // 键盘：v = 让它来串门（你的桌面上出现"来访"）  a <动画名> = 换动作  n <新名字> = 改名  q = 退出
 //
@@ -27,6 +27,7 @@ import {
   encodeHeartbeat,
   encodePacket,
   encodeVisitAck,
+  encodeVisitRecallAck,
   encodeVisitRequest,
   parsePacket
 } from '../src/protocol.js'
@@ -121,6 +122,8 @@ function handle (packet, rinfo) {
       console.log(`[假邻居] 「${state.visit.nickname}」被召回家了。`)
       state.visit = null
     }
+    // 回执：真邻居靠它停止重发 recall（丢一包时还会再发两次）。
+    send(encodeVisitRecallAck({ deviceId, visitId: packet.visitId }), rinfo.address, rinfo.port)
     return
   }
 

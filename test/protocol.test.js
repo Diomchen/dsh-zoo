@@ -18,6 +18,7 @@ import {
   encodeVisitAck,
   encodeVisitDeny,
   encodeVisitRecall,
+  encodeVisitRecallAck,
   encodeVisitRequest,
   isSafeAnimationName,
   isVisitId,
@@ -274,12 +275,13 @@ test('串门请求只写 v/type/deviceId/visitId/nickname/anim', () => {
   assert.equal(parsePacket(idle).packet.anim, null)
 })
 
-test('visit-ack / visit-recall 只关联串门 id，visit-deny 多一个固定枚举 reason', () => {
+test('visit-ack / visit-recall / visit-recall-ack 只关联串门 id，visit-deny 多一个固定枚举 reason', () => {
   const deviceId = randomUUID()
   const visitId = randomUUID()
   const cases = [
     ['visit-ack', encodeVisitAck({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId']],
     ['visit-recall', encodeVisitRecall({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId']],
+    ['visit-recall-ack', encodeVisitRecallAck({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId']],
     ['visit-deny', encodeVisitDeny({ deviceId, visitId }), 'not-admitted', ['v', 'type', 'deviceId', 'visitId', 'reason']],
     ['visit-deny', encodeVisitDeny({ deviceId, visitId, reason: 'visits-off' }), 'visits-off', ['v', 'type', 'deviceId', 'visitId', 'reason']]
   ]
@@ -510,7 +512,8 @@ test('默认参数：发现 5 秒、心跳 2 秒、心跳影子 30 秒、出门�
     'visit-request',
     'visit-ack',
     'visit-deny',
-    'visit-recall'
+    'visit-recall',
+    'visit-recall-ack'
   ])
 })
 

@@ -20,6 +20,14 @@ export const DESKTOP_RESTART_MAX_MS = 8000
 export const DESKTOP_STABLE_MS = 60000
 /** 宿主给 helper 的保活节拍；helper 侧 30s 收不到任何一行就自行退出。 */
 export const DESKTOP_PING_MS = 5000
+/**
+ * pong 看门狗：超过这么久没有回 pong 就按「卡死」处理（杀进程 + 走现有退避重启）。
+ * 必须明显大于 ping 间隔和正常的长 GC（一次 full GC/一次系统卡顿可能几百 ms 到几秒），
+ * 所以取 3 个 ping 周期：活着的 helper 会回 3 次 pong，丢一两个也不会误杀。
+ */
+export const DESKTOP_PONG_TIMEOUT_MS = 15000
+/** 看门狗的检查节拍；只读时间戳，不影响 helper。 */
+export const DESKTOP_WATCHDOG_TICK_MS = 1000
 export const DESKTOP_SHOT_TIMEOUT_MS = 8000
 export const DESKTOP_STATUS_TIMEOUT_MS = 3000
 

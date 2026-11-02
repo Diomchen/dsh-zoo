@@ -534,7 +534,8 @@ function liveRects (now) {
     pets = rendererRects
   } else if (rendererRectsAt === 0 && sceneAt > 0 && now - sceneAt <= shared.SCENE_RECT_FALLBACK_MS && scene.items.length > 0) {
     // 只在渲染端**从未**上报过矩形时用出生矩形兜底；一旦它报过，过期就回穿透（fail-closed）。
-    pets = shared.rectsOfScene(scene)
+    // 出生矩形同样要裁到工作区里，别让一个坏场景把整块屏幕变成可交互区。
+    pets = shared.normalizeRects(shared.rectsOfScene(scene), { area: localArea() })
   } else {
     pets = []
   }
@@ -557,6 +558,17 @@ function startPointerWatchdog () {
     }
   }, shared.POINTER_POLL_MS)
   pointerTimer.unref?.()
+}
+
+/** 窗口 = 主屏工作区，窗口局部坐标从 (0,0) 起；命中矩形只允许落在这个范围里。 */
+function localArea () {
+  if (win === null || win.isDestroyed()) return null
+  try {
+    const bounds = win.getBounds()
+    return { x: 0, y: 0, width: bounds.width, height: bounds.height }
+  } catch {
+    return null
+  }
 }
 
 function localCursor () {
@@ -614,7 +626,8 @@ ipcMain.on('local-pet:renderer-ready', (event) => {
 
 ipcMain.on('local-pet:rects', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
-  rendererRects = shared.normalizeRects(payload)
+  // 渲染端是不可信输入：超大/越界的矩形在这里被拒绝或裁到工作区里（fail closed）。
+  rendererRects = shared.normalizeRects(payload, { area: localArea() })
   rendererRectsAt = Date.now()
   // 立即按新矩形复核一次；主进程仍会用自己的光标位置投票。
   applyDecision('renderer-rects')
@@ -622,7 +635,7 @@ ipcMain.on('local-pet:rects', (event, payload) => {
 
 ipcMain.on('local-pet:overlay-rects', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
-  overlayRects = shared.normalizeRects(payload)
+  overlayRects = shared.normalizeRects(payload, { area: localArea() })
   overlayRectsAt = Date.now()
   // 弹层/卡片自己也是命中区：光标压上去时主进程要接管鼠标，不必等悬停心跳。
   applyDecision('renderer-overlays')

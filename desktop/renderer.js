@@ -11,16 +11,16 @@
  * 页面是 file://，这里**没有** `/dsh-pet-7340/thumb/...` 可用。
  *
  * 拖拽：pointerdown 立刻申请输入租约（busy），每 300ms 续期；pointerup/pointercancel/
- * window blur/页面隐藏/2.5s 无移动都会释放。宠物落后于光标、光标跑到矩形外时，
- * 靠租约保持窗口可交互，pointermove/pointerup 才不会断。
+ * window blur/页面隐藏/2.5s 无移动都会释放。宠物落后于光标时，租约 + 一条跟随光标的
+ * `ui:drag` 命中矩形一起保持窗口可交互，pointermove/pointerup 才不会断。
  *
  * 控件（ticket 11）：
  *   - 悬停/点击自己的宠物 → 弹层（串门；出门时桌面上没有 self，用常驻「召回」胶囊代替）；
- *   - 点击客人 → 弹层（送客）；放行卡由场景里的 controls.prompt 驱动；
- *   - 弹层打开期间同样持有输入租约：弹层与宠物之间有间隙，光标穿过时窗口不能翻回穿透；
- *   - 弹层/卡片/胶囊的矩形单独上报（local-pet:overlay-rects），所以即使租约被收回，
- *     光标真的压在按钮上时主进程仍能接管鼠标；
- *   - 关闭/离开/失焦/超时/场景 reset 都会释放租约；渲染端整个死掉时主进程按租约超时兜底。
+ *   - 点击访客 → 弹层（送客）；放行卡由场景里的 controls.prompt 驱动；
+ *   - 弹层**不持有输入租约**：它和宠物之间的 8px 间隙由 overlay 的桥接矩形盖住，
+ *     光标离开宠物与弹层后窗口立刻回到穿透——点桌面别处不会被弹层吃掉；
+ *   - 弹层/卡片/胶囊的矩形单独上报（local-pet:overlay-rects），主进程只认这些矩形；
+ *   - 关闭/离开/失焦/超时/场景 reset 都会撤掉控件矩形；渲染端整个死掉时主进程按矩形过期兜底。
  *   - 点击只是一次**申请**（local-pet:action），状态永远等宿主的场景/action-result 回灌。
  */
 
@@ -39,7 +39,7 @@
   const RECT_HEARTBEAT_MS = 300
   /** 拖拽中这么久没有任何 pointermove：渲染端自己收手（主进程的租约会更早过期）。 */
   const DRAG_TIMEOUT_MS = 2500
-  /** 弹层最长打开时间；到点自己关掉并交还租约，绝不无限期占着整窗鼠标。 */
+  /** 弹层最长打开时间；到点自己关掉并撤掉命中矩形，绝不无限期留在桌面上。 */
   const UI_MAX_OPEN_MS = 12000
   /** 光标离开宠物与弹层后的宽限：够跨过 ~8px 的间隙，又不至于让弹层赖着不走。 */
   const UI_LEAVE_GRACE_MS = 500
@@ -54,6 +54,12 @@
   /** 点击判定：按下到松开的位移/时长都小才算一次点击，否则是拖拽。 */
   const CLICK_MAX_MOVE = 5
   const CLICK_MAX_MS = 600
+  /**
+   * 拖拽时跟随光标的命中半径。宠物是弹簧跟随，快速拖动时光标会跑到宠物矩形外面；
+   * 主进程的输入租约又只认“光标压在一条活矩形上”，所以拖拽期间额外报一条以光标为
+   * 中心的小矩形（`ui:drag`）。它只覆盖光标附近，不会把整窗变成可交互。
+   */
+  const DRAG_HIT_RADIUS = 80
 
   let scene = shared.normalizeScene(null)
   let area = readArea()
@@ -72,8 +78,8 @@
   let rafId = 0
 
   /**
-   * 桌面控件的全部可变状态。租约只有两条来源：拖拽（drag !== null）与打开的弹层（lease）；
-   * 放行卡/召回胶囊是常驻控件，不持有租约——它们靠 overlay 矩形按需接管鼠标。
+   * 桌面控件的全部可变状态。输入租约只有一条来源：拖拽（drag !== null）。
+   * 弹层/放行卡/召回胶囊都不持有租约——它们靠 overlay 命中矩形按需接管鼠标。
    */
   const ui = {
     popover: null, // { petId, kind, el, signature, openedAt, lastActiveAt }
@@ -85,14 +91,14 @@
     suppressedPetId: null,
     leaveTimer: null,
     openTimer: null,
-    lease: false,
     actionSeq: 0,
     pending: new Map(),
     lastNoticeAt: 0,
     lastSelfRect: null,
     layoutAt: 0,
     overlaySignature: '',
-    lastOverlayAt: 0
+    lastOverlayAt: 0,
+    lastDragRectAt: 0
   }
 
   const ACTION_FAILED_NOTICE = '这次操作没有完成，稍后再试。'
@@ -179,9 +185,9 @@
     }
   }
 
-  /** 拖拽与打开的弹层都可能需要租约；任何一方还想要，就不能放手。 */
+  /** 唯一需要输入租约的是拖拽：宠物落后于光标时位置判定必须让位。 */
   function updateLease () {
-    setBusy(drag !== null || ui.lease)
+    setBusy(drag !== null)
   }
 
   function stopHoverHeartbeat () {
@@ -199,7 +205,7 @@
 
   /**
    * 控件矩形（弹层/放行卡/胶囊）是第二批命中区。它们不参与物理，但必须能被主进程看见，
-   * 否则租约一收回（失焦/超时/调试冻结）按钮就再也点不到。
+   * 否则控件一旦不报矩形（失焦/超时/调试冻结）按钮就再也点不到。
    * 桥接矩形把锚点宠物和控件之间的间隙也盖住，光标横穿时不会短暂落空。
    */
   function uiRects () {
@@ -217,8 +223,26 @@
       return rect
     }
 
-    // 顺序有讲究：bridge 在前、容器其次、按钮最后。hitTestRects 倒序扫描，
-    // 因此按钮 > 卡片/弹层 > 桥接矩形；诊断 itemId 不会永远停在 ui:bridge:* 上。
+    // 顺序有讲究：drag/bridge 在前、容器其次、按钮最后。hitTestRects 倒序扫描，
+    // 因此按钮 > 卡片/弹层 > 桥接矩形 > 拖拽矩形；诊断 itemId 不会停在辅助矩形上。
+    if (drag !== null) {
+      const pet = pets.get(drag.id)
+      const point = drag.point
+      if (pet !== undefined && point !== null) {
+        const around = {
+          x: point.x - DRAG_HIT_RADIUS,
+          y: point.y - DRAG_HIT_RADIUS,
+          width: DRAG_HIT_RADIUS * 2,
+          height: DRAG_HIT_RADIUS * 2
+        }
+        const union = shared.unionRect([
+          { x: pet.body.x, y: pet.body.y, width: pet.body.width, height: pet.body.height },
+          around
+        ])
+        if (union !== null) rects.push({ id: 'ui:drag', ...union })
+      }
+    }
+
     const popoverRect = ui.popover === null ? null : rectOf('ui:popover', ui.popover.el)
     if (popoverRect !== null) {
       const pet = pets.get(ui.popover.petId)
@@ -611,12 +635,12 @@
       el.appendChild(makeButton('送客', 'end-visit', {
         deviceId: info?.deviceId ?? deviceId ?? undefined,
         disabled: info === undefined,
-        reason: '这位客人已经不在桌面上了。'
+        reason: '这位访客已经不在桌面上了。'
       }))
       if (info === undefined) {
         const why = document.createElement('div')
         why.className = 'lp-why'
-        why.textContent = '这位客人已经不在桌面上了。'
+        why.textContent = '这位访客已经不在桌面上了。'
         el.appendChild(why)
       }
     }
@@ -643,16 +667,10 @@
     }, UI_MAX_OPEN_MS)
   }
 
-  function setUiLease (value) {
-    const next = value === true
-    if (ui.lease === next) return
-    ui.lease = next
-    updateLease()
-  }
-
   /**
-   * 打开弹层：先关掉旧的（不 suppress），挂 DOM、拿租约、定位、开始超时。
-   * 租约让光标从宠物跨过间隙走到按钮时窗口不会翻回穿透；overlay 矩形是第二道保险。
+   * 打开弹层：先关掉旧的（不 suppress），挂 DOM、定位、开始超时。
+   * 不拿输入租约：光标从宠物跨过间隙走到按钮时，靠 overlay 的桥接矩形接管鼠标；
+   * 离开宠物与弹层之后窗口必须立刻回到穿透（否则点桌面别处会被弹层吃掉）。
    */
   function openPopover (pet) {
     if (pet === null || pet === undefined) return
@@ -674,14 +692,13 @@
     ui.hoverSuppressed = false
     ui.suppressedPetId = null
     cancelLeaveTimer()
-    setUiLease(true)
     layoutUi(true)
     resetOpenTimer()
     reportOverlayRects(true)
   }
 
   /**
-   * 关闭弹层并立刻交还租约。suppress=true 表示“这次是用户/超时关的”，
+   * 关闭弹层并立刻撤掉它的命中矩形。suppress=true 表示“这次是用户/超时关的”，
    * 光标还停在自己的宠物上时不要马上又弹出——必须离开再回来。
    */
   function closePopover (reason, options = {}) {
@@ -695,7 +712,6 @@
     } catch {
       // 已经没了
     }
-    setUiLease(false)
     if (options.suppress !== false) {
       ui.hoverSuppressed = true
       ui.suppressedPetId = current.petId
@@ -1001,7 +1017,7 @@
   function fallbackNoticeFor (action) {
     if (action === 'visit') return '还不能串门：还没有放行你的在线邻居。'
     if (action === 'recall') return '现在不用召回：宠物已经在家了。'
-    if (action === 'end-visit') return '这位客人已经不在桌面上了。'
+    if (action === 'end-visit') return '这位访客已经不在桌面上了。'
     if (action === 'admit' || action === 'reject') return '这位邻居已经不在了，刷新后再试。'
     if (action === 'dismiss') return '这张卡片暂时关不掉，稍后再试。'
     return ACTION_FAILED_NOTICE
@@ -1094,7 +1110,7 @@
       return
     }
     if (action === 'visit' || action === 'recall' || action === 'end-visit') {
-      // 弹层点击后立刻关掉并交还租约；失败会以气泡出现，不靠弹层赖着。
+      // 弹层点击后立刻关掉并撤掉命中矩形；失败会以气泡出现，不靠弹层赖着。
       closePopover('action')
       requestAction(action, deviceId)
       return
@@ -1333,6 +1349,7 @@
       offsetX: x - pet.body.x,
       offsetY: y - pet.body.y,
       target: { x: pet.body.x, y: pet.body.y },
+      point: { x, y },
       trail: [{ t: now, x, y }],
       lastAt: now,
       startX: x,
@@ -1360,6 +1377,7 @@
     if (drag === null) return
     const now = performance.now()
     drag.lastAt = now
+    drag.point = { x, y }
     drag.moved = Math.max(drag.moved, Math.hypot(x - drag.startX, y - drag.startY))
     drag.target = { x: x - drag.offsetX, y: y - drag.offsetY }
     const last = drag.trail[drag.trail.length - 1]
@@ -1402,6 +1420,8 @@
     if (x !== null && y !== null) pointer = { x, y }
     evaluate(pointer, true)
     reportRects(true)
+    // 立刻撤掉 ui:drag：否则主进程还会把光标附近那块当成命中区，最多 900ms。
+    reportOverlayRects(true)
     if (isClick && pet !== undefined) {
       ui.hoverSuppressed = false
       ui.suppressedPetId = null
@@ -1426,6 +1446,7 @@
     updateLease()
     evaluate(pointer, true)
     reportRects(true)
+    reportOverlayRects(true)
   }
 
   // -------------------------------------------------------------------------
@@ -1507,7 +1528,7 @@
     if (ui.popover === null) return
     const target = event.target
     if (!(target instanceof Element)) return
-    // 点在弹层或宠物身上由它们自己处理；点桌面空白处 = 关掉弹层并交还租约。
+    // 点在弹层或宠物身上由它们自己处理；点桌面空白处 = 关掉弹层。
     if (ui.popover.el.contains(target)) return
     if (target.closest('.lp-pet') !== null) return
     closePopover('outside')
@@ -1552,6 +1573,11 @@
     // 弹层/卡片跟着宠物走；overlay 矩形按 10Hz 重新上报，静止时靠心跳。
     if (ui.popover !== null || ui.prompt !== null || ui.recall !== null || ui.notice !== null) {
       layoutUi(false)
+    }
+    // 拖拽时 ui:drag 必须紧跟光标：租约只有在“光标压在活矩形上”时才生效。
+    if (drag !== null && now - ui.lastDragRectAt >= RECT_REPORT_MS) {
+      ui.lastDragRectAt = now
+      reportOverlayRects(false)
     }
     reportRects(false)
   }
@@ -1719,7 +1745,6 @@
           prompt: ui.prompt === null ? null : { deviceId: ui.prompt.deviceId, nickname: ui.prompt.nickname },
           recallChip: ui.recall === null ? null : { nickname: scene.controls.recall.nickname },
           notice: ui.notice === null ? null : { text: ui.notice.text, at: ui.notice.at },
-          lease: ui.lease,
           pending: [...ui.pending.values()].map((pending) => ({
             id: pending.id,
             action: pending.action,

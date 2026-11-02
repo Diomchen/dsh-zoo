@@ -26,7 +26,7 @@ export const HEARTBEAT_INTERVAL_MS = 2000
 export const GUEST_TTL_MS = 30000
 /**
  * 一次**出门**的硬上限：30 分钟到点主动回家并写记录（ticket 09）。
- * 入站串门没有时间上限——客人待到主人点「送客」（ticket 10）。
+ * 入站串门没有时间上限——访客待到主人点「送客」（ticket 10）。
  * 这个值同时是单条串门记录的时长上限（见 src/visit-record.js）。
  */
 export const VISIT_MAX_MS = 30 * 60 * 1000
@@ -37,7 +37,8 @@ export const VISIT_MAX_MS = 30 * 60 * 1000
 export const PEER_LOST_MS = 2 * 60 * 1000
 /**
  * 串门走现有 UDP socket，不另开 TCP 监听（见 docs/protocol.md 的“为什么是 UDP”）。
- * 类型集按生命周期固定：请求 → ack/deny，任一方可发 recall。
+ * 类型集按生命周期固定：请求 → ack/deny，任一方可发 recall，收到 recall 的一方回一条
+ * `visit-recall-ack` 作为回执（recall 也会丢，发起方要靠它停止重试）。
  */
 export const PACKET_TYPES = Object.freeze([
   'beacon',
@@ -46,9 +47,16 @@ export const PACKET_TYPES = Object.freeze([
   'visit-request',
   'visit-ack',
   'visit-deny',
-  'visit-recall'
+  'visit-recall',
+  'visit-recall-ack'
 ])
-const VISIT_TYPES = new Set(['visit-request', 'visit-ack', 'visit-deny', 'visit-recall'])
+const VISIT_TYPES = new Set([
+  'visit-request',
+  'visit-ack',
+  'visit-deny',
+  'visit-recall',
+  'visit-recall-ack'
+])
 /**
  * visit-deny 的理由是固定枚举，不是自由文本：
  * - not-admitted：本机没放行这位邻居（默认，也兼容不带 reason 的旧报文）
@@ -131,7 +139,7 @@ export function resolvePort (env = process.env) {
  *   beacon / beacon-ack     → { v, type, deviceId, nickname, port }
  *   heartbeat               → { v, type, deviceId, anim }
  *   visit-request           → { v, type, deviceId, visitId, nickname, anim }
- *   visit-ack / visit-recall → { v, type, deviceId, visitId }
+ *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
@@ -202,6 +210,11 @@ export function encodeVisitDeny ({ deviceId, visitId, reason } = {}) {
 
 export function encodeVisitRecall ({ deviceId, visitId } = {}) {
   return encodePacket({ type: 'visit-recall', deviceId, visitId })
+}
+
+/** 收到 recall 的回执：让发起方立刻停止重发（它可能有两次重试在路上）。 */
+export function encodeVisitRecallAck ({ deviceId, visitId } = {}) {
+  return encodePacket({ type: 'visit-recall-ack', deviceId, visitId })
 }
 
 function fail (reason) {

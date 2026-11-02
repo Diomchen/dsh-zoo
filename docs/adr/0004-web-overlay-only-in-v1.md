@@ -2,7 +2,8 @@
 
 ## Status
 
-accepted
+superseded by [ADR-0005](./0005-desktop-window-not-gui-overlay.md)
+（v1 的决定只在 v1 成立；v2 已把宠物搬到全屏透明桌面上）
 
 ## 背景
 
