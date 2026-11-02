@@ -201,12 +201,18 @@ export function createService (ctx, options = {}) {
       if (req.method !== 'GET') return sendJson(res, 405, { error: 'method-not-allowed' })
       if (desktop === null) return sendJson(res, 200, { running: false })
       let status = null
+      let helperStatus = null
       try {
         status = typeof desktop.status === 'function' ? desktop.status() : null
+        // 只读缓存永远看不到渲染端的 clip：这里主动问一次 helper（它回 status 事件）。
+        if (typeof desktop.requestStatus === 'function') {
+          const reply = await desktop.requestStatus()
+          helperStatus = reply !== null && typeof reply === 'object' ? reply.status ?? null : null
+        }
       } catch {
-        status = null
+        helperStatus = null
       }
-      sendJson(res, 200, { running: true, status })
+      sendJson(res, 200, { running: true, status, helperStatus })
     }
   }))
 
