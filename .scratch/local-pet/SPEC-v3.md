@@ -43,6 +43,7 @@ local-pet 只做四件事：收、存、画、检查。
   "id": "corgi",
   "name": "楼下的柯基",
   "size": 220,
+  "idle": "idle",
   "actions": {
     "idle":  { "file": "idle.webm",  "loop": true },
     "sleep": { "file": "sleep.webm", "loop": true, "semantic": "sleeping" },
@@ -52,8 +53,11 @@ local-pet 只做四件事：收、存、画、检查。
 }
 ```
 
-- `size`：基准宽度（px），用于缩放到桌面上的实际大小；缺省 220。
-- `actions` 至少要有 `idle`；键是动作 id（自由字符串，≤64，安全字符），值是文件 + 是否循环 + 可选语义。
+- `idle`：待机动作的 id，必须存在于 `actions`；缺省时取排序后的第一个动作。
+  dsh-pet 的待机动作叫 `待机呼吸休闲`，没有叫 `idle` 的文件，所以这个字段是必要的。
+- `name`：外观包的名字；宠物自己的名字仍走 `nickname`，不要在这里重复。
+- `size`：基准宽度（px），用于缩放到桌面上的实际大小；缺省 462（dsh-pet 的基准），新插件建议 220 左右。
+- `actions` 至少有一个动作；键是动作 id（自由字符串，≤64，安全字符），值是文件 + 是否循环 + 可选语义。
 - `file` 是素材源里的相对文件名，只允许安全名 + `.webm`。
 - `hash` 可选；给了就校验整个 manifest 的规范化 JSON。
 - 没有 manifest 的旧邻居：走 L0，只按 `anim` 名字找本机素材。
