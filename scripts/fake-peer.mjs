@@ -8,8 +8,9 @@
 //   node scripts/fake-peer.mjs                       # 默认 45872，对端 45871
 //   node scripts/fake-peer.mjs --name 隔壁的小鲸鱼
 //
-// 然后在 GUI 客厅里：等灯亮 → 点「接受」→ 它的宠物就走进来了。
-// 键盘：v = 让它来串门（你的客厅里出现"来访"）  a <动画名> = 换动作  q = 退出
+// 然后在本地放行它（ticket 11 之前桌面还没有放行卡片，用 /local-pet/action 的 admit），
+// 它的宠物就会出现在你的桌面上。
+// 键盘：v = 让它来串门（你的桌面上出现"来访"）  a <动画名> = 换动作  n <新名字> = 改名  q = 退出
 //
 // 为什么要换个端口（45872）：你的插件已经占了 45871，同一台机器上再绑同一个 UDP 端口
 // 在 macOS 上会打架。假邻居用一个自己的端口，靠报文里的 port 字段告诉对方"回我发这里"。
@@ -69,7 +70,7 @@ socket.on('error', (error) => {
 
 socket.bind(port, bindAddress, () => {
   console.log(`[假邻居] 我是「${nickname}」，在 ${bindAddress}:${port} 上听着，去找 ${destHost}:${targetPort} 的插件。`)
-  console.log(`[假邻居] 现在去 GUI 客厅：等那盏灯亮，点「接受」，然后 ${nickname} 的宠物就会走进来。`)
+  console.log(`[假邻居] 现在去 /local-pet/state 看 neighbors，用 /local-pet/action 的 admit 放行我；${nickname} 的宠物就会出现在你的桌面上。`)
   console.log('[假邻居] 键盘：v=让它来串门  a <动画名>=换动作  n <新名字>=改名  q=退出')
   // 发往广播地址必须先开 SO_BROADCAST，否则 macOS 直接 EACCES，而且错误会被静默吞掉。
   try {
@@ -91,7 +92,7 @@ function handle (packet, rinfo) {
     const next = { address: rinfo.address, port: packet.port }
     if (state.endpoint === null || state.endpoint.port !== next.port) {
       state.endpoint = next
-      console.log(`[假邻居] 看见你的插件了（${next.address}:${next.port}）。等你在客厅里点「接受」。`)
+      console.log(`[假邻居] 看见你的插件了（${next.address}:${next.port}）。等你在本地放行我。`)
     }
     return
   }
@@ -100,7 +101,7 @@ function handle (packet, rinfo) {
     state.theirAnim = packet.anim
     if (!state.admitted) {
       state.admitted = true
-      console.log('[假邻居] 你放行了 🎉 它现在会作为访客待在客厅里；把鼠标移到它身上就能拖。')
+      console.log('[假邻居] 你放行了 🎉 它现在会作为访客待在桌面上；把鼠标移到它身上就能拖。')
       // 脚本化演示：放行之后自动发一次串门，省得再敲键盘。
       if (autoVisit !== null && Number.isFinite(autoVisit)) {
         setTimeout(outboundVisit, Math.max(0, autoVisit) * 1000)
@@ -183,10 +184,10 @@ function startInput () {
 
 function outboundVisit () {
   if (state.endpoint === null) {
-    return console.log('[假邻居] 还没看见你的插件——先在 GUI 里确认客厅出来了。')
+    return console.log('[假邻居] 还没看见你的插件——确认 DSH 正在跑、UDP 45871 没被别的进程占。')
   }
   if (!state.admitted) {
-    return console.log('[假邻居] 你还没放行我。先去客厅点「接受」，再让我串门。')
+    return console.log('[假邻居] 你还没放行我。先用 /local-pet/action 的 admit 放行，再让我串门。')
   }
   const visitId = randomUUID()
   send(
@@ -194,11 +195,11 @@ function outboundVisit () {
     state.endpoint.address,
     state.endpoint.port
   )
-  console.log('[假邻居] 发出串门请求：等你的客厅里出现一位"来访"的客人。')
+  console.log('[假邻居] 发出串门请求：等你的桌面上出现一位"来访"的客人。')
 }
 
 function reasonText (reason) {
-  if (reason === 'visits-off') return '你关掉了串门开关（客厅右下角那个），先打开它。'
+  if (reason === 'visits-off') return '你关掉了串门开关（accept-visits=false），先打开它。'
   if (reason === 'not-admitted') return '你还没放行这个邻居。'
   return reason ?? '未知原因'
 }

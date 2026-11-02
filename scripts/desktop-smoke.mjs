@@ -2,37 +2,43 @@
 /**
  * 桌面 helper 的真机冒烟（只在 macOS + 本机有 Electron 时有意义；不进 npm test）。
  *
- * 覆盖 ticket 07 的每一条验收：
- *   1. 透明窗口 + 占位方块：--local-pet-shot 走 capturePage，落 PNG + 同名 .json；
- *      这里用 zlib 自己解 PNG，断言背景 alpha=0、方块中心是 #3b74d8、方块外是透明的。
- *   2. 点击穿透：
- *      - 渲染端路径：debug-move 合成 mousemove → 渲染端命中 → IPC → setIgnoreMouseEvents(false)，
- *        hit 事件的 reason 必须是 'hovering'；
- *      - 兜底路径：只改主进程光标（forward 钩子失效的模拟），停留 300ms 后 reason='main-fallback'；
- *      - 反向：光标移出命中区 → 100ms 内恢复穿透（reason='outside'）；
- *      - 渲染端失效：debug-freeze-hover 后 1.2s 内必须恢复穿透；
- *      - 主进程否决：渲染端心跳说 inside，但真实光标在命中区外 → 必须穿透。
- *   3. 生命周期：quit / SIGKILL / 宿主被 SIGKILL 三种情况都不留进程。
- *   4. 宿主 manager：ready、update、shot、崩溃后重启一次、dispose 后进程消失。
- * 只依赖 node:zlib，不装任何包。
+ * 覆盖 ticket 07 + 08 的验收：
+ *   1. 宠物真的画出来：截图模式用 capturePage() 抓 PNG + 同名 .json，zlib 自己解 PNG，
+ *      断言背景透明、每只宠物的媒体区/昵称条有像素、素材走 localpet://（source=video）；
+ *   2. 点击穿透：渲染端悬停路径、主进程兜底（forward 失效）、主进程否决（光标真在外面）、
+ *      渲染端冻结后 fail-closed；
+ *   3. 输入租约：拖拽时把光标移到宠物矩形外，窗口仍保持可交互；pointerup 后立刻交还穿透；
+ *      busy 心跳冻结后超过 BUSY_LEASE_MS 自动释放；
+ *   4. 物理：渲染端 60fps 跑重力/反弹/边缘夹取，逐帧上报的矩形与主进程命中判定一致；
+ *      拖拽跟手、松手有速度、几秒后速度衰减且不出界；
+ *   5. 场景 v2：宿主删/加宠物、改动作，渲染端跟着增删，reset 会重新出生；
+ *   6. 生命周期：quit / 崩溃重启 / dispose / 宿主被 SIGKILL 都不留进程。
  *
- * 用法：npm run smoke:desktop
+ * 抓图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）。设
+ *   LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop
+ * 会把整窗（棋盘格合成）和宠物特写写进 .scratch/local-pet/notes/。
+ *
+ * 只依赖 node:zlib，不装任何包。
  */
 
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
-import { inflateSync } from 'node:zlib'
+import { fileURLToPath } from 'node:url'
+import { deflateSync, inflateSync } from 'node:zlib'
 
 import shared from '../desktop/shared.js'
 import { createDesktop, HELPER_MAIN } from '../src/desktop.js'
 import { buildHelperArgs, helperEnv, resolveElectronBinary } from '../src/desktop-launch.js'
+import { resolveDshPetAssetDirs } from '../src/pet-assets.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
 const OUT_DIR = join(tmpdir(), 'dsh-local-pet-desktop-smoke-' + process.pid)
+const NOTES_DIR = join(ROOT, '.scratch', 'local-pet', 'notes')
+const WRITE_NOTES = process.env.LOCAL_PET_SMOKE_NOTES === '1'
+const ASSET_ROOTS = resolveDshPetAssetDirs({ env: process.env })
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const spawned = []
 let checks = 0
@@ -60,7 +66,7 @@ function assert (condition, message) {
 }
 
 // ---------------------------------------------------------------------------
-// 极简 PNG 解码（8-bit RGB/RGBA，非隔行）——为了不依赖任何 npm 包
+// 极简 PNG 解码/编码（8-bit RGBA，非隔行）——为了不依赖任何 npm 包
 // ---------------------------------------------------------------------------
 
 function decodePng (buffer) {
@@ -125,66 +131,247 @@ function decodePng (buffer) {
     current.copy(out, row * stride)
     previous = current
   }
-  return { width, height, channels, data: out }
+  if (channels === 3) {
+    const rgba = Buffer.alloc(width * height * 4)
+    for (let index = 0; index < width * height; index += 1) {
+      rgba[index * 4] = out[index * 3]
+      rgba[index * 4 + 1] = out[index * 3 + 1]
+      rgba[index * 4 + 2] = out[index * 3 + 2]
+      rgba[index * 4 + 3] = 255
+    }
+    return { width, height, channels: 4, data: rgba }
+  }
+  return { width, height, channels: 4, data: out }
+}
+
+const CRC_TABLE = (() => {
+  const table = new Int32Array(256)
+  for (let n = 0; n < 256; n += 1) {
+    let c = n
+    for (let k = 0; k < 8; k += 1) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    table[n] = c
+  }
+  return table
+})()
+
+function crc32 (buffer) {
+  let c = 0xffffffff
+  for (let index = 0; index < buffer.length; index += 1) c = CRC_TABLE[(c ^ buffer[index]) & 0xff] ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+
+function pngChunk (type, data) {
+  const head = Buffer.alloc(8)
+  head.writeUInt32BE(data.length, 0)
+  head.write(type, 4, 'ascii')
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), data])), 0)
+  return Buffer.concat([head, data, crc])
+}
+
+function encodePng (image) {
+  const { width, height, data } = image
+  const stride = width * 4
+  const raw = Buffer.alloc((stride + 1) * height)
+  for (let row = 0; row < height; row += 1) {
+    raw[row * (stride + 1)] = 0
+    data.copy(raw, row * (stride + 1) + 1, row * stride, row * stride + stride)
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(width, 0)
+  ihdr.writeUInt32BE(height, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  ihdr[10] = 0
+  ihdr[11] = 0
+  ihdr[12] = 0
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', deflateSync(raw, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0))
+  ])
 }
 
 function pixelAt (image, x, y) {
-  const index = (y * image.width + x) * image.channels
-  return [
-    image.data[index],
-    image.data[index + 1],
-    image.data[index + 2],
-    image.channels === 4 ? image.data[index + 3] : 255
-  ]
+  const index = (y * image.width + x) * 4
+  return [image.data[index], image.data[index + 1], image.data[index + 2], image.data[index + 3]]
+}
+
+function countOpaque (image, left, top, right, bottom, threshold = 0) {
+  let count = 0
+  const x0 = Math.max(0, Math.floor(left))
+  const y0 = Math.max(0, Math.floor(top))
+  const x1 = Math.min(image.width, Math.ceil(right))
+  const y1 = Math.min(image.height, Math.ceil(bottom))
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      if (image.data[(y * image.width + x) * 4 + 3] > threshold) count += 1
+    }
+  }
+  return count
 }
 
 function countTransparent (image) {
   let transparent = 0
-  if (image.channels !== 4) return 0
   for (let index = 3; index < image.data.length; index += 4) {
     if (image.data[index] === 0) transparent += 1
   }
   return transparent
 }
 
-function verifyShot (pngPath, sidecarPath) {
-  const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'))
-  const image = decodePng(readFileSync(pngPath))
-  const item = sidecar.scene.items[0]
-  const scaleX = image.width / sidecar.bounds.width
-  const scaleY = image.height / sidecar.bounds.height
-  const toPixel = (localX, localY) => [
-    Math.round((sidecar.bounds.x + localX) * scaleX),
-    Math.round((sidecar.bounds.y + localY) * scaleY)
-  ]
-  assert(sidecar.bounds.width === sidecar.workArea.width && sidecar.bounds.height === sidecar.workArea.height,
-    '窗口铺满工作区：' + sidecar.bounds.width + '×' + sidecar.bounds.height)
-  assert(image.width >= sidecar.bounds.width && image.width / sidecar.bounds.width === scaleX,
-    '截图像素与逻辑坐标同尺度（scale=' + scaleX + '）')
+/** 棋盘格合成：让透明度在一张不透明的 PNG 里肉眼可辨。 */
+function compositeOverCheckerboard (image, square = 64) {
+  const out = Buffer.alloc(image.width * image.height * 4)
+  const light = [237, 242, 248]
+  const dark = [198, 208, 220]
+  for (let y = 0; y < image.height; y += 1) {
+    for (let x = 0; x < image.width; x += 1) {
+      const index = (y * image.width + x) * 4
+      const alpha = image.data[index + 3] / 255
+      const background = (Math.floor(x / square) + Math.floor(y / square)) % 2 === 0 ? light : dark
+      out[index] = Math.round(image.data[index] * alpha + background[0] * (1 - alpha))
+      out[index + 1] = Math.round(image.data[index + 1] * alpha + background[1] * (1 - alpha))
+      out[index + 2] = Math.round(image.data[index + 2] * alpha + background[2] * (1 - alpha))
+      out[index + 3] = 255
+    }
+  }
+  return { width: image.width, height: image.height, channels: 4, data: out }
+}
 
-  const corner = pixelAt(image, 2, 2)
-  assert(corner[3] === 0, '窗口背景是透明的（左上角 alpha=0）')
-  const target = pixelAt(image, ...toPixel(item.x + item.width / 2, item.y + item.height / 2))
-  // capturePage 会按 Skia 的显示色彩配置做一次转换：RGB 各差几个数值是正常的，只做容差比较。
-  const nearBlue = Math.abs(target[0] - 0x3b) <= 24 && Math.abs(target[1] - 0x74) <= 24 && Math.abs(target[2] - 0xd8) <= 24
-  assert(nearBlue && target[3] === 255,
-    '占位方块中心是 #3b74d8 蓝色且不透明（实际 ' + target.join(',') + '）')
-  const outside = pixelAt(image, ...toPixel(item.x - 20, item.y - 20))
-  assert(outside[3] === 0, '方块外 20px 处是透明的')
-  const transparent = countTransparent(image)
-  const total = image.width * image.height
-  assert(transparent / total > 0.9, '整张图 >90% 像素透明（' + ((transparent / total) * 100).toFixed(2) + '%）')
-  return { image, sidecar, item }
+/** 2×2/4×4 盒式降采样（先合成到不透明背景，避免透明像素被平均成灰边）。 */
+function downscale (image, factor) {
+  const width = Math.max(1, Math.floor(image.width / factor))
+  const height = Math.max(1, Math.floor(image.height / factor))
+  const out = Buffer.alloc(width * height * 4)
+  const area = factor * factor
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let r = 0
+      let g = 0
+      let b = 0
+      let a = 0
+      for (let dy = 0; dy < factor; dy += 1) {
+        for (let dx = 0; dx < factor; dx += 1) {
+          const sx = Math.min(image.width - 1, x * factor + dx)
+          const sy = Math.min(image.height - 1, y * factor + dy)
+          const index = (sy * image.width + sx) * 4
+          r += image.data[index]
+          g += image.data[index + 1]
+          b += image.data[index + 2]
+          a += image.data[index + 3]
+        }
+      }
+      const index = (y * width + x) * 4
+      out[index] = Math.round(r / area)
+      out[index + 1] = Math.round(g / area)
+      out[index + 2] = Math.round(b / area)
+      out[index + 3] = Math.round(a / area)
+    }
+  }
+  return { width, height, channels: 4, data: out }
+}
+
+function cropImage (image, left, top, width, height) {
+  const out = Buffer.alloc(width * height * 4)
+  for (let y = 0; y < height; y += 1) {
+    image.data.copy(out, y * width * 4, ((top + y) * image.width + left) * 4, ((top + y) * image.width + left + width) * 4)
+  }
+  return { width, height, channels: 4, data: out }
 }
 
 // ---------------------------------------------------------------------------
-// 直接 stdio 客户端：验证 helper 本身
+// 截图断言
 // ---------------------------------------------------------------------------
 
-function createHelperClient (log) {
+function verifyShot (pngPath, sidecarPath, expectedPets, options = {}) {
+  const sidecar = JSON.parse(readFileSync(sidecarPath, 'utf8'))
+  const image = decodePng(readFileSync(pngPath))
+  const bounds = sidecar.bounds
+  const scaleX = image.width / bounds.width
+  const scaleY = image.height / bounds.height
+  const toPixel = (localX, localY) => [Math.round(localX * scaleX), Math.round(localY * scaleY)]
+
+  assert(scaleX === scaleY, '截图像素与逻辑坐标同尺度（scale=' + scaleX + '）')
+  assert(image.width === Math.round(bounds.width * scaleX) && image.height === Math.round(bounds.height * scaleY),
+    '截图尺寸 = 窗口 bounds × scale（' + image.width + '×' + image.height + '）')
+  assert(sidecar.scene.version === 2, 'sidecar 里是场景 v2')
+  const pets = sidecar.renderer !== null && Array.isArray(sidecar.renderer.pets)
+    ? sidecar.renderer.pets
+    : sidecar.scene.items
+  assert(pets.length === expectedPets, 'sidecar 里有 ' + expectedPets + ' 只宠物（实际 ' + pets.length + '）')
+
+  const corner = pixelAt(image, 2, 2)
+  assert(corner[3] === 0, '窗口背景是透明的（左上角 alpha=0）')
+  const transparent = countTransparent(image)
+  assert(transparent / (image.width * image.height) > 0.9,
+    '整张图 >90% 像素透明（' + ((transparent / (image.width * image.height)) * 100).toFixed(2) + '%）')
+
+  for (const pet of pets) {
+    assert(pet.x >= 0 && pet.y >= 0 &&
+      pet.x + pet.width <= bounds.width + 0.5 && pet.y + pet.height <= bounds.height + 0.5,
+    '宠物 ' + pet.id + ' 在工作区内')
+    const [px, py] = toPixel(pet.x, pet.y)
+    const mediaWidth = Math.round(pet.width * scaleX)
+    const mediaHeight = Math.round(Math.min(pet.width, pet.height) * scaleY)
+    const mediaPixels = countOpaque(image, px, py, px + mediaWidth, py + mediaHeight, 0)
+    assert(mediaPixels > mediaWidth * mediaHeight * 0.003,
+      '宠物 ' + pet.id + ' 的媒体区有可见像素（' + mediaPixels + '）')
+    const namePixels = countOpaque(image, px, py + mediaHeight, px + mediaWidth, py + Math.round(pet.height * scaleY), 0)
+    assert(namePixels > 80, '宠物 ' + pet.id + ' 的昵称条画出来了（' + namePixels + ' px）')
+  }
+
+  const videos = pets.filter((pet) => pet.source === 'video')
+  const svgs = pets.filter((pet) => pet.source === 'svg')
+  if (options.source === 'svg') {
+    assert(svgs.length === pets.length, '没有素材时所有宠物都退到内置 SVG 色块')
+  } else if (options.source === 'video' || ASSET_ROOTS.length > 0) {
+    assert(videos.length === pets.length,
+      '所有宠物都通过 localpet:// 加载了 dsh-pet WebM（' + videos.map((pet) => pet.clip).join(', ') + '）')
+  } else {
+    info('没有找到 dsh-pet 素材：宠物退到内置 SVG 色块')
+    assert(svgs.length === pets.length, '没有素材时全部退到 SVG')
+  }
+  return { image, sidecar, pets, scaleX, scaleY, bounds }
+}
+
+function writeNoteScreenshots (verified) {
+  if (!WRITE_NOTES) return null
+  mkdirSync(NOTES_DIR, { recursive: true })
+  const composite = compositeOverCheckerboard(verified.image)
+  const full = downscale(composite, 4)
+  const fullPath = join(NOTES_DIR, '08-desktop-pets-composited.png')
+  writeFileSync(fullPath, encodePng(full))
+
+  // 宠物特写：自己的那只 + 四周 110 逻辑 px，能看清素材和昵称。
+  const focus = verified.pets.find((pet) => pet.role === 'self') ?? verified.pets[0]
+  const margin = 110
+  const left = focus.x
+  const top = focus.y
+  const px = Math.max(0, Math.floor((left - margin) * verified.scaleX))
+  const py = Math.max(0, Math.floor((top - margin) * verified.scaleY))
+  const pw = Math.min(composite.width - px, Math.ceil((focus.width + margin * 2) * verified.scaleX))
+  const ph = Math.min(composite.height - py, Math.ceil((focus.height + margin * 2) * verified.scaleY))
+  const crop = downscale(cropImage(composite, px, py, pw, ph), 2)
+  const cropPath = join(NOTES_DIR, '08-desktop-pets-crop-composited.png')
+  writeFileSync(cropPath, encodePng(crop))
+  return { fullPath, cropPath }
+}
+
+// ---------------------------------------------------------------------------
+// 直接 stdio 客户端
+// ---------------------------------------------------------------------------
+
+function createHelperClient (log, extraArgs = [], clientOptions = {}) {
   const resolved = resolveElectronBinary({})
   assert(resolved.ok, '找到 Electron：' + resolved.path)
-  const child = spawn(resolved.path, buildHelperArgs({ helperPath: HELPER_MAIN, hostPid: process.pid, debug: true }), {
+  const args = buildHelperArgs({
+    helperPath: HELPER_MAIN,
+    hostPid: process.pid,
+    debug: true,
+    assetRoots: clientOptions.withAssets === false ? [] : ASSET_ROOTS
+  }).concat(extraArgs)
+  const child = spawn(resolved.path, args, {
     cwd: ROOT,
     env: helperEnv(process.env, process.pid),
     stdio: ['pipe', 'pipe', 'pipe']
@@ -235,123 +422,399 @@ function createHelperClient (log) {
   }
   const status = async () => {
     const start = mark()
-    send({ type: 'status', id: 'smoke-' + Date.now() })
+    send({ type: 'status', id: 'smoke-status-' + Date.now() })
     const event = await waitFrom(start, (candidate) => candidate.type === 'status', 3000, 'status')
     return event.status
   }
-  return { child, events, send, mark, waitFrom, status, exited, stderr }
+  const rendererState = async () => {
+    const start = mark()
+    send({ type: 'debug-renderer', id: 'smoke-renderer-' + Date.now() })
+    const event = await waitFrom(start, (candidate) => candidate.type === 'renderer-state', 3000, 'renderer-state')
+    return event.state
+  }
+  const waitStatus = async (predicate, timeoutMs, label) => {
+    const deadline = Date.now() + timeoutMs
+    let last = null
+    while (Date.now() < deadline) {
+      last = await status()
+      if (predicate(last)) return last
+      await sleep(60)
+    }
+    throw new Error('等待状态超时：' + label + '（最后 ' + JSON.stringify(last) + '）')
+  }
+  return { child, events, send, mark, waitFrom, status, waitStatus, rendererState, exited, stderr }
 }
+
+function screenCenter (pet, workArea) {
+  return {
+    x: workArea.x + pet.x + pet.width / 2,
+    y: workArea.y + pet.y + pet.height / 2
+  }
+}
+
+function hitMatchesPet (hit, pet, workArea, tolerance = 2) {
+  if (hit.rect === null) return false
+  return Math.abs(hit.rect.x - (workArea.x + pet.x)) <= tolerance &&
+    Math.abs(hit.rect.y - (workArea.y + pet.y)) <= tolerance &&
+    Math.abs(hit.rect.width - pet.width) <= tolerance &&
+    Math.abs(hit.rect.height - pet.height) <= tolerance
+}
+
+async function leavePointer (client, point) {
+  // 让渲染端也看见光标离开（合成 pointermove；不依赖 hit 事件——本来就穿透时不会发）。
+  client.send({ type: 'debug-dispatch', phase: 'move', x: point.x, y: point.y })
+  client.send({ type: 'pointer', x: point.x, y: point.y })
+  return client.waitStatus((status) => status.ignoring === true, 2500, '恢复穿透')
+}
+
+// ---------------------------------------------------------------------------
+// 1) 截图模式：自己画三只演示宠物，抓图后退出
+// ---------------------------------------------------------------------------
+
+async function verifyShotMode () {
+  const pngPath = join(OUT_DIR, 'standalone.png')
+  const client = createHelperClient((line) => info(line), [
+    '--local-pet-shot', pngPath,
+    '--local-pet-shot-delay', '1200'
+  ])
+  const exit = await Promise.race([client.exited, sleep(20000).then(() => null)])
+  assert(exit !== null, '截图模式在 20s 内自己退出')
+  assert(exit.code === 0 || exit.code === null, '截图模式退出码正常（' + JSON.stringify(exit) + '）')
+  assert(existsSync(pngPath), 'shot 落盘：' + pngPath)
+  assert(existsSync(pngPath + '.json'), 'shot sidecar 落盘：' + pngPath + '.json')
+  const verified = verifyShot(pngPath, pngPath + '.json', 3, { source: ASSET_ROOTS.length > 0 ? 'video' : 'svg' })
+  info('截图：' + pngPath + '（' + verified.image.width + '×' + verified.image.height + '）')
+  if (ASSET_ROOTS.length > 0) info('素材根：' + ASSET_ROOTS.join(' | '))
+  return { pngPath, sidecarPath: pngPath + '.json', verified }
+}
+
+async function verifySvgFallback () {
+  const pngPath = join(OUT_DIR, 'no-assets.png')
+  const client = createHelperClient((line) => info(line), [
+    '--local-pet-shot', pngPath,
+    '--local-pet-shot-delay', '200'
+  ], { withAssets: false })
+  const exit = await Promise.race([client.exited, sleep(20000).then(() => null)])
+  assert(exit !== null, '无素材的截图模式也在 20s 内退出')
+  assert(exit.code === 0 || exit.code === null, '无素材的截图模式退出码正常（' + JSON.stringify(exit) + '）')
+  assert(existsSync(pngPath), '无素材 shot 落盘：' + pngPath)
+  const verified = verifyShot(pngPath, pngPath + '.json', 3, { source: 'svg' })
+  info('无素材降级截图：' + pngPath)
+  return verified
+}
+
+// ---------------------------------------------------------------------------
+// 2) 交互模式：点击穿透 / 输入租约 / 物理 / 场景对账 / 截图
+// ---------------------------------------------------------------------------
 
 async function verifyHelper () {
   const client = createHelperClient((line) => info(line))
   const readyMark = client.mark()
   const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
   assert(ready.pid === client.child.pid, 'ready.pid 就是 helper 进程（' + ready.pid + '）')
-  assert(ready.workArea.width > 0 && ready.workArea.height > 0, 'ready 上报主屏工作区 ' + ready.workArea.width + '×' + ready.workArea.height)
+  assert(ready.workArea.width > 0 && ready.workArea.height > 0,
+    'ready 上报主屏工作区 ' + ready.workArea.width + '×' + ready.workArea.height)
   assert(Array.isArray(ready.displays) && ready.displays.length >= 1, 'ready 上报显示器列表')
   assert(ready.debug === true && ready.shotMode === false, 'debug 模式已生效')
+  const workArea = ready.workArea
 
-  const scene = shared.placeholderScene(ready.workArea)
-  const item = scene.items[0]
-  client.send({ type: 'update', scene })
-  await sleep(500)
+  // 场景来之前先看默认态：窗口只在有宠物/卡片时才可能接管鼠标。
   let current = await client.status()
-  assert(current.sceneItems === 1, 'stdin 的 update 命令被接受（sceneItems=1）')
-  assert(current.ignoring === true, '窗口默认点击穿透（ignoring=true）')
+  assert(current.sceneItems === 0 && current.ignoring === true,
+    '窗口默认点击穿透（ignoring=true，场景为空）')
+
+  const scene = shared.demoPetScene(workArea)
+  client.send({ type: 'update', scene })
+  await sleep(700)
+  current = await client.status()
+  assert(current.sceneItems === scene.items.length, 'stdin 的 update 被接受（sceneItems=' + current.sceneItems + '）')
   assert(current.visible === true, '窗口已显示')
   assert(current.focused === false, '窗口不抢焦点（focused=false）')
   assert(current.focusable === false, '窗口不可聚焦（focusable=false）')
   assert(current.alwaysOnTop === true, '窗口置顶（alwaysOnTop=true）')
   assert(current.allWorkspaces === true, '窗口显示在所有工作区（allWorkspaces=true）')
-  assert(current.bounds.width === ready.workArea.width && current.bounds.height === ready.workArea.height,
+  assert(current.bounds.width === workArea.width && current.bounds.height === workArea.height,
     '窗口尺寸等于工作区，不越界')
+  // 冒烟只走合成 PointerEvent：锁住真实输入，环境里的鼠标/焦点事件不能干扰用例。
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: workArea.x + 8, y: workArea.y + 8 })
+  await sleep(150)
+  assert((await client.status()).ignoring === true, '锁住输入后窗口回到穿透（没有悬停）')
+  current = await client.waitStatus((status) => status.rendererRects >= 3, 4000, '渲染端上报 3 个命中矩形')
+  assert(current.rendererRectsAgeMs !== null && current.rendererRectsAgeMs < shared.RENDERER_RECT_MAX_AGE_MS,
+    '命中矩形是新鲜的（' + current.rendererRectsAgeMs + 'ms）')
 
-  const center = {
-    x: ready.workArea.x + item.x + item.width / 2,
-    y: ready.workArea.y + item.y + item.height / 2
+  // 等出生速度被地面摩擦吃掉：命中判定是在宠物静止时做的，避免测试和物理赛跑。
+  await sleep(2600)
+  let state = await client.rendererState()
+  assert(state !== null && state.pets.length === 3, '渲染端有 3 只宠物')
+  assert(state.pets.every((pet) => pet.x >= 0 && pet.y >= 0 &&
+    pet.x + pet.width <= workArea.width + 0.5 && pet.y + pet.height <= workArea.height + 0.5),
+  '所有宠物都在工作区内（出生后立即受重力/夹取约束）')
+  if (ASSET_ROOTS.length > 0) {
+    assert(state.pets.every((pet) => pet.source === 'video'),
+      '宠物素材经 localpet:// 加载成功（' + state.pets.map((pet) => pet.clip).join(', ') + '）')
   }
-  const outside = { x: ready.workArea.x + 8, y: ready.workArea.y + 8 }
+  assert(state.pets.every((pet) => Number.isFinite(pet.vx) && Number.isFinite(pet.vy)), '速度是有限数')
 
-  // 渲染端路径：合成 mousemove → 渲染端命中 → IPC → 主进程复核
-  let start = client.mark()
-  client.send({ type: 'debug-move', x: center.x, y: center.y })
-  const entered = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '进入命中区')
-  assert(entered.inside === true && entered.reason === 'hovering', '光标进命中区 → 渲染端路径接管鼠标（reason=hovering）')
-  assert(entered.rect !== null && entered.rect.x === ready.workArea.x + item.x, 'hit 事件上报屏幕坐标的命中矩形')
-  current = await client.status()
-  assert(current.ignoring === false, '主进程真的调用了 setIgnoreMouseEvents(false)')
+  // 渲染端悬停路径（真实输入管线）：sendInputEvent 的合成 mousemove → 渲染端 hover → IPC。
+  // 宠物可能刚出生还在动，重试几次拿新鲜位置；之后锁住真实输入，后续全用 debug-dispatch。
+  const outside = { x: workArea.x + 8, y: workArea.y + 8 }
+  // 真实输入管线单独验一次：解锁 → sendInputEvent mousemove → 命中；验完立刻重新锁上。
+  client.send({ type: 'debug-lock-input', locked: false })
+  await sleep(150)
+  let hovered = null
+  let hoveredPet = null
+  let self = null
+  let center = null
+  let start = 0
+  for (let attempt = 1; attempt <= 3 && hovered === null; attempt += 1) {
+    state = await client.rendererState()
+    hoveredPet = state.pets.find((pet) => pet.id === 'self')
+    center = screenCenter(hoveredPet, workArea)
+    start = client.mark()
+    client.send({ type: 'debug-move', x: center.x, y: center.y })
+    try {
+      hovered = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 1500, '进入命中区')
+    } catch {
+      info('真实输入悬停第 ' + attempt + ' 次没中，重试')
+      client.send({ type: 'pointer', x: outside.x, y: outside.y })
+      await sleep(250)
+      hovered = null
+    }
+  }
+  assert(hovered !== null, '真实输入管线（sendInputEvent mousemove）能触发命中')
+  assert(hovered.inside === true && hovered.itemId === 'self', '光标进命中区 → 命中 self（itemId=self）')
+  assert(['hovering', 'main-fallback'].includes(hovered.reason), '渲染端路径接管鼠标（reason=' + hovered.reason + '）')
+  assert(hitMatchesPet(hovered, hoveredPet, workArea), 'hit.rect 与渲染端上报的宠物矩形一致（屏幕 DIP）')
 
-  // ticket 08 会逐帧 update：同样的场景重复下发不能把交互闪断
-  client.send({ type: 'update', scene })
-  await sleep(250)
-  current = await client.status()
-  assert(current.ignoring === false, '逐帧 update 不打断已接管状态（场景更新按新场景复核）')
-
-  // 场景把方块挪走：即使渲染端还没重新确认，主进程也必须立刻恢复穿透
-  const movedScene = shared.normalizeScene({
-    items: [{ ...scene.items[0], x: scene.items[0].x - 500 }]
-  })
+  // 重新锁住真实输入，用合成 PointerEvent 做确定性的悬停/穿透判定。
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+  state = await client.rendererState()
+  self = state.pets.find((pet) => pet.id === 'self')
+  center = screenCenter(self, workArea)
   start = client.mark()
-  client.send({ type: 'update', scene: movedScene })
-  const moved = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 2000, '场景移走命中区')
-  assert(moved.reason === 'outside', '方块移走后穿透（真实光标已不在新场景命中区）')
-  client.send({ type: 'update', scene })
-  await sleep(300)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  const synthHover = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '合成悬停')
+  assert(synthHover.itemId === 'self', '合成 pointermove 也能命中 self')
+  assert((await client.status()).ignoring === false, '主进程真的调用了 setIgnoreMouseEvents(false)')
 
-  // 移出：恢复穿透
-  start = client.mark()
-  client.send({ type: 'debug-move', x: outside.x, y: outside.y })
-  const left = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 3000, '离开命中区')
-  assert(left.reason === 'outside', '光标离开 → 恢复穿透（reason=outside）')
-  current = await client.status()
-  assert(current.ignoring === true, '主进程真的恢复了 setIgnoreMouseEvents(true)')
-
-  // 兜底路径：只改主进程看到的光标，不产生任何渲染端事件（模拟 macOS 收不到 forward）
-  start = client.mark()
-  client.send({ type: 'pointer', x: center.x, y: center.y })
-  const fallback = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '兜底接管')
-  assert(fallback.reason === 'main-fallback', '渲染端无消息时，停留 300ms 由主进程兜底接管')
-  current = await client.status()
-  assert(typeof current.insideForMs === 'number' && current.insideForMs >= 250, '兜底计时来自主进程真实光标，而非渲染端上报')
-
-  // 兜底接管后先离开，让状态回到穿透（setIgnore 只在状态翻转时发事件）
-  start = client.mark()
-  client.send({ type: 'pointer', x: outside.x, y: outside.y })
-  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 3000, '兜底后离开')
-  assert((await client.status()).ignoring === true, '兜底接管后移出命中区也恢复穿透')
-
-  // 主进程否决：渲染端还在心跳 inside，但真实光标在命中区外 → 必须穿透
-  start = client.mark()
-  client.send({ type: 'debug-move', x: center.x, y: center.y })
-  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '再次进入')
+  // 主进程否决：渲染端还在说 inside，但真实光标在外面
   start = client.mark()
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
   const vetoed = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 2000, '主进程否决')
   assert(vetoed.reason === 'outside', '渲染端说 inside 也不能否决「真实光标在外面」')
+  assert((await client.status()).ignoring === true, '恢复穿透')
 
-  // 渲染端失效：心跳停止后必须恢复穿透，且兜底不得在冻结状态下重新接管
+  // 主进程兜底：先让渲染端真的看见光标离开，再只改主进程光标（渲染端完全没消息）
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await sleep(1300)
+  center = screenCenter(hoveredPet, workArea)
   start = client.mark()
-  client.send({ type: 'debug-move', x: center.x, y: center.y })
-  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '再次进入 2')
+  client.send({ type: 'pointer', x: center.x, y: center.y })
+  const fallback = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '兜底接管')
+  assert(fallback.reason === 'main-fallback', '渲染端无消息时，停留 300ms 由主进程兜底接管')
+  await leavePointer(client, outside)
+  assert((await client.status()).ignoring === true, '兜底接管后移出命中区也恢复穿透')
+
+  // 输入租约：拖拽中把光标移到宠物矩形外，窗口必须保持可交互。
+  // 外部应用抢焦点会让 helper 收到 blur 并（正确地）收回租约；这是环境事件，不是被测行为，
+  // 所以这里最多重试 3 次。每次等 1.4s > hover 确认的 1.2s，证明不是位置判定在兜底。
+  let leaseHeld = false
+  let dragged = null
+  for (let attempt = 1; attempt <= 3 && !leaseHeld; attempt += 1) {
+    state = await client.rendererState()
+    self = state.pets.find((pet) => pet.id === 'self')
+    center = screenCenter(self, workArea)
+    start = client.mark()
+    client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+    await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '拖拽前悬停')
+    const before = self
+    client.send({ type: 'debug-dispatch', phase: 'down', x: center.x, y: center.y })
+    current = await client.waitStatus((status) => status.busy === true, 2000, '拖拽开始（busy=true）')
+    assert(current.ignoring === false, '拖拽开始后窗口可交互')
+    state = await client.rendererState()
+    assert(state.dragging === 'self', '渲染端记录了拖拽中的宠物（dragging=self）')
+    dragged = state.pets.find((pet) => pet.id === 'self')
+    assert(Math.abs(dragged.x - before.x) < 3 && Math.abs(dragged.y - before.y) < 3,
+      '刚按下时宠物还在原地（弹簧跟随，不瞬移）')
+
+    // 只移动主进程光标到宠物外：渲染端收不到新的 pointermove，宠物留在原地。
+    client.send({ type: 'pointer', x: outside.x, y: outside.y })
+    await sleep(1400)
+    current = await client.status()
+    if (current.busy === true && current.ignoring === false) {
+      leaseHeld = true
+    } else {
+      info('输入租约被外部焦点变化打断（第 ' + attempt + ' 次），重试')
+      client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
+      await sleep(250)
+      await leavePointer(client, outside)
+    }
+  }
+  assert(leaseHeld, '光标离开宠物矩形 1.4s 后窗口仍保持可交互（输入租约生效）')
+  assert(shared.hitTestRects(
+    [{ x: dragged.x, y: dragged.y, width: dragged.width, height: dragged.height }],
+    { x: outside.x - workArea.x, y: outside.y - workArea.y }
+  ) === null, '此时真实光标确实在宠物矩形外（不是位置判定在兜底）')
+
+  // pointerup → 立刻交还穿透；宠物不会因为光标在外面而弹飞
   start = client.mark()
-  client.send({ type: 'debug-freeze-hover', frozen: true })
-  const frozen = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 2500, '冻结后恢复穿透')
-  assert(['no-renderer-confirmation', 'stale-renderer-confirmation', 'waiting-for-confirmation'].includes(frozen.reason),
-    '渲染端停止确认 → 恢复穿透（reason=' + frozen.reason + '）')
-  await sleep(1200)
+  client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 2500, '拖拽结束交还穿透')
   current = await client.status()
-  assert(current.ignoring === true, '冻结 1.2s 后仍是穿透（兜底不会在渲染端失效时重新接管）')
+  assert(current.busy === false, 'pointerup 后 busy 释放')
+  assert(current.ignoring === true, 'pointerup 后恢复穿透')
+  state = await client.rendererState()
+  assert(state.dragging === null, '渲染端拖拽状态已清空')
+  self = state.pets.find((pet) => pet.id === 'self')
+  assert(Math.hypot(self.vx, self.vy) < 30, '在宠物外松手且没有轨迹 → 不投掷（速度≈0）')
 
-  // 截图：透明 + 占位方块位置
+  // 拖拽跟手 + 投掷
+  center = screenCenter(self, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '投掷前悬停')
+  client.send({ type: 'debug-dispatch', phase: 'down', x: center.x, y: center.y })
+  await client.waitStatus((status) => status.busy === true, 2000, '投掷拖拽开始')
+  const dragStart = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  await sleep(100)
+  const midX = center.x + 140
+  const midY = center.y - 70
+  client.send({ type: 'debug-dispatch', phase: 'move', x: midX, y: midY })
+  await sleep(80)
+  const endX = center.x + 300
+  const endY = center.y - 150
+  client.send({ type: 'debug-dispatch', phase: 'move', x: endX, y: endY })
+  await sleep(50)
+  const following = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  assert(following.x > dragStart.x + 50, '拖拽时宠物朝光标方向跟随（' + dragStart.x.toFixed(0) + ' → ' + following.x.toFixed(0) + '）')
+  client.send({ type: 'debug-dispatch', phase: 'up', x: endX, y: endY })
+  await sleep(120)
+  state = await client.rendererState()
+  const thrown = state.pets.find((pet) => pet.id === 'self')
+  const throwSpeed = Math.hypot(thrown.vx, thrown.vy)
+  assert(throwSpeed > 100, '松手带上了释放速度（' + throwSpeed.toFixed(0) + ' px/s）')
+  assert(state.pets.every((pet) => pet.x >= 0 && pet.y >= 0 &&
+    pet.x + pet.width <= workArea.width + 0.5 && pet.y + pet.height <= workArea.height + 0.5),
+  '投掷瞬间所有宠物仍在工作区内')
+  await sleep(2500)
+  state = await client.rendererState()
+  const landed = state.pets.find((pet) => pet.id === 'self')
+  assert(Math.hypot(landed.vx, landed.vy) < throwSpeed, '投掷速度随时间衰减（' + throwSpeed.toFixed(0) + ' → ' + Math.hypot(landed.vx, landed.vy).toFixed(0) + '）')
+  assert(landed.y + landed.height <= workArea.height + 0.5, '落地后没有穿出工作区底边')
+
+  // 移动中的命中矩形：主进程的命中判定跟着渲染端位置走
+  state = await client.rendererState()
+  const guest = state.pets.find((pet) => pet.id === 'guest:demo-a')
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'move', x: screenCenter(guest, workArea).x, y: screenCenter(guest, workArea).y })
+  const movedHit = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '移动后命中')
+  assert(movedHit.itemId === guest.id, '移动后命中的是正确的那只（' + movedHit.itemId + '）')
+  assert(hitMatchesPet(movedHit, guest, workArea), '命中矩形与渲染端当前位置一致')
+  await leavePointer(client, outside)
+
+  // 场景 v2：宿主删一只 → 渲染端立刻销毁；再加回来 → 重新出生
+  const remaining = shared.petScene(scene.items
+    .filter((item) => item.id !== 'guest:demo-b')
+    .map((item) => ({ id: item.id, role: item.role, label: item.label, anim: item.anim, color: item.color })), workArea, { reset: true })
+  client.send({ type: 'update', scene: remaining })
+  await sleep(350)
+  state = await client.rendererState()
+  assert(state.pets.length === 2, '宿主删掉一只宠物后渲染端只剩 2 只（' + state.pets.map((pet) => pet.id).join(',') + '）')
+  assert(state.pets.every((pet) => pet.id !== 'guest:demo-b'), '被删的宠物不再出现在渲染端')
+
+  const restored = shared.petScene(scene.items.map((item) => ({
+    id: item.id,
+    role: item.role,
+    label: item.label,
+    anim: item.anim,
+    color: item.color
+  })), workArea, { reset: true })
+  client.send({ type: 'update', scene: restored })
+  await sleep(350)
+  state = await client.rendererState()
+  assert(state.pets.length === 3, '场景加回来 → 渲染端重新出生 3 只')
+  assert(state.pets.every((pet) => pet.x >= 0 && pet.y >= 0 &&
+    pet.x + pet.width <= workArea.width + 0.5 && pet.y + pet.height <= workArea.height + 0.5),
+  'reset 后的宠物仍在工作区内')
+
+  // 动作/昵称更新（宿主仍是动画/名字的权威）
+  const renamed = shared.normalizeScene({
+    ...restored,
+    reset: false,
+    items: restored.items.map((item) => item.id === 'self'
+      ? { ...item, label: '小蓝二号', anim: '原地小憩沉眠' }
+      : item)
+  })
+  client.send({ type: 'update', scene: renamed })
+  await sleep(400)
+  state = await client.rendererState()
+  const renamedPet = state.pets.find((pet) => pet.id === 'self')
+  assert(renamedPet.label === '小蓝二号' && renamedPet.anim === '原地小憩沉眠', '昵称/动作跟着宿主场景更新')
+  assert(renamedPet.source === 'video' || renamedPet.source === 'loading', '动作更新后仍走 WebM 素材')
+
+  // 渲染端冻结：hover 通道完全没消息时，主进程兜底也必须停（fail-closed）
+  await sleep(2600)
+  state = await client.rendererState()
+  const freezeTarget = state.pets.find((pet) => pet.id === 'self')
+  client.send({ type: 'debug-freeze-hover', frozen: true })
+  client.send({ type: 'pointer', x: screenCenter(freezeTarget, workArea).x, y: screenCenter(freezeTarget, workArea).y })
+  await sleep(900)
+  current = await client.status()
+  assert(current.ignoring === true, '渲染端冻结时，主进程兜底不会接管（依旧穿透）')
+  client.send({ type: 'debug-freeze-hover', frozen: false })
+  await leavePointer(client, outside)
+
+  // 输入租约超时：busy 心跳不再续期时，超过 BUSY_LEASE_MS 自动收回
+  state = await client.rendererState()
+  self = state.pets.find((pet) => pet.id === 'self')
+  center = screenCenter(self, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '超时前悬停')
+  client.send({ type: 'debug-dispatch', phase: 'down', x: center.x, y: center.y })
+  await client.waitStatus((status) => status.busy === true, 2000, '超时拖拽开始')
+  client.send({ type: 'debug-freeze-busy', frozen: true })
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  current = await client.waitStatus((status) => status.ignoring === true, shared.BUSY_LEASE_MS + 2500, '租约超时释放')
+  assert(current.busy === false, 'BUSY_LEASE_MS 内没有续期 → busy 自动释放（busy=false）')
+  client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
+  client.send({ type: 'debug-freeze-busy', frozen: false })
+  await sleep(200)
+  assert((await client.status()).ignoring === true, '渲染端也收手后仍是穿透（不残留输入租约）')
+
+  // window blur 也要交还租约（真实环境里临时解锁输入，测完立刻锁回去）
+  client.send({ type: 'debug-lock-input', locked: false })
+  await sleep(150)
+  state = await client.rendererState()
+  self = state.pets.find((pet) => pet.id === 'self')
+  center = screenCenter(self, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, 'blur 前悬停')
+  client.send({ type: 'debug-dispatch', phase: 'down', x: center.x, y: center.y })
+  await client.waitStatus((status) => status.busy === true, 2000, 'blur 前拖拽')
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  client.send({ type: 'debug-dispatch', phase: 'blur', x: center.x, y: center.y })
+  await sleep(250)
+  current = await client.status()
+  assert(current.busy === false && current.ignoring === true, 'window blur → 渲染端立刻交还输入租约并恢复穿透')
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+
+  // 截图：宠物 + 昵称 + 透明背景
   mkdirSync(OUT_DIR, { recursive: true })
   const pngPath = join(OUT_DIR, 'helper.png')
   start = client.mark()
-  client.send({ type: 'shot', id: 'shot-1', path: pngPath })
+  client.send({ type: 'shot', id: 'shot-helper', path: pngPath })
   const shot = await client.waitFrom(start, (event) => event.type === 'shot', 8000, 'shot')
   assert(existsSync(pngPath), 'shot 落盘：' + pngPath)
   assert(shot.width > 0 && shot.height > 0, 'shot 返回像素尺寸 ' + shot.width + '×' + shot.height)
-  const verified = verifyShot(pngPath, pngPath + '.json')
-  info('占位方块：' + JSON.stringify({ scene: verified.item, pointer: verified.sidecar.pointer }))
+  const verified = verifyShot(pngPath, pngPath + '.json', 3)
+  info('交互截图：' + pngPath)
 
   // quit：进程自己退出
   const exitPromise = client.exited
@@ -359,11 +822,11 @@ async function verifyHelper () {
   const exit = await Promise.race([exitPromise, sleep(4000).then(() => null)])
   assert(exit !== null, 'quit 命令让 helper 自己退出')
   assert(exit.code === 0 || exit.code === null, 'quit 退出码正常（' + JSON.stringify(exit) + '）')
-  return { pngPath, sidecarPath: pngPath + '.json' }
+  return { pngPath, sidecarPath: pngPath + '.json', verified }
 }
 
 // ---------------------------------------------------------------------------
-// manager：宿主侧生命周期
+// 3) manager：宿主侧生命周期 + 宠物场景
 // ---------------------------------------------------------------------------
 
 function pidAlive (pid) {
@@ -391,6 +854,7 @@ async function verifyManager () {
     desktopHost: true,
     platform: 'darwin',
     debug: true,
+    assetRoots: ASSET_ROOTS,
     log: { info: (line) => { infos.push(line); info(line) }, warn: (line) => { warns.push(line); info(line) } }
   })
   try {
@@ -399,15 +863,19 @@ async function verifyManager () {
     await waitUntil(() => manager.status().ready, 15000, 'manager ready')
     const workArea = manager.status().workArea
     assert(workArea.width > 0, 'manager 收到 ready 工作区')
-    const scene = shared.placeholderScene(workArea)
-    assert(manager.update(scene) === true, 'manager 把场景写进 stdin')
-    await sleep(400)
+    assert(manager.status().assetRoots.length === ASSET_ROOTS.length, 'manager 把素材目录传给了 helper')
+    const scene = shared.petScene([
+      { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
+      { id: 'guest:manager', role: 'guest', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
+    ], workArea)
+    assert(manager.update(scene) === true, 'manager 把宠物场景写进 stdin')
+    await sleep(1400)
     const status = await manager.requestStatus()
-    assert(status.ok === true && status.status.sceneItems === 1, 'helper 应用了场景（sceneItems=1）')
+    assert(status.ok === true && status.status.sceneItems === 2, 'helper 应用了宠物场景（sceneItems=2）')
     const pngPath = join(OUT_DIR, 'manager.png')
     const shot = await manager.shot(pngPath)
-    assert(shot.ok === true && existsSync(pngPath), 'manager 的 shot 命令落盘' + '（' + shot.width + '×' + shot.height + '）')
-    verifyShot(pngPath, pngPath + '.json')
+    assert(shot.ok === true && existsSync(pngPath), 'manager 的 shot 命令落盘（' + shot.width + '×' + shot.height + '）')
+    verifyShot(pngPath, pngPath + '.json', 2)
 
     const firstPid = manager.pid
     process.kill(firstPid, 'SIGKILL')
@@ -415,10 +883,11 @@ async function verifyManager () {
     assert(warns.some((line) => /退出/.test(line) && /重启/.test(line)), '宿主为 helper 崩溃打了一行日志')
     assert(manager.status().restarts === 1, '重启计数 = 1')
     await waitUntil(() => manager.status().ready, 10000, '重启后 ready')
-    assert(manager.update(scene) === true, '重启后场景能重新下发')
-    await sleep(300)
+    // 强制整包对账：即使场景没变也让渲染端重新出生（helper 重启后宿主可以这么做）
+    assert(manager.resync({ ...scene, reset: false }) === true, 'manager.resync 能强制整包对账')
+    await sleep(500)
     const status2 = await manager.requestStatus()
-    assert(status2.ok === true && status2.status.sceneItems === 1, '重启后场景生效')
+    assert(status2.ok === true && status2.status.sceneItems === 2, '重启后场景生效')
 
     const secondPid = manager.pid
     manager.dispose()
@@ -455,15 +924,20 @@ async function verifyManager () {
 }
 
 // ---------------------------------------------------------------------------
-// 宿主被 SIGKILL：helper 必须自己发现并退出（POSIX 没有 job object 兜底）
+// 4) 宿主被 SIGKILL：helper 必须自己发现并退出
 // ---------------------------------------------------------------------------
 
 async function verifyHostKill () {
   const hostScript = join(OUT_DIR, 'host-child.mjs')
   mkdirSync(OUT_DIR, { recursive: true })
   writeFileSync(hostScript, `
-import { createDesktop } from ${JSON.stringify(pathToFileURL(join(ROOT, 'src', 'desktop.js')).href)}
-const manager = createDesktop({ desktopHost: true, platform: 'darwin', log: { info() {}, warn() {} } })
+import { createDesktop } from ${JSON.stringify(new URL('../src/desktop.js', import.meta.url).href)}
+const manager = createDesktop({
+  desktopHost: true,
+  platform: 'darwin',
+  assetRoots: ${JSON.stringify(ASSET_ROOTS)},
+  log: { info() {}, warn() {} }
+})
 const started = manager.start()
 process.stdout.write(JSON.stringify(started) + '\\n')
 setInterval(() => {}, 1000)
@@ -510,14 +984,23 @@ try {
   rmSync(OUT_DIR, { recursive: true, force: true })
   mkdirSync(OUT_DIR, { recursive: true })
   console.log('Electron: ' + (resolveElectronBinary({}).path ?? '未找到'))
+  console.log('dsh-pet 素材: ' + (ASSET_ROOTS.length > 0 ? ASSET_ROOTS.join(' | ') : '未找到（将退化为 SVG 色块）'))
   console.log('输出目录: ' + OUT_DIR)
-  shot = await run('helper：窗口 / 点击穿透 / 截图 / quit', verifyHelper)
-  await run('manager：ready / update / shot / 崩溃重启 / dispose', verifyManager)
+  if (WRITE_NOTES) console.log('截图笔记: ' + NOTES_DIR)
+  const standalone = await run('截图模式：三只演示宠物 + 透明背景 + 真实素材', verifyShotMode)
+  await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
+  await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
+  await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
+  const notes = writeNoteScreenshots(standalone.verified)
+  if (notes !== null) {
+    console.log('\n截图笔记：')
+    console.log('  整窗（棋盘格合成）: ' + notes.fullPath)
+    console.log('  宠物特写（棋盘格合成）: ' + notes.cropPath)
+  }
   console.log('\n全部通过（' + checks + ' 项断言）。')
-  console.log('截图：' + shot.pngPath)
-  console.log('说明：' + shot.sidecarPath)
-  console.log('PNG 可直接打开查看透明背景与占位方块。')
+  console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
+  console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {
   exitCode = 1
   console.error('\n冒烟失败：' + (error instanceof Error ? error.message : String(error)))

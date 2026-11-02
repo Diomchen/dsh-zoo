@@ -3,9 +3,11 @@ import { hostname } from 'node:os'
 
 import shared from '../desktop/shared.js'
 import { createDesktop } from './desktop.js'
+import { petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
+import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
 import { createSettingsStore } from './settings.js'
@@ -32,6 +34,8 @@ export const VISIT_REQUEST_RETRY_MS = 600
 export const VISIT_REQUEST_TIMEOUT_MS = 1800
 /** 重试/超时计时器的检查粒度；测试可以调更快。 */
 export const VISIT_TIMER_TICK_MS = 200
+/** 桌面场景的巡检节拍：guest 出现/消失、对方动作变化最迟这么久后反映到桌面上。 */
+export const DESKTOP_SYNC_MS = 500
 
 /**
  * 把客厅接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -66,6 +70,7 @@ export function createService (ctx, options = {}) {
   )
   const visitAttempts = integerOption(options.visitAttempts, VISIT_REQUEST_ATTEMPTS, 1, 8)
   const visitTickMs = positiveOption(options.visitTickMs, VISIT_TIMER_TICK_MS, 10)
+  const desktopSyncMs = positiveOption(options.desktopSyncMs, DESKTOP_SYNC_MS, 20)
 
   let identity = null
   let discovery = null
@@ -74,6 +79,10 @@ export function createService (ctx, options = {}) {
   let settings = null
   let bridge = null
   let desktop = null
+  let desktopWorkArea = null
+  let desktopHelperPid = null
+  let desktopSceneSignature = null
+  let desktopSyncTimer = null
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
@@ -339,8 +348,9 @@ export function createService (ctx, options = {}) {
             room.setSelfPet(result.pet)
             room.setBridge(result.bridge)
             // 动作变了就立刻补发心跳，不等下一次 2 秒节拍：
-            // 对方客厅里的访客因此能尽快跟着换动作。
+            // 对方桌面上的访客因此能尽快跟着换动作。
             sendHeartbeats()
+            syncDesktop()
           }
         })
         // 首轮失败不会 reject；它只是把 room 降级成一行说明。
@@ -372,6 +382,14 @@ export function createService (ctx, options = {}) {
     if (options.desktop === false) return
     try {
       const factory = typeof options.desktopFactory === 'function' ? options.desktopFactory : createDesktop
+      // 素材目录在宿主侧解析（不硬编码 profile 路径）；helper 只收到绝对路径。
+      // 解析失败/没装 dsh-pet → 空数组 → 渲染端退内置色块，串门不受影响。
+      const assetRoots = Array.isArray(options.dshPetAssets)
+        ? options.dshPetAssets.slice()
+        : resolveDshPetAssetDirs({ env })
+      if (assetRoots.length === 0) {
+        log.info('没找到 dsh-pet 素材目录，桌面宠物先用内置色块（串门不受影响）')
+      }
       const manager = factory({
         log,
         env,
@@ -381,16 +399,25 @@ export function createService (ctx, options = {}) {
         helperPath: options.desktopHelperPath,
         debug: options.desktopDebug === true,
         maxRestarts: options.desktopMaxRestarts,
+        assetRoots,
         onEvent (event) {
-          if (disposed) return
-          // helper 每次 ready（首次 / 重启 / 显示器变化）都会报工作区；占位方块的场景由宿主算。
-          if (event?.type === 'ready' && desktop !== null) {
-            desktop.update(shared.placeholderScene(event.workArea))
+          if (disposed || desktop === null) return
+          if (event?.type === 'ready') {
+            // helper 每次 ready（首次 / 崩溃重启 / 显示器变化）都会报工作区。
+            // pid 变了 = 换了新 helper（渲染端是空的）→ reset 让它重新出生；
+            // 同一个 pid = 只是显示器变化 → 保留现场位置，渲染端按新尺寸夹取。
+            desktopWorkArea = event.workArea
+            const pid = Number.isInteger(event.pid) && event.pid > 0 ? event.pid : null
+            const restarted = pid === null || pid !== desktopHelperPid
+            desktopHelperPid = pid
+            desktopSceneSignature = null
+            syncDesktop({ reset: restarted })
           }
         }
       })
       // 先挂上引用：即使 start() 同步触发 ready（假实现可能这样），onEvent 也能拿到 manager。
       desktop = manager
+      startDesktopSync()
       const started = manager.start()
       if (started !== null && typeof started?.then === 'function') {
         // 未来若 start 变成异步：失败也要安静地收掉，不能留下半个 manager。
@@ -399,21 +426,24 @@ export function createService (ctx, options = {}) {
           if (result?.ok === false) {
             manager.dispose()
             desktop = null
+            stopDesktopSync()
             return
           }
-          log.info('桌面宠物窗口已启动（ticket 07 占位方块）')
+          log.info('桌面宠物窗口已启动')
         }).catch(() => {
           manager.dispose()
           if (desktop === manager) desktop = null
+          stopDesktopSync()
         })
         return
       }
       if (started?.ok === false) {
         manager.dispose()
         if (desktop === manager) desktop = null
+        stopDesktopSync()
         return
       }
-      log.info('桌面宠物窗口已启动（ticket 07 占位方块）')
+      log.info('桌面宠物窗口已启动')
     } catch (error) {
       // 桌面层永远只能是「锦上添花」：初始化失败 = 这一行日志 + 没有宠物。
       try {
@@ -422,8 +452,46 @@ export function createService (ctx, options = {}) {
         // 半初始化的 manager 也不能把 dispose 的异常抛出去
       }
       desktop = null
+      stopDesktopSync()
       warn(ctx, '桌面层初始化失败，本次不显示宠物：' + message(error))
     }
+  }
+
+  /**
+   * 宿主对「桌面上有谁」的权威同步。
+   *
+   * 场景只在宠物集合/动作/昵称真的变了时下发（签名比较），不是逐帧：位置和物理在渲染端。
+   * 500ms 的巡检兜底所有状态变化路径（心跳、tick、桥接轮询、action），避免漏发某一条。
+   */
+  function syncDesktop ({ reset = false } = {}) {
+    if (disposed || desktop === null || desktopWorkArea === null) return false
+    const pets = petsFromSnapshot(room.snapshot())
+    const signature = JSON.stringify(pets)
+    if (!reset && signature === desktopSceneSignature) return false
+    desktopSceneSignature = signature
+    const scene = shared.petScene(pets, desktopWorkArea, { reset })
+    try {
+      if (reset && typeof desktop.resync === 'function') return desktop.resync(scene)
+      return desktop.update(scene)
+    } catch (error) {
+      // 桌面层写管道失败只影响这一帧；下一次巡检会再试。
+      return false
+    }
+  }
+
+  function startDesktopSync () {
+    if (desktopSyncTimer !== null || disposed) return
+    // 第一次 ready 之前 syncDesktop 是 no-op；ready 的 onEvent 会立刻同步一次。
+    desktopSyncTimer = setInterval(() => {
+      syncDesktop()
+    }, desktopSyncMs)
+    desktopSyncTimer.unref?.()
+  }
+
+  function stopDesktopSync () {
+    if (desktopSyncTimer === null) return
+    clearInterval(desktopSyncTimer)
+    desktopSyncTimer = null
   }
 
   /**
@@ -605,6 +673,8 @@ export function createService (ctx, options = {}) {
         // 对方已经离线：它自己的 TTL 会清理
       }
     }
+    // 谁在/谁走/动作变了都可能从这里经过：让桌面场景跟上（没变就不发）。
+    syncDesktop()
     return records.length
   }
 
@@ -640,6 +710,7 @@ export function createService (ctx, options = {}) {
         clearInterval(visitTimer)
         visitTimer = null
       }
+      stopDesktopSync()
       request = null
       discovery?.dispose()
       discovery = null

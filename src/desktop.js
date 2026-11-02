@@ -55,6 +55,7 @@ function safe (fn, fallback) {
  * @param {boolean} [options.desktopHost] 覆盖桌面版判定（测试/冒烟用）
  * @param {Function} [options.spawn] child_process.spawn 注入
  * @param {Function} [options.exists] 路径存在性注入
+ * @param {string[]} [options.assetRoots] 宿主解析好的 dsh-pet 素材目录（helper 的 localpet:// 根）
  * @param {Function} [options.onEvent] 收到 helper 事件（ready/hit/...）时回调；异常被吞
  */
 export function createDesktop (options = {}) {
@@ -70,6 +71,7 @@ export function createDesktop (options = {}) {
     ? options.helperPath
     : HELPER_MAIN
   const hostPid = Number.isInteger(options.hostPid) && options.hostPid > 0 ? options.hostPid : process.pid
+  const assetRoots = Array.isArray(options.assetRoots) ? options.assetRoots.slice() : []
   const debug = options.debug === true
   const pingMs = Number.isFinite(options.pingMs) && options.pingMs >= 100 ? options.pingMs : DESKTOP_PING_MS
   const log = {
@@ -156,7 +158,7 @@ export function createDesktop (options = {}) {
     if (disposed || child !== null || availability === null || !availability.ok) {
       return { ok: false, reason: 'not-running' }
     }
-    const args = buildHelperArgs({ helperPath: helperMain, hostPid, debug })
+    const args = buildHelperArgs({ helperPath: helperMain, hostPid, debug, assetRoots })
     policy.onStart(now())
     let spawned = null
     try {
@@ -334,8 +336,9 @@ export function createDesktop (options = {}) {
     if (event.type === 'ready') {
       ready = true
       workArea = event.workArea
-      // 重启后 helper 是空的：把最后一份场景补给它（服务层在 ready 时也会再 update 一次）。
-      if (lastScene !== null) send({ type: 'update', scene: lastScene })
+      // 重启/重载后 helper 是空的：把最后一份场景补给它（服务层在 ready 时还会对账一次）。
+      // 这里刻意去掉 reset：新渲染端本来就会按 x/y 出生；显示器变化时保留现场位置更自然。
+      if (lastScene !== null) send({ type: 'update', scene: { ...lastScene, reset: false } })
     } else if (event.type === 'shot') {
       if (pendingShot !== null && (event.id === null || event.id === pendingShot.id)) {
         const pending = pendingShot
@@ -410,6 +413,22 @@ export function createDesktop (options = {}) {
       lastScene = shared.normalizeScene(scene)
       if (!ready) return false
       return send({ type: 'update', scene: lastScene })
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 强制整包对账：即使场景内容没变，也让渲染端按 item 的 x/y 重新出生所有宠物。
+   * 用于 helper 重启（新渲染端本来是空的，这只算保险）和宿主主动「把宠物摆回原位」。
+   */
+  function resync (scene) {
+    try {
+      const normalized = shared.normalizeScene(scene)
+      normalized.reset = true
+      lastScene = normalized
+      if (!ready) return false
+      return send({ type: 'update', scene: normalized })
     } catch {
       return false
     }
@@ -514,6 +533,7 @@ export function createDesktop (options = {}) {
       lastError,
       helperErrors,
       lastEvent,
+      assetRoots: assetRoots.slice(),
       stderr: stderrLines.slice(),
       debug: debugLines.slice()
     }
@@ -565,6 +585,7 @@ export function createDesktop (options = {}) {
   return {
     start,
     update,
+    resync,
     show,
     hide,
     shot,
