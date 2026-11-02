@@ -103,10 +103,180 @@
       .lp-pet[data-role='guest'] .lp-pet-name {
         background: rgba(40, 48, 60, 0.58);
       }
+      /* ------------------------------------------------------------------
+       * 桌面控件（ticket 11）：弹层 / 放行卡 / 召回胶囊 / 提示气泡
+       * 全部是鼠标控件；窗口没有键盘输入（focusable:false）。
+       * 只有这些节点 pointer-events:auto，其余 #ui-layer 继续穿透。
+       * ------------------------------------------------------------------ */
+      #ui-layer {
+        position: fixed;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+        z-index: 10;
+      }
+      #ui-layer [hidden] {
+        display: none !important;
+      }
+      .lp-popover,
+      .lp-card,
+      .lp-recall-chip,
+      .lp-notice {
+        position: absolute;
+        left: 0;
+        top: 0;
+        box-sizing: border-box;
+      }
+      .lp-popover {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-width: 128px;
+        max-width: 220px;
+        padding: 8px;
+        border-radius: 12px;
+        background: rgba(15, 21, 29, 0.9);
+        color: #f4f8ff;
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.36), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+        pointer-events: auto;
+      }
+      .lp-popover-title {
+        max-width: 190px;
+        padding: 0 2px;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 1.4;
+        color: rgba(244, 248, 255, 0.72);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .lp-btn {
+        appearance: none;
+        border: 0;
+        border-radius: 8px;
+        padding: 7px 12px;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 1.2;
+        color: #f4f8ff;
+        background: rgba(59, 116, 216, 0.94);
+        cursor: pointer;
+        white-space: nowrap;
+        pointer-events: auto;
+      }
+      .lp-btn:hover {
+        filter: brightness(1.08);
+      }
+      .lp-btn-quiet {
+        background: rgba(255, 255, 255, 0.13);
+      }
+      .lp-btn-danger {
+        background: rgba(176, 74, 86, 0.94);
+      }
+      .lp-btn[data-disabled='true'] {
+        background: rgba(255, 255, 255, 0.1);
+        color: rgba(244, 248, 255, 0.55);
+        cursor: default;
+        filter: none;
+      }
+      .lp-why {
+        max-width: 200px;
+        padding: 0 2px;
+        font-size: 10.5px;
+        line-height: 1.45;
+        color: rgba(244, 248, 255, 0.7);
+      }
+      .lp-card {
+        width: 232px;
+        padding: 10px 10px 9px;
+        border-radius: 14px;
+        background: rgba(15, 21, 29, 0.93);
+        color: #f4f8ff;
+        box-shadow: 0 14px 34px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+        pointer-events: auto;
+      }
+      .lp-card-head {
+        display: flex;
+        align-items: flex-start;
+        gap: 6px;
+      }
+      .lp-card-title {
+        flex: 1;
+        padding-top: 1px;
+        font-size: 12.5px;
+        font-weight: 700;
+        line-height: 1.4;
+      }
+      .lp-card-text {
+        margin: 4px 0 9px;
+        font-size: 11px;
+        line-height: 1.5;
+        color: rgba(244, 248, 255, 0.72);
+      }
+      .lp-card-actions {
+        display: flex;
+        gap: 6px;
+      }
+      .lp-card-actions .lp-btn {
+        flex: 1;
+      }
+      .lp-x {
+        appearance: none;
+        flex: none;
+        width: 18px;
+        height: 18px;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.1);
+        color: rgba(244, 248, 255, 0.72);
+        font: inherit;
+        font-size: 13px;
+        line-height: 18px;
+        text-align: center;
+        cursor: pointer;
+      }
+      .lp-recall-chip {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        padding: 7px 12px;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        border-radius: 999px;
+        background: rgba(15, 21, 29, 0.9);
+        color: #f4f8ff;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        line-height: 1.2;
+        cursor: pointer;
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
+        pointer-events: auto;
+      }
+      .lp-recall-chip .lp-chip-sub {
+        font-size: 10.5px;
+        font-weight: 500;
+        color: rgba(244, 248, 255, 0.66);
+      }
+      .lp-notice {
+        max-width: 246px;
+        padding: 7px 10px;
+        border-radius: 10px;
+        background: rgba(15, 21, 29, 0.92);
+        color: #f4f8ff;
+        font-size: 11.5px;
+        font-weight: 500;
+        line-height: 1.5;
+        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.34), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+        pointer-events: none;
+      }
     </style>
   </head>
   <body>
     <div id="stage"></div>
+    <div id="ui-layer" aria-live="polite"></div>
     <script src="shared.js"></script>
     <script src="renderer.js"></script>
   </body>

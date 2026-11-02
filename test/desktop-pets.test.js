@@ -6,7 +6,7 @@ import test from 'node:test'
 
 import shared from '../desktop/shared.js'
 import { buildHelperArgs } from '../src/desktop-launch.js'
-import { petsFromSnapshot } from '../src/desktop-pets.js'
+import { controlsFromSnapshot, petsFromSnapshot } from '../src/desktop-pets.js'
 import { DSH_PET_ASSET_ENV, resolveDshPetAssetDirs } from '../src/pet-assets.js'
 
 // ---------------------------------------------------------------------------
@@ -300,6 +300,30 @@ test('穿透裁定：busy 租约期间光标在矩形外也保持交互；租约
   )
 })
 
+test('穿透裁定：租约连续持有超过 BUSY_MAX_MS 也必须收回（泄漏租约不能砖掉桌面）', () => {
+  const rects = [{ id: 'p', x: 100, y: 100, width: 50, height: 50 }]
+  const outside = { x: 10, y: 10 }
+  const now = 100000
+  // 心跳很新鲜，但这条租约已经连续续了超过硬上限。
+  const leaked = shared.shouldBeInteractive({
+    rects,
+    point: outside,
+    busy: true,
+    busyAt: now - 50,
+    busySince: now - shared.BUSY_MAX_MS - 1,
+    now
+  })
+  assert.deepEqual(leaked, { interactive: false, reason: 'outside' })
+  // 刚超过上限一点点也收；上限内仍可信。
+  assert.equal(shared.shouldBeInteractive({
+    rects, point: outside, busy: true, busyAt: now, busySince: now - shared.BUSY_MAX_MS + 1, now
+  }).interactive, true)
+  // 调用方显式给一个更短的 busyMaxMs（测试/调试用）。
+  assert.equal(shared.shouldBeInteractive({
+    rects, point: outside, busy: true, busyAt: now, busySince: now - 500, busyMaxMs: 400, now
+  }).interactive, false)
+})
+
 test('命中矩形上报：只接受合法矩形、保留 id、数量封顶', () => {
   const rects = shared.normalizeRects([
     { id: 'self', x: 1, y: 2, width: 3, height: 4 },
@@ -429,6 +453,54 @@ test('petsFromSnapshot：坏快照不抛、重复 deviceId 只画一次、最多
     })
   }
   assert.equal(petsFromSnapshot(snapshotWith({ visitors })).length, shared.MAX_SCENE_ITEMS)
+})
+
+test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客名单、放行卡、notice', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const promptId = '44444444-4444-4444-8444-444444444444'
+  const snapshot = snapshotWith({
+    visitTargets: [{ deviceId: visitorId, nickname: '阿蟹' }],
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, since: 1, lastSeen: 1, endsAt: null }],
+    prompt: { deviceId: promptId, nickname: '泡泡' },
+    notices: [{ text: '「阿蟹」没有回应，等了一会儿，宠物先留在家里了。', at: 5000 }]
+  })
+  const controls = controlsFromSnapshot(snapshot)
+  assert.deepEqual(controls.visit, { enabled: true, reason: null })
+  assert.deepEqual(controls.recall, { enabled: false, nickname: null })
+  assert.deepEqual(controls.visitors, [{ deviceId: visitorId, label: '阿蟹' }])
+  assert.deepEqual(controls.prompt, { deviceId: promptId, nickname: '泡泡' })
+  assert.equal(controls.notice.text, '「阿蟹」没有回应，等了一会儿，宠物先留在家里了。')
+  assert.equal(controls.notice.at, 5000)
+
+  // 没有任何可串门邻居：置灰，但必须有一句可读的理由（不能静默）。
+  const noTargets = controlsFromSnapshot(snapshotWith({ visitTargets: [] }))
+  assert.equal(noTargets.visit.enabled, false)
+  assert.match(noTargets.visit.reason, /还没有人放行你/)
+  assert.match(noTargets.visit.reason, /出不了门/)
+
+  // 出门在外：串门置灰、召回可用；理由里带对方昵称。
+  const away = controlsFromSnapshot(snapshotWith({
+    self: {
+      ...snapshotWith().self,
+      out: { deviceId: visitorId, nickname: '阿蟹', visitId: 'v', phase: 'active', startedAt: 1, endsAt: 2 }
+    }
+  }))
+  assert.equal(away.visit.enabled, false)
+  assert.equal(away.recall.enabled, true)
+  assert.equal(away.recall.nickname, '阿蟹')
+  assert.match(away.visit.reason, /阿蟹/)
+  assert.match(away.visit.reason, /召回/)
+
+  // 坏输入：坏 deviceId 不出现；空快照给空控件。
+  const broken = controlsFromSnapshot(snapshotWith({
+    visitors: [{ deviceId: 'not a uuid', nickname: '坏' }],
+    prompt: { deviceId: 'bad id', nickname: '坏' },
+    notices: [{ text: '', at: 1 }]
+  }))
+  assert.deepEqual(broken.visitors, [])
+  assert.equal(broken.prompt, null)
+  assert.equal(broken.notice, null)
+  assert.deepEqual(controlsFromSnapshot(null), shared.emptyControls())
 })
 
 // ---------------------------------------------------------------------------

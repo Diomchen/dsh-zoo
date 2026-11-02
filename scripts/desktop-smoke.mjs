@@ -359,6 +359,81 @@ function writeNoteScreenshots (verified) {
 }
 
 // ---------------------------------------------------------------------------
+// 控件截图（ticket 11）：弹层按钮 + 放行卡 + 失败气泡
+// ---------------------------------------------------------------------------
+
+function rectCenterScreen (rect, workArea) {
+  return {
+    x: Math.round(workArea.x + rect.x + rect.width / 2),
+    y: Math.round(workArea.y + rect.y + rect.height / 2)
+  }
+}
+
+function overlapsRect (a, b) {
+  return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+}
+
+/** 控件区域必须真的有像素：不是“DOM 里存在”而是画出来了。 */
+function assertControlPixels (verified, rects) {
+  for (const rect of rects) {
+    const [px, py] = [
+      Math.round(rect.x * verified.scaleX),
+      Math.round(rect.y * verified.scaleY)
+    ]
+    const pw = Math.max(1, Math.round(rect.width * verified.scaleX))
+    const ph = Math.max(1, Math.round(rect.height * verified.scaleY))
+    const pixels = countOpaque(verified.image, px, py, px + pw, py + ph, 8)
+    assert(pixels > pw * ph * 0.25,
+      '控件 ' + rect.id + ' 在截图里有可见像素（' + pixels + '/' + (pw * ph) + '）')
+  }
+}
+
+function writeControlNotes (verified, noticeVerified) {
+  if (!WRITE_NOTES) return null
+  mkdirSync(NOTES_DIR, { recursive: true })
+  const composite = compositeOverCheckerboard(verified.image)
+  const fullPath = join(NOTES_DIR, '11-desktop-controls-composited.png')
+  writeFileSync(fullPath, encodePng(downscale(composite, 4)))
+
+  const ui = Array.isArray(verified.sidecar.renderer?.uiRects) ? verified.sidecar.renderer.uiRects : []
+  const self = verified.pets.find((pet) => pet.role === 'self') ?? verified.pets[0]
+  const boxes = [{ x: self.x, y: self.y, width: self.width, height: self.height }, ...ui]
+  const left = Math.max(0, Math.min(...boxes.map((box) => box.x)) - 70)
+  const top = Math.max(0, Math.min(...boxes.map((box) => box.y)) - 90)
+  const right = Math.min(verified.bounds.width, Math.max(...boxes.map((box) => box.x + box.width)) + 70)
+  const bottom = Math.min(verified.bounds.height, Math.max(...boxes.map((box) => box.y + box.height)) + 60)
+  const crop = downscale(cropImage(
+    composite,
+    Math.floor(left * verified.scaleX),
+    Math.floor(top * verified.scaleY),
+    Math.ceil((right - left) * verified.scaleX),
+    Math.ceil((bottom - top) * verified.scaleY)
+  ), 2)
+  const cropPath = join(NOTES_DIR, '11-desktop-controls-crop-composited.png')
+  writeFileSync(cropPath, encodePng(crop))
+
+  let noticePath = null
+  if (noticeVerified !== null && noticeVerified !== undefined) {
+    const noticeComposite = compositeOverCheckerboard(noticeVerified.image)
+    const noticeSelf = noticeVerified.pets.find((pet) => pet.role === 'self') ?? noticeVerified.pets[0]
+    const nLeft = Math.max(0, Math.floor(noticeSelf.x - 160))
+    const nTop = Math.max(0, Math.floor(noticeSelf.y - 220))
+    const nRight = Math.min(noticeVerified.bounds.width, Math.ceil(noticeSelf.x + noticeSelf.width + 380))
+    const nBottom = Math.min(noticeVerified.bounds.height, Math.ceil(noticeSelf.y + noticeSelf.height + 80))
+    const nCrop = downscale(cropImage(
+      noticeComposite,
+      Math.floor(nLeft * noticeVerified.scaleX),
+      Math.floor(nTop * noticeVerified.scaleY),
+      Math.ceil((nRight - nLeft) * noticeVerified.scaleX),
+      Math.ceil((nBottom - nTop) * noticeVerified.scaleY)
+    ), 2)
+    noticePath = join(NOTES_DIR, '11-desktop-controls-notice-composited.png')
+    writeFileSync(noticePath, encodePng(nCrop))
+  }
+  return { fullPath, cropPath, noticePath }
+}
+
+// ---------------------------------------------------------------------------
 // 直接 stdio 客户端
 // ---------------------------------------------------------------------------
 
@@ -504,6 +579,307 @@ async function verifySvgFallback () {
 }
 
 // ---------------------------------------------------------------------------
+// 2) 控件（ticket 11）：hover → 弹层 → 租约 → 按钮申请 → 失败气泡 → 放行卡 → 送客/召回
+// ---------------------------------------------------------------------------
+
+async function verifyControls () {
+  const client = createHelperClient((line) => info(line))
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  const workArea = ready.workArea
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const promptId = '44444444-4444-4444-8444-444444444444'
+  const outside = { x: workArea.x + 8, y: workArea.y + 8 }
+
+  // 冒烟只走合成输入：真实鼠标/焦点事件不能干扰租约用例。
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+
+  const scene = shared.petScene([
+    { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
+    { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] },
+    { id: 'guest:demo', role: 'guest', label: '泡泡', anim: '原地小憩沉眠', color: shared.PET_COLORS[2] }
+  ], workArea, {
+    reset: true,
+    controls: {
+      visit: { enabled: true, reason: null },
+      recall: { enabled: false, nickname: null },
+      visitors: [{ deviceId: visitorId, label: '阿蟹' }],
+      prompt: { deviceId: promptId, nickname: '泡泡' },
+      notice: null
+    }
+  })
+  client.send({ type: 'update', scene })
+  await sleep(1800)
+
+  let state = await client.rendererState()
+  assert(state !== null && state.pets.length === 3, '控件场景里有 3 只宠物')
+  assert(state.controls.prompt !== null && state.controls.prompt.nickname === '泡泡',
+    '场景里的 prompt → 放行卡出现')
+  assert(state.controls.popover === null, '没有悬停时弹层是关着的')
+  let current = await client.status()
+  assert(current.overlayRects >= 3, '放行卡的命中矩形已经单独上报（' + current.overlayRects + ' 块）')
+
+  // 悬停自己的宠物：弹层出现并持有输入租约。
+  let self = state.pets.find((pet) => pet.id === 'self')
+  let center = screenCenter(self, workArea)
+  let start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  const hoverHit = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '悬停自己')
+  assert(hoverHit.itemId === 'self', '悬停命中自己的宠物')
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.popover !== null
+  }, 2500, '悬停后弹层出现')
+  current = await client.waitStatus((status) => status.busy === true, 2000, '弹层持有输入租约')
+  assert(current.ignoring === false, '弹层打开时窗口可交互（setIgnoreMouseEvents(false)）')
+  assert(current.overlayRects >= 6, '弹层+按钮+卡片都有独立命中矩形（' + current.overlayRects + ' 块）')
+
+  state = await client.rendererState()
+  const selfRect = { x: self.x, y: self.y, width: self.width, height: self.height }
+  const popoverRect = state.uiRects.find((rect) => rect.id === 'ui:popover')
+  const promptRect = state.uiRects.find((rect) => rect.id === 'ui:prompt')
+  const visitButton = state.uiRects.find((rect) => rect.id === 'ui:btn:visit')
+  assert(Boolean(popoverRect), '弹层有命中矩形')
+  assert(Boolean(promptRect), '放行卡有命中矩形')
+  assert(Boolean(visitButton), '「串门」按钮有命中矩形')
+  assert(!overlapsRect(popoverRect, selfRect), '弹层不遮挡宠物本体')
+  assert(!overlapsRect(promptRect, selfRect), '放行卡不遮挡宠物本体')
+
+  // 截图：弹层按钮 + 放行卡同框。
+  mkdirSync(OUT_DIR, { recursive: true })
+  const pngPath = join(OUT_DIR, 'controls.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-controls', path: pngPath })
+  const shot = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-controls', 8000, '控件截图')
+  assert(shot.width > 0 && existsSync(pngPath), '控件截图落盘：' + pngPath)
+  const verified = verifyShot(pngPath, pngPath + '.json', 3)
+  assertControlPixels(verified, [popoverRect, promptRect, visitButton])
+  const sidecarUi = verified.sidecar.renderer?.uiRects ?? []
+  assert(sidecarUi.some((rect) => rect.id === 'ui:btn:visit'), '截图 sidecar 记录了按钮矩形')
+
+  // 弹层打开期间把真实光标移到空白处：租约必须继续续期，窗口不能翻回穿透。
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  await sleep(1600)
+  current = await client.status()
+  assert(current.busy === true && current.ignoring === false,
+    '弹层打开期间租约持续续期（光标在空白处 1.6s 后仍可交互）')
+
+  // 点「串门」：渲染端只发申请，helper 把它写进 stdio 给宿主。
+  const visitPoint = rectCenterScreen(visitButton, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: visitPoint.x, y: visitPoint.y })
+  const action = await client.waitFrom(start, (event) => event.type === 'action', 3000, '串门申请')
+  assert(action.action === 'visit', '「串门」按钮点击 → 宿主收到 action=visit')
+  assert(typeof action.id === 'string' && action.id !== '', 'action 带 id，宿主才能对上是哪一次点击')
+  assert(action.deviceId === null, '串门由宿主随机挑邻居，不带 deviceId')
+
+  // 失败必须冒泡：宿主回 ok:false + notice，渲染端在宠物旁边显示几秒。
+  client.send({
+    type: 'action-result',
+    id: action.id,
+    ok: false,
+    notice: '还没有人放行你，宠物出不了门。'
+  })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.notice !== null && /还没有人放行你/.test(snapshot.controls.notice.text)
+  }, 2500, '失败气泡出现')
+  state = await client.rendererState()
+  assert(state.controls.popover === null, '点完动作弹层关闭')
+  assert(state.controls.lease === false, '弹层关闭后渲染端释放租约')
+  await waitUntil(async () => {
+    const status = await client.status()
+    return status.busy === false
+  }, 2500, '弹层关闭后 busy=false')
+
+  // 保留一张失败气泡的截图（和放行卡同框，证明“不静默”）。
+  const noticePng = join(OUT_DIR, 'controls-notice.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-notice', path: noticePng })
+  await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-notice', 8000, '失败气泡截图')
+  const noticeVerified = verifyShot(noticePng, noticePng + '.json', 3)
+
+  // 气泡在几秒后自己消失。
+  await sleep(4600)
+  state = await client.rendererState()
+  assert(state.controls.notice === null, '失败气泡几秒后自动消失（不会永久糊在桌面上）')
+
+  // 把两个光标都移开 → 恢复穿透；这是“控件关闭必须交还桌面”的底线。
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await client.waitStatus((status) => status.ignoring === true, 3000, '关闭控件后恢复穿透')
+  assert((await client.status()).busy === false, '关闭控件后没有残留租约')
+
+  // 放行卡是常驻控件、不持有租约：只把主进程光标放到卡片上，也必须能接管鼠标。
+  // 渲染端此刻完全没消息（光标在空白处），走的是 overlay 矩形 + 300ms 主进程兜底。
+  state = await client.rendererState()
+  const cardRect = state.uiRects.find((rect) => rect.id === 'ui:prompt')
+  assert(Boolean(cardRect), '放行卡仍然可见（还没决定）')
+  const cardPoint = rectCenterScreen(cardRect, workArea)
+  start = client.mark()
+  client.send({ type: 'pointer', x: cardPoint.x, y: cardPoint.y })
+  const cardHit = await client.waitFrom(start,
+    (event) => event.type === 'hit' && event.interactive === true, 3000, '放行卡命中')
+  assert(cardHit.itemId === 'ui:prompt', '放行卡自身的矩形让窗口接管鼠标（itemId=' + cardHit.itemId + '）')
+  assert((await client.status()).ignoring === false, '光标压在放行卡上时可交互（不靠租约）')
+  start = client.mark()
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 3000, '离开放行卡恢复穿透')
+
+  // 再打开弹层，验证泄漏租约的 fail-closed：冻结 busy 续期后主进程必须收回。
+  state = await client.rendererState()
+  self = state.pets.find((pet) => pet.id === 'self')
+  center = screenCenter(self, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.popover !== null
+  }, 2500, '再次打开弹层')
+  await client.waitStatus((status) => status.busy === true, 2000, '再次持有租约')
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  client.send({ type: 'debug-freeze-busy', frozen: true })
+  current = await client.waitStatus((status) => status.ignoring === true, shared.BUSY_LEASE_MS + 2500, '泄漏租约 fail-closed')
+  assert(current.busy === false, '主进程按 BUSY_LEASE_MS 收回泄漏租约（busy=false）')
+  state = await client.rendererState()
+  assert(state.controls.popover !== null, '此时渲染端仍然开着弹层：桌面靠主进程兜底恢复穿透')
+  client.send({ type: 'debug-freeze-busy', frozen: false })
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await client.waitStatus((status) => status.busy === false && status.ignoring === true, 3500, '关掉弹层后回到穿透')
+
+  // 硬上限：渲染端活着、心跳也一直在续，但一条租约连续持有超过 BUSY_MAX_MS 必须收回。
+  // 用调试命令把 30s 缩短到 700ms；收回后 blocked 是粘滞的，悬停不能复活，只认 busy:false。
+  state = await client.rendererState()
+  self = state.pets.find((pet) => pet.id === 'self')
+  center = screenCenter(self, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.popover !== null
+  }, 2500, '硬上限前打开弹层')
+  await client.waitStatus((status) => status.busy === true, 2000, '硬上限前持有租约')
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  client.send({ type: 'debug-busy-max', ms: 700 })
+  current = await client.waitStatus((status) => status.ignoring === true, 4000, '硬上限收回租约')
+  assert(current.busy === false && current.busyBlocked === true,
+    '租约连续持有超过硬上限 → 主进程收回并标记 blocked（busy=false, blocked=true）')
+  state = await client.rendererState()
+  assert(state.controls.popover !== null, '硬上限收回时渲染端仍在续租/弹层仍开着：窗口仍恢复穿透')
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await client.waitStatus((status) => status.busyBlocked === false && status.ignoring === true, 3500,
+    '显式放手清除 blocked')
+  client.send({ type: 'debug-busy-max', ms: 0 })
+
+  // 点击客人 → 弹层（送客）。
+  state = await client.rendererState()
+  const visitor = state.pets.find((pet) => pet.id === 'visitor:' + visitorId)
+  const visitorPoint = screenCenter(visitor, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: visitorPoint.x, y: visitorPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.popover !== null && snapshot.controls.popover.petId === visitor.id
+  }, 2500, '点击客人出现送客弹层')
+  state = await client.rendererState()
+  const sendButton = state.uiRects.find((rect) => rect.id === 'ui:btn:end-visit')
+  assert(Boolean(sendButton), '「送客」按钮有命中矩形')
+  const sendPoint = rectCenterScreen(sendButton, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: sendPoint.x, y: sendPoint.y })
+  const sendAction = await client.waitFrom(start, (event) => event.type === 'action' && event.action === 'end-visit', 3000, '送客申请')
+  assert(sendAction.deviceId === visitorId, '送客申请带上访客的 deviceId')
+  client.send({ type: 'action-result', id: sendAction.id, ok: true })
+
+  // 放行卡：接受 → action=admit，成功后卡片收起。
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.prompt !== null
+  }, 2000, '放行卡仍在')
+  state = await client.rendererState()
+  const admitButton = state.uiRects.find((rect) => rect.id === 'ui:btn:admit')
+  assert(Boolean(admitButton), '「接受」按钮有命中矩形')
+  const admitPoint = rectCenterScreen(admitButton, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: admitPoint.x, y: admitPoint.y })
+  const admitAction = await client.waitFrom(start, (event) => event.type === 'action' && event.action === 'admit', 3000, '接受申请')
+  assert(admitAction.deviceId === promptId, '接受申请带上放行卡的 deviceId')
+  client.send({ type: 'action-result', id: admitAction.id, ok: true })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.prompt === null
+  }, 2500, '接受后放行卡收起')
+
+  // 置灰的「串门」：必须有可读理由；点它只冒泡，不发 action（不静默、也不假装成功）。
+  const disabledScene = {
+    ...scene,
+    reset: false,
+    controls: {
+      ...scene.controls,
+      visit: { enabled: false, reason: '还没有人放行你，宠物出不了门。' }
+    }
+  }
+  client.send({ type: 'update', scene: disabledScene })
+  await sleep(300)
+  state = await client.rendererState()
+  self = state.pets.find((pet) => pet.id === 'self')
+  center = screenCenter(self, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.popover !== null && snapshot.controls.popover.disabled.includes('visit')
+  }, 2500, '置灰的串门按钮')
+  state = await client.rendererState()
+  const disabledButton = state.uiRects.find((rect) => rect.id === 'ui:btn:visit')
+  const actionsBefore = client.events.filter((event) => event.type === 'action').length
+  const disabledPoint = rectCenterScreen(disabledButton, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: disabledPoint.x, y: disabledPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.notice !== null && /还没有人放行你/.test(snapshot.controls.notice.text)
+  }, 2500, '点置灰按钮也有一句理由')
+  assert(client.events.filter((event) => event.type === 'action').length === actionsBefore,
+    '置灰按钮点击不会发 action（宿主不会收到一次假申请）')
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await client.waitStatus((status) => status.busy === false, 3000, '关掉置灰弹层并释放租约')
+
+  // 自己出门：桌面没有 self → 常驻「召回」胶囊（否则召回按钮没有锚点）。
+  const awayScene = shared.petScene([
+    { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
+  ], workArea, {
+    reset: true,
+    controls: {
+      visit: { enabled: false, reason: '宠物在「阿蟹」家，先召回再串门。' },
+      recall: { enabled: true, nickname: '阿蟹' },
+      visitors: [{ deviceId: visitorId, label: '阿蟹' }],
+      prompt: null,
+      notice: null
+    }
+  })
+  client.send({ type: 'update', scene: awayScene })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.recallChip !== null
+  }, 2500, '出门后出现召回胶囊')
+  state = await client.rendererState()
+  const chip = state.uiRects.find((rect) => rect.id === 'ui:recall-chip')
+  assert(Boolean(chip), '召回胶囊有命中矩形（没有 self 时也能点）')
+  const chipPoint = rectCenterScreen(chip, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: chipPoint.x, y: chipPoint.y })
+  const recallAction = await client.waitFrom(start, (event) => event.type === 'action' && event.action === 'recall', 3000, '召回申请')
+  assert(typeof recallAction.id === 'string' && recallAction.id !== '', '召回申请带 id')
+  client.send({ type: 'action-result', id: recallAction.id, ok: true })
+
+  // 收尾：quit 自己退出。
+  const exitPromise = client.exited
+  client.send({ type: 'quit' })
+  const exit = await Promise.race([exitPromise, sleep(4000).then(() => null)])
+  assert(exit !== null, '控件用例结束后 helper 自己退出')
+  assert(exit.code === 0 || exit.code === null, '控件用例退出码正常（' + JSON.stringify(exit) + '）')
+
+  return { pngPath, sidecarPath: pngPath + '.json', verified, noticeVerified }
+}
+
+// ---------------------------------------------------------------------------
 // 2) 交互模式：点击穿透 / 输入租约 / 物理 / 场景对账 / 截图
 // ---------------------------------------------------------------------------
 
@@ -593,12 +969,14 @@ async function verifyHelper () {
   client.send({ type: 'debug-lock-input', locked: true })
   await sleep(150)
   state = await client.rendererState()
-  self = state.pets.find((pet) => pet.id === 'self')
-  center = screenCenter(self, workArea)
+  // 用 guest 做“主进程否决/兜底”：悬停 self 会弹控件并持有租约（ticket 11），
+  // 而这里要验证的恰恰是“没有租约时，位置判定必须听真实光标的”。guest 悬停不弹控件。
+  const hoverGuest = state.pets.find((pet) => pet.id === 'guest:demo-a')
+  center = screenCenter(hoverGuest, workArea)
   start = client.mark()
   client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
   const synthHover = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '合成悬停')
-  assert(synthHover.itemId === 'self', '合成 pointermove 也能命中 self')
+  assert(synthHover.itemId === hoverGuest.id, '合成 pointermove 也能命中 guest（' + synthHover.itemId + '）')
   assert((await client.status()).ignoring === false, '主进程真的调用了 setIgnoreMouseEvents(false)')
 
   // 主进程否决：渲染端还在说 inside，但真实光标在外面
@@ -611,7 +989,7 @@ async function verifyHelper () {
   // 主进程兜底：先让渲染端真的看见光标离开，再只改主进程光标（渲染端完全没消息）
   client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
   await sleep(1300)
-  center = screenCenter(hoveredPet, workArea)
+  center = screenCenter(hoverGuest, workArea)
   start = client.mark()
   client.send({ type: 'pointer', x: center.x, y: center.y })
   const fallback = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '兜底接管')
@@ -990,16 +1368,24 @@ try {
   const standalone = await run('截图模式：三只演示宠物 + 透明背景 + 真实素材', verifyShotMode)
   await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
   await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
+  const controls = await run('控件：悬停弹层 / 租约 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls)
   await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
   const notes = writeNoteScreenshots(standalone.verified)
+  const controlNotes = writeControlNotes(controls.verified, controls.noticeVerified)
   if (notes !== null) {
     console.log('\n截图笔记：')
     console.log('  整窗（棋盘格合成）: ' + notes.fullPath)
     console.log('  宠物特写（棋盘格合成）: ' + notes.cropPath)
   }
+  if (controlNotes !== null) {
+    console.log('  控件整窗（棋盘格合成）: ' + controlNotes.fullPath)
+    console.log('  控件特写（棋盘格合成）: ' + controlNotes.cropPath)
+    console.log('  失败气泡特写（棋盘格合成）: ' + controlNotes.noticePath)
+  }
   console.log('\n全部通过（' + checks + ' 项断言）。')
   console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
+  console.log('控件截图：' + controls.pngPath)
   console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {
   exitCode = 1

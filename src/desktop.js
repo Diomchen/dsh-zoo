@@ -450,6 +450,25 @@ export function createDesktop (options = {}) {
     }
   }
 
+  /**
+   * 回一条控件申请的结果给 helper（ticket 11）。id 必须原样带回，渲染端才能把
+   * “这次点击失败了”对上是哪一次；notice 必须是能直接显示给人看的一句话。
+   */
+  function actionResult (id, result = {}) {
+    try {
+      if (typeof id !== 'string' || id.trim() === '' || id.length > shared.MAX_ID_LENGTH) return false
+      return send({
+        type: 'action-result',
+        id,
+        ok: result !== null && typeof result === 'object' && result.ok === true,
+        notice: typeof result?.notice === 'string' ? result.notice : null,
+        error: typeof result?.error === 'string' ? result.error : null
+      })
+    } catch {
+      return false
+    }
+  }
+
   function shot (filePath) {
     return new Promise((resolve) => {
       try {
@@ -588,6 +607,7 @@ export function createDesktop (options = {}) {
     resync,
     show,
     hide,
+    actionResult,
     shot,
     requestStatus,
     status,

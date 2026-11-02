@@ -78,3 +78,69 @@ export function petsFromSnapshot (snapshot) {
   }
   return pets
 }
+
+/**
+ * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
+ * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
+ *
+ * 文案必须是人话——渲染端只负责显示，不猜 error code；失败/置灰都不允许静默。
+ * 渲染端只会把这些按钮点击翻译成 action 申请，状态变化仍然等下一次快照。
+ *
+ * @param {object} snapshot room.snapshot()
+ * @returns {object} 与 shared.emptyControls() 同形状的归一化控件状态
+ */
+export function controlsFromSnapshot (snapshot) {
+  const controls = shared.emptyControls()
+  if (snapshot === null || typeof snapshot !== 'object') return controls
+
+  const self = snapshot.self !== null && typeof snapshot.self === 'object' ? snapshot.self : null
+  const out = self !== null && self.out !== null && typeof self.out === 'object' ? self.out : null
+  const away = out !== null
+  const awayNickname = away ? shared.normalizeLabel(out.nickname, '邻居') : null
+
+  const targets = Array.isArray(snapshot.visitTargets) ? snapshot.visitTargets : []
+  const canVisit = !away && targets.length > 0
+  controls.visit.enabled = canVisit
+  if (canVisit) {
+    controls.visit.reason = null
+  } else if (away) {
+    controls.visit.reason = `宠物在「${awayNickname}」家，先召回再串门。`
+  } else {
+    controls.visit.reason = '还没有人放行你，宠物出不了门。'
+  }
+  controls.recall.enabled = away
+  controls.recall.nickname = awayNickname
+
+  const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
+  for (const visitor of visitors) {
+    if (controls.visitors.length >= shared.MAX_SCENE_ITEMS) break
+    if (visitor === null || typeof visitor !== 'object') continue
+    const deviceId = deviceIdOf(visitor.deviceId)
+    if (deviceId === null) continue
+    if (controls.visitors.some((candidate) => candidate.deviceId === deviceId)) continue
+    controls.visitors.push({ deviceId, label: shared.normalizeLabel(visitor.nickname, '邻居') })
+  }
+
+  const prompt = snapshot.prompt !== null && typeof snapshot.prompt === 'object' ? snapshot.prompt : null
+  if (prompt !== null) {
+    const deviceId = deviceIdOf(prompt.deviceId)
+    if (deviceId !== null) {
+      controls.prompt = { deviceId, nickname: shared.normalizeLabel(prompt.nickname, '邻居') }
+    }
+  }
+
+  // 异步失败（对方失联、超时、被送客）不会走 action 的返回值，靠最新 notice 冒泡。
+  const notice = Array.isArray(snapshot.notices) && snapshot.notices.length > 0
+    ? snapshot.notices[0]
+    : null
+  if (notice !== null && typeof notice === 'object' &&
+    typeof notice.text === 'string' && notice.text.trim() !== '' &&
+    Number.isFinite(notice.at) && notice.at >= 0) {
+    controls.notice = {
+      text: notice.text.trim().slice(0, shared.MAX_NOTICE_LENGTH),
+      at: notice.at
+    }
+  }
+
+  return controls
+}
