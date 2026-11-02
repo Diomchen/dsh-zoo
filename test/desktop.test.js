@@ -68,26 +68,37 @@ test('encodeMessage/parseLine：只接受对象，超长拒发，坏 JSON 不抛
 // 场景 / 协议归一化
 // ---------------------------------------------------------------------------
 
-test('场景归一化：未知字段、未知 kind、重复 id、坏矩形、坏颜色全部丢弃，数量封顶', () => {
+test('场景 v2 归一化：role/anim/reset 保留，未知字段、未知 kind、重复 id、坏矩形全部丢弃', () => {
   const scene = shared.normalizeScene({
     version: 99,
+    reset: true,
     extra: 'ignored',
     items: [
-      { id: 'a', kind: 'placeholder', x: 10, y: 20, width: 30, height: 40, label: 'A', color: '#ABCDEF', junk: true },
+      {
+        id: 'a', kind: 'pet', role: 'self', anim: '东张西望',
+        x: 10, y: 20, width: 30, height: 40, label: 'A', color: '#ABCDEF', junk: true
+      },
       { id: 'a', kind: 'pet', x: 0, y: 0, width: 10, height: 10 },
-      { id: 'b', kind: 'unknown-kind', x: 0, y: 0, width: 10, height: 10 },
+      { id: 'b', kind: 'placeholder', x: 0, y: 0, width: 10, height: 10 },
       { id: 'c', kind: 'pet', x: 0, y: 0, width: 0, height: 10 },
       { id: 'bad id', kind: 'pet', x: 0, y: 0, width: 10, height: 10 },
       { id: 'd', kind: 'card', x: 1, y: 2, width: 3, height: 4, color: 'red' },
+      { id: 'e', kind: 'pet', role: 'nobody', anim: '../evil', x: 0, y: 0, width: 10, height: 10 },
       null,
       'nope'
     ]
   })
-  assert.equal(scene.version, 1)
-  assert.deepEqual(scene.items.map((item) => item.id), ['a', 'd'])
+  assert.equal(scene.version, 2)
+  assert.equal(scene.reset, true)
+  assert.deepEqual(scene.items.map((item) => item.id), ['a', 'd', 'e'])
   assert.equal(scene.items[0].color, '#abcdef')
   assert.equal(scene.items[0].label, 'A')
+  assert.equal(scene.items[0].role, 'self')
+  assert.equal(scene.items[0].anim, '东张西望')
+  assert.equal(scene.items[1].role, null)
   assert.equal(scene.items[1].color, shared.DEFAULT_COLOR)
+  assert.equal(scene.items[2].role, null, '未知 role 归 null')
+  assert.equal(scene.items[2].anim, null, '夹斜杠的动画名丢弃')
 
   const many = { items: [] }
   for (let index = 0; index < shared.MAX_SCENE_ITEMS + 20; index += 1) {
@@ -108,6 +119,23 @@ test('宿主命令：update/show/hide/quit/ping/shot/pointer 白名单，未知�
   assert.deepEqual(shared.normalizeHostCommand({ type: 'pointer', clear: true }).command.point, null)
   assert.equal(shared.normalizeHostCommand({ type: 'pointer', x: Number.NaN, y: 2 }).ok, false)
   assert.equal(shared.normalizeHostCommand({ type: 'debug-freeze-hover', frozen: true }).command.frozen, true)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-freeze-busy', frozen: true }).command.frozen, true)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-renderer' }).command.type, 'debug-renderer')
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-dispatch', phase: 'down', x: 5, y: 6 }).command.phase,
+    'down'
+  )
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-dispatch', phase: 'blur', x: 5, y: 6 }).command.phase,
+    'blur'
+  )
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-dispatch', phase: 'sideways', x: 5, y: 6 }).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-lock-input', locked: false }).command.locked, false)
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-input', action: 'down', x: 5, y: 6 }).command.action,
+    'down'
+  )
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-input', action: 'nope', x: 5, y: 6 }).ok, false)
 
   const update = shared.normalizeHostCommand({
     type: 'update',
@@ -199,7 +227,7 @@ test('命中数学：右/下边界排他、场景后画的优先、屏幕坐标�
 
 test('穿透裁定：光标不在命中区永远是穿透；渲染端确认要新鲜；没确认时按停留兜底', () => {
   const scene = shared.normalizeScene({
-    items: [{ id: 'p', kind: 'placeholder', x: 100, y: 100, width: 50, height: 50 }]
+    items: [{ id: 'p', kind: 'pet', x: 100, y: 100, width: 50, height: 50 }]
   })
   const inside = { x: 110, y: 110 }
   const outside = { x: 10, y: 10 }
@@ -245,22 +273,6 @@ test('穿透裁定：光标不在命中区永远是穿透；渲染端确认要�
     }).interactive,
     false
   )
-})
-
-test('占位场景：在工作区内、尺寸有界、id/kind 稳定', () => {
-  const scene = shared.placeholderScene({ x: 0, y: 30, width: 2488, height: 1410 })
-  const item = scene.items[0]
-  assert.equal(item.id, 'placeholder')
-  assert.equal(item.kind, 'placeholder')
-  assert.ok(item.width >= 96 && item.width <= 180)
-  assert.ok(item.x >= 0 && item.x + item.width <= 2488)
-  assert.ok(item.y >= 0 && item.y + item.height <= 1410)
-
-  const small = shared.placeholderScene({ x: 0, y: 0, width: 120, height: 80 }).items[0]
-  assert.equal(small.width, 96)
-  assert.equal(small.x, 24)
-  assert.equal(small.y, 24)
-  assert.equal(shared.placeholderScene(null).items.length, 1)
 })
 
 // ---------------------------------------------------------------------------
@@ -453,7 +465,9 @@ test('manager：spawn 参数正确、ready 后补场景、update/shot/status 走
   assert.equal('ELECTRON_RUN_AS_NODE' in spawnCalls[0].options.env, false)
   assert.equal(spawnCalls[0].options.stdio[0], 'pipe')
 
-  const scene = shared.placeholderScene({ x: 0, y: 30, width: 1000, height: 700 })
+  const scene = shared.petScene([
+    { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] }
+  ], { x: 0, y: 30, width: 1000, height: 700 })
   assert.equal(manager.update(scene), false, 'ready 之前只记场景，不写管道')
   children[0].emitLine({
     type: 'ready',
@@ -465,7 +479,8 @@ test('manager：spawn 参数正确、ready 后补场景、update/shot/status 走
   await new Promise((resolve) => setTimeout(resolve, 5))
   const afterReady = children[0].parsedLines()
   assert.equal(afterReady.at(-1).type, 'update')
-  assert.equal(afterReady.at(-1).scene.items[0].id, 'placeholder')
+  assert.equal(afterReady.at(-1).scene.items[0].id, 'self')
+  assert.equal(afterReady.at(-1).scene.reset, false, 'ready 补发场景不重置现场位置')
 
   assert.equal(manager.update(scene), true)
   children[0].emitLine({ type: 'hit', inside: true, interactive: true, point: { x: 1, y: 2 }, rect: scene.items[0] })
@@ -659,13 +674,14 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
   const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
 
-  const calls = { start: 0, dispose: 0, updates: [] }
+  const calls = { start: 0, dispose: 0, updates: [], resync: 0 }
   let captured = null
   const factory = (options) => {
     captured = options
     return {
       start () { calls.start += 1; return { ok: true, pid: 4242 } },
       update (scene) { calls.updates.push(scene); return true },
+      resync (scene) { calls.resync += 1; calls.updates.push(scene); return true },
       dispose () { calls.dispose += 1 }
     }
   }
@@ -675,15 +691,25 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
     petBridge: false,
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
-    desktopFactory: factory
+    desktopFactory: factory,
+    desktopSyncMs: 10000
   })
   t.after(() => service.dispose())
   await service.ready
   assert.equal(calls.start, 1)
   assert.ok(captured)
-  captured.onEvent({ type: 'ready', workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  captured.onEvent({ type: 'ready', pid: 4242, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
   assert.equal(calls.updates.length, 1)
-  assert.equal(calls.updates[0].items[0].id, 'placeholder')
+  assert.equal(calls.resync, 1, '新 helper（pid 第一次出现）走强制整包对账')
+  assert.equal(calls.updates[0].version, 2)
+  assert.equal(calls.updates[0].reset, true)
+  assert.equal(calls.updates[0].items[0].id, 'self')
+  assert.equal(calls.updates[0].items[0].role, 'self')
+  assert.deepEqual(calls.updates[0].items[0].anim, null)
+  // 同一个 helper 的第二次 ready（显示器变化）保留现场位置，不再 reset
+  captured.onEvent({ type: 'ready', pid: 4242, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  assert.equal(calls.resync, 1)
+  assert.equal(calls.updates.at(-1).reset, false)
   assert.deepEqual(warnings, [])
   service.dispose()
   assert.equal(calls.dispose, 1)
@@ -719,3 +745,57 @@ test('service：桌面工厂抛错只降级成一行告警，服务照常 ready'
   assert.ok(warnings.some((line) => /桌面层初始化失败/.test(line)))
   assert.ok(service.snapshot().self.deviceId)
 })
+
+test('service：桌面场景跟着 snapshot 走（客人出现/换动作无需逐帧 update）', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-sync-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const updates = []
+  let captured = null
+  const factory = (options) => {
+    captured = options
+    return {
+      start () { return { ok: true, pid: 9001 } },
+      update (scene) { updates.push(scene); return true },
+      resync (scene) { updates.push(scene); return true },
+      dispose () {}
+    }
+  }
+  const { ctx, warnings } = fakeCtx()
+  const service = createService(ctx, {
+    network: false,
+    petBridge: false,
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: factory,
+    desktopSyncMs: 20
+  })
+  t.after(() => service.dispose())
+  await service.ready
+  captured.onEvent({ type: 'ready', pid: 9001, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  assert.equal(updates.at(-1).items.length, 1)
+  assert.equal(updates.at(-1).items[0].id, 'self')
+
+  const guestId = '66666666-6666-4666-8666-666666666666'
+  service.room.setTrust({ allowed: { [guestId]: { nickname: '阿蟹' } } })
+  service.room.observeHeartbeat({ deviceId: guestId, anim: '螃蟹走路' })
+  await waitFor(() => updates.some((scene) => scene.items.some((item) => item.role === 'guest')), 1500)
+  const withGuest = updates.at(-1)
+  const guest = withGuest.items.find((item) => item.role === 'guest')
+  assert.ok(guest)
+  assert.equal(guest.label, '阿蟹')
+  assert.equal(guest.anim, '螃蟹走路')
+  assert.equal(guest.id, 'guest:' + guestId)
+
+  service.room.observeHeartbeat({ deviceId: guestId, anim: '东张西望' })
+  await waitFor(() => updates.at(-1).items.some((item) => item.role === 'guest' && item.anim === '东张西望'), 1500)
+  assert.deepEqual(warnings, [])
+})
+
+async function waitFor (predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error('等待超时')
+}

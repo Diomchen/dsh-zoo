@@ -9,7 +9,7 @@
  */
 
 import { statSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import { dshHome } from './paths.js'
 
@@ -73,13 +73,28 @@ export function resolveElectronBinary ({ env = process.env, platform = process.p
 /**
  * helper 的 argv。**全部用 --local-pet- 前缀**：Electron/Chromium 会自己消费 --debug 之类的
  * 已知开关（实测 `--debug` 直接让 Electron 以 exit 9 退出），前缀确保它们原样落到 process.argv。
+ *
+ * `assetRoots` 是宿主解析好的 dsh-pet 素材目录（绝对路径，按优先级排列）。helper 的页面是
+ * file://，拿不到 DSH 的 HTTP 路由，所以它要注册 localpet:// 协议，根目录只能从 argv 拿。
  */
-export function buildHelperArgs ({ helperPath, hostPid, debug = false } = {}) {
+export function buildHelperArgs ({ helperPath, hostPid, debug = false, assetRoots = [] } = {}) {
   const args = [String(helperPath)]
   if (Number.isInteger(hostPid) && hostPid > 0) {
     args.push('--local-pet-host-pid', String(hostPid))
   }
   if (debug) args.push('--local-pet-debug')
+  const seen = new Set()
+  if (Array.isArray(assetRoots)) {
+    for (const root of assetRoots) {
+      if (typeof root !== 'string') continue
+      const dir = root.trim()
+      if (dir === '' || dir.includes('\u0000') || !isAbsolute(dir)) continue
+      if (seen.has(dir)) continue
+      seen.add(dir)
+      args.push('--local-pet-assets', dir)
+      if (seen.size >= 8) break
+    }
+  }
   return args
 }
 

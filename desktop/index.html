@@ -2,10 +2,13 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <!-- 这个页面不联网、不加载远程资源：只允许同目录脚本，连 img 都只放行 data:。 -->
+    <!--
+      这个页面不联网、不加载远程资源：只允许同目录脚本、内联样式、data: 图片，
+      以及 helper 自己注册的 localpet:// 素材协议（dsh-pet 的 WebM 文件）。
+    -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src localpet:; connect-src 'none'"
     />
     <title>dsh-local-pet</title>
     <style>
@@ -20,6 +23,7 @@
         user-select: none;
         -webkit-user-select: none;
         font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        cursor: default;
       }
       #stage {
         position: fixed;
@@ -28,55 +32,76 @@
         pointer-events: none;
       }
       /*
-       * 命中区就是道具自己的矩形：窗口默认整窗穿透，只有光标进入矩形时才由主进程接管鼠标。
-       * pointer-events:auto 只在「已经接管鼠标」时才有意义（拖拽/点卡片，ticket 08）。
+       * 一只宠物 = 一个 wrapper。整个 rect（媒体 + 下方昵称条）就是命中矩形：
+       * 窗口默认整窗穿透，只有光标进入某只宠物时才由主进程接管鼠标。
+       * 位置由渲染端每帧写 transform；left/top 永远留在 0。
        */
-      .lp-item {
+      .lp-pet {
         position: absolute;
-        box-sizing: border-box;
+        left: 0;
+        top: 0;
+        pointer-events: auto;
+        cursor: grab;
+        transform: translate3d(0, 0, 0);
+        will-change: transform;
+        -webkit-user-drag: none;
+      }
+      .lp-pet[data-dragging='true'] {
+        cursor: grabbing;
+      }
+      .lp-pet[data-dragging='true'] .lp-pet-media {
+        transform: scale(1.06);
+      }
+      .lp-pet-media {
+        position: relative;
+        width: 100%;
+        aspect-ratio: 1 / 1;
         display: flex;
         align-items: center;
         justify-content: center;
-        padding: 6px;
-        border-radius: 22%;
-        overflow: hidden;
-        pointer-events: auto;
+        transform-origin: 50% 80%;
+        pointer-events: none;
+      }
+      .lp-pet-video,
+      .lp-pet-svg {
+        width: 100%;
+        height: 100%;
+        display: block;
+        object-fit: cover;
+        pointer-events: none;
+        -webkit-user-drag: none;
+        filter: drop-shadow(0 5px 7px rgba(0, 0, 0, 0.28));
+      }
+      .lp-pet-name {
+        position: absolute;
+        left: 50%;
+        bottom: 0;
+        transform: translateX(-50%);
+        max-width: 100%;
+        box-sizing: border-box;
+        padding: 1px 7px;
+        border-radius: 999px;
+        background: rgba(15, 21, 29, 0.56);
         color: #f4f8ff;
         font-size: 11px;
         font-weight: 600;
-        letter-spacing: 0.04em;
+        line-height: 1.5;
+        letter-spacing: 0.02em;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
         text-align: center;
-        text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
-        box-shadow:
-          inset 0 0 0 1px rgba(255, 255, 255, 0.35),
-          0 6px 18px rgba(0, 0, 0, 0.18);
-      }
-      .lp-item[data-kind='card'] {
-        align-items: flex-start;
-        justify-content: flex-start;
-        border-radius: 12px;
-        background: rgba(20, 26, 34, 0.92) !important;
-        color: #eaf1fb;
-        font-weight: 400;
-        text-align: left;
-      }
-      .lp-item[data-kind='placeholder'] {
-        cursor: default;
-      }
-      .lp-item-label {
         pointer-events: none;
-        overflow-wrap: anywhere;
+        text-shadow: 0 1px 1px rgba(0, 0, 0, 0.4);
       }
-      /* 截图/调试标识：占位方块右下角的锚点，肉眼就能看出窗口坐标系的原点方向 */
-      .lp-item[data-kind='placeholder']::after {
-        content: '';
-        position: absolute;
-        right: 8px;
-        bottom: 8px;
-        width: 6px;
-        height: 6px;
-        border-radius: 50%;
-        background: rgba(255, 255, 255, 0.75);
+      .lp-pet[data-role='self'] .lp-pet-name {
+        background: rgba(47, 95, 168, 0.7);
+      }
+      .lp-pet[data-role='visitor'] .lp-pet-name {
+        background: rgba(47, 143, 91, 0.74);
+      }
+      .lp-pet[data-role='guest'] .lp-pet-name {
+        background: rgba(40, 48, 60, 0.58);
       }
     </style>
   </head>
