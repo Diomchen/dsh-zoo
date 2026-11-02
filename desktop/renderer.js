@@ -410,10 +410,12 @@
       nameEl,
       video: null,
       svg: null,
+      badge: null,
       nodeWidth: -1,
       nodeHeight: -1,
       media: {
         clip: null,
+        src: null,
         source: 'pending',
         anim: null,
         failed: new Set(),
@@ -1232,6 +1234,15 @@
     svg.appendChild(leftEye)
     svg.appendChild(rightEye)
     svg.appendChild(mouth)
+    const badge = document.createElementNS('http://www.w3.org/2000/svg', 'text')
+    badge.setAttribute('x', '48')
+    badge.setAttribute('y', '14')
+    badge.setAttribute('text-anchor', 'middle')
+    badge.setAttribute('font-size', '12')
+    badge.setAttribute('fill', 'rgba(18,24,32,0.72)')
+    badge.setAttribute('class', 'lp-pet-badge')
+    svg.appendChild(badge)
+    pet.badge = badge
     pet.svg = svg
     pet.mediaBox.appendChild(svg)
     return svg
@@ -1242,6 +1253,11 @@
     const svg = ensureSvg(pet)
     const body = svg.querySelector('.lp-pet-blob-body')
     if (body !== null) body.setAttribute('fill', pet.item.color)
+    if (pet.badge !== null) {
+      const badge = shared.semanticBadge(pet.item.fallback)
+      pet.badge.textContent = badge
+      pet.badge.style.display = badge === '' ? 'none' : 'block'
+    }
     svg.style.display = 'block'
     if (pet.video !== null) {
       pet.video.style.display = 'none'
@@ -1257,10 +1273,13 @@
   }
 
   function playClip (pet, clip) {
-    const url = assetUrl(clip)
+    playUrl(pet, assetUrl(clip), clip)
+  }
+
+  function playUrl (pet, url, key) {
     if (url === null) {
-      // 非法名字（孤立代理项等）：标记失败，下一帧走降级链，而不是永久停在 SVG。
-      pet.media.failed.add(clip)
+      // 非法名字 / 非法 URL：标记失败，下一帧走降级链，而不是永久停在 SVG。
+      pet.media.failed.add(key)
       pet.media.clip = null
       pet.media.source = 'pending'
       pet.media.nextIdleAt = 0
@@ -1269,10 +1288,10 @@
     const video = ensureVideo(pet)
     if (pet.svg !== null) pet.svg.style.display = 'none'
     video.style.display = 'block'
-    pet.media.clip = clip
+    pet.media.clip = key
     pet.media.source = 'loading'
     pet.media.clipStartedAt = performance.now()
-    video.dataset.clip = clip
+    video.dataset.clip = key
     video.src = url
     video.load()
     const played = video.play()
@@ -1286,6 +1305,14 @@
   function updateMedia (pet, now) {
     const media = pet.media
     const anim = pet.item.anim
+    const src = pet.item.src ?? null
+    if (media.src !== src) {
+      media.src = src
+      media.clip = null
+      media.idleIndex = shared.hashString(pet.id) % shared.IDLE_CLIPS.length
+      media.nextIdleAt = now + IDLE_ROTATE_MS
+      media.gaveUp = false
+    }
     if (media.anim !== anim) {
       media.anim = anim
       media.clip = null
@@ -1301,6 +1328,11 @@
       media.clip = null
       media.source = 'pending'
       media.nextIdleAt = 0
+    }
+    // 远端自带素材优先；失败/没有 src 时再用本机同名素材。
+    if (src !== null && !media.failed.has(src)) {
+      if (media.clip !== src) playUrl(pet, src, src)
+      return
     }
     if (anim !== null && !media.failed.has(anim)) {
       if (media.clip !== anim) playClip(pet, anim)

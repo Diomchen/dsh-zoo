@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
+import { join } from 'node:path'
 
 import shared from '../desktop/shared.js'
 import { createDesktop } from './desktop.js'
@@ -14,6 +15,7 @@ import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import { resolveSkinPort, startSkinServer } from './skin-server.js'
 import { loadSkinSources } from './skin-sources.js'
+import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
   PEER_LOST_MS,
@@ -114,6 +116,10 @@ export function createService (ctx, options = {}) {
   // 对外素材源（ticket 15）：端口与源 id 随 beacon/心跳广告；起不来就是 null。
   let skinServer = null
   let skinRef = null
+  // 访客素材（ticket 17）：deviceId → { action, semantic, src?, fallback, at }。
+  // 拉取是异步的，syncDesktop 只读这一份结果，绝不在同步路径上等网络。
+  let skinFetcher = null
+  const visitorSkins = new Map()
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
@@ -341,6 +347,7 @@ export function createService (ctx, options = {}) {
       if (disposed) return
 
       if (options.network !== false) {
+        skinFetcher = createSkinFetcher({ dir, log })
         // 先起素材源，再起发现：beacon 的第一拍就能带上 skinPort。
         await startSkinSource()
         if (disposed) return
@@ -365,8 +372,10 @@ export function createService (ctx, options = {}) {
             // 以及一次串门完成时写一条有界记录。这里不读本机文件、不回传本机状态。
             if (packet.type === 'heartbeat') {
               room.observeHeartbeat(packet)
+              noteVisitorSkin(packet)
             } else if (packet.type === 'visit-request') {
               handleVisitRequest(packet)
+              noteVisitorSkin(packet)
             } else if (packet.type === 'visit-ack') {
               const result = room.observeVisitAck(packet)
               if (result.ok) clearRequest(packet.visitId)
@@ -478,6 +487,39 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 访客素材（ticket 17）：按对方广告的 skinPort/skinId 异步拉当前动作。
+   * 失败只影响这一只访客的“皮”，它仍然以通用小人出现；不阻塞心跳/串门。
+   * 同一只访客同一个动作 60 秒内不重复拉（失败也有冷却，见 skin-fetch）。
+   */
+  function noteVisitorSkin (packet) {
+    if (skinFetcher === null || discovery === null) return
+    if (packet.skinPort === undefined || packet.skinId === undefined) return
+    const endpoint = discovery.addressOf(packet.deviceId)
+    if (endpoint === null || typeof endpoint.address !== 'string') return
+    const action = packet.action ?? packet.anim ?? null
+    const semantic = packet.semantic ?? 'other'
+    const at = Date.now()
+    const previous = visitorSkins.get(packet.deviceId)
+    if (previous !== undefined && previous.action === action && previous.semantic === semantic &&
+      at - previous.at < 60000) return
+
+    skinFetcher.resolve({
+      address: endpoint.address,
+      port: packet.skinPort,
+      skinId: packet.skinId,
+      action
+    }).then((result) => {
+      if (disposed) return
+      const next = { action, semantic, fallback: semantic, at: Date.now() }
+      if (result !== null) next.src = result.url
+      visitorSkins.set(packet.deviceId, next)
+      syncDesktop()
+    }).catch(() => {
+      // 拉取失败已经由 skin-fetch 冷却；这里不让异常冒到心跳循环
+    })
+  }
+
+  /**
    * 桌面层是**尽力而为**的一层：宿主不是桌面版、不是 macOS、没有 Electron、helper 崩了，
    * 都只让宠物不显示。这里绝不把异常抛回 start()，也不 await 它的启动（窗口就绪是异步的）。
    * 测试用 options.desktopFactory 注入假实现，options.desktop === false 直接跳过。
@@ -513,6 +555,7 @@ export function createService (ctx, options = {}) {
         debug: options.desktopDebug === true,
         maxRestarts: options.desktopMaxRestarts,
         assetRoots,
+        cacheRoot: join(dir, 'skin-cache'),
         onEvent (event) {
           if (disposed || desktop === null) return
           if (event?.type === 'ready') {
@@ -588,7 +631,17 @@ export function createService (ctx, options = {}) {
   function syncDesktop ({ reset = false } = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
     const snapshot = room.snapshot()
-    const pets = petsFromSnapshot(snapshot)
+    const pets = petsFromSnapshot(snapshot).map((pet) => {
+      if (pet.role !== 'visitor') return pet
+      const key = pet.id.startsWith('visitor:') ? pet.id.slice('visitor:'.length) : null
+      const skin = key === null ? undefined : visitorSkins.get(key)
+      if (skin === undefined) return pet
+      return {
+        ...pet,
+        ...(skin.src === undefined ? {} : { src: skin.src }),
+        fallback: skin.fallback
+      }
+    })
     // 访客多到一次场景放不下：让 room 写一条人话提示（只提醒一次），
     // 这次同步就把 notice 带进场景；宠物不会静默消失。
     const dropped = droppedVisitors(snapshot)
@@ -1136,6 +1189,8 @@ export function createService (ctx, options = {}) {
       try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }
       skinServer = null
       skinRef = null
+      skinFetcher = null
+      visitorSkins.clear()
       request = null
       recalls.clear()
       discovery?.dispose()

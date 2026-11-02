@@ -122,7 +122,8 @@ POST /local-pet/self-state
 
 1. 本机某个源有同名动作 → 用本机文件。
 2. 缓存命中（源 + 动作 + hash）→ 用缓存。
-3. 远端拉：manifest（TTL 10 分钟）→ 动作文件 → `<dataDir>/skin-cache/<source>/<sha256>.webm`。
+3. 远端拉：manifest（TTL 10 分钟）→ 动作文件 → `<dataDir>/skin-cache/<sha256>.webm`。
+   扁平内容寻址：同一个 hash 跨来源共享，helper 的 `localpet://cache/<sha256>.webm` 直接对得上。
 4. 都失败 → 场景给 `fallback`，渲染端画通用小人。
 
 限制：单请求 2 秒超时；单文件 ≤8 MB；manifest ≤256 KB；缓存总量 ≤200 MB（LRU）。

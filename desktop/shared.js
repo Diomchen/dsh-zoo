@@ -129,6 +129,18 @@
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
   /** dsh-pet 不上报随机待机动作；没有动作时轮播这几段真实存在的素材。 */
   const IDLE_CLIPS = ['东张西望', '原地漂浮踏步', '原地小憩沉眠']
+  /** 远端素材只接受 helper 的 cache 协议 URL；本机素材仍走 `localpet://asset/<名字>`。 */
+  const CACHE_ASSET_RE = /^localpet:\/\/cache\/[0-9a-f]{64}\.webm$/
+  /** 语义标签是固定小表：不认识的动作靠它画一个通用表情。 */
+  const SEMANTIC_VALUES = ['working', 'eating', 'sleeping', 'idle', 'other']
+  /** 通用小人头顶的短标记；空串表示不画。 */
+  const SEMANTIC_BADGES = Object.freeze({
+    working: '...',
+    eating: 'yum',
+    sleeping: 'z',
+    idle: '',
+    other: '?'
+  })
 
   /**
    * 物理参数。数值不是物理常量，只是「看起来像桌宠」的调参结果：
@@ -203,6 +215,19 @@
     return PET_ROLES.includes(value) ? value : null
   }
 
+  function normalizeSemantic (value) {
+    return typeof value === 'string' && SEMANTIC_VALUES.includes(value) ? value : null
+  }
+
+  /** helper 只认自己的 cache 协议：不是这个形状的 URL 一律丢掉，不让场景变成任意地址。 */
+  function normalizeAssetUrl (value) {
+    return typeof value === 'string' && CACHE_ASSET_RE.test(value) ? value : null
+  }
+
+  function semanticBadge (value) {
+    return Object.prototype.hasOwnProperty.call(SEMANTIC_BADGES, value) ? SEMANTIC_BADGES[value] : ''
+  }
+
   function normalizeColor (value) {
     return typeof value === 'string' && /^#[0-9a-fA-F]{6}$/.test(value) ? value.toLowerCase() : DEFAULT_COLOR
   }
@@ -241,11 +266,16 @@
     const rect = normalizeRect(raw)
     if (rect === null) return null
     const isPet = raw.kind === 'pet'
+    const src = isPet ? normalizeAssetUrl(raw.src) : null
+    const fallback = isPet ? normalizeSemantic(raw.fallback) : null
     return {
       id,
       kind: raw.kind,
       role: isPet ? normalizeRole(raw.role) : null,
       anim: isPet ? normalizeAnim(raw.anim) : null,
+      // 只有真的用得上时才带这两个字段：旧场景形状保持不变，测试/日志不无故多两个 null。
+      ...(src === null ? {} : { src }),
+      ...(fallback === null ? {} : { fallback }),
       x: rect.x,
       y: rect.y,
       width: rect.width,
@@ -1224,6 +1254,9 @@
     normalizeLabel,
     normalizeAnim,
     normalizeRole,
+    normalizeSemantic,
+    normalizeAssetUrl,
+    semanticBadge,
     normalizeRect,
     normalizePoint,
     normalizeRects,

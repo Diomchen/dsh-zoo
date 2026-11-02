@@ -57,6 +57,7 @@ const SHOT_DEFAULT_DELAY_MS = 900
 const SHOT_MEDIA_WAIT_MS = 3000
 const ASSET_SCHEME = 'localpet'
 const ASSET_HOST = 'asset'
+const CACHE_HOST = 'cache'
 const MAX_ASSET_BYTES = 8 * 1024 * 1024
 const MAX_ASSET_NAME = 200
 
@@ -81,6 +82,10 @@ const hostPid = isShotMode ? 0 : (options.hostPid > 0 ? options.hostPid : parseH
 const assetRoots = (Array.isArray(options.assets) ? options.assets : [])
   .filter((dir) => typeof dir === 'string' && dir !== '' && path.isAbsolute(dir))
   .slice(0, 8)
+/** 远端素材缓存目录：只允许绝对路径，helper 只读它，不联网。 */
+const cacheRoot = typeof options.cache === 'string' && options.cache !== '' && path.isAbsolute(options.cache)
+  ? options.cache
+  : null
 if (isShotMode && !path.isAbsolute(options.shot)) {
   process.stderr.write('[local-pet helper] --local-pet-shot 需要绝对路径：' + options.shot + '\n')
   process.exit(3)
@@ -345,7 +350,7 @@ async function handleAssetRequest (request) {
     } catch {
       return textResponse(400, 'bad asset url')
     }
-    if (url.protocol !== ASSET_SCHEME + ':' || url.hostname !== ASSET_HOST) {
+    if (url.protocol !== ASSET_SCHEME + ':' || (url.hostname !== ASSET_HOST && url.hostname !== CACHE_HOST)) {
       return textResponse(404, 'unknown asset')
     }
     let name
@@ -355,7 +360,7 @@ async function handleAssetRequest (request) {
       return textResponse(400, 'bad asset name')
     }
     if (!isSafeAssetName(name)) return textResponse(400, 'bad asset name')
-    const file = resolveAssetFile(name)
+    const file = url.hostname === CACHE_HOST ? resolveCacheFile(name) : resolveAssetFile(name)
     if (file === null) return textResponse(404, 'asset not found')
 
     const data = await fsp.readFile(file)
@@ -419,6 +424,29 @@ function resolveAssetFile (name) {
     } catch {
       // 这个根目录里没有：继续找下一个（用户目录 → 包内目录的降级链）
     }
+  }
+  return null
+}
+
+function isSafeCacheName (name) {
+  return typeof name === 'string' && /^[0-9a-f]{64}\.webm$/.test(name)
+}
+
+function resolveCacheFile (name) {
+  if (cacheRoot === null || !isSafeCacheName(name)) return null
+  let base
+  try {
+    base = path.resolve(cacheRoot)
+  } catch {
+    return null
+  }
+  const candidate = path.resolve(base, name)
+  if (candidate === base || !candidate.startsWith(base + path.sep)) return null
+  try {
+    const stat = fs.statSync(candidate)
+    if (stat.isFile() && stat.size > 0 && stat.size <= MAX_ASSET_BYTES) return candidate
+  } catch {
+    // 缓存还没落盘：渲染端会走本机素材/通用小人
   }
   return null
 }
@@ -1507,7 +1535,8 @@ function parseArgs (argv) {
     shotDelayMs: SHOT_DEFAULT_DELAY_MS,
     hostPid: 0,
     debug: false,
-    assets: []
+    assets: [],
+    cache: null
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -1531,6 +1560,11 @@ function parseArgs (argv) {
       index += 1
     } else if (arg.startsWith('--local-pet-assets=')) {
       parsed.assets.push(arg.slice('--local-pet-assets='.length))
+    } else if (arg === '--local-pet-cache') {
+      if (typeof argv[index + 1] === 'string') parsed.cache = argv[index + 1]
+      index += 1
+    } else if (arg.startsWith('--local-pet-cache=')) {
+      parsed.cache = arg.slice('--local-pet-cache='.length)
     } else if (arg === '--local-pet-debug') {
       parsed.debug = true
     }

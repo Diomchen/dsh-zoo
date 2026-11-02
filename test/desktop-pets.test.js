@@ -649,3 +649,48 @@ test('helper argv：素材目录只接受绝对路径、去重、最多 8 个，
   ])
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', assetRoots: null }), ['/h'])
 })
+
+test('场景 item 保留合法的 cache src 与语义 fallback，非法值丢掉', () => {
+  const hash = 'a'.repeat(64)
+  const scene = shared.normalizeScene({
+    v: 2,
+    items: [
+      {
+        id: 'visitor:x',
+        kind: 'pet',
+        role: 'visitor',
+        label: '柯基',
+        anim: null,
+        src: 'localpet://cache/' + hash + '.webm',
+        fallback: 'sleeping',
+        x: 10, y: 10, width: 100, height: 100
+      },
+      {
+        id: 'visitor:y',
+        kind: 'pet',
+        role: 'visitor',
+        label: '猫',
+        anim: null,
+        src: 'http://evil/x.webm',
+        fallback: 'nope',
+        x: 20, y: 20, width: 100, height: 100
+      }
+    ],
+    reset: false
+  })
+
+  const first = scene.items.find((item) => item.id === 'visitor:x')
+  assert.equal(first.src, 'localpet://cache/' + hash + '.webm')
+  assert.equal(first.fallback, 'sleeping')
+  const second = scene.items.find((item) => item.id === 'visitor:y')
+  assert.equal(second.src, undefined)
+  assert.equal(second.fallback, undefined)
+})
+
+test('helper argv 带 cacheRoot：只接受绝对路径', () => {
+  assert.deepEqual(
+    buildHelperArgs({ helperPath: '/h', cacheRoot: '/tmp/skin-cache' }),
+    ['/h', '--local-pet-cache', '/tmp/skin-cache']
+  )
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', cacheRoot: 'relative' }), ['/h'])
+})
