@@ -3,7 +3,7 @@ import { hostname } from 'node:os'
 
 import shared from '../desktop/shared.js'
 import { createDesktop } from './desktop.js'
-import { controlsFromSnapshot, petsFromSnapshot } from './desktop-pets.js'
+import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
@@ -19,12 +19,14 @@ import {
   encodeVisitAck,
   encodeVisitDeny,
   encodeVisitRecall,
+  encodeVisitRecallAck,
   encodeVisitRequest,
   isDeviceId,
   normalizeNickname,
   resolvePort
 } from './protocol.js'
 import { createRoom } from './room.js'
+import { visitReasonText } from './visit-copy.js'
 import { createVisitStore } from './visits.js'
 
 export const ROUTE_PREFIX = '/local-pet'
@@ -33,6 +35,15 @@ export const NEIGHBOR_TICK_MS = 1000
 export const VISIT_REQUEST_ATTEMPTS = 3
 export const VISIT_REQUEST_RETRY_MS = 600
 export const VISIT_REQUEST_TIMEOUT_MS = 1800
+/**
+ * `visit-recall` 也用同样的重试：UDP 丢一包，对方就会把出门状态挂到 30 分钟上限，
+ * 记录里也变成 30 分钟。首次 + 两次重试、间隔约 500ms；收到对方的
+ * `visit-recall-ack`（或对方已经不可达）就提前收手。重发是幂等的：接收方按
+ * deviceId 清一位访客、只写一条记录，重复 recall 不会重复记账。
+ */
+export const RECALL_ATTEMPTS = 3
+export const RECALL_RETRY_MS = 500
+export const RECALL_TIMEOUT_MS = 1500
 /** 重试/超时计时器的检查粒度；测试可以调更快。 */
 export const VISIT_TIMER_TICK_MS = 200
 /** 桌面场景的巡检节拍：guest 出现/消失、对方动作变化最迟这么久后反映到桌面上。 */
@@ -67,12 +78,7 @@ export function createService (ctx, options = {}) {
   const room = createRoom({
     dir,
     log,
-    // visitMaxMs 是 ticket 09 的名字；visitTtlMs 是 ticket 05 的旧名，保留兼容。
-    visitMaxMs: positiveOption(
-      options.visitMaxMs,
-      positiveOption(options.visitTtlMs, VISIT_MAX_MS, 100),
-      100
-    ),
+    visitMaxMs: positiveOption(options.visitMaxMs, VISIT_MAX_MS, 100),
     // 测试注入：2 分钟失联窗口可以缩短，但生产默认不动。
     peerLostMs: positiveOption(options.peerLostMs, PEER_LOST_MS, 100)
   })
@@ -85,6 +91,9 @@ export function createService (ctx, options = {}) {
   )
   const visitAttempts = integerOption(options.visitAttempts, VISIT_REQUEST_ATTEMPTS, 1, 8)
   const visitTickMs = positiveOption(options.visitTickMs, VISIT_TIMER_TICK_MS, 10)
+  const recallRetryMs = positiveOption(options.recallRetryMs, RECALL_RETRY_MS, 10)
+  const recallAttempts = integerOption(options.recallAttempts, RECALL_ATTEMPTS, 1, 8)
+  const recallTimeoutMs = positiveOption(options.recallTimeoutMs, RECALL_TIMEOUT_MS, recallRetryMs)
   const desktopSyncMs = positiveOption(options.desktopSyncMs, DESKTOP_SYNC_MS, 20)
   const autoVisitIntervalMs = positiveOption(options.autoVisitIntervalMs, AUTO_VISIT_INTERVAL_MS, 10)
 
@@ -105,6 +114,8 @@ export function createService (ctx, options = {}) {
   let autoVisitTimer = null
   // 当前出门请求的重试状态；只活在 service，room 只记“在请求中/已抵达”。
   let request = null
+  // 已发出、等回执的 visit-recall：visitId → { deviceId, attempts, nextAt, deadline }。
+  const recalls = new Map()
   // 活动信号的可观测性：第一次见到某个来源、以及同一条策略结论的日志节流。
   const loggedActivitySources = new Set()
   let lastPolicyLog = { reason: null, at: 0 }
@@ -307,6 +318,8 @@ export function createService (ctx, options = {}) {
           port,
           // 下面几项只为测试注入：回环上跑两个实例，不依赖真实广播域。
           targetPort: options.targetPort,
+          // 广告一个与 bind 不同的端口（回环上用一个会丢包的中继模拟 UDP 丢包）。
+          servicePort: options.servicePort,
           bindAddress: options.bindAddress,
           broadcastAddress: options.broadcastAddress,
           beaconIntervalMs: options.beaconIntervalMs,
@@ -328,7 +341,14 @@ export function createService (ctx, options = {}) {
               if (result.ok) clearRequest(packet.visitId)
             } else if (packet.type === 'visit-recall') {
               const result = room.observeVisitRecall(packet)
-              if (result.ok) clearRequest(packet.visitId)
+              if (result.ok) {
+                clearRequest(packet.visitId)
+                // 回执：对方可能正拿着一条“没发出去”的 recall 在重试。
+                sendVisitRecallAck(packet.deviceId, packet.visitId)
+              }
+            } else if (packet.type === 'visit-recall-ack') {
+              // 对方确认收到了这次召回：不用再重发。
+              clearRecall(packet)
             } else {
               room.observeBeacon(packet)
             }
@@ -493,7 +513,11 @@ export function createService (ctx, options = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
     const snapshot = room.snapshot()
     const pets = petsFromSnapshot(snapshot)
-    const controls = controlsFromSnapshot(snapshot)
+    // 访客多到一次场景放不下：让 room 写一条人话提示（只提醒一次），
+    // 这次同步就把 notice 带进场景；宠物不会静默消失。
+    const dropped = droppedVisitors(snapshot)
+    if (dropped > 0) room.noteSceneOverflow(dropped)
+    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot)
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const signature = JSON.stringify({ pets, controls })
     if (!reset && signature === desktopSceneSignature) return false
@@ -550,7 +574,10 @@ export function createService (ctx, options = {}) {
 
   /** 失败动作的兜底人话：room 通常已经给了 notice，这里只处理协议层的坏请求。 */
   function desktopActionNotice (error) {
-    if (error === 'starting') return '桌面还在准备中，稍等一下再试。'
+    // starting / no-visitor / not-out 这类不需要昵称的原因，和 room 共用同一句文案。
+    if (error === 'starting' || error === 'no-visitor' || error === 'not-out') {
+      return visitReasonText(error)
+    }
     if (error === 'bad-device-id' || error === 'unknown-neighbor') return '这位邻居已经不在桌面上了。'
     if (error === 'disposed') return '桌面正在关闭，这次操作没有完成。'
     if (error === 'not-implemented') return '这个操作暂不支持。'
@@ -768,6 +795,14 @@ export function createService (ctx, options = {}) {
     if (request !== null && request.visitId === visitId) request = null
   }
 
+  /** 收到 recall 回执：只认这次串门的发起方，别人的 ack 不能替它收手。 */
+  function clearRecall (packet) {
+    const recall = recalls.get(packet.visitId)
+    if (recall === undefined || recall.deviceId !== packet.deviceId) return false
+    recalls.delete(packet.visitId)
+    return true
+  }
+
   /**
    * 开始一次出门的唯一入口：手动按钮与自发策略共用同一条路径。
    * 生成 visitId、写 room 状态、发第一包、登记重试计时器；失败时由 room 给一句人话。
@@ -865,6 +900,19 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 回一条 recall 回执。和 recall 一样走 sendTo（必须互相放行、必须有地址）；
+   * 发不出去也没关系：对方会按自己的重试计划收手，不会无限重发。
+   */
+  function sendVisitRecallAck (deviceId, visitId) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendTo(deviceId, encodeVisitRecallAck({ deviceId: identity.deviceId, visitId }))
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * 把 room 里完成但未落盘的串门记录交给 visits.json，并补发待发的 recall。
    * 记录失败只影响历史，不回滚桌面状态；这是 ticket 06 的“记录不能拖垮串门”。
    */
@@ -880,16 +928,52 @@ export function createService (ctx, options = {}) {
         }
       }
     }
-    for (const recall of room.drainVisitRecalls()) {
-      try {
-        sendVisitRecall(recall.deviceId, recall.visitId)
-      } catch {
-        // 对方已经离线：它自己的 TTL 会清理
-      }
-    }
+    for (const recall of room.drainVisitRecalls()) queueRecall(recall)
+    runRecallRetries()
     // 谁在/谁走/动作变了都可能从这里经过：让桌面场景跟上（没变就不发）。
     syncDesktop()
     return records.length
+  }
+
+  /**
+   * 登记一次要发的 recall 并立刻发第一包。对方已经不可达（没地址/不再放行）时
+   * 不排队：重试也不会成功，白占计时器。
+   */
+  function queueRecall ({ deviceId, visitId }) {
+    if (disposed || typeof deviceId !== 'string' || typeof visitId !== 'string') return false
+    if (recalls.has(visitId)) return false
+    if (!sendVisitRecall(deviceId, visitId)) return false
+    const now = Date.now()
+    recalls.set(visitId, {
+      deviceId,
+      attempts: 1,
+      nextAt: now + recallRetryMs,
+      deadline: now + recallTimeoutMs
+    })
+    return true
+  }
+
+  /**
+   * recall 的重试计时器（由 visitTimer 每 200ms 驱动一次）。只补发到次数/时限为止；
+   * 收到 visit-recall-ack、或对方已经不可达时提前删掉。整条路径有界且幂等。
+   */
+  function runRecallRetries () {
+    if (recalls.size === 0) return
+    const now = Date.now()
+    for (const [visitId, recall] of recalls) {
+      if (recall.attempts >= recallAttempts || now >= recall.deadline) {
+        recalls.delete(visitId)
+        continue
+      }
+      if (now < recall.nextAt) continue
+      if (!sendVisitRecall(recall.deviceId, visitId)) {
+        // 对方离线/不再放行：再发也不会到，收手。
+        recalls.delete(visitId)
+        continue
+      }
+      recall.attempts += 1
+      recall.nextAt += recallRetryMs
+    }
   }
 
   // 先挂上 session 活动信号，再启动：DSH 可能在 start() 的 await 期间就有事件。
@@ -932,6 +1016,7 @@ export function createService (ctx, options = {}) {
       }
       stopDesktopSync()
       request = null
+      recalls.clear()
       discovery?.dispose()
       discovery = null
       bridge?.dispose()

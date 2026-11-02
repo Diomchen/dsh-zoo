@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { GUEST_TTL_MS, MAX_NEIGHBORS, NEIGHBOR_TTL_MS } from '../src/protocol.js'
 import { MAX_GUESTS, MAX_PROMPTS, PROMPT_SNOOZE_MS, createRoom } from '../src/room.js'
+import { visitReasonText } from '../src/visit-copy.js'
 
 const T0 = 1_700_000_000_000
 
@@ -596,4 +597,59 @@ test('心跳只影响访客表：不改本地影子、名字、信任或邻居�
   assert.equal(snap.guests[0].nickname, '甲')
   assert.equal(snap.guests[0].anim, '东张西望')
   assert.equal(room.mayTalkTo('neighbor-a'), true)
+})
+
+test('visitBlockedReason 跟 visitTargets 用同一个判定：没人放行 / 都离线 / 有目标', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '我' })
+  // 没有邻居：没人放行我。
+  assert.equal(room.snapshot().visitBlockedReason, 'no-admitted')
+  assert.equal(room.snapshot().visitTargets.length, 0)
+
+  // 放行一位还没心跳过的邻居：我放行了它，但它没证明放行我 → 目标表还是空的。
+  room.observeBeacon({ deviceId: 'neighbor-a', nickname: '甲', port: 40001 }, T0)
+  room.admit('neighbor-a')
+  const snap = room.snapshot()
+  assert.deepEqual(snap.visitTargets, [])
+  assert.equal(snap.visitBlockedReason, 'no-online')
+  // 按钮的理由（A6）和失败 notice 是同一句话。
+  assert.equal(room.noVisitTarget().notice, visitReasonText('no-online'))
+
+  // 对方心跳到达：既可出门，也没有“为什么不能”的理由了。
+  room.observeHeartbeat({ deviceId: 'neighbor-a', anim: null }, T0 + 1000)
+  assert.equal(room.snapshot().visitTargets.length, 1)
+  assert.equal(room.snapshot().visitBlockedReason, null)
+
+  // 没有放行名单（空名单）时回到 no-admitted。
+  const bare = roomAt()
+  bare.setIdentity({ deviceId: 'me-2', nickname: '我' })
+  assert.equal(bare.snapshot().visitBlockedReason, 'no-admitted')
+})
+
+test('场景放不下访客时提醒一次：不静默丢宠物，拥挤解除后可以再提醒', () => {
+  const room = roomAt()
+  assert.equal(room.snapshot().notices.length, 0)
+
+  room.noteSceneOverflow(3, T0)
+  let notices = room.snapshot().notices
+  assert.equal(notices.length, 1)
+  assert.match(notices[0].text, /3 位/)
+  assert.match(notices[0].text, /访客/)
+
+  // 同一次拥挤不重复刷屏。
+  room.noteSceneOverflow(3, T0 + 500)
+  assert.equal(room.snapshot().notices.length, 1)
+
+  // 拥挤解除（dropped=0）之后，下一次拥挤可以再提醒。
+  room.noteSceneOverflow(0, T0 + 1000)
+  room.noteSceneOverflow(2, T0 + 1500)
+  notices = room.snapshot().notices
+  assert.equal(notices.length, 2)
+  assert.match(notices[0].text, /2 位/)
+
+  // 坏输入不写 notice、也不抛。
+  room.noteSceneOverflow('nope', T0 + 2000)
+  room.noteSceneOverflow(-1, T0 + 2000)
+  room.noteSceneOverflow(null, T0 + 2000)
+  assert.doesNotThrow(() => room.noteSceneOverflow(undefined, T0))
 })

@@ -1054,3 +1054,190 @@ test('LOCAL_PET_DESKTOP 为空或其它值时仍然启动桌面层', async (t) =
     service.dispose()
   }
 })
+
+// ---------------------------------------------------------------------------
+// pong 看门狗（A4）
+// ---------------------------------------------------------------------------
+
+function tickingClock (start = 1_000_000) {
+  let value = start
+  const timers = []
+  const intervals = []
+  const make = (fn, ms) => ({ fn, ms, cleared: false, unref () {} })
+  return {
+    now: () => value,
+    advance (ms) { value += ms },
+    timers,
+    intervals,
+    setTimer (fn, ms) {
+      const timer = make(fn, ms)
+      timers.push(timer)
+      return timer
+    },
+    clearTimer (timer) {
+      if (timer) timer.cleared = true
+    },
+    setInterval (fn, ms) {
+      const timer = make(fn, ms)
+      intervals.push(timer)
+      return timer
+    },
+    clearInterval (timer) {
+      if (timer) timer.cleared = true
+    },
+    tickIntervals (ms) {
+      for (const timer of intervals) {
+        if (!timer.cleared && timer.ms === ms) timer.fn()
+      }
+    },
+    runDue (ms) {
+      const due = timers.find((timer) => !timer.cleared && timer.ms === ms)
+      assert.ok(due, '应该有 ' + ms + 'ms 的定时器')
+      due.cleared = true
+      due.fn()
+    }
+  }
+}
+
+test('manager：pong 看门狗——超过 15s 没回 pong 杀掉并按现有退避重启（A4）', (t) => {
+  const clock = tickingClock()
+  const children = []
+  const warns = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4000 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    setInterval: clock.setInterval,
+    clearInterval: clock.clearInterval,
+    pongTimeoutMs: 15000,
+    watchdogTickMs: 1000,
+    log: { info () {}, warn: (line) => warns.push(line) },
+    pingMs: 100000
+  })
+  t.after(() => manager.dispose())
+
+  assert.equal(manager.start().ok, true)
+  // ready 之前 helper 还没开始读 stdin：冷启动再慢也不能算卡死。
+  clock.advance(60000)
+  clock.tickIntervals(1000)
+  assert.deepEqual(children[0].killCalls, [], 'ready 之前不杀')
+
+  children[0].emitLine({ type: 'ready', pid: 4000, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  // 正常的长 GC / 卡顿：12s 内回一包 pong，看门狗不误杀。
+  clock.advance(12000)
+  children[0].emitLine({ type: 'pong', id: 1 })
+  clock.tickIntervals(1000)
+  assert.deepEqual(children[0].killCalls, [], 'pong 新鲜时不杀')
+  assert.equal(manager.status().pongAgeMs, 0)
+  assert.equal(manager.status().pongTimeoutMs, 15000)
+
+  // 从此不再回 pong：超过阈值就杀掉，然后走现有退避（默认 300ms）。
+  clock.advance(16000)
+  clock.tickIntervals(1000)
+  assert.deepEqual(children[0].killCalls, ['SIGKILL'])
+  assert.ok(warns.some((line) => /没有回 pong/.test(line)), '日志要说明为什么杀掉：' + warns.join(' / '))
+  assert.equal(manager.status().running, false)
+  clock.runDue(300)
+  assert.equal(children.length, 2)
+  assert.equal(manager.status().pid, 4001)
+
+  // 新 helper 重新 ready 之后看门狗重新计时：不会拿着旧时间戳接着杀。
+  children[1].emitLine({ type: 'ready', pid: 4001, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  clock.advance(1000)
+  clock.tickIntervals(1000)
+  assert.deepEqual(children[1].killCalls, [])
+  // 只有一次杀掉：看门狗不会在进程退出的间隙里反复 kill。
+  assert.equal(children[0].killCalls.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// 场景上限与溢出提示（A5）
+// ---------------------------------------------------------------------------
+
+test('service：访客超出场景上限时不静默丢宠物，宿主给一条人话提示（A5）', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-overflow-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const updates = []
+  let captured = null
+  const factory = (options) => {
+    captured = options
+    return {
+      start () { return { ok: true, pid: 9200 } },
+      update (scene) { updates.push(scene); return true },
+      resync (scene) { updates.push(scene); return true },
+      dispose () {}
+    }
+  }
+  const { ctx, warnings } = fakeCtx()
+  const service = createService(ctx, {
+    network: false,
+    petBridge: false,
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: factory,
+    desktopSyncMs: 20
+  })
+  t.after(() => service.dispose())
+  await service.ready
+  captured.onEvent({ type: 'ready', pid: 9200, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  await waitFor(() => updates.length > 0, 500)
+
+  // 一次来 30 位访客：超过 64 的旧上限，但在新的场景上限之内。
+  const idAt = (index) => '88888888-8888-4888-8888-' + String(index).padStart(12, '0')
+  const allowed = {}
+  for (let index = 0; index < 30; index += 1) allowed[idAt(index)] = { nickname: '访客' + index }
+  service.room.setTrust({ allowed })
+  const visitId = '99999999-9999-4999-8999-999999999999'
+  for (let index = 0; index < 30; index += 1) {
+    const replied = service.room.observeVisitRequest({
+      deviceId: idAt(index),
+      visitId,
+      nickname: '访客' + index,
+      anim: null
+    })
+    assert.equal(replied.reply, 'ack')
+  }
+  await waitFor(() => (updates.at(-1).items.length === 31), 3000)
+  assert.equal(updates.at(-1).controls.visitors.length, 30, '30 位访客都能被送客')
+  assert.equal(updates.at(-1).controls.notice, null, '没有溢出就不该打扰用户')
+
+  // 再来 30 位（共 60 位）：旧的 64 上限下会被静默丢掉，现在必须画出来。
+  for (let index = 30; index < 60; index += 1) {
+    allowed[idAt(index)] = { nickname: '访客' + index }
+  }
+  service.room.setTrust({ allowed })
+  for (let index = 30; index < 60; index += 1) {
+    service.room.observeVisitRequest({ deviceId: idAt(index), visitId, nickname: '访客' + index, anim: null })
+  }
+  await waitFor(() => updates.at(-1).items.length === 61, 3000)
+
+  // 真的超过场景上限时：画出上限那么多，并给一条能读懂的提示（不是静默丢弃）。
+  const overflow = shared.MAX_SCENE_ITEMS + 5
+  for (let index = 60; index < overflow; index += 1) {
+    allowed[idAt(index)] = { nickname: '访客' + index }
+  }
+  service.room.setTrust({ allowed })
+  for (let index = 60; index < overflow; index += 1) {
+    service.room.observeVisitRequest({ deviceId: idAt(index), visitId, nickname: '访客' + index, anim: null })
+  }
+  await waitFor(() => updates.at(-1).controls.notice !== null, 3000)
+  const scene = updates.at(-1)
+  assert.equal(scene.items.length, shared.MAX_SCENE_ITEMS)
+  const missing = overflow - (shared.MAX_SCENE_ITEMS - 1)
+  assert.match(scene.controls.notice.text, /放不下/)
+  assert.match(scene.controls.notice.text, new RegExp(String(missing) + ' 位'))
+
+  // 同一次拥挤只提醒一次，不会每 500ms 刷一条新 notice。
+  const at = scene.controls.notice.at
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  assert.equal(updates.at(-1).controls.notice.at, at)
+  assert.deepEqual(warnings, [])
+})

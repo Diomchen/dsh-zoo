@@ -29,7 +29,16 @@ env -u ELECTRON_RUN_AS_NODE \
 env -u ELECTRON_RUN_AS_NODE /Users/gensean/.dsh/electron/Electron.app/Contents/MacOS/Electron \
   desktop/main.js --local-pet-host-pid $$ --local-pet-debug \
   --local-pet-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
+
+# 不开 argv、只靠环境变量也能进 debug 模式（宿主 spawn helper 时会继承自己的环境）：
+env -u ELECTRON_RUN_AS_NODE LOCAL_PET_DESKTOP_DEBUG=1 \
+  /Users/gensean/.dsh/electron/Electron.app/Contents/MacOS/Electron \
+  desktop/main.js --local-pet-host-pid $$
 ```
+
+debug 模式 = `--local-pet-debug` **或** 环境变量 `LOCAL_PET_DESKTOP_DEBUG=1`。
+它打开 devTools，并接受下面那组 `debug-*` / `pointer` 命令；两者效果完全一样，
+后者只是方便在宿主 spawn 出来的 helper 上临时开调试，不用改 argv。
 
 **所有 helper 自己的开关都必须带 `--local-pet-` 前缀**：Electron 会消费 `--debug` 之类的已知
 开关（实测 `--debug` 直接以 exit 9 退出），前缀保证它们原样落到 `process.argv`。
@@ -48,13 +57,16 @@ LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/n
 它用 `capturePage()` 抓图并用 zlib 自己解/编码 PNG：断言背景透明、每只宠物的媒体区和昵称条
 有像素、`localpet://` 真的加载了 WebM；再跑点击穿透两条通道、输入租约（含超时）、拖拽/投掷、
 场景增删/reset、素材缺失时的 SVG 降级、崩溃重启、dispose、宿主被 SIGKILL 后 helper 自行退出。
-ticket 11 又加了：悬停 → 弹层、弹层打开期间租约续期、按钮点击真的把 `action` 写给宿主、失败
-`notice` 冒泡、放行卡接受/拒绝、送客、自己出门时的召回胶囊，以及两条 fail-closed 路径：
-租约超时（冻住心跳）和连续持有硬上限（心跳仍在续租，`debug-busy-max` 缩短到 700ms）。
+ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给宿主、失败 `notice` 冒泡、
+放行卡接受/拒绝、送客、自己出门时的召回胶囊，以及点击穿透的几条硬线（A2/A3）：
+弹层打开但光标离开宠物与弹层时整窗必须穿透、宠物与弹层之间的空隙由桥接矩形接管、
+拖拽租约必须在 `ui:drag` 盖住光标时才生效、租约超时（冻住心跳）和连续持有硬上限
+（心跳仍在续租，`debug-busy-max` 缩短到 700ms）。
 
 ## 宿主 → helper 命令
 
-一行一个 JSON 对象，`\n` 结尾，单行上限 64 KiB。未知字段忽略，未知 `type`/坏字段整条丢弃。
+一行一个 JSON 对象，`\n` 结尾，单行上限 256 KiB（一条场景最多 256 个 item，留足余量）。
+未知字段忽略，未知 `type`/坏字段整条丢弃。
 
 | 命令 | 字段 | 说明 |
 | --- | --- | --- |
@@ -67,7 +79,7 @@ ticket 11 又加了：悬停 → 弹层、弹层打开期间租约续期、按�
 | `status` | `id?` | 回 `status` 事件（诊断用） |
 | `quit` | — | 优雅退出 |
 
-只有 `--local-pet-debug` 下才接受：
+只有 debug 模式（`--local-pet-debug` 或 `LOCAL_PET_DESKTOP_DEBUG=1`）下才接受：
 
 | 命令 | 字段 | 说明 |
 | --- | --- | --- |
@@ -154,11 +166,11 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   `x`/`y` 不会让它瞬移。`reset: true` 才会让渲染端按 `x`/`y` 重新出生全部宠物
   （`src/desktop.js` 的 `manager.resync(scene)`）。
 - **尺寸**：`width`/`height` 是整只宠物的命中矩形；渲染端用同一个矩形做物理边界和上报。
-- **谁在画**：宿主目前只下发 `self` / `visitor`（心跳影子不下发，它不是客人）；
+- **谁在画**：宿主目前只下发 `self` / `visitor`（心跳影子不下发，它不是访客）；
   场景协议仍接受 `guest` 给截图/演示用。`kind` 留了 `card` 给 ticket 11。
 - **动作降级**：`anim` 是 dsh-pet 动画名；渲染端先试它，404/解码失败退到内置待机片段轮播，
   全失败才画带昵称的 SVG 色块。
-- `items` 上限 64；重复 `id`、未知 `kind`、非正尺寸、非 `#rrggbb` 颜色都会被丢弃/回落。
+- `items` 上限 256；重复 `id`、未知 `kind`、非正尺寸、非 `#rrggbb` 颜色都会被丢弃/回落。
 - 宿主只在宠物集合/动作/昵称变化时下发（签名比较），**不逐帧**：位置与物理在渲染端。
   500ms 的巡检兜底所有状态变化路径（心跳、tick、dsh-pet 轮询、action）。
 
@@ -171,23 +183,31 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 2. 控件（弹层、放行卡、召回胶囊、按钮）用另一条 `local-pet:overlay-rects` 上报，同样带
    时间戳、同样 900ms 过期。它们不参与物理，但决定了“光标压在按钮上”时窗口是否接管鼠标；
    **宠物矩形排在控件矩形后面**，重叠时宠物优先（`hit.itemId` 不会变成 `ui:*`）。
+   弹层还多报一条 `ui:bridge:popover`：宠物与弹层之间 8px 间隙的并集，光标横穿时不会落空。
 3. 主进程的 `shouldBeInteractive()` **只认**这些矩形（超过 `RENDERER_RECT_MAX_AGE_MS` 就当作
    没有命中区）。场景刚更新、渲染端还没上报时，用出生矩形兜底最多 800ms。
+   渲染端上报的矩形是不可信输入：单边超过 `MAX_HIT_RECT_SIZE`（1024）直接拒绝、越界的
+   裁到工作区里（裁完为空就丢掉）、数量上限 `MAX_HIT_RECTS`（256）。
 4. 光标位置仍由主进程用自己的 `screen.getCursorScreenPoint()` 独立复核；渲染端只能申请，
    不能单方面把窗口变成可交互。
-5. 拖拽和**打开的弹层**都会让渲染端通过 `local-pet:busy` 持有**输入租约**：宠物落后于光标、
-   光标跨过宠物与弹层之间的 8px 间隙时位置判定已经失效，窗口也必须保持可交互，否则
-   `pointermove`/`pointerup` 与按钮点击全断（ticket 07 的坑）。弹层关闭（点按钮/移开/失焦/
-   12s 超时/场景 reset）立刻交还租约。
-6. 租约每 `BUSY_HEARTBEAT_MS`（300ms）续期一次，主进程超过 `BUSY_LEASE_MS`（1200ms）没收到
+5. **只有拖拽**会让渲染端通过 `local-pet:busy` 持有**输入租约**：宠物是弹簧跟随，快速拖动
+   时光标会跑到宠物矩形外，位置判定已经失效，窗口也必须保持可交互，否则
+   `pointermove`/`pointerup` 全断（ticket 07 的坑）。为此拖拽期间额外上报一条以光标为
+   中心、半径 80px 的 `ui:drag` 矩形（并集上宠物本体），约 30Hz 跟着指针走。
+   **租约本身不能把窗口变成可交互**：光标必须真的压在一条活的命中矩形上（`ui:drag` 也算），
+   否则一律 fail closed 回穿透。
+6. 弹层**不持有输入租约**：它靠 `ui:popover` + `ui:bridge:popover` 接管鼠标，光标离开
+   宠物与弹层后窗口立刻穿透（点桌面别处不会被弹层吃掉）。关闭/移开/失焦/12s 超时/场景
+   reset 都会撤掉它的矩形。
+7. 租约每 `BUSY_HEARTBEAT_MS`（300ms）续期一次，主进程超过 `BUSY_LEASE_MS`（1200ms）没收到
    就自动释放；`pointerup`/`pointercancel`/window `blur`/页面隐藏/2.5s 无移动也会主动释放。
    另外还有一条 `BUSY_MAX_MS`（30s）的**连续持有硬上限**：即使渲染端活着且一直续租，
    到点也必须收回；硬上限触发的收回是粘滞的，只认一次显式 `busy:false`（普通超时可由新的
    悬停确认恢复）。
    `forceIgnore()`（隐藏、失焦、显示器变化、宿主失联、退出）会收回租约并要求渲染端重新确认。
    **窗口失焦/渲染端死掉时，最多 1.2s + 一个 100ms 轮询就恢复穿透。**
-7. 放行卡/召回胶囊是常驻控件，**不持有租约**（否则桌面会一直被整窗接管）；它们靠
-   `overlay-rects` 在光标真正压上去时接管鼠标，并用“宠物 + 控件”的桥接矩形盖住间隙。
+8. 放行卡/召回胶囊是常驻控件，**不持有租约**；它们靠 `overlay-rects` 在光标真正压上去时
+   接管鼠标，并用“宠物 + 控件”的桥接矩形盖住间隙。
 
 ## 素材协议 `localpet://`
 
@@ -209,6 +229,10 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - helper 的 stdin 关闭/EPIPE 也直接退出；stdout/stderr 错误都不会弹 Electron 的默认崩溃框。
 - 崩溃重启由宿主 `src/desktop.js` 负责：300ms 起指数退避（300/600/1200/2400/4800），最多 5 次；
   稳定运行 60s 后计数清零。每次崩溃/熔断只打一行日志。
+- 宿主每 5s 发一次 `ping`；helper 30s 没收到任何一行就自行退出。
+- **pong 看门狗**：`ready` 之后超过 15s 没有收到 `pong`（3 个 ping 周期，正常长 GC 不会误杀），
+  宿主按卡死处理：SIGKILL 掉，然后走同一套退避重启。helper 卡在死循环/无响应时，
+  桌面上不会留下一个永远不动的窗口。
 - helper 重启后宿主会重新下发生成场景；`pid` 变了说明是新的渲染端，`reset: true` 让它重新出生。
 
 ## 多显示器 / 分辨率
@@ -228,6 +252,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - `setVisibleOnAllWorkspaces` + `focusable:false` 在「全屏应用/台前调度」下的实际层级没有真机
   验证；置顶层级用 `floating`，不压截图。
 - 宠物之间没有物理碰撞（SPEC v2 out of scope）；同屏数量不设产品上限，但场景协议单条消息
-  最多 64 个 item（渲染上限），且每个宠物一个 `<video>`，客人非常多时解码开销线性增长。
+  最多 256 个 item（渲染上限），超过时宿主会写一条“还有 N 位没有画出来”的提示；
+  每个宠物一个 `<video>`，访客非常多时解码开销线性增长。
 - 截图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）；合成输入走
   `debug-dispatch`/`debug-lock-input`，没有用真实鼠标点过这些按钮。

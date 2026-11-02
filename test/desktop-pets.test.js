@@ -6,8 +6,10 @@ import test from 'node:test'
 
 import shared from '../desktop/shared.js'
 import { buildHelperArgs } from '../src/desktop-launch.js'
-import { controlsFromSnapshot, petsFromSnapshot } from '../src/desktop-pets.js'
+import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from '../src/desktop-pets.js'
 import { DSH_PET_ASSET_ENV, resolveDshPetAssetDirs } from '../src/pet-assets.js'
+import { createRoom } from '../src/room.js'
+import { visitReasonText } from '../src/visit-copy.js'
 
 // ---------------------------------------------------------------------------
 // 场景 v2
@@ -261,33 +263,40 @@ test('物理：随机 100 只 × 600 帧，任何一帧都不出界、不穿地�
 // 输入租约 / 命中矩形
 // ---------------------------------------------------------------------------
 
-test('穿透裁定：busy 租约期间光标在矩形外也保持交互；租约过期立即回穿透', () => {
+test('穿透裁定：busy 租约只在光标压在活矩形上时生效；矩形外/没有矩形一律穿透', () => {
   const rects = [{ id: 'p', x: 100, y: 100, width: 50, height: 50 }]
   const inside = { x: 120, y: 120 }
   const outside = { x: 10, y: 10 }
   const now = 100000
 
+  // 拖拽：宠物落后于光标，但渲染端报的 ui:drag 矩形盖住了光标 → 租约生效。
   assert.deepEqual(
-    shared.shouldBeInteractive({ rects, point: outside, busy: true, busyAt: now - 100, now }),
+    shared.shouldBeInteractive({ rects, point: inside, busy: true, busyAt: now - 100, now }),
     { interactive: true, reason: 'busy-lease' }
   )
+  // A3：租约本身不能把整窗变成可交互；光标不在任何活矩形里 = fail closed。
+  assert.deepEqual(
+    shared.shouldBeInteractive({ rects, point: outside, busy: true, busyAt: now - 100, now }),
+    { interactive: false, reason: 'outside' },
+    '光标在命中矩形外时，租约也不能让窗口吃掉点击'
+  )
+  assert.deepEqual(
+    shared.shouldBeInteractive({ rects: [], point: outside, busy: true, busyAt: now, now }),
+    { interactive: false, reason: 'no-scene' },
+    '没有任何活矩形时，租约也不能让窗口吃掉点击'
+  )
   assert.equal(
-    shared.shouldBeInteractive({ rects, point: outside, busy: true, busyAt: now - shared.BUSY_LEASE_MS - 1, now }).interactive,
+    shared.shouldBeInteractive({ rects, point: inside, busy: true, busyAt: now - shared.BUSY_LEASE_MS - 1, now }).interactive,
     false,
     '租约超过 BUSY_LEASE_MS 没续期 → 穿透'
   )
   assert.equal(
-    shared.shouldBeInteractive({ rects, point: outside, busy: true, busyAt: 0, now }).interactive,
+    shared.shouldBeInteractive({ rects, point: inside, busy: true, busyAt: 0, now }).interactive,
     false,
     '没有时间戳的 busy 不可信'
   )
   assert.equal(
-    shared.shouldBeInteractive({ rects: [], point: outside, busy: true, busyAt: now, now }).interactive,
-    true,
-    '拖拽租约不依赖命中矩形（宠物被拖到窗口外仍要收 pointerup）'
-  )
-  assert.equal(
-    shared.shouldBeInteractive({ rects, point: outside, busy: false, busyAt: now, now }).interactive,
+    shared.shouldBeInteractive({ rects, point: inside, busy: false, busyAt: now, now }).interactive,
     false
   )
   assert.deepEqual(
@@ -302,25 +311,25 @@ test('穿透裁定：busy 租约期间光标在矩形外也保持交互；租约
 
 test('穿透裁定：租约连续持有超过 BUSY_MAX_MS 也必须收回（泄漏租约不能砖掉桌面）', () => {
   const rects = [{ id: 'p', x: 100, y: 100, width: 50, height: 50 }]
-  const outside = { x: 10, y: 10 }
+  const inside = { x: 120, y: 120 }
   const now = 100000
-  // 心跳很新鲜，但这条租约已经连续续了超过硬上限。
+  // 心跳很新鲜、光标也在矩形里，但这条租约已经连续续了超过硬上限。
   const leaked = shared.shouldBeInteractive({
     rects,
-    point: outside,
+    point: inside,
     busy: true,
     busyAt: now - 50,
     busySince: now - shared.BUSY_MAX_MS - 1,
     now
   })
-  assert.deepEqual(leaked, { interactive: false, reason: 'outside' })
+  assert.deepEqual(leaked, { interactive: false, reason: 'waiting-for-confirmation' })
   // 刚超过上限一点点也收；上限内仍可信。
   assert.equal(shared.shouldBeInteractive({
-    rects, point: outside, busy: true, busyAt: now, busySince: now - shared.BUSY_MAX_MS + 1, now
+    rects, point: inside, busy: true, busyAt: now, busySince: now - shared.BUSY_MAX_MS + 1, now
   }).interactive, true)
   // 调用方显式给一个更短的 busyMaxMs（测试/调试用）。
   assert.equal(shared.shouldBeInteractive({
-    rects, point: outside, busy: true, busyAt: now, busySince: now - 500, busyMaxMs: 400, now
+    rects, point: inside, busy: true, busyAt: now, busySince: now - 500, busyMaxMs: 400, now
   }).interactive, false)
 })
 
@@ -344,6 +353,58 @@ test('命中矩形上报：只接受合法矩形、保留 id、数量封顶', ()
     many.push({ id: 'i' + index, x: 0, y: 0, width: 10, height: 10 })
   }
   assert.equal(shared.normalizeRects(many).length, shared.MAX_SCENE_ITEMS)
+})
+
+test('命中矩形防守（A3）：超大矩形拒绝、越界裁到工作区、数量封顶', () => {
+  const area = { x: 0, y: 0, width: 500, height: 400 }
+  const rects = shared.normalizeRects([
+    { id: 'screen-size', x: 0, y: 0, width: 10000, height: 10000 },
+    { id: 'too-wide', x: 0, y: 0, width: 2000, height: 10 },
+    { id: 'off-screen', x: 900, y: 900, width: 50, height: 50 },
+    { id: 'edge', x: 480, y: 380, width: 50, height: 50 },
+    { id: 'ok', x: 10, y: 10, width: 20, height: 20 }
+  ], { area })
+  assert.deepEqual(rects.map((rect) => rect.id), ['edge', 'ok'])
+  assert.deepEqual(rects[0], { id: 'edge', x: 480, y: 380, width: 20, height: 20 })
+  assert.deepEqual(rects[1], { id: 'ok', x: 10, y: 10, width: 20, height: 20 })
+
+  // 单边刚好超过上限就拒绝；刚好多一点也会被裁掉/接受，但绝不会扩大命中区。
+  const limit = shared.MAX_HIT_RECT_SIZE
+  assert.equal(shared.normalizeRects([{ x: 0, y: 0, width: limit + 1, height: 10 }], { area }).length, 0)
+  assert.equal(shared.normalizeRects([{ x: 0, y: 0, width: limit, height: 10 }], { area }).length, 1)
+  // 只裁不扩：裁剪后的矩形一定在原矩形 && 工作区里。
+  const clipped = shared.normalizeRects([{ id: 'p', x: -20, y: -20, width: 100, height: 100 }], { area })[0]
+  assert.deepEqual(clipped, { id: 'p', x: 0, y: 0, width: 80, height: 80 })
+
+  // 数量封顶：不会因为渲染端塞一堆矩形把判定拖垮。
+  const many = []
+  for (let index = 0; index < shared.MAX_HIT_RECTS + 10; index += 1) {
+    many.push({ id: 'r' + index, x: 1, y: 1, width: 5, height: 5 })
+  }
+  assert.equal(shared.normalizeRects(many, { area }).length, shared.MAX_HIT_RECTS)
+})
+
+test('穿透裁定（A2）：弹层只靠 overlay 矩形接管鼠标，不需要输入租约', () => {
+  const pet = { id: 'self', x: 100, y: 400, width: 160, height: 200 }
+  const popover = { id: 'ui:popover', x: 100, y: 300, width: 160, height: 92 }
+  // 渲染端上报顺序：桥接矩形在前、弹层其次、宠物最后（倒序扫描 → 宠物优先）。
+  const bridge = { id: 'ui:bridge:popover', ...shared.unionRect([popover, pet]) }
+  const rects = [bridge, popover, pet]
+  const now = 5000
+
+  // 光标从宠物跨过 8px 间隙走到弹层：桥接矩形必须盖住这条缝。
+  for (const point of [{ x: 180, y: 396 }, { x: 180, y: 350 }, { x: 180, y: 320 }]) {
+    assert.deepEqual(
+      shared.shouldBeInteractive({ rects, point, lastHoverAt: now - 100, now }),
+      { interactive: true, reason: 'hovering' },
+      '弹层/间隙/宠物之间移动时窗口保持可交互（busy=false，不靠租约）'
+    )
+  }
+  // 光标离开宠物与弹层：窗口必须立刻回到穿透，不能把整块桌面吃掉。
+  assert.deepEqual(
+    shared.shouldBeInteractive({ rects, point: { x: 900, y: 100 }, lastHoverAt: now - 100, now }),
+    { interactive: false, reason: 'outside' }
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -444,15 +505,20 @@ test('petsFromSnapshot：坏快照不抛、重复 deviceId 只画一次、最多
   assert.equal(duplicated.length, 2)
 
   const visitors = []
-  for (let index = 0; index < 80; index += 1) {
+  for (let index = 0; index < shared.MAX_SCENE_ITEMS + 5; index += 1) {
     const suffix = String(index).padStart(12, '0')
     visitors.push({
       deviceId: '55555555-5555-4555-8555-' + suffix,
-      nickname: '客人' + index,
+      nickname: '访客' + index,
       anim: null
     })
   }
-  assert.equal(petsFromSnapshot(snapshotWith({ visitors })).length, shared.MAX_SCENE_ITEMS)
+  const roomy = snapshotWith({ visitors })
+  assert.equal(petsFromSnapshot(roomy).length, shared.MAX_SCENE_ITEMS)
+  // 场景放不下的访客数要能被宿主看见（A5：不能静默丢宠物）。
+  assert.equal(droppedVisitors(roomy), shared.MAX_SCENE_ITEMS + 5 - (shared.MAX_SCENE_ITEMS - 1))
+  assert.equal(droppedVisitors(snapshotWith()), 0)
+  assert.equal(droppedVisitors(null), 0)
 })
 
 test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客名单、放行卡、notice', () => {
@@ -475,8 +541,36 @@ test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客�
   // 没有任何可串门邻居：置灰，但必须有一句可读的理由（不能静默）。
   const noTargets = controlsFromSnapshot(snapshotWith({ visitTargets: [] }))
   assert.equal(noTargets.visit.enabled, false)
+  assert.equal(noTargets.visit.reason, visitReasonText('no-admitted'))
   assert.match(noTargets.visit.reason, /还没有人放行你/)
   assert.match(noTargets.visit.reason, /出不了门/)
+
+  // A6：有人放行、只是都不在线时，按钮不能再说“还没有人放行你”。
+  // 原因由 room 判定（快照字段 visitBlockedReason），文案和 notice 共用一份。
+  const noOnline = controlsFromSnapshot(snapshotWith({
+    visitTargets: [],
+    visitBlockedReason: 'no-online'
+  }))
+  assert.equal(noOnline.visit.enabled, false)
+  assert.equal(noOnline.visit.reason, visitReasonText('no-online'))
+  assert.match(noOnline.visit.reason, /不在线/)
+  assert.doesNotMatch(noOnline.visit.reason, /还没有人放行你/)
+
+  // 按钮的理由和 room 真正写下的 notice 是同一句话（同一个 reason）。
+  const T0 = 1_700_000_000_000
+  for (const reason of ['no-admitted', 'no-online']) {
+    const room = createRoom({ clock: () => T0 })
+    room.setIdentity({ deviceId: '11111111-1111-4111-8111-111111111111', nickname: '我' })
+    if (reason === 'no-online') {
+      // 放行一位从没在线过的邻居：放行名单非空，但没有可去的目标。
+      const offline = '22222222-2222-4222-8222-222222222222'
+      room.observeBeacon({ deviceId: offline, nickname: '掉线', port: 40001 }, T0)
+      room.admit(offline)
+    }
+    const snapshot = room.snapshot()
+    assert.equal(snapshot.visitBlockedReason, reason)
+    assert.equal(controlsFromSnapshot(snapshot).visit.reason, room.noVisitTarget().notice)
+  }
 
   // 出门在外：串门置灰、召回可用；理由里带对方昵称。
   const away = controlsFromSnapshot(snapshotWith({
@@ -488,6 +582,7 @@ test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客�
   assert.equal(away.visit.enabled, false)
   assert.equal(away.recall.enabled, true)
   assert.equal(away.recall.nickname, '阿蟹')
+  assert.equal(away.visit.reason, visitReasonText('already-out', '阿蟹'))
   assert.match(away.visit.reason, /阿蟹/)
   assert.match(away.visit.reason, /召回/)
 

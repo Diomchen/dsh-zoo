@@ -17,6 +17,7 @@ import {
   VISIT_RECORD_LIMIT,
   normalizeVisitRecord
 } from './visit-record.js'
+import { visitReasonText } from './visit-copy.js'
 import {
   eligibleVisitTargets,
   isVisitPolicyReason,
@@ -46,7 +47,7 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *     neighbors: [ { deviceId, nickname, status: 'pending'|'allowed'|'denied', lastSeen, port,
  *                    heartbeatAt } ],
  *                // heartbeatAt > 0 = 收到过对方心跳 = 对方也放行了我（心跳只发给放行名单）
- *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子
+ *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子，v2 不渲染
  *     visitors:  [ { deviceId, nickname, anim, visitId, since, lastSeen, endsAt: null } ],
  *                 // 入站串门访客：没有时间上限，只靠心跳存活与「送客」结束
  *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs } ],
@@ -59,7 +60,9 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *       lastActivityAt, lastDepartureAt,
  *       lastDecision: { at, reason, gate, candidate, activitySource, ... } | null
  *     },
- *     visitTargets: [ { deviceId, nickname } ]    // 手动「串门」可用的邻居（在线且互相放行）
+ *     visitTargets: [ { deviceId, nickname } ],   // 手动「串门」可用的邻居（在线且互相放行）
+ *     visitBlockedReason: 'no-admitted'|'no-online'|null
+ *                                                // 没有目标时的原因；按钮与 notice 共用
  *   }
  *
  * 已知限制（ticket 01）：`dsh-pet` 不上报随机待机动画，所以 `self.pet.anim`
@@ -84,7 +87,7 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *   是四种结束方式；每种都只写一条记录，durationMs 是真实停留时长。
  * - 总开关、活动窗口与冷却只影响**自发**出门；手动「串门」永远可用。
  *
- * ticket 10（客人常驻）的边界：
+ * ticket 10（访客常驻）的边界：
  * - 入站访客没有 TTL，也不设同屏上限；只有主人「送客」或对方失联（2 分钟无心跳）
  *   才会离开。每次离开都写一条 in 记录。
  * - 接收方自己检测失联，不假设对方会发 recall；发送方也自己检测，不假设对方守约。
@@ -120,11 +123,9 @@ export function createRoom ({
   log,
   clock = () => Date.now(),
   visitMaxMs,
-  // 兼容 ticket 05 的旧参数名：它是同一条“出门上限”，不是入站 TTL。
-  visitTtlMs,
   peerLostMs = PEER_LOST_MS
 } = {}) {
-  const maxVisitMs = positiveMs(visitMaxMs, positiveMs(visitTtlMs, VISIT_MAX_MS))
+  const maxVisitMs = positiveMs(visitMaxMs, VISIT_MAX_MS)
   const lostMs = positiveMs(peerLostMs, PEER_LOST_MS)
   const state = {
     self: { deviceId: null, nickname: '我', pet: null, bridge: { ...IDLE_BRIDGE } },
@@ -144,7 +145,9 @@ export function createRoom ({
     autoVisits: false,
     lastDepartureAt: null,
     activity: { session: null, pointer: null },
-    lastPolicyDecision: null
+    lastPolicyDecision: null,
+    // 「一次场景画不下所有访客」的提示只提醒一次；拥挤解除后才能再提醒。
+    overflowNotified: false
   }
 
   function nowMs () {
@@ -169,6 +172,17 @@ export function createRoom ({
 
   function currentVisitTargets () {
     return eligibleVisitTargets([...state.neighbors.values()], { now: nowMs() })
+  }
+
+  /**
+   * 没有可串门目标时的原因：放行名单是空的 → no-admitted；
+   * 有人被我放行、但此刻都不在线/没证明放行我 → no-online。
+   * 快照字段与失败提示共用这一个判定。
+   */
+  function visitBlockedReason () {
+    if (currentVisitTargets().length > 0) return null
+    const admitted = [...state.trust.allowed.keys()].some((deviceId) => canTalkTo(deviceId))
+    return admitted ? 'no-online' : 'no-admitted'
   }
 
   function copyCandidate (candidate) {
@@ -333,50 +347,8 @@ export function createRoom ({
     return notice
   }
 
-  /**
-   * 失败提示的唯一文案表：五种失败必须各自可读、彼此不同。
-   * 这里不出现 error code、堆栈或 socket 细节；用户只看到一句能理解的话。
-   */
-  function failureText (reason, nickname) {
-    const name = normalizeNickname(nickname) ?? FALLBACK_NICKNAME
-    if (reason === 'not-admitted') {
-      return `还没放行「${name}」，先接受它的放行卡片，宠物才能过去。`
-    }
-    if (reason === 'peer-offline') {
-      return `「${name}」好像不在线，宠物这次没出门。`
-    }
-    if (reason === 'timeout') {
-      return `「${name}」没有回应，等了一会儿，宠物先留在家里了。`
-    }
-    if (reason === 'denied') {
-      return `「${name}」没有放行你，宠物没能进门。`
-    }
-    if (reason === 'visits-off') {
-      return `「${name}」关掉了串门，宠物这次没能进去。`
-    }
-    if (reason === 'already-out') {
-      return `宠物已经在「${name}」家了，先召回来再说。`
-    }
-    if (reason === 'no-admitted') {
-      return '还没有人放行你，宠物出不了门。'
-    }
-    if (reason === 'no-online') {
-      return '还没有邻居放行你，或者他们现在都不在线，宠物这次没出门。'
-    }
-    if (reason === 'no-visitor') {
-      return '这位客人已经不在桌面上了。'
-    }
-    if (reason === 'not-out') {
-      return '宠物现在在家，不用召回。'
-    }
-    if (reason === 'starting') {
-      return '桌面还在准备中，稍等一下再试。'
-    }
-    return '这次串门没成功，宠物还在家里。'
-  }
-
   function failWithNotice (reason, nickname, at) {
-    const notice = pushNotice(failureText(reason, nickname), at)
+    const notice = pushNotice(visitReasonText(reason, nickname), at)
     return {
       ok: false,
       error: reason,
@@ -440,7 +412,7 @@ export function createRoom ({
     const code = reason === 'peer-offline' || reason === 'timeout' || reason === 'denied' || reason === 'visits-off'
       ? reason
       : 'peer-offline'
-    const notice = pushNotice(failureText(code, out.nickname), now)
+    const notice = pushNotice(visitReasonText(code, out.nickname), now)
     return {
       ok: true,
       error: code,
@@ -508,7 +480,7 @@ export function createRoom ({
           nickname: guest.nickname,
           anim: guest.anim,
           since: guest.since,
-          // 心跳影子的到期时刻：客户端据此在最后 ~2.5 秒淡出；Host 仍然按 TTL 移除。
+          // 心跳影子的到期时刻（最后一次心跳 + 30 秒）。v2 不画 guests，只在 TTL 到点时移除。
           expiresAt: guest.lastSeen + GUEST_TTL_MS
         })),
         visitors: [...state.visitors.values()].map(copyVisitor),
@@ -523,7 +495,10 @@ export function createRoom ({
           lastDepartureAt: state.lastDepartureAt,
           lastDecision: copyDecision(state.lastPolicyDecision)
         },
-        visitTargets: currentVisitTargets()
+        visitTargets: currentVisitTargets(),
+        // 「串门」为什么没有目标：no-admitted / no-online / null（有目标）。
+        // 和 noVisitTarget() 的 notice 用同一个判定，按钮的置灰理由因此不会和气泡打架。
+        visitBlockedReason: visitBlockedReason()
       }
     },
 
@@ -643,8 +618,26 @@ export function createRoom ({
 
     /** 手动「串门」但没有目标：区分“没人放行”与“放行了但都不在线”。 */
     noVisitTarget (at = clock()) {
-      const admitted = [...state.trust.allowed.keys()].some((deviceId) => canTalkTo(deviceId))
-      return failWithNotice(admitted ? 'no-online' : 'no-admitted', null, at)
+      const reason = visitBlockedReason()
+      return failWithNotice(reason ?? 'no-admitted', null, at)
+    },
+
+    /**
+     * 宿主发现一次场景放不下所有访客时调用（ticket 10 的“不设同屏上限”遇到渲染端的
+     * 单包上限）。写一条人话提示，让人知道桌面上少画了几位，而不是以为它们凭空消失。
+     *
+     * 同一次拥挤只提醒一次；`dropped` 回到 0 表示拥挤解除，下一次再提醒。
+     * 返回这次是否真的写了一条 notice。
+     */
+    noteSceneOverflow (dropped, at = clock()) {
+      const count = Number(dropped)
+      if (!Number.isInteger(count) || count <= 0) {
+        state.overflowNotified = false
+        return null
+      }
+      if (state.overflowNotified) return null
+      state.overflowNotified = true
+      return pushNotice(`桌面上放不下这么多访客，还有 ${count} 位没有画出来。`, at)
     },
 
     /**
@@ -1132,7 +1125,7 @@ export function createRoom ({
         if (now - visitor.lastSeen >= lostMs) {
           state.visitors.delete(deviceId)
           recordVisit('in', visitor.nickname, visitor.since, now)
-          pushNotice(`「${visitor.nickname}」失联了，客人已经离开。`, now)
+          pushNotice(`「${visitor.nickname}」失联了，访客已经离开。`, now)
         }
       }
 
@@ -1173,6 +1166,7 @@ export function createRoom ({
       state.activity.session = null
       state.activity.pointer = null
       state.lastPolicyDecision = null
+      state.overflowNotified = false
       state.self.pet = null
       state.self.bridge = { ...IDLE_BRIDGE }
     }

@@ -25,8 +25,9 @@
  * 安全约定（这一层是点击穿透的「否决权」所在，见 ADR-0005）：
  *   `shouldBeInteractive()` 只在以下两种情况下返回 true：
  *     a) 渲染端拿着输入租约（`busy`，最近 `BUSY_LEASE_MS` 内有心跳，且没有超过 `BUSY_MAX_MS`
- *        的连续持有上限）——拖拽时宠物会落后于光标、弹层与宠物之间有间隙，位置判定必须让位，
- *        否则窗口翻回穿透，pointermove/pointerup/按钮点击全断；
+ *        的连续持有上限）**并且**光标确实压在一条活的命中矩形上——拖拽时宠物会落后于光标，
+ *        所以渲染端会上报一条跟随光标的 `ui:drag` 矩形；租约本身不能单独把整窗变成可交互
+ *        （渲染端报一个超大矩形也不行，`normalizeRects` 会拒绝）；
  *     b) 主进程按真实光标位置算出在渲染端上报的命中矩形内，并且渲染端最近 `maxAgeMs` 内确认过
  *        inside（心跳，不是一次性事件）；渲染端完全没消息时按停留时长兜底。
  *   租约总会过期：渲染端崩了/卡了/失联，最多 BUSY_LEASE_MS 后自动恢复穿透；硬上限保证
@@ -41,9 +42,25 @@
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict'
 
-  /** 单行上限：协议行很小，64 KiB 已经比任何合法消息大两个数量级。 */
-  const MAX_LINE_LENGTH = 64 * 1024
-  const MAX_SCENE_ITEMS = 64
+  /**
+   * 单行上限。这条管道只有宿主 ↔ helper 两个进程，没有网络输入；但一条 `update`
+   * 要装下整个场景（`MAX_SCENE_ITEMS` 只宠物 + 控件名单），256 位访客时约 70 KiB，
+   * 所以留到 256 KiB：仍然是一个硬上限，不会被坏写入撑爆内存。
+   */
+  const MAX_LINE_LENGTH = 256 * 1024
+  /**
+   * 场景里最多几个 item。产品上“不设同屏上限”（SPEC v2 / ADR-0006），但一条消息
+   * 必须有界：256 位访客已经远超过一个局域网的合理规模。超出时宿主会给一条提示，
+   * 不会静默丢掉宠物（见 src/desktop-pets.js 的 droppedVisitors）。
+   */
+  const MAX_SCENE_ITEMS = 256
+  /**
+   * 渲染端上报的命中矩形：单边超过这个数只可能是算错了。直接**拒绝**而不是夹小——
+   * 夹小会留下一个仍然很大的可交互区，等于没 fail closed。
+   */
+  const MAX_HIT_RECT_SIZE = 1024
+  /** 一条 IPC 最多接受几个命中矩形；与场景上限同量级，控件另有独立通道。 */
+  const MAX_HIT_RECTS = 256
   const MAX_ID_LENGTH = 64
   const MAX_LABEL_LENGTH = 40
   const MAX_ANIM_LENGTH = 64
@@ -97,7 +114,7 @@
   /** 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。 */
   const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss']
 
-  /** 宠物色板：self 固定第一格，客人按 deviceId 散列到其余颜色。 */
+  /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
   /** dsh-pet 不上报随机待机动作；没有动作时轮播这几段真实存在的素材。 */
   const IDLE_CLIPS = ['东张西望', '原地漂浮踏步', '原地小憩沉眠']
@@ -433,7 +450,7 @@
     return { version: SCENE_VERSION, reset: options.reset === true, items, controls: normalizeControls(options.controls) }
   }
 
-  /** 截图/冒烟用的固定演示场景：自己的 + 两位客人，走真实素材。 */
+  /** 截图/冒烟用的固定演示场景：自己的 + 两位访客，走真实素材。 */
   function demoPetScene (workArea) {
     return petScene([
       { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: PET_COLORS[0] },
@@ -442,18 +459,48 @@
     ], workArea, { reset: true })
   }
 
+  /** 求矩形与工作区的交集；没有交集返回 null。 */
+  function clipRectToArea (rect, area) {
+    const source = normalizeRect(rect)
+    const box = normalizeRect(area)
+    if (source === null || box === null) return null
+    const left = Math.max(source.x, box.x)
+    const top = Math.max(source.y, box.y)
+    const right = Math.min(source.x + source.width, box.x + box.width)
+    const bottom = Math.min(source.y + source.height, box.y + box.height)
+    if (!(right > left) || !(bottom > top)) return null
+    return { x: left, y: top, width: right - left, height: bottom - top }
+  }
+
   /**
    * 渲染端上报的命中矩形。id 只用于诊断和「场景里删掉的宠物立刻撤销命中区」，
    * 没有 id 的矩形也接受（更保守的将来）。
+   *
+   * 这是**不可信输入**：渲染端可以报一个 10000×10000 的矩形，命中判定会照单全收，
+   * 等于把整块屏幕变成可交互区。所以：
+   *   - 单边超过 `MAX_HIT_RECT_SIZE` 的矩形直接丢掉（夹小没有意义，那仍然很大）；
+   *   - 传了 `area`（窗口/工作区）时，矩形裁到工作区里，裁完为空的丢掉；
+   *   - 数量上限 `MAX_HIT_RECTS`，超出的忽略。
+   * 所有失败方向都是“少一块命中区”，永远不会“多一块”。
+   *
+   * @param {Array<object>} raw
+   * @param {{area?:object}} [options]
    */
-  function normalizeRects (raw) {
+  function normalizeRects (raw, options = {}) {
     const rects = []
     if (!Array.isArray(raw)) return rects
+    const area = options !== null && typeof options === 'object' && options.area !== undefined
+      ? normalizeRect(options.area)
+      : null
     for (const candidate of raw) {
-      if (rects.length >= MAX_SCENE_ITEMS) break
+      if (rects.length >= MAX_HIT_RECTS) break
+      if (candidate === null || typeof candidate !== 'object') continue
       const rect = normalizeRect(candidate)
       if (rect === null) continue
-      rects.push({ id: normalizeId(candidate.id), x: rect.x, y: rect.y, width: rect.width, height: rect.height })
+      if (rect.width > MAX_HIT_RECT_SIZE || rect.height > MAX_HIT_RECT_SIZE) continue
+      const clipped = area === null ? rect : clipRectToArea(rect, area)
+      if (clipped === null) continue
+      rects.push({ id: normalizeId(candidate.id), ...clipped })
     }
     return rects
   }
@@ -1062,9 +1109,6 @@
       : BUSY_MAX_MS
     const leaseFresh = busyAt > 0 && now - busyAt <= lease && now - busyAt >= 0
     const underCap = busySince <= 0 || now - busySince <= busyMax
-    if (options.busy === true && leaseFresh && underCap) {
-      return { interactive: true, reason: 'busy-lease' }
-    }
 
     let rects
     if (Array.isArray(options.rects)) {
@@ -1077,7 +1121,14 @@
     if (rects.length === 0) return { interactive: false, reason: 'no-scene' }
 
     const point = normalizePoint(options.point)
-    if (point === null || hitTestRects(rects, point) === null) {
+    const hit = point !== null && hitTestRects(rects, point) !== null
+    // 输入租约可以让“位置判定”让位给拖拽，但不能单独把整窗变成可交互：
+    // 光标必须确实压在某个**活的**命中矩形上（拖拽时渲染端会上报一条跟随光标的
+    // `ui:drag` 矩形）。没有活矩形 = 一律 fail closed 回穿透。
+    if (options.busy === true && leaseFresh && underCap && hit) {
+      return { interactive: true, reason: 'busy-lease' }
+    }
+    if (!hit) {
       return { interactive: false, reason: 'outside' }
     }
     const lastHoverAt = Number.isFinite(options.lastHoverAt) ? options.lastHoverAt : 0
@@ -1103,6 +1154,8 @@
   return {
     MAX_LINE_LENGTH,
     MAX_SCENE_ITEMS,
+    MAX_HIT_RECT_SIZE,
+    MAX_HIT_RECTS,
     MAX_ID_LENGTH,
     MAX_LABEL_LENGTH,
     MAX_ANIM_LENGTH,
@@ -1137,6 +1190,7 @@
     normalizeRect,
     normalizePoint,
     normalizeRects,
+    clipRectToArea,
     normalizeScene,
     normalizeControls,
     normalizeHostCommand,

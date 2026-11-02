@@ -373,6 +373,39 @@ function overlapsRect (a, b) {
   return a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
 }
 
+/**
+ * 两个矩形之间那个“缝”里的一点（窗口局部坐标），用于验证弹层的桥接矩形。
+ * 弹层可能被摆在宠物的右/左/上/下，这里按最近的一条边算；重叠则返回 null。
+ */
+function gapPointBetween (a, b) {
+  const mid = (start, end) => (start + end) / 2
+  if (a.x + a.width <= b.x) {
+    return {
+      x: mid(a.x + a.width, b.x),
+      y: mid(Math.max(a.y, b.y), Math.min(a.y + a.height, b.y + b.height))
+    }
+  }
+  if (b.x + b.width <= a.x) {
+    return {
+      x: mid(b.x + b.width, a.x),
+      y: mid(Math.max(a.y, b.y), Math.min(a.y + a.height, b.y + b.height))
+    }
+  }
+  if (a.y + a.height <= b.y) {
+    return {
+      x: mid(Math.max(a.x, b.x), Math.min(a.x + a.width, b.x + b.width)),
+      y: mid(a.y + a.height, b.y)
+    }
+  }
+  if (b.y + b.height <= a.y) {
+    return {
+      x: mid(Math.max(a.x, b.x), Math.min(a.x + a.width, b.x + b.width)),
+      y: mid(b.y + b.height, a.y)
+    }
+  }
+  return null
+}
+
 /** 控件区域必须真的有像素：不是“DOM 里存在”而是画出来了。 */
 function assertControlPixels (verified, rects) {
   for (const rect of rects) {
@@ -620,7 +653,7 @@ async function verifyControls () {
   let current = await client.status()
   assert(current.overlayRects >= 3, '放行卡的命中矩形已经单独上报（' + current.overlayRects + ' 块）')
 
-  // 悬停自己的宠物：弹层出现并持有输入租约。
+  // 悬停自己的宠物：弹层出现，但**不拿输入租约**（A2：整窗不能被一个弹层按 12 秒）。
   let self = state.pets.find((pet) => pet.id === 'self')
   let center = screenCenter(self, workArea)
   let start = client.mark()
@@ -631,20 +664,51 @@ async function verifyControls () {
     const snapshot = await client.rendererState()
     return snapshot.controls.popover !== null
   }, 2500, '悬停后弹层出现')
-  current = await client.waitStatus((status) => status.busy === true, 2000, '弹层持有输入租约')
-  assert(current.ignoring === false, '弹层打开时窗口可交互（setIgnoreMouseEvents(false)）')
+  current = await client.status()
+  assert(current.busy === false, '弹层不持有输入租约（A2）')
+  assert(current.ignoring === false, '弹层打开时窗口可交互（靠命中矩形，不靠租约）')
   assert(current.overlayRects >= 6, '弹层+按钮+卡片都有独立命中矩形（' + current.overlayRects + ' 块）')
 
   state = await client.rendererState()
   const selfRect = { x: self.x, y: self.y, width: self.width, height: self.height }
   const popoverRect = state.uiRects.find((rect) => rect.id === 'ui:popover')
+  const bridgeRect = state.uiRects.find((rect) => rect.id === 'ui:bridge:popover')
   const promptRect = state.uiRects.find((rect) => rect.id === 'ui:prompt')
   const visitButton = state.uiRects.find((rect) => rect.id === 'ui:btn:visit')
   assert(Boolean(popoverRect), '弹层有命中矩形')
+  assert(Boolean(bridgeRect), '宠物与弹层之间有桥接矩形（不靠租约也能跨过间隙）')
   assert(Boolean(promptRect), '放行卡有命中矩形')
   assert(Boolean(visitButton), '「串门」按钮有命中矩形')
   assert(!overlapsRect(popoverRect, selfRect), '弹层不遮挡宠物本体')
   assert(!overlapsRect(promptRect, selfRect), '放行卡不遮挡宠物本体')
+
+  // 桥接矩形真的盖住了宠物与弹层之间的那几像素（纯几何，不动光标）。
+  const gapPoint = gapPointBetween(selfRect, popoverRect)
+  assert(gapPoint !== null, '能找到宠物与弹层之间的空隙')
+  assert(shared.hitTestRects([bridgeRect], gapPoint) !== null, '桥接矩形覆盖宠物与弹层之间的空隙')
+  assert(shared.hitTestRects([selfRect, popoverRect], gapPoint) === null, '这个点确实既不在宠物上也不在弹层上')
+
+  // A2 的验收条件：弹层开着、光标既不在宠物上也不在弹层上 → 整个窗口必须恢复穿透。
+  // 这里只动主进程光标（渲染端仍以为光标在宠物上），穿透只能来自“真实光标不在命中区”。
+  start = client.mark()
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  const cleared = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 3000, '弹层开着也恢复穿透')
+  assert(cleared.reason === 'outside', '恢复穿透是因为真实光标不在命中区（reason=' + cleared.reason + '）')
+  assert((await client.status()).busy === false, '穿透时也没有残留租约')
+  state = await client.rendererState()
+  assert(state.controls.popover !== null, '穿透不是“关掉弹层”：弹层仍然开着')
+
+  // 光标移进宠物与弹层之间的缝隙：桥接矩形接管鼠标（不需要租约）。
+  start = client.mark()
+  client.send({ type: 'pointer', x: workArea.x + gapPoint.x, y: workArea.y + gapPoint.y })
+  const gapHit = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '间隙命中')
+  assert(['ui:bridge:popover', 'ui:popover'].includes(gapHit.itemId),
+    '光标在间隙里时窗口接管鼠标（不靠租约，itemId=' + gapHit.itemId + '）')
+
+  // 光标从缝隙回到宠物上：一直可交互（没有状态翻转，所以不会有新的 hit 事件）。
+  client.send({ type: 'pointer', x: center.x, y: center.y })
+  await sleep(150)
+  assert((await client.status()).ignoring === false, '光标回到宠物上仍然可交互，弹层可以继续用')
 
   // 截图：弹层按钮 + 放行卡同框。
   mkdirSync(OUT_DIR, { recursive: true })
@@ -657,13 +721,6 @@ async function verifyControls () {
   assertControlPixels(verified, [popoverRect, promptRect, visitButton])
   const sidecarUi = verified.sidecar.renderer?.uiRects ?? []
   assert(sidecarUi.some((rect) => rect.id === 'ui:btn:visit'), '截图 sidecar 记录了按钮矩形')
-
-  // 弹层打开期间把真实光标移到空白处：租约必须继续续期，窗口不能翻回穿透。
-  client.send({ type: 'pointer', x: outside.x, y: outside.y })
-  await sleep(1600)
-  current = await client.status()
-  assert(current.busy === true && current.ignoring === false,
-    '弹层打开期间租约持续续期（光标在空白处 1.6s 后仍可交互）')
 
   // 点「串门」：渲染端只发申请，helper 把它写进 stdio 给宿主。
   const visitPoint = rectCenterScreen(visitButton, workArea)
@@ -687,11 +744,10 @@ async function verifyControls () {
   }, 2500, '失败气泡出现')
   state = await client.rendererState()
   assert(state.controls.popover === null, '点完动作弹层关闭')
-  assert(state.controls.lease === false, '弹层关闭后渲染端释放租约')
   await waitUntil(async () => {
     const status = await client.status()
     return status.busy === false
-  }, 2500, '弹层关闭后 busy=false')
+  }, 2500, '点完动作后没有残留租约')
 
   // 保留一张失败气泡的截图（和放行卡同框，证明“不静默”）。
   const noticePng = join(OUT_DIR, 'controls-notice.png')
@@ -727,45 +783,45 @@ async function verifyControls () {
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
   await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 3000, '离开放行卡恢复穿透')
 
-  // 再打开弹层，验证泄漏租约的 fail-closed：冻结 busy 续期后主进程必须收回。
+  // 拖拽租约的 fail-closed：冻结 busy 续期后，主进程必须按 BUSY_LEASE_MS 收回。
+  // （弹层不再持有租约，这条路径现在由拖拽负责——它也确实是唯一需要租约的地方。）
   state = await client.rendererState()
   self = state.pets.find((pet) => pet.id === 'self')
   center = screenCenter(self, workArea)
+  start = client.mark()
   client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
-  await waitUntil(async () => {
-    const snapshot = await client.rendererState()
-    return snapshot.controls.popover !== null
-  }, 2500, '再次打开弹层')
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '泄漏前悬停')
+  client.send({ type: 'debug-dispatch', phase: 'down', x: center.x, y: center.y })
   await client.waitStatus((status) => status.busy === true, 2000, '再次持有租约')
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
   client.send({ type: 'debug-freeze-busy', frozen: true })
-  current = await client.waitStatus((status) => status.ignoring === true, shared.BUSY_LEASE_MS + 2500, '泄漏租约 fail-closed')
-  assert(current.busy === false, '主进程按 BUSY_LEASE_MS 收回泄漏租约（busy=false）')
+  current = await client.waitStatus((status) => status.busy === false, shared.BUSY_LEASE_MS + 2500, '泄漏租约 fail-closed')
+  assert(current.ignoring === true, '主进程按 BUSY_LEASE_MS 收回泄漏租约并恢复穿透')
   state = await client.rendererState()
-  assert(state.controls.popover !== null, '此时渲染端仍然开着弹层：桌面靠主进程兜底恢复穿透')
+  assert(state.dragging === 'self', '此时渲染端仍然在拖拽：桌面靠主进程收回租约恢复穿透')
   client.send({ type: 'debug-freeze-busy', frozen: false })
-  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
-  await client.waitStatus((status) => status.busy === false && status.ignoring === true, 3500, '关掉弹层后回到穿透')
+  client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
+  await client.waitStatus((status) => status.busy === false && status.ignoring === true, 3500, '松开后回到穿透')
+  assert((await client.rendererState()).dragging === null, '渲染端也收手了')
 
   // 硬上限：渲染端活着、心跳也一直在续，但一条租约连续持有超过 BUSY_MAX_MS 必须收回。
   // 用调试命令把 30s 缩短到 700ms；收回后 blocked 是粘滞的，悬停不能复活，只认 busy:false。
   state = await client.rendererState()
   self = state.pets.find((pet) => pet.id === 'self')
   center = screenCenter(self, workArea)
+  start = client.mark()
   client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
-  await waitUntil(async () => {
-    const snapshot = await client.rendererState()
-    return snapshot.controls.popover !== null
-  }, 2500, '硬上限前打开弹层')
+  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '硬上限前悬停')
+  client.send({ type: 'debug-dispatch', phase: 'down', x: center.x, y: center.y })
   await client.waitStatus((status) => status.busy === true, 2000, '硬上限前持有租约')
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
   client.send({ type: 'debug-busy-max', ms: 700 })
-  current = await client.waitStatus((status) => status.ignoring === true, 4000, '硬上限收回租约')
-  assert(current.busy === false && current.busyBlocked === true,
+  current = await client.waitStatus((status) => status.busyBlocked === true, 4000, '硬上限收回租约')
+  assert(current.busy === false && current.ignoring === true,
     '租约连续持有超过硬上限 → 主进程收回并标记 blocked（busy=false, blocked=true）')
   state = await client.rendererState()
-  assert(state.controls.popover !== null, '硬上限收回时渲染端仍在续租/弹层仍开着：窗口仍恢复穿透')
-  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  assert(state.dragging === 'self', '硬上限收回时渲染端仍在拖拽：窗口仍恢复穿透')
+  client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
   await client.waitStatus((status) => status.busyBlocked === false && status.ignoring === true, 3500,
     '显式放手清除 blocked')
   client.send({ type: 'debug-busy-max', ms: 0 })
@@ -997,11 +1053,12 @@ async function verifyHelper () {
   await leavePointer(client, outside)
   assert((await client.status()).ignoring === true, '兜底接管后移出命中区也恢复穿透')
 
-  // 输入租约：拖拽中把光标移到宠物矩形外，窗口必须保持可交互。
+  // 输入租约 + ui:drag（A3）：拖拽时宠物落后于光标，租约负责让位置判定让位；
+  // 但租约**不能单独**让整窗可交互——光标必须压在一条活的命中矩形上。
   // 外部应用抢焦点会让 helper 收到 blur 并（正确地）收回租约；这是环境事件，不是被测行为，
-  // 所以这里最多重试 3 次。每次等 1.4s > hover 确认的 1.2s，证明不是位置判定在兜底。
+  // 所以这里最多重试 3 次。
   let leaseHeld = false
-  let dragged = null
+  let dragPoint = null
   for (let attempt = 1; attempt <= 3 && !leaseHeld; attempt += 1) {
     state = await client.rendererState()
     self = state.pets.find((pet) => pet.id === 'self')
@@ -1015,32 +1072,56 @@ async function verifyHelper () {
     assert(current.ignoring === false, '拖拽开始后窗口可交互')
     state = await client.rendererState()
     assert(state.dragging === 'self', '渲染端记录了拖拽中的宠物（dragging=self）')
-    dragged = state.pets.find((pet) => pet.id === 'self')
-    assert(Math.abs(dragged.x - before.x) < 3 && Math.abs(dragged.y - before.y) < 3,
+    const grabbed = state.pets.find((pet) => pet.id === 'self')
+    assert(Math.abs(grabbed.x - before.x) < 3 && Math.abs(grabbed.y - before.y) < 3,
       '刚按下时宠物还在原地（弹簧跟随，不瞬移）')
 
-    // 只移动主进程光标到宠物外：渲染端收不到新的 pointermove，宠物留在原地。
-    client.send({ type: 'pointer', x: outside.x, y: outside.y })
-    await sleep(1400)
+    // 把光标甩到右边 260px：弹簧跟随需要时间，此刻光标已经在宠物矩形外，
+    // 但渲染端上报的 ui:drag（宠物 ∪ 光标周围 80px）必须把它盖住。
+    dragPoint = { x: center.x + 260, y: center.y - 40 }
+    client.send({ type: 'debug-dispatch', phase: 'move', x: dragPoint.x, y: dragPoint.y })
+    await sleep(120)
+    state = await client.rendererState()
+    const lagging = state.pets.find((pet) => pet.id === 'self')
+    const dragRects = state.uiRects.filter((rect) => rect.id === 'ui:drag')
+    assert(dragRects.length === 1, '拖拽期间上报了一条跟随光标的 ui:drag 矩形')
+    const localDragPoint = { x: dragPoint.x - workArea.x, y: dragPoint.y - workArea.y }
+    assert(shared.hitTestRects(dragRects, localDragPoint) !== null, 'ui:drag 矩形盖住了光标')
+    assert(shared.hitTestRects(
+      [{ x: lagging.x, y: lagging.y, width: lagging.width, height: lagging.height }],
+      localDragPoint
+    ) === null, '光标确实在（落后的）宠物矩形外：靠租约 + ui:drag 接管鼠标')
     current = await client.status()
     if (current.busy === true && current.ignoring === false) {
       leaseHeld = true
     } else {
       info('输入租约被外部焦点变化打断（第 ' + attempt + ' 次），重试')
-      client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
+      client.send({ type: 'debug-dispatch', phase: 'up', x: dragPoint.x, y: dragPoint.y })
       await sleep(250)
       await leavePointer(client, outside)
     }
   }
-  assert(leaseHeld, '光标离开宠物矩形 1.4s 后窗口仍保持可交互（输入租约生效）')
-  assert(shared.hitTestRects(
-    [{ x: dragged.x, y: dragged.y, width: dragged.width, height: dragged.height }],
-    { x: outside.x - workArea.x, y: outside.y - workArea.y }
-  ) === null, '此时真实光标确实在宠物矩形外（不是位置判定在兜底）')
+  assert(leaseHeld, '光标在宠物矩形外、却压在 ui:drag 上时窗口保持可交互（输入租约生效）')
 
-  // pointerup → 立刻交还穿透；宠物不会因为光标在外面而弹飞
+  // A3：租约还在续期，但主进程光标离开所有活矩形 → 必须恢复穿透。
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  current = await client.waitStatus((status) => status.ignoring === true, 3000, '租约不能单独占住桌面')
+  assert(current.busy === true, '此时租约仍然新鲜：穿透不是因为租约过期，而是因为没有活矩形')
+  state = await client.rendererState()
+  assert(state.dragging === 'self', '渲染端还在拖拽，窗口依然恢复穿透（fail closed）')
+
+  // 光标回到 ui:drag 上 → 立刻恢复可交互，拖拽没断。
+  client.send({ type: 'pointer', x: dragPoint.x, y: dragPoint.y })
+  await client.waitStatus((status) => status.ignoring === false, 3000, '回到拖拽矩形恢复可交互')
+  assert((await client.rendererState()).dragging === 'self', '拖拽没有被打断')
+
+  // pointerup → 释放租约；宠物不会因为光标在外面而弹飞
+  client.send({ type: 'debug-dispatch', phase: 'up', x: dragPoint.x, y: dragPoint.y })
+  current = await client.waitStatus((status) => status.busy === false, 2500, '拖拽结束释放租约')
+  assert(current.busy === false, 'pointerup 立刻释放租约（不再靠租约兜底）')
+  // 没有租约兜底之后，光标一移开就必须立刻回穿透。
   start = client.mark()
-  client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
   await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 2500, '拖拽结束交还穿透')
   current = await client.status()
   assert(current.busy === false, 'pointerup 后 busy 释放')
@@ -1048,7 +1129,8 @@ async function verifyHelper () {
   state = await client.rendererState()
   assert(state.dragging === null, '渲染端拖拽状态已清空')
   self = state.pets.find((pet) => pet.id === 'self')
-  assert(Math.hypot(self.vx, self.vy) < 30, '在宠物外松手且没有轨迹 → 不投掷（速度≈0）')
+  // 松手位置比抓起来时高 40px，宠物会自然下落（vy ≠ 0 是重力，不是投掷）。
+  assert(Math.abs(self.vx) < 30, '没有新轨迹就松手 → 不投掷（水平速度≈0）')
 
   // 拖拽跟手 + 投掷
   center = screenCenter(self, workArea)
@@ -1157,8 +1239,11 @@ async function verifyHelper () {
   await client.waitStatus((status) => status.busy === true, 2000, '超时拖拽开始')
   client.send({ type: 'debug-freeze-busy', frozen: true })
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
-  current = await client.waitStatus((status) => status.ignoring === true, shared.BUSY_LEASE_MS + 2500, '租约超时释放')
-  assert(current.busy === false, 'BUSY_LEASE_MS 内没有续期 → busy 自动释放（busy=false）')
+  // 光标先离开命中区（立刻穿透是 A3 的正确行为），再等租约自己过期。
+  current = await client.waitStatus((status) => status.ignoring === true, 3000, '离开拖拽矩形恢复穿透')
+  assert(current.busy === true, '这时租约还没过期：穿透来自“没有活矩形”，不是租约失效')
+  current = await client.waitStatus((status) => status.busy === false, shared.BUSY_LEASE_MS + 2500, '租约超时释放')
+  assert(current.ignoring === true, 'BUSY_LEASE_MS 内没有续期 → 租约自动释放（busy=false）')
   client.send({ type: 'debug-dispatch', phase: 'up', x: outside.x, y: outside.y })
   client.send({ type: 'debug-freeze-busy', frozen: false })
   await sleep(200)
@@ -1368,7 +1453,7 @@ try {
   const standalone = await run('截图模式：三只演示宠物 + 透明背景 + 真实素材', verifyShotMode)
   await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
   await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
-  const controls = await run('控件：悬停弹层 / 租约 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls)
+  const controls = await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls)
   await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
   const notes = writeNoteScreenshots(standalone.verified)

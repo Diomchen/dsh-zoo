@@ -17,8 +17,10 @@ import { fileURLToPath } from 'node:url'
 import shared from '../desktop/shared.js'
 import {
   DESKTOP_PING_MS,
+  DESKTOP_PONG_TIMEOUT_MS,
   DESKTOP_SHOT_TIMEOUT_MS,
   DESKTOP_STATUS_TIMEOUT_MS,
+  DESKTOP_WATCHDOG_TICK_MS,
   buildHelperArgs,
   createRestartPolicy,
   describeUnavailable,
@@ -67,6 +69,8 @@ export function createDesktop (options = {}) {
   const now = typeof options.now === 'function' ? options.now : Date.now
   const setTimer = typeof options.setTimer === 'function' ? options.setTimer : setTimeout
   const clearTimer = typeof options.clearTimer === 'function' ? options.clearTimer : clearTimeout
+  const setIntervalFn = typeof options.setInterval === 'function' ? options.setInterval : setInterval
+  const clearIntervalFn = typeof options.clearInterval === 'function' ? options.clearInterval : clearInterval
   const helperMain = typeof options.helperPath === 'string' && options.helperPath !== ''
     ? options.helperPath
     : HELPER_MAIN
@@ -74,6 +78,12 @@ export function createDesktop (options = {}) {
   const assetRoots = Array.isArray(options.assetRoots) ? options.assetRoots.slice() : []
   const debug = options.debug === true
   const pingMs = Number.isFinite(options.pingMs) && options.pingMs >= 100 ? options.pingMs : DESKTOP_PING_MS
+  const pongTimeoutMs = Number.isFinite(options.pongTimeoutMs) && options.pongTimeoutMs >= 5000
+    ? options.pongTimeoutMs
+    : DESKTOP_PONG_TIMEOUT_MS
+  const watchdogTickMs = Number.isFinite(options.watchdogTickMs) && options.watchdogTickMs >= 50
+    ? options.watchdogTickMs
+    : DESKTOP_WATCHDOG_TICK_MS
   const log = {
     info: typeof options.log?.info === 'function' ? options.log.info : noop,
     warn: typeof options.log?.warn === 'function' ? options.log.warn : noop
@@ -99,10 +109,13 @@ export function createDesktop (options = {}) {
   let helperErrors = 0
   let restartTimer = null
   let pingTimer = null
-  let shotTimer = null
-  let statusTimer = null
-  let pendingShot = null
-  let pendingStatus = null
+  let watchdogTimer = null
+  /** 最近一次收到 pong（或 ready）的时刻；0 = 还没连上，看门狗不工作。 */
+  let lastPongAt = 0
+  /** 已经在为超时收尸：避免看门狗在进程退出的间隙里反复 kill。 */
+  let pongKilled = false
+  /** 发出去还没回执的请求：kind（shot/status）→ { id, resolve, timer }。 */
+  const pendingReplies = new Map()
   let sequence = 0
   let exitHook = null
   const stdoutParser = shared.createLineParser()
@@ -181,6 +194,7 @@ export function createDesktop (options = {}) {
     stderrParser.reset()
     installExitHook()
     installPingTimer()
+    startPongWatchdog()
     if (debug) log.info('桌面 helper 已拉起（pid ' + String(spawned.pid ?? '?') + '）')
 
     safe(() => spawned.stdout?.setEncoding('utf8'))
@@ -216,6 +230,8 @@ export function createDesktop (options = {}) {
       }
       child = null
       ready = false
+      lastPongAt = 0
+      pongKilled = false
       settlePending('helper-error')
       const decision = policy.onExit(now())
       log.warn('桌面 helper 进程错误（' + lastError + '）' + restartSuffix(decision))
@@ -226,6 +242,8 @@ export function createDesktop (options = {}) {
       child = null
       ready = false
       workArea = null
+      lastPongAt = 0
+      pongKilled = false
       settlePending('helper-exited')
       if (disposed) return
       const decision = policy.onExit(now())
@@ -293,10 +311,42 @@ export function createDesktop (options = {}) {
 
   function installPingTimer () {
     if (pingTimer !== null || disposed) return
-    pingTimer = setInterval(() => {
+    pingTimer = setIntervalFn(() => {
       if (child !== null) send({ type: 'ping', id: nextId() })
     }, pingMs)
     pingTimer?.unref?.()
+  }
+
+  /**
+   * pong 看门狗：宿主杀掉 helper 的另一个条件——它不再回答。
+   *
+   * 只看 `ready` 之后的时间戳：helper 只有在 `app.whenReady()` 之后才开始读 stdin，
+   * 冷启动慢不算卡死。阈值是 3 个 ping 周期（15s），正常长 GC 最多耽误一两次 pong，
+   * 不会误杀；真的卡死时最迟 ~16s 收尸，然后走现有的退避重启。
+   */
+  function startPongWatchdog () {
+    if (watchdogTimer !== null || disposed) return
+    watchdogTimer = setIntervalFn(() => {
+      if (disposed || child === null || !ready || lastPongAt <= 0 || pongKilled) return
+      const age = now() - lastPongAt
+      if (age <= pongTimeoutMs) return
+      pongKilled = true
+      log.warn('桌面 helper ' + String(Math.round(age / 1000)) +
+        's 没有回 pong，按卡死处理：杀掉后重启')
+      try {
+        child.kill('SIGKILL')
+      } catch (error) {
+        lastError = messageOf(error)
+        // kill 失败也要走 exit/error 路径；下一次 exit 会把 pongKilled 复位。
+      }
+    }, watchdogTickMs)
+    watchdogTimer?.unref?.()
+  }
+
+  /** helper 重新连上（ready）或回了 pong：看门狗重新计时。 */
+  function notePong () {
+    lastPongAt = now()
+    pongKilled = false
   }
 
   // -------------------------------------------------------------------------
@@ -336,29 +386,14 @@ export function createDesktop (options = {}) {
     if (event.type === 'ready') {
       ready = true
       workArea = event.workArea
+      notePong()
       // 重启/重载后 helper 是空的：把最后一份场景补给它（服务层在 ready 时还会对账一次）。
       // 这里刻意去掉 reset：新渲染端本来就会按 x/y 出生；显示器变化时保留现场位置更自然。
       if (lastScene !== null) send({ type: 'update', scene: { ...lastScene, reset: false } })
-    } else if (event.type === 'shot') {
-      if (pendingShot !== null && (event.id === null || event.id === pendingShot.id)) {
-        const pending = pendingShot
-        pendingShot = null
-        if (shotTimer !== null) {
-          clearTimer(shotTimer)
-          shotTimer = null
-        }
-        pending.resolve({ ok: true, ...event })
-      }
-    } else if (event.type === 'status') {
-      if (pendingStatus !== null && (event.id === null || event.id === pendingStatus.id)) {
-        const pending = pendingStatus
-        pendingStatus = null
-        if (statusTimer !== null) {
-          clearTimer(statusTimer)
-          statusTimer = null
-        }
-        pending.resolve({ ok: true, status: event.status })
-      }
+    } else if (event.type === 'shot' || event.type === 'status') {
+      settleReply(event)
+    } else if (event.type === 'pong') {
+      notePong()
     } else if (event.type === 'error') {
       lastError = event.code + ': ' + event.message
       helperErrors += 1
@@ -378,22 +413,25 @@ export function createDesktop (options = {}) {
     return sequence
   }
 
-  function settlePending (reason) {
-    if (pendingShot !== null) {
-      const pending = pendingShot
-      pendingShot = null
-      if (shotTimer !== null) {
-        clearTimer(shotTimer)
-        shotTimer = null
-      }
-      pending.resolve({ ok: false, error: reason })
+  /** 收到 shot/status 回执：id 对得上就结算；null id 当作“就是这一次”。 */
+  function settleReply (event) {
+    const pending = pendingReplies.get(event.type)
+    if (pending === undefined) return
+    if (event.id !== null && event.id !== pending.id) return
+    pendingReplies.delete(event.type)
+    if (pending.timer !== null) {
+      clearTimer(pending.timer)
+      pending.timer = null
     }
-    if (pendingStatus !== null) {
-      const pending = pendingStatus
-      pendingStatus = null
-      if (statusTimer !== null) {
-        clearTimer(statusTimer)
-        statusTimer = null
+    pending.resolve(pending.readReply(event))
+  }
+
+  function settlePending (reason) {
+    for (const [kind, pending] of [...pendingReplies]) {
+      pendingReplies.delete(kind)
+      if (pending.timer !== null) {
+        clearTimer(pending.timer)
+        pending.timer = null
       }
       pending.resolve({ ok: false, error: reason })
     }
@@ -469,69 +507,63 @@ export function createDesktop (options = {}) {
     }
   }
 
-  function shot (filePath) {
+  /**
+   * 一次「发一条命令 → 等一条同名回执」的请求。shot 和 status 只差命令体、
+   * 超时时间和回执怎么读；pending 去重、超时、进程退出/卸载时的结算完全一样。
+   * 同一 kind 同时只允许一个在飞，第二个直接 busy。
+   */
+  function requestReply (kind, { timeoutMs, unavailable, payload = {}, readReply }) {
     return new Promise((resolve) => {
       try {
-        if (!ready || child === null) {
-          resolve({ ok: false, error: 'not-ready' })
+        const blocked = unavailable()
+        if (blocked !== null) {
+          resolve(blocked)
           return
         }
-        if (typeof filePath !== 'string' || filePath === '') {
-          resolve({ ok: false, error: 'bad-path' })
-          return
-        }
-        if (pendingShot !== null) {
+        if (pendingReplies.has(kind)) {
           resolve({ ok: false, error: 'busy' })
           return
         }
         const id = nextId()
-        pendingShot = { id, resolve }
-        if (!send({ type: 'shot', id, path: filePath })) {
-          pendingShot = null
+        const pending = { id, resolve, timer: null, readReply }
+        pendingReplies.set(kind, pending)
+        if (!send({ type: kind, id, ...payload })) {
+          pendingReplies.delete(kind)
           resolve({ ok: false, error: 'send-failed' })
           return
         }
-        shotTimer = setTimer(() => {
-          if (pendingShot === null || pendingShot.id !== id) return
-          pendingShot = null
-          shotTimer = null
+        pending.timer = setTimer(() => {
+          if (pendingReplies.get(kind) !== pending) return
+          pendingReplies.delete(kind)
+          pending.timer = null
           resolve({ ok: false, error: 'timeout' })
-        }, DESKTOP_SHOT_TIMEOUT_MS)
-        shotTimer?.unref?.()
+        }, timeoutMs)
+        pending.timer?.unref?.()
       } catch (error) {
+        pendingReplies.delete(kind)
         resolve({ ok: false, error: messageOf(error) })
       }
     })
   }
 
+  function shot (filePath) {
+    return requestReply('shot', {
+      timeoutMs: DESKTOP_SHOT_TIMEOUT_MS,
+      unavailable: () => {
+        if (!ready || child === null) return { ok: false, error: 'not-ready' }
+        if (typeof filePath !== 'string' || filePath === '') return { ok: false, error: 'bad-path' }
+        return null
+      },
+      payload: { path: filePath },
+      readReply: (event) => ({ ok: true, ...event })
+    })
+  }
+
   function requestStatus () {
-    return new Promise((resolve) => {
-      try {
-        if (child === null) {
-          resolve({ ok: false, error: 'not-running' })
-          return
-        }
-        if (pendingStatus !== null) {
-          resolve({ ok: false, error: 'busy' })
-          return
-        }
-        const id = nextId()
-        pendingStatus = { id, resolve }
-        if (!send({ type: 'status', id })) {
-          pendingStatus = null
-          resolve({ ok: false, error: 'send-failed' })
-          return
-        }
-        statusTimer = setTimer(() => {
-          if (pendingStatus === null || pendingStatus.id !== id) return
-          pendingStatus = null
-          statusTimer = null
-          resolve({ ok: false, error: 'timeout' })
-        }, DESKTOP_STATUS_TIMEOUT_MS)
-        statusTimer?.unref?.()
-      } catch (error) {
-        resolve({ ok: false, error: messageOf(error) })
-      }
+    return requestReply('status', {
+      timeoutMs: DESKTOP_STATUS_TIMEOUT_MS,
+      unavailable: () => (child === null ? { ok: false, error: 'not-running' } : null),
+      readReply: (event) => ({ ok: true, status: event.status })
     })
   }
 
@@ -549,6 +581,8 @@ export function createDesktop (options = {}) {
       ready,
       restarts: policy.restarts,
       workArea,
+      pongAgeMs: lastPongAt > 0 ? Math.max(0, now() - lastPongAt) : null,
+      pongTimeoutMs,
       lastError,
       helperErrors,
       lastEvent,
@@ -568,6 +602,10 @@ export function createDesktop (options = {}) {
     if (pingTimer !== null) {
       clearInterval(pingTimer)
       pingTimer = null
+    }
+    if (watchdogTimer !== null) {
+      clearInterval(watchdogTimer)
+      watchdogTimer = null
     }
     settlePending('disposed')
     const target = child
