@@ -14,14 +14,16 @@
     "index.js",
     "client.js",
     "src",
+    "desktop",
     "cordis.patch.yml"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check client.js && node --test test/*.test.js",
+    "check": "node --check client.js && node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --test test/*.test.js",
     "install:profile": "node scripts/install.mjs",
     "uninstall:profile": "node scripts/uninstall.mjs",
-    "fake-peer": "node scripts/fake-peer.mjs"
+    "fake-peer": "node scripts/fake-peer.mjs",
+    "smoke:desktop": "node scripts/desktop-smoke.mjs"
   },
   "engines": {
     "node": ">=22.12.0"

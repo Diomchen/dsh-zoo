@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 
+import shared from '../desktop/shared.js'
+import { createDesktop } from './desktop.js'
 import { createDiscovery } from './discovery.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
@@ -71,6 +73,7 @@ export function createService (ctx, options = {}) {
   let visits = null
   let settings = null
   let bridge = null
+  let desktop = null
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
@@ -273,6 +276,11 @@ export function createService (ctx, options = {}) {
       if (disposed) return
       room.setIdentity(identity)
 
+      // 桌面层（ticket 07）：一个全屏透明 helper + 一个占位方块。
+      // 它坏了/起不来都只是「没有宠物」，这里不 await、不抛，网络与信任逻辑完全不受影响。
+      startDesktopLayer()
+      if (disposed) return
+
       if (options.network !== false) {
         const port = options.port ?? resolvePort(env)
         discovery = createDiscovery({
@@ -352,6 +360,69 @@ export function createService (ctx, options = {}) {
         startNeighborTick()
         startVisitTimer()
       }
+    }
+  }
+
+  /**
+   * 桌面层是**尽力而为**的一层：宿主不是桌面版、不是 macOS、没有 Electron、helper 崩了，
+   * 都只让宠物不显示。这里绝不把异常抛回 start()，也不 await 它的启动（窗口就绪是异步的）。
+   * 测试用 options.desktopFactory 注入假实现，options.desktop === false 直接跳过。
+   */
+  function startDesktopLayer () {
+    if (options.desktop === false) return
+    try {
+      const factory = typeof options.desktopFactory === 'function' ? options.desktopFactory : createDesktop
+      const manager = factory({
+        log,
+        env,
+        platform: options.platform,
+        versions: options.versions,
+        desktopHost: options.desktopHost,
+        helperPath: options.desktopHelperPath,
+        debug: options.desktopDebug === true,
+        maxRestarts: options.desktopMaxRestarts,
+        onEvent (event) {
+          if (disposed) return
+          // helper 每次 ready（首次 / 重启 / 显示器变化）都会报工作区；占位方块的场景由宿主算。
+          if (event?.type === 'ready' && desktop !== null) {
+            desktop.update(shared.placeholderScene(event.workArea))
+          }
+        }
+      })
+      // 先挂上引用：即使 start() 同步触发 ready（假实现可能这样），onEvent 也能拿到 manager。
+      desktop = manager
+      const started = manager.start()
+      if (started !== null && typeof started?.then === 'function') {
+        // 未来若 start 变成异步：失败也要安静地收掉，不能留下半个 manager。
+        started.then((result) => {
+          if (disposed || desktop !== manager) return
+          if (result?.ok === false) {
+            manager.dispose()
+            desktop = null
+            return
+          }
+          log.info('桌面宠物窗口已启动（ticket 07 占位方块）')
+        }).catch(() => {
+          manager.dispose()
+          if (desktop === manager) desktop = null
+        })
+        return
+      }
+      if (started?.ok === false) {
+        manager.dispose()
+        if (desktop === manager) desktop = null
+        return
+      }
+      log.info('桌面宠物窗口已启动（ticket 07 占位方块）')
+    } catch (error) {
+      // 桌面层永远只能是「锦上添花」：初始化失败 = 这一行日志 + 没有宠物。
+      try {
+        desktop?.dispose()
+      } catch {
+        // 半初始化的 manager 也不能把 dispose 的异常抛出去
+      }
+      desktop = null
+      warn(ctx, '桌面层初始化失败，本次不显示宠物：' + message(error))
     }
   }
 
@@ -574,6 +645,8 @@ export function createService (ctx, options = {}) {
       discovery = null
       bridge?.dispose()
       bridge = null
+      desktop?.dispose()
+      desktop = null
       for (const dispose of disposers.reverse()) {
         try {
           dispose()
