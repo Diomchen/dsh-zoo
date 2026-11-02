@@ -88,6 +88,31 @@ node scripts/uninstall.mjs          # 摘掉登记与链接；<DSH_HOME>/local-p
 
 如果 DSH 自己被卡住，把 profile 的 `package.json` 从 `.bak` 还原即可。
 
+## 打包与分发
+
+```sh
+npm pack          # → dsh-local-pet-<version>.tgz
+```
+
+包里只有运行需要的东西：宿主入口、`src/`、`desktop/`（Electron helper）、`scripts/`、
+`cordis.patch.yml`、README。测试和 `.scratch/` 不进去。
+
+装到另一台机器（或另一个 profile）：
+
+```sh
+# 用 DSH 自带的 pnpm（不需要全局装 pnpm）
+node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs" \
+  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.2.0.tgz --save-exact
+
+# 再把 "dsh-local-pet" 加进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
+```
+
+然后重启 DSH。
+
+**前提**：桌面层需要一个 Electron 运行时。本机已有 `~/.dsh/electron/Electron.app`
+（装过 dsh-pet 就会有）。没有的话宠物不显示，但发现、放行、串门照常工作——日志里
+会有一行说明。
+
 ## 端口与防火墙
 
 - 发现/服务端口默认 **45871**（UDP），可用环境变量 `LOCAL_PET_PORT` 覆盖。

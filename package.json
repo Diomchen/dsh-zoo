@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-pet",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "让同一局域网里的 DSH 宠物互相看得见，并且能互相串门。",
   "type": "module",
@@ -13,7 +13,9 @@
     "index.js",
     "src",
     "desktop",
-    "cordis.patch.yml"
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
   ],
   "scripts": {
     "test": "node --test test/*.test.js",
@@ -21,7 +23,8 @@
     "install:profile": "node scripts/install.mjs",
     "uninstall:profile": "node scripts/uninstall.mjs",
     "fake-peer": "node scripts/fake-peer.mjs",
-    "smoke:desktop": "node scripts/desktop-smoke.mjs"
+    "smoke:desktop": "node scripts/desktop-smoke.mjs",
+    "pack:release": "npm pack"
   },
   "engines": {
     "node": ">=22.12.0"
