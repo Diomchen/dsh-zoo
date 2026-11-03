@@ -27,9 +27,10 @@
 - [x] `recordVisit` 现在是 4 个位置参数，改签名要同步 5 个调用点（in / out 都写）
 - [x] `snapshot.visits` 只给 4 个字段、最近 5 条：想在后端看见 `gift` 也要同步加
 - [x] `/local-pet/state` 直接 `sendJson(room.snapshot())`：`backpack` / `gifts` 要并进快照（磁盘在 service，room 只持内存视图）
-- [ ] 真机冒烟：字条 / 文件 / 图片三种卡片、缩略图、扔掉、送达与没送达两种气泡；
+- [x] 真机冒烟：字条 / 文件 / 图片三种卡片、缩略图、扔掉、送达与没送达两种气泡；
       截图落到 `.scratch/local-pet/notes/27-*.png`；`npm test` 全绿
-      （按分工只跑了 gift 段；全量留给父 agent）
+      （父 agent 复跑：全量冒烟 **398 项断言、全部段落通过**；截图 `27-gift-card.png` /
+      `27-gift-image.png` / `27-gift-file.png` / `27-bring-window.png`）
 
 
 > 完成情况：限额、记录、状态出口与文档已经收口（ticket 27）。
