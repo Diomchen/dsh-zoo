@@ -120,6 +120,8 @@ export function createDesktop (options = {}) {
   let lastPongAt = 0
   /** 已经在为超时收尸：避免看门狗在进程退出的间隙里反复 kill。 */
   let pongKilled = false
+  /** 「重载配置」主动杀掉的 helper：退出时立刻重建，并且不记成一次崩溃。 */
+  let manualReload = false
   /** 发出去还没回执的请求：kind（shot/status）→ { id, resolve, timer }。 */
   const pendingReplies = new Map()
   let sequence = 0
@@ -254,6 +256,19 @@ export function createDesktop (options = {}) {
       pongKilled = false
       settlePending('helper-exited')
       if (disposed) return
+      // 「重载配置」（ticket 22）：这次退出是用户点名要的，不算崩溃、不占退避次数，
+      // 立刻按最新配置重建一个 helper。
+      if (manualReload) {
+        manualReload = false
+        log.info('桌面 helper 已按「重载配置」退出，正在重建')
+        restartTimer = setTimer(() => {
+          restartTimer = null
+          if (disposed || child !== null) return
+          spawnHelper()
+        }, 0)
+        restartTimer?.unref?.()
+        return
+      }
       const decision = policy.onExit(now())
       const detail = 'code=' + String(code ?? 'null') + ', signal=' + String(signal ?? 'null')
       if (decision.action === 'give-up') {
@@ -481,6 +496,43 @@ export function createDesktop (options = {}) {
     }
   }
 
+  /**
+   * 重载配置（ticket 22）：「重载配置」菜单项背后那一下。
+   * 杀掉现有 helper，退出事件里立刻按新场景重建——配置由调用方（service）在此之前重读。
+   * 手动重载不占崩溃退避次数，否则手快连点两次就会把宠物"重启到放弃"。
+   */
+  function reload () {
+    if (disposed) return { ok: false, reason: 'disposed' }
+    if (availability === null) availability = computeAvailability()
+    if (!availability.ok) return { ...availability }
+    if (child === null) return spawnHelper()
+    manualReload = true
+    // 先记住 pid：kill 可能同步触发 exit（测试里的假子进程就是这样），那时 child 已经空了。
+    const pid = child.pid ?? null
+    try {
+      child.kill('SIGTERM')
+      return { ok: true, pid }
+    } catch (error) {
+      manualReload = false
+      return { ok: false, reason: 'kill-failed', detail: messageOf(error) }
+    }
+  }
+
+  /**
+   * 让系统默认浏览器/应用打开一个地址（菜单里的「打开软件」）。地址由宿主给。
+   * 先在**发出去之前**过一遍命令白名单：坏地址（file:/javascript:）不该写进管道，
+   * 让 helper 去拒等于把一条垃圾行留在两进程之间。
+   */
+  function openUrl (url) {
+    const normalized = shared.normalizeHostCommand({ type: 'open-url', url })
+    if (normalized.ok !== true) return false
+    try {
+      return send(normalized.command)
+    } catch {
+      return false
+    }
+  }
+
   function show () {
     try {
       return send({ type: 'show' })
@@ -655,6 +707,8 @@ export function createDesktop (options = {}) {
     resync,
     show,
     hide,
+    reload,
+    openUrl,
     actionResult,
     shot,
     requestStatus,

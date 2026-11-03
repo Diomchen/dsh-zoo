@@ -47,7 +47,7 @@ if (electronApi === null || typeof electronApi !== 'object' || typeof electronAp
   process.exit(3)
 }
 
-const { app, BrowserWindow, ipcMain, protocol, screen } = electronApi
+const { app, BrowserWindow, ipcMain, protocol, screen, shell } = electronApi
 const shared = require('./shared.js')
 
 const APP_NAME = 'dsh-local-pet-desktop'
@@ -161,6 +161,8 @@ let debugInputLocked = false
 let pointerTimer = null
 let hostPollTimer = null
 let stdinParser = null
+/** 宿主 → helper 的输入流（Windows 上是 fd 0 上的读流）；退出时必须显式销毁，见 shutdown()。 */
+let hostInput = null
 
 // ---------------------------------------------------------------------------
 // 进程级兜底：任何未捕获错误都先恢复穿透再退出，绝不把一个可交互全屏窗留在桌面上。
@@ -736,7 +738,7 @@ ipcMain.on('local-pet:action', (event, payload) => {
   if (!rendererReady) return
   const id = shared.normalizeId(payload?.id)
   const action = typeof payload?.action === 'string' ? payload.action.trim().toLowerCase() : ''
-  if (id === null || !shared.CONTROL_ACTIONS.includes(action)) return
+  if (id === null || !shared.DESKTOP_ACTIONS.includes(action)) return
   const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
   // `visit` 是「可能带对象」：从邻居面板点某一户就带 deviceId；没有就交给宿主随机挑一位
   // （HTTP 口的老行为）。needsDevice 的那几个动作则必须有对象，缺了直接拒绝。
@@ -745,8 +747,14 @@ ipcMain.on('local-pet:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '这个操作缺少对象，稍后再试。', error: 'bad-device-id' })
     return
   }
+  // 点播要带动画名：只收安全的动画名，名字由宿主再去 dsh-pet 那边校验一次。
+  const name = action === 'play-anim' ? shared.normalizeAnim(payload?.name) : null
+  if (action === 'play-anim' && name === null) {
+    sendActionResult({ id, ok: false, notice: '这个动作没有名字，播不了。', error: 'bad-name' })
+    return
+  }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
-  const written = writeEvent({ type: 'action', id, action, deviceId })
+  const written = writeEvent({ type: 'action', id, action, deviceId, ...(name === null ? {} : { name }) })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
 
@@ -1027,6 +1035,7 @@ function startHostLink () {
 
   stdinParser = shared.createLineParser()
   const input = openHostInput()
+  hostInput = input
   input.setEncoding('utf8')
   input.on('data', (chunk) => {
     for (const entry of stdinParser.push(chunk)) {
@@ -1133,6 +1142,19 @@ function applyCommand (command) {
     case 'status':
       writeEvent(statusEvent(command.id))
       return
+    case 'open-url': {
+      // 「打开软件」（ticket 22）：地址由宿主给（它拿得到 DSH 的 origin），helper 只负责交出去。
+      // 只认 http/https（shared.normalizeHostCommand 已经挡过一遍），这里再挡一次纯属防御。
+      const url = typeof command.url === 'string' ? command.url : ''
+      if (!/^https?:\/\//i.test(url)) {
+        writeEvent({ type: 'error', id: command.id, code: 'bad-url', message: 'only http(s) allowed' })
+        return
+      }
+      void shell.openExternal(url).catch((error) => {
+        writeEvent({ type: 'error', id: command.id, code: 'open-failed', message: String(error?.message ?? error).slice(0, 200) })
+      })
+      return
+    }
     case 'shot':
       if (!rendererReady) {
         writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'renderer not ready' })
@@ -1506,6 +1528,14 @@ function shutdown (code) {
   if (quitting) return
   quitting = true
   forceIgnore('shutdown')
+  // fd 0 上的读请求会挂在 libuv 线程池里，Electron 的退出流程要等它回报；
+  // 不主动销毁这条流，Windows 上收到 `quit` 后进程会一直停在那里不退出
+  // （宿主 dispose 时会顺带关掉管道所以看不出来，冒烟里只发 quit 就卡住了）。
+  try {
+    if (hostInput !== null) hostInput.destroy()
+  } catch {
+    // 已经关了
+  }
   stopTimers()
   closeRenameWindow('shutdown')
   try {

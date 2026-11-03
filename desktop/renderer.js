@@ -1,5 +1,5 @@
 /**
- * 渲染端：把宿主给的场景 v2 画成桌面宠物，并在本地跑 60fps 物理。
+ * 渲染端：把宿主给的场景 v3 画成桌面宠物，并在本地跑 60fps 物理。
  *
  * 分工（ticket 08）：
  *   - 宿主决定「有谁/叫什么/在播什么」（scene.items 的 id/role/label/anim/color）；
@@ -85,6 +85,7 @@
    */
   const ui = {
     popover: null, // { petId, kind, el, signature, openedAt, lastActiveAt }
+    menu: null, // { petId, root, panels: [{ level, el }], openedAt, lastActiveAt, leaveTimer }
     street: null, // { petId, el, head, title, grid, more, actions, showBlocked, openedAt, lastActiveAt }
     prompt: null, // { key, deviceId, nickname, el }
     recall: null, // { el }
@@ -282,6 +283,22 @@
       }
     }
 
+    if (ui.menu !== null) {
+      const panels = []
+      for (const panel of ui.menu.panels) {
+        const rect = rectOf('ui:menu:' + String(panel.level), panel.el)
+        if (rect !== null) panels.push(rect)
+      }
+      // 桥接只连"一级面板 ↔ 宠物"，不把整串子菜单并进来：并集会变成一大块可交互区，
+      // 等于在桌面上挖掉一片本该穿透的地方。
+      const pet = pets.get(ui.menu.petId)
+      if (panels.length > 0 && pet !== undefined) {
+        const bridge = shared.unionRect([panels[0], anchorOfPet(pet)])
+        if (bridge !== null) rects.push({ id: 'ui:menu-bridge', ...bridge })
+      }
+      for (const rect of panels) rects.push(rect)
+    }
+
     if (ui.recall !== null) add('ui:recall-chip', ui.recall.el)
     return rects
   }
@@ -386,6 +403,7 @@
     for (const [id, pet] of [...pets]) {
       if (alive.has(id)) continue
       if (drag !== null && drag.id === id) abortDrag()
+      if (ui.menu !== null && ui.menu.petId === id) closeMenu('gone')
       destroyPet(pet)
       pets.delete(id)
     }
@@ -415,12 +433,16 @@
     el.appendChild(nameEl)
     el.addEventListener('pointerdown', onPetPointerDown)
     el.addEventListener('mousedown', onPetMouseDown)
+    el.addEventListener('contextmenu', onPetContextMenu)
     stage.appendChild(el)
 
     const pet = {
       id: item.id,
       item,
       body: spawnBody(item),
+      // 「回到初始位置」回这里：它第一次出现时宿主给的那个出生点。场景后续的 x/y 只是
+      // "如果要重出生就用这个"，不会让已经在场上的宠物瞬移，所以不能拿它当 home。
+      spawn: { x: item.x, y: item.y },
       el,
       mediaBox,
       nameEl,
@@ -440,7 +462,9 @@
         clipStartedAt: 0,
         durationMs: 0,
         poolKey: '',
-        gaveUp: false
+        gaveUp: false,
+        // 本机兜底点播：{ name, until }。有它时 updateMedia 优先播这一段。
+        local: null
       }
     }
     updateNode(pet)
@@ -498,6 +522,7 @@
     }
     pet.el.removeEventListener('pointerdown', onPetPointerDown)
     pet.el.removeEventListener('mousedown', onPetMouseDown)
+    pet.el.removeEventListener('contextmenu', onPetContextMenu)
     pet.el.remove()
   }
 
@@ -687,6 +712,7 @@
       ui.openTimer = null
       if (ui.popover !== null) closePopover('timeout')
       if (ui.street !== null) closeStreet('timeout')
+      if (ui.menu !== null) closeMenu('timeout')
     }, UI_MAX_OPEN_MS)
   }
 
@@ -741,6 +767,274 @@
     }
     reportOverlayRects(true)
     layoutUi(true)
+  }
+
+  // -------------------------------------------------------------------------
+  // 右键菜单（ticket 22 / ADR-0010）
+  //
+  // 只挂自己的宠物。菜单是自绘 DOM：宿主下发树（scene.menu），这里只负责画和收。
+  // 每一级面板都是**平级**的绝对定位盒子：右/下贴边翻到另一侧，各自独立滚动。
+  // 菜单矩形进 overlay-rects，整窗其余部分继续穿透——点菜单外不关菜单（那一击要落到桌面）。
+  // -------------------------------------------------------------------------
+
+  /** 面板与父项之间的缝；和 owner 的 item 挨得够近，但不至于盖住父项。 */
+  const MENU_GAP = 2
+  const MENU_MARGIN = 4
+
+  function menuUsable (menu) {
+    if (menu === null || typeof menu !== 'object') return false
+    const tools = Array.isArray(menu.tools) ? menu.tools.length : 0
+    const groups = Array.isArray(menu.groups) ? menu.groups.length : 0
+    return tools > 0 || groups > 0
+  }
+
+  function onPetContextMenu (event) {
+    if (inputLocked && event.isTrusted) return
+    const pet = pets.get(event.currentTarget.dataset.id)
+    if (pet === undefined || pet.item.role !== 'self') return
+    event.preventDefault()
+    event.stopPropagation()
+    if (!menuUsable(scene.menu)) return
+    if (ui.menu !== null && ui.menu.petId === pet.id) {
+      closeMenu('toggle')
+      return
+    }
+    openMenu(pet, event.clientX, event.clientY)
+  }
+
+  function openMenu (pet, x, y) {
+    closeMenu('replace')
+    closePopover('menu', { suppress: false })
+    closeStreet('menu')
+    const root = document.createElement('div')
+    root.className = 'lp-menu'
+    root.setAttribute('role', 'menu')
+    root.addEventListener('pointerdown', (event) => event.stopPropagation())
+    root.addEventListener('click', onMenuClick)
+    uiLayer.appendChild(root)
+    ui.menu = {
+      petId: pet.id,
+      root,
+      panels: [],
+      groupIndex: 0,
+      hoverRow: null,
+      openedAt: performance.now(),
+      lastActiveAt: performance.now(),
+      leaveTimer: null
+    }
+    // 停住：菜单悬停期间它不飞、不漫游（dsh-pet 的 stopThrow/stopMove 同一个意思）。
+    pet.body = shared.createBody({ ...pet.body, vx: 0, vy: 0 }, area)
+    openMenuPanel(0, { x, y, width: 0, height: 0 })
+    resetOpenTimer()
+    reportOverlayRects(true)
+  }
+
+  function closeMenu (reason) {
+    if (ui.menu === null) return
+    const current = ui.menu
+    ui.menu = null
+    if (current.leaveTimer !== null) clearTimeout(current.leaveTimer)
+    try {
+      current.root.remove()
+    } catch {
+      // 已经没了
+    }
+    void reason
+    reportOverlayRects(true)
+  }
+
+  function trimMenuPanels (level) {
+    if (ui.menu === null) return
+    while (ui.menu.panels.length > level) {
+      const panel = ui.menu.panels.pop()
+      try {
+        panel.el.remove()
+      } catch {
+        // 已经没了
+      }
+    }
+  }
+
+  /**
+   * 打开第 level 级面板，锚点是父项那一条（一级菜单用指针处的一个点）。
+   * 先裁掉更深的旧面板：悬停换了分类，上一串子菜单必须立刻消失，不能留在屏幕上。
+   */
+  function openMenuPanel (level, anchor) {
+    if (ui.menu === null) return
+    trimMenuPanels(level)
+    const el = buildMenuPanel(level)
+    if (el === null) return
+    el.dataset.level = String(level)
+    ui.menu.root.appendChild(el)
+    const rect = shared.placeMenu(
+      anchor,
+      { width: el.offsetWidth, height: el.offsetHeight },
+      { width: Math.max(1, Math.round(window.innerWidth)), height: Math.max(1, Math.round(window.innerHeight)) },
+      { margin: MENU_MARGIN, gap: MENU_GAP }
+    )
+    el.style.left = rect.x.toFixed(1) + 'px'
+    el.style.top = rect.y.toFixed(1) + 'px'
+    ui.menu.panels.push({ level, el })
+    ui.menu.lastActiveAt = performance.now()
+    reportOverlayRects(true)
+  }
+
+  function menuRow (label, options = {}) {
+    const row = document.createElement('div')
+    row.className = 'lp-menu-item'
+    row.setAttribute('role', 'menuitem')
+    if (options.kind === 'tool') {
+      row.dataset.menuKind = 'tool'
+      row.dataset.menuId = options.id
+    } else if (options.kind === 'branch') {
+      row.dataset.menuKind = 'branch'
+    } else if (options.kind === 'group') {
+      row.dataset.menuKind = 'group'
+      row.dataset.menuGroup = String(options.index)
+    } else if (options.kind === 'anim') {
+      row.dataset.menuKind = 'anim'
+      row.dataset.menuAnim = options.name
+    }
+    const text = document.createElement('span')
+    text.className = 'lp-menu-label'
+    text.textContent = label
+    row.appendChild(text)
+    if (typeof options.hint === 'string' && options.hint !== '') {
+      const hint = document.createElement('span')
+      hint.className = 'lp-menu-hint'
+      hint.textContent = options.hint
+      row.appendChild(hint)
+    }
+    if (options.arrow === true) {
+      const arrow = document.createElement('span')
+      arrow.className = 'lp-menu-arrow'
+      arrow.textContent = '›'
+      row.appendChild(arrow)
+    }
+    return row
+  }
+
+  function buildMenuPanel (level) {
+    const menu = scene.menu
+    const panel = document.createElement('div')
+    panel.className = 'lp-menu-panel'
+    panel.setAttribute('role', 'menu')
+    if (level === 0) {
+      for (const tool of menu.tools) {
+        panel.appendChild(menuRow(tool.label, { kind: 'tool', id: tool.id, hint: tool.hint }))
+      }
+      if (menu.groups.length > 0) {
+        panel.appendChild(menuRow('动作', { kind: 'branch', arrow: true }))
+      }
+      return panel
+    }
+    if (level === 1) {
+      menu.groups.forEach((group, index) => {
+        panel.appendChild(menuRow(group.label, { kind: 'group', index, arrow: true }))
+      })
+      return panel
+    }
+    const group = menu.groups[ui.menu === null ? 0 : ui.menu.groupIndex]
+    if (group === undefined) return null
+    for (const name of group.actions) {
+      panel.appendChild(menuRow(name, { kind: 'anim', name }))
+    }
+    return panel
+  }
+
+  /**
+   * 悬停切链：跟着指针走（pointermove），不靠 mouseover——整窗在穿透与可交互之间翻，
+   * 指针事件才是每个输入路径都会有的那一份。
+   */
+  function updateMenuPointer (point) {
+    if (ui.menu === null || point === null) return
+    const element = document.elementFromPoint(point.x, point.y)
+    const row = element === null ? null : element.closest('.lp-menu-item')
+    if (row === null || row === ui.menu.hoverRow) return
+    ui.menu.hoverRow = row
+    ui.menu.lastActiveAt = performance.now()
+    const kind = row.dataset.menuKind
+    const panel = row.closest('.lp-menu-panel')
+    const level = panel === null ? 0 : Number(panel.dataset.level)
+    const rect = row.getBoundingClientRect()
+    if (kind === 'branch') {
+      openMenuPanel(1, { x: rect.right, y: rect.top, width: 0, height: 0 })
+    } else if (kind === 'group') {
+      ui.menu.groupIndex = Number(row.dataset.menuGroup)
+      openMenuPanel(2, { x: rect.right, y: rect.top, width: 0, height: 0 })
+    } else {
+      trimMenuPanels(level + 1)
+    }
+  }
+
+  function onMenuClick (event) {
+    if (ui.menu === null) return
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const row = target.closest('.lp-menu-item')
+    if (row === null) return
+    event.preventDefault()
+    event.stopPropagation()
+    const kind = row.dataset.menuKind
+    ui.lastMenuClick = { kind, name: row.dataset.menuAnim ?? null, id: row.dataset.menuId ?? null, at: performance.now() }
+    if (kind === 'tool') {
+      const id = row.dataset.menuId
+      const petId = ui.menu.petId
+      closeMenu('action')
+      runMenuTool(id, petId)
+      return
+    }
+    if (kind === 'anim') {
+      const name = row.dataset.menuAnim
+      const petId = ui.menu.petId
+      closeMenu('action')
+      playAnimFromMenu(petId, name)
+    }
+    // branch / group 只是展开，点击不收起
+  }
+
+  function runMenuTool (id, petId) {
+    const pet = pets.get(petId)
+    if (id === 'home') {
+      if (pet !== undefined) homePet(pet)
+      return
+    }
+    if (id === 'reload' || id === 'open-site') requestAction(id)
+  }
+
+  /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */
+  function homePet (pet) {
+    const spawn = pet.spawn ?? { x: pet.item.x, y: pet.item.y }
+    pet.body = shared.createBody({
+      x: spawn.x,
+      y: spawn.y,
+      width: pet.body.width,
+      height: pet.body.height,
+      vx: 0,
+      vy: 0
+    }, area)
+    applyTransform(pet)
+    reportRects(true)
+  }
+
+  function playAnimFromMenu (petId, name) {
+    const pet = pets.get(petId)
+    if (pet === undefined) return
+    const fallback = () => playLocalAnim(pet, name)
+    // 先申请本体的点播；宿主说不行（没装/不可达/被拒）再退成本机播一次。
+    requestAction('play-anim', undefined, { name, fallback })
+  }
+
+  /**
+   * 本机兜底：在影子上播一次，并在这一段结束前不让 `/state` 把它盖回去。
+   * 只影响本地表现——本体的动作仍然是它自己的事（ADR-0009 的降级路径）。
+   */
+  function playLocalAnim (pet, name) {
+    if (name === null || name === undefined || name === '') return
+    pet.media.failed.delete(name)
+    pet.media.local = { name, until: performance.now() + 8000 }
+    playClip(pet, name)
+    reportOverlayRects(true)
   }
 
   // -------------------------------------------------------------------------
@@ -1012,7 +1306,8 @@
   }
 
   function maybeOpenHoverControls () {
-    if (pointer === null || drag !== null || ui.popover !== null || !uiLayer) return
+    // 菜单开着时不再弹左键弹层：右键菜单和悬停弹层是两套入口，同时出现会互相抢鼠标。
+    if (pointer === null || drag !== null || ui.popover !== null || ui.menu !== null || !uiLayer) return
     const pet = petAt(pointer)
     // 悬停抑制只对“被关掉的那只宠物”生效：光标还停在它身上时不要原地重弹；
     // 指针一旦离开它（例如从放行卡按钮移回宠物），抑制就解除。
@@ -1029,6 +1324,7 @@
   /** 光标离开弹层与锚点宠物后，给一小段宽限再关闭。 */
   function updateUiHover () {
     updateStreetHover()
+    updateMenuHover()
     if (ui.popover === null || pointer === null) return
     const current = ui.popover
     const pet = pets.get(current.petId)
@@ -1044,6 +1340,47 @@
     ui.leaveTimer = setTimeout(() => {
       ui.leaveTimer = null
       if (ui.popover === current) closePopover('leave')
+    }, UI_LEAVE_GRACE_MS)
+  }
+
+  /**
+   * 菜单的收起：点菜单外不关（那一击已经落到桌面上了），只能靠"移开"和超时。
+   * 光标从宠物跨进菜单要穿过一小段缝，所以给和弹层同一档宽限。
+   */
+  /**
+   * 光标是不是压在菜单上。
+   *
+   * 不能量 `.lp-menu` 根节点：它里面全是 `position:absolute` 的面板，根节点自己 0×0，
+   * 于是"在菜单里"永远判 false —— 光标一离开宠物，500ms 宽限一到菜单就自己关了
+   * （用户看到的"一瞬间就消失"）。真正有尺寸的是每一级面板。
+   */
+  function menuContainsPoint (point) {
+    if (ui.menu === null || point === null) return false
+    for (const panel of ui.menu.panels) {
+      if (pointInRect(point, elementRect(panel.el))) return true
+    }
+    return false
+  }
+
+  function updateMenuHover () {
+    if (ui.menu === null || pointer === null) return
+    const current = ui.menu
+    const pet = pets.get(current.petId)
+    const insideMenu = menuContainsPoint(pointer)
+    const insidePet = pet !== undefined && pointInRect(pointer, anchorOfPet(pet))
+    if (insideMenu || insidePet) {
+      current.lastActiveAt = performance.now()
+      if (current.leaveTimer !== null) {
+        clearTimeout(current.leaveTimer)
+        current.leaveTimer = null
+      }
+      resetOpenTimer()
+      return
+    }
+    if (current.leaveTimer !== null) return
+    current.leaveTimer = setTimeout(() => {
+      current.leaveTimer = null
+      if (ui.menu === current) closeMenu('leave')
     }, UI_LEAVE_GRACE_MS)
   }
 
@@ -1354,17 +1691,29 @@
     const notice = result !== null && typeof result.notice === 'string' && result.notice.trim() !== ''
       ? result.notice
       : fallbackNoticeFor(pending.action)
+    // 本机兜底先于气泡：点了动作，宠物先动起来，再解释"只是本机播了一次"。
+    if (typeof pending.fallback === 'function') {
+      try {
+        pending.fallback(result)
+      } catch {
+        // 兜底自己坏了，至少还有气泡
+      }
+    }
     showNotice(notice)
   }
 
   function requestAction (action, deviceId, options = {}) {
-    if (!shared.CONTROL_ACTIONS.includes(action)) return
+    if (!shared.DESKTOP_ACTIONS.includes(action)) return
     ui.actionSeq += 1
     const id = 'act-' + String(ui.actionSeq) + '-' + Date.now().toString(36)
     const pending = {
       id,
       action,
       deviceId: typeof deviceId === 'string' && deviceId !== '' ? deviceId : undefined,
+      // 点播要带名字；其余动作为 undefined。
+      name: typeof options.name === 'string' && options.name !== '' ? options.name : undefined,
+      // 失败时的本机兜底（点播不可达 → 本机播一次）。只能影响本地表现，绝不能改状态。
+      fallback: typeof options.fallback === 'function' ? options.fallback : null,
       prompt: options.prompt === true,
       at: Date.now(),
       timer: null
@@ -1387,7 +1736,7 @@
       return
     }
     try {
-      api.requestAction({ id, action, deviceId: pending.deviceId })
+      api.requestAction({ id, action, deviceId: pending.deviceId, name: pending.name })
     } catch {
       settleAction(id, { ok: false, notice: ACTION_FAILED_NOTICE })
     }
@@ -1635,6 +1984,18 @@
   function updateMedia (pet, now) {
     const media = pet.media
     const anim = pet.item.anim
+    // 本机兜底点播（ADR-0009 的降级路径）：这一段播完之前，不被 /state 的镜像盖回去。
+    if (media.local !== null && media.local !== undefined) {
+      if (anim !== null && anim === media.local.name) {
+        // 本体已经回灌了同一个动作：兜底使命结束，交还给镜像。
+        media.local = null
+      } else if (now < media.local.until) {
+        if (media.clip !== media.local.name) playClip(pet, media.local.name)
+        return
+      } else {
+        media.local = null
+      }
+    }
     const src = pet.item.src ?? null
     // 本机素材池由宿主下发（dsh-pet 的全部动作）；没有就退回内置 3 段。
     const pool = Array.isArray(pet.item.idlePool) && pet.item.idlePool.length > 0
@@ -1852,6 +2213,7 @@
     }
     evaluate(pointer)
     updateUiHover()
+    updateMenuPointer(pointer)
     maybeOpenHoverControls()
   }
 
@@ -1909,6 +2271,7 @@
     }
     if (drag !== null) abortDrag()
     closePopover('resize')
+    closeMenu('resize')
     layoutUi(true)
     evaluate(pointer, true)
     reportRects(true)
@@ -1951,7 +2314,13 @@
 
     if (drag !== null && now - drag.lastAt > DRAG_TIMEOUT_MS) abortDrag()
 
+    const frozenId = ui.menu === null ? null : ui.menu.petId
     for (const pet of pets.values()) {
+      // 菜单开着的那只停住：不飞、不漫游，也不轮播换段（ADR-0010）。
+      if (pet.id === frozenId) {
+        applyTransform(pet)
+        continue
+      }
       if (drag !== null && drag.id === pet.id) {
         pet.body = shared.dragBody(pet.body, drag.target, area, dt)
       } else {
@@ -1960,9 +2329,15 @@
       applyTransform(pet)
       updateMedia(pet, now)
     }
-    // 弹层/卡片跟着宠物走；overlay 矩形按 10Hz 重新上报，静止时靠心跳。
-    if (ui.popover !== null || ui.prompt !== null || ui.recall !== null || ui.notice !== null) {
+    // 弹层/卡片/菜单跟着宠物走；overlay 矩形按 10Hz 重新上报，静止时靠心跳。
+    //
+    // 这里**必须**包括菜单：矩形只在变化时报一次的话，主进程 900ms 后按过期处理，
+    // 窗口翻回穿透——菜单画着，点击却落到后面的 app 上（用户报的"点了没反应、穿透"）。
+    // reportOverlayRects 自己按 300ms 节流，逐帧调用不会刷屏。
+    if (ui.popover !== null || ui.prompt !== null || ui.recall !== null || ui.notice !== null ||
+      ui.menu !== null || ui.street !== null) {
       layoutUi(false)
+      reportOverlayRects(false)
     }
     // 拖拽时 ui:drag 必须紧跟光标：租约只有在“光标压在活矩形上”时才生效。
     if (drag !== null && now - ui.lastDragRectAt >= RECT_REPORT_MS) {
@@ -2054,6 +2429,23 @@
           window.dispatchEvent(new Event('blur'))
           return drag === null
         }
+        /** 右键：在光标下的宠物元素上派发 contextmenu，走和真实右键同一套处理器。 */
+        if (phase === 'context') {
+          const element = document.elementFromPoint(x, y)
+          const petEl = element === null ? null : element.closest('.lp-pet')
+          if (petEl === null) return false
+          petEl.dispatchEvent(new MouseEvent('contextmenu', {
+            bubbles: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            button: 2,
+            buttons: 2
+          }))
+          return true
+        }
         if (phase === 'up') {
           const hadDrag = drag !== null
           window.dispatchEvent(new PointerEvent('pointerup', {
@@ -2078,6 +2470,11 @@
         if (phase === 'click') {
           const element = document.elementFromPoint(x, y)
           if (element === null) return false
+          const menuRow = element.closest('.lp-menu-item')
+          if (menuRow !== null) {
+            menuRow.click()
+            return true
+          }
           const button = element.closest('[data-lp-action]')
           if (button !== null) {
             button.click()
@@ -2152,6 +2549,35 @@
           })),
           hoverSuppressed: ui.hoverSuppressed
         },
+        lastMenuClick: ui.lastMenuClick ?? null,
+        // 诊断：菜单开着时不该还有弹层 DOM（两套入口会互相抢鼠标）。
+        strayPopovers: uiLayer === null ? 0 : uiLayer.querySelectorAll('.lp-popover').length,
+        menu: ui.menu === null
+          ? null
+          : {
+              petId: ui.menu.petId,
+              panels: ui.menu.panels.map((panel) => {
+                const box = panel.el.getBoundingClientRect()
+                return {
+                  level: panel.level,
+                  x: round(box.left),
+                  y: round(box.top),
+                  width: round(box.width),
+                  height: round(box.height)
+                }
+              }),
+              rows: [...ui.menu.root.querySelectorAll('.lp-menu-item')].map((row) => {
+                const box = row.getBoundingClientRect()
+                return {
+                  kind: row.dataset.menuKind ?? null,
+                  label: row.querySelector('.lp-menu-label')?.textContent ?? row.textContent,
+                  x: round(box.left),
+                  y: round(box.top),
+                  width: round(box.width),
+                  height: round(box.height)
+                }
+              })
+            },
         uiRects: uiRects().map((rect) => ({
           id: rect.id,
           x: round(rect.x),
@@ -2166,6 +2592,9 @@
           anim: pet.item.anim,
           x: round(pet.body.x),
           y: round(pet.body.y),
+          // 「回到初始位置」的目标点：调试/冒烟要能断言"回到哪儿"。
+          spawnX: round(pet.spawn?.x ?? pet.item.x),
+          spawnY: round(pet.spawn?.y ?? pet.item.y),
           width: round(pet.body.width),
           height: round(pet.body.height),
           vx: round(pet.body.vx),

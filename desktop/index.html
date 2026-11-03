@@ -465,6 +465,66 @@
         box-shadow: 0 8px 22px rgba(0, 0, 0, 0.34), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
         pointer-events: none;
       }
+
+      /* 右键菜单（ticket 22）：每级一个独立面板，位置由 renderer 用 shared.placeMenu 写死，
+         面板之间平级、各自滚动——子面板不嵌进父面板，才不会一起被裁掉。 */
+      .lp-menu {
+        position: absolute;
+        left: 0;
+        top: 0;
+        z-index: 30;
+        pointer-events: auto;
+        user-select: none;
+      }
+      .lp-menu-panel {
+        position: absolute;
+        min-width: 148px;
+        max-width: 280px;
+        max-height: min(62vh, 460px);
+        overflow-y: auto;
+        padding: 4px;
+        border-radius: 10px;
+        background: rgba(15, 21, 29, 0.94);
+        box-shadow: 0 10px 26px rgba(0, 0, 0, 0.4), inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+        font-size: 12px;
+        line-height: 1.4;
+        color: #f4f8ff;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(255, 255, 255, 0.22) transparent;
+      }
+      .lp-menu-panel::-webkit-scrollbar {
+        width: 8px;
+      }
+      .lp-menu-panel::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.18);
+        border-radius: 4px;
+        border: 2px solid transparent;
+        background-clip: content-box;
+      }
+      .lp-menu-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 14px;
+        padding: 6px 10px;
+        border-radius: 6px;
+        white-space: nowrap;
+        cursor: default;
+      }
+      .lp-menu-item:hover {
+        background: rgba(59, 116, 216, 0.34);
+      }
+      .lp-menu-label {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .lp-menu-hint,
+      .lp-menu-arrow {
+        flex: none;
+        font-size: 11px;
+        color: rgba(244, 248, 255, 0.55);
+      }
     </style>
   </head>
   <body>

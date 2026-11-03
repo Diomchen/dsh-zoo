@@ -1,5 +1,5 @@
 /**
- * 桌面 helper 与宿主共用的纯逻辑：stdio 行协议、场景 v2、宠物物理、命中判定、点击穿透的安全裁定。
+ * 桌面 helper 与宿主共用的纯逻辑：stdio 行协议、场景 v3、宠物物理、命中判定、点击穿透的安全裁定。
  *
  * 为什么是 UMD（同时给三种运行环境用）：
  *   - Electron 主进程（desktop/main.js，CJS）—— require('./shared.js')；
@@ -76,6 +76,17 @@
   const MAX_COORD = 1e6
   const MAX_ITEM_SIZE = 10000
 
+  /**
+   * 右键菜单（ticket 22）。菜单内容由宿主下发，渲染端只画。
+   *
+   * 一级 = 工具项 + 动作；「动作」下面是分类，分类下面是动画名。
+   * 工具项是**固定集合**：渲染端只认这几个 id，不认识的直接丢——宿主不该借菜单下发任意命令。
+   */
+  const MAX_MENU_TOOLS = 8
+  const MAX_MENU_GROUPS = 24
+  const MAX_MENU_ACTIONS = 256
+  const MENU_TOOL_IDS = ['open-site', 'home', 'reload']
+
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
   const HOVER_CONFIRM_MAX_AGE_MS = 1200
@@ -114,13 +125,17 @@
   const DEFAULT_COLOR = '#3b74d8'
   const ITEM_KINDS = ['pet', 'card']
   const PET_ROLES = ['self', 'guest', 'visitor']
-  const SCENE_VERSION = 2
+  const SCENE_VERSION = 3
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
    * （装了 dsh-pet 就写它的配置，见 ADR-0007）。
    */
   const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss', 'rename']
+  /** 菜单项的动作（ticket 22）：点播 / 重载配置 / 打开软件。同样只是一次「申请」。 */
+  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site']
+  /** helper → 宿主能报的全部动作：控件 + 菜单。 */
+  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
   const MAX_ACTION_TEXT = 64
   /**
@@ -228,6 +243,22 @@
   /** helper 只认自己的 cache 协议：不是这个形状的 URL 一律丢掉，不让场景变成任意地址。 */
   function normalizeAssetUrl (value) {
     return typeof value === 'string' && CACHE_ASSET_RE.test(value) ? value : null
+  }
+
+  /**
+   * 交给系统浏览器/应用去打开的地址（ticket 22 的「打开软件」）。
+   * 只认 http/https：`file:` 之类会让一个菜单项变成任意本地文件的入口。
+   */
+  function normalizeHttpUrl (value) {
+    if (typeof value !== 'string') return null
+    const text = value.trim()
+    if (text === '' || text.length > MAX_PATH_LENGTH) return null
+    try {
+      const url = new URL(text)
+      return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : null
+    } catch {
+      return null
+    }
   }
 
   function semanticBadge (value) {
@@ -441,6 +472,101 @@
     return controls
   }
 
+  /**
+   * 右键菜单（ticket 22）的宿主 → 渲染端状态。
+   *
+   * 形状刻意扁平，渲染端不做任何"拼菜单"的判断：
+   *   tools  [{ id, label, hint? }]                 一级工具项，id ∈ MENU_TOOL_IDS
+   *   groups [{ label, actions: [动画名] }]          「动作」下的分类；空分类不出现
+   *
+   * 菜单是高频交互入口：一条坏数据只能丢自己，绝不能让整份菜单消失。
+   */
+  function emptyMenu () {
+    return { tools: [], groups: [] }
+  }
+
+  function normalizeMenu (raw) {
+    const menu = emptyMenu()
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return menu
+
+    const seenTools = new Set()
+    if (Array.isArray(raw.tools)) {
+      for (const candidate of raw.tools) {
+        if (menu.tools.length >= MAX_MENU_TOOLS) break
+        if (candidate === null || typeof candidate !== 'object') continue
+        const id = typeof candidate.id === 'string' && MENU_TOOL_IDS.includes(candidate.id)
+          ? candidate.id
+          : null
+        if (id === null || seenTools.has(id)) continue
+        const label = normalizeText(candidate.label, null, MAX_LABEL_LENGTH)
+        if (label === null) continue
+        seenTools.add(id)
+        const hint = normalizeText(candidate.hint, null, MAX_LABEL_LENGTH)
+        menu.tools.push({ id, label, ...(hint === null ? {} : { hint }) })
+      }
+    }
+
+    const seenGroups = new Set()
+    if (Array.isArray(raw.groups)) {
+      for (const candidate of raw.groups) {
+        if (menu.groups.length >= MAX_MENU_GROUPS) break
+        if (candidate === null || typeof candidate !== 'object') continue
+        const label = normalizeText(candidate.label, null, MAX_LABEL_LENGTH)
+        if (label === null || seenGroups.has(label)) continue
+        const actions = []
+        const seen = new Set()
+        if (Array.isArray(candidate.actions)) {
+          for (const name of candidate.actions) {
+            if (actions.length >= MAX_MENU_ACTIONS) break
+            const anim = normalizeAnim(name)
+            if (anim === null || seen.has(anim)) continue
+            seen.add(anim)
+            actions.push(anim)
+          }
+        }
+        // 空分类不画：dsh-pet 的配置里就有没配动作的档位（事件、转向…），留一排空箭头更糟。
+        if (actions.length === 0) continue
+        seenGroups.add(label)
+        menu.groups.push({ label, actions })
+      }
+    }
+
+    return menu
+  }
+
+  /**
+   * 把一块面板（菜单一级 / 子菜单）摆到锚点旁边：贴右翻左、贴下翻上，再夹进工作区。
+   *
+   * 锚点是一块矩形：一级菜单用"指针处 1×1"，子菜单用"父项那一条"。
+   * 返回的是窗口局部坐标，渲染端只负责写 style。
+   */
+  function placeMenu (anchor, size, area, options = {}) {
+    const box = normalizeArea(area)
+    const margin = clampNumber(options.margin ?? 8, 0, 64)
+    const gap = clampNumber(options.gap ?? 2, 0, 32)
+    const width = Math.max(1, Math.min(Math.round(size?.width ?? 0), box.width))
+    const height = Math.max(1, Math.min(Math.round(size?.height ?? 0), box.height))
+    const anchorX = Number.isFinite(anchor?.x) ? anchor.x : 0
+    const anchorY = Number.isFinite(anchor?.y) ? anchor.y : 0
+    const anchorW = Number.isFinite(anchor?.width) ? anchor.width : 0
+    const maxX = Math.max(margin, box.width - width - margin)
+    const maxY = Math.max(margin, box.height - height - margin)
+
+    // 先试贴在锚点右侧；放不下就翻到左侧（子菜单就是这样一层层展开的）。
+    let x = anchorX + anchorW + gap
+    if (x + width > box.width - margin) x = anchorX - width - gap
+    // 纵向默认对齐锚点顶部；底部放不下就往上顶。
+    let y = anchorY
+    if (y + height > box.height - margin) y = anchorY + (anchor?.height ?? 0) - height
+    if (y < margin) y = box.height - height - margin
+    return {
+      x: clampNumber(x, margin, maxX),
+      y: clampNumber(y, margin, maxY),
+      width,
+      height
+    }
+  }
+
   function normalizeScene (raw) {
     const items = []
     if (raw !== null && typeof raw === 'object' && Array.isArray(raw.items)) {
@@ -457,12 +583,20 @@
       version: SCENE_VERSION,
       reset: raw !== null && typeof raw === 'object' && raw.reset === true,
       items,
-      controls: normalizeControls(raw !== null && typeof raw === 'object' ? raw.controls : null)
+      controls: normalizeControls(raw !== null && typeof raw === 'object' ? raw.controls : null),
+      // v3：右键菜单的内容。旧场景没有这个字段 → 空菜单，渲染端不弹。
+      menu: normalizeMenu(raw !== null && typeof raw === 'object' ? raw.menu : null)
     }
   }
 
   function emptyScene () {
-    return { version: SCENE_VERSION, reset: false, items: [], controls: emptyControls() }
+    return {
+      version: SCENE_VERSION,
+      reset: false,
+      items: [],
+      controls: emptyControls(),
+      menu: emptyMenu()
+    }
   }
 
   function normalizeArea (area) {
@@ -567,7 +701,13 @@
         color: pet.color
       }
     })
-    return { version: SCENE_VERSION, reset: options.reset === true, items, controls: normalizeControls(options.controls) }
+    return {
+      version: SCENE_VERSION,
+      reset: options.reset === true,
+      items,
+      controls: normalizeControls(options.controls),
+      menu: normalizeMenu(options.menu)
+    }
   }
 
   /** 截图/冒烟用的固定演示场景：自己的 + 两位访客，走真实素材。 */
@@ -763,6 +903,11 @@
           }
         }
       }
+      case 'open-url': {
+        const url = normalizeHttpUrl(raw.url)
+        if (url === null) return { ok: false, error: 'bad-url' }
+        return { ok: true, command: { type, id, url } }
+      }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
@@ -793,7 +938,7 @@
         return { ok: true, command: { type, id, close: raw.close === true } }
       case 'debug-dispatch': {
         const phase = typeof raw.phase === 'string' ? raw.phase.trim().toLowerCase() : ''
-        if (!['down', 'move', 'up', 'click', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
+        if (!['down', 'move', 'up', 'click', 'context', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
         const point = normalizePoint(raw)
         if (point === null) return { ok: false, error: 'bad-point' }
         return { ok: true, command: { type, id, point, phase } }
@@ -966,7 +1111,7 @@
         }
       case 'action': {
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
-        if (!CONTROL_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
+        if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
         if (id === null) return { ok: false, error: 'bad-id' }
         const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
         // `visit` 是「可能带对象」：邻居面板点某一户就带 deviceId；不带则由宿主随机挑。
@@ -977,7 +1122,10 @@
         const nickname = action === 'rename' && typeof raw.nickname === 'string'
           ? raw.nickname.slice(0, MAX_ACTION_TEXT)
           : null
-        return { ok: true, event: { type, id, action, deviceId, nickname } }
+        // 点播带动画名；名字必须是安全的动画名，否则整条事件丢掉（宿主还得再校验一遍）。
+        const name = action === 'play-anim' ? normalizeAnim(raw.name) : null
+        if (action === 'play-anim' && name === null) return { ok: false, error: 'bad-name' }
+        return { ok: true, event: { type, id, action, deviceId, nickname, ...(name === null ? {} : { name }) } }
       }
       case 'pong':
         return { ok: true, event: { type, id } }
@@ -1347,6 +1495,9 @@
     PET_ROLES,
     SCENE_VERSION,
     CONTROL_ACTIONS,
+    MENU_ACTION_IDS,
+    DESKTOP_ACTIONS,
+    MENU_TOOL_IDS,
     MAX_ACTION_TEXT,
     MAX_NAME_LENGTH,
     PET_COLORS,
@@ -1360,6 +1511,7 @@
     normalizeRole,
     normalizeSemantic,
     normalizeAssetUrl,
+    normalizeHttpUrl,
     normalizeIdlePool,
     pickIdleClip,
     semanticBadge,
@@ -1369,10 +1521,13 @@
     clipRectToArea,
     normalizeScene,
     normalizeControls,
+    normalizeMenu,
+    placeMenu,
     normalizeHostCommand,
     normalizeHelperEvent,
     emptyScene,
     emptyControls,
+    emptyMenu,
     encodeMessage,
     parseLine,
     createLineParser,

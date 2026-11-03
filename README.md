@@ -3,11 +3,12 @@
 局域网里的 DSH 宠物：自己的宠物活在桌面上，同一网段里邻居的宠物也会来串门，
 留下串门记录。没有客厅，没有第二块屏幕——整个桌面就是它们待的地方。
 
-当前落地的是 **ticket 01–18**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
+当前落地的是 **ticket 01–22**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
 helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约），宠物自发出门、访客常驻
 与「送客」/失联清理的完整状态机，桌面控件：悬停自己弹出「串门 / 召回 / 改名」、点访客
 弹出「送客」、新邻居的放行卡与失败气泡，「一只宠物只有一个名字」（ADR-0007），
-以及跨插件素材：宠物来串门时自带外观包和状态（ADR-0008 / SPEC v3）。
+跨插件素材：宠物来串门时自带外观包和状态（ADR-0008 / SPEC v3），
+以及**桌面右键菜单**：打开软件 / 回到初始位置 / 重载配置 + 「动作」三级树（ADR-0010）。
 同样的动作也可以通过 `POST /local-pet/action` 完成（见下）。
 
 ## 它做什么
@@ -24,6 +25,13 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
   串门、记录、其他访客都不受影响。**不需要为任何插件打包素材**。
 - **物理**：每只宠物有本地坐标与速度，重力、落地反弹、地面摩擦、撞边、工作区夹取；
   可以用鼠标拖起来（弹簧跟随），松手按最近轨迹投掷。位置永不过网（ADR-0003）。
+- **右键菜单**：右键自己的宠物弹出菜单——「打开软件」（主进程用系统浏览器打开 DSH）、
+  「回到初始位置」（这只回到自己的出生点）、「重载配置」（重读 `settings.json` +
+  `skin.json`，重建场景并重启 helper，不占崩溃退避次数），以及「动作」三级树
+  （分类 → 动画名，分类照 `dsh-pet` 的 `animations` 配置；没装 dsh-pet 时退到本机素材源
+  的平铺清单）。点一项动画名会 `POST dsh-pet /anim` 点播本体（ADR-0009），不可达时
+  只在本机播一次并冒一句人话。菜单只挂自己：访客和空白桌面都不弹。菜单矩形进
+  `overlay-rects`，**点菜单外不关菜单**（那一击要落到桌面），收起靠点中一项 / 移开 / 12 秒超时。
 - **点击穿透**：窗口默认整窗 `setIgnoreMouseEvents(true, { forward: true })`；只有光标
   真的在**渲染端上报的活的命中矩形**里、且渲染端心跳确认过，才临时接管鼠标。命中矩形
   只可能来自宠物与控件（弹层/放行卡/召回胶囊），超大或越界的矩形一律拒绝/裁剪。
@@ -81,6 +89,9 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
   `{"action":"end-visit","deviceId":"<访客 UUID>"}` 送走一位访客。两者都立即清场、
   写记录，并把 `visit-recall` 发三次（收到回执就停）：丢一包不会让对方把出门状态
   挂到 30 分钟上限，记录也不会变成 30 分钟。
+- **点播 / 重载 / 打开软件**：`{"action":"play-anim","name":"写代码"}` 让 `dsh-pet`
+  本体播一段（失败回 `409` + `anim-unreachable` / `anim-no-pet` / `anim-rejected`）；
+  `{"action":"reload"}` 重读配置并重建桌面；`{"action":"open-site"}` 打开 DSH。
 - **串门记录**：每次串门在双方各留一条 `{direction, nickname, startedAt, durationMs}`，
   `durationMs` 是真实停留时长（封顶 30 分钟），存在 `<dataDir>/visits.json`，
   滚动上限 200 条；记录文件损坏或不可写时只丢历史。
@@ -128,7 +139,7 @@ npm pack          # → dsh-local-pet-<version>.tgz
 ```sh
 # 用 DSH 自带的 pnpm（不需要全局装 pnpm）
 node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs" \
-  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.3.0.tgz --save-exact
+  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.3.1.tgz --save-exact
 
 # 再把 "dsh-local-pet" 加进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
 ```

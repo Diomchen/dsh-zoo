@@ -72,8 +72,9 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | --- | --- | --- |
 | `show` | — | `showInactive()` 显示；不抢焦点 |
 | `hide` | — | 先恢复穿透并入租约再隐藏 |
-| `update` | `scene` | 替换整个场景 v2（含 `controls`）；按新场景 + 渲染端矩形重新复核光标 |
+| `update` | `scene` | 替换整个场景 v3（含 `controls` / `menu`）；按新场景 + 渲染端矩形重新复核光标 |
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
+| `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行 |
 | `shot` | `id?`, `path`（绝对路径） | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
@@ -93,13 +94,29 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-busy-max` | `ms`（0 = 恢复默认） | 调试/冒烟：临时缩短连续租约硬上限（200ms..60s），用来几秒内验证 fail-closed |
 | `debug-lock-input` | `locked` | 调试/冒烟：锁住真实鼠标/焦点事件，只接受 `debug-dispatch` 的合成输入（同时清掉悬停与租约） |
 
+## 右键菜单（ticket 22）
+
+菜单内容由宿主随场景下发（`scene.menu`），helper 只画：
+
+- 只挂**自己**（`role: 'self'`）；访客和空白桌面都不弹，也不吞鼠标。
+- 一级 = 工具项（`open-site` / `home` / `reload`）+「动作」；二级 = 分类；三级 = 动画名。
+- 每级是**平级面板**：贴右/贴下自动翻到另一侧，各自独立滚动；面板矩形进 `overlay-rects`，
+  一级面板与宠物之间有桥接矩形。
+- 菜单打开时宠物停住（不飞、不漫游、不轮播换段）。
+- **浮层存在期间，overlay 矩形必须按心跳续报**（`reportOverlayRects(false)`，300ms 节流）。
+  主进程对这批矩形只认 `RENDERER_RECT_MAX_AGE_MS`（900ms），过期就当没有：窗口翻回穿透，
+  菜单画着但点击落到后面的 app 上。只在"变化时"报一次是不够的。
+- 收起只有三条路：点中某项 / 光标离开菜单与宠物 `UI_LEAVE_GRACE_MS` / `UI_MAX_OPEN_MS` 超时。
+  **点菜单外不关**——窗口在该处是穿透的，那一击要落到桌面；窗口 `focusable:false`，Esc 也收不到。
+- 「回到初始位置」在渲染端本地完成（回到该宠物的出生点）；其余两项与「动作」都只是申请。
+
 ## helper → 宿主事件
 
 | 事件 | 字段 | 说明 |
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
-| `action` | `id`, `action`, `deviceId?`, `nickname?` | 渲染端控件申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 是唯一带正文的动作（`nickname`），helper 只截长度、清洗交给宿主 |
+| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?` | 渲染端控件/菜单申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名），helper 只截长度/校验形状，清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |

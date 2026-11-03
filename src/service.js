@@ -11,6 +11,7 @@ import { dataDir, dshPetConfigPath } from './paths.js'
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
+import { buildMenu, readAnimationsConfig } from './menu.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import { resolveSkinPort, startSkinServer } from './skin-server.js'
@@ -123,6 +124,8 @@ export function createService (ctx, options = {}) {
   // 本机宠物的待机池：dsh-pet 那一整套动作名；桌面只拿它轮播，不猜、不点播。
   // 测试可以注入 options.skinPool；生产由 startSkinSource 从注册表填。
   let skinPool = Array.isArray(options.skinPool) ? options.skinPool.slice() : []
+  // 右键菜单（ticket 22）：工具项 + 动作分类，随场景一起下发；dsh-pet 的配置读不到就退平铺。
+  let desktopMenu = { tools: [], groups: [] }
   let tickTimer = null
   let heartbeatTimer = null
   let visitTimer = null
@@ -362,6 +365,54 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'rename', nickname: saved }
     }
 
+    // 右键菜单的「动作」（ticket 22 / ADR-0009）：点播本体，让 /state 把这一句回灌给影子。
+    // 失败必须是明确的失败：渲染端拿到 ok:false 会降级成本机播一次，并冒一句人话。
+    if (action === 'play-anim') {
+      const name = typeof body?.name === 'string' ? body.name.trim() : ''
+      if (name === '') return { ok: false, error: 'bad-name' }
+      if (bridge === null) return { ok: false, error: 'anim-unreachable' }
+      const played = await bridge.playAnim(name)
+      if (played.ok === true) return { ok: true, action: 'play-anim', name }
+      if (played.reason === 'no-pet') return { ok: false, error: 'anim-no-pet' }
+      if (played.reason === 'rejected') {
+        return {
+          ok: false,
+          error: 'anim-rejected',
+          ...(typeof played.message === 'string' && played.message !== '' ? { detail: played.message } : {})
+        }
+      }
+      return { ok: false, error: 'anim-unreachable' }
+    }
+
+    // 「重载配置」（ticket 22）：重读 settings.json + skin.json，重建菜单与场景，再让 helper 重建。
+    // 手动重载不占崩溃退避次数（桌面层那边另有一面旗），所以手快连点也不会把宠物重启到放弃。
+    if (action === 'reload') {
+      if (settings === null) return { ok: false, error: 'starting' }
+      try {
+        await settings.load()
+        room.setAcceptVisits(settings.acceptVisits)
+        room.setAutoVisits(settings.autoVisits)
+        syncSessionSignal()
+      } catch (error) {
+        warn(ctx, '重载设置失败：' + message(error))
+        return { ok: false, error: 'reload-failed' }
+      }
+      await refreshDesktopMenu()
+      desktopSceneSignature = null
+      syncDesktop({ reset: true })
+      if (desktop !== null && typeof desktop.reload === 'function') desktop.reload()
+      return { ok: true, action: 'reload' }
+    }
+
+    // 「打开软件」：地址由宿主给（渲染端不传 URL），只交给主进程的默认浏览器。
+    if (action === 'open-site') {
+      const url = dshOrigin(ctx)
+      if (url === null) return { ok: false, error: 'no-origin' }
+      if (desktop === null) return { ok: false, error: 'desktop-off' }
+      const opened = typeof desktop.openUrl === 'function' ? desktop.openUrl(url) : false
+      return opened ? { ok: true, action: 'open-site' } : { ok: false, error: 'open-failed' }
+    }
+
     return { ok: false, error: 'not-implemented', action }
   }
 
@@ -408,10 +459,17 @@ export function createService (ctx, options = {}) {
       startDesktopLayer()
       if (disposed) return
 
+      // 菜单的内容依赖素材源（降级清单）与 DSH 地址，所以在素材源之后建。
+      await refreshDesktopMenu()
+      if (disposed) return
+
       if (options.network !== false) {
         skinFetcher = createSkinFetcher({ dir, log })
         // 先起素材源，再起发现：beacon 的第一拍就能带上 skinPort。
         await startSkinSource()
+        if (disposed) return
+        // 素材源读完才知道降级清单（skinPool）；菜单要在这之后再建一次。
+        await refreshDesktopMenu()
         if (disposed) return
         const port = options.port ?? resolvePort(env)
         discovery = createDiscovery({
@@ -513,6 +571,26 @@ export function createService (ctx, options = {}) {
         startAutoVisitTimer()
       }
     }
+  }
+
+  /**
+   * 重建右键菜单（ticket 22）：dsh-pet 的 animations 优先，读不到退到本机素材源平铺。
+   * 任何失败都只让菜单变短，不影响桌面/串门。
+   */
+  async function refreshDesktopMenu () {
+    let animations = null
+    try {
+      const found = await readAnimationsConfig(resolveDshPetAssetDirs({ env }))
+      animations = found?.animations ?? null
+    } catch {
+      animations = null
+    }
+    try {
+      desktopMenu = buildMenu({ animations, pool: skinPool, hasOrigin: dshOrigin(ctx) !== null })
+    } catch {
+      desktopMenu = buildMenu({ pool: skinPool, hasOrigin: dshOrigin(ctx) !== null })
+    }
+    return desktopMenu
   }
 
   /**
@@ -716,10 +794,10 @@ export function createService (ctx, options = {}) {
     if (dropped > 0) room.noteSceneOverflow(dropped)
     const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot)
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
-    const signature = JSON.stringify({ pets, controls })
+    const signature = JSON.stringify({ pets, controls, menu: desktopMenu })
     if (!reset && signature === desktopSceneSignature) return false
     desktopSceneSignature = signature
-    const scene = shared.petScene(pets, desktopWorkArea, { reset, controls })
+    const scene = shared.petScene(pets, desktopWorkArea, { reset, controls, menu: desktopMenu })
     try {
       if (reset && typeof desktop.resync === 'function') return desktop.resync(scene)
       return desktop.update(scene)
@@ -742,6 +820,8 @@ export function createService (ctx, options = {}) {
       result = await handleAction({
         action: event.action,
         deviceId: event.deviceId ?? undefined,
+        // 动作点播要带名字；其余动作这里是 undefined，与 HTTP 那条路同形。
+        name: event.name ?? undefined,
         // 只有改名带正文；其余动作这里是 undefined，与 HTTP 那条路同形。
         nickname: event.nickname ?? undefined
       })
@@ -784,6 +864,14 @@ export function createService (ctx, options = {}) {
     if (error === 'bad-nickname') return '这个名字不行：要么是空的，要么太长。'
     if (error === 'dsh-pet-unreachable') return 'dsh-pet 没有响应，名字没有改（它还开着吗？）。'
     if (error === 'dsh-pet-write-failed') return 'dsh-pet 没有接受这次改名，名字没有变。'
+    if (error === 'anim-no-pet') return 'dsh-pet 里还没有宠物，这个动作只在本机播了一次。'
+    if (error === 'anim-unreachable') return 'dsh-pet 没有响应，这个动作只在本机播了一次。'
+    if (error === 'anim-rejected') return 'dsh-pet 没有接受这个动作，只在本机播了一次。'
+    if (error === 'bad-name') return '这个动作没有名字，播不了。'
+    if (error === 'reload-failed') return '配置没读出来，还是用之前那份。'
+    if (error === 'no-origin') return '拿不到 DSH 的地址，开不了软件。'
+    if (error === 'desktop-off') return '桌面层没有在运行，开不了软件。'
+    if (error === 'open-failed') return '系统没有接受这个打开请求。'
     if (error === 'dsh-pet-no-pet') return 'dsh-pet 里还没有宠物，没地方存这个名字。'
     return '这次操作没有完成，稍后再试。'
   }
@@ -1300,6 +1388,27 @@ export function createService (ctx, options = {}) {
       room.dispose()
     }
   }
+}
+
+/**
+ * DSH 自己的 GUI 地址（菜单里的「打开软件」要打开它）。
+ * 只认 http(s)；取不到就返回 null，这一项就不出现在菜单里。
+ */
+function dshOrigin (ctx) {
+  const server = ctx?.webServer
+  try {
+    if (typeof server?.getOrigin === 'function') {
+      const origin = server.getOrigin()
+      if (typeof origin === 'string' && origin !== '') {
+        const parsed = new URL(origin)
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.toString()
+      }
+    }
+  } catch {
+    // listen 还没绑定
+  }
+  const port = server?.port
+  return Number.isInteger(port) && port > 0 ? `http://127.0.0.1:${port}` : null
 }
 
 /**

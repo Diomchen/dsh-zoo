@@ -4,7 +4,9 @@ import { MAX_NICKNAME, isSafeAnimationName, sanitizeLabel } from './protocol.js'
 
 /**
  * dsh-pet 适配层。它很薄，因为 dsh-pet 的 HTTP 接口是**未承诺接口**：
- * - 只读 `/state`，不写它的配置、不调用 `/anim`；
+ * - 只读 `/state`，不写它的配置；
+ * - 唯一写口是 `/anim` 点播（ADR-0009）——桌面右键菜单的「动作」必须落到本体，
+ *   否则影子会在下一个 `/state` tick 被回落，邻居也会看到假动作；
  * - 只借 `/thumb/main/<动画名>.webm` 的素材路由（客户端用）；
  * - 任何失败都降级成一行说明，绝不让客厅白屏。
  *
@@ -294,7 +296,69 @@ export function createPetBridge ({
     }
   }
 
-  return { start, pollOnce, refresh, dispose }
+  /**
+   * 点播一段动作（[ADR-0009](../../docs/adr/0009-anim-playback-write-port.md)）：唯一的写口。
+   *
+   * 走的正是 dsh-pet 自己右键菜单「动作」那条路（`POST /anim?pet=<id>` + `{name}`），
+   * 所以效果与它本体完全一致，`/state` 也会把这一句回灌给影子。
+   *
+   * 返回 `{ ok:true }` 或 `{ ok:false, reason, message? }`，**绝不抛**：
+   *   unreachable  够不着它的 HTTP 口（没装/没起/超时）
+   *   no-pet       配置里没有宠物，没地方点播
+   *   rejected     它自己拒了（名字不在它的动画集合里、正被拖拽占用…），message 是它的原话
+   * 调用方（桌面菜单）拿到 false 就降级成本机播一次。
+   */
+  async function playAnim (name, { facing } = {}) {
+    if (disposed) return { ok: false, reason: 'unreachable' }
+    const anim = typeof name === 'string' ? name.trim() : ''
+    if (anim === '') return { ok: false, reason: 'rejected', message: '动画名是空的' }
+    const base = origin()
+    if (base === null) return { ok: false, reason: 'unreachable' }
+    const petConfig = await config()
+    const petId = typeof petConfig?.id === 'string' && petConfig.id !== '' ? petConfig.id : null
+    if (petId === null) return { ok: false, reason: 'no-pet' }
+
+    const body = { name: anim }
+    if (facing === 'left' || facing === 'right') body.facing = facing
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), timeoutMs)
+    timeout.unref?.()
+    try {
+      const response = await fetchImpl(
+        // `surface` 是 dsh-pet 的必填参数（issue #122）：声明"我要哪一端的宠物"。
+        // local-pet 不是它的渲染端，只是镜像 /state，所以这里明说 `any`——
+        // 只要那只宠物显示在任意一端就受理；display:none 会被它自己拒掉。
+        base + DSH_PET_ROUTE + '/anim?pet=' + encodeURIComponent(petId) + '&surface=any',
+        {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { accept: 'application/json', 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: controller.signal
+        }
+      )
+      if (!response.ok) return { ok: false, reason: 'unreachable' }
+      let result = null
+      try {
+        result = await response.json()
+      } catch {
+        result = null
+      }
+      if (result !== null && typeof result === 'object' && result.ok === true) return { ok: true }
+      return {
+        ok: false,
+        reason: 'rejected',
+        message: typeof result?.message === 'string' ? result.message : null,
+        code: typeof result?.reason === 'string' ? result.reason : null
+      }
+    } catch {
+      return { ok: false, reason: 'unreachable' }
+    } finally {
+      clearTimeout(timeout)
+    }
+  }
+
+  return { start, pollOnce, refresh, playAnim, dispose }
 }
 
 function petFromConfig (petConfig, anim) {

@@ -255,3 +255,83 @@ test('宠物名与线路上的昵称同一个上限：32 码点', async (t) => {
   const config = await readPetConfig(path)
   assert.equal(config.name.length, 32)
 })
+
+// ---------------------------------------------------------------------------
+// 点播写口（ADR-0009 / ticket 22）
+// ---------------------------------------------------------------------------
+
+test('点播：POST /anim?pet=<id>，成功回 ok', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+
+  const seen = []
+  const server = createServer((req, res) => {
+    let body = ''
+    req.on('data', (chunk) => { body += chunk })
+    req.on('end', () => {
+      seen.push({ method: req.method, url: req.url, body: JSON.parse(body || 'null') })
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ ok: true, playbackId: 7 }))
+    })
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+
+  const bridge = createPetBridge({ getOrigin: () => origin, configPath, pollIntervalMs: 60000 })
+  t.after(() => bridge.dispose())
+
+  assert.deepEqual(await bridge.playAnim('写代码'), { ok: true })
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].method, 'POST')
+  assert.equal(seen[0].url, '/dsh-pet-7340/anim?pet=main&surface=any')
+  assert.deepEqual(seen[0].body, { name: '写代码' })
+
+  // 名字里带空格/中文：照原样送过去，只有 query 里的 pet id 需要编码
+  await bridge.playAnim('  东张西望 ')
+  assert.deepEqual(seen[1].body, { name: '东张西望' })
+})
+
+test('点播：被 dsh-pet 拒绝时带回它的原话；够不着时报 unreachable', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
+
+  const server = createServer((req, res) => {
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ ok: false, reason: 'not-in-pool', message: '没有这段动作' }))
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+
+  const bridge = createPetBridge({ getOrigin: () => origin, configPath, pollIntervalMs: 60000 })
+  t.after(() => bridge.dispose())
+  const rejected = await bridge.playAnim('不存在的动作')
+  assert.equal(rejected.ok, false)
+  assert.equal(rejected.reason, 'rejected')
+  assert.equal(rejected.message, '没有这段动作')
+
+  const noOrigin = createPetBridge({ getOrigin: () => null, configPath, pollIntervalMs: 60000 })
+  t.after(() => noOrigin.dispose())
+  assert.deepEqual(await noOrigin.playAnim('写代码'), { ok: false, reason: 'unreachable' })
+
+  // 空名字不发请求
+  assert.equal((await bridge.playAnim('   ')).reason, 'rejected')
+})
+
+test('点播：配置里没有宠物时报 no-pet，不去敲它的门', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'empty.jsonc')
+  await writeFile(configPath, '{"pets":[]}', 'utf8')
+  let hits = 0
+  const server = createServer((req, res) => {
+    hits += 1
+    res.end('{}')
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+  const bridge = createPetBridge({ getOrigin: () => origin, configPath, pollIntervalMs: 60000 })
+  t.after(() => bridge.dispose())
+  assert.deepEqual(await bridge.playAnim('写代码'), { ok: false, reason: 'no-pet' })
+  assert.equal(hits, 0)
+})

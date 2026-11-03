@@ -69,7 +69,7 @@ test('encodeMessage/parseLine：只接受对象，超长拒发，坏 JSON 不抛
 // 场景 / 协议归一化
 // ---------------------------------------------------------------------------
 
-test('场景 v2 归一化：role/anim/reset 保留，未知字段、未知 kind、重复 id、坏矩形全部丢弃', () => {
+test('场景 v3 归一化：role/anim/reset/menu 保留，未知字段、未知 kind、重复 id、坏矩形全部丢弃', () => {
   const scene = shared.normalizeScene({
     version: 99,
     reset: true,
@@ -89,7 +89,7 @@ test('场景 v2 归一化：role/anim/reset 保留，未知字段、未知 kind�
       'nope'
     ]
   })
-  assert.equal(scene.version, 2)
+  assert.equal(scene.version, 3)
   assert.equal(scene.reset, true)
   assert.deepEqual(scene.items.map((item) => item.id), ['a', 'd', 'e'])
   assert.equal(scene.items[0].color, '#abcdef')
@@ -902,7 +902,7 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
   captured.onEvent({ type: 'ready', pid: 4242, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
   assert.equal(calls.updates.length, 1)
   assert.equal(calls.resync, 1, '新 helper（pid 第一次出现）走强制整包对账')
-  assert.equal(calls.updates[0].version, 2)
+  assert.equal(calls.updates[0].version, 3)
   assert.equal(calls.updates[0].reset, true)
   assert.equal(calls.updates[0].items[0].id, 'self')
   assert.equal(calls.updates[0].items[0].role, 'self')
@@ -1357,4 +1357,80 @@ test('buildHelperArgs：默认不带 --no-sandbox，只有显式开关才关沙�
     if (previous === undefined) delete process.env.LOCAL_PET_HELPER_NO_SANDBOX
     else process.env.LOCAL_PET_HELPER_NO_SANDBOX = previous
   }
+})
+
+test('manager：reload 杀掉 helper 后立刻重建，不计崩溃、不占退避（ticket 22）', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const infos = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4000 + children.length)
+      children.push(child)
+      return child
+    },
+    maxRestarts: 1,
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: (line) => infos.push(line), warn: () => {} },
+    pingMs: 100000
+  })
+  t.after(() => manager.dispose())
+
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4000, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+
+  const reloadResult = manager.reload()
+  assert.equal(reloadResult.ok, true, JSON.stringify(reloadResult))
+  assert.ok(children[0].killCalls.includes('SIGTERM'), '重载 = 让 helper 退出，由退出事件重建')
+  children[0].emit('exit', 0, 'SIGTERM')
+  clock.runDue(0)
+  assert.equal(children.length, 2, '手动重载立刻重建，不排队等退避')
+  assert.equal(manager.status().restarts, 0, '手动重载不算崩溃')
+
+  // 之后真的崩了，仍然按第一次退避（300ms），不是"已连续崩溃 2 次"
+  children[1].emitLine({ type: 'ready', pid: 4001, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+  children[1].emit('exit', 1, null)
+  clock.runDue(300)
+  assert.equal(children.length, 3)
+  assert.equal(manager.status().restarts, 1)
+})
+
+test('manager：openUrl 只把 http(s) 地址写进管道，坏地址不写', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4200 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4200, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+
+  assert.equal(manager.openUrl('http://127.0.0.1:64071/'), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), {
+    type: 'open-url',
+    id: null,
+    url: 'http://127.0.0.1:64071/'
+  })
+
+  // file:/javascript: 这类地址在 shared 的命令白名单处就被丢掉，写不进管道
+  assert.equal(manager.openUrl('file:///etc/passwd'), false)
+  assert.equal(children[0].parsedLines().at(-1).type, 'open-url')
 })

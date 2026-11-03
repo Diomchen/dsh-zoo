@@ -24,7 +24,7 @@ test('petScene：角色/昵称/动作/颜色来自输入，出生点全部落在
     { id: 'visitor:bbb', role: 'visitor', label: '泡泡', anim: null }
   ]
   const scene = shared.petScene(pets, AREA)
-  assert.equal(scene.version, 2)
+  assert.equal(scene.version, 3)
   assert.equal(scene.reset, false)
   assert.deepEqual(scene.items.map((item) => item.id), ['self', 'guest:aaa', 'visitor:bbb'])
   assert.deepEqual(scene.items.map((item) => item.role), ['self', 'guest', 'visitor'])

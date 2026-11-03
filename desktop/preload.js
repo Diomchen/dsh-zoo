@@ -12,7 +12,7 @@
  * - requestAction(payload)：把一次按钮点击作为**申请**交给宿主（visit/recall/end-visit/admit/
  *   reject/dismiss），渲染端永远不直接改状态；
  * - onActionResult(handler)：宿主对某次申请的答复（ok + 人话 notice）；失败必须能冒泡；
- * - onScene(handler)：接收宿主下发的场景 v2（已经过 desktop/shared.js 归一化）。
+ * - onScene(handler)：接收宿主下发的场景 v3（已经过 desktop/shared.js 归一化，含 menu）。
  */
 'use strict'
 
@@ -48,7 +48,10 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
     ipcRenderer.send('local-pet:action', {
       id: payload.id,
       action: payload.action,
-      deviceId: payload.deviceId
+      deviceId: payload.deviceId,
+      // 动作点播要带名字（右键菜单的「动作」那一支）；其它动作这里是 undefined。
+      name: payload.name,
+      nickname: payload.nickname
     })
   },
   /**

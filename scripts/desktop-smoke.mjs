@@ -295,7 +295,7 @@ function verifyShot (pngPath, sidecarPath, expectedPets, options = {}) {
   assert(scaleX === scaleY, '截图像素与逻辑坐标同尺度（scale=' + scaleX + '）')
   assert(image.width === Math.round(bounds.width * scaleX) && image.height === Math.round(bounds.height * scaleY),
     '截图尺寸 = 窗口 bounds × scale（' + image.width + '×' + image.height + '）')
-  assert(sidecar.scene.version === 2, 'sidecar 里是场景 v2')
+  assert(sidecar.scene.version === 3, 'sidecar 里是场景 v3（带 menu）')
   const pets = sidecar.renderer !== null && Array.isArray(sidecar.renderer.pets)
     ? sidecar.renderer.pets
     : sidecar.scene.items
@@ -1380,6 +1380,229 @@ async function waitUntil (predicate, timeoutMs, label) {
 }
 
 // ---------------------------------------------------------------------------
+// 2.5) 右键菜单（ticket 22）：只挂自己、级联、点一项就申请动作
+// ---------------------------------------------------------------------------
+
+async function verifyMenu () {
+  const client = createHelperClient((line) => info(line))
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  const workArea = ready.workArea
+  const visitorId = '55555555-5555-4555-8555-555555555555'
+
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+
+  const scene = shared.petScene([
+    { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
+    { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
+  ], workArea, {
+    reset: true,
+    menu: {
+      tools: [
+        { id: 'open-site', label: '打开软件' },
+        { id: 'home', label: '回到初始位置' },
+        { id: 'reload', label: '重载配置' }
+      ],
+      groups: [
+        { label: '待机', actions: ['东张西望', '原地小憩沉眠'] },
+        { label: '小动作', actions: ['悠闲哼歌', '写代码'] }
+      ]
+    }
+  })
+  client.send({ type: 'update', scene })
+  await sleep(1500)
+
+  let state = await client.rendererState()
+  assert(state !== null && state.menu === null, '没人右键时菜单是关着的')
+
+  const self = state.pets.find((pet) => pet.id === 'self')
+  const center = screenCenter(self, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'context', x: center.x, y: center.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu !== null
+  }, 3000, '右键后菜单出现')
+
+  state = await client.rendererState()
+  assert(state.menu.petId === 'self', '菜单挂在自己身上')
+  assert(state.menu.panels.length === 1, '一级只有一个面板（' + state.menu.panels.length + '）')
+  const rowLabels = state.menu.rows.map((row) => row.label)
+  assert(rowLabels.includes('打开软件') && rowLabels.includes('回到初始位置') && rowLabels.includes('重载配置'),
+    '一级有 tool 三件套：' + rowLabels.join('/'))
+  assert(rowLabels.includes('动作'), '一级有「动作」')
+
+  // 矩形是异步过 IPC 的：等主进程真的按新矩形翻成可交互，再看数量。
+  await client.waitStatus((status) => status.ignoring === false, 3000, '菜单打开后可交互')
+  const current = await client.status()
+  assert(current.overlayRects >= 2, '菜单面板与桥接矩形都上报了（' + current.overlayRects + ' 块）')
+
+  // 菜单开着时宠物停住（ADR-0010）：位置与速度都不该再变。
+  const frozenBefore = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  await sleep(450)
+  const frozenAfter = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  assert(frozenBefore.x === frozenAfter.x && frozenBefore.y === frozenAfter.y,
+    '菜单开着时宠物停住（' + frozenBefore.x + ',' + frozenBefore.y + ' → ' + frozenAfter.x + ',' + frozenAfter.y + '）')
+
+  // 人手真实的用法：右键之后把光标**移到菜单上**，停一会儿再点。
+  // 菜单必须还在——这就是用户报的「一瞬间就消失」。
+  const firstPanel = state.menu.panels[0]
+  const selfRect = state.pets.find((pet) => pet.id === 'self')
+  // 必须落在「菜单上、宠物外」：菜单是贴着指针开的，第一段会和宠物重叠。
+  const intoMenu = {
+    x: workArea.x + Math.max(selfRect.x + selfRect.width + 8, firstPanel.x + 12),
+    y: workArea.y + firstPanel.y + 14
+  }
+  client.send({ type: 'debug-dispatch', phase: 'move', x: intoMenu.x, y: intoMenu.y })
+  await sleep(800)
+  const afterHover = await client.rendererState()
+  assert(afterHover.menu !== null && afterHover.menu.panels.length === 1,
+    '光标移到菜单上停 800ms，菜单仍然开着')
+
+  // 用户真的要点的时候：光标停在菜单项上，持续 2 秒，窗口必须仍然接鼠标。
+  // 这里量的是主进程的真实状态（ignoring），不是渲染端自己说"我在菜单上"。
+  client.send({ type: 'debug-dispatch', phase: 'move', x: intoMenu.x, y: intoMenu.y })
+  await sleep(2000)
+  const hoverState = await client.status()
+  assert(hoverState.ignoring === false,
+    '光标停在菜单项上 2s，窗口仍然接鼠标（ignoring=' + hoverState.ignoring + '）')
+
+  // 菜单开着时，光标回到宠物身上不该再弹左键弹层（两套入口会互相抢鼠标）。
+  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
+  await sleep(400)
+  state = await client.rendererState()
+  assert(state.controls.popover === null, '菜单开着时不再弹悬停弹层')
+
+  // 悬停「动作」→ 分类面板；悬停「小动作」→ 动作面板
+  // 宠物会走：每次右键前都现取它的位置，别用几十毫秒前的那份。
+  const petCenterNow = async () => {
+    const snapshot = await client.rendererState()
+    const self = snapshot.pets.find((pet) => pet.id === 'self')
+    return screenCenter(self, workArea)
+  }
+  const openToGroup = async (groupLabel) => {
+    // 菜单开着时，先移开让宽限把它收掉（右键 toggle 要命中宠物，而菜单正好盖在光标上）。
+    if ((await client.rendererState()).menu !== null) {
+      client.send({ type: 'debug-dispatch', phase: 'move', x: workArea.x + 4, y: workArea.y + 4 })
+      await waitUntil(async () => (await client.rendererState()).menu === null, 3000, '移开收起旧菜单')
+    }
+    const selfCenter = await petCenterNow()
+    client.send({ type: 'debug-dispatch', phase: 'context', x: selfCenter.x, y: selfCenter.y })
+    await waitUntil(async () => {
+      const snapshot = await client.rendererState()
+      return snapshot.menu !== null && snapshot.menu.panels.length === 1
+    }, 3000, '右键展开一级')
+    let snapshot = await client.rendererState()
+    const branch = snapshot.menu.rows.find((row) => row.kind === 'branch')
+    const branchPoint = rectCenterScreen(branch, workArea)
+    client.send({ type: 'debug-dispatch', phase: 'move', x: branchPoint.x, y: branchPoint.y })
+    await waitUntil(async () => {
+      const next = await client.rendererState()
+      return next.menu !== null && next.menu.panels.length === 2
+    }, 3000, '悬停「动作」展开分类')
+    snapshot = await client.rendererState()
+    const group = snapshot.menu.rows.find((row) => row.kind === 'group' && row.label === groupLabel)
+    assert(Boolean(group), '分类面板里有「' + groupLabel + '」')
+    const groupPoint = rectCenterScreen(group, workArea)
+    client.send({ type: 'debug-dispatch', phase: 'move', x: groupPoint.x, y: groupPoint.y })
+    await waitUntil(async () => {
+      const next = await client.rendererState()
+      return next.menu !== null && next.menu.panels.length === 3
+    }, 3000, '悬停分类展开动作')
+    return client.rendererState()
+  }
+
+  state = await openToGroup('小动作')
+  assert(state.strayPopovers === 0, '菜单展开后没有残留的弹层 DOM（实际 ' + state.strayPopovers + '）')
+
+  // 截图：三级菜单同框
+  mkdirSync(OUT_DIR, { recursive: true })
+  const pngPath = join(OUT_DIR, 'menu.png')
+  let start = client.mark()
+  client.send({ type: 'shot', id: 'shot-menu', path: pngPath })
+  const shot = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-menu', 8000, '菜单截图')
+  assert(shot.width > 0 && existsSync(pngPath), '菜单截图落盘：' + pngPath)
+  const verified = verifyShot(pngPath, pngPath + '.json', 2, { allowSvg: false })
+  const menuPanels = verified.sidecar.renderer?.menu?.panels ?? []
+  assert(menuPanels.length === 3, '截图 sidecar 里有三级面板')
+  assertControlPixels(verified, menuPanels.map((panel) => ({
+    id: 'menu:' + panel.level,
+    x: panel.x,
+    y: panel.y,
+    width: panel.width,
+    height: panel.height
+  })))
+  info('菜单截图：' + pngPath)
+
+  // 点一个动作名：菜单收起，助手把 play-anim 申请写给宿主。
+  // 截图可能耗掉一段 12 秒上限（菜单自己收起是特性），所以这里**总是**重新展开一次：
+  // 既重置超时，也拿到一份新的面板坐标。
+  state = await openToGroup('小动作')
+  const animRow = state.menu.rows.find((row) => row.kind === 'anim' && row.label === '写代码')
+  assert(Boolean(animRow), '动作面板里有「写代码」')
+  const animPoint = rectCenterScreen(animRow, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: animPoint.x, y: animPoint.y })
+  let request
+  try {
+    request = await client.waitFrom(start, (event) => event.type === 'action' && event.action === 'play-anim', 3000, '点播申请')
+  } catch (error) {
+    const diag = await client.rendererState()
+    console.error('[diag] click=' + JSON.stringify(diag?.lastMenuClick) +
+      ' menu=' + JSON.stringify(diag?.menu) +
+      ' pending=' + JSON.stringify(diag?.controls?.pending) +
+      ' events=' + JSON.stringify(client.events.slice(-6).map((event) => event.type + ':' + (event.action ?? ''))))
+    throw error
+  }
+  assert(request.name === '写代码', '点播申请带着动画名：' + request.name)
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu === null
+  }, 2000, '点完收起菜单')
+
+  // 「回到初始位置」：先把它拖走，再点菜单，应该回到出生点而不是原地。
+  const dragFrom = await petCenterNow()
+  client.send({ type: 'debug-dispatch', phase: 'down', x: dragFrom.x, y: dragFrom.y })
+  await sleep(60)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: dragFrom.x + 320, y: dragFrom.y - 140 })
+  await sleep(60)
+  client.send({ type: 'debug-dispatch', phase: 'up', x: dragFrom.x + 320, y: dragFrom.y - 140 })
+  await sleep(500)
+  const dragged = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  assert(Math.abs(dragged.x - dragged.spawnX) > 40, '拖走之后它确实不在出生点上（' + dragged.x + ' vs ' + dragged.spawnX + '）')
+
+  const beforeHome = await petCenterNow()
+  client.send({ type: 'debug-dispatch', phase: 'context', x: beforeHome.x, y: beforeHome.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu !== null
+  }, 3000, '为「回到初始位置」展开菜单')
+  state = await client.rendererState()
+  const homeRow = state.menu.rows.find((row) => row.kind === 'tool' && row.label === '回到初始位置')
+  assert(Boolean(homeRow), '菜单里有「回到初始位置」')
+  const homePoint = rectCenterScreen(homeRow, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: homePoint.x, y: homePoint.y })
+  await waitUntil(async () => (await client.rendererState()).menu === null, 2000, '点完收起菜单')
+  const homed = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  assert(Math.abs(homed.x - homed.spawnX) <= 2 && Math.abs(homed.y - homed.spawnY) <= 2,
+    '「回到初始位置」把这一只放回出生点（' + homed.x + ',' + homed.y + ' → ' + homed.spawnX + ',' + homed.spawnY + '）')
+
+  // 右键访客：不出菜单（也不吞鼠标）
+  state = await client.rendererState()
+  const visitor = state.pets.find((pet) => pet.id.startsWith('visitor:'))
+  const visitorCenter = screenCenter(visitor, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'context', x: visitorCenter.x, y: visitorCenter.y })
+  await sleep(400)
+  state = await client.rendererState()
+  assert(state.menu === null, '访客身上不弹菜单')
+
+  client.send({ type: 'quit' })
+  await client.exited
+  pass('右键菜单：只挂自己 / 三级级联 / 点一项就申请点播 / 访客不弹')
+  return { pngPath }
+}
+
+// ---------------------------------------------------------------------------
 // 3) 邻居面板的稳定性：人多时面板不许自己动，点谁就是谁
 // ---------------------------------------------------------------------------
 
@@ -1670,6 +1893,7 @@ try {
   if (wants('svg')) await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
   if (wants('helper')) await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
   const controls = wants('controls') ? await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 街道面板 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls) : null
+  if (wants('menu')) await run('右键菜单：只挂自己 / 三级级联 / 点一项就申请点播 / 访客不弹', verifyMenu)
   if (wants('street')) await run('街道：人多时面板不跳、点谁就是谁', verifyStreetStability)
   if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)

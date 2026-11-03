@@ -3,7 +3,9 @@
 ## Status
 
 accepted — §决定 中「不写它的配置」一条已由 ADR-0007 收窄为「不绕过它的 API 直接改文件」；
-「耦合收敛在一处」也随之变成**两处薄模块**：`src/pet-bridge.js` 读、`src/pet-name-write.js` 写
+「耦合收敛在一处」也随之变成**两处薄模块**：`src/pet-bridge.js` 读、`src/pet-name-write.js` 写。
+「只读 `/state`、不调用 `/anim`」一条再由 [ADR-0009](0009-anim-playback-write-port.md) 收窄为
+「只读 + 一个点播写口」——右键菜单里「动作」那一支必须落到本体才诚实。
 
 ## 背景
 
