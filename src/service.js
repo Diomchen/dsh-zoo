@@ -9,7 +9,16 @@ import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './deskt
 import { createDiscovery } from './discovery.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-copy.js'
 import { createGiftFetcher } from './gift-fetch.js'
-import { createGiftStore } from './gifts.js'
+import {
+  GIFT_RATE_PER_DAY,
+  GIFT_RATE_PER_HOUR,
+  createGiftRateLimiter
+} from './gift-limits.js'
+import {
+  MAX_GIFT_COUNT,
+  MAX_GIFT_TOTAL_BYTES,
+  createGiftStore
+} from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
 import { resolveDshPetAssetDirs } from './pet-assets.js'
@@ -82,6 +91,8 @@ export const AUTO_VISIT_LOG_INTERVAL_MS = 5 * 60 * 1000
  * 且这次串门一结束（回家/送客/超时/失联）立刻 unarm。
  */
 export const ARMED_GIFT_MS = 5 * 60 * 1000
+/** `/local-pet/state` 只列最近 20 件收到的礼物（SPEC v4「记录与状态出口」）。 */
+export const STATE_GIFT_LIMIT = 20
 
 /**
  * 把桌面接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -159,6 +170,18 @@ export function createService (ctx, options = {}) {
   const armedGifts = new Map()
   /** 正在拉取的文件礼物：同一 giftId 的迟到重试不重复下载。 */
   const receivingGifts = new Set()
+  /**
+   * 入站礼物的频率限额（ticket 27）：同一邻居 ≤10 件/小时、≤50 件/天。
+   * 只活在本次运行的内存里；字条与文件两条接收路径共用它。
+   * 单测可以注入更小的额度（生产不传，就是 SPEC 的 10 / 50）。
+   */
+  const giftRate = createGiftRateLimiter({
+    perHour: integerOption(options.giftRatePerHour, GIFT_RATE_PER_HOUR, 1, 10000),
+    perDay: integerOption(options.giftRatePerDay, GIFT_RATE_PER_DAY, 1, 10000)
+  })
+  /** 磁盘限额的值同样只给单测缩小（生产 500 MiB / 200 件）。 */
+  const giftMaxTotalBytes = positiveOption(options.giftMaxTotalBytes, MAX_GIFT_TOTAL_BYTES, 1)
+  const giftMaxCount = integerOption(options.giftMaxCount, MAX_GIFT_COUNT, 1, 10000)
   // 文件礼物的拉取客户端（ticket 25）；没有网络时是 null。
   let giftFetcher = null
   // 本机宠物的待机池：dsh-pet 那一整套动作名；桌面只拿它轮播，不猜、不点播。
@@ -191,7 +214,7 @@ export function createService (ctx, options = {}) {
     path: ROUTE_PREFIX + '/state',
     handler: async (req, res) => {
       if (req.method !== 'GET') return sendJson(res, 405, { error: 'method-not-allowed' })
-      sendJson(res, 200, room.snapshot())
+      sendJson(res, 200, stateView())
     }
   }))
 
@@ -485,6 +508,41 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * `/local-pet/state` 的唯一形状（ticket 27）：room 的纯快照 + 两份磁盘视图。
+   *
+   * 磁盘只在这里读，room 永远不碰 fs。两个字段在任何时候都是数组：
+   * store 还没起来/初始化为 null 时就是空数组，绝不出现 `undefined`。
+   */
+  function stateView () {
+    return {
+      ...room.snapshot(),
+      backpack: backpack?.items() ?? [],
+      gifts: recentGifts()
+    }
+  }
+
+  /** 最近 20 件已落盘的礼物，最新在前；形状按 SPEC v4「记录与状态出口」。 */
+  function recentGifts () {
+    const list = gifts?.list() ?? []
+    return list.slice(0, STATE_GIFT_LIMIT).map((record) => {
+      const view = {
+        id: record.id,
+        from: { ...record.from },
+        kind: record.kind,
+        at: record.receivedAt,
+        // 能进 store 的都已经真的写进了 gifts/。
+        status: 'received',
+        path: record.kind === 'file' ? record.filePath : record.notePath
+      }
+      if (record.kind === 'file') {
+        view.name = record.name
+        view.size = record.size
+      }
+      return view
+    })
+  }
+
+  /**
    * 礼物卡的系统动作（ticket 23）。只认本地来路：桌面控件的 action 与
    * `POST /local-pet/action` 都会到这里，UDP 报文没有入口。
    *
@@ -672,7 +730,11 @@ export function createService (ctx, options = {}) {
 
       // 礼物也只降级、不挡启动：gifts 目录读不出来时，收到字条会变成一张 failed 卡。
       try {
-        gifts = await createGiftStore(dir, { log })
+        gifts = await createGiftStore(dir, {
+          log,
+          maxTotalBytes: giftMaxTotalBytes,
+          maxCount: giftMaxCount
+        })
       } catch (error) {
         gifts = null
         warn(ctx, '礼物目录初始化失败，本次收到的字条不会落盘：' + message(error))
@@ -1557,6 +1619,8 @@ export function createService (ctx, options = {}) {
     }
 
     const sent = sendVisitRequest(visitId, gift)
+    // 记录里只写**真正带上路**的那一件（编码层可能因为整包超 4 KiB 把它丢了）。
+    if (sent.ok) room.markOutboundGift(visitId, sent.gift ?? null)
     if (!sent.ok) {
       request = null
       if (carried !== null && backpack !== null) await backpack.releaseOut(carried.id, visitId)
@@ -1687,6 +1751,18 @@ export function createService (ctx, options = {}) {
   async function receiveGift (packet) {
     const gift = packet.gift
     if (gift === undefined || gift === null || !isVisitId(gift.id)) return
+    // 单件 16 MiB 先判：超大的东西不该消耗这个邻居的频率额度。
+    if (gift.kind === 'file' &&
+      (!Number.isInteger(gift.size) || gift.size <= 0 || gift.size > MAX_GIFT_BYTES)) {
+      setGiftStatus(packet, 'refused', 'too-large')
+      return
+    }
+    // 频率限额是字条与文件**共用**的门卫（ticket 27）：超了不落盘、不回执。
+    // 同一 giftId 的重试不重复计数；已经在 store 里的那一件也只会走幂等分支。
+    if (!giftRate.allow(packet.deviceId, gift.id)) {
+      setGiftStatus(packet, 'refused', 'rate')
+      return
+    }
     if (gift.kind === 'text') return receiveTextGift(packet)
     if (gift.kind === 'file') return receiveFileGift(packet)
   }
@@ -2096,7 +2172,7 @@ export function createService (ctx, options = {}) {
   return {
     room,
     ready,
-    snapshot: () => room.snapshot(),
+    snapshot: () => stateView(),
     /** ticket 04 的心跳/串门发送必须走这一个门控。 */
     mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
     /** ticket 04 的窄口：地址只从这里出，单播只从这里发（内部先过 mayTalkTo）。 */
@@ -2139,6 +2215,7 @@ export function createService (ctx, options = {}) {
       armedGifts.clear()
       receivingGifts.clear()
       giftFetcher = null
+      giftRate.clear()
       // 回执不再发了；还没回执的礼物先写回 idle，再放开背包引用。
       receipts.clear()
       releaseOutboundGiftsOnDispose()

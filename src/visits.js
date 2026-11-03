@@ -15,7 +15,8 @@ import { VISIT_RECORD_LIMIT, normalizeVisitRecord } from './visit-record.js'
  *   }
  *
  * 每完成一次串门追加一条；最多 200 条，超出丢最旧的。文件按“最新在前”写，
- * 快照只读最近 5 条。记录只含四个字段：方向、对方昵称、开始时间、停留时长。
+ * 快照只读最近 5 条。记录固定四个字段（方向、对方昵称、开始时间、停留时长），
+ * 外加一个可选的 `gift: { kind, name? }`（ticket 27；不记字条正文）。
  *
  * 容错规则与 peers.json 一致，而且更严格地保证“记录坏掉不影响客厅”：
  *   - 文件不存在：空记录开始，不告警。
@@ -100,9 +101,12 @@ class VisitStore {
     this.#records = records.slice(0, this.#maxRecords)
   }
 
-  /** 给 room 的只读副本，最新在前；调用方改它不影响 store。 */
+  /** 给 room 的只读副本，最新在前；调用方改它不影响 store（gift 也复制一层）。 */
   records () {
-    return this.#records.map((record) => ({ ...record }))
+    return this.#records.map((record) => ({
+      ...record,
+      ...(record.gift === undefined ? {} : { gift: { ...record.gift } })
+    }))
   }
 
   count () {

@@ -3,12 +3,14 @@
 局域网里的 DSH 宠物：自己的宠物活在桌面上，同一网段里邻居的宠物也会来串门，
 留下串门记录。没有客厅，没有第二块屏幕——整个桌面就是它们待的地方。
 
-当前落地的是 **ticket 01–22**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
+当前落地的是 **ticket 01–27（0.4.0）**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
 helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约），宠物自发出门、访客常驻
 与「送客」/失联清理的完整状态机，桌面控件：悬停自己弹出「串门 / 召回 / 改名」、点访客
 弹出「送客」、新邻居的放行卡与失败气泡，「一只宠物只有一个名字」（ADR-0007），
 跨插件素材：宠物来串门时自带外观包和状态（ADR-0008 / SPEC v3），
-以及**桌面右键菜单**：打开软件 / 回到初始位置 / 重载配置 + 「动作」三级树（ADR-0010）。
+**桌面右键菜单**：打开软件 / 回到初始位置 / 重载配置 + 「动作」三级树（ADR-0010），
+以及**带派**：出门前给宠物带一件东西（字条或文件），到了邻居家留下；背包、送达回执、
+礼物卡与磁盘限额都已落地（ADR-0011 / SPEC v4）。
 同样的动作也可以通过 `POST /local-pet/action` 完成（见下）。
 
 ## 它做什么
@@ -92,15 +94,80 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
 - **点播 / 重载 / 打开软件**：`{"action":"play-anim","name":"写代码"}` 让 `dsh-pet`
   本体播一段（失败回 `409` + `anim-unreachable` / `anim-no-pet` / `anim-rejected`）；
   `{"action":"reload"}` 重读配置并重建桌面；`{"action":"open-site"}` 打开 DSH。
+- **带派 / 背包 / 礼物卡**：右键自己 →「带派」打开小窗，放一条 ≤500 字的字条或一个
+  ≤16 MB 的文件；也可以 `{"action":"bring","gift":{"kind":"text","text":"…"}}` 直接放进背包。
+  背包最多两件、先放的先带走；到了邻居家东西留下，访客旁边出现礼物卡（打开 / 在文件夹里
+  显示 / 扔掉，字条另有复制），**收到对方回执才算送到**，否则串门结束时退回背包。
+  细节、落盘位置与限额见下节「带派：串门捎东西」。
 - **串门记录**：每次串门在双方各留一条 `{direction, nickname, startedAt, durationMs}`，
   `durationMs` 是真实停留时长（封顶 30 分钟），存在 `<dataDir>/visits.json`，
-  滚动上限 200 条；记录文件损坏或不可写时只丢历史。
+  滚动上限 200 条；记录文件损坏或不可写时只丢历史。带礼物的串门多一个可选的
+  `gift: { kind, name? }`——**不记字条正文**。
 - **身份**：`deviceId` 是持久化在 `<dataDir>/identity.json` 的随机 UUID；
   **名字只有一份**（ADR-0007）：它住在 `dsh-pet` 的 `pets[].name` 里，本机的 `nickname`
   只是它的镜像——配置里改了名，约 30 秒内跟着改并补发一次广播；没装 `dsh-pet` 时它回落到
   主机名或「我」，并以 `identity.json` 为准。改名用
   `{"action":"rename","nickname":"…"}`：装了 `dsh-pet` 就写进它的配置（`PUT /config`），
   写不进去就整个不改，返回 `409`。
+
+## 带派：串门捎东西
+
+一次串门可以带**一件**东西，两种形态：
+
+- **字条**：≤500 字，内联在 `visit-request` 里；保留换行，最多在卡片上显示 8 行，
+  全文用「打开」看 `note.txt`。
+- **文件**：≤16 MB（超了连背包都放不进去）；图片（jpg/png/gif/webp）在卡片上给缩略图，
+  其余给文件名 + 大小。文件本体**不进 UDP**：到了对方家，由接收方在访客抵达时从
+  对方的只读素材端口拉取，校验大小与 sha256 后才落盘。
+
+### 放在哪
+
+| 路径 | 是什么 |
+| --- | --- |
+| `<dataDir>/backpack.json` | 发送端背包：最多 2 件，先放的先带走；文件件只存**本机绝对路径**，不复制 |
+| `<dataDir>/gifts/<dir>/` | 收到的礼物：字条是 `note.txt`，文件是原文件名；每件都有一份 `meta.json`（谁捎的、原名、大小、sha256、到达时间、打开过没有） |
+| `<dataDir>/visits.json` | 串门记录；可选 `gift` 字段只记 `kind` 与文件名，不记字条正文 |
+
+`<dir>` 形如 `20261103-153245-ab12cd`：到达时间的本地时间 + 礼物 id 前 8 位，在 Finder 里
+一眼能看出什么时候收到的。真正的键始终是 UUID，拼路径前一律严格正则，绝不信报文里的字符串。
+
+### 送达、退回与限额
+
+- **送达以回执为准**：接收方真的写进 `gifts/` 之后回一条 `gift-received`（发 3 次、间隔
+  400ms）。发起方收到才把背包那件删掉；串门结束还没收到，就把 `out` 退回 `idle` 并说一句
+  「没送到」。礼物在对方那儿的卡片状态是 `pending / receiving / received / failed / refused`。
+- **限额**：单件 ≤16 MiB；`gifts/` 总量 ≤500 MiB 且 ≤200 件，超了按 `receivedAt` 删最旧
+  （整目录删，每次新礼物写成功之后剪一次）；同一邻居 ≤10 件/小时、≤50 件/天，超了
+  `refused`（原因 `rate`），**不落盘、不回执**。字条和文件共用同一道频率闸。
+- **扔掉**：卡片上的「扔掉」立刻删掉那个目录，并记进本次运行的黑名单——同一件礼物重发
+  也不会再长回来。删除不可恢复。
+- **只在 armed 期间可读**：文件路由只在「这次串门请求发出后 5 分钟内、且串门还没结束」时
+  返回字节；其他时间 404，不列目录。串门一结束（回家 / 送客 / 超时 / 失联 / 被拒绝）立刻失效。
+- **礼物坏了不丢串门**：报文里的礼物字段非法只会少一张卡片，串门照常 ack；坏文件/超时/
+  对方没开端口只让这一张卡 `failed`。
+
+### `/local-pet/action` 的礼物动作
+
+| action | body | 说明 |
+| --- | --- | --- |
+| `bring` | `{ "kind": "text", "text": "…" }` 或 `{ "kind": "file", "path": "/绝对/路径" }` | 放进背包（≤2 件）。不带 gift 的 `bring` 在桌面端表示「打开带派小窗」 |
+| `unbring` | `{ "giftId": "<uuid>" }` | 从背包撤掉；只有 `idle` 件能撤，`out` 中的东西可能已经在对方磁盘上 |
+| `gift-open` | `{ "giftId": "<uuid>" }` | 用系统程序打开（字条 = `note.txt`，文件 = 本体） |
+| `gift-reveal` | `{ "giftId": "<uuid>" }` | 在文件夹里显示 |
+| `gift-discard` | `{ "giftId": "<uuid>" }` | 扔掉（整目录删除 + 当前运行内拉黑） |
+| `gift-copy` | `{ "giftId": "<uuid>" }` | 字条正文进剪贴板；文件没有可复制正文，返回 `409` |
+
+`GET /local-pet/state` 多两项（只对本机页面/回环可用）：
+
+```json
+"backpack": [ { "id": "…", "kind": "text", "text": "…", "at": 1700000000000, "state": "idle" } ],
+"gifts":    [ { "id": "…", "from": { "deviceId": "…", "nickname": "…" }, "kind": "file",
+                "name": "报价单.pdf", "size": 23194, "at": 1700000000000,
+                "status": "received", "path": "/…/gifts/20261103-153245-ab12cd/报价单.pdf" } ]
+```
+
+`backpack` 按「先放的在前」；`gifts` 只列最近 **20** 件、最新在前，带 `path` 与 `status`。
+两个字段在任何时候都是数组，不会出现 `undefined`。
 
 ## 安装
 
@@ -139,7 +206,7 @@ npm pack          # → dsh-local-pet-<version>.tgz
 ```sh
 # 用 DSH 自带的 pnpm（不需要全局装 pnpm）
 node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs" \
-  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.3.1.tgz --save-exact
+  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.4.0.tgz --save-exact
 
 # 再把 "dsh-local-pet" 加进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
 ```
@@ -160,8 +227,11 @@ macOS 是 `~/.dsh/electron/Electron.app`，Windows 是 `%USERPROFILE%\.dsh\elect
 
 - 发现/服务端口默认 **45871**（UDP），可用环境变量 `LOCAL_PET_PORT` 覆盖。
   同一网段的所有机器要用同一个端口。串门复用同一条 UDP socket，不再另开 TCP 端口。
-- 桌面 helper 与宿主只走 **stdio 的 JSON 行**，不开新端口；素材走 helper 自己注册的
-  `localpet://` 协议（本机文件，仅渲染页可读）。
+- 桌面 helper 与宿主只走 **stdio 的 JSON 行**，不开新端口；素材与礼物缩略图走 helper
+  自己注册的 `localpet://` 协议（本机文件，仅渲染页可读）。
+- 素材源 / 文件礼物共用 **TCP 45873**（`LOCAL_PET_SKIN_PORT` 可覆盖）。串门只走 UDP 45871；
+  两边 UDP 通、但 45873 被防火墙挡住时，**串门照常成功，文件礼物取不到**：接收方卡片显示
+  「没取到」，发送方等不到回执、串门结束时把东西退回背包并说「没送到」。字条不经过这个端口。
 - macOS 首次监听会弹一次“允许传入连接”，允许后才会收到邻居广播。
 - Windows 首次监听会弹 Defender 防火墙询问（通常是 DSH 所在的 `electron.exe` 或
   `DeepSeek Harness.exe`），要给**专用网络**放行，否则收不到邻居广播。
@@ -212,18 +282,30 @@ pkill -f "local-pet/desktop/main.js"
   宠物最多待 30 分钟；接收方没有 TTL，只按对方心跳判断失联。UDP 丢 ack 时接收方可能
   先看到访客、发起方报超时；重复请求/重复召回都按 id 幂等，不会重复写记录。
 - 串门记录滚动上限 200 条；`visits.json` 损坏或不可写时，本次运行仍能在内存里看到新记录，
-  但磁盘历史会丢失。
+  但磁盘历史会丢失。带礼物的记录只留 `gift.kind` 与文件名，**不留字条正文**。
+- **礼物限制**：单件 ≤16 MB、字条 ≤500 字、一次串门只带一件；没有文件夹、多选、URL/链接卡片、
+  礼物历史界面，也没有单独的「只送礼不串门」或「不收礼物」开关。
+- **旧端收不到**：0.3.x 及更早的版本解析 `visit-request` 时会丢弃未知的 `gift` 字段。
+  串门和记录照常，但对方不会落盘、也不会回执；本机看到的是「没送到」，礼物退回背包。
+- **端口被防火墙挡**：文件礼物还需要对方 TCP 素材端口（默认 45873）可达。只放行 UDP 45871
+  时，串门成功但文件取不到；`gifts/` 里不会留下半个文件，卡片显示 `failed`，发送端退回背包。
+- **不自动打开**：礼物永远不会被自动打开或执行；打开 / 在文件夹里显示 / 复制都只在用户点
+  卡片时发生。卡片正文用 `textContent` 渲染，不解析 HTML/Markdown。
+- 礼物卡跟着这一次访客：访客回家 / 被送客 / 失联，卡片就收起；礼物本身留在 `<dataDir>/gifts/`，
+  在 Finder 里能看到。字条全文只存在 `note.txt`，`/state` 与记录都不搬运正文。
 - 桌面 helper 是 `focusable: false`：没有键盘输入；桌面按钮只能是鼠标点击。
 - 多显示器只保证主屏工作区；其它屏不显示。显示器变化后渲染端会把宠物夹回新工作区。
 - 宠物之间没有物理碰撞（SPEC v2 out of scope）。
 - 没有屏幕录制权限，**看窗口只能靠 helper 的 `capturePage()`**：
   ```sh
   npm run smoke:desktop
-  LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 写 .scratch/local-pet/notes/08-*.png、11-*.png
+  LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 写 .scratch/local-pet/notes/ 下的整窗与特写
   ```
   最近的整窗截图：`.scratch/local-pet/notes/11-desktop-controls-composited.png`；
   宠物特写：`.scratch/local-pet/notes/11-desktop-controls-crop-composited.png`；
-  失败气泡：`.scratch/local-pet/notes/11-desktop-controls-notice-composited.png`。
+  失败气泡：`.scratch/local-pet/notes/11-desktop-controls-notice-composited.png`；
+  礼物卡（字条 / 图片 / 文件）：`.scratch/local-pet/notes/25-gift-card.png`、
+  `25-gift-image.png`、`25-gift-file.png`。
 
 ## 在本机假装一个邻居
 
@@ -232,6 +314,7 @@ pkill -f "local-pet/desktop/main.js"
 ```sh
 npm run fake-peer                                  # 默认叫「隔壁的小鲸鱼」
 npm run fake-peer -- --name 楼下的柯基 --auto-visit 5
+npm run fake-peer -- --gift $'给你留了张便条\n第二行'   # 串门时捎一条字条
 ```
 
 它是一颗真的 UDP socket，说的是真协议（真 beacon、真心跳、真串门请求），只是 bind 在
@@ -288,20 +371,26 @@ env -u ELECTRON_RUN_AS_NODE \
   --local-pet-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
 ```
 
-协议、点击穿透裁定、场景 v2、素材协议的细节见 [`desktop/README.md`](desktop/README.md)。
+协议、点击穿透裁定、场景 v3、素材协议的细节见 [`desktop/README.md`](desktop/README.md)。
 
 ## 开发
 
 ```sh
 npm test              # node --test，零依赖
 npm run smoke:desktop # 真 Electron 冒烟（不进 npm test）
+
+# 只跑礼物段（本机 Chromium sandbox 起不来时需要两个 NO_SANDBOX）：
+LOCAL_PET_SMOKE_ONLY=gift LOCAL_PET_SMOKE_NO_SANDBOX=1 LOCAL_PET_HELPER_NO_SANDBOX=1 \
+  npm run smoke:desktop
 ```
 
 - 协议与敌意输入边界：`docs/protocol.md`
 - 领域词汇：`CONTEXT.md`；决策：`docs/adr/`
 - 宿主逻辑是“纯状态机 + 薄外壳”：`src/room.js` 不碰 socket/fs，I/O 在
   `src/identity.js`、`src/peers.js`、`src/settings.js`、`src/visits.js`、`src/discovery.js`、
-  `src/pet-bridge.js`、`src/service.js`；桌面场景是 `src/desktop-pets.js` +
+  `src/pet-bridge.js`、`src/service.js`；礼物在 `src/gifts.js`（落盘与磁盘限额）、
+  `src/backpack.js`（发送端）、`src/gift-fetch.js`（拉取）、`src/gift-limits.js`（频率限额）、
+  `src/visit-record.js`（记录规范器）；桌面场景是 `src/desktop-pets.js` +
   `src/pet-assets.js`，物理/命中/场景归一化在 `desktop/shared.js`（纯函数，单测覆盖）。
 - v1 的 GUI 客厅（`client.js`、`shell.overlay`、预览器）已按 ADR-0005 删除，代码留在
   `v0.1.0` 标签里。
