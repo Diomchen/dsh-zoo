@@ -66,9 +66,15 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
   同屏上限。唯一的自动清场是对方 2 分钟没有心跳（失联），双方各写一条记录。
   渲染端的单包场景最多画 **256** 只；真到了这一步，宿主会在桌面上说一句
   “还有 N 位没有画出来”，不会让宠物静默消失。
-- **串门**：`POST /local-pet/action {"action":"visit"}`（不带 `deviceId` 时随机挑一位
-  在线且互相放行的邻居；一个都没有返回 `no-admitted` / `no-online`）。也可以显式带
-  `deviceId`。请求走现有 UDP socket（`visit-request` / `visit-ack` / `visit-deny` /
+- **邻居面板**：桌面上的「串门」不再替你掷骰子，先弹出那条小街——两列小房子，一格一户
+  人家，屋顶和脸色都由 `deviceId` 定，第二行写它此刻在干什么（动作名取自心跳）。点哪户就
+  去哪家；去不了的折叠在「附近还有 N 位，现在去不了」里，理由只有三种：还没放行你、
+  它还没放行你、刚掉线。鼠标停上去那颗头从窗户里探出来晃；谁换了动作，那户自己探一次。
+  自己出门期间整条街压暗，只剩「召回」。掉线的邻居在街上灰着留十分钟才消失。
+  面板是纯本地的派生视图：不新增报文字段，远端写不进来。
+- **串门**：`POST /local-pet/action {"action":"visit"}`（桌面上从邻居面板点某一户会带上
+  它的 `deviceId`；不带 `deviceId` 时随机挑一位在线且互相放行的邻居，一个都没有返回
+  `no-admitted` / `no-online`）。也可以显式带 `deviceId`。请求走现有 UDP socket（`visit-request` / `visit-ack` / `visit-deny` /
   `visit-recall`），共发三次；未放行、离线、超时、被拒绝、对方关掉了串门、已经在
   串门都会留一条可读提示。
 - **召回 / 送客**：`{"action":"recall"}` 让自己的宠物立刻回家；
@@ -122,7 +128,7 @@ npm pack          # → dsh-local-pet-<version>.tgz
 ```sh
 # 用 DSH 自带的 pnpm（不需要全局装 pnpm）
 node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs" \
-  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.2.1.tgz --save-exact
+  --dir ~/.dsh/profiles/desktop add /path/to/dsh-local-pet-0.3.0.tgz --save-exact
 
 # 再把 "dsh-local-pet" 加进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
 ```
