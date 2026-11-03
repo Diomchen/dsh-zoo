@@ -23,5 +23,9 @@
 - [ ] 文档互指：`CONTEXT.md` ↔ ADR-0011 ↔ SPEC v4 ↔ 票 23–27；`.scratch/local-pet/SPEC-v4.md`
       的头部承接 ADR-0011
 - [ ] `package.json` 升到 `0.4.0`；`npm pack` 出来的包里不含测试与 `.scratch/`
+- [ ] `normalizeVisitRecord` 会**洗键**（只保留 4 个键，`visits.append` 前还再洗一次）：不改它，`gift` 永远落不了盘，而且「写进去」与「读回来」会漂移
+- [ ] `recordVisit` 现在是 4 个位置参数，改签名要同步 5 个调用点（in / out 都写）
+- [ ] `snapshot.visits` 只给 4 个字段、最近 5 条：想在后端看见 `gift` 也要同步加
+- [ ] `/local-pet/state` 直接 `sendJson(room.snapshot())`：`backpack` / `gifts` 要并进快照（磁盘在 service，room 只持内存视图）
 - [ ] 真机冒烟：字条 / 文件 / 图片三种卡片、缩略图、扔掉、送达与没送达两种气泡；
       截图落到 `.scratch/local-pet/notes/27-*.png`；`npm test` 全绿

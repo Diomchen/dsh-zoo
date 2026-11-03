@@ -49,7 +49,8 @@
 
 规则：
 
-- `id` 是 UUID 形状（复用 `isVisitId`），也是落盘目录名与拉取路径的唯一键。
+- `id` 是 UUID 形状（复用 `isVisitId`），是线路上的键、也是拉取路径的唯一键；
+  **不是**落盘目录名（目录名见「存储与限额」，两者由 `receivedAt` 确定性关联）。
 - `kind` 只能是 `text` / `file`；别的值整条 `gift` 丢弃。
 - `text`：≤500 码点；清洗时**保留换行**，去掉其余控制字符与双向覆盖符，首尾空白裁掉。
 - `name`：≤120 码点，清洗掉路径分隔符、控制字符与前导点；清洗后为空就用 `file`。
@@ -58,6 +59,9 @@
 - **礼物坏了不让串门失败**：`gift` 校验不过就整条丢掉，串门照常发生，接收方只是没卡片。
   （这与 `anim` 非法整包丢弃不同：一道便条不该把一次串门搞砸。）
 - 编码后整包超过 4 KiB：丢掉 `gift` 重编一次，并在本机说一句「字条太长了，这次没带上」。
+  实测最坏基准包 945 B，加 500 码点 emoji 字条约 3.0 KB —— 正常触不到，这是**防御路径**。
+  重编必须留在**编码层**：`encodePacket` 超限是裸 `throw`（没有可判别的 code），
+  调用方没法在 service 里安全地 catch 后猜原因。
 - 旧版本收到 `gift` 直接忽略（白名单重建）；新版本收到旧报文就是没有礼物。
 
 `gift-received`（接收方 → 发起方）：
@@ -138,9 +142,25 @@ GET /local-pet-gift/<giftId>   → 文件本体
 - **卡片跟着访客**：访客回家/被送客/失联 → 卡片收起。`gift-discard` 之后永不再出现。
 - 送客时若这件礼物一次都没打开过，冒一句：「「楼下的柯基」捎来的东西还在 gifts 里。」
 
+### 跨进程字段要过的四道白名单
+
+任何新字段（`gift` / `gifts[]` / `giftId`）都要**各自**过一遍，漏一处就是静默丢字段：
+
+1. wire：`src/protocol.js`（编解码 + 解析）
+2. 宿主：`src/desktop-pets.js` 的 `controlsFromSnapshot`
+3. helper：`desktop/shared.js` 的 `emptyControls` / `normalizeControls` / 动作白名单
+4. 渲染：`desktop/renderer.js` 的 `uiRects` / `requestAction`
+
+`giftId` 还额外要过三处只转发 `deviceId` / `name` / `nickname` 的窄口：
+`src/service.js` 的 `handleDesktopAction`、`desktop/preload.js`、`desktop/shared.js` 的动作归一化。
+
 ## 存储与限额
 
-- 目录：`<dataDir>/gifts/<giftId>/`，`giftId` 形如 `20261103-153245-ab12cd`（时间可读 + 随机）。
+- 目录：`<dataDir>/gifts/<dir>/`，`dir` = `<yyyyMMdd>-<HHmmss>-<id 前 8 位>`（形如
+  `20261103-153245-ab12cd`）——由 `receivedAt` 与 `id` 确定性推出，一眼能看出什么时候到的；
+  `id` 本身仍是 UUID，拼路径前一律严格正则，绝不信报文里的字符串。
+- `meta.json` 同时记 `id` 与 `dir`。宿主在内存里保留本次运行收到的礼物；重启后按 `meta.json`
+  扫描 `gifts/`（≤200 个目录）来定位，不另建索引文件——卡片本来就跟着这一次串门走。
 - `meta.json`：`{ version, id, from: { deviceId, nickname }, kind, name?, size?, sha256?, text?,
   receivedAt, opened }`。字条正文在这里留一份，`note.txt` 是给人看的那份。
 - 单件 ≤16 MiB；`gifts/` 总量 ≤500 MiB 且 ≤200 件，超了按 `receivedAt` 删最旧（整目录删）。
@@ -171,7 +191,7 @@ GET /local-pet-gift/<giftId>   → 文件本体
 | `gift-open` | `{ giftId }` | 用系统程序打开（字条=note.txt，文件=本体） |
 | `gift-reveal` | `{ giftId }` | 在文件夹里显示 |
 | `gift-discard` | `{ giftId }` | 扔掉（删目录） |
-| `gift-copy` | `{ giftId }` | 字条正文进剪贴板 |
+| `gift-copy` | `{ giftId }` | 字条正文进剪贴板（宿主读文件 → 新命令 `copy-text` → helper 的 `clipboard.writeText`） |
 
   错误码：`bad-gift` / `too-large` / `backpack-full` / `no-such-file` / `gift-not-found` /
   `open-failed` / `gift-out`.

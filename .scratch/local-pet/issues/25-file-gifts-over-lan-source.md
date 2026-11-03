@@ -29,4 +29,8 @@
       渲染端只在 `received` 时显示缩略图，其余给文件图标
 - [ ] 集成：正常拉取（含中文文件名）、sha256 不符、410、413、超时、对方没广告 `skinPort`、
       对方中途回家（unarm → 404）；一个坏礼物不影响串门与其他访客
+- [ ] **两处 return 都要拆**：`src/service.js:608-611` 无素材源直接 return、`src/skin-server.js:47` 空源返回 null——不拆，没装素材源的用户就没有礼物端口
+- [ ] **不要复用 `src/skin-fetch.js` 的 `fetchBytes`**：它是「一个 AbortController 管总时长 + 响应体全量进内存」；礼物要 5s 连接 / 20s 总计 / `.part` 再 rename，另写 client，只借 `isPrivateAddress` 与失败冷却（`:76`）
+- [ ] helper 新 argv 根（`src/desktop-launch.js:107` + `desktop/main.js:1586`），`localpet://gifts/...` 只认两层目录 + 扩展名白名单，夹取用 `resolve` / `startsWith(base + sep)`（模板 `main.js:416`）
+- [ ] **`desktop/index.html:11` 的 CSP `img-src` 加 `localpet:`**，否则缩略图被静默挡掉
 - [ ] 冒烟：文件卡片与图片缩略图各一张截图；`npm test` 全绿

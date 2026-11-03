@@ -26,4 +26,8 @@
 - [ ] 出门（手动与自发）时取背包里 `at` 最小的一件，编码进 `visit-request`；
       手动出门若无背包件则不捎（不阻挡串门）
 - [ ] 单测：背包读写（损坏 / 满 / 撤回 / 源文件消失）、小窗入参校验、`bring`/`unbring` 的错误码
+- [ ] 菜单工具项**三处同改**：`src/menu.js` 的 `MENU_TOOL_LABELS` + `menuTools`，以及 `desktop/shared.js` 的 `MENU_TOOL_IDS`——少一处 `normalizeMenu` 就把它当未知项丢掉
+- [ ] 小窗照抄 `desktop/main.js:905 openRenameWindow`：单独 preload、`hadFocus` 后才按失焦关闭、10s 超时、只认自己那扇窗（`isRenameSender:791` 那种校验）；文件选择要新加 `dialog.showOpenDialog`（现在没有）
+- [ ] `src/visits.js` 不是 tmp+rename（`:138` 直接 writeFile）：「同一套路」只对「串行化 + 告警一次」成立，原子写自己补
+- [ ] 重发的 `visit-request` 必须带**同一件**礼物（`sendVisitRequest` 会发三次）
 - [ ] 真机冒烟：右键出「带派」、写一条放进背包、背包里看得到、撤掉；截图
