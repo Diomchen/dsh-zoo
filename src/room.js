@@ -28,7 +28,7 @@ import {
   giftReceivedText,
   isGiftReason,
   isGiftStatus
-} from './gift-copy.js'
+} from './gift-text.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -1260,7 +1260,7 @@ export function createRoom ({
      * service 把字条/文件写进磁盘之后回报状态（ticket 23 / 25）。只认这位访客身上的那一件：
      * 访客已经走了 / 礼物已经被换掉 / giftId 对不上，都返回 false 而不是顺手造一张卡。
      *
-     * status 由 gift-copy 的固定词表校验；presentation 的文案表同时是这里的状态词表，
+     * status 由 gift-text 的固定词表校验；presentation 的文案表同时是这里的状态词表，
      * 免得两处各有一份、迟早对不上。`reason`（ticket 25）只用于 failed/refused 的状态行，
      * 取值同样来自固定词表，绝不把任意字符串带进快照。
      */
@@ -1285,15 +1285,27 @@ export function createRoom ({
     /**
      * 主人点了「扔掉」：卡片立刻消失，并记住这个 giftId（本次运行内不再出现）。
      * 磁盘删除由 service 负责；这里只改内存，磁盘不归它管。
+     *
+     * `deviceId` 可以为空：礼物还没落盘（pending / receiving / failed / refused）时，
+     * service 查不到 `from.deviceId`，这时按 giftId 找到那张卡——卡片必须能扔掉。
      */
     discardGift (rawDeviceId, rawGiftId) {
       const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
       if (!isVisitId(giftId)) return false
       rememberDiscardedGift(giftId)
       const deviceId = normalizeDeviceId(rawDeviceId)
-      if (deviceId === null) return false
-      const visitor = state.visitors.get(deviceId)
-      if (visitor === undefined || visitor.gift === undefined) return false
+      let visitor = null
+      if (deviceId !== null) {
+        visitor = state.visitors.get(deviceId) ?? null
+      } else {
+        for (const candidate of state.visitors.values()) {
+          if (candidate.gift?.id === giftId) {
+            visitor = candidate
+            break
+          }
+        }
+      }
+      if (visitor === null || visitor.gift === undefined) return false
       if (visitor.gift.id !== giftId) return false
       delete visitor.gift
       return true
@@ -1312,7 +1324,7 @@ export function createRoom ({
 
     /**
      * 背包里那件东西这次带不上（文件被删/读不了）：留一句人话，串门照常。
-     * 文案由 service 从 `gift-copy.js` 取，room 只负责排进快照。
+     * 文案由 service 从 `gift-text.js` 取，room 只负责排进快照。
      */
     noteGiftMissed (text, at = clock()) {
       if (typeof text !== 'string' || text.trim() === '') return null

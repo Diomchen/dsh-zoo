@@ -14,7 +14,7 @@
  */
 
 import shared from '../desktop/shared.js'
-import { isGiftStatus, giftStatusText, giftTitleText } from './gift-copy.js'
+import { isGiftStatus, giftStatusText, giftTitleText } from './gift-text.js'
 import { isDeviceId, isVisitId, sanitizeGiftName } from './protocol.js'
 import { MAX_STREET, isBlockedReason } from './street.js'
 import { isVisitReason, visitReasonText } from './visit-copy.js'
@@ -140,7 +140,7 @@ function streetFromSnapshot (snapshot) {
  *
  * 卡片**跟着访客**：这里按 `snapshot.visitors` 走，访客一走这张卡自然就不输出了，
  * 渲染端不需要另一套“什么时候收起卡片”的规则。标题与状态文案在宿主算好，
- * 渲染端只画（`gift-copy.js` 是唯一文案表）。
+ * 渲染端只画（`gift-text.js` 是唯一文案表）。
  *
  * 文件礼物额外带 name/size；`thumb` 只在**真的收下**且扩展名是 jpg/png/gif/webp 时给，
  * 地址由 service 注入的 `thumbOf(giftId)` 算（目录名+文件名都来自礼物 store）。

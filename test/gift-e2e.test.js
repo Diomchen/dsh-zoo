@@ -4,13 +4,13 @@
  * 真 socket、真协议、真磁盘：
  *   - fake peer 发来一条带 gift 的 visit-request → `gifts/<dir>/note.txt` + meta.json；
  *   - 快照里挂到访客身上，`controls.gifts` 变成一张卡；
- *   - 「扔掉」后目录没了，重发同一件礼物也不会复活；
- *   - 不带 gift 的旧报文、超过 500 码点的字条都不影响串门本身。
+ *   - 「扔掉」后目录没了，重发同一件礼物也不会复活；没有磁盘记录的卡片同样能扔掉；
+ *   - 不带 gift 的旧报文不影响串门；`visit` 只从背包带礼物（票 23 的临时入口已删）。
  */
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import dgram from 'node:dgram'
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -296,13 +296,83 @@ test('fake peer 发来字条：落盘 → 快照挂到访客 → 卡片出现；
   assert.equal('gift' in service.snapshot().visitors[0], false)
   assert.deepEqual(controlsFromSnapshot(service.snapshot()).gifts, [])
 
-  // 再扔一次：这次是明确的 gift-not-found。
+  // 再扔一次：这次没有磁盘记录了，但「扔掉」仍然认（只拉黑，不碰文件），幂等返回 ok。
   const again = await callAction(service, { action: 'gift-discard', giftId })
-  assert.equal(again.status, 409)
-  assert.equal(again.body.error, 'gift-not-found')
+  assert.equal(again.status, 200)
+  assert.equal(again.body.ok, true)
 
   // 收尾：让对方回家，避免 t.after 里的 dispose 留下一条 in 记录（这不是本测试的断言点）。
   peer.socket.send(recallAckPayload({ deviceId, visitId }), servicePort, '127.0.0.1')
+})
+
+test('没有磁盘记录的礼物卡也能「扔掉」：拉黑、卡片消失、返回 ok、不碰文件', async (t) => {
+  const dir = await tempDir(t)
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.socket.address().port
+  const servicePort = await freeUdpPort()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: true,
+    desktop: false,
+    port: servicePort,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    heartbeatIntervalMs: 60000,
+    tickIntervalMs: 50
+  })
+  await service.ready
+
+  const deviceId = randomUUID()
+  peer.socket.send(
+    beaconPayload({ deviceId, nickname: '楼下的柯基', port: peerPort }),
+    servicePort,
+    '127.0.0.1'
+  )
+  await waitFor(() => service.snapshot().neighbors.length === 1)
+  assert.equal((await callAction(service, { action: 'admit', deviceId })).status, 200)
+
+  const visitId = randomUUID()
+  const giftId = randomUUID()
+  const sendGift = () => peer.socket.send(
+    visitRequestPayload({
+      deviceId,
+      visitId,
+      nickname: '楼下的柯基',
+      // 没有 skinPort：文件礼物根本取不回来 → failed/no-port，磁盘上没有记录。
+      gift: {
+        id: giftId,
+        kind: 'file',
+        name: '报价单.pdf',
+        size: 4,
+        sha256: 'sha256:' + 'a'.repeat(64)
+      }
+    }),
+    servicePort,
+    '127.0.0.1'
+  )
+
+  sendGift()
+  await waitFor(() => {
+    const gift = service.snapshot().visitors[0]?.gift
+    return gift?.id === giftId && gift.status === 'failed' && gift.reason === 'no-port'
+  })
+  assert.deepEqual(await giftDirs(dir), [], '没有落盘，所以没有磁盘记录')
+  assert.equal(controlsFromSnapshot(service.snapshot()).gifts[0]?.status, 'failed')
+
+  const discarded = await callAction(service, { action: 'gift-discard', giftId })
+  assert.equal(discarded.status, 200)
+  assert.equal(discarded.body.ok, true)
+  assert.equal('gift' in service.snapshot().visitors[0], false)
+  assert.deepEqual(controlsFromSnapshot(service.snapshot()).gifts, [])
+
+  // 重发同一条：黑名单认这件，卡片不会长回来，也不会尝试写盘。
+  sendGift()
+  await delay(250)
+  assert.equal('gift' in service.snapshot().visitors[0], false)
+  assert.deepEqual(await giftDirs(dir), [])
 })
 
 test('不带 gift 的旧报文：访客照常进门，没有礼物目录、没有卡片', async (t) => {
@@ -340,7 +410,7 @@ test('不带 gift 的旧报文：访客照常进门，没有礼物目录、没�
   assert.deepEqual(await giftDirs(dir), [])
 })
 
-test('两个实例：A 的 visit 带字条 → B 落盘并出现在 B 的卡片上', async (t) => {
+test('两个实例：A 背包里的字条随 visit 带过去 → B 落盘并出现在 B 的卡片上', async (t) => {
   const dirA = await tempDir(t)
   const dirB = await tempDir(t)
   const [portA, portB] = await distinctPorts(2)
@@ -355,13 +425,13 @@ test('两个实例：A 的 visit 带字条 → B 落盘并出现在 B 的卡片�
   assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
   assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
 
-  const giftId = randomUUID()
-  const started = await callAction(a, {
-    action: 'visit',
-    deviceId: bId,
-    gift: { id: giftId, kind: 'text', text: '到你家门口了\n顺带一句' }
-  })
+  // 礼物唯一入口是背包（票 24）：先放进去，出门时自动带上 `at` 最小的那件。
+  const added = await callAction(a, { action: 'bring', kind: 'text', text: '到你家门口了\n顺带一句' })
+  assert.equal(added.status, 200)
+  const giftId = added.body.giftId
+  const started = await callAction(a, { action: 'visit', deviceId: bId })
   assert.equal(started.status, 200)
+  assert.equal(started.body.giftId, giftId)
   assert.equal(started.body.giftDropped, false)
   await waitFor(() => b.snapshot().visitors[0]?.gift?.status === 'received')
   assert.equal(b.snapshot().visitors[0].gift.id, giftId)
@@ -378,7 +448,7 @@ test('两个实例：A 的 visit 带字条 → B 落盘并出现在 B 的卡片�
   )
 })
 
-test('字条超过 500 码点：丢 gift、串门照常、本机留一句 notice', async (t) => {
+test('visit action 不再接受显式 gift：只从背包带东西', async (t) => {
   const dir = await tempDir(t)
   const peer = await loopbackPeer(t)
   const peerPort = peer.socket.address().port
@@ -404,20 +474,25 @@ test('字条超过 500 码点：丢 gift、串门照常、本机留一句 notice
   await waitFor(() => service.snapshot().neighbors.length === 1)
   assert.equal((await callAction(service, { action: 'admit', deviceId })).status, 200)
 
+  const added = await callAction(service, { action: 'bring', kind: 'text', text: '背包里的' })
+  assert.equal(added.status, 200)
   const started = await callAction(service, {
     action: 'visit',
     deviceId,
-    gift: { id: randomUUID(), kind: 'text', text: '字'.repeat(501) }
+    // 票 23 的临时入口已经删掉：这个字段必须被忽略，带上的只能是背包里那件。
+    gift: { id: randomUUID(), kind: 'text', text: '这条应该被忽略' }
   })
   assert.equal(started.status, 200)
   assert.equal(started.body.ok, true)
-  assert.equal(started.body.giftDropped, true)
-  assert.match(started.body.notice, /字条太长了，这次没带上/)
+  assert.equal(started.body.giftId, added.body.giftId)
 
   await waitFor(() => visitEntries(peer.received).length >= 1)
   const requests = visitEntries(peer.received)
-  for (const entry of requests) assert.equal('gift' in entry.parsed.packet, false)
-  assert.ok(service.snapshot().notices.some((notice) => /字条太长了/.test(notice.text)))
+  for (const entry of requests) {
+    assert.equal(entry.parsed.packet.gift.id, added.body.giftId)
+    assert.equal(entry.parsed.packet.gift.text, '背包里的')
+  }
+  assert.equal(service.snapshot().notices.some((notice) => /字条太长了/.test(notice.text)), false)
 })
 
 test('桌面动作：打开/显示/复制走 helper，扔掉交给 helper；路径只从 store 来', async (t) => {
@@ -469,7 +544,20 @@ test('桌面动作：打开/显示/复制走 helper，扔掉交给 helper；路�
   const copied = await callAction(service, { action: 'gift-copy', giftId })
   assert.equal(copied.status, 200)
   assert.equal(copied.body.notice, '字条已经复制到剪贴板。')
-  assert.deepEqual(calls.copy, ['你好\n再见'])
+  // 宿主读的是 note.txt 原文（写入时带一个换行；helper 侧还会再清洗一遍）。
+  assert.deepEqual(calls.copy, ['你好\n再见\n'])
+
+  // 用户手改过 note.txt：复制到的是磁盘上的当前内容，不是内存里的旧正文。
+  await writeFile(saved.gift.notePath, '手改过的正文\n', 'utf8')
+  const copiedEdited = await callAction(service, { action: 'gift-copy', giftId })
+  assert.equal(copiedEdited.status, 200)
+  assert.deepEqual(calls.copy.at(-1), '手改过的正文\n')
+
+  // 磁盘文件读不到时才回退内存值：至少还能复制到收到时的正文。
+  await rm(saved.gift.notePath, { force: true })
+  const copiedFallback = await callAction(service, { action: 'gift-copy', giftId })
+  assert.equal(copiedFallback.status, 200)
+  assert.deepEqual(calls.copy.at(-1), '你好\n再见')
 
   const discarded = await callAction(service, { action: 'gift-discard', giftId })
   assert.equal(discarded.status, 200)
@@ -477,12 +565,16 @@ test('桌面动作：打开/显示/复制走 helper，扔掉交给 helper；路�
   assert.deepEqual(await readdir(join(dir, GIFTS_DIR)), [])
   assert.deepEqual(calls.discard, [saved.gift.dirPath])
 
-  // 已经不在索引里：后续动作都是 gift-not-found；坏 id 是 bad-gift。
-  for (const action of ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard']) {
+  // 已经不在索引里：打开/显示/复制都是 gift-not-found；坏 id 是 bad-gift。
+  for (const action of ['gift-open', 'gift-reveal', 'gift-copy']) {
     const missing = await callAction(service, { action, giftId })
     assert.equal(missing.status, 409, action)
     assert.equal(missing.body.error, 'gift-not-found', action)
   }
+  // 「扔掉」是幂等的：没有磁盘记录也认这次操作（只拉黑，不碰文件），返回 ok。
+  const discardedAgain = await callAction(service, { action: 'gift-discard', giftId })
+  assert.equal(discardedAgain.status, 200)
+  assert.equal(discardedAgain.body.ok, true)
   const bad = await callAction(service, { action: 'gift-open', giftId: 'gift-1' })
   assert.equal(bad.status, 409)
   assert.equal(bad.body.error, 'bad-gift')
@@ -656,12 +748,11 @@ test('记录里带 gift：字条在双方 visits.json 都留下 {kind:"text"}，
   assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
 
   const secret = '私房话：今晚吃鱼\n第二行'
-  const started = await callAction(a, {
-    action: 'visit',
-    deviceId: bId,
-    gift: { id: randomUUID(), kind: 'text', text: secret }
-  })
+  const added = await callAction(a, { action: 'bring', kind: 'text', text: secret })
+  assert.equal(added.status, 200)
+  const started = await callAction(a, { action: 'visit', deviceId: bId })
   assert.equal(started.status, 200)
+  assert.equal(started.body.giftId, added.body.giftId)
   await waitFor(() => b.snapshot().visitors[0]?.gift?.status === 'received')
   await waitFor(() => a.snapshot().self.out?.phase === 'active')
 

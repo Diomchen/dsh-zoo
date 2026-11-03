@@ -3,7 +3,7 @@
  *
  * 这一层不起 service/网络，只回答四件事：
  *   1. `gift-received` 的编码/解析只带五个字段，`giftId` 不会被 VISIT_TYPES 吃掉；
- *   2. 三句人话都在 `gift-copy.js`，昵称非法时退成「邻居」；
+ *   2. 三句人话都在 `gift-text.js`，昵称非法时退成「邻居」；
  *   3. 背包的「按 giftId 删 out 件」与「按 visitId 回退」各自只动该动的那一件；
  *   4. 入站串门结束（送客 / 对方召回 / 失联）都会把礼物交给 service，且只交一次。
  */
@@ -19,7 +19,7 @@ import {
   giftLeftBehindText,
   giftNotReceivedText,
   giftReceivedText
-} from '../src/gift-copy.js'
+} from '../src/gift-text.js'
 import {
   MAX_PACKET_BYTES,
   PROTOCOL_VERSION,
@@ -119,7 +119,7 @@ test('gift-received 校验：缺/坏 giftId 整包丢；多余的昵称/端口/�
 // 文案
 // ---------------------------------------------------------------------------
 
-test('回执/没送到/还在 gifts 里：三句话都在 gift-copy，昵称非法有兜底', () => {
+test('回执/没送到/还在 gifts 里：三句话都在 gift-text，昵称非法有兜底', () => {
   assert.equal(giftReceivedText('楼下的柯基'), '「楼下的柯基」收下了。')
   assert.equal(giftReceivedText(null), '「邻居」收下了。')
   assert.equal(giftReceivedText('   '), '「邻居」收下了。')

@@ -17,12 +17,12 @@
 - [x] 背包 `out` 状态：带 `visitId`；收到回执 → 删除该件 + notice「「楼下的柯基」收下了。」
 - [x] 串门结束（回家 / 送客 / 超时 / 失联）仍未收到回执 → 退回 `idle` +
       notice「没送到：对方没取到（可能没开端口、或对方版本较旧）。」
-- [ ] 失败话术统一进 `src/visit-copy.js`（同一张表，别在渲染端分叉）：
+- [x] 失败话术统一进 `src/gift-text.js`（礼物与背包的同一张表，别在渲染端分叉）：
       `timeout` / `no-port` / `checksum` / `too-large` / `rate` / `write` 各一句人话；
       接收方卡片上的 `failed` / `refused` 也走这张表
-      （留给 25：这些失败原因由文件拉取产生；本票没动 `visit-copy.js`）
-- [x] 送客提醒：这张卡一次都没打开过（`meta.opened === false`）→ notice
-      「「楼下的柯基」捎来的东西还在 gifts 里。」
+      （实现落在 `gift-text.js` 的 `giftStatusText` / `backpackErrorText`；`visit-copy.js` 只管串门失败）
+- [x] 入站串门结束时（送客 / 对方召回 / 失联 / 清场）这张卡一次都没打开过
+      （`meta.opened === false`）→ notice「「楼下的柯基」捎来的东西还在 gifts 里。」
 - [x] 单元：回执编解码、重复回执幂等、退包、`opened` 落盘
 - [x] 集成：回执正常到达；回执丢包（退包并提示）；旧端永不回执（超时退包）；串门被拒（根本没有 out 件）
 - [x] `gift-received` 走**单独分支**，别塞 `VISIT_TYPES`（`:396` 那条只重建 4 个字段，会吃掉 `giftId`）
@@ -53,13 +53,13 @@
 > 另一次 visitId，还没回执的就退包 + 说「没送到：…」。因此 `finishOutbound` /
 > `failOutbound`（含 deny）/ `tick` 的到期与失联 / `observeVisitRecall` 里「请求中被对方 recall
 > 直接 `state.out=null`」/ 本地召回全被同一条覆盖；`dispose` 另走
-> `releaseOutboundGiftsOnDispose`（先写回 idle，再放掉 store 引用）。真退了一件才冒泡；
-> 脚本入口的显式礼物本来就不在背包里，不会假报“退回背包”。
+> `releaseOutboundGiftsOnDispose`（先写回 idle，再放掉 store 引用）。真退了一件才冒泡，
+> 不会假报“退回背包”。
 > **送客提醒**：room 在四个入站结束出口（`endInboundVisit` / `observeVisitRecall` 的 in 侧 /
 > `tick` 失联 / `dropInboundVisitor`）把「谁捎来的、哪一件」排进 `endedInboundGifts`；
 > service 的 `noteEndedInboundGifts` 查 `gifts.lookup(...).opened === false` 才说
 > 「「XX」捎来的东西还在 gifts 里。」（`opened` 只在磁盘的 meta.json 上，所以判断留在 service）。
-> 三句新文案都**追加**在 `src/gift-copy.js` 末尾（没有重排旧表，冲突留给 merger）。
+> 三句新文案都**追加**在 `src/gift-text.js` 末尾（没有重排旧表，冲突留给 merger）。
 > **测试**：`npm test` 全绿 **406** 条（原 391 + 新 15）。新增 `test/receipt.test.js`（7）：
 > 回执编解码/白名单/小写归一、三句文案、`confirmOut`、`releaseOutByVisit`、入站三个结束出口的
 > 排队与“只交一次”、没礼物的访客不排队；`test/receipt-e2e.test.js`（8）：两实例回执到达 +
