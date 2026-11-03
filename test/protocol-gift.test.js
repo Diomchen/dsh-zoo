@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 import {
+  MAX_GIFT_BYTES,
   MAX_GIFT_TEXT,
   MAX_PACKET_BYTES,
   PROTOCOL_VERSION,
@@ -74,7 +75,7 @@ test('sanitizeNote：≤500 码点，超了返回 null（不截断——截一�
   assert.equal(sanitizeNote('\ud800'), null)
 })
 
-test('normalizeGift：只认 id/kind/text；形状不对返回 null，不抛', () => {
+test('normalizeGift：字条与文件各自一套白名单；形状不对返回 null，不抛', () => {
   const id = visitId()
   assert.deepEqual(
     normalizeGift({ id, kind: 'text', text: '  你好\n世界  ', extra: 'x' }),
@@ -83,28 +84,44 @@ test('normalizeGift：只认 id/kind/text；形状不对返回 null，不抛', (
   // id 统一小写：目录名与后续 action 都以它为准。
   assert.equal(normalizeGift({ id: id.toUpperCase(), kind: 'text', text: 'x' }).id, id)
 
+  // 文件礼物（ticket 24 起发）：报文里只有元数据，**没有路径**；本体由 25 拉取。
+  const sha256 = 'sha256:' + 'a'.repeat(64)
+  assert.deepEqual(
+    normalizeGift({ id, kind: 'file', name: '  报价单.pdf  ', size: 23194, sha256, path: '/tmp/secret' }),
+    { id, kind: 'file', name: '报价单.pdf', size: 23194, sha256 }
+  )
+  // 名字清洗后为空不是错误：退成 `file`（名字只是给人看的）。
+  assert.equal(normalizeGift({ id, kind: 'file', name: '../', size: 1, sha256 }).name, 'file')
+  assert.equal(
+    normalizeGift({ id, kind: 'file', name: 'x'.repeat(200), size: 1, sha256 }).name.length,
+    120
+  )
+
   for (const bad of [
     null,
     'text',
     [],
     { id: 'gift-1', kind: 'text', text: 'x' },
     { id, kind: 'file', text: 'x' },
+    { id, kind: 'file', name: 'x.pdf', size: 0, sha256 },
+    { id, kind: 'file', name: 'x.pdf', size: MAX_GIFT_BYTES + 1, sha256 },
+    { id, kind: 'file', name: 'x.pdf', size: 1, sha256: 'sha256:abc' },
+    { id, kind: 'file', name: 'x.pdf', size: 1, sha256: 'md5:' + 'a'.repeat(32) },
     { id, kind: 'text', text: '' },
     { id, kind: 'text', text: 'x'.repeat(MAX_GIFT_TEXT + 1) },
     { id, kind: 'text' }
   ]) {
-    if (bad !== null && typeof bad === 'object' && bad.kind === 'file') {
-      // kind:'file' 现在整条不收（ticket 25 才加），但形状本身是合法的：返回 null 即可。
-      assert.equal(normalizeGift(bad), null)
-      continue
-    }
     assert.equal(normalizeGift(bad), null, JSON.stringify(bad))
   }
 
-  // 白名单重建：多余的字段（例如文件礼物的 name/size/path）一律丢掉，不改变字条本身。
+  // 白名单重建：字条多出来的文件字段、文件多出来的 text 一律丢掉。
   assert.deepEqual(
     normalizeGift({ id, kind: 'text', text: 'x', name: '报价单.pdf', path: '/tmp/x' }),
     { id, kind: 'text', text: 'x' }
+  )
+  assert.deepEqual(
+    normalizeGift({ id, kind: 'file', name: 'x.pdf', size: 7, sha256, text: '夹带' }),
+    { id, kind: 'file', name: 'x.pdf', size: 7, sha256 }
   )
 })
 
@@ -212,7 +229,7 @@ test('parsePacket：坏 gift 只丢字段，串门请求照常被接受（与 an
     { id: base.visitId, kind: 'text', text: 42 },
     'gift',
     [],
-    { id: base.visitId, kind: 'file', name: '报价单.pdf', size: 23194, sha256: 'sha256:' + '0'.repeat(64) }
+    { id: base.visitId, kind: 'file', name: '报价单.pdf', size: 0, sha256: 'sha256:' + '0'.repeat(64) }
   ]
   for (const gift of badGifts) {
     const parsed = parsePacket(encodeJson({ ...base, gift }))
@@ -241,4 +258,25 @@ test('parsePacket：伪造的超长字段也走白名单，不因为 gift 被放
   assert.equal('coordinates' in parsed.packet, false)
   assert.equal('path' in parsed.packet, false)
   assert.deepEqual(Object.keys(parsed.packet.gift), ['id', 'kind', 'text'])
+})
+
+test('文件礼物：编码只带 name/size/sha256，解析后仍然没有路径', () => {
+  const deviceId = randomUUID()
+  const id = visitId()
+  const sha256 = 'sha256:' + 'b'.repeat(64)
+  const built = encodeVisitRequestDetailed({
+    deviceId,
+    visitId: id,
+    nickname: '甲',
+    anim: null,
+    gift: { id, kind: 'file', name: '报价单.pdf', size: 23194, sha256, path: '/tmp/secret' }
+  })
+  assert.equal(built.giftDropped, false)
+  const raw = JSON.parse(built.data.toString('utf8'))
+  assert.deepEqual(raw.gift, { id, kind: 'file', name: '报价单.pdf', size: 23194, sha256 })
+
+  const parsed = parsePacket(built.data)
+  assert.equal(parsed.ok, true)
+  assert.deepEqual(parsed.packet.gift, raw.gift)
+  assert.deepEqual(Object.keys(parsed.packet.gift), ['id', 'kind', 'name', 'size', 'sha256'])
 })

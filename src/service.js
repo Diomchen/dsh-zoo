@@ -3,9 +3,11 @@ import { hostname } from 'node:os'
 import { join } from 'node:path'
 
 import shared from '../desktop/shared.js'
+import { createBackpackStore } from './backpack.js'
 import { createDesktop } from './desktop.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
+import { backpackErrorText, giftPrepareFailedText } from './gift-copy.js'
 import { createGiftStore } from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
@@ -111,6 +113,8 @@ export function createService (ctx, options = {}) {
   let visits = null
   // 入站礼物的落盘（ticket 23）；起不来只意味着“这次运行收不到字条”，串门照常。
   let gifts = null
+  // 发送端的背包（ticket 24）；起不来 = 这次运行不带东西，串门照常。
+  let backpack = null
   let settings = null
   let bridge = null
   let desktop = null
@@ -292,9 +296,8 @@ export function createService (ctx, options = {}) {
 
     // 手动「串门」：可以指定 deviceId，也可以不带——后者是 ticket 11 的按钮路径，
     // 由宿主随机挑一位在线且互相放行的邻居。手动永远不受总开关/活动窗口限制。
-    //
-    // `gift` 是 ticket 23 的内部/脚本入口：一次性捎一条字条，验证“走线 → 对端落盘”的整条路。
-    // ticket 24 的背包会从这里接进来（先放的先带走），所以入口本身不会变。
+    // `gift` 是脚本/内部入口的一次性礼物（ticket 23 起保留）；不传时 ticket 24 的背包
+    // 会按「先放的先带走」自动捎上最旧的一件。手动与自发走同一条 `startOutboundVisit`。
     if (action === 'visit') {
       let deviceId
       if (body?.deviceId === undefined || body?.deviceId === null) {
@@ -317,6 +320,13 @@ export function createService (ctx, options = {}) {
       action === 'gift-copy' || action === 'gift-discard') {
       return handleGiftAction(action, body?.giftId)
     }
+
+    // 背包（ticket 24）：
+    //   - 不带物品的 bring 来自右键「带派」→ 打开小窗（内容由宿主算好交下去）；
+    //   - 带 `{gift}` / `{kind,text|path}` 的 bring 来自小窗或脚本 → 真正放进背包；
+    //   - unbring 只删 idle 件（out 中的东西可能已经在对方磁盘上了）。
+    if (action === 'bring') return handleBringAction(body)
+    if (action === 'unbring') return handleUnbringAction(body)
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') {
@@ -498,6 +508,91 @@ export function createService (ctx, options = {}) {
     return { ok: false, error: 'not-implemented', action }
   }
 
+  /**
+   * 背包动作（ticket 24）。
+   *
+   * 入参从三条路来，形状刻意收在同一个白名单里：
+   *   - HTTP：`{action:'bring', kind:'text', text}` / `{kind:'file', path}`（SPEC 的 action 表）；
+   *   - 小窗：`{action:'bring', gift:{kind,text|path}}`（helper 转交）；
+   *   - 右键菜单：`{action:'bring'}`，没有物品 → 打开小窗。
+   *
+   * 只有本地页面/桌面控件/HTTP 能到这里，UDP 报文永远碰不到它。
+   */
+  async function handleBringAction (body) {
+    if (backpack === null) {
+      return { ok: false, error: 'starting', notice: backpackErrorText('starting') }
+    }
+    const input = bringInputFromBody(body)
+    if (input === null) {
+      // 没带物品 = 右键「带派」那一下：打开小窗，背包内容与限额由宿主交给 helper。
+      if (desktop === null || typeof desktop.bringWindow !== 'function') {
+        return { ok: false, error: 'desktop-off', notice: backpackErrorText('desktop-off') }
+      }
+      if (desktop.bringWindow(bringWindowPayload({ open: true })) !== true) {
+        return { ok: false, error: 'desktop-off', notice: backpackErrorText('desktop-off') }
+      }
+      return { ok: true, action: 'bring', window: 'opened', count: backpack.count() }
+    }
+
+    const added = await backpack.add(input)
+    if (!added.ok) {
+      return { ok: false, error: added.error, notice: backpackErrorText(added.error) }
+    }
+    // 小窗正开着（HTTP/脚本放进来的情况）就刷新列表；关着时这条命令只是更新 helper 内存。
+    refreshBringWindow()
+    return { ok: true, action: 'bring', giftId: added.item.id, count: added.count }
+  }
+
+  /** 从背包撤掉一件。只有 idle 能撤；`out` 中的东西可能已经在对方磁盘上了。 */
+  async function handleUnbringAction (body) {
+    if (backpack === null) {
+      return { ok: false, error: 'starting', notice: backpackErrorText('starting') }
+    }
+    const removed = await backpack.remove(body?.giftId)
+    if (!removed.ok) {
+      return { ok: false, error: removed.error, notice: backpackErrorText(removed.error) }
+    }
+    refreshBringWindow()
+    return { ok: true, action: 'unbring', giftId: removed.item.id, count: removed.count }
+  }
+
+  /**
+   * 从 action body 里挖出「要放进背包的东西」。
+   * 不含任何 kind 时返回 null（那是打开小窗的菜单动作），而不是当成坏礼物——
+   * 这两种请求都叫 bring，区别就在有没有东西。
+   */
+  function bringInputFromBody (body) {
+    if (body === null || typeof body !== 'object') return null
+    const nested = body.gift !== null && typeof body.gift === 'object' && !Array.isArray(body.gift)
+    const raw = nested ? body.gift : body
+    if (typeof raw.kind !== 'string') return null
+    return raw
+  }
+
+  /**
+   * 交给 helper 的背包快照：只带 id/kind/显示文案/state，**绝不带文件路径**。
+   * 路径只活在宿主；小窗删一件只发 giftId。
+   */
+  function bringWindowPayload ({ open = false } = {}) {
+    const items = backpack?.items() ?? []
+    return {
+      open: open === true,
+      items: items.map((item) => item.kind === 'file'
+        ? { id: item.id, kind: 'file', name: item.name, state: item.state }
+        : { id: item.id, kind: 'text', text: item.text, state: item.state })
+    }
+  }
+
+  /** 已开着的窗跟着背包变；没有桌面层/没有窗时它是 no-op。 */
+  function refreshBringWindow () {
+    if (desktop === null || typeof desktop.bringWindow !== 'function') return false
+    try {
+      return desktop.bringWindow(bringWindowPayload({ open: false })) === true
+    } catch {
+      return false
+    }
+  }
+
   async function start () {
     try {
       // 先把放行/拒绝名单读进内存，再开始发现：重启后第一次广播就不会再问。
@@ -535,6 +630,15 @@ export function createService (ctx, options = {}) {
       } catch (error) {
         gifts = null
         warn(ctx, '礼物目录初始化失败，本次收到的字条不会落盘：' + message(error))
+      }
+      if (disposed) return
+
+      // 背包（ticket 24）同样是锦上添花：读不出来 = 这次运行空手出门，串门照常。
+      try {
+        backpack = await createBackpackStore(dir, { log })
+      } catch (error) {
+        backpack = null
+        warn(ctx, '背包初始化失败，本次出门不会带东西：' + message(error))
       }
       if (disposed) return
 
@@ -916,7 +1020,9 @@ export function createService (ctx, options = {}) {
         // 只有改名带正文；其余动作这里是 undefined，与 HTTP 那条路同形。
         nickname: event.nickname ?? undefined,
         // 礼物四动作只带 giftId（UUID）；路径由宿主查 store，渲染端从来不知道。
-        giftId: event.giftId ?? undefined
+        giftId: event.giftId ?? undefined,
+        // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
+        gift: event.gift ?? undefined
       })
     } catch (error) {
       warn(ctx, '桌面控件动作失败（' + event.action + '）：' + message(error))
@@ -967,6 +1073,11 @@ export function createService (ctx, options = {}) {
     if (error === 'open-failed') return '系统没有接受这个打开请求。'
     if (error === 'gift-not-found') return '这件东西已经不在了。'
     if (error === 'bad-gift') return '这张礼物卡已经不在了。'
+    // 背包（ticket 24）：小窗/HTTP 的失败一律说人话，五个错误码各有各的下一步。
+    if (error === 'backpack-full' || error === 'too-large' || error === 'no-such-file' ||
+      error === 'gift-out') {
+      return backpackErrorText(error)
+    }
     if (error === 'dsh-pet-no-pet') return 'dsh-pet 里还没有宠物，没地方存这个名字。'
     return '这次操作没有完成，稍后再试。'
   }
@@ -1082,7 +1193,11 @@ export function createService (ctx, options = {}) {
   function startAutoVisitTimer () {
     if (autoVisitTimer !== null || disposed || discovery === null) return
     autoVisitTimer = setInterval(() => {
-      maybeSpontaneousVisit()
+      // 背包里可能是文件：sendVisitRequest 之前要 await stat/hash，所以这里接了 Promise。
+      // 任何异常都只影响这一拍，不能冒成 unhandledRejection 把进程带走。
+      maybeSpontaneousVisit().catch((error) => {
+        warn(ctx, '自动串门没有完成：' + message(error))
+      })
     }, autoVisitIntervalMs)
     autoVisitTimer.unref?.()
   }
@@ -1092,7 +1207,7 @@ export function createService (ctx, options = {}) {
    * 每次判定都写进 room 快照（lastDecision），并按 reason 节流打一行日志，
    * 这样“为什么它没出门”在日志里能直接读到，不用猜。
    */
-  function maybeSpontaneousVisit () {
+  async function maybeSpontaneousVisit () {
     if (disposed) return null
     const plan = room.spontaneousVisitPlan()
     room.notePolicyDecision(plan)
@@ -1101,7 +1216,9 @@ export function createService (ctx, options = {}) {
       return plan
     }
 
-    const result = startOutboundVisit(plan.candidate.deviceId)
+    // 自发与手动走同一条路：背包里最旧的一件也会被带上（ticket 24）。
+    const result = await startOutboundVisit(plan.candidate.deviceId)
+    if (disposed) return { ...plan, result }
     // 自动路径没有 action 的 finally：手动同步一次桌面，让本机立刻收起自己。
     flushRoomEffects()
     if (!result.ok) {
@@ -1246,22 +1363,55 @@ export function createService (ctx, options = {}) {
    * 开始一次出门的唯一入口：手动按钮与自发策略共用同一条路径。
    * 生成 visitId、写 room 状态、发第一包、登记重试计时器；失败时由 room 给一句人话。
    *
-   * `gift` 是这次捎的字条（ticket 23）：由编码层判定带不带得上，重发必须带同一件。
-   * ticket 24 会从背包里取最旧的一件填进来；这里不关心它从哪来。
+   * `explicitGift` 是脚本/内部入口的一次性礼物（ticket 23 起保留）；不传就按背包
+   * 「先放的先带走」取最旧的一件。编码层判定带不带得上，重发必须带同一个 gift 对象。
    */
-  function startOutboundVisit (deviceId, gift = null) {
+  async function startOutboundVisit (deviceId, explicitGift = null) {
     const visitId = randomUUID()
+    let gift = explicitGift ?? null
+    // 背包里被选中的那一件；只有真的发出去才留在 out，发不出去立刻放回 idle。
+    let carried = null
+    let skipped = null
+
+    // 没有显式礼物时，按「先放的先带走」从背包取最旧的一件。
+    // 文件件的 size/sha256 在这里（发送那一刻）才读；读不出来就空手出门，东西留在背包。
+    if (gift === null && backpack !== null) {
+      const picked = backpack.oldestIdle()
+      if (picked !== null) {
+        const prepared = await backpack.prepareGift(picked)
+        if (disposed) return { ok: false, error: 'disposed' }
+        if (prepared.ok) {
+          gift = prepared.gift
+          carried = picked
+        } else {
+          skipped = room.noteGiftMissed(giftPrepareFailedText(prepared.error, picked.name))
+        }
+      }
+    }
+
     const begun = room.beginVisit(deviceId, { visitId })
     if (!begun.ok) return begun
+
+    if (carried !== null && backpack !== null) {
+      const marked = await backpack.markOut(carried.id, visitId)
+      if (!marked.ok) {
+        // 准备文件的那一会儿用户把它撤掉了（或已经被另一次串门带走）：这次就空手。
+        carried = null
+        gift = null
+      }
+    }
+
     const sent = sendVisitRequest(visitId, gift)
     if (!sent.ok) {
       request = null
+      if (carried !== null && backpack !== null) await backpack.releaseOut(carried.id, visitId)
       const failed = room.failOutboundVisit('peer-offline')
       return {
         ok: false,
         error: 'peer-offline',
         deviceId,
-        notice: failed.ok ? failed.notice : null
+        notice: failed.ok ? failed.notice : null,
+        ...(skipped === null ? {} : { missed: skipped.text })
       }
     }
     const now = Date.now()
@@ -1272,11 +1422,18 @@ export function createService (ctx, options = {}) {
       nextAt: now + visitRetryMs,
       deadline: now + visitTimeoutMs,
       // 只留真的带上的那一件：整包超限被丢掉之后再重试也不该反复撞同一面墙。
+      // 重发**原样**用它，文件件不在重试里重新算 hash（对方看到的是同一件东西）。
       gift: sent.gift
     }
-    // 字条没带上（太长/坏形状/整包超 4 KiB）：串门照常，但必须在本机说一句，
-    // 不能让人以为东西已经送出去了。
-    const notice = sent.giftDropped ? room.noteGiftDropped() : null
+
+    if (sent.giftDropped && carried !== null) {
+      // 编码层把礼物丢掉了：它根本没上路，退回 idle，不占着“正在捎出”。
+      if (backpack !== null) await backpack.releaseOut(carried.id, visitId)
+      carried = null
+    }
+    // 字条没带上（太长/坏形状/整包超 4 KiB）或背包那件文件读不出来：串门照常，
+    // 但必须在本机说一句，不能让人以为东西已经送出去了。
+    const notice = sent.giftDropped ? room.noteGiftDropped() : skipped
     return {
       ok: true,
       action: 'visit',
@@ -1285,6 +1442,7 @@ export function createService (ctx, options = {}) {
       phase: 'requesting',
       nickname: begun.visit.nickname,
       giftDropped: sent.giftDropped,
+      ...(carried === null ? {} : { giftId: carried.id }),
       ...(notice === null ? {} : { notice: notice.text })
     }
   }
@@ -1355,6 +1513,9 @@ export function createService (ctx, options = {}) {
   async function receiveGift (packet) {
     const gift = packet.gift
     if (gift === undefined || gift === null || !isVisitId(gift.id)) return
+    // ticket 24 只会发文件礼物；接收/拉取是 ticket 25 的事。在那之前让卡片停在 pending，
+    // 而不是拿文件礼物去写字条、把它标成没取到。
+    if (gift.kind !== 'text') return
     const saved = gifts === null
       ? { ok: false, error: 'starting' }
       : await gifts.receiveText({
@@ -1522,6 +1683,7 @@ export function createService (ctx, options = {}) {
       visitorSkins.clear()
       skinPool = []
       gifts = null
+      backpack = null
       request = null
       recalls.clear()
       discovery?.dispose()

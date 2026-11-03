@@ -29,3 +29,24 @@ test('状态文案：五种状态齐全；received 不给解释，failed/refused
   assert.match(giftStatusText('refused'), /没收下/)
   assert.equal(giftStatusText('unknown'), null)
 })
+
+test('背包文案：五个错误码都有人话；文件没带上时带名字且不猜原因', async () => {
+  const copy = await import('../src/gift-copy.js')
+  assert.match(copy.backpackErrorText('backpack-full'), /两件/)
+  assert.match(copy.backpackErrorText('too-large'), /16 MB/)
+  assert.match(copy.backpackErrorText('no-such-file'), /不在了/)
+  assert.match(copy.backpackErrorText('bad-gift'), /绝对路径/)
+  assert.match(copy.backpackErrorText('gift-out'), /路上/)
+  assert.match(copy.backpackErrorText('gift-not-found'), /没有这件东西/)
+  assert.match(copy.backpackErrorText('starting'), /还没准备好/)
+  assert.match(copy.backpackErrorText('desktop-off'), /带派/)
+  assert.equal(typeof copy.backpackErrorText('unknown'), 'string')
+
+  assert.equal(copy.giftDroppedText(), '字条太长了，这次没带上。')
+  assert.match(copy.giftPrepareFailedText('no-such-file', '报价单.pdf'), /「报价单.pdf」.*找不到了/)
+  assert.match(copy.giftPrepareFailedText('unreadable', '报价单.pdf'), /读不出来/)
+  assert.match(copy.giftPrepareFailedText('too-large', '报价单.pdf'), /16 MB/)
+  // 名字来自可手改的背包文件：同样要清洗，不能把奇怪字符带进气泡。
+  assert.doesNotMatch(copy.giftPrepareFailedText('no-such-file', '../../etc'), /\.\.\//)
+  assert.match(copy.giftPrepareFailedText('no-such-file', null), /这个文件/)
+})

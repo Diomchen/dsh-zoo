@@ -20,7 +20,7 @@ import {
   VISIT_RECORD_LIMIT,
   normalizeVisitRecord
 } from './visit-record.js'
-import { isGiftStatus } from './gift-copy.js'
+import { giftDroppedText, isGiftStatus } from './gift-copy.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -1245,7 +1245,16 @@ export function createRoom ({
 
     /** 本机这次的礼物没带上（太长/整包超 4 KiB）：留一句人话，串门照常。 */
     noteGiftDropped (at = clock()) {
-      return pushNotice('字条太长了，这次没带上。', at)
+      return pushNotice(giftDroppedText(), at)
+    },
+
+    /**
+     * 背包里那件东西这次带不上（文件被删/读不了）：留一句人话，串门照常。
+     * 文案由 service 从 `gift-copy.js` 取，room 只负责排进快照。
+     */
+    noteGiftMissed (text, at = clock()) {
+      if (typeof text !== 'string' || text.trim() === '') return null
+      return pushNotice(text.trim(), at)
     },
 
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */

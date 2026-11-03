@@ -1401,6 +1401,7 @@ async function verifyMenu () {
     menu: {
       tools: [
         { id: 'open-site', label: '打开软件' },
+        { id: 'bring', label: '带派' },
         { id: 'home', label: '回到初始位置' },
         { id: 'reload', label: '重载配置' }
       ],
@@ -1429,7 +1430,8 @@ async function verifyMenu () {
   assert(state.menu.panels.length === 1, '一级只有一个面板（' + state.menu.panels.length + '）')
   const rowLabels = state.menu.rows.map((row) => row.label)
   assert(rowLabels.includes('打开软件') && rowLabels.includes('回到初始位置') && rowLabels.includes('重载配置'),
-    '一级有 tool 三件套：' + rowLabels.join('/'))
+    '一级有工具项三件套：' + rowLabels.join('/'))
+  assert(rowLabels.includes('带派'), '一级有「带派」（' + rowLabels.join('/') + '）')
   assert(rowLabels.includes('动作'), '一级有「动作」')
 
   // 矩形是异步过 IPC 的：等主进程真的按新矩形翻成可交互，再看数量。
@@ -1586,6 +1588,29 @@ async function verifyMenu () {
   const homed = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
   assert(Math.abs(homed.x - homed.spawnX) <= 2 && Math.abs(homed.y - homed.spawnY) <= 2,
     '「回到初始位置」把这一只放回出生点（' + homed.x + ',' + homed.y + ' → ' + homed.spawnX + ',' + homed.spawnY + '）')
+
+  // 「带派」（ticket 24）：点一级工具项只发一个空动作，开窗是宿主的事。
+  const bringCenter = await petCenterNow()
+  client.send({ type: 'debug-dispatch', phase: 'context', x: bringCenter.x, y: bringCenter.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu !== null
+  }, 3000, '为「带派」展开菜单')
+  state = await client.rendererState()
+  const bringRow = state.menu.rows.find((row) => row.kind === 'tool' && row.label === '带派')
+  assert(Boolean(bringRow), '菜单里有「带派」')
+  const bringPoint = rectCenterScreen(bringRow, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: bringPoint.x, y: bringPoint.y })
+  const bringRequest = await client.waitFrom(
+    start,
+    (event) => event.type === 'action' && event.action === 'bring',
+    3000,
+    '「带派」申请'
+  )
+  assert(bringRequest.deviceId === null, '「带派」不夹带邻居身份')
+  assert(bringRequest.gift === undefined, '右键「带派」只请求开窗，不带礼物')
+  await waitUntil(async () => (await client.rendererState()).menu === null, 2000, '点完收起菜单')
 
   // 右键访客：不出菜单（也不吞鼠标）
   state = await client.rendererState()
@@ -1845,6 +1870,108 @@ async function verifyGifts () {
   return { pngPath, sidecarPath: pngPath + '.json', verified }
 }
 
+// ---------------------------------------------------------------------------
+// 2.5) 「带派」小窗（ticket 24）：真窗口打开 + 背包列表 + 截图
+// ---------------------------------------------------------------------------
+
+async function verifyBringWindow () {
+  const client = createHelperClient((line) => info(line))
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  assert(ready.workArea.width > 0, '带派小窗用例拿到工作区')
+
+  client.send({
+    type: 'update',
+    scene: shared.petScene([
+      { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] }
+    ], ready.workArea)
+  })
+  await sleep(800)
+
+  const idleFile = '99999999-9999-4999-8999-999999999998'
+  // 宿主交下来的背包快照：一件能撤的文件 → 截图里能看到列表、可用的撤掉按钮与可用的提交按钮。
+  client.send({
+    type: 'bring-window',
+    open: true,
+    items: [
+      { id: idleFile, kind: 'file', name: '报价单.pdf', state: 'idle' }
+    ]
+  })
+  await client.waitStatus((status) => status.bringOpen === true, 5000, '「带派」小窗打开')
+  await sleep(900)
+
+  const pngPath = join(OUT_DIR, 'bring.png')
+  const start = client.mark()
+  client.send({ type: 'shot', id: 'smoke-bring-shot', path: pngPath, window: 'bring' })
+  const shot = await client.waitFrom(start, (event) => event.type === 'shot', 6000, '「带派」小窗截图')
+  assert(shot.width > 0 && shot.height > 0, '「带派」小窗有真实尺寸（' + shot.width + '×' + shot.height + '）')
+  assert(existsSync(pngPath), '「带派」小窗截图落盘：' + pngPath)
+
+  const image = decodePng(readFileSync(pngPath))
+  assert(image.width >= 300 && image.height >= 300, '截图尺寸与窗口一致（' + image.width + '×' + image.height + '）')
+  let visible = 0
+  for (let index = 3; index < image.data.length; index += 4) {
+    if (image.data[index] > 16) visible += 1
+  }
+  assert(visible > image.width * image.height * 0.2,
+    '小窗里画出了可见内容（' + visible + '/' + (image.width * image.height) + ' px）')
+
+  let notePath = null
+  if (WRITE_NOTES) {
+    mkdirSync(NOTES_DIR, { recursive: true })
+    const composite = compositeOverCheckerboard(image)
+    notePath = join(NOTES_DIR, '12-bring-window-composited.png')
+    writeFileSync(notePath, encodePng(composite))
+    info('带派小窗截图笔记：' + notePath)
+  }
+
+  // 撤掉：点列表里的「撤掉」，helper 必须报一条带 giftId 的 unbring 申请。
+  const removeMark = client.mark()
+  client.send({ type: 'debug-gift-remove', id: 'smoke-bring-remove' })
+  let removeRequest
+  try {
+    removeRequest = await client.waitFrom(
+      removeMark,
+      (event) => event.type === 'action' && event.action === 'unbring',
+      5000,
+      '「撤掉」申请'
+    )
+  } catch (error) {
+    console.error('[diag] events=' + JSON.stringify(client.events.slice(-8)))
+    throw error
+  }
+  assert(removeRequest.giftId === idleFile, '「撤掉」带的是那一条的 giftId（' + removeRequest.giftId + '）')
+  client.send({ type: 'action-result', id: removeRequest.id, ok: true })
+
+  // 小窗 → 主进程 → 宿主：在真渲染进程里填字条并点提交，helper 必须报一条 action 申请。
+  const submitText = '从窗口里放进来的字条'
+  const actionMark = client.mark()
+  client.send({ type: 'debug-gift-submit', id: 'smoke-bring-submit', text: submitText })
+  const action = await client.waitFrom(
+    actionMark,
+    (event) => event.type === 'action' && event.action === 'bring',
+    5000,
+    '「带派」小窗提交为一次 action 申请'
+  )
+  assert(typeof action.id === 'string' && action.id !== '', '提交申请带 action id')
+  assert(
+    JSON.stringify(action.gift) === JSON.stringify({ kind: 'text', text: submitText }),
+    '申请里带的就是窗口里写的那段字条（' + JSON.stringify(action.gift) + '）'
+  )
+  assert(action.deviceId === null, '带派申请不夹带邻居身份')
+
+  // 宿主答复成功：主进程应该把这扇窗关掉（“放进背包”成功即收窗）。
+  const closeMark = client.mark()
+  client.send({ type: 'action-result', id: action.id, ok: true })
+  await client.waitStatus((status) => status.bringOpen === false, 4000, '提交成功后小窗关闭')
+  assert(closeMark > 0, '关窗走的是 action-result（先记了事件起点）')
+
+  client.send({ type: 'quit' })
+  const exit = await Promise.race([client.exited, sleep(10000).then(() => null)])
+  assert(exit !== null, '带派小窗用例结束后 helper 自己退出')
+  return { pngPath, notePath }
+}
+
 async function verifyManager () {
   const infos = []
   const warns = []
@@ -2007,6 +2134,7 @@ try {
   if (wants('menu')) await run('右键菜单：只挂自己 / 三级级联 / 点一项就申请点播 / 访客不弹', verifyMenu)
   if (wants('street')) await run('街道：人多时面板不跳、点谁就是谁', verifyStreetStability)
   const gifts = wants('gift') ? await run('礼物卡：字条卡片 / 复制 / 扔掉 / 命中矩形', verifyGifts) : null
+  const bring = wants('bring') ? await run('带派小窗：真窗口打开 / 背包列表 / 截图 / 退出', verifyBringWindow) : null
   if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
   const notes = standalone === null ? null : writeNoteScreenshots(standalone.verified)
@@ -2025,6 +2153,10 @@ try {
   console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
   if (controls !== null) console.log('控件截图：' + controls.pngPath)
   if (gifts !== null) console.log('礼物卡截图：' + gifts.pngPath)
+  if (bring !== null) {
+    console.log('带派小窗截图：' + bring.pngPath)
+    if (bring.notePath !== null) console.log('  带派小窗（棋盘格合成）: ' + bring.notePath)
+  }
   if (standalone !== null) console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {
   exitCode = 1

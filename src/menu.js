@@ -31,6 +31,7 @@ export const MAX_MENU_ACTIONS = 256
 /** 一级工具项。id 是渲染端认的固定集合，文案在这里定。 */
 export const MENU_TOOL_LABELS = Object.freeze({
   'open-site': '打开软件',
+  bring: '带派',
   home: '回到初始位置',
   reload: '重载配置'
 })
@@ -112,6 +113,8 @@ export function groupsFromPool (pool) {
 export function menuTools ({ hasOrigin = false } = {}) {
   const tools = []
   if (hasOrigin) tools.push({ id: 'open-site', label: MENU_TOOL_LABELS['open-site'] })
+  // 「带派」（ticket 24）：永远可用——背包是本地东西，不依赖邻居在线。
+  tools.push({ id: 'bring', label: MENU_TOOL_LABELS.bring })
   tools.push({ id: 'home', label: MENU_TOOL_LABELS.home })
   tools.push({ id: 'reload', label: MENU_TOOL_LABELS.reload })
   return tools

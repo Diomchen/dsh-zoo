@@ -1590,3 +1590,152 @@ test('manager：gift-open/reveal/discard 只写绝对路径，gift-copy 只写�
   assert.equal(manager.giftCopy('   '), false)
   assert.equal(children[0].parsedLines().at(-1).type, 'gift-copy')
 })
+
+// ---------------------------------------------------------------------------
+// ticket 24：背包小窗的桥与宿主命令
+// ---------------------------------------------------------------------------
+
+test('normalizeBringGift：字条 ≤500 保留换行；文件只认绝对路径；多出的字段丢掉', () => {
+  assert.deepEqual(shared.normalizeBringGift({ kind: 'text', text: '  第一行\r\n第二行  ' }), {
+    kind: 'text',
+    text: '第一行\n第二行'
+  })
+  assert.deepEqual(shared.normalizeBringGift({ kind: 'file', path: '/Users/me/a.pdf', text: 'x' }), {
+    kind: 'file',
+    path: '/Users/me/a.pdf'
+  })
+  assert.equal(shared.normalizeBringGift({ kind: 'text', text: '字'.repeat(501) }), null)
+  assert.equal(shared.normalizeBringGift({ kind: 'text', text: '  ' }), null)
+  assert.equal(shared.normalizeBringGift({ kind: 'file', path: 'relative.pdf' }), null)
+  assert.equal(shared.normalizeBringGift({ pick: true }), null)
+  assert.equal(shared.normalizeBringGift(null), null)
+})
+
+test('bring-window：窗口只拿 id/kind/文案/state，路径与多余物品都被丢掉', () => {
+  const id = '55555555-5555-4555-8555-555555555555'
+  const command = shared.normalizeHostCommand({
+    type: 'bring-window',
+    open: true,
+    items: [
+      { id, kind: 'text', text: ' 第一行\r\n第二行 ', state: 'idle', path: '/tmp/secret' },
+      { id, kind: 'file', name: '../报价单.pdf', state: 'out', path: '/tmp/secret' },
+      { id: 'not-a-uuid', kind: 'text', text: '坏' },
+      { id, kind: 'movie', text: '坏' }
+    ]
+  })
+  assert.equal(command.ok, true)
+  assert.deepEqual(command.command.items, [
+    { id, kind: 'text', text: '第一行\n第二行', state: 'idle' },
+    { id, kind: 'file', name: '../报价单.pdf', state: 'out' }
+  ])
+  assert.equal('path' in command.command.items[0], false)
+  assert.equal(command.command.open, true)
+  assert.equal(command.command.count, 2)
+  assert.equal(command.command.maxItems, shared.MAX_BACKPACK_ITEMS)
+  assert.equal(command.command.maxTextLength, shared.MAX_GIFT_TEXT_LENGTH)
+  assert.equal(command.command.maxFileBytes, shared.MAX_GIFT_FILE_BYTES)
+
+  // open:false = 只刷新；缺省是 false。
+  assert.equal(shared.normalizeHostCommand({ type: 'bring-window', items: [] }).command.open, false)
+  // 超过两件只留前两件（上限由 shared 自己定，不信宿主）。
+  const capped = shared.normalizeHostCommand({
+    type: 'bring-window',
+    items: Array.from({ length: 5 }, (_, index) => ({
+      id: '6666666' + String(index) + '-6666-4666-8666-666666666666',
+      kind: 'text',
+      text: '第' + index
+    }))
+  }).command
+  assert.equal(capped.items.length, shared.MAX_BACKPACK_ITEMS)
+})
+
+test('helper 动作：bring 可带物品也可空手（开窗）；unbring 必须带 giftId', () => {
+  const gift = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-bring',
+    action: 'bring',
+    gift: { kind: 'text', text: '带去的东西' }
+  })
+  assert.equal(gift.ok, true)
+  assert.deepEqual(gift.event.gift, { kind: 'text', text: '带去的东西' })
+  assert.equal('giftId' in gift.event, false)
+
+  // 右键菜单的 bring 没有物品：这是“开窗”申请，不能被当成坏礼物。
+  const empty = shared.normalizeHelperEvent({ type: 'action', id: 'act-open', action: 'bring' })
+  assert.equal(empty.ok, true)
+  assert.equal('gift' in empty.event, false)
+
+  assert.deepEqual(shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-bad',
+    action: 'bring',
+    gift: { kind: 'file', path: 'relative.pdf' }
+  }), { ok: false, error: 'bad-gift' })
+
+  const unbring = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-unbring',
+    action: 'unbring',
+    giftId: '77777777-7777-4777-8777-777777777777'
+  })
+  assert.equal(unbring.ok, true)
+  assert.equal(unbring.event.giftId, '77777777-7777-4777-8777-777777777777')
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-unbring', action: 'unbring' }).ok, false)
+
+  // 新动作都进了帮助侧白名单：渲染端菜单/小窗才发得出来。
+  assert.equal(shared.DESKTOP_ACTIONS.includes('bring'), true)
+  assert.equal(shared.DESKTOP_ACTIONS.includes('unbring'), true)
+  assert.equal(shared.MENU_TOOL_IDS.includes('bring'), true)
+})
+
+test('status 白名单放行 bringOpen：冒烟能等到「带派」小窗真的打开', () => {
+  const status = shared.normalizeHelperEvent({
+    type: 'status',
+    id: 'status-1',
+    bringOpen: true,
+    renameOpen: false,
+    ignored: 'x'
+  })
+  assert.equal(status.ok, true)
+  assert.equal(status.event.status.bringOpen, true)
+  assert.equal(status.event.status.renameOpen, false)
+  assert.equal('ignored' in status.event.status, false)
+})
+
+test('manager：bringWindow 把背包快照写进管道，路径不在命令里', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4400 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4400, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+
+  const id = '88888888-8888-4888-8888-888888888888'
+  assert.equal(manager.bringWindow({
+    open: true,
+    items: [{ id, kind: 'text', text: '一条字条', state: 'idle' }]
+  }), true)
+  const command = children[0].parsedLines().at(-1)
+  assert.equal(command.type, 'bring-window')
+  assert.equal(command.open, true)
+  assert.deepEqual(command.items, [{ id, kind: 'text', text: '一条字条', state: 'idle' }])
+  assert.equal(command.maxItems, shared.MAX_BACKPACK_ITEMS)
+
+  assert.equal(manager.bringWindow({ open: false, items: [] }), true)
+  assert.equal(children[0].parsedLines().at(-1).open, false)
+})

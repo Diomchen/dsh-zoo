@@ -1018,7 +1018,8 @@
       if (pet !== undefined) homePet(pet)
       return
     }
-    if (id === 'reload' || id === 'open-site') requestAction(id)
+    // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
+    if (id === 'reload' || id === 'open-site' || id === 'bring') requestAction(id)
   }
 
   /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */
