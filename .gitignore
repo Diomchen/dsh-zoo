@@ -3,3 +3,4 @@ node_modules/
 dist/
 .cache/
 *.tgz
+.scratch/local-pet/prototype/.chrome/

@@ -244,17 +244,34 @@
   }
 
   /**
-   * 从待机池里挑下一段。返回 `{ clip, next }`，`next` 已经前进到选中项的下一格。
-   * 这里必须返回**前进后的游标**：旧实现把游标停在选中项，于是每 8 秒都选中同一段，
-   * 桌面上看起来就像“只会奔跑”。
+   * 从待机池里挑下一段。返回 `{ clip, next }`。
+   *
+   * 传了 `random` 就随机起点（避开刚播过的 `avoid`），不传则从 `start` 顺序走——
+   * 顺序模式只用于测试/可复现，桌面上永远传 `Math.random`。
+   * `next` 仍然前进一格，保证即使调用方忘了传 random 也不会卡在同一段。
    */
-  function pickIdleClip (pool, start, failed) {
+  function pickIdleClip (pool, start, failed, random, avoid) {
     if (!Array.isArray(pool) || pool.length === 0) return { clip: null, next: 0 }
     const from = Number.isInteger(start) && start >= 0 ? start % pool.length : 0
+    const randomStart = typeof random === 'function'
+      ? Math.floor(Math.abs(Number(random()) || 0) * pool.length) % pool.length
+      : from
+    const skipped = pool.length > 1 && typeof avoid === 'string' ? avoid : null
+
+    const usable = (clip) => !(failed !== null && failed !== undefined &&
+      typeof failed.has === 'function' && failed.has(clip))
+
     for (let offset = 0; offset < pool.length; offset += 1) {
-      const index = (from + offset) % pool.length
+      const index = (randomStart + offset) % pool.length
       const clip = pool[index]
-      if (failed !== null && failed !== undefined && typeof failed.has === 'function' && failed.has(clip)) continue
+      if (clip === skipped || !usable(clip)) continue
+      return { clip, next: (index + 1) % pool.length }
+    }
+    // 全被 avoid/failed 排除（例如池子只有一段）：退回第一个可用的，宁可重复也不黑屏。
+    for (let offset = 0; offset < pool.length; offset += 1) {
+      const index = (randomStart + offset) % pool.length
+      const clip = pool[index]
+      if (!usable(clip)) continue
       return { clip, next: (index + 1) % pool.length }
     }
     return { clip: null, next: from }

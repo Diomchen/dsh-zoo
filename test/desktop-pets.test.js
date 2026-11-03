@@ -735,3 +735,12 @@ test('petScene 把本机待机池带进场景（ticket 19 的池子不能在这�
   ], AREA)
   assert.deepEqual(scene.items[0].idlePool, ['A', 'B'])
 })
+
+test('待机池随机：注入 random 后从随机位置选，并避开刚播过的那段', () => {
+  const first = shared.pickIdleClip(['A', 'B', 'C'], 0, new Set(), () => 0, 'A')
+  assert.equal(first.clip, 'B')
+  const last = shared.pickIdleClip(['A', 'B', 'C'], 0, new Set(), () => 0.99, null)
+  assert.equal(last.clip, 'C')
+  const only = shared.pickIdleClip(['A'], 0, new Set(), () => 0, 'A')
+  assert.equal(only.clip, 'A', '池子只有一段时允许重复')
+})

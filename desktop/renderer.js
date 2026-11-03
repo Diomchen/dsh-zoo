@@ -1373,7 +1373,7 @@
     }
     const due = media.clip === null || now >= media.nextIdleAt
     if (!due) return
-    const picked = shared.pickIdleClip(pool, media.idleIndex, media.failed)
+    const picked = shared.pickIdleClip(pool, media.idleIndex, media.failed, Math.random, media.clip)
     const chosen = picked.clip
     media.idleIndex = picked.next
     media.nextIdleAt = now + idleDelay(media)
