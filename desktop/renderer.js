@@ -1505,10 +1505,24 @@
   function giftSignature (gift) {
     return JSON.stringify({
       title: gift.title,
+      kind: gift.kind,
       text: gift.text ?? null,
+      name: gift.name ?? null,
+      size: gift.size ?? null,
+      thumb: gift.thumb ?? null,
       status: gift.status,
       statusText: gift.statusText ?? null
     })
+  }
+
+  /** 文件大小只给人看个量级；精确字节数没有意义，也不该让卡片挤成一团。 */
+  function formatFileSize (bytes) {
+    if (!Number.isInteger(bytes) || bytes <= 0) return ''
+    if (bytes < 1024) return bytes + ' B'
+    if (bytes < 1024 * 1024) {
+      return (bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0) + ' KB'
+    }
+    return (bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0) + ' MB'
   }
 
   function setGiftButtonsEnabled (entry, enabled) {
@@ -1542,18 +1556,51 @@
     // 正文走 textContent + CSS pre-wrap：便条的换行是内容，不能被折掉，也绝不解析 HTML。
     const body = document.createElement('p')
     body.className = 'lp-gift-text'
+
+    // 文件卡（ticket 25）：缩略图只在宿主给了 thumb 时出现；没有就画文件图标 + 名字 + 大小。
+    // 图片同样走 textContent/URL 白名单：src 来自宿主校验过的 localpet://gifts/...
+    const fileBox = document.createElement('div')
+    fileBox.className = 'lp-gift-file'
+    fileBox.hidden = true
+    const thumb = document.createElement('img')
+    thumb.className = 'lp-gift-thumb'
+    thumb.alt = ''
+    thumb.draggable = false
+    thumb.hidden = true
+    const fileRow = document.createElement('div')
+    fileRow.className = 'lp-gift-file-row'
+    const fileIcon = document.createElement('span')
+    fileIcon.className = 'lp-gift-file-icon'
+    fileIcon.setAttribute('aria-hidden', 'true')
+    fileIcon.textContent = '▤'
+    const fileMeta = document.createElement('span')
+    fileMeta.className = 'lp-gift-file-meta'
+    const fileName = document.createElement('span')
+    fileName.className = 'lp-gift-file-name'
+    const fileSize = document.createElement('span')
+    fileSize.className = 'lp-gift-file-size'
+    fileMeta.appendChild(fileName)
+    fileMeta.appendChild(fileSize)
+    fileRow.appendChild(fileIcon)
+    fileRow.appendChild(fileMeta)
+    fileBox.appendChild(thumb)
+    fileBox.appendChild(fileRow)
+
     const status = document.createElement('p')
     status.className = 'lp-gift-status'
 
     const actions = document.createElement('div')
     actions.className = 'lp-card-actions lp-gift-actions'
     actions.appendChild(makeButton('打开', 'gift-open', { giftId: gift.giftId }))
-    actions.appendChild(makeButton('复制', 'gift-copy', { giftId: gift.giftId }))
+    // 只有字条有正文可复制；文件卡的按钮在 update 里隐藏（不留一个点了没用的按钮）。
+    const copyButton = makeButton('复制', 'gift-copy', { giftId: gift.giftId })
+    actions.appendChild(copyButton)
     actions.appendChild(makeButton('在文件夹里显示', 'gift-reveal', { giftId: gift.giftId }))
     actions.appendChild(makeButton('扔掉', 'gift-discard', { giftId: gift.giftId, tone: 'danger' }))
 
     el.appendChild(head)
     el.appendChild(body)
+    el.appendChild(fileBox)
     el.appendChild(status)
     el.appendChild(actions)
     el.addEventListener('pointerdown', (event) => event.stopPropagation())
@@ -1564,8 +1611,16 @@
       giftId: gift.giftId,
       deviceId: gift.deviceId,
       status: gift.status,
+      kind: gift.kind,
+      name: gift.name ?? null,
+      size: gift.size ?? null,
       titleEl: title,
       bodyEl: body,
+      fileEl: fileBox,
+      thumbEl: thumb,
+      fileNameEl: fileName,
+      fileSizeEl: fileSize,
+      copyButton,
       statusEl: status,
       signature: ''
     }
@@ -1577,12 +1632,34 @@
     const signature = giftSignature(gift)
     entry.deviceId = gift.deviceId
     entry.status = gift.status
+    entry.kind = gift.kind
+    entry.name = gift.name ?? null
+    entry.size = gift.size ?? null
     if (entry.signature === signature) return
     entry.signature = signature
     entry.titleEl.textContent = gift.title
     entry.el.setAttribute('aria-label', gift.title)
-    entry.bodyEl.textContent = gift.text ?? ''
-    entry.bodyEl.hidden = gift.text === undefined
+    const isFile = gift.kind === 'file'
+    entry.bodyEl.textContent = isFile ? '' : (gift.text ?? '')
+    entry.bodyEl.hidden = isFile || gift.text === undefined
+    entry.fileEl.hidden = !isFile
+    if (isFile) {
+      entry.fileNameEl.textContent = gift.name ?? '文件'
+      const sizeText = formatFileSize(gift.size)
+      entry.fileSizeEl.textContent = sizeText
+      entry.fileSizeEl.hidden = sizeText === ''
+      if (typeof gift.thumb === 'string' && gift.thumb !== '') {
+        if (entry.thumbEl.getAttribute('src') !== gift.thumb) entry.thumbEl.setAttribute('src', gift.thumb)
+        entry.thumbEl.hidden = false
+      } else {
+        entry.thumbEl.hidden = true
+        entry.thumbEl.removeAttribute('src')
+      }
+    } else {
+      entry.thumbEl.hidden = true
+      entry.thumbEl.removeAttribute('src')
+    }
+    entry.copyButton.hidden = isFile
     entry.statusEl.textContent = gift.statusText ?? ''
     entry.statusEl.hidden = gift.statusText === undefined
     setGiftButtonsEnabled(entry, gift.status === 'received')
@@ -2724,10 +2801,23 @@
             return {
               giftId: entry.giftId,
               deviceId: entry.deviceId,
+              kind: entry.kind,
+              name: entry.name,
+              size: entry.size,
               status: entry.status,
               title: entry.titleEl.textContent,
               text: entry.bodyEl.textContent,
               statusText: entry.statusEl.hidden ? null : entry.statusEl.textContent,
+              // 缩略图诊断：loaded=true 才证明 CSP + localpet://gifts 协议真的把图喂进了 <img>。
+              thumb: entry.thumbEl.hidden
+                ? null
+                : {
+                    src: entry.thumbEl.getAttribute('src'),
+                    loaded: entry.thumbEl.complete && entry.thumbEl.naturalWidth > 0,
+                    width: entry.thumbEl.naturalWidth,
+                    height: entry.thumbEl.naturalHeight
+                  },
+              copyVisible: entry.copyButton.hidden !== true,
               x: round(box.left),
               y: round(box.top),
               width: round(box.width),

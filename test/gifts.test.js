@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
@@ -244,4 +244,119 @@ test('giftDirPath / isVisitId：目录名只来自校验过的字符串', () => 
   assert.equal(basename(giftDirPath('/tmp/x', name)), name)
   assert.equal(giftDirPath('/tmp/x', name + '/../../etc'), null)
   assert.equal(giftDirPath('/tmp/x', '20261103-153245-zzzzzzzz'), null)
+})
+
+// ---------------------------------------------------------------------------
+// ticket 25：文件礼物（meta.kind = 'file'）
+// ---------------------------------------------------------------------------
+
+test('normalizeGiftMeta：文件礼物只认 name/size/sha256；缺一项或形状不对就 null', () => {
+  const id = randomUUID()
+  const sha = 'sha256:' + 'a'.repeat(64)
+  const valid = {
+    version: 1,
+    id,
+    dir: giftDirName(id, T0),
+    from: { deviceId: randomUUID(), nickname: '隔壁' },
+    kind: 'file',
+    name: '报价单.pdf',
+    size: 23194,
+    sha256: sha,
+    receivedAt: T0,
+    opened: true,
+    path: '/etc/passwd'
+  }
+  const meta = normalizeGiftMeta(valid)
+  assert.deepEqual(Object.keys(meta), ['id', 'dir', 'from', 'kind', 'name', 'size', 'sha256', 'receivedAt', 'opened'])
+  assert.equal(meta.kind, 'file')
+  assert.equal(meta.name, '报价单.pdf')
+  assert.equal(meta.size, 23194)
+  assert.equal(meta.sha256, sha)
+  assert.equal('path' in meta, false)
+  assert.equal('text' in meta, false)
+
+  for (const broken of [
+    { ...valid, name: '' },
+    { ...valid, name: '../..' },
+    { ...valid, size: 0 },
+    { ...valid, size: 16 * 1024 * 1024 + 1 },
+    { ...valid, sha256: 'sha256:xyz' },
+    { ...valid, sha256: 'a'.repeat(64) },
+    { ...valid, kind: 'other' }
+  ]) {
+    assert.equal(normalizeGiftMeta(broken), null, JSON.stringify(broken))
+  }
+})
+
+test('createGiftStore：文件礼物 beginFile → 写盘 → finishFile 落 meta；重载后仍有 filePath', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createGiftStore(dir, { log: { warn () {} } })
+  const id = randomUUID()
+  const bytes = Buffer.from('报价单的字节', 'utf8')
+  const sha = 'sha256:' + createHash('sha256').update(bytes).digest('hex')
+  const slot = await store.beginFile({
+    id,
+    from: from(),
+    name: '../报价单.pdf',
+    size: bytes.length,
+    sha256: sha,
+    receivedAt: T0
+  })
+  assert.equal(slot.ok, true)
+  assert.equal(slot.created, true)
+  assert.equal(slot.dirPath.startsWith(join(dir, GIFTS_DIR)), true)
+  // 名字里的路径分隔符/前导点在落盘前已经被洗掉，绝不会拼出目录外的路径。
+  assert.equal(slot.filePath, join(slot.dirPath, '报价单.pdf'))
+  await writeFile(slot.filePath, bytes)
+
+  const finished = await store.finishFile({
+    id,
+    from: from(),
+    name: '报价单.pdf',
+    size: bytes.length,
+    sha256: sha,
+    receivedAt: T0
+  })
+  assert.equal(finished.ok, true)
+  assert.equal(finished.gift.kind, 'file')
+  assert.equal(finished.gift.name, '报价单.pdf')
+  assert.equal(finished.gift.size, bytes.length)
+  assert.equal(finished.gift.sha256, sha)
+  assert.equal(finished.gift.filePath, slot.filePath)
+  assert.equal(await store.markOpened(id), true)
+  const meta = await readMeta(dir, finished.gift.dirName)
+  assert.deepEqual(Object.keys(meta), ['version', 'id', 'dir', 'from', 'kind', 'name', 'size', 'sha256', 'receivedAt', 'opened'])
+  assert.equal(meta.opened, true)
+
+  // 重启后从磁盘读回来：filePath 仍然由校验过的目录名拼出来。
+  const reloaded = await createGiftStore(dir, { log: { warn () {} } })
+  const record = reloaded.lookup(id)
+  assert.equal(record.kind, 'file')
+  assert.equal(record.filePath, slot.filePath)
+  assert.equal(record.opened, true)
+})
+
+test('createGiftStore：文件下载失败 abortFile 清掉这次新开的目录；重试复用同一落点', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createGiftStore(dir, { log: { warn () {} } })
+  const id = randomUUID()
+  const input = {
+    id,
+    from: from(),
+    name: 'x.bin',
+    size: 3,
+    sha256: 'sha256:' + 'b'.repeat(64),
+    receivedAt: T0
+  }
+  const first = await store.beginFile(input)
+  const second = await store.beginFile(input)
+  assert.equal(first.dirPath, second.dirPath, '同一 giftId 的重试复用同一个目录')
+  assert.equal(await store.abortFile(id), true)
+  assert.equal(await readdir(join(dir, GIFTS_DIR)).then((list) => list.length), 0, '失败后目录被清掉')
+  assert.equal(store.lookup(id), null)
+
+  // 坏输入不建目录。
+  assert.deepEqual(await store.beginFile({ ...input, id: 'gift-1' }), { ok: false, error: 'bad-gift' })
+  assert.deepEqual(await store.beginFile({ ...input, sha256: 'nope' }), { ok: false, error: 'bad-gift' })
+  assert.equal(store.lookup(id), null)
 })

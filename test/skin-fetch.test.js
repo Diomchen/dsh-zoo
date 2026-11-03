@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { startSkinServer } from '../src/skin-server.js'
+import { startLanServer } from '../src/lan-server.js'
 import { createSkinFetcher, isPrivateAddress, SKIN_CACHE_DIR } from '../src/skin-fetch.js'
 
 const EBML = Buffer.from([0x1a, 0x45, 0xdf, 0xa3])
@@ -34,7 +34,7 @@ async function fixture (t, { cacheMaxBytes } = {}) {
       B: { file: 'B.webm', dir }
     }
   }
-  const server = await startSkinServer({ sources: [source], host: '127.0.0.1', port: 0 })
+  const server = await startLanServer({ sources: [source], host: '127.0.0.1', port: 0 })
   t.after(() => server.close())
   const cacheDir = await tempDir(t)
   const fetcher = createSkinFetcher({

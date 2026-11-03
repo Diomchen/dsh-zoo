@@ -1739,3 +1739,102 @@ test('manager：bringWindow 把背包快照写进管道，路径不在命令里'
   assert.equal(manager.bringWindow({ open: false, items: [] }), true)
   assert.equal(children[0].parsedLines().at(-1).open, false)
 })
+
+// ---------------------------------------------------------------------------
+// ticket 25：文件礼物的跨进程字段（helpers 白名单 + helper argv）
+// ---------------------------------------------------------------------------
+
+test('场景 controls.gifts：文件卡带 name/size；thumb 只给 received 且只认 localpet://gifts', () => {
+  const deviceId = '55555555-5555-4555-8555-555555555555'
+  const dir = '20261103-153245-ab12cd12'
+  const thumb = 'localpet://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
+  const scene = shared.normalizeScene({
+    v: 3,
+    items: [],
+    controls: {
+      gifts: [
+        {
+          deviceId,
+          giftId: '66666666-6666-4666-8666-666666666666',
+          kind: 'file',
+          status: 'received',
+          title: '「阿蟹」捎来一个文件',
+          name: '照片.PNG',
+          size: 23194,
+          thumb
+        },
+        {
+          // pending 时的 thumb 一律画不出来。
+          deviceId,
+          giftId: '77777777-7777-4777-8777-777777777777',
+          kind: 'file',
+          status: 'pending',
+          title: 'x',
+          name: '照片.PNG',
+          size: 1,
+          thumb
+        },
+        {
+          // 只认宿主生成的 localpet://gifts 地址。
+          deviceId,
+          giftId: '88888888-8888-4888-8888-888888888888',
+          kind: 'file',
+          status: 'received',
+          title: 'x',
+          name: '照片.PNG',
+          size: 1,
+          thumb: 'http://evil/gifts/x.png'
+        },
+        {
+          // 缺 size 的文件卡画不出来。
+          deviceId,
+          giftId: '99999999-9999-4999-8999-999999999999',
+          kind: 'file',
+          status: 'received',
+          title: 'x',
+          name: '照片.PNG'
+        },
+        {
+          // 路径分隔符/前导点在名字里：这个字段本身就不合法。
+          deviceId,
+          giftId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          kind: 'file',
+          status: 'received',
+          title: 'x',
+          name: '../照片.PNG',
+          size: 1
+        }
+      ]
+    }
+  })
+  const byId = (id) => scene.controls.gifts.find((gift) => gift.giftId === id)
+  // 合法的文件卡原样保留。
+  assert.deepEqual(byId('66666666-6666-4666-8666-666666666666'), {
+    deviceId,
+    giftId: '66666666-6666-4666-8666-666666666666',
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '照片.PNG',
+    size: 23194,
+    thumb
+  })
+  // pending 时不画缩略图，但卡片本身还在。
+  assert.equal('thumb' in byId('77777777-7777-4777-8777-777777777777'), false)
+  // 坏 thumb 只丢 thumb，不丢整张卡。
+  assert.equal('thumb' in byId('88888888-8888-4888-8888-888888888888'), false)
+  // 名字会被清洗（去路径分隔符/前导点）。
+  assert.equal(byId('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa').name, '照片.PNG')
+  // 缺 size 的卡片画不出来，整张丢掉。
+  assert.equal(byId('99999999-9999-4999-8999-999999999999'), undefined)
+  assert.equal(scene.controls.gifts.length, 4)
+})
+
+test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后', () => {
+  assert.deepEqual(
+    buildHelperArgs({ helperPath: '/h', cacheRoot: '/tmp/skin-cache', giftsRoot: '/tmp/data/gifts' }),
+    ['/h', '--local-pet-cache', '/tmp/skin-cache', '--local-pet-gifts', '/tmp/data/gifts']
+  )
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: 'relative/gifts' }), ['/h'])
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: '' }), ['/h'])
+})

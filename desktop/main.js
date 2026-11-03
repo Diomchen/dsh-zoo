@@ -49,6 +49,8 @@ if (electronApi === null || typeof electronApi !== 'object' || typeof electronAp
 
 const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol, screen, shell } = electronApi
 const shared = require('./shared.js')
+// `localpet://gifts/...` 的路径白名单（ticket 25）：纯函数，单独一份、可单测。
+const giftPath = require('./gift-path.js')
 
 const APP_NAME = 'dsh-local-pet-desktop'
 const HOST_STALE_MS = 30000
@@ -58,6 +60,8 @@ const SHOT_MEDIA_WAIT_MS = 3000
 const ASSET_SCHEME = 'localpet'
 const ASSET_HOST = 'asset'
 const CACHE_HOST = 'cache'
+/** 礼物缩略图主机：与 asset/cache 同一套注册好的 localpet:// scheme，只多一个 host。 */
+const GIFT_HOST = 'gifts'
 const MAX_ASSET_BYTES = 8 * 1024 * 1024
 const MAX_ASSET_NAME = 200
 
@@ -85,6 +89,13 @@ const assetRoots = (Array.isArray(options.assets) ? options.assets : [])
 /** 远端素材缓存目录：只允许绝对路径，helper 只读它，不联网。 */
 const cacheRoot = typeof options.cache === 'string' && options.cache !== '' && path.isAbsolute(options.cache)
   ? options.cache
+  : null
+/**
+ * 礼物根目录（ticket 25）：宿主把 `<dataDir>/gifts` 当 argv 传进来；helper 只读它，
+ * 只为 `localpet://gifts/<目录>/<图片>` 服务。没传 = 不注册这条读路径（所有 gifts URL 404）。
+ */
+const giftsRoot = typeof options.gifts === 'string' && options.gifts !== '' && path.isAbsolute(options.gifts)
+  ? options.gifts
   : null
 if (isShotMode && !path.isAbsolute(options.shot)) {
   process.stderr.write('[local-pet helper] --local-pet-shot 需要绝对路径：' + options.shot + '\n')
@@ -371,7 +382,10 @@ async function handleAssetRequest (request) {
     } catch {
       return textResponse(400, 'bad asset url')
     }
-    if (url.protocol !== ASSET_SCHEME + ':' || (url.hostname !== ASSET_HOST && url.hostname !== CACHE_HOST)) {
+    if (url.protocol !== ASSET_SCHEME + ':') return textResponse(404, 'unknown asset')
+    // 礼物缩略图（ticket 25）：host=gifts，路径恰好两段；守卫与夹取都在 gift-path.js 里。
+    if (url.hostname === GIFT_HOST) return handleGiftRequest(url)
+    if (url.hostname !== ASSET_HOST && url.hostname !== CACHE_HOST) {
       return textResponse(404, 'unknown asset')
     }
     let name
@@ -419,6 +433,49 @@ async function handleAssetRequest (request) {
 
 function textResponse (status, body) {
   return new Response(body, { status, headers: { 'content-type': 'text/plain; charset=utf-8' } })
+}
+
+/**
+ * `localpet://gifts/<礼物目录>/<图片>`（ticket 25）。
+ * 只认两层、只认四种图片扩展名、只认 gifts 根目录下的文件；读不到一律 404（不区分原因）。
+ * 这条路径只给缩略图用：卡片上的「打开」走宿主通过 gift-open 命令送来的绝对路径，不经过 URL。
+ */
+async function handleGiftRequest (url) {
+  try {
+    if (giftsRoot === null) return textResponse(404, 'gift not found')
+    const parts = url.pathname.replace(/^\/+/, '').split('/')
+    if (parts.length !== 2) return textResponse(404, 'gift not found')
+    let dirName
+    let fileName
+    try {
+      dirName = decodeURIComponent(parts[0])
+      fileName = decodeURIComponent(parts[1])
+    } catch {
+      return textResponse(400, 'bad gift name')
+    }
+    const file = giftPath.resolveGiftFile(giftsRoot, dirName, fileName)
+    if (file === null) return textResponse(404, 'gift not found')
+    let info
+    try {
+      info = await fsp.stat(file)
+    } catch {
+      return textResponse(404, 'gift not found')
+    }
+    if (!info.isFile() || info.size <= 0 || info.size > giftPath.MAX_GIFT_IMAGE_BYTES) {
+      return textResponse(404, 'gift not found')
+    }
+    const data = await fsp.readFile(file)
+    return new Response(new Uint8Array(data), {
+      headers: {
+        'content-type': giftPath.contentTypeOf(fileName) ?? 'application/octet-stream',
+        'content-length': String(data.length),
+        // 缩略图跟着这次收到的礼物走：礼物被扔掉/换掉时不要拿缓存里的旧图。
+        'cache-control': 'no-store'
+      }
+    })
+  } catch {
+    return textResponse(404, 'gift not found')
+  }
 }
 
 function isSafeAssetName (name) {
@@ -2017,7 +2074,8 @@ function parseArgs (argv) {
     hostPid: 0,
     debug: false,
     assets: [],
-    cache: null
+    cache: null,
+    gifts: null
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -2046,6 +2104,11 @@ function parseArgs (argv) {
       index += 1
     } else if (arg.startsWith('--local-pet-cache=')) {
       parsed.cache = arg.slice('--local-pet-cache='.length)
+    } else if (arg === '--local-pet-gifts') {
+      if (typeof argv[index + 1] === 'string') parsed.gifts = argv[index + 1]
+      index += 1
+    } else if (arg.startsWith('--local-pet-gifts=')) {
+      parsed.gifts = arg.slice('--local-pet-gifts='.length)
     } else if (arg === '--local-pet-debug') {
       parsed.debug = true
     }

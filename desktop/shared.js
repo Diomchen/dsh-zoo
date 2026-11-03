@@ -248,6 +248,43 @@
       : null
   }
 
+  /**
+   * 文件礼物的名字（ticket 25）：与 `src/protocol.js` 的 `sanitizeGiftName` 同一口径——
+   * 去掉路径分隔符、控制字符、双向覆盖符与前导点；超长/为空就丢掉这张卡。
+   * 这个名字只用来显示，不参与拼路径；但跨进程边界各自守一次，别让宿主的新版本带坏 helper。
+   */
+  function normalizeGiftName (value) {
+    if (typeof value !== 'string') return null
+    if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+    const clean = value
+      .replace(/[\\/]/g, '')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+      .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')
+      .trim()
+      .replace(/^\.+/, '')
+      .trim()
+    if (clean === '') return null
+    const chars = Array.from(clean)
+    return chars.length > MAX_GIFT_NAME_LENGTH ? null : clean
+  }
+
+  /** 文件大小：正整数且 ≤16 MiB；别的值整张卡丢掉（卡片要显示大小，缺了就没意义）。 */
+  function normalizeGiftSize (value) {
+    return Number.isInteger(value) && value > 0 && value <= MAX_GIFT_FILE_BYTES ? value : null
+  }
+
+  /**
+   * 缩略图地址只接受宿主生成的 `localpet://gifts/<目录>/<文件名>`（目录名是固定形状，
+   * 文件名是 encodeURIComponent 过的）。渲染端拿不到别的 URL，也不许自己拼。
+   */
+  function normalizeGiftThumb (value) {
+    if (typeof value !== 'string' || value.length > 2048) return null
+    return /^localpet:\/\/gifts\/\d{8}-\d{6}-[0-9a-f]{8}(?:-\d+)?\/[^\u0000-\u001f/\\]{1,1024}$/.test(value)
+      ? value
+      : null
+  }
+
   function normalizeToken (value) {
     if (typeof value === 'number' && Number.isFinite(value)) return value
     if (typeof value !== 'string') return null
@@ -592,7 +629,7 @@
       }
     }
 
-    // 礼物卡（ticket 23）：宿主已经按 visitor 算好标题/正文/状态，这里只做形状校验。
+    // 礼物卡（ticket 23 / 25）：宿主已经按 visitor 算好标题/正文/大小/状态，这里只做形状校验。
     // 一张坏卡只丢它自己；deviceId/giftId 认不出来就没法落回访客身上，整张丢。
     const seenGifts = new Set()
     if (Array.isArray(raw.gifts)) {
@@ -601,21 +638,42 @@
         if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
         const deviceId = normalizeId(candidate.deviceId)
         const giftId = normalizeGiftId(candidate.giftId)
-        // 本版本只画字条；文件礼物（ticket 25）会带来 name/size/thumb，这个分支再扩。
-        if (deviceId === null || giftId === null || candidate.kind !== 'text') continue
+        const kind = candidate.kind === 'text' || candidate.kind === 'file' ? candidate.kind : null
+        if (deviceId === null || giftId === null || kind === null) continue
         if (seenGifts.has(giftId)) continue
         const status = typeof candidate.status === 'string' && GIFT_STATUSES.includes(candidate.status)
           ? candidate.status
           : null
         if (status === null) continue
-        seenGifts.add(giftId)
         const title = normalizeText(candidate.title, '捎来一件东西', MAX_LABEL_LENGTH * 3)
-        // 正文只在该收到时出现；别的状态下即便宿主误发也不画。
-        const text = status === 'received' ? normalizeNoteText(candidate.text) : null
-        // received 不需要解释（正文就是内容）；别的状态才画一行“怎么了”。
+        // received 不需要解释（正文/文件本身就是内容）；别的状态才画一行“怎么了”。
         const statusText = status === 'received'
           ? null
           : normalizeText(candidate.statusText, null, MAX_REASON_LENGTH * 2)
+        if (kind === 'file') {
+          const name = normalizeGiftName(candidate.name)
+          const size = normalizeGiftSize(candidate.size)
+          // 文件名/大小缺一个就画不出文件卡，整张丢掉（宁可没有，也不画一张半截的卡）。
+          if (name === null || size === null) continue
+          // 缩略图只在真的收下时才给；pending/receiving 时宿主即使误发也不画。
+          const thumb = status === 'received' ? normalizeGiftThumb(candidate.thumb) : null
+          seenGifts.add(giftId)
+          controls.gifts.push({
+            deviceId,
+            giftId,
+            kind: 'file',
+            status,
+            title,
+            name,
+            size,
+            ...(thumb === null ? {} : { thumb }),
+            ...(statusText === null ? {} : { statusText })
+          })
+          continue
+        }
+        seenGifts.add(giftId)
+        // 正文只在该收到时出现；别的状态下即便宿主误发也不画。
+        const text = status === 'received' ? normalizeNoteText(candidate.text) : null
         controls.gifts.push({
           deviceId,
           giftId,
@@ -1745,6 +1803,9 @@
     clampNumber,
     normalizeId,
     normalizeGiftId,
+    normalizeGiftName,
+    normalizeGiftSize,
+    normalizeGiftThumb,
     normalizeLabel,
     normalizeNoteText,
     normalizeBackpackText,

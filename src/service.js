@@ -8,6 +8,7 @@ import { createDesktop } from './desktop.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-copy.js'
+import { createGiftFetcher } from './gift-fetch.js'
 import { createGiftStore } from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
@@ -17,11 +18,12 @@ import { createPetBridge, readPetConfig } from './pet-bridge.js'
 import { buildMenu, readAnimationsConfig } from './menu.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
-import { resolveSkinPort, startSkinServer } from './skin-server.js'
+import { resolveSkinPort, startLanServer } from './lan-server.js'
 import { idlePoolOf, loadSkinSources } from './skin-sources.js'
 import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
+  MAX_GIFT_BYTES,
   PEER_LOST_MS,
   VISIT_MAX_MS,
   encodeHeartbeat,
@@ -31,6 +33,7 @@ import {
   encodeVisitRecallAck,
   encodeVisitRequestDetailed,
   isDeviceId,
+  isPort,
   isVisitId,
   normalizeNickname,
   resolvePort
@@ -65,6 +68,11 @@ export const DESKTOP_SYNC_MS = 500
 export const AUTO_VISIT_INTERVAL_MS = 30 * 1000
 /** 同一条“为什么没出门”的日志最多每 5 分钟重复一次，避免刷屏。 */
 export const AUTO_VISIT_LOG_INTERVAL_MS = 5 * 60 * 1000
+/**
+ * 礼物源（ticket 25）的 armed 窗口：发出这次串门请求后 5 分钟内可读，
+ * 且这次串门一结束（回家/送客/超时/失联）立刻 unarm。
+ */
+export const ARMED_GIFT_MS = 5 * 60 * 1000
 
 /**
  * 把桌面接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -106,6 +114,8 @@ export function createService (ctx, options = {}) {
   const recallTimeoutMs = positiveOption(options.recallTimeoutMs, RECALL_TIMEOUT_MS, recallRetryMs)
   const desktopSyncMs = positiveOption(options.desktopSyncMs, DESKTOP_SYNC_MS, 20)
   const autoVisitIntervalMs = positiveOption(options.autoVisitIntervalMs, AUTO_VISIT_INTERVAL_MS, 10)
+  /** 测试可以缩短 armed 窗口；生产固定 5 分钟。 */
+  const armedGiftMs = positiveOption(options.armedGiftMs, ARMED_GIFT_MS, 10)
 
   let identity = null
   let discovery = null
@@ -129,6 +139,16 @@ export function createService (ctx, options = {}) {
   // 拉取是异步的，syncDesktop 只读这一份结果，绝不在同步路径上等网络。
   let skinFetcher = null
   const visitorSkins = new Map()
+  /**
+   * 礼物源（ticket 25）：giftId → { path, size, hash, visitId, until }。
+   * 这是串门模块与只读 HTTP 服务之间**唯一**的耦合：路由只查这张表，绝不拼报文里的路径。
+   * 只在“这次串门还没结束、且请求发出不到 5 分钟”时可读；结束/超时/失联立刻 unarm。
+   */
+  const armedGifts = new Map()
+  /** 正在拉取的文件礼物：同一 giftId 的迟到重试不重复下载。 */
+  const receivingGifts = new Set()
+  // 文件礼物的拉取客户端（ticket 25）；没有网络时是 null。
+  let giftFetcher = null
   // 本机宠物的待机池：dsh-pet 那一整套动作名；桌面只拿它轮播，不猜、不点播。
   // 测试可以注入 options.skinPool；生产由 startSkinSource 从注册表填。
   let skinPool = Array.isArray(options.skinPool) ? options.skinPool.slice() : []
@@ -333,6 +353,8 @@ export function createService (ctx, options = {}) {
       const result = room.recallOutbound()
       if (!result.ok) return result
       request = null
+      // 本地召回 = 这次串门结束：礼物立刻不可读（26 会在这里同时退包）。
+      unarmGift(result.visit?.visitId)
       return {
         ok: true,
         action: 'recall',
@@ -481,8 +503,11 @@ export function createService (ctx, options = {}) {
     // 打开/显示/复制都需要 Electron 主进程：宿主进程自己没有 shell 与剪贴板。
     if (desktop === null) return { ok: false, error: 'open-failed' }
 
+    // 字条看 note.txt；文件礼物打开的就是本体（名字来自 store 清洗过的 name）。
+    const targetPath = record.kind === 'file' ? record.filePath : record.notePath
+
     if (action === 'gift-open') {
-      if (typeof desktop.giftOpen !== 'function' || desktop.giftOpen(record.notePath) !== true) {
+      if (typeof desktop.giftOpen !== 'function' || desktop.giftOpen(targetPath) !== true) {
         return { ok: false, error: 'open-failed' }
       }
       // opened 只用于 ticket 26 的“送客时提醒一次”；写不进去不影响东西已经被打开。
@@ -491,13 +516,15 @@ export function createService (ctx, options = {}) {
     }
 
     if (action === 'gift-reveal') {
-      if (typeof desktop.giftReveal !== 'function' || desktop.giftReveal(record.notePath) !== true) {
+      if (typeof desktop.giftReveal !== 'function' || desktop.giftReveal(targetPath) !== true) {
         return { ok: false, error: 'open-failed' }
       }
       return { ok: true, action, giftId }
     }
 
     if (action === 'gift-copy') {
+      // 只有字条有正文可复制；文件礼物的卡片不显示「复制」，这里仍然明确拒绝。
+      if (record.kind !== 'text') return { ok: false, error: 'not-implemented' }
       if (typeof desktop.giftCopy !== 'function' || desktop.giftCopy(record.text) !== true) {
         return { ok: false, error: 'open-failed' }
       }
@@ -660,6 +687,14 @@ export function createService (ctx, options = {}) {
 
       if (options.network !== false) {
         skinFetcher = createSkinFetcher({ dir, log })
+        // 礼物拉取（ticket 25）：连接 5s / 总计 20s、流式落盘、失败冷却 60s。
+        // 测试可以注入更短的超时；生产默认值不能改（SPEC v4「接收端流程」）。
+        giftFetcher = createGiftFetcher({
+          log,
+          connectTimeoutMs: options.giftConnectTimeoutMs,
+          totalTimeoutMs: options.giftTimeoutMs,
+          cooldownMs: options.giftCooldownMs
+        })
         // 先起素材源，再起发现：beacon 的第一拍就能带上 skinPort。
         await startSkinSource()
         if (disposed) return
@@ -696,11 +731,17 @@ export function createService (ctx, options = {}) {
               if (result.ok) clearRequest(packet.visitId)
             } else if (packet.type === 'visit-deny') {
               const result = room.observeVisitDeny(packet)
-              if (result.ok) clearRequest(packet.visitId)
+              if (result.ok) {
+                clearRequest(packet.visitId)
+                // 对方没放行 = 这次串门结束：礼物不再可读（26 会在这里同时退包）。
+                unarmGift(packet.visitId)
+              }
             } else if (packet.type === 'visit-recall') {
               const result = room.observeVisitRecall(packet)
               if (result.ok) {
                 clearRequest(packet.visitId)
+                // 我是发起方：对方送客/召回，串门结束 → 立刻 unarm（请求中被取消也一样）。
+                if (result.side === 'out') unarmGift(result.visit?.visitId ?? packet.visitId)
                 // 回执：对方可能正拿着一条“没发出去”的 recall 在重试。
                 sendVisitRecallAck(packet.deviceId, packet.visitId)
               }
@@ -789,8 +830,12 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 对外素材源（ticket 15）：把本机注册表里的源挂到一个只读 HTTP 端口上。
-   * 起不来只影响「访客能不能拿我的素材」，不影响发现/串门/桌面。
+   * 对外只读端口（ticket 15 的素材源 + ticket 25 的礼物源）：同一个端口、同一套只读约束。
+   * 起不来只影响「访客能不能拿我的素材 / 文件礼物」，不影响发现/串门/桌面。
+   *
+   * **服务器无条件起**：没有素材源的用户也要有礼物端口（ADR-0011 唯一的新入站面），
+   * 所以这里不再因为 `sources` 为空而 return；空源只是让 skin 路由一律 404。
+   * `options.skinServer === false` 是测试用的逃生开关（不起端口，beacon 也不带 skinPort）。
    */
   async function startSkinSource () {
     try {
@@ -800,24 +845,28 @@ export function createService (ctx, options = {}) {
       }
       // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
       skinPool = loaded.sources.length > 0 ? idlePoolOf(loaded.sources[0]) : []
-      if (loaded.sources.length === 0) {
-        log.info('没有可对外的素材源：访客先用本机素材，没有就画通用小人')
-        return
-      }
       if (options.skinServer === false) return
       const requested = Number.isInteger(options.skinPort) ? options.skinPort : resolveSkinPort(env)
-      skinServer = await startSkinServer({
+      skinServer = await startLanServer({
         sources: loaded.sources,
         port: requested,
         host: '0.0.0.0',
-        log
+        log,
+        // 串门模块与服务器之间只通过这张表耦合：路由拿不到任何报文里的路径。
+        lookupGift: lookupArmedGift
       })
       if (skinServer === null) {
-        log.warn('素材源端口没起来：访客先用本机素材，没有就画通用小人')
+        log.warn('素材源端口没起来：访客先用本机素材，没有就画通用小人；礼物也发不出去')
         return
       }
-      skinRef = { port: skinServer.port, id: loaded.sources[0].id }
-      log.info('素材源已对外：' + skinRef.id + ' @ ' + skinRef.port)
+      // 端口总有；源 id 可能没有（没装素材源时 beacon/心跳/串门请求只带 skinPort）。
+      skinRef = {
+        port: skinServer.port,
+        ...(loaded.sources.length > 0 ? { id: loaded.sources[0].id } : {})
+      }
+      log.info(loaded.sources.length > 0
+        ? '素材源已对外：' + skinRef.id + ' @ ' + skinRef.port
+        : '礼物端口已对外：' + skinRef.port + '（没有素材源）')
     } catch (error) {
       log.warn('素材源没起来（不影响串门）：' + message(error))
     }
@@ -854,6 +903,80 @@ export function createService (ctx, options = {}) {
     }).catch(() => {
       // 拉取失败已经由 skin-fetch 冷却；这里不让异常冒到心跳循环
     })
+  }
+
+  // ---------------------------------------------------------------------------
+  // 礼物源（ticket 25）：armed 表 + 缩略图地址
+  //
+  // 文件礼物走「拉取，不推送」：发送方把「这次要送的那一个绝对路径」记进 armedGifts，
+  // 接收方在访客抵达时按 giftId 来取。路由只查这张表，报文里没有任何路径可拼。
+  // 只在「请求发出后 5 分钟内、且这次串门还没结束」时可读；五个结束点都会 unarm。
+  // ---------------------------------------------------------------------------
+
+  /** 路由的唯一读取入口；service 之外拿不到表本身。 */
+  function lookupArmedGift (giftId) {
+    if (typeof giftId !== 'string' || !isVisitId(giftId)) return null
+    return armedGifts.get(giftId.toLowerCase()) ?? null
+  }
+
+  /**
+   * arm 一件真的上路了的文件礼物。只记背包里那个**绝对路径**，不复制文件：
+   * 用户在这期间改/删了它，路由会按 size/sha256 报 410（东西已经不在了）。
+   */
+  function armFileGift (gift, path, visitId) {
+    if (gift === null || typeof gift !== 'object') return false
+    if (gift.kind !== 'file') return false
+    if (typeof path !== 'string' || path === '') return false
+    if (!isVisitId(visitId)) return false
+    if (!Number.isInteger(gift.size) || gift.size <= 0 || gift.size > MAX_GIFT_BYTES) return false
+    const now = Date.now()
+    armedGifts.set(gift.id.toLowerCase(), {
+      path,
+      size: gift.size,
+      hash: gift.sha256,
+      visitId: visitId.toLowerCase(),
+      until: now + armedGiftMs
+    })
+    return true
+  }
+
+  /** 一次串门结束时调用：只清这次 visitId 的那一件（一次最多带一件）。 */
+  function unarmGift (visitId) {
+    if (typeof visitId !== 'string' || visitId === '') return 0
+    const id = visitId.toLowerCase()
+    let removed = 0
+    for (const [giftId, entry] of armedGifts) {
+      if (entry.visitId !== id) continue
+      armedGifts.delete(giftId)
+      removed += 1
+    }
+    return removed
+  }
+
+  /**
+   * 兜底清扫：tick 可能让一次已抵达的串门到期/失联（room 直接 finishOutbound），
+   * 这里按「当前出门的 visitId」对账，任何不再属于这次串门的条目立刻丢掉。
+   * 显式的五个结束点仍然各自 unarm；这一层只防止漏掉某条路径。
+   */
+  function unarmEndedGifts () {
+    if (armedGifts.size === 0) return
+    const out = room.outboundVisit()
+    const visitId = out === null ? null : out.visitId
+    for (const [giftId, entry] of armedGifts) {
+      if (visitId === null || entry.visitId !== visitId) armedGifts.delete(giftId)
+    }
+  }
+
+  /**
+   * 缩略图地址：只在**本机真的收下**这件文件礼物之后才有记录可查。
+   * 目录名与文件名都来自礼物 store（校验过的目录名 + 清洗过的文件名），
+   * 渲染端只拿到这个 URL，拿不到任何本机路径。扩展名是否可作缩略图由 desktop-pets 判。
+   */
+  function giftThumb (giftId) {
+    const record = gifts?.lookup(giftId) ?? null
+    if (record === null || record.kind !== 'file') return null
+    if (typeof record.dirName !== 'string' || typeof record.name !== 'string') return null
+    return 'localpet://gifts/' + record.dirName + '/' + encodeURIComponent(record.name)
   }
 
   /**
@@ -893,6 +1016,8 @@ export function createService (ctx, options = {}) {
         maxRestarts: options.desktopMaxRestarts,
         assetRoots,
         cacheRoot: join(dir, 'skin-cache'),
+        // 缩略图只读这个根；helper 不认任何别的路径（ticket 25）。
+        giftsRoot: join(dir, 'gifts'),
         onEvent (event) {
           if (disposed || desktop === null) return
           if (event?.type === 'ready') {
@@ -987,7 +1112,8 @@ export function createService (ctx, options = {}) {
     // 这次同步就把 notice 带进场景；宠物不会静默消失。
     const dropped = droppedVisitors(snapshot)
     if (dropped > 0) room.noteSceneOverflow(dropped)
-    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot)
+    // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 localpet:// URL。
+    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const signature = JSON.stringify({ pets, controls, menu: desktopMenu })
     if (!reset && signature === desktopSceneSignature) return false
@@ -1178,7 +1304,9 @@ export function createService (ctx, options = {}) {
     const interval = positiveOption(options.tickIntervalMs, NEIGHBOR_TICK_MS, 10)
     tickTimer = setInterval(() => {
       room.tick()
-      // tick 可能让一次串门到期：记录交给 visits.json，recall 交给 socket。
+      // tick 可能让一次串门到期/失联：记录交给 visits.json，recall 交给 socket；
+      // 礼物表按“当前出门的 visitId”对账，任何已结束的条目立刻失效。
+      unarmEndedGifts()
       flushRoomEffects()
     }, interval)
     tickTimer.unref?.()
@@ -1328,11 +1456,15 @@ export function createService (ctx, options = {}) {
     if (request !== null) {
       const out = room.outboundVisit()
       if (out === null || out.visitId !== request.visitId || out.phase !== 'requesting') {
+        // 已经抵达（active）只是不再重发，arm 还要留着；串门没了/换了一次就立刻 unarm。
+        if (out === null || out.visitId !== request.visitId) unarmGift(request.visitId)
         request = null
       } else {
         const now = Date.now()
         if (now >= request.deadline) {
           room.failOutboundVisit('timeout', now)
+          // 请求超时 = 这次串门结束：对方再也取不到这件东西。
+          unarmGift(request.visitId)
           request = null
         } else {
           while (request.attempts < visitAttempts && now >= request.nextAt) {
@@ -1426,6 +1558,12 @@ export function createService (ctx, options = {}) {
       gift: sent.gift
     }
 
+    // 文件礼物真的上路了才 arm：对方会在这次串门期间按 giftId 来取。
+    // arm 必须晚于 markOut（背包里那件已经标成 out），也只认背包登记过的绝对路径。
+    if (carried !== null && sent.gift !== null && sent.gift !== undefined) {
+      armFileGift(sent.gift, carried.path, visitId)
+    }
+
     if (sent.giftDropped && carried !== null) {
       // 编码层把礼物丢掉了：它根本没上路，退回 idle，不占着“正在捎出”。
       if (backpack !== null) await backpack.releaseOut(carried.id, visitId)
@@ -1507,15 +1645,29 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 字条落盘（ticket 23）。失败只让这一张卡 `failed`，不影响已经 ack 的串门。
-   * 重试报文会再写一次同一个目录：store 对同一 gift.id 是幂等的。
+   * 入站礼物：字条同步落盘；文件让接收方按对方广告的 skinPort 主动来取（拉取，不推送）。
+   * 失败只让这一张卡 `failed` / `refused`，不影响已经 ack 的串门。
    */
   async function receiveGift (packet) {
     const gift = packet.gift
     if (gift === undefined || gift === null || !isVisitId(gift.id)) return
-    // ticket 24 只会发文件礼物；接收/拉取是 ticket 25 的事。在那之前让卡片停在 pending，
-    // 而不是拿文件礼物去写字条、把它标成没取到。
-    if (gift.kind !== 'text') return
+    if (gift.kind === 'text') return receiveTextGift(packet)
+    if (gift.kind === 'file') return receiveFileGift(packet)
+  }
+
+  /** 卡片状态只在这里改：状态变一次就让桌面场景跟上（签名里含 controls.gifts）。 */
+  function setGiftStatus (packet, status, reason = null) {
+    const changed = room.markGiftStatus(packet.deviceId, packet.gift.id, status, reason)
+    if (changed) flushRoomEffects()
+    return changed
+  }
+
+  /**
+   * 字条落盘（ticket 23）。失败只让这一张卡 `failed`，不影响已经 ack 的串门。
+   * 重试报文会再写一次同一个目录：store 对同一 gift.id 是幂等的。
+   */
+  async function receiveTextGift (packet) {
+    const gift = packet.gift
     const saved = gifts === null
       ? { ok: false, error: 'starting' }
       : await gifts.receiveText({
@@ -1525,12 +1677,104 @@ export function createService (ctx, options = {}) {
         receivedAt: Date.now()
       })
     if (disposed) return
-    room.markGiftStatus(packet.deviceId, gift.id, saved.ok ? 'received' : 'failed')
+    setGiftStatus(packet, saved.ok ? 'received' : 'failed', saved.ok ? null : 'write')
     if (!saved.ok) {
       warn(ctx, '字条没写进 gifts（' + saved.error + '）：卡片会显示“没取到”')
     }
-    // 状态变了要让桌面场景跟上（签名里含 controls.gifts）。
-    flushRoomEffects()
+  }
+
+  /**
+   * 文件礼物（ticket 25）：先做上限判定 → receiving → 拉取（连接 5s / 总计 20s、≤16 MiB、
+   * 边下边算 sha256、先写 `.part` 再 rename）→ received；任何失败都只记固定词表里的原因。
+   *
+   * 同一个 giftId 的迟到重试不重复下载；一个坏礼物只影响这一张卡。
+   */
+  async function receiveFileGift (packet) {
+    const gift = packet.gift
+    const giftId = gift.id.toLowerCase()
+    if (receivingGifts.has(giftId)) return
+    if (gifts === null) {
+      setGiftStatus(packet, 'failed', 'write')
+      return
+    }
+    // 重发/上一次已经收过：幂等，不再下载。
+    if (gifts.lookup(giftId) !== null) {
+      setGiftStatus(packet, 'received')
+      return
+    }
+    // 单件 ≤16 MiB：wire 层已经挡过一次，这里是本机落盘前的最后一道（防御）。
+    if (!Number.isInteger(gift.size) || gift.size <= 0 || gift.size > MAX_GIFT_BYTES) {
+      setGiftStatus(packet, 'refused', 'too-large')
+      return
+    }
+    if (!isPort(packet.skinPort)) {
+      // 对方没开素材端口（或版本太旧不广告）：东西取不回来，但串门本身照常。
+      setGiftStatus(packet, 'failed', 'no-port')
+      return
+    }
+    const endpoint = discovery === null ? null : discovery.addressOf(packet.deviceId)
+    if (endpoint === null || typeof endpoint.address !== 'string') {
+      setGiftStatus(packet, 'failed', 'timeout')
+      return
+    }
+
+    receivingGifts.add(giftId)
+    setGiftStatus(packet, 'receiving')
+    try {
+      const slot = await gifts.beginFile({
+        id: giftId,
+        from: { deviceId: packet.deviceId, nickname: packet.nickname },
+        name: gift.name,
+        size: gift.size,
+        sha256: gift.sha256,
+        receivedAt: Date.now()
+      })
+      if (disposed) return
+      if (!slot.ok) {
+        setGiftStatus(packet, 'failed', slot.error === 'bad-gift' ? 'refused' : 'write')
+        return
+      }
+      const fetched = giftFetcher === null
+        ? { ok: false, error: 'write' }
+        : await giftFetcher.fetchTo({
+          address: endpoint.address,
+          port: packet.skinPort,
+          giftId,
+          targetPath: slot.filePath,
+          size: gift.size,
+          sha256: gift.sha256
+        })
+      if (disposed) return
+      if (!fetched.ok) {
+        await gifts.abortFile(giftId)
+        setGiftStatus(packet, 'failed', fetched.error)
+        warn(ctx, '文件礼物没取到（' + fetched.error + '）：卡片会显示“没取到”')
+        return
+      }
+      const saved = await gifts.finishFile({
+        id: giftId,
+        from: { deviceId: packet.deviceId, nickname: packet.nickname },
+        name: gift.name,
+        size: gift.size,
+        sha256: gift.sha256,
+        receivedAt: Date.now()
+      })
+      if (disposed) return
+      if (!saved.ok) {
+        await gifts.abortFile(giftId)
+        setGiftStatus(packet, 'failed', 'write')
+        warn(ctx, '文件礼物写不进 gifts（' + saved.error + '）：卡片会显示“没取到”')
+        return
+      }
+      setGiftStatus(packet, 'received')
+    } catch (error) {
+      await gifts.abortFile(giftId).catch(() => {})
+      if (disposed) return
+      setGiftStatus(packet, 'failed', 'write')
+      warn(ctx, '文件礼物接收失败：' + message(error))
+    } finally {
+      receivingGifts.delete(giftId)
+    }
   }
 
   function sendVisitAck (deviceId, visitId) {
@@ -1682,6 +1926,10 @@ export function createService (ctx, options = {}) {
       skinFetcher = null
       visitorSkins.clear()
       skinPool = []
+      // 礼物端口随服务器一起关了：内存里的 armed 表与在途标记不再有意义。
+      armedGifts.clear()
+      receivingGifts.clear()
+      giftFetcher = null
       gifts = null
       backpack = null
       request = null

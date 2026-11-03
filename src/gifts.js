@@ -2,7 +2,14 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
-import { isDeviceId, isVisitId, normalizeNickname, sanitizeNote } from './protocol.js'
+import {
+  MAX_GIFT_BYTES,
+  isDeviceId,
+  isVisitId,
+  normalizeNickname,
+  sanitizeGiftName,
+  sanitizeNote
+} from './protocol.js'
 
 /**
  * 入站礼物的落盘：`<dataDir>/gifts/<dir>/note.txt` + `meta.json`。
@@ -33,7 +40,9 @@ export const MAX_GIFT_INDEX = 200
 
 /** 目录名：`20261103-153245-ab12cd12`，可读的时间前缀 + gift id 前 8 位。 */
 const GIFT_DIR_RE = /^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$/
+const GIFT_HASH_RE = /^sha256:[0-9a-f]{64}$/
 const FALLBACK_NICKNAME = '邻居'
+const FALLBACK_FILE_NAME = 'file'
 
 function pad (value, width = 2) {
   return String(value).padStart(width, '0')
@@ -71,6 +80,9 @@ export function giftDirPath (dataDir, dirName) {
 /**
  * 读回来的 `meta.json` 白名单。形状不对返回 null，由 store 跳过并告警一次。
  * `version` 缺省容忍（手改过的老文件），但明确写了别的版本就不认。
+ *
+ * ticket 25 起认两种 kind：`text`（正文 + note.txt）与 `file`（name/size/sha256，
+ * 本体是目录里的同名文件）。不认识的 kind（未来版本的新礼物）整条跳过。
  */
 export function normalizeGiftMeta (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
@@ -80,24 +92,48 @@ export function normalizeGiftMeta (value) {
   const from = value.from
   if (from === null || typeof from !== 'object' || Array.isArray(from)) return null
   if (!isDeviceId(from.deviceId)) return null
-  // 本版本只会写 kind:'text'；文件礼物（ticket 25）会加自己的分支，旧端读到就跳过。
-  if (value.kind !== 'text') return null
-  const text = sanitizeNote(value.text)
-  if (text === null) return null
   const receivedAt = Number(value.receivedAt)
   if (!Number.isFinite(receivedAt) || receivedAt <= 0) return null
-  return {
-    id: value.id.toLowerCase(),
-    dir: value.dir,
-    from: {
-      deviceId: from.deviceId.toLowerCase(),
-      nickname: normalizeNickname(from.nickname) ?? FALLBACK_NICKNAME
-    },
-    kind: 'text',
-    text,
-    receivedAt: Math.floor(receivedAt),
-    opened: value.opened === true
+  const sender = {
+    deviceId: from.deviceId.toLowerCase(),
+    nickname: normalizeNickname(from.nickname) ?? FALLBACK_NICKNAME
   }
+
+  if (value.kind === 'text') {
+    const text = sanitizeNote(value.text)
+    if (text === null) return null
+    return {
+      id: value.id.toLowerCase(),
+      dir: value.dir,
+      from: sender,
+      kind: 'text',
+      text,
+      receivedAt: Math.floor(receivedAt),
+      opened: value.opened === true
+    }
+  }
+
+  if (value.kind === 'file') {
+    // meta 里必须有可显示的名字：空名/带路径分隔符的名字说明这份 meta 不是本店写的，跳过。
+    const name = sanitizeGiftName(value.name)
+    if (name === null) return null
+    const size = Number(value.size)
+    if (!Number.isInteger(size) || size <= 0 || size > MAX_GIFT_BYTES) return null
+    if (typeof value.sha256 !== 'string' || !GIFT_HASH_RE.test(value.sha256)) return null
+    return {
+      id: value.id.toLowerCase(),
+      dir: value.dir,
+      from: sender,
+      kind: 'file',
+      name,
+      size,
+      sha256: value.sha256,
+      receivedAt: Math.floor(receivedAt),
+      opened: value.opened === true
+    }
+  }
+
+  return null
 }
 
 export async function createGiftStore (dir, { log } = {}) {
@@ -112,6 +148,11 @@ class GiftStore {
   #log
   /** giftId（小写 UUID）→ 记录；记录里的 dir/路径只由校验过的目录名拼出来。 */
   #index = new Map()
+  /**
+   * 正在下载的文件礼物：giftId → { dirName, dirPath, filePath, created }。
+   * 目录先分配、下载在锁外进行；同一件礼物的重试复用同一个落点，不另开目录。
+   */
+  #pendingFiles = new Map()
   #warned = new Set()
   /**
    * 串行化所有写操作。同一个 gift.id 的重试报文可能先后脚到达：两条异步链都先看到
@@ -243,6 +284,115 @@ class GiftStore {
     }
   }
 
+  /**
+   * 收下一件文件礼物的**第一步**：分配目录，返回最终文件名（`<dir>/<name>`）。
+   * 这里不写 meta、不进索引；下载成功后再 `finishFile`，失败就 `abortFile` 清场。
+   * 同一 giftId 的重试复用同一个落点，绝不另开一个目录。
+   */
+  beginFile (input = {}) {
+    return this.#enqueue(() => this.#beginFile(input))
+  }
+
+  async #beginFile (input) {
+    const clean = normalizeFileGift(input)
+    if (!clean.ok) return clean
+    const pending = this.#pendingFiles.get(clean.giftId)
+    if (pending !== undefined) return { ok: true, ...pending }
+    const existing = this.#index.get(clean.giftId)
+    if (existing !== undefined) {
+      return {
+        ok: true,
+        dirName: existing.dirName,
+        dirPath: existing.dirPath,
+        filePath: existing.filePath,
+        created: false,
+        existing: true
+      }
+    }
+    try {
+      await mkdir(join(this.#dir, GIFTS_DIR), { recursive: true, mode: 0o700 })
+      const allocated = await allocateDir(
+        join(this.#dir, GIFTS_DIR),
+        giftDirName(clean.giftId, clean.receivedAt),
+        clean.giftId
+      )
+      const slot = {
+        dirName: allocated.dirName,
+        dirPath: allocated.dirPath,
+        filePath: join(allocated.dirPath, clean.name),
+        created: allocated.created
+      }
+      this.#pendingFiles.set(clean.giftId, slot)
+      return { ok: true, ...slot }
+    } catch (error) {
+      this.#warnOnce('write', '礼物目录建不出来，这张卡片会显示“没取到”（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+  }
+
+  /**
+   * 收下一件文件礼物的**第二步**：文件已经 rename 到位，写 meta.json 并进索引。
+   * meta 写失败只回 `{ ok:false, error:'write' }`，由调用方把卡片标成 failed。
+   */
+  finishFile (input = {}) {
+    return this.#enqueue(() => this.#finishFile(input))
+  }
+
+  async #finishFile (input) {
+    const clean = normalizeFileGift(input)
+    if (!clean.ok) return clean
+    let slot = this.#pendingFiles.get(clean.giftId)
+    if (slot === undefined) {
+      const existing = this.#index.get(clean.giftId)
+      if (existing !== undefined) return { ok: true, gift: copyRecord(existing) }
+      const allocated = await this.#beginFile(input)
+      if (!allocated.ok) return allocated
+      slot = { dirName: allocated.dirName, dirPath: allocated.dirPath, filePath: allocated.filePath, created: allocated.created }
+    }
+    const existing = this.#index.get(clean.giftId)
+    const meta = {
+      version: GIFT_META_VERSION,
+      id: clean.giftId,
+      dir: slot.dirName,
+      from: clean.from,
+      kind: 'file',
+      name: clean.name,
+      size: clean.size,
+      sha256: clean.sha256,
+      receivedAt: clean.receivedAt,
+      // 重试不该把“已经打开过”抹掉。
+      opened: existing?.opened === true
+    }
+    try {
+      await writeFileAtomic(join(slot.dirPath, META_FILE), JSON.stringify(meta, null, 2) + '\n')
+      const record = this.#record(clean.giftId, meta)
+      this.#index.set(clean.giftId, record)
+      this.#pendingFiles.delete(clean.giftId)
+      this.#pruneIndex()
+      return { ok: true, gift: copyRecord(record) }
+    } catch (error) {
+      this.#warnOnce('write', '礼物写不进去，这张卡片会显示“没取到”（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+  }
+
+  /** 下载失败：把这次新开的目录整目录删掉（已有礼物/别的目录一概不动）。 */
+  abortFile (giftId) {
+    return this.#enqueue(() => this.#abortFile(giftId))
+  }
+
+  async #abortFile (giftId) {
+    if (!isVisitId(giftId)) return false
+    const id = giftId.toLowerCase()
+    const slot = this.#pendingFiles.get(id)
+    if (slot === undefined) return false
+    this.#pendingFiles.delete(id)
+    if (slot.created === true && !this.#index.has(id)) {
+      await rm(slot.dirPath, { recursive: true, force: true }).catch(() => {})
+    }
+    return true
+  }
+
   /** 「打开」成功后记一笔；写不进 meta 不影响东西已经被系统打开。 */
   markOpened (giftId) {
     return this.#enqueue(() => this.#markOpened(giftId))
@@ -253,16 +403,29 @@ class GiftStore {
     const record = this.#index.get(giftId.toLowerCase())
     if (record === undefined) return false
     if (record.opened) return true
-    const meta = {
-      version: GIFT_META_VERSION,
-      id: record.id,
-      dir: record.dirName,
-      from: { ...record.from },
-      kind: 'text',
-      text: record.text,
-      receivedAt: record.receivedAt,
-      opened: true
-    }
+    const meta = record.kind === 'file'
+      ? {
+          version: GIFT_META_VERSION,
+          id: record.id,
+          dir: record.dirName,
+          from: { ...record.from },
+          kind: 'file',
+          name: record.name,
+          size: record.size,
+          sha256: record.sha256,
+          receivedAt: record.receivedAt,
+          opened: true
+        }
+      : {
+          version: GIFT_META_VERSION,
+          id: record.id,
+          dir: record.dirName,
+          from: { ...record.from },
+          kind: 'text',
+          text: record.text,
+          receivedAt: record.receivedAt,
+          opened: true
+        }
     try {
       await writeFileAtomic(record.metaPath, JSON.stringify(meta, null, 2) + '\n')
       record.opened = true
@@ -304,18 +467,28 @@ class GiftStore {
 
   #record (giftId, meta) {
     const dirPath = giftDirPath(this.#dir, meta.dir)
-    return {
+    const base = {
       id: giftId,
       dirName: meta.dir,
       dirPath,
       notePath: join(dirPath, NOTE_FILE),
       metaPath: join(dirPath, META_FILE),
       from: { ...meta.from },
-      kind: meta.kind,
-      text: meta.text,
       receivedAt: meta.receivedAt,
       opened: meta.opened === true
     }
+    if (meta.kind === 'file') {
+      return {
+        ...base,
+        kind: 'file',
+        name: meta.name,
+        size: meta.size,
+        sha256: meta.sha256,
+        // 本体就是目录里的同名文件；名字已经过 sanitizeGiftName，绝不含路径分隔符。
+        filePath: join(dirPath, meta.name)
+      }
+    }
+    return { ...base, kind: 'text', text: meta.text, filePath: null }
   }
 
   #pruneIndex () {
@@ -381,8 +554,46 @@ function copyRecord (record) {
     from: { ...record.from },
     kind: record.kind,
     text: record.text,
+    name: record.name,
+    size: record.size,
+    sha256: record.sha256,
+    filePath: record.filePath,
     receivedAt: record.receivedAt,
     opened: record.opened
+  }
+}
+
+/**
+ * 文件礼物入参白名单（store 与 service 共用同一套边界）：
+ * id 是 UUID、from 是合法 deviceId、name 清洗过、size 在 1…16 MiB、sha256 形状正确。
+ * 坏输入只回 `{ ok:false, error:'bad-gift' }`，绝不建目录。
+ */
+function normalizeFileGift (input) {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return { ok: false, error: 'bad-gift' }
+  }
+  if (!isVisitId(input.id)) return { ok: false, error: 'bad-gift' }
+  const deviceId = isDeviceId(input.from?.deviceId) ? input.from.deviceId.toLowerCase() : null
+  if (deviceId === null) return { ok: false, error: 'bad-gift' }
+  const size = Number(input.size)
+  if (!Number.isInteger(size) || size <= 0 || size > MAX_GIFT_BYTES) {
+    return { ok: false, error: 'bad-gift' }
+  }
+  if (typeof input.sha256 !== 'string' || !GIFT_HASH_RE.test(input.sha256)) {
+    return { ok: false, error: 'bad-gift' }
+  }
+  const receivedAt = Number(input.receivedAt)
+  return {
+    ok: true,
+    giftId: input.id.toLowerCase(),
+    from: {
+      deviceId,
+      nickname: normalizeNickname(input.from?.nickname) ?? FALLBACK_NICKNAME
+    },
+    name: sanitizeGiftName(input.name) ?? FALLBACK_FILE_NAME,
+    size,
+    sha256: input.sha256,
+    receivedAt: Number.isFinite(receivedAt) && receivedAt > 0 ? Math.floor(receivedAt) : Date.now()
   }
 }
 

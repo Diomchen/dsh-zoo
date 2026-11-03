@@ -5,10 +5,11 @@
     <!--
       这个页面不联网、不加载远程资源：只允许同目录脚本、内联样式、data: 图片，
       以及 helper 自己注册的 localpet:// 素材协议（dsh-pet 的 WebM 文件）。
+      礼物缩略图也走 localpet:// gifts 主机，所以 img-src 必须显式放行它，否则会被静默挡掉。
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src localpet:; connect-src 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: localpet:; media-src localpet:; connect-src 'none'"
     />
     <title>dsh-local-pet</title>
     <style>
@@ -448,6 +449,62 @@
       .lp-gift-status[hidden] {
         display: none;
       }
+      /* 文件卡（ticket 25）：缩略图是本地协议图片，最多高 96px；没有缩略图就画图标 + 名字 + 大小。 */
+      .lp-gift-file {
+        margin: 5px 0 7px;
+      }
+      .lp-gift-file[hidden] {
+        display: none;
+      }
+      .lp-gift-thumb {
+        display: block;
+        width: 100%;
+        max-height: 96px;
+        margin-bottom: 6px;
+        border-radius: 8px;
+        object-fit: cover;
+        background: rgba(255, 255, 255, 0.06);
+      }
+      .lp-gift-thumb[hidden] {
+        display: none;
+      }
+      .lp-gift-file-row {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+      }
+      .lp-gift-file-icon {
+        flex: none;
+        width: 26px;
+        height: 30px;
+        border-radius: 5px;
+        background: rgba(255, 255, 255, 0.12);
+        color: rgba(244, 248, 255, 0.78);
+        font-size: 15px;
+        line-height: 30px;
+        text-align: center;
+      }
+      .lp-gift-file-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        min-width: 0;
+      }
+      .lp-gift-file-name {
+        font-size: 11.5px;
+        font-weight: 600;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
+      }
+      .lp-gift-file-size {
+        font-size: 10px;
+        line-height: 1.35;
+        color: rgba(244, 248, 255, 0.6);
+      }
+      .lp-gift-file-size[hidden] {
+        display: none;
+      }
       .lp-gift-actions {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -455,6 +512,9 @@
       }
       .lp-gift-actions .lp-btn {
         padding: 6px 8px;
+      }
+      .lp-gift-actions .lp-btn[hidden] {
+        display: none;
       }
       .lp-x {
         appearance: none;
