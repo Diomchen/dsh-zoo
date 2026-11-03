@@ -618,8 +618,14 @@ test('session/event 是主活动信号：订阅带 global，任何事件都刷�
   })
   await service.ready
 
+  // 默认自动串门关着，不订阅；开了才需要主信号。
+  const enabled = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'auto-visits', enabled: true }
+  })
+  assert.equal(enabled.status, 200)
   const entry = service.handlers.get('session/event')
-  assert.ok(entry, '应该订阅 session/event')
+  assert.ok(entry, '开了自动串门才订阅 session/event')
   assert.deepEqual(entry.options, { global: true })
   assert.equal(service.snapshot().autoVisit.activitySource, 'none')
 
@@ -665,6 +671,12 @@ test('session/event 不可用时退回桌面指针：光标进入宠物才算活
   // 光标离开宠物不算“有活动”；session/event 的事件更近时又切回主信号。
   captured.onEvent({ type: 'hit', inside: false, point: { x: 10, y: 20 }, reason: 'outside' })
   assert.equal(service.snapshot().autoVisit.lastActivityAt, pointer.lastActivityAt)
+  // 默认自动串门关着，不订阅 session/event；开启后才挂上主信号。
+  const enabled = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'auto-visits', enabled: true }
+  })
+  assert.equal(enabled.status, 200)
   service.handlers.get('session/event').fn({ id: 's' }, { type: 'turn/start' })
   assert.equal(service.snapshot().autoVisit.activitySource, 'session')
 })
@@ -925,4 +937,25 @@ test('POST /local-pet/self-state：动作进入快照，非法请求 400，非 P
 
   const wrong = await call(service, '/local-pet/self-state')
   assert.equal(wrong.status, 405)
+})
+
+test('自动串门关着时不订阅 session/event；打开后订阅，关掉退订', async (t) => {
+  const service = makeService(t)
+  await service.ready
+  const handlers = service.handlers
+  assert.equal(handlers.has('session/event'), false, '默认（自动串门关）不该读 DSH 事件流')
+
+  const on = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'auto-visits', enabled: true }
+  })
+  assert.equal(on.status, 200)
+  assert.equal(handlers.has('session/event'), true, '开了自动串门才需要活动信号')
+
+  const off = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'auto-visits', enabled: false }
+  })
+  assert.equal(off.status, 200)
+  assert.equal(handlers.has('session/event'), false, '关掉后必须退订')
 })

@@ -279,6 +279,7 @@ export function createService (ctx, options = {}) {
       if (typeof body?.enabled !== 'boolean') return { ok: false, error: 'bad-enabled' }
       const persisted = await settings.setAutoVisits(body.enabled)
       const autoVisits = room.setAutoVisits(body.enabled)
+      syncSessionSignal()
       return { ok: true, action: 'auto-visits', autoVisits, persisted }
     }
 
@@ -381,6 +382,9 @@ export function createService (ctx, options = {}) {
         warn(ctx, '桌面开关初始化失败，本次按“允许入站串门、不自动出门”运行：' + message(error))
       }
       if (disposed) return
+
+      // 设置读完后才知道自动串门开没开：只有开着才订阅 session/event。
+      syncSessionSignal()
 
       // 串门记录是“锦上添花”：读写失败只降级成空记录，绝不让桌面起不来。
       try {
@@ -966,30 +970,52 @@ export function createService (ctx, options = {}) {
     return result
   }
 
+  // 活动信号只在自动串门开着时订阅；关掉就退订。
+  // 默认配置下自动串门是关的，所以默认连这条事件流都不读。
+  let sessionSignal = null
+
   /**
    * session/event 是 ticket 09 的主活动信号：DSH 里只要有人在用（发消息、跑 turn），
-   * 宠物就知道“本机最近有活动”。拿不到这个能力（web/老宿主/ctx 没有 on）时不报错，
+   * 宠物就知道“本机最近有活动”。**只在自动串门开启期间订阅**——关掉时这个信号没有任何
+   * 用途，多读一条就是多余的隐私面。拿不到这个能力（web/老宿主/ctx 没有 on）时不报错，
    * 自动退回桌面指针；两者都没有时策略的 activity 门永远关着。
    */
   function subscribeSessionEvents () {
-    if (disposed) return false
+    if (disposed || sessionSignal !== null) return true
     if (typeof ctx?.on !== 'function') {
       log.info('活动信号：宿主没有 session/event，自动串门只靠桌面指针活动')
       return false
     }
     try {
-      const dispose = ctx.on('session/event', (session, event) => {
+      const off = ctx.on('session/event', () => {
         if (disposed) return
-        // 任何 session 事件都代表这台机器上有人在用 DSH；事件类型不是安全边界。
+        // 只记“有活动”的时间戳；事件内容不读、不存、不发。
         noteActivity('session')
       }, { global: true })
-      if (typeof dispose === 'function') disposers.push(dispose)
-      log.info('活动信号：已订阅 session/event')
+      sessionSignal = typeof off === 'function' ? off : () => {}
+      log.info('活动信号：已订阅 session/event（自动串门开启期间）')
       return true
     } catch (error) {
       warn(ctx, '订阅 session/event 失败，自动串门退回桌面指针：' + message(error))
       return false
     }
+  }
+
+  function unsubscribeSessionEvents () {
+    if (sessionSignal === null) return
+    try {
+      sessionSignal()
+    } catch {
+      // 退订失败不影响卸载
+    }
+    sessionSignal = null
+  }
+
+  /** 自动串门开关变化时调用：开就订阅，关就退订。 */
+  function syncSessionSignal () {
+    if (disposed) return
+    if (room.snapshot().autoVisit.enabled) subscribeSessionEvents()
+    else unsubscribeSessionEvents()
   }
 
   /**
@@ -1211,8 +1237,7 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  // 先挂上 session 活动信号，再启动：DSH 可能在 start() 的 await 期间就有事件。
-  subscribeSessionEvents()
+  // 活动信号由 syncSessionSignal 在设置加载后按“自动串门是否开启”决定，默认不订阅。
   const ready = start()
 
   return {
@@ -1250,6 +1275,7 @@ export function createService (ctx, options = {}) {
         autoVisitTimer = null
       }
       stopDesktopSync()
+      unsubscribeSessionEvents()
       try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }
       skinServer = null
       skinRef = null
