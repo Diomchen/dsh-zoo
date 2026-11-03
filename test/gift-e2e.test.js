@@ -19,6 +19,7 @@ import { controlsFromSnapshot } from '../src/desktop-pets.js'
 import { GIFTS_DIR, META_FILE, NOTE_FILE, createGiftStore } from '../src/gifts.js'
 import { PROTOCOL_VERSION, parsePacket } from '../src/protocol.js'
 import { createService } from '../src/service.js'
+import { VISITS_FILE } from '../src/visits.js'
 
 function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -485,4 +486,195 @@ test('桌面动作：打开/显示/复制走 helper，扔掉交给 helper；路�
   const bad = await callAction(service, { action: 'gift-open', giftId: 'gift-1' })
   assert.equal(bad.status, 409)
   assert.equal(bad.body.error, 'bad-gift')
+})
+
+async function visitsOf (dir) {
+  try {
+    const raw = JSON.parse(await readFile(join(dir, VISITS_FILE), 'utf8'))
+    return Array.isArray(raw?.visits) ? raw.visits : []
+  } catch {
+    return []
+  }
+}
+
+test('频率限额：同一邻居第 11 件礼物 → refused/rate，不落盘、不回执；文件路径同样被挡', async (t) => {
+  const dir = await tempDir(t)
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.socket.address().port
+  const servicePort = await freeUdpPort()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: true,
+    desktop: false,
+    port: servicePort,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    heartbeatIntervalMs: 60000,
+    tickIntervalMs: 50
+  })
+  await service.ready
+
+  const deviceId = randomUUID()
+  peer.socket.send(beaconPayload({ deviceId, nickname: '楼下的柯基', port: peerPort }), servicePort, '127.0.0.1')
+  await waitFor(() => service.snapshot().neighbors.length === 1)
+  assert.equal((await callAction(service, { action: 'admit', deviceId })).status, 200)
+
+  // 10 件字条逐件等落盘：第 11 件才该被频率闸挡下。
+  for (let index = 0; index < 10; index += 1) {
+    const giftId = randomUUID()
+    peer.socket.send(
+      visitRequestPayload({
+        deviceId,
+        visitId: randomUUID(),
+        nickname: '楼下的柯基',
+        gift: { id: giftId, kind: 'text', text: '第 ' + index + ' 张便条' }
+      }),
+      servicePort,
+      '127.0.0.1'
+    )
+    await waitFor(() => {
+      const gift = service.snapshot().visitors[0]?.gift
+      return gift?.id === giftId && gift.status === 'received'
+    })
+  }
+  assert.equal((await giftDirs(dir)).length, 10)
+
+  // 第 11 件故意走文件路径（没有 skinPort，本会得到 failed/no-port）：
+  // 现在必须是 refused/rate —— 证明字条与文件共用同一道闸，且限速先于拉取。
+  const refusedGiftId = randomUUID()
+  peer.socket.send(
+    visitRequestPayload({
+      deviceId,
+      visitId: randomUUID(),
+      nickname: '楼下的柯基',
+      gift: {
+        id: refusedGiftId,
+        kind: 'file',
+        name: '报价单.pdf',
+        size: 4,
+        sha256: 'sha256:' + 'a'.repeat(64)
+      }
+    }),
+    servicePort,
+    '127.0.0.1'
+  )
+  await waitFor(() => {
+    const gift = service.snapshot().visitors[0]?.gift
+    return gift?.id === refusedGiftId && gift.status === 'refused'
+  })
+  const refused = service.snapshot().visitors[0].gift
+  assert.equal(refused.status, 'refused')
+  assert.equal(refused.reason, 'rate')
+
+  await delay(250)
+  assert.equal((await giftDirs(dir)).length, 10, '第 11 件不落盘')
+  const receipts = visitEntries(peer.received, 'gift-received')
+  assert.equal(
+    receipts.some((entry) => entry.parsed.packet.giftId === refusedGiftId),
+    false,
+    '第 11 件不回执'
+  )
+  // 串门本身照常：访客还在，礼物卡只是「没收下」。
+  assert.equal(service.snapshot().visitors.length, 1)
+})
+
+test('gifts/ 总量超限（注入小额度）：新礼物写成功后立刻按 receivedAt 删最旧，/state 只剩最新', async (t) => {
+  const dir = await tempDir(t)
+  const peer = await loopbackPeer(t)
+  const peerPort = peer.socket.address().port
+  const servicePort = await freeUdpPort()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: true,
+    desktop: false,
+    // 生产是 500 MiB；这里缩小到 1 字节，验的是「先写后剪、删最旧」这条路径。
+    giftMaxTotalBytes: 1,
+    port: servicePort,
+    targetPort: peerPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 60000,
+    heartbeatIntervalMs: 60000,
+    tickIntervalMs: 50
+  })
+  await service.ready
+
+  const deviceId = randomUUID()
+  peer.socket.send(beaconPayload({ deviceId, nickname: '楼下的柯基', port: peerPort }), servicePort, '127.0.0.1')
+  await waitFor(() => service.snapshot().neighbors.length === 1)
+  assert.equal((await callAction(service, { action: 'admit', deviceId })).status, 200)
+
+  let latestGiftId = null
+  for (let index = 0; index < 3; index += 1) {
+    const giftId = randomUUID()
+    latestGiftId = giftId
+    peer.socket.send(
+      visitRequestPayload({
+        deviceId,
+        visitId: randomUUID(),
+        nickname: '楼下的柯基',
+        gift: { id: giftId, kind: 'text', text: '第 ' + index + ' 张便条' }
+      }),
+      servicePort,
+      '127.0.0.1'
+    )
+    await waitFor(() => {
+      const gift = service.snapshot().visitors[0]?.gift
+      return gift?.id === giftId && gift.status === 'received'
+    })
+    // 每次收下之后目录里只剩刚写的这一件：旧的两件都被整目录删掉了。
+    await waitFor(async () => (await giftDirs(dir)).length === 1)
+  }
+
+  const dirs = await giftDirs(dir)
+  assert.equal(dirs.length, 1)
+  assert.equal(dirs[0].endsWith(latestGiftId.slice(0, 8)), true, '保留的是最新那件')
+  const state = service.snapshot()
+  assert.equal(state.gifts.length, 1)
+  assert.equal(state.gifts[0].id, latestGiftId)
+  assert.equal(state.gifts[0].status, 'received')
+  assert.match(state.gifts[0].path, /note\.txt$/)
+})
+
+test('记录里带 gift：字条在双方 visits.json 都留下 {kind:"text"}，不记正文', async (t) => {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  const [portA, portB] = await distinctPorts(2)
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA))
+  await b.ready
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+
+  const secret = '私房话：今晚吃鱼\n第二行'
+  const started = await callAction(a, {
+    action: 'visit',
+    deviceId: bId,
+    gift: { id: randomUUID(), kind: 'text', text: secret }
+  })
+  assert.equal(started.status, 200)
+  await waitFor(() => b.snapshot().visitors[0]?.gift?.status === 'received')
+  await waitFor(() => a.snapshot().self.out?.phase === 'active')
+
+  assert.equal((await callAction(a, { action: 'recall' })).status, 200)
+  await waitFor(async () => (await visitsOf(dirA)).length === 1 && (await visitsOf(dirB)).length === 1)
+
+  const outRecord = (await visitsOf(dirA))[0]
+  const inRecord = (await visitsOf(dirB))[0]
+  assert.equal(outRecord.direction, 'out')
+  assert.equal(inRecord.direction, 'in')
+  assert.deepEqual(outRecord.gift, { kind: 'text' })
+  assert.deepEqual(inRecord.gift, { kind: 'text' })
+  // 记录只留摘要：正文不写进历史文件。
+  assert.equal(JSON.stringify(outRecord).includes('私房话'), false)
+  assert.equal(JSON.stringify(inRecord).includes('私房话'), false)
 })

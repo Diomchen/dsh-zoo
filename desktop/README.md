@@ -1,4 +1,4 @@
-# 桌面 helper（ticket 07–11）
+# 桌面 helper（ticket 07–27）
 
 宿主是 `ELECTRON_RUN_AS_NODE=1` 的纯 Node，拿不到 `BrowserWindow`。这个目录是另起的
 Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与宿主只通过 stdin/stdout 的 JSON 行
@@ -9,7 +9,7 @@ Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与�
   `setBusy` / `requestAction` / `onActionResult` / `onScene`
 - `index.html` + `renderer.js` — 透明画布；每只宠物一个 DOM 节点，60fps 本地物理；
   悬停/点击控件（串门/召回/送客/放行卡/提示气泡）也在这里
-- `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v2（含 `controls`）、物理、
+- `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v3（含 `controls` / `menu`）、物理、
   命中判定、穿透裁定
 
 ## 怎么跑
@@ -46,6 +46,10 @@ debug 模式 = `--local-pet-debug` **或** 环境变量 `LOCAL_PET_DESKTOP_DEBUG
 `--local-pet-assets <dir>` 可以重复，按顺序查找素材；宿主侧由 `src/pet-assets.js` 解析
 （`$DSH_HOME/dsh-pet/main-animation/webm` → 包内 `assets/webm` → `profiles/*/node_modules/...`），
 **不写死 profile 名**。没有素材时宠物退成内置 SVG 色块，串门不受影响。
+
+`--local-pet-gifts <dir>`（ticket 25）是收到的礼物根目录（宿主传 `<dataDir>/gifts`），
+只用于 `localpet://gifts/...` 的**缩略图**读取；不传时这条读路径不注册（所有 gifts URL 404）。
+它和 `--local-pet-assets` 一样是绝对路径，helper 不自己拼数据目录。
 
 真机冒烟（不进 `npm test`；没有 Electron 时应该跳过）：
 
@@ -133,7 +137,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 `waiting-for-confirmation` / `stale-renderer-confirmation` / `no-scene` / `scene-updated` /
 `renderer-busy` / `renderer-idle` / `renderer-rects` / `hide` / `blur` / `display-changed` 等。
 
-## 场景协议 v2（`update.scene`）
+## 场景协议 v3（`update.scene`）
 
 ```json
 {
@@ -163,9 +167,13 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
     "visit": { "enabled": true, "reason": null },
     "recall": { "enabled": false, "nickname": null },
     "visitors": [{ "deviceId": "6f1c…", "label": "阿蟹" }],
+    "gifts": [{ "deviceId": "6f1c…", "giftId": "…", "kind": "file", "name": "照片.png",
+                "title": "「阿蟹」捎来一个文件", "status": "received",
+                "thumb": "localpet://gifts/20261103-153245-ab12cd/照片.png" }],
     "prompt": { "deviceId": "9a2b…", "nickname": "泡泡" },
     "notice": { "text": "「阿蟹」没有回应，宠物先留在家里了。", "at": 1762000000000 }
-  }
+  },
+  "menu": { "tools": [], "groups": [] }
 }
 ```
 
@@ -175,9 +183,14 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - `recall`：自己出门时桌面没有 `self`，渲染端用一个常驻「召回」胶囊代替；
   `nickname` 用来显示“在「阿蟹」家”。
 - `visitors`：当前可送客的访客；`item.id` 是 `visitor:<deviceId>`，两边按 deviceId 对上。
+- `gifts`：贴着访客的礼物卡（ticket 23/25）。状态与标题由宿主算好；`text` 只在
+  `received` 时给，`thumb` 只给图片且只接受 `localpet://gifts/...`。卡片/按钮/桥接矩形
+  都进 `overlay-rects`，按钮 id 带 `giftId`，两张卡不会撞名。
 - `prompt`：放行 FIFO 队首；渲染端在宠物旁边画 接受 / 拒绝 / 稍后再说，绝不遮挡宠物本体。
 - `notice`：最近一条人话提示。异步失败（超时、对方失联、被送客）不经过 `action-result`，
   渲染端靠 `notice.at` 变化冒泡；超过 30s 的旧 notice 不会在 helper 重启后重新弹出。
+- `menu`（ticket 22）：右键自己的宠物时画的一级工具项 + 「动作」三级树；内容由宿主下发，
+  渲染端只画、只发申请。
 
 位置仍是渲染端拥有；`controls` 只描述“能点什么、为什么不能点”，点击只发 `action` 申请。
 
@@ -187,7 +200,8 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   （`src/desktop.js` 的 `manager.resync(scene)`）。
 - **尺寸**：`width`/`height` 是整只宠物的命中矩形；渲染端用同一个矩形做物理边界和上报。
 - **谁在画**：宿主目前只下发 `self` / `visitor`（心跳影子不下发，它不是访客）；
-  场景协议仍接受 `guest` 给截图/演示用。`kind` 留了 `card` 给 ticket 11。
+  场景协议仍接受 `guest` 给截图/演示用。`kind` 留了 `card` 给 ticket 11，但礼物卡走的是
+  `controls.gifts`，**不**塞进 `items`。
 - **动作降级**：`anim` 是 dsh-pet 动画名；渲染端先试它，404/解码失败退到内置待机片段轮播，
   全失败才画带昵称的 SVG 色块。
 - `items` 上限 256；重复 `id`、未知 `kind`、非正尺寸、非 `#rrggbb` 颜色都会被丢弃/回落。
@@ -232,13 +246,21 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 ## 素材协议 `localpet://`
 
 页面是 `file://`，拿不到 DSH 的 `/dsh-pet-7340/thumb/...`。主进程在 app ready 前把
-`localpet` 注册成 standard/secure/stream scheme，再从宿主传入的绝对目录里只读地取
-`localpet://asset/<encodeURIComponent(动画名)>.webm`：
+`localpet` 注册成 standard/secure/stream scheme，再从宿主传入的绝对目录里只读地取：
 
-- 只接受 `<name>.webm`，拒绝 `/`、`\`、控制字符、以 `.` 开头的名字；解析后必须仍在素材根内。
+- `localpet://asset/<encodeURIComponent(动画名)>.webm` —— 宠物素材（ticket 07–17）；
+- `localpet://gifts/<礼物目录>/<图片文件名>` —— 礼物缩略图（ticket 25）。只认**两层**路径：
+  第一层必须是礼物目录名（`^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$`），文件名只认
+  `jpg/jpeg/png/gif/webp`，解析后必须仍在 `--local-pet-gifts` 根内；不列目录、不返回
+  非图片文件。`desktop/index.html` 的 CSP 为此在 `img-src` 里加了 `localpet:`。
+
+素材（WebM）一侧的规则：
+
+- 素材只接受 `<name>.webm`，拒绝 `/`、`\`、控制字符、以 `.` 开头的名字；解析后必须仍在素材根内。
 - 单文件上限 8 MiB；支持 `Range`（206）让 `<video>` 边下边播/循环。
 - 根目录按优先级查找（用户素材覆盖包内素材），找不到就 404 → 渲染端降级。
-- 页面 CSP 只放行 `media-src localpet:`，没有网络、没有新端口。
+- 礼物缩略图只读不做 Range：图片是完整返回的，且只用于 `<img>`。
+- 页面 CSP 放行 `media-src localpet:` 与 `img-src localpet:`，没有网络、没有新端口。
 
 ## 进程存亡
 
@@ -272,7 +294,9 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 ## 带派小窗（ticket 24）
 
-背包是宿主的东西（`<dataDir>/backpack.json`），helper 只负责画与收输入：
+背包是宿主的东西（`<dataDir>/backpack.json`），helper 只负责画与收输入；访客捎来的
+礼物卡由场景 `controls.gifts` 下发（宿主管状态与文案），缩略图走
+`localpet://gifts/<礼物目录>/<图片>`，与素材读路径同一套夹取规则。
 
 - 右键自己那只 → 一级工具项「带派」→ 渲染端只发一个**空** `{action:'bring'}`；
   宿主开窗，并用 `bring-window` 把背包内容（id/kind/文案/state，**没有路径**）交给 helper。

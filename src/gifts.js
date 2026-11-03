@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
@@ -29,14 +29,23 @@ import {
  *
  * 目录已存在时：同一 `gift.id` 的重试**原地覆盖**（幂等）；不同 id 撞名就加后缀，
  * 绝不覆盖别人已经收到的礼物。
+ *
+ * ticket 27 的磁盘限额：`gifts/` 总量 ≤500 MiB 且 ≤200 个目录；每次**新礼物写成功之后**
+ * 剪一次，超了按 `receivedAt` 删最旧的整个目录。先写后剪的顺序是刻意的——限额再紧也不能
+ * 让刚到的这一件写不进去。清理只删有合法 meta 的目录（以及能读出 meta 的目录），
+ * 正在下载的目录一律跳过。
  */
 
 export const GIFTS_DIR = 'gifts'
 export const NOTE_FILE = 'note.txt'
 export const META_FILE = 'meta.json'
 export const GIFT_META_VERSION = 1
-/** 内存索引上限（/state 与 action 都只服务最近的礼物）；磁盘清理由 ticket 27 做。 */
+/** 内存索引上限（/state 与 action 都只服务最近的礼物）；与磁盘目录数上限同一个数。 */
 export const MAX_GIFT_INDEX = 200
+/** `gifts/` 目录总量上限（SPEC v4「存储与限额」）：500 MiB。 */
+export const MAX_GIFT_TOTAL_BYTES = 500 * 1024 * 1024
+/** `gifts/` 目录数上限（SPEC v4「存储与限额」）：200 件。 */
+export const MAX_GIFT_COUNT = MAX_GIFT_INDEX
 
 /** 目录名：`20261103-153245-ab12cd12`，可读的时间前缀 + gift id 前 8 位。 */
 const GIFT_DIR_RE = /^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$/
@@ -136,9 +145,17 @@ export function normalizeGiftMeta (value) {
   return null
 }
 
-export async function createGiftStore (dir, { log } = {}) {
+/**
+ * `maxTotalBytes` / `maxCount` 只给单测把 500 MiB / 200 件缩小到能跑的量；
+ * 生产调用方（service）不传，就是 SPEC 的默认值。
+ */
+export async function createGiftStore (dir, {
+  log,
+  maxTotalBytes = MAX_GIFT_TOTAL_BYTES,
+  maxCount = MAX_GIFT_COUNT
+} = {}) {
   if (typeof dir !== 'string' || dir === '') throw new Error('gifts: missing data directory')
-  const store = new GiftStore({ dir, log })
+  const store = new GiftStore({ dir, log, maxTotalBytes, maxCount })
   await store.load()
   return store
 }
@@ -146,6 +163,8 @@ export async function createGiftStore (dir, { log } = {}) {
 class GiftStore {
   #dir
   #log
+  #maxTotalBytes
+  #maxCount
   /** giftId（小写 UUID）→ 记录；记录里的 dir/路径只由校验过的目录名拼出来。 */
   #index = new Map()
   /**
@@ -161,9 +180,13 @@ class GiftStore {
    */
   #chain = Promise.resolve()
 
-  constructor ({ dir, log }) {
+  constructor ({ dir, log, maxTotalBytes, maxCount }) {
     this.#dir = dir
     this.#log = log
+    this.#maxTotalBytes = Number.isFinite(maxTotalBytes) && maxTotalBytes > 0
+      ? maxTotalBytes
+      : MAX_GIFT_TOTAL_BYTES
+    this.#maxCount = Number.isInteger(maxCount) && maxCount > 0 ? maxCount : MAX_GIFT_COUNT
   }
 
   #enqueue (task) {
@@ -272,6 +295,7 @@ class GiftStore {
         opened: meta.opened
       })
       this.#index.set(giftId, record)
+      await this.#pruneDisk(allocated.dirName)
       this.#pruneIndex()
       return { ok: true, gift: copyRecord(record) }
     } catch (error) {
@@ -368,6 +392,7 @@ class GiftStore {
       const record = this.#record(clean.giftId, meta)
       this.#index.set(clean.giftId, record)
       this.#pendingFiles.delete(clean.giftId)
+      await this.#pruneDisk(slot.dirName)
       this.#pruneIndex()
       return { ok: true, gift: copyRecord(record) }
     } catch (error) {
@@ -491,6 +516,90 @@ class GiftStore {
     return { ...base, kind: 'text', text: meta.text, filePath: null }
   }
 
+  /**
+   * 磁盘限额：扫描 `gifts/`，超了按 `receivedAt` 从旧到新整目录删。
+   *
+   * 三个“绝不”：
+   *   - 绝不删刚写进来的这一件（`keepDirName`）——先写后剪就是为了它一定能落盘；
+   *   - 绝不删正在下载的目录（`#pendingFiles` 里还有它的落点）；
+   *   - 绝不删没有合法 meta 的陌生目录（读不出 `receivedAt` 就不知道谁更旧）。
+   * 清理失败只告警一次，不影响这次收礼物。
+   */
+  async #pruneDisk (keepDirName = null) {
+    // 清理只是“锦上添花”：任何意外都不能把刚写成功的这一件反判成 failed。
+    try {
+      await this.#pruneDiskOnce(keepDirName)
+    } catch (error) {
+      this.#warnOnce('prune', '礼物目录清理失败，gifts/ 可能继续变大（' + errorName(error) + '）')
+    }
+  }
+
+  async #pruneDiskOnce (keepDirName) {
+    const giftsDir = join(this.#dir, GIFTS_DIR)
+    let entries
+    try {
+      entries = await readdir(giftsDir, { withFileTypes: true })
+    } catch {
+      return
+    }
+
+    const pendingDirs = new Set([...this.#pendingFiles.values()].map((slot) => slot.dirName))
+    const byDir = new Map()
+    for (const record of this.#index.values()) byDir.set(record.dirName, record)
+
+    const items = []
+    let totalBytes = 0
+    let count = 0
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !isGiftDirName(entry.name)) continue
+      const kept = entry.name === keepDirName
+      const pending = pendingDirs.has(entry.name)
+      const dirPath = join(giftsDir, entry.name)
+      let record = byDir.get(entry.name) ?? null
+      if (record === null) {
+        // 内存索引只留最近 200 条；更旧的目录仍然在磁盘上，读 meta 才能按 receivedAt 排队。
+        try {
+          const meta = normalizeGiftMeta(JSON.parse(await readFile(join(dirPath, META_FILE), 'utf8')))
+          if (meta !== null && meta.dir === entry.name) record = { ...meta, dirName: meta.dir, dirPath }
+        } catch {
+          // 陌生目录 / 坏 meta：不参与删除，也不影响其他目录。
+        }
+      }
+      // 陌生目录（没有合法 meta、也不在下载中）不是本店写的：不计入限额，也绝不删。
+      if (record === null && !kept && !pending) continue
+      const bytes = await dirBytes(dirPath)
+      totalBytes += bytes
+      count += 1
+      items.push({
+        record,
+        dirPath,
+        bytes,
+        receivedAt: record?.receivedAt ?? 0,
+        deletable: !kept && !pending && record !== null
+      })
+    }
+
+    items.sort((left, right) => left.receivedAt - right.receivedAt)
+    let removed = 0
+    for (const item of items) {
+      if (totalBytes <= this.#maxTotalBytes && count <= this.#maxCount) break
+      if (!item.deletable) continue
+      try {
+        await rm(item.dirPath, { recursive: true, force: true })
+      } catch (error) {
+        this.#warnOnce('prune', '旧礼物删不掉，gifts/ 可能继续变大（' + errorName(error) + '）')
+        continue
+      }
+      this.#index.delete(item.record.id)
+      totalBytes -= item.bytes
+      count -= 1
+      removed += 1
+    }
+    if (removed > 0) {
+      this.#warnOnce('prune', '礼物目录超过限额，已按 receivedAt 删掉最旧的 ' + removed + ' 件')
+    }
+  }
+
   #pruneIndex () {
     if (this.#index.size <= MAX_GIFT_INDEX) return
     const overflow = [...this.#index.values()]
@@ -542,6 +651,26 @@ async function writeFileAtomic (path, text) {
     await rm(tmp, { force: true }).catch(() => {})
     throw error
   }
+}
+
+/** 一个礼物目录里所有普通文件的总字节数；读不出来按 0 算，绝不因此中止清理。 */
+async function dirBytes (dirPath) {
+  let bytes = 0
+  let entries
+  try {
+    entries = await readdir(dirPath, { withFileTypes: true })
+  } catch {
+    return 0
+  }
+  for (const entry of entries) {
+    if (!entry.isFile()) continue
+    try {
+      bytes += (await stat(join(dirPath, entry.name))).size
+    } catch {
+      // 文件刚被删/读不到：按 0 算，下一次写入还会重扫。
+    }
+  }
+  return bytes
 }
 
 function copyRecord (record) {

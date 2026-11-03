@@ -18,6 +18,7 @@ import {
 import {
   MAX_VISIT_RECORD_MS,
   VISIT_RECORD_LIMIT,
+  normalizeVisitGift,
   normalizeVisitRecord
 } from './visit-record.js'
 import {
@@ -62,7 +63,8 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子，v2 不渲染
  *     visitors:  [ { deviceId, nickname, anim, visitId, since, lastSeen, endsAt: null } ],
  *                 // 入站串门访客：没有时间上限，只靠心跳存活与「送客」结束
- *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs } ],
+ *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs,
+ *                    gift?: { kind: 'text'|'file', name? } } ],
  *     prompt:    { deviceId, nickname } | null,   // 放行 FIFO 的队首；其余排队等待
  *     notices:   [ { text, at } ],
  *     acceptVisits: true,                         // 本机桌面是否接受入站串门
@@ -109,6 +111,7 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *   后交给 src/visits.js，room 自己不碰磁盘。
  * - 记录最多保留 VISIT_RECORD_LIMIT 条，丢掉最旧的；快照只给最近 5 条。
  * - 记录损坏/不可写时，visits.json 由 store 降级；这里始终有一份内存记录可用。
+ * - 每条记录还可带一个可选的礼物摘要（ticket 27）：只记 kind 与文件名，不记字条正文。
  *
  * 桌面开关（ticket 02 用户故事 22）：
  * - acceptVisits 只挡**入站串门请求**：关掉时回一条带 visits-off 理由的 deny，
@@ -465,7 +468,9 @@ export function createRoom ({
       direction: record.direction,
       nickname: record.nickname,
       startedAt: record.startedAt,
-      durationMs: record.durationMs
+      durationMs: record.durationMs,
+      // 可选字段只加不改：没有礼物的记录与 ticket 06 的形状完全一致。
+      ...(record.gift === undefined ? {} : { gift: { ...record.gift } })
     }
   }
 
@@ -487,7 +492,12 @@ export function createRoom ({
     }
   }
 
-  function recordVisit (direction, nickname, startedAt, endedAt) {
+  /**
+   * 写一条完成的串门记录（in / out 都走这里）。
+   * `gift` 是可选的第 5 个参数：来访者身上那件礼物，或这次出门带在路上的那一件。
+   * 只留 kind 与文件名；非法/没有就只是少一个字段，记录本身照写。
+   */
+  function recordVisit (direction, nickname, startedAt, endedAt, gift = null) {
     const start = Number.isFinite(startedAt) ? Math.max(0, startedAt) : nowMs()
     const end = Number.isFinite(endedAt) ? Math.max(start, endedAt) : nowMs()
     const record = {
@@ -496,6 +506,8 @@ export function createRoom ({
       startedAt: start,
       durationMs: Math.min(Math.max(0, end - start), MAX_VISIT_RECORD_MS)
     }
+    const cleanGift = normalizeVisitGift(gift)
+    if (cleanGift !== null) record.gift = cleanGift
     state.visits.unshift(record)
     if (state.visits.length > VISIT_RECORD_LIMIT) state.visits.length = VISIT_RECORD_LIMIT
     // room 不落盘：完成的记录排队，service 在 tick/action 之后交给 visits.json。
@@ -515,7 +527,7 @@ export function createRoom ({
     state.out = null
     let record = null
     if (wasActive) {
-      record = recordVisit('out', out.nickname, out.startedAt, at)
+      record = recordVisit('out', out.nickname, out.startedAt, at, out.gift)
       if (notifyRemote) state.pendingRecalls.push({ deviceId: out.deviceId, visitId: out.visitId })
     }
     if (notice !== null) pushNotice(notice, at)
@@ -528,7 +540,7 @@ export function createRoom ({
     if (visitor === undefined) return null
     state.visitors.delete(deviceId)
     rememberEndedInboundGift(visitor)
-    return recordVisit('in', visitor.nickname, visitor.since, at)
+    return recordVisit('in', visitor.nickname, visitor.since, at, visitor.gift)
   }
 
   /**
@@ -1015,7 +1027,10 @@ export function createRoom ({
         phase: 'requesting',
         startedAt: now,
         endsAt: null,
-        lastSeen: now
+        lastSeen: now,
+        // 这次出门捎的东西（ticket 27）。只进记录、不进快照；sendVisitRequest 成功后才由
+        // service 用 markOutboundGift 填上（编码层丢掉 gift 时就不会误记成“带上了”）。
+        gift: null
       }
       // 冷却从“开始出门”算，而不是从 ack 算：即使这次请求最终失败，
       // 宠物也已经试过一次，不该在 30 秒后的下一轮策略里再试一次。
@@ -1113,7 +1128,7 @@ export function createRoom ({
       if (visitor !== undefined) {
         state.visitors.delete(deviceId)
         rememberEndedInboundGift(visitor)
-        const record = recordVisit('in', visitor.nickname, visitor.since, now)
+        const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
         return {
           ok: true,
           side: 'in',
@@ -1230,7 +1245,7 @@ export function createRoom ({
       const now = stampOf(at)
       state.visitors.delete(deviceId)
       rememberEndedInboundGift(visitor)
-      const record = recordVisit('in', visitor.nickname, visitor.since, now)
+      const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
       state.pendingRecalls.push({ deviceId: visitor.deviceId, visitId: visitor.visitId })
       return {
         ok: true,
@@ -1322,6 +1337,19 @@ export function createRoom ({
       return pushNotice(giftLeftBehindText(nickname), at)
     },
 
+    /**
+     * 记下这次出门真正带上路的那件礼物（ticket 27）。由 service 在 visit-request
+     * 编码成功之后调用：编码层丢掉 gift 时传 null，记录里就不会出现一件没带上的东西。
+     * 只认当前这次 visitId，迟到/旧的调用什么也不改。
+     */
+    markOutboundGift (rawVisitId, gift) {
+      const visitId = normalizeVisitId(rawVisitId)
+      if (visitId === null || state.out === null || state.out.visitId !== visitId) return false
+      const clean = normalizeVisitGift(gift)
+      state.out.gift = clean
+      return true
+    },
+
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */
     outboundVisit () {
       return copyOutbound(state.out)
@@ -1398,7 +1426,7 @@ export function createRoom ({
         if (now - visitor.lastSeen >= lostMs) {
           state.visitors.delete(deviceId)
           rememberEndedInboundGift(visitor)
-          recordVisit('in', visitor.nickname, visitor.since, now)
+          recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
           pushNotice(`「${visitor.nickname}」失联了，访客已经离开。`, now)
         }
       }

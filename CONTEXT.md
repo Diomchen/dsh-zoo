@@ -4,6 +4,10 @@
 
 这份文件只定义这个领域里的词，不放实现细节。
 
+「带派 / 礼物 / 背包 / 礼物卡」的决策见 [ADR-0011](docs/adr/0011-bring-gift-on-visit.md)，
+规格见 [SPEC v4](.scratch/local-pet/SPEC-v4.md)；票 23–27 在
+[`.scratch/local-pet/issues/`](.scratch/local-pet/issues/)。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段），它们与这里的“邻居 / 访客 / 名字”同义，不算违反。
 
 ## Language

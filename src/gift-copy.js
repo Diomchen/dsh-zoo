@@ -34,14 +34,15 @@ export function isGiftStatus (value) {
 }
 
 /**
- * 文件礼物失败原因的固定词表（ticket 25）。reason 只决定状态行的一句话，
- * 不进 wire、不进 /state、也绝不来自远端字符串。（限额的 `rate` 留给 ticket 27。）
+ * 文件礼物失败原因的固定词表（ticket 25；`rate` 由 ticket 27 的频率限额产生）。
+ * reason 只决定状态行的一句话，不进 wire、不进 /state、也绝不来自远端字符串。
  */
 export const GIFT_REASONS = Object.freeze([
   'timeout',
   'no-port',
   'checksum',
   'too-large',
+  'rate',
   'refused',
   'write'
 ])
@@ -80,6 +81,7 @@ export function giftStatusText (status, reason = null) {
   }
   if (status === 'refused') {
     if (reason === 'too-large') return '这件东西超过 16 MB，没收下。'
+    if (reason === 'rate') return '这位邻居最近送得太频繁了，这件先没收下。'
     return '这件东西没收下。'
   }
   return null
