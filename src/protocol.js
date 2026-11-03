@@ -26,6 +26,13 @@ export const MAX_SAY = 80
  * 文件礼物走拉取（ticket 25），报文里只放元数据。
  */
 export const MAX_GIFT_TEXT = 500
+/**
+ * 文件礼物（ticket 24 起发、ticket 25 收）：单件上限 16 MiB，文件名最多 120 个码点。
+ * 报文里只放元数据（name/size/sha256），本体永远走 HTTP 拉取（ADR-0011）。
+ */
+export const MAX_GIFT_NAME = 120
+export const MAX_GIFT_BYTES = 16 * 1024 * 1024
+const GIFT_SHA256_RE = /^sha256:[0-9a-f]{64}$/
 /** 气泡最多活 30 秒；过期就不再显示，避免一条旧话挂在别人桌面上。 */
 export const SAY_MAX_AGE_MS = 30 * 1000
 /** 语义标签是固定小表：不认识的动作名靠它画一个通用表情。 */
@@ -192,20 +199,54 @@ export function sanitizeNote (value, max = MAX_GIFT_TEXT) {
 }
 
 /**
- * 串门捎的礼物（ADR-0011）。v1 只有字条这一种；文件礼物的 `kind:'file'` 由 ticket 25 加进来。
+ * 文件礼物的名字：去掉路径分隔符、控制字符、双向覆盖符与前导点，最多 120 码点。
+ * 空名返回 null，由 `normalizeGift` 退成 `file`——名字只是给人看的，不该让整件礼物作废。
+ *
+ * 这个名字**不参与拼路径**：接收端目录名由 `receivedAt` + id 推出来（ticket 25），
+ * 所以「去路径分隔符」是双保险，不是唯一防线。
+ */
+export function sanitizeGiftName (value) {
+  if (typeof value !== 'string') return null
+  if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+  const clean = value
+    .replace(/[\\/]/g, '')
+    .replace(CONTROL_RE, '')
+    .replace(BIDI_RE, '')
+    .trim()
+    .replace(/^\.+/, '')
+    .trim()
+  if (clean === '') return null
+  const chars = Array.from(clean)
+  return chars.length > MAX_GIFT_NAME ? chars.slice(0, MAX_GIFT_NAME).join('') : clean
+}
+
+/**
+ * 串门捎的礼物（ADR-0011）：`kind:'text'` 是内联字条，`kind:'file'` 只有元数据
+ * （name/size/sha256），本体由接收方在访客抵达时向发起方拉取（ticket 25）。
  *
  * **校验不过返回 null，由调用方把整个 `gift` 字段丢掉，串门照常。**
  * 这与 `anim` 非法就整包丢是相反的策略：动画是这次串门的“外观”，坏了可以退回待机；
- * 便条只是搭车的一件东西，为它把一次串门搞砸，代价和收益完全不对等。
+ * 便条/文件只是搭车的一件东西，为它把一次串门搞砸，代价和收益完全不对等。
  */
 export function normalizeGift (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
   if (!isVisitId(value.id)) return null
-  // kind 只认本版本真的能收下的那一种；未来加 'file' 时，旧端的表现就是“这次没有礼物”。
-  if (value.kind !== 'text') return null
-  const text = sanitizeNote(value.text)
-  if (text === null) return null
-  return { id: value.id.toLowerCase(), kind: 'text', text }
+  const id = value.id.toLowerCase()
+  if (value.kind === 'text') {
+    const text = sanitizeNote(value.text)
+    if (text === null) return null
+    return { id, kind: 'text', text }
+  }
+  if (value.kind === 'file') {
+    const name = sanitizeGiftName(value.name) ?? 'file'
+    const size = Number(value.size)
+    // `1 … 16 MiB`：0 字节的文件不叫礼物，也会让接收端的 sha256 校验没有意义。
+    if (!Number.isInteger(size) || size <= 0 || size > MAX_GIFT_BYTES) return null
+    if (typeof value.sha256 !== 'string' || !GIFT_SHA256_RE.test(value.sha256)) return null
+    return { id, kind: 'file', name, size, sha256: value.sha256 }
+  }
+  // 认识的 kind 就这两种；别的值整条 gift 丢掉（旧端读到新 kind 也是这条路径）。
+  return null
 }
 
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */

@@ -561,6 +561,19 @@ export function createDesktop (options = {}) {
     return sendHostCommand({ type: 'gift-discard', path: dirPath })
   }
 
+  /**
+   * 「带派」小窗（ticket 24）：把背包内容 + 限额交给 helper。
+   * `open:true` 打开/聚焦，`open:false` 只刷新已经开着的那扇（撤掉一件之后）。
+   * 窗口只发 giftId / 选中的绝对路径，删除与统计都在宿主。
+   */
+  function bringWindow (payload = {}) {
+    return sendHostCommand({
+      type: 'bring-window',
+      open: payload?.open === true,
+      items: Array.isArray(payload?.items) ? payload.items : []
+    })
+  }
+
   function show () {
     try {
       return send({ type: 'show' })
@@ -741,6 +754,7 @@ export function createDesktop (options = {}) {
     giftReveal,
     giftCopy,
     giftDiscard,
+    bringWindow,
     actionResult,
     shot,
     requestStatus,

@@ -85,7 +85,7 @@
   const MAX_MENU_TOOLS = 8
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  const MENU_TOOL_IDS = ['open-site', 'home', 'reload']
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'home', 'reload']
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -143,12 +143,15 @@
     'gift-open',
     'gift-reveal',
     'gift-copy',
-    'gift-discard'
+    'gift-discard',
+    // ticket 24：右键「带派」只发一个空动作，由宿主开小窗；unbring 才带 giftId。
+    'bring',
+    'unbring'
   ]
-  /** 这四个动作必须带 giftId；其余动作带了也会被丢掉。 */
-  const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard']
-  /** 菜单项的动作（ticket 22）：点播 / 重载配置 / 打开软件。同样只是一次「申请」。 */
-  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site']
+  /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
+  const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
+  /** 菜单项的动作（ticket 22 / 24）：点播 / 重载配置 / 打开软件 / 带派。同样只是一次「申请」。 */
+  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring']
   /** helper → 宿主能报的全部动作：控件 + 菜单。 */
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
@@ -163,6 +166,12 @@
    * helper 是另一个进程，各自守自己的边界：宿主已经清过一遍，这里再夹一次。
    */
   const MAX_GIFT_TEXT_LENGTH = 500
+  /** 背包上限（件），与 `src/backpack.js` 的 `MAX_BACKPACK_ITEMS` 同一个数。 */
+  const MAX_BACKPACK_ITEMS = 2
+  /** 单件文件礼物上限，与 `src/protocol.js` 的 `MAX_GIFT_BYTES` 同一个数。 */
+  const MAX_GIFT_FILE_BYTES = 16 * 1024 * 1024
+  /** 文件礼物名字上限（码点），与 `src/protocol.js` 的 `MAX_GIFT_NAME` 同一个数。 */
+  const MAX_GIFT_NAME_LENGTH = 120
   /** 一次场景最多几件礼物（≤ 访客数）；上限只为让一条消息有界，不表达产品限额。 */
   const MAX_GIFT_ITEMS = 64
   /** 礼物的状态词表，与 `src/gift-copy.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
@@ -278,6 +287,77 @@
 
   function normalizeLabel (value, fallback) {
     return normalizeText(value, fallback, MAX_LABEL_LENGTH)
+  }
+
+  /**
+   * 背包里的字条正文（ticket 24）：和卡片一样保留换行，但**超 500 码点返回 null**，
+   * 不学 `normalizeNoteText` 的截断——「带派」小窗里少一个字都算替用户改稿。
+   */
+  function normalizeBackpackText (value) {
+    if (typeof value !== 'string') return null
+    // 先按同一套清洗（给一个足够大的上限）再数码点；超过 500 就是错误。
+    const text = normalizeNoteText(value, MAX_GIFT_TEXT_LENGTH * 8)
+    if (text === null || Array.from(text).length > MAX_GIFT_TEXT_LENGTH) return null
+    return text
+  }
+
+  /**
+   * 「带派」小窗提交的物品（ticket 24）：`{kind:'text',text}` 或 `{kind:'file',path}`。
+   * 文件路径只来自主进程的 `dialog.showOpenDialog`；宿主还会再 stat 一次。
+   */
+  function normalizeBringGift (value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+    if (value.kind === 'text') {
+      const text = normalizeBackpackText(value.text)
+      return text === null ? null : { kind: 'text', text }
+    }
+    if (value.kind === 'file') {
+      const path = normalizePath(value.path)
+      return path === null ? null : { kind: 'file', path }
+    }
+    return null
+  }
+
+  /** 背包小窗里的一条：只带 id/kind/显示文案/state，**绝不带路径**（路径只活在宿主）。 */
+  function normalizeBringWindowItem (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeGiftId(raw.id)
+    if (id === null) return null
+    const state = raw.state === 'out' ? 'out' : 'idle'
+    if (raw.kind === 'text') {
+      const text = normalizeNoteText(raw.text)
+      if (text === null) return null
+      return { id, kind: 'text', text, state }
+    }
+    if (raw.kind === 'file') {
+      const name = normalizeText(raw.name, 'file', MAX_GIFT_NAME_LENGTH)
+      return { id, kind: 'file', name, state }
+    }
+    return null
+  }
+
+  /**
+   * 宿主 → helper 的「带派」小窗状态（ticket 24）。`open:true` = 打开/聚焦这扇窗；
+   * `open:false` = 只刷新已开着的窗（撤掉一件之后）。上限由 shared 自己定，
+   * 不信任宿主传来的数字。
+   */
+  function normalizeBringWindow (raw) {
+    const items = []
+    if (Array.isArray(raw.items)) {
+      for (const candidate of raw.items) {
+        if (items.length >= MAX_BACKPACK_ITEMS) break
+        const item = normalizeBringWindowItem(candidate)
+        if (item !== null) items.push(item)
+      }
+    }
+    return {
+      open: raw.open === true,
+      items,
+      count: items.length,
+      maxItems: MAX_BACKPACK_ITEMS,
+      maxTextLength: MAX_GIFT_TEXT_LENGTH,
+      maxFileBytes: MAX_GIFT_FILE_BYTES
+    }
   }
 
   /** 动画名会拼进 `localpet://asset/<name>.webm`：和宿主协议层同一套字符约束。 */
@@ -1020,10 +1100,18 @@
         if (text === null) return { ok: false, error: 'bad-text' }
         return { ok: true, command: { type, id, text } }
       }
+      /**
+       * 「带派」小窗（ticket 24）：宿主把背包内容 + 限额交给 helper。
+       * `open:true` 打开/聚焦；`open:false` 只刷新已开着的窗（撤掉一件之后）。
+       * 路径不在这个命令里：窗口只发 giftId，删除由宿主查背包。
+       */
+      case 'bring-window':
+        return { ok: true, command: { type, id, ...normalizeBringWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
-        return { ok: true, command: { type, id, path } }
+        const window = raw.window === 'bring' ? 'bring' : null
+        return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
         if (raw.clear === true) return { ok: true, command: { type, id, point: null } }
@@ -1048,6 +1136,13 @@
       case 'debug-rename':
         // 冒烟用：开/关改名小窗（它没有渲染端可点击的关闭按钮，测试只能从这里关）。
         return { ok: true, command: { type, id, close: raw.close === true } }
+      case 'debug-gift-submit':
+        // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
+        if (typeof raw.text !== 'string') return { ok: false, error: 'bad-text' }
+        return { ok: true, command: { type, id, text: raw.text.slice(0, MAX_GIFT_TEXT_LENGTH * 2) } }
+      case 'debug-gift-remove':
+        // 冒烟用：点背包列表里第一个可撤的「撤掉」（out 中的按钮是禁用的）。
+        return { ok: true, command: { type, id } }
       case 'debug-dispatch': {
         const phase = typeof raw.phase === 'string' ? raw.phase.trim().toLowerCase() : ''
         if (!['down', 'move', 'up', 'click', 'context', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
@@ -1128,6 +1223,7 @@
       focused: raw.focused === true,
       focusable: raw.focusable === true,
       renameOpen: raw.renameOpen === true,
+      bringOpen: raw.bringOpen === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -1233,6 +1329,13 @@
         const needsGift = GIFT_ACTIONS.includes(action)
         const giftId = needsGift ? normalizeGiftId(raw.giftId) : null
         if (needsGift && giftId === null) return { ok: false, error: 'bad-gift' }
+        // 「带派」小窗的提交（ticket 24）：只有 bring 带物品正文；菜单上的 bring 不带，
+        // 那一条由宿主用来打开小窗。字段不合法的提交整条拒绝，不做半截猜测。
+        let gift = null
+        if (action === 'bring' && raw.gift !== undefined && raw.gift !== null) {
+          gift = normalizeBringGift(raw.gift)
+          if (gift === null) return { ok: false, error: 'bad-gift' }
+        }
         // 只有改名带正文：清洗交给宿主（那里有 normalizeNickname），这里只做长度兜底，
         // 免得渲染端一个粘贴把一行 JSON 撑成几兆。
         const nickname = action === 'rename' && typeof raw.nickname === 'string'
@@ -1241,7 +1344,19 @@
         // 点播带动画名；名字必须是安全的动画名，否则整条事件丢掉（宿主还得再校验一遍）。
         const name = action === 'play-anim' ? normalizeAnim(raw.name) : null
         if (action === 'play-anim' && name === null) return { ok: false, error: 'bad-name' }
-        return { ok: true, event: { type, id, action, deviceId, nickname, ...(name === null ? {} : { name }), ...(giftId === null ? {} : { giftId }) } }
+        return {
+          ok: true,
+          event: {
+            type,
+            id,
+            action,
+            deviceId,
+            nickname,
+            ...(name === null ? {} : { name }),
+            ...(giftId === null ? {} : { giftId }),
+            ...(gift === null ? {} : { gift })
+          }
+        }
       }
       case 'pong':
         return { ok: true, event: { type, id } }
@@ -1620,6 +1735,9 @@
     MAX_NAME_LENGTH,
     MAX_GIFT_TEXT_LENGTH,
     MAX_GIFT_ITEMS,
+    MAX_BACKPACK_ITEMS,
+    MAX_GIFT_FILE_BYTES,
+    MAX_GIFT_NAME_LENGTH,
     PET_COLORS,
     IDLE_CLIPS,
     PHYSICS,
@@ -1629,6 +1747,10 @@
     normalizeGiftId,
     normalizeLabel,
     normalizeNoteText,
+    normalizeBackpackText,
+    normalizeBringGift,
+    normalizeBringWindowItem,
+    normalizeBringWindow,
     normalizeAnim,
     normalizeRole,
     normalizeSemantic,
