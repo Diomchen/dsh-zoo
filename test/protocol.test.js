@@ -194,6 +194,17 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'gift-received') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        visitId,
+        giftId: randomUUID(),
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
     } else if (type.startsWith('visit-')) {
       raw = {
         v: PROTOCOL_VERSION,
@@ -226,9 +237,11 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
           ? ['v', 'type', 'deviceId', 'visitId', 'nickname', 'anim']
           : type === 'visit-deny'
             ? ['v', 'type', 'deviceId', 'visitId', 'reason']
-            : type.startsWith('visit-')
-              ? ['v', 'type', 'deviceId', 'visitId']
-              : ['v', 'type', 'deviceId', 'nickname', 'port']
+            : type === 'gift-received'
+              ? ['v', 'type', 'deviceId', 'visitId', 'giftId']
+              : type.startsWith('visit-')
+                ? ['v', 'type', 'deviceId', 'visitId']
+                : ['v', 'type', 'deviceId', 'nickname', 'port']
     )
   }
 })
@@ -513,7 +526,8 @@ test('默认参数：发现 5 秒、心跳 2 秒、心跳影子 30 秒、出门�
     'visit-ack',
     'visit-deny',
     'visit-recall',
-    'visit-recall-ack'
+    'visit-recall-ack',
+    'gift-received'
   ])
 })
 

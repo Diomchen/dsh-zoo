@@ -117,3 +117,29 @@ export function backpackErrorText (error) {
   if (error === 'desktop-off') return '桌面层没有在运行，打不开「带派」。'
   return '这次没有放进背包。'
 }
+
+// ---------------------------------------------------------------------------
+// ticket 26：送达回执与退包的三句话
+// 追加在表尾，不改上面任何一条——票 25 也在改这个文件，冲突留给 merger 解。
+// ---------------------------------------------------------------------------
+
+/** 对方回执到了：发起方确认「东西真的被收下了」。 */
+export function giftReceivedText (nickname) {
+  const name = normalizeNickname(nickname) ?? FALLBACK_NICKNAME
+  return `「${name}」收下了。`
+}
+
+/**
+ * 串门结束还没等到回执（回家 / 送客 / 到期 / 失联都算）：东西已经退回背包。
+ * 与 `giftStatusText('failed')` 一样**不猜原因**：没开端口、旧版本、防火墙都会
+ * 得到同一个可见结果，把“对方太旧”写死比不说更糟。
+ */
+export function giftNotReceivedText () {
+  return '没送到：对方没取到（可能没开端口、或对方版本较旧）。'
+}
+
+/** 送客提醒：这件礼物一次都没打开过，正文还留在 gifts 里。 */
+export function giftLeftBehindText (nickname) {
+  const name = normalizeNickname(nickname) ?? FALLBACK_NICKNAME
+  return `「${name}」捎来的东西还在 gifts 里。`
+}
