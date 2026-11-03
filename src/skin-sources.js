@@ -241,3 +241,24 @@ async function scanActions (dirs, readdirImpl, warn, sourceId) {
 function message (error) {
   return error instanceof Error ? error.message : String(error)
 }
+
+/**
+ * 本机待机的动作池：从源的动作里剔掉「点击回应 / 拖拽 / 余额 / 碎碎念 / 工作状态 / 文字类」。
+ * 这些事件动画应该由各自的触发条件播放，不该在待机时随机出现；剩下的才是 dsh-pet
+ * 随机链真正会抽的日常动作（idle / 转向 / 移动 / 随机小动作）。
+ */
+const IDLE_EXCLUDE_PREFIXES = ['点击回应-', '被鼠标拖拽', '余额-', '碎碎念-', '工作状态-']
+const IDLE_EXCLUDE_EXACT = new Set(['是啊，吃什么', '深度思考碎碎念'])
+
+export function idlePoolOf (source) {
+  if (source === null || typeof source !== 'object') return []
+  const actions = source.actions
+  if (actions === null || typeof actions !== 'object' || Array.isArray(actions)) return []
+  const pool = []
+  for (const name of Object.keys(actions)) {
+    if (IDLE_EXCLUDE_PREFIXES.some((prefix) => name.startsWith(prefix))) continue
+    if (IDLE_EXCLUDE_EXACT.has(name)) continue
+    pool.push(name)
+  }
+  return pool.sort()
+}

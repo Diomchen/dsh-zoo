@@ -223,3 +223,16 @@ test('~ 展开到 home', async (t) => {
 
   assert.equal(result.sources[0].dirs[0], '/home/tester/skins/a')
 })
+
+test('待机池过滤掉点击回应/拖拽/事件/文字类，只留日常动作', async () => {
+  const { idlePoolOf } = await import('../src/skin-sources.js')
+  const source = {
+    actions: {
+      写代码: {}, 吃西瓜: {}, 待机呼吸休闲: {},
+      '点击回应-开心跃动': {}, 被鼠标拖拽悬空反馈: {},
+      '余额-钱袋满溢': {}, '碎碎念-发呆碎碎念': {}, '工作状态-忙碌点按': {},
+      '是啊，吃什么': {}, 深度思考碎碎念: {}
+    }
+  }
+  assert.deepEqual(idlePoolOf(source), ['写代码', '吃西瓜', '待机呼吸休闲'].sort())
+})

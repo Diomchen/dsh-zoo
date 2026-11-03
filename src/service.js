@@ -14,7 +14,7 @@ import { createPetBridge, readPetConfig } from './pet-bridge.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import { resolveSkinPort, startSkinServer } from './skin-server.js'
-import { loadSkinSources } from './skin-sources.js'
+import { idlePoolOf, loadSkinSources } from './skin-sources.js'
 import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -522,7 +522,7 @@ export function createService (ctx, options = {}) {
         log.warn('素材源：' + warning.code + (warning.detail === undefined ? '' : '（' + warning.detail + '）'))
       }
       // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
-      skinPool = loaded.sources.length > 0 ? Object.keys(loaded.sources[0].actions).sort() : []
+      skinPool = loaded.sources.length > 0 ? idlePoolOf(loaded.sources[0]) : []
       if (loaded.sources.length === 0) {
         log.info('没有可对外的素材源：访客先用本机素材，没有就画通用小人')
         return

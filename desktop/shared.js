@@ -479,11 +479,13 @@
         if (id === null || seen.has(id)) continue
         seen.add(id)
         const role = normalizeRole(raw.role) ?? 'guest'
+        const idlePool = normalizeIdlePool(raw.idlePool)
         list.push({
           id,
           role,
           label: normalizeLabel(raw.label, role === 'self' ? '我' : '邻居'),
           anim: normalizeAnim(raw.anim),
+          ...(idlePool === null ? {} : { idlePool }),
           color: normalizeColor(raw.color)
         })
       }
@@ -514,6 +516,7 @@
         kind: 'pet',
         role: pet.role,
         anim: pet.anim,
+        ...(pet.idlePool === undefined ? {} : { idlePool: pet.idlePool }),
         x,
         y: ground,
         width,

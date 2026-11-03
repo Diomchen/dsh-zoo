@@ -728,3 +728,10 @@ test('待机池轮播：跳过加载失败的片段', () => {
   assert.equal(picked.clip, 'B')
   assert.equal(picked.next, 2)
 })
+
+test('petScene 把本机待机池带进场景（ticket 19 的池子不能在这一层丢）', () => {
+  const scene = shared.petScene([
+    { id: 'self', role: 'self', label: '我', color: shared.PET_COLORS[0], idlePool: ['A', 'B'] }
+  ], AREA)
+  assert.deepEqual(scene.items[0].idlePool, ['A', 'B'])
+})
