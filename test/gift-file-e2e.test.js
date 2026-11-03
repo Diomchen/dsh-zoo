@@ -19,6 +19,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { BACKPACK_FILE } from '../src/backpack.js'
 import { GIFTS_DIR, META_FILE } from '../src/gifts.js'
 import { MAX_GIFT_BYTES } from '../src/protocol.js'
 import { createService } from '../src/service.js'
@@ -290,6 +291,13 @@ test('两个 service：文件礼物正常取回（中文名）；armed 期间可
   assert.equal(meta.size, bytes.length)
   assert.equal(meta.sha256, sha256(bytes))
   assert.equal(meta.from.deviceId, aId)
+
+  // 送达回执（ticket 26 的文件路径）：A 只有收到 `gift-received` 才会把这一件从背包里删掉。
+  // 这条接线是解合并冲突时补的，25 与 26 各自的测试都碰不到它。
+  await waitFor(async () => {
+    const backpack = JSON.parse(await readFile(join(dirA, BACKPACK_FILE), 'utf8'))
+    return Array.isArray(backpack.items) && backpack.items.length === 0
+  })
 
   // A 这边的礼物路由在 armed 期间可读（B 就是这么取的）。
   const live = await giftRoute(skinPortA, giftId)
