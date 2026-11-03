@@ -67,6 +67,10 @@
   const MAX_PATH_LENGTH = 1024
   const MAX_ERROR_LENGTH = 500
   const MAX_NOTICE_LENGTH = 200
+  /** 街上最多几户。与 src/street.js 的 MAX_STREET 同一个数：跨进程各自守自己的边界。 */
+  const MAX_STREET_ITEMS = 16
+  /** 街上「去不了」的三种理由；与 src/street.js 的 blockedReason 同一套词。 */
+  const STREET_REASONS = new Set(['not-admitted', 'not-mutual', 'peer-offline'])
   const MAX_REASON_LENGTH = 80
   const MAX_DISPLAYS = 8
   const MAX_COORD = 1e6
@@ -351,6 +355,7 @@
    *   visit    { enabled, reason }        串门按钮（reason 只在置灰时出现，必须是给人看的一句话）
    *   recall   { enabled, nickname }      召回入口（自己出门时桌面没有 self，需要常驻小胶囊）
    *   visitors [{ deviceId, label }]      可以送客的访客（item id 是 visitor:<deviceId>）
+   *   street   [{ deviceId, label, action, canVisit, blockedReason }]  邻居面板那一排房子（ticket 21）
    *   prompt   { deviceId, nickname }     放行卡队首；null 表示没有待决定的新邻居
    *   notice   { text, at }               最近一条人话提示（异步失败也靠它冒泡）
    */
@@ -359,6 +364,7 @@
       visit: { enabled: false, reason: null },
       recall: { enabled: false, nickname: null },
       visitors: [],
+      street: [],
       prompt: null,
       notice: null
     }
@@ -393,6 +399,25 @@
         if (deviceId === null || seenVisitors.has(deviceId)) continue
         seenVisitors.add(deviceId)
         controls.visitors.push({ deviceId, label: normalizeLabel(candidate.label, '邻居') })
+      }
+    }
+
+    const seenStreet = new Set()
+    if (Array.isArray(raw.street)) {
+      for (const candidate of raw.street) {
+        if (controls.street.length >= MAX_STREET_ITEMS) break
+        if (candidate === null || typeof candidate !== 'object') continue
+        const deviceId = normalizeId(candidate.deviceId)
+        if (deviceId === null || seenStreet.has(deviceId)) continue
+        seenStreet.add(deviceId)
+        controls.street.push({
+          deviceId,
+          label: normalizeLabel(candidate.label, '邻居'),
+          action: normalizeLabel(candidate.action, null),
+          canVisit: candidate.canVisit === true,
+          // 认不出的理由不猜：房子照样画，只是点不了（渲染端统一按“现在去不了”处理）。
+          blockedReason: STREET_REASONS.has(candidate.blockedReason) ? candidate.blockedReason : null
+        })
       }
     }
 
@@ -944,7 +969,8 @@
         if (!CONTROL_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
         if (id === null) return { ok: false, error: 'bad-id' }
         const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
-        const deviceId = needsDevice ? normalizeId(raw.deviceId) : null
+        // `visit` 是「可能带对象」：邻居面板点某一户就带 deviceId；不带则由宿主随机挑。
+        const deviceId = needsDevice || action === 'visit' ? normalizeId(raw.deviceId) : null
         if (needsDevice && deviceId === null) return { ok: false, error: 'bad-device-id' }
         // 只有改名带正文：清洗交给宿主（那里有 normalizeNickname），这里只做长度兜底，
         // 免得渲染端一个粘贴把一行 JSON 撑成几兆。

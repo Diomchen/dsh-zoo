@@ -1313,3 +1313,48 @@ test('service：访客超出场景上限时不静默丢宠物，宿主给一条�
   assert.equal(updates.at(-1).controls.notice.at, at)
   assert.deepEqual(warnings, [])
 })
+
+test('normalizeControls：街上的房子去重、封顶十六、认不出的理由降级成“去不了”', () => {
+  const a = '11111111-1111-4111-8111-111111111111'
+  const b = '22222222-2222-4222-8222-222222222222'
+
+  const controls = shared.normalizeControls({
+    street: [
+      { deviceId: a, label: '老王', action: '改那个 bug', canVisit: true, blockedReason: null },
+      { deviceId: a, label: '重复', canVisit: true },
+      { deviceId: b, label: '秃头哥', action: '', canVisit: false, blockedReason: 'nonsense' },
+      { deviceId: 'not an id', label: '坏' }
+    ]
+  })
+
+  assert.deepEqual(controls.street, [
+    { deviceId: a, label: '老王', action: '改那个 bug', canVisit: true, blockedReason: null },
+    { deviceId: b, label: '秃头哥', action: null, canVisit: false, blockedReason: null }
+  ])
+
+  // 没有 street 的旧 scene：空街，不抛。
+  assert.deepEqual(shared.normalizeControls({}).street, [])
+  assert.deepEqual(shared.emptyControls().street, [])
+
+  // 封顶：多出来的房子不塞进一条消息。
+  const many = Array.from({ length: 20 }, (_, index) => ({
+    deviceId: '33333333-3333-4333-8333-' + String(index).padStart(12, '0'),
+    label: '邻居' + index,
+    canVisit: true
+  }))
+  assert.equal(shared.normalizeControls({ street: many }).street.length, 16)
+})
+
+test('buildHelperArgs：默认不带 --no-sandbox，只有显式开关才关沙箱', () => {
+  const base = { helperPath: '/tmp/helper.js', hostPid: 1 }
+  const previous = process.env.LOCAL_PET_HELPER_NO_SANDBOX
+  try {
+    delete process.env.LOCAL_PET_HELPER_NO_SANDBOX
+    assert.equal(buildHelperArgs(base).includes('--no-sandbox'), false)
+    process.env.LOCAL_PET_HELPER_NO_SANDBOX = '1'
+    assert.equal(buildHelperArgs(base).includes('--no-sandbox'), true)
+  } finally {
+    if (previous === undefined) delete process.env.LOCAL_PET_HELPER_NO_SANDBOX
+    else process.env.LOCAL_PET_HELPER_NO_SANDBOX = previous
+  }
+})

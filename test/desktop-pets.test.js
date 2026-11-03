@@ -744,3 +744,22 @@ test('待机池随机：注入 random 后从随机位置选，并避开刚播过
   const only = shared.pickIdleClip(['A'], 0, new Set(), () => 0, 'A')
   assert.equal(only.clip, 'A', '池子只有一段时允许重复')
 })
+
+test('controlsFromSnapshot：街上的每一户都送到桌面，去不了的带着理由', () => {
+  const goId = '22222222-2222-4222-8222-222222222222'
+  const goneId = '33333333-3333-4333-8333-333333333333'
+  const snapshot = snapshotWith({
+    street: [
+      { deviceId: goId, nickname: '老王', action: '改那个 bug', canVisit: true, blockedReason: null },
+      { deviceId: goneId, nickname: '秃头哥', action: null, canVisit: false, blockedReason: 'peer-offline' }
+    ]
+  })
+
+  assert.deepEqual(controlsFromSnapshot(snapshot).street, [
+    { deviceId: goId, label: '老王', action: '改那个 bug', canVisit: true, blockedReason: null },
+    { deviceId: goneId, label: '秃头哥', action: null, canVisit: false, blockedReason: 'peer-offline' }
+  ])
+
+  // 旧快照没有 street：街道是空的，不抛。
+  assert.deepEqual(controlsFromSnapshot(snapshotWith()).street, [])
+})

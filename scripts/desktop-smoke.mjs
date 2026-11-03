@@ -473,12 +473,15 @@ function writeControlNotes (verified, noticeVerified) {
 function createHelperClient (log, extraArgs = [], clientOptions = {}) {
   const resolved = resolveElectronBinary({})
   assert(resolved.ok, '找到 Electron：' + resolved.path)
+  // 某些受限环境（容器、被沙箱化的 CI）里 Chromium 的沙箱起不来，helper 会直接崩。
+  // 这是**冒烟专用**的逃生开关，不影响产品里的 helper：默认仍然带沙箱。
+  const noSandbox = process.env.LOCAL_PET_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []
   const args = buildHelperArgs({
     helperPath: HELPER_MAIN,
     hostPid: process.pid,
     debug: true,
     assetRoots: clientOptions.withAssets === false ? [] : ASSET_ROOTS
-  }).concat(extraArgs)
+  }).concat(noSandbox, extraArgs)
   const child = spawn(resolved.path, args, {
     cwd: ROOT,
     env: helperEnv(process.env, process.pid),
@@ -638,6 +641,11 @@ async function verifyControls () {
       visit: { enabled: true, reason: null },
       recall: { enabled: false, nickname: null },
       visitors: [{ deviceId: visitorId, label: '阿蟹' }],
+      // 那条小街（ticket 21）：一户能去，一户刚掉线。
+      street: [
+        { deviceId: visitorId, label: '阿蟹', action: '在改那个 bug', canVisit: true, blockedReason: null },
+        { deviceId: promptId, label: '泡泡', action: null, canVisit: false, blockedReason: 'peer-offline' }
+      ],
       prompt: { deviceId: promptId, nickname: '泡泡' },
       notice: null
     }
@@ -674,7 +682,7 @@ async function verifyControls () {
   const popoverRect = state.uiRects.find((rect) => rect.id === 'ui:popover')
   const bridgeRect = state.uiRects.find((rect) => rect.id === 'ui:bridge:popover')
   const promptRect = state.uiRects.find((rect) => rect.id === 'ui:prompt')
-  const visitButton = state.uiRects.find((rect) => rect.id === 'ui:btn:visit')
+  const visitButton = state.uiRects.find((rect) => rect.id === 'ui:btn:open-street')
   assert(Boolean(popoverRect), '弹层有命中矩形')
   assert(Boolean(bridgeRect), '宠物与弹层之间有桥接矩形（不靠租约也能跨过间隙）')
   assert(Boolean(promptRect), '放行卡有命中矩形')
@@ -720,16 +728,41 @@ async function verifyControls () {
   const verified = verifyShot(pngPath, pngPath + '.json', 3)
   assertControlPixels(verified, [popoverRect, promptRect, visitButton])
   const sidecarUi = verified.sidecar.renderer?.uiRects ?? []
-  assert(sidecarUi.some((rect) => rect.id === 'ui:btn:visit'), '截图 sidecar 记录了按钮矩形')
+  assert(sidecarUi.some((rect) => rect.id === 'ui:btn:open-street'), '截图 sidecar 记录了按钮矩形')
 
-  // 点「串门」：渲染端只发申请，helper 把它写进 stdio 给宿主。
+  // 点「串门」：先弹出那条街，而不是替用户随机挑一位（ticket 21）。
   const visitPoint = rectCenterScreen(visitButton, workArea)
   start = client.mark()
   client.send({ type: 'debug-dispatch', phase: 'click', x: visitPoint.x, y: visitPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.uiRects.some((rect) => rect.id === 'ui:street')
+  }, 3000, '邻居面板弹出')
+  state = await client.rendererState()
+  assert(state.controls.popover === null, '点「串门」后弹层收起，换成那条街')
+  assert(state.controls.street.length === 2, '街上有两户（' + state.controls.street.length + '）')
+
+  // 面板截图：这条街得真的被画出来，不是一片背景。
+  const streetPng = join(OUT_DIR, 'street.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-street', path: streetPng })
+  await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-street', 8000, '邻居面板截图')
+  const streetVerified = verifyShot(streetPng, streetPng + '.json', 3)
+  const streetRect = state.uiRects.find((rect) => rect.id === 'ui:street')
+  assert(Boolean(streetRect), '邻居面板有命中矩形')
+  assertControlPixels(streetVerified, [streetRect])
+  info('邻居面板截图：' + streetPng)
+
+  // 点能去的那一户：请求带的就是这一户的 deviceId。
+  const houseRect = state.uiRects.find((rect) => rect.id === 'ui:street:visit:' + visitorId)
+  assert(Boolean(houseRect), '能去的那一户在面板里有自己的命中矩形')
+  const housePoint = rectCenterScreen(houseRect, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: housePoint.x, y: housePoint.y })
   const action = await client.waitFrom(start, (event) => event.type === 'action', 3000, '串门申请')
-  assert(action.action === 'visit', '「串门」按钮点击 → 宿主收到 action=visit')
+  assert(action.action === 'visit', '点某一户 → 宿主收到 action=visit')
   assert(typeof action.id === 'string' && action.id !== '', 'action 带 id，宿主才能对上是哪一次点击')
-  assert(action.deviceId === null, '串门由宿主随机挑邻居，不带 deviceId')
+  assert(action.deviceId === visitorId, '带的是这一户的 deviceId（' + action.deviceId + '）')
 
   // 失败必须冒泡：宿主回 ok:false + notice，渲染端在宠物旁边显示几秒。
   client.send({
@@ -744,6 +777,7 @@ async function verifyControls () {
   }, 2500, '失败气泡出现')
   state = await client.rendererState()
   assert(state.controls.popover === null, '点完动作弹层关闭')
+  assert(state.controls.streetOpen === false, '点完动作那条街也收起来')
   await waitUntil(async () => {
     const status = await client.status()
     return status.busy === false
@@ -881,10 +915,10 @@ async function verifyControls () {
   client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
   await waitUntil(async () => {
     const snapshot = await client.rendererState()
-    return snapshot.controls.popover !== null && snapshot.controls.popover.disabled.includes('visit')
+    return snapshot.controls.popover !== null && snapshot.controls.popover.disabled.includes('open-street')
   }, 2500, '置灰的串门按钮')
   state = await client.rendererState()
-  const disabledButton = state.uiRects.find((rect) => rect.id === 'ui:btn:visit')
+  const disabledButton = state.uiRects.find((rect) => rect.id === 'ui:btn:open-street')
   const actionsBefore = client.events.filter((event) => event.type === 'action').length
   const disabledPoint = rectCenterScreen(disabledButton, workArea)
   client.send({ type: 'debug-dispatch', phase: 'click', x: disabledPoint.x, y: disabledPoint.y })
@@ -1460,6 +1494,21 @@ function cleanup () {
   }
 }
 
+/**
+ * 只跑某一段（排查用）：`LOCAL_PET_SMOKE_ONLY=controls`。
+ * 默认什么都不设就跑全部；跳过任何一段都会在输出里写明，不许静默变成“全绿”。
+ */
+const ONLY = typeof process.env.LOCAL_PET_SMOKE_ONLY === 'string' && process.env.LOCAL_PET_SMOKE_ONLY.trim() !== ''
+  ? process.env.LOCAL_PET_SMOKE_ONLY.trim()
+  : null
+
+function wants (name) {
+  if (ONLY === null) return true
+  const skip = ONLY !== name
+  if (skip) console.log('# 跳过：' + name + '（LOCAL_PET_SMOKE_ONLY=' + ONLY + '）')
+  return !skip
+}
+
 let exitCode = 0
 let shot = null
 try {
@@ -1469,14 +1518,14 @@ try {
   console.log('dsh-pet 素材: ' + (ASSET_ROOTS.length > 0 ? ASSET_ROOTS.join(' | ') : '未找到（将退化为 SVG 色块）'))
   console.log('输出目录: ' + OUT_DIR)
   if (WRITE_NOTES) console.log('截图笔记: ' + NOTES_DIR)
-  const standalone = await run('截图模式：三只演示宠物 + 透明背景 + 真实素材', verifyShotMode)
-  await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
-  await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
-  const controls = await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls)
-  await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
-  await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
-  const notes = writeNoteScreenshots(standalone.verified)
-  const controlNotes = writeControlNotes(controls.verified, controls.noticeVerified)
+  const standalone = wants('shot') ? await run('截图模式：三只演示宠物 + 透明背景 + 真实素材', verifyShotMode) : null
+  if (wants('svg')) await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
+  if (wants('helper')) await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
+  const controls = wants('controls') ? await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 街道面板 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls) : null
+  if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
+  if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
+  const notes = standalone === null ? null : writeNoteScreenshots(standalone.verified)
+  const controlNotes = controls === null ? null : writeControlNotes(controls.verified, controls.noticeVerified)
   if (notes !== null) {
     console.log('\n截图笔记：')
     console.log('  整窗（棋盘格合成）: ' + notes.fullPath)
@@ -1487,10 +1536,10 @@ try {
     console.log('  控件特写（棋盘格合成）: ' + controlNotes.cropPath)
     console.log('  失败气泡特写（棋盘格合成）: ' + controlNotes.noticePath)
   }
-  console.log('\n全部通过（' + checks + ' 项断言）。')
+  console.log('\n通过（' + checks + ' 项断言' + (ONLY === null ? '，全部段落' : '，只跑了 ' + ONLY) + '）。')
   console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
-  console.log('控件截图：' + controls.pngPath)
-  console.log('截图模式输出：' + standalone.pngPath)
+  if (controls !== null) console.log('控件截图：' + controls.pngPath)
+  if (standalone !== null) console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {
   exitCode = 1
   console.error('\n冒烟失败：' + (error instanceof Error ? error.message : String(error)))

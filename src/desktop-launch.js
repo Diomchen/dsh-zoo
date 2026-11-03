@@ -110,6 +110,9 @@ export function buildHelperArgs ({ helperPath, hostPid, debug = false, assetRoot
     args.push('--local-pet-host-pid', String(hostPid))
   }
   if (debug) args.push('--local-pet-debug')
+  // 逃生开关：受限环境（容器化 CI、被沙箱住的 runner）里 Chromium 的沙箱起不来，
+  // helper 会直接崩。只有显式设了环境变量才关，产品路径默认始终带沙箱。
+  if (process.env.LOCAL_PET_HELPER_NO_SANDBOX === '1') args.push('--no-sandbox')
   if (typeof cacheRoot === 'string') {
     const dir = cacheRoot.trim()
     if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {

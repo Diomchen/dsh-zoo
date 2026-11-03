@@ -51,6 +51,8 @@
   const NOTICE_MAX_AGE_MS = 30000
   /** 浮动控件与锚点之间的间隙。 */
   const UI_GAP = 8
+  /** 某一户换了动作时，它自己探头多久（ticket 21）。 */
+  const STREET_PEEK_MS = 700
   /** 点击判定：按下到松开的位移/时长都小才算一次点击，否则是拖拽。 */
   const CLICK_MAX_MOVE = 5
   const CLICK_MAX_MS = 600
@@ -83,6 +85,7 @@
    */
   const ui = {
     popover: null, // { petId, kind, el, signature, openedAt, lastActiveAt }
+    street: null, // { petId, el, head, title, grid, more, actions, showBlocked, openedAt, lastActiveAt }
     prompt: null, // { key, deviceId, nickname, el }
     recall: null, // { el }
     notice: null, // { text, at, el, timer }
@@ -263,6 +266,19 @@
       rects.push(promptRect)
       for (const button of ui.prompt.el.querySelectorAll('[data-lp-action]')) {
         add('ui:btn:' + button.dataset.lpAction, button)
+      }
+    }
+
+    const streetRect = ui.street === null ? null : rectOf('ui:street', ui.street.el)
+    if (streetRect !== null) {
+      const bridge = shared.unionRect([streetRect, promptAnchor()])
+      if (bridge !== null) rects.push({ id: 'ui:bridge:street', ...bridge })
+      rects.push(streetRect)
+      for (const button of ui.street.el.querySelectorAll('[data-lp-action]')) {
+        const device = typeof button.dataset.lpDevice === 'string' && button.dataset.lpDevice !== ''
+          ? ':' + button.dataset.lpDevice
+          : ''
+        add('ui:street:' + button.dataset.lpAction + device, button)
       }
     }
 
@@ -616,7 +632,7 @@
 
     if (kind === 'self') {
       const visit = scene.controls.visit
-      el.appendChild(makeButton('串门', 'visit', {
+      el.appendChild(makeButton('串门', 'open-street', {
         disabled: visit.enabled !== true,
         reason: visit.reason === null ? '现在还不能串门。' : visit.reason
       }))
@@ -670,6 +686,7 @@
     ui.openTimer = setTimeout(() => {
       ui.openTimer = null
       if (ui.popover !== null) closePopover('timeout')
+      if (ui.street !== null) closeStreet('timeout')
     }, UI_MAX_OPEN_MS)
   }
 
@@ -726,6 +743,223 @@
     layoutUi(true)
   }
 
+  // -------------------------------------------------------------------------
+  // 邻居面板（ticket 21）：那条小街
+  // -------------------------------------------------------------------------
+
+  /**
+   * 去不了的那一户，第二行说什么。
+   * 这里只有“此刻为什么去不了”的短句；点击失败仍然是 visit-copy.js 那一套长句，
+   * 两边不许各自发明理由。
+   */
+  function streetStatusText (row) {
+    if (row.blockedReason === 'peer-offline') return '刚掉线了'
+    if (row.blockedReason === 'not-mutual') return '它还没放行你'
+    if (row.blockedReason === 'not-admitted') return '你还没放行它'
+    return '现在去不了'
+  }
+
+  /**
+   * 一户人家的脸色与屋顶，都从 deviceId 哈希来，同一个人每次都长一样。
+   * 屋顶单独一套暖色：和脸色同色的话，那颗头看着像戴了顶自己的帽子。
+   */
+  const ROOF_COLORS = ['#f4a8a8', '#f7d17e', '#9ed5c0', '#b5b8e8', '#f0b48c']
+
+  function streetColors (deviceId) {
+    const palette = shared.PET_COLORS.slice(1)
+    const hash = shared.hashString(deviceId)
+    return { face: palette[hash % palette.length], roof: ROOF_COLORS[hash % ROOF_COLORS.length] }
+  }
+
+  function buildHouse (row) {
+    const house = document.createElement(row.canVisit === true ? 'button' : 'div')
+    house.className = 'lp-house'
+    house.dataset.canVisit = row.canVisit === true ? 'true' : 'false'
+    house.title = row.label
+    if (row.canVisit === true) {
+      house.type = 'button'
+      house.dataset.lpAction = 'visit'
+      house.dataset.lpDevice = row.deviceId
+    }
+
+    const top = document.createElement('span')
+    top.className = 'lp-house-top'
+    const colors = streetColors(row.deviceId)
+    const roof = document.createElement('span')
+    roof.className = 'lp-roof'
+    roof.style.setProperty('--lp-roof', colors.roof)
+    const wall = document.createElement('span')
+    wall.className = 'lp-wall'
+    const face = document.createElement('span')
+    face.className = 'lp-face'
+    face.style.background = colors.face
+    for (const side of ['l', 'r']) {
+      const eye = document.createElement('i')
+      eye.className = 'lp-eye lp-eye-' + side
+      face.appendChild(eye)
+    }
+    wall.appendChild(face)
+    top.appendChild(roof)
+    top.appendChild(wall)
+
+    const name = document.createElement('span')
+    name.className = 'lp-house-name'
+    name.textContent = row.label
+    const doing = document.createElement('span')
+    doing.className = 'lp-house-doing'
+    // 能去的说它在干什么，去不了的说为什么去不了——第二行永远有字，不留空。
+    doing.textContent = row.canVisit === true
+      ? (typeof row.action === 'string' && row.action !== '' ? row.action : '在附近')
+      : streetStatusText(row)
+
+    house.appendChild(top)
+    house.appendChild(name)
+    house.appendChild(doing)
+    return house
+  }
+
+  /** 那一户自己探一次头；用一次性动画，不常驻，免得整条街一直动。 */
+  function peekHouse (house) {
+    const face = house.querySelector('.lp-face')
+    if (face === null) return
+    face.dataset.peek = 'true'
+    setTimeout(() => {
+      if (face.isConnected) delete face.dataset.peek
+    }, STREET_PEEK_MS)
+  }
+
+  function openStreet (petId) {
+    closeStreet('replace')
+    const el = document.createElement('div')
+    el.className = 'lp-street'
+    el.setAttribute('role', 'dialog')
+    el.setAttribute('aria-label', '邻居')
+    const head = document.createElement('div')
+    head.className = 'lp-street-head'
+    const grid = document.createElement('div')
+    grid.className = 'lp-street-grid'
+    const more = document.createElement('button')
+    more.type = 'button'
+    more.className = 'lp-street-more'
+    more.dataset.lpAction = 'street-more'
+    el.appendChild(head)
+    el.appendChild(grid)
+    el.appendChild(more)
+    el.addEventListener('pointerdown', (event) => event.stopPropagation())
+    uiLayer.appendChild(el)
+
+    ui.street = {
+      petId,
+      el,
+      head,
+      grid,
+      more,
+      actions: new Map(),
+      showBlocked: false,
+      openedAt: performance.now(),
+      lastActiveAt: performance.now()
+    }
+    renderStreet()
+    reportOverlayRects(true)
+    layoutUi(true)
+  }
+
+  function closeStreet (reason) {
+    if (ui.street === null) return
+    const current = ui.street
+    ui.street = null
+    try {
+      current.el.remove()
+    } catch {
+      // 已经没了
+    }
+    reportOverlayRects(true)
+    layoutUi(true)
+  }
+
+  function renderStreet () {
+    const street = ui.street
+    if (street === null) return
+    const rows = Array.isArray(scene.controls.street) ? scene.controls.street : []
+    const away = scene.controls.recall.enabled === true
+    const awayName = scene.controls.recall.nickname
+
+    street.el.dataset.away = away ? 'true' : 'false'
+    street.head.textContent = ''
+    const title = document.createElement('span')
+    title.className = 'lp-street-title'
+    if (away) {
+      title.textContent = '宠物正在「' + (awayName === null ? '邻居' : awayName) + '」家'
+      const recall = makeButton('召回', 'recall')
+      street.head.appendChild(title)
+      street.head.appendChild(recall)
+    } else {
+      const visitable = rows.filter((row) => row.canVisit === true)
+      title.textContent = '邻居'
+      const sub = document.createElement('span')
+      sub.className = 'lp-street-sub'
+      sub.textContent = visitable.length + ' 位在附近'
+      street.head.appendChild(title)
+      street.head.appendChild(sub)
+    }
+
+    street.grid.textContent = ''
+    const previous = street.actions
+    const next = new Map()
+    const visitable = rows.filter((row) => row.canVisit === true)
+    const blocked = rows.filter((row) => row.canVisit !== true)
+
+    for (const row of visitable) {
+      const house = buildHouse(row)
+      street.grid.appendChild(house)
+      next.set(row.deviceId, row.action)
+      // 谁换了动作，哪户探个头：面板因此是活的，又不会一直吵。
+      if (previous.has(row.deviceId) && previous.get(row.deviceId) !== row.action) peekHouse(house)
+    }
+    if (street.showBlocked) {
+      for (const row of blocked) street.grid.appendChild(buildHouse(row))
+    }
+    if (visitable.length === 0) {
+      const empty = document.createElement('div')
+      empty.className = 'lp-street-empty'
+      empty.textContent = away ? '它现在在外面。' : '这条街还只有你一家。'
+      street.grid.appendChild(empty)
+    }
+    street.actions = next
+
+    street.more.hidden = blocked.length === 0 || away
+    street.more.textContent = street.showBlocked
+      ? '收起 ›'
+      : '附近还有 ' + blocked.length + ' 位，现在去不了 ›'
+
+    layoutUi(true)
+  }
+
+  function syncStreet () {
+    if (ui.street === null) return
+    renderStreet()
+  }
+
+  /** 光标离开面板与锚点宠物后的宽限关闭；和弹层同一套手感。 */
+  function updateStreetHover () {
+    if (ui.street === null || pointer === null) return
+    const street = ui.street
+    const inside = pointInElement(pointer, street.el)
+    const self = pets.get(street.petId)
+    const onAnchor = self !== undefined && pointInRect(pointer, anchorOfPet(self))
+    if (inside || onAnchor) {
+      street.lastActiveAt = performance.now()
+      cancelLeaveTimer()
+      resetOpenTimer()
+      return
+    }
+    if (ui.leaveTimer !== null) return
+    ui.leaveTimer = setTimeout(() => {
+      ui.leaveTimer = null
+      if (ui.street === street) closeStreet('leave')
+    }, UI_LEAVE_GRACE_MS)
+  }
+
   function maybeOpenHoverControls () {
     if (pointer === null || drag !== null || ui.popover !== null || !uiLayer) return
     const pet = petAt(pointer)
@@ -743,6 +977,7 @@
 
   /** 光标离开弹层与锚点宠物后，给一小段宽限再关闭。 */
   function updateUiHover () {
+    updateStreetHover()
     if (ui.popover === null || pointer === null) return
     const current = ui.popover
     const pet = pets.get(current.petId)
@@ -986,6 +1221,13 @@
       }
     }
 
+    if (ui.street !== null) {
+      positionFloating(ui.street.el, promptAnchor(), {
+        avoid: petRects.concat(occupied),
+        gap: UI_GAP
+      })
+    }
+
     if (ui.recall !== null) {
       positionFloating(ui.recall.el, promptAnchor(), {
         avoid: petRects.concat(occupied),
@@ -1006,11 +1248,13 @@
 
   function syncControls (reset) {
     if (reset === true) closePopover('scene-reset')
+    if (reset === true) closeStreet('scene-reset')
     if (ui.popover !== null) {
       if (!pets.has(ui.popover.petId)) closePopover('scene-gone')
       else if (ui.popover.signature !== popoverSignature()) closePopover('controls-changed')
     }
     syncPrompt()
+    syncStreet()
     syncRecallChip()
     syncNotice()
     layoutUi(true)
@@ -1115,9 +1359,23 @@
       showNotice(reason)
       return
     }
-    if (action === 'visit' || action === 'recall' || action === 'end-visit') {
-      // 弹层点击后立刻关掉并撤掉命中矩形；失败会以气泡出现，不靠弹层赖着。
+    if (action === 'open-street') {
+      // 「串门」先开那条街：挑谁去哪家，而不是替用户掷骰子（ticket 21）。
       closePopover('action')
+      openStreet('self')
+      return
+    }
+    if (action === 'street-more') {
+      if (ui.street !== null) {
+        ui.street.showBlocked = ui.street.showBlocked !== true
+        renderStreet()
+      }
+      return
+    }
+    if (action === 'visit' || action === 'recall' || action === 'end-visit') {
+      // 弹层/面板点击后立刻关掉并撤掉命中矩形；失败会以气泡出现，不靠控件赖着。
+      closePopover('action')
+      closeStreet('action')
       requestAction(action, deviceId)
       return
     }
@@ -1827,6 +2085,13 @@
                   .map((button) => button.dataset.lpAction)
               },
           prompt: ui.prompt === null ? null : { deviceId: ui.prompt.deviceId, nickname: ui.prompt.nickname },
+          street: scene.controls.street.map((row) => ({
+            deviceId: row.deviceId,
+            label: row.label,
+            canVisit: row.canVisit
+          })),
+          streetOpen: ui.street !== null,
+          streetShowBlocked: ui.street === null ? false : ui.street.showBlocked,
           recallChip: ui.recall === null ? null : { nickname: scene.controls.recall.nickname },
           notice: ui.notice === null ? null : { text: ui.notice.text, at: ui.notice.at },
           pending: [...ui.pending.values()].map((pending) => ({

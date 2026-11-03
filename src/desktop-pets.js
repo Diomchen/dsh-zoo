@@ -15,6 +15,7 @@
 
 import shared from '../desktop/shared.js'
 import { isDeviceId } from './protocol.js'
+import { MAX_STREET, isBlockedReason } from './street.js'
 import { isVisitReason, visitReasonText } from './visit-copy.js'
 
 /** 快照里的 deviceId 是身份层生成的 UUID；复用协议层的形状校验，不另写一份。 */
@@ -115,6 +116,34 @@ export function droppedVisitors (snapshot) {
  * @param {object} snapshot room.snapshot()
  * @returns {object} 与 shared.emptyControls() 同形状的归一化控件状态
  */
+/**
+ * 快照的 `street` → 渲染端能画的一排房子（ticket 20/21）。
+ *
+ * 只做搬运和清洗：昵称、动作名、能不能去、为什么不能去。顺序就是宿主给的顺序
+ * （能去的在前），渲染端不再排——两处各排一次，迟早排得不一样。
+ */
+function streetFromSnapshot (snapshot) {
+  const rows = []
+  if (!Array.isArray(snapshot.street)) return rows
+  const seen = new Set()
+  for (const raw of snapshot.street) {
+    if (rows.length >= MAX_STREET) break
+    if (raw === null || typeof raw !== 'object') continue
+    const deviceId = deviceIdOf(raw.deviceId)
+    if (deviceId === null || seen.has(deviceId)) continue
+    seen.add(deviceId)
+    rows.push({
+      deviceId,
+      label: shared.normalizeLabel(raw.nickname, '邻居'),
+      action: shared.normalizeLabel(raw.action, null),
+      canVisit: raw.canVisit === true,
+      // 认不出来的理由一律当成“现在去不了”，不猜；词表只有 street.js 那一份。
+      blockedReason: isBlockedReason(raw.blockedReason) ? raw.blockedReason : null
+    })
+  }
+  return rows
+}
+
 export function controlsFromSnapshot (snapshot) {
   const controls = shared.emptyControls()
   if (snapshot === null || typeof snapshot !== 'object') return controls
@@ -152,6 +181,8 @@ export function controlsFromSnapshot (snapshot) {
     if (controls.visitors.some((candidate) => candidate.deviceId === deviceId)) continue
     controls.visitors.push({ deviceId, label: shared.normalizeLabel(visitor.nickname, '邻居') })
   }
+
+  controls.street = streetFromSnapshot(snapshot)
 
   const prompt = snapshot.prompt !== null && typeof snapshot.prompt === 'object' ? snapshot.prompt : null
   if (prompt !== null) {

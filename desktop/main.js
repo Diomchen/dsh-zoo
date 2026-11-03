@@ -738,7 +738,9 @@ ipcMain.on('local-pet:action', (event, payload) => {
   const action = typeof payload?.action === 'string' ? payload.action.trim().toLowerCase() : ''
   if (id === null || !shared.CONTROL_ACTIONS.includes(action)) return
   const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
-  const deviceId = needsDevice ? shared.normalizeId(payload?.deviceId) : null
+  // `visit` 是「可能带对象」：从邻居面板点某一户就带 deviceId；没有就交给宿主随机挑一位
+  // （HTTP 口的老行为）。needsDevice 的那几个动作则必须有对象，缺了直接拒绝。
+  const deviceId = needsDevice || action === 'visit' ? shared.normalizeId(payload?.deviceId) : null
   if (needsDevice && deviceId === null) {
     sendActionResult({ id, ok: false, notice: '这个操作缺少对象，稍后再试。', error: 'bad-device-id' })
     return

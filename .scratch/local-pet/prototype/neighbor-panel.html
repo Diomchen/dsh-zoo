@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>邻居面板 · 原型</title>
+<!--
+  一次性原型：只回答一个问题——「邻居面板长什么样才算可爱」。
+  不是产品代码，不接服务、不读快照；数据写死在下面 NEIGHBORS 里。
+
+  三个变体（?v=wood|journal|map）：
+    wood    造型派：一块挂在家门口的小木牌，每行一块门牌
+    journal 文案派：一张贴在桌面上的便签，可爱全在句子和留白
+    map     动效派：一条街的小房子，邻居从窗户里探头，悬停会蹦
+
+  真实桌面上它会是透明浮层，底下的壁纸由用户自己决定；这里用一张假壁纸顶替，
+  免得白底骗人。
+-->
+<style>
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    height: 100%;
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* 假壁纸：真实的桌面上这里是用户自己的图。 */
+  body {
+    background:
+      radial-gradient(1200px 600px at 18% 8%, #cfe3f7 0%, transparent 60%),
+      radial-gradient(900px 700px at 92% 92%, #f7d9d0 0%, transparent 55%),
+      linear-gradient(160deg, #eef3f6 0%, #dfe7ee 100%);
+    overflow: hidden;
+  }
+
+  .desktop { position: fixed; inset: 0; }
+
+  /* 本机宠物：面板的锚点，所有变体共用。 */
+  .self {
+    position: absolute; right: 96px; bottom: 92px;
+    width: 96px; height: 96px; display: grid; place-items: center;
+  }
+  .self .body-blob {
+    width: 74px; height: 74px;
+    border-radius: 40% 60% 55% 45% / 55% 45% 58% 42%;
+    background: #7fb3e8;
+    box-shadow: inset -8px -10px 0 rgba(0, 0, 0, .08), 0 12px 24px rgba(48, 76, 105, .22);
+    animation: bop 3.6s ease-in-out infinite;
+  }
+  .self .eye { position: absolute; width: 7px; height: 7px; border-radius: 50%; background: #2c3e50; top: 46px; }
+  .self .eye.l { left: 34px; }
+  .self .eye.r { left: 50px; }
+  .self .mouth {
+    position: absolute; width: 14px; height: 7px; top: 60px; left: 41px;
+    border-bottom: 2px solid #2c3e50; border-radius: 0 0 14px 14px;
+  }
+  .self .tag {
+    position: absolute; top: -14px; right: 4px;
+    font-size: 11px; color: #4a5a68; background: rgba(255, 255, 255, .78);
+    padding: 2px 8px; border-radius: 999px; box-shadow: 0 2px 6px rgba(0, 0, 0, .08);
+  }
+  @keyframes bop {
+    0%, 100% { transform: translateY(0) scale(1, 1); }
+    50% { transform: translateY(-5px) scale(.985, 1.02); }
+  }
+
+  .variant-label {
+    position: absolute; left: 28px; bottom: 24px;
+    font-size: 12px; letter-spacing: .08em; color: #6b7c8c;
+    background: rgba(255, 255, 255, .6); padding: 6px 12px; border-radius: 999px;
+  }
+
+  /* ============ 共用骨架 ============ */
+  .panel {
+    position: absolute; right: 96px; bottom: 208px; width: 272px;
+    animation: rise .26s cubic-bezier(.2, 1.5, .5, 1) both;
+  }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(10px) scale(.96); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  .rows { list-style: none; margin: 0; padding: 0; }
+
+  .row {
+    display: flex; align-items: center; gap: 10px;
+    cursor: pointer;
+    transition: transform .16s ease, background .16s ease, box-shadow .16s ease;
+  }
+  .row .line { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+  .row .name {
+    font-size: 14px; font-weight: 600; line-height: 1.25;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .row .doing {
+    font-size: 11.5px; line-height: 1.3; opacity: .72;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+
+  /* 一张小脸：三笔画完，够用也够可爱。 */
+  .face {
+    position: relative; flex: none;
+    display: block;
+    box-shadow: inset -3px -4px 0 rgba(0, 0, 0, .09);
+  }
+  .face .e {
+    position: absolute; border-radius: 50%; background: #3d3d46; top: 42%;
+    width: 12%; height: 12%; min-width: 2px; min-height: 2px;
+  }
+  .face .e.l { left: 30%; }
+  .face .e.r { right: 30%; }
+
+  .more {
+    margin-top: 10px; font-size: 12px; opacity: .68;
+    display: flex; align-items: center; justify-content: space-between;
+    cursor: pointer; padding: 6px 2px;
+  }
+  .more:hover { opacity: .9; }
+
+  /* ============ A · 木牌 ============ */
+  body[data-v="wood"] .panel {
+    background:
+      repeating-linear-gradient(92deg, rgba(120, 78, 44, .07) 0 2px, transparent 2px 9px),
+      linear-gradient(180deg, #e6c39a 0%, #d9b182 55%, #cf9f70 100%);
+    border: 2px solid #a97a4e;
+    border-radius: 16px;
+    padding: 14px 14px 10px;
+    box-shadow: 0 2px 0 #b98a5c inset, 0 20px 34px rgba(80, 52, 26, .3);
+  }
+  body[data-v="wood"] .panel::before,
+  body[data-v="wood"] .panel::after {
+    content: ""; position: absolute; top: 10px; width: 7px; height: 7px; border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #f6e2c6, #8a6134 70%);
+    box-shadow: 0 1px 1px rgba(0, 0, 0, .35);
+  }
+  body[data-v="wood"] .panel::before { left: 9px; }
+  body[data-v="wood"] .panel::after { right: 9px; }
+
+  body[data-v="wood"] .head {
+    font-size: 13px; letter-spacing: .22em; color: #6b4322;
+    text-align: center; margin: 2px 0 12px; font-weight: 700;
+  }
+  body[data-v="wood"] .head small {
+    display: block; letter-spacing: .04em; font-weight: 400;
+    font-size: 11px; color: #8a6134; margin-top: 3px;
+  }
+  body[data-v="wood"] .row {
+    background: linear-gradient(180deg, #f7e4c9, #eed3ae);
+    border: 1.5px solid #b98a5c;
+    border-radius: 11px;
+    padding: 7px 10px 7px 8px;
+    margin-bottom: 7px;
+    box-shadow: 0 2px 0 rgba(255, 255, 255, .5) inset, 0 3px 5px rgba(90, 58, 28, .18);
+  }
+  body[data-v="wood"] .row:hover { background: linear-gradient(180deg, #fff0dc, #f4dcbb); }
+  body[data-v="wood"] .row .name { color: #5d3b1d; }
+  body[data-v="wood"] .row .doing { color: #8a6134; opacity: .9; }
+  body[data-v="wood"] .face {
+    width: 30px; height: 30px;
+    border-radius: 44% 56% 52% 48% / 52% 48% 56% 44%;
+  }
+  body[data-v="wood"] .more { color: #6b4322; border-top: 1.5px dashed rgba(107, 67, 34, .35); }
+
+  /* ============ B · 便签 ============ */
+  body[data-v="journal"] .panel {
+    background: #fffdf8;
+    border-radius: 6px;
+    padding: 18px 18px 12px;
+    box-shadow: 0 1px 0 rgba(0, 0, 0, .04), 0 18px 40px rgba(60, 70, 85, .2);
+    transform: rotate(-.5deg);
+  }
+  body[data-v="journal"] .panel::before {
+    content: ""; position: absolute; top: -9px; left: 50%; width: 74px; height: 18px;
+    transform: translateX(-50%) rotate(1.5deg);
+    background: rgba(246, 226, 178, .85);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, .06);
+  }
+  body[data-v="journal"] .head { font-size: 15px; font-weight: 700; color: #3c4a58; margin-bottom: 2px; }
+  body[data-v="journal"] .head small {
+    display: block; font-weight: 400; font-size: 11.5px; color: #8d9aa6; margin-top: 3px;
+  }
+  body[data-v="journal"] .row { padding: 9px 2px; border-bottom: 1px dashed #e7e1d6; }
+  body[data-v="journal"] .row .name { color: #35424f; font-weight: 600; }
+  body[data-v="journal"] .row .doing { color: #8d9aa6; opacity: 1; }
+  body[data-v="journal"] .face { width: 26px; height: 26px; border-radius: 50%; }
+  body[data-v="journal"] .go { font-size: 11px; color: #b08968; opacity: 0; transition: opacity .15s ease; flex: none; }
+  body[data-v="journal"] .row:hover .go { opacity: 1; }
+  body[data-v="journal"] .more { color: #8d9aa6; border-top: 1px solid #f0ebe2; margin-top: 4px; }
+
+  /* ============ C · 小街 ============ */
+  body[data-v="map"] .panel {
+    background: #fdf6ec;
+    border: 2.5px solid #4a4a55;
+    border-radius: 20px;
+    padding: 12px 12px 8px;
+    box-shadow: 4px 6px 0 rgba(74, 74, 85, .16);
+  }
+  body[data-v="map"] .head {
+    font-size: 13px; font-weight: 800; color: #4a4a55; margin: 0 2px 9px;
+    display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  }
+  body[data-v="map"] .head small { font-weight: 500; font-size: 11px; color: #8a8a95; letter-spacing: 0; }
+  body[data-v="map"] .row {
+    background: #fff; border: 2px solid #4a4a55; border-radius: 13px;
+    padding: 6px 9px 6px 5px; margin-bottom: 6px;
+    box-shadow: 2px 3px 0 rgba(74, 74, 85, .14);
+  }
+  body[data-v="map"] .row:hover { transform: translate(-1px, -2px) rotate(-.6deg); }
+  body[data-v="map"] .row:hover .face { animation: peek .55s ease-in-out infinite alternate; }
+  @keyframes peek {
+    from { transform: translateY(0) rotate(-4deg); }
+    to { transform: translateY(-4px) rotate(5deg); }
+  }
+  body[data-v="map"] .house {
+    position: relative; width: 38px; height: 34px; flex: none;
+  }
+  body[data-v="map"] .roof {
+    position: absolute; top: 0; left: 3px; width: 32px; height: 15px;
+    border: 2px solid #4a4a55; border-bottom: 0;
+    border-radius: 17px 17px 0 0;
+    background: var(--roof, #f4a8a8);
+  }
+  body[data-v="map"] .wall {
+    position: absolute; bottom: 0; left: 4px; width: 30px; height: 20px;
+    border: 2px solid #4a4a55; border-radius: 0 0 7px 7px;
+    background: #fff; display: grid; place-items: end center;
+  }
+  body[data-v="map"] .face {
+    width: 22px; height: 22px; border-radius: 50%;
+    border: 2px solid #4a4a55; margin-bottom: -3px;
+  }
+  body[data-v="map"] .row .name { color: #3f3f49; font-size: 13px; }
+  body[data-v="map"] .row .doing { color: #8a8a95; font-size: 11px; opacity: 1; }
+  body[data-v="map"] .more { color: #6f6f7a; border-top: 2px dashed #e2d8c8; margin-top: 8px; font-weight: 500; }
+
+  /* 去不了的邻居：灰态一致，不抢眼但仍可读。 */
+  .row.blocked { cursor: default; opacity: .5; }
+  .row.blocked:hover { transform: none; }
+  .row.blocked:hover .face { animation: none; }
+</style>
+</head>
+<body data-v="wood">
+<div class="desktop">
+  <div class="panel" id="panel">
+    <div class="head">
+      <span data-role="title">邻居</span>
+      <small data-role="subtitle">3 位在附近</small>
+    </div>
+    <ul class="rows" id="rows"></ul>
+    <div class="more" id="more">
+      <span data-role="more-text">附近还有 2 位，现在去不了</span>
+      <span>›</span>
+    </div>
+  </div>
+
+  <div class="self">
+    <div class="body-blob"></div>
+    <div class="eye l"></div>
+    <div class="eye r"></div>
+    <div class="mouth"></div>
+    <div class="tag">我</div>
+  </div>
+
+  <div class="variant-label" id="label"></div>
+</div>
+
+<script>
+  // 数据照真实快照的形状写：名字 + 此刻在干什么 + 能不能去。
+  // 「去不了」的两种真实来源：掉线（10 分钟内的灰态）和没放行我。
+  const NEIGHBORS = [
+    { name: '老王', doing: '在打瞌睡', color: '#f2b8a2', roof: '#f4a8a8', canVisit: true },
+    { name: '小张', doing: '在改那个 bug', color: '#a8d5ba', roof: '#9ed5c0', canVisit: true },
+    { name: '阿 May', doing: '在做晚饭', color: '#f6d68a', roof: '#f7d17e', canVisit: true },
+    { name: '秃头哥', doing: '刚掉线了', color: '#c3cfe2', roof: '#c3cfe2', canVisit: false },
+    { name: '楼下新来的', doing: '还没放行你', color: '#d7c3e8', roof: '#d7c3e8', canVisit: false }
+  ]
+
+  const VARIANTS = {
+    wood: 'A · 造型派：小木牌',
+    journal: 'B · 文案派：便签',
+    map: 'C · 动效派：那条小街'
+  }
+
+  const params = new URLSearchParams(location.search)
+  const variant = VARIANTS[params.get('v')] ? params.get('v') : 'wood'
+  document.body.dataset.v = variant
+  document.getElementById('label').textContent = VARIANTS[variant]
+
+  const rows = document.getElementById('rows')
+  const visitable = NEIGHBORS.filter((n) => n.canVisit)
+  const blocked = NEIGHBORS.filter((n) => !n.canVisit)
+
+  document.querySelector('[data-role="subtitle"]').textContent = visitable.length + ' 位在附近'
+  document.querySelector('[data-role="more-text"]').textContent =
+    '附近还有 ' + blocked.length + ' 位，现在去不了'
+
+  for (const n of visitable) {
+    const li = document.createElement('li')
+    li.className = 'row'
+    li.innerHTML = faceMarkup(n) +
+      '<span class="line"><span class="name">' + n.name + '</span>' +
+      '<span class="doing">' + n.doing + '</span></span>' +
+      (variant === 'journal' ? '<span class="go">去 ›</span>' : '')
+    rows.appendChild(li)
+  }
+
+  // 折叠起来的灰态：默认不展开，点开才露出来（真实实现里这才是发请求的时刻）。
+  let expanded = false
+  document.getElementById('more').addEventListener('click', () => {
+    expanded = !expanded
+    if (expanded) {
+      for (const n of blocked) {
+        const li = document.createElement('li')
+        li.className = 'row blocked'
+        li.innerHTML = faceMarkup(n) +
+          '<span class="line"><span class="name">' + n.name + '</span>' +
+          '<span class="doing">' + n.doing + '</span></span>'
+        rows.appendChild(li)
+      }
+    } else {
+      document.querySelectorAll('.row.blocked').forEach((el) => el.remove())
+    }
+  })
+
+  function faceMarkup (n) {
+    const eyes = '<i class="e l"></i><i class="e r"></i>'
+    if (variant === 'map') {
+      return '<span class="house"><span class="roof" style="--roof:' + n.roof + '"></span>' +
+        '<span class="wall"><span class="face" style="background:' + n.color + '">' + eyes + '</span></span></span>'
+    }
+    return '<span class="face" style="background:' + n.color + '">' + eyes + '</span>'
+  }
+</script>
+</body>
+</html>
