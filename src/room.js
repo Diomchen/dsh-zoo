@@ -20,7 +20,13 @@ import {
   VISIT_RECORD_LIMIT,
   normalizeVisitRecord
 } from './visit-record.js'
-import { giftDroppedText, isGiftStatus } from './gift-copy.js'
+import {
+  giftDroppedText,
+  giftLeftBehindText,
+  giftNotReceivedText,
+  giftReceivedText,
+  isGiftStatus
+} from './gift-copy.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -127,6 +133,11 @@ export const MAX_NOTICES = 10
  * 它对应的访客早就走了，重发的报文也不会再带同一个 UUID。
  */
 export const MAX_DISCARDED_GIFTS = 200
+/**
+ * 「刚结束的入站串门身上那件礼物」的传递队列上限（ticket 26）。service 每次
+ * flush 都会取走；给个上限只是为了让 room 的内存永远有界。
+ */
+const MAX_ENDED_INBOUND_GIFTS = 32
 /** 点“稍后再说”后，同一位邻居至少安静这么久再问（它消失后重新出现则立刻重问）。 */
 export const PROMPT_SNOOZE_MS = 10 * 60 * 1000
 
@@ -158,6 +169,9 @@ export function createRoom ({
     visits: [],
     completedVisits: [],
     pendingRecalls: [],
+    // ticket 26：结束的入站串门身上那件礼物（送客 / 对方召回 / 失联）。
+    // 只有 service 知道磁盘上的 meta.opened，所以这里只负责“交给它”。
+    endedInboundGifts: [],
     trust: { allowed: new Map(), denied: new Map() },
     prompts: [],
     promptSet: new Set(),
@@ -422,6 +436,25 @@ export function createRoom ({
     }
   }
 
+  /**
+   * 入站串门结束了（送客 / 对方召回 / 失联 / 名单收紧）：如果访客身上还有一件礼物，
+   * 记下“谁捎来的、哪一件”，交给 service 去查 `meta.opened`。
+   *
+   * room 不碰磁盘，所以这里刻意不判断“要不要提醒”——只传递事实。
+   * 每取走一次就清空（见 `drainEndedInboundGifts`），不会在快照里重复。
+   */
+  function rememberEndedInboundGift (visitor) {
+    if (visitor?.gift === undefined) return
+    state.endedInboundGifts.push({
+      deviceId: visitor.deviceId,
+      nickname: visitor.nickname,
+      giftId: visitor.gift.id
+    })
+    while (state.endedInboundGifts.length > MAX_ENDED_INBOUND_GIFTS) {
+      state.endedInboundGifts.shift()
+    }
+  }
+
   function copyRecord (record) {
     return {
       direction: record.direction,
@@ -489,6 +522,7 @@ export function createRoom ({
     const visitor = state.visitors.get(deviceId)
     if (visitor === undefined) return null
     state.visitors.delete(deviceId)
+    rememberEndedInboundGift(visitor)
     return recordVisit('in', visitor.nickname, visitor.since, at)
   }
 
@@ -1073,6 +1107,7 @@ export function createRoom ({
       const visitor = state.visitors.get(deviceId)
       if (visitor !== undefined) {
         state.visitors.delete(deviceId)
+        rememberEndedInboundGift(visitor)
         const record = recordVisit('in', visitor.nickname, visitor.since, now)
         return {
           ok: true,
@@ -1189,6 +1224,7 @@ export function createRoom ({
 
       const now = stampOf(at)
       state.visitors.delete(deviceId)
+      rememberEndedInboundGift(visitor)
       const record = recordVisit('in', visitor.nickname, visitor.since, now)
       state.pendingRecalls.push({ deviceId: visitor.deviceId, visitId: visitor.visitId })
       return {
@@ -1257,6 +1293,24 @@ export function createRoom ({
       return pushNotice(text.trim(), at)
     },
 
+    /** 对方回执到了（ticket 26）：发起方把「收下了」说一句。 */
+    noteGiftReceived (nickname, at = clock()) {
+      return pushNotice(giftReceivedText(nickname), at)
+    },
+
+    /** 串门结束还没等到回执（ticket 26）：东西已经退回背包，这一句必须说清楚。 */
+    noteGiftNotReceived (at = clock()) {
+      return pushNotice(giftNotReceivedText(), at)
+    },
+
+    /**
+     * 送客提醒（ticket 26）：这件礼物一次都没打开过，东西还留在 gifts 里。
+     * “到底打没打开”在磁盘的 meta.json 上，所以判断留给 service，这里只说一句。
+     */
+    noteGiftLeftBehind (nickname, at = clock()) {
+      return pushNotice(giftLeftBehindText(nickname), at)
+    },
+
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */
     outboundVisit () {
       return copyOutbound(state.out)
@@ -1274,6 +1328,16 @@ export function createRoom ({
       const recalls = state.pendingRecalls
       state.pendingRecalls = []
       return recalls
+    },
+
+    /**
+     * 刚结束的入站串门身上那件礼物（ticket 26）。service 取走后查 meta.opened，
+     * 决定要不要留一句「捎来的东西还在 gifts 里」。
+     */
+    drainEndedInboundGifts () {
+      const ended = state.endedInboundGifts
+      state.endedInboundGifts = []
+      return ended
     },
 
     /**
@@ -1322,6 +1386,7 @@ export function createRoom ({
       for (const [deviceId, visitor] of state.visitors) {
         if (now - visitor.lastSeen >= lostMs) {
           state.visitors.delete(deviceId)
+          rememberEndedInboundGift(visitor)
           recordVisit('in', visitor.nickname, visitor.since, now)
           pushNotice(`「${visitor.nickname}」失联了，访客已经离开。`, now)
         }
@@ -1358,6 +1423,7 @@ export function createRoom ({
       state.visits.length = 0
       state.completedVisits.length = 0
       state.pendingRecalls.length = 0
+      state.endedInboundGifts.length = 0
       state.trust.allowed.clear()
       state.trust.denied.clear()
       state.prompts.length = 0

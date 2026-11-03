@@ -24,6 +24,7 @@ import {
   HEARTBEAT_INTERVAL_MS,
   PEER_LOST_MS,
   VISIT_MAX_MS,
+  encodeGiftReceived,
   encodeHeartbeat,
   encodeVisitAck,
   encodeVisitDeny,
@@ -54,6 +55,14 @@ export const VISIT_REQUEST_TIMEOUT_MS = 1800
 export const RECALL_ATTEMPTS = 3
 export const RECALL_RETRY_MS = 500
 export const RECALL_TIMEOUT_MS = 1500
+/**
+ * 礼物回执（ticket 26）：接收方写进 `gifts/` 之后发三次、间隔约 400ms。
+ * 回执**没有** ack——重复到达在发起方是幂等的（不是自己登记过的那一件就什么也不做），
+ * 所以重发只需要有界，不需要回执的确认。
+ */
+export const RECEIPT_ATTEMPTS = 3
+export const RECEIPT_RETRY_MS = 400
+export const RECEIPT_TIMEOUT_MS = 1200
 /** 重试/超时计时器的检查粒度；测试可以调更快。 */
 export const VISIT_TIMER_TICK_MS = 200
 /** 桌面场景的巡检节拍：guest 出现/消失、对方动作变化最迟这么久后反映到桌面上。 */
@@ -104,6 +113,9 @@ export function createService (ctx, options = {}) {
   const recallRetryMs = positiveOption(options.recallRetryMs, RECALL_RETRY_MS, 10)
   const recallAttempts = integerOption(options.recallAttempts, RECALL_ATTEMPTS, 1, 8)
   const recallTimeoutMs = positiveOption(options.recallTimeoutMs, RECALL_TIMEOUT_MS, recallRetryMs)
+  const receiptRetryMs = positiveOption(options.receiptRetryMs, RECEIPT_RETRY_MS, 10)
+  const receiptAttempts = integerOption(options.receiptAttempts, RECEIPT_ATTEMPTS, 1, 8)
+  const receiptTimeoutMs = positiveOption(options.receiptTimeoutMs, RECEIPT_TIMEOUT_MS, receiptRetryMs)
   const desktopSyncMs = positiveOption(options.desktopSyncMs, DESKTOP_SYNC_MS, 20)
   const autoVisitIntervalMs = positiveOption(options.autoVisitIntervalMs, AUTO_VISIT_INTERVAL_MS, 10)
 
@@ -142,6 +154,13 @@ export function createService (ctx, options = {}) {
   let request = null
   // 已发出、等回执的 visit-recall：visitId → { deviceId, attempts, nextAt, deadline }。
   const recalls = new Map()
+  // 已发出、等对方确认的回执（接收方，ticket 26）：
+  // giftId → { deviceId, visitId, attempts, nextAt, deadline }。
+  const receipts = new Map()
+  // 已经捎出去、等回执的礼物（发起方，ticket 26）：
+  // giftId → { deviceId, visitId, nickname }。收到回执就删件，串门一结束就退包；
+  // 先把条目从表里摘掉再动背包，所以同一条回执/同一次结束只会生效一次。
+  const outboundGifts = new Map()
   // 活动信号的可观测性：第一次见到某个来源、以及同一条策略结论的日志节流。
   const loggedActivitySources = new Set()
   let lastPolicyLog = { reason: null, at: 0 }
@@ -707,6 +726,10 @@ export function createService (ctx, options = {}) {
             } else if (packet.type === 'visit-recall-ack') {
               // 对方确认收到了这次召回：不用再重发。
               clearRecall(packet)
+            } else if (packet.type === 'gift-received') {
+              // 礼物的送达回执（ticket 26）。**必须有这个分支**：落到下面的 else 会被
+              // 当成 beacon 静默吞掉——不报错，只是礼物永远删不掉。
+              handleGiftReceived(packet)
             } else {
               room.observeBeacon(packet)
             }
@@ -1425,6 +1448,19 @@ export function createService (ctx, options = {}) {
       // 重发**原样**用它，文件件不在重试里重新算 hash（对方看到的是同一件东西）。
       gift: sent.gift
     }
+    if (sent.gift !== null && sent.gift !== undefined) {
+      // 从这一刻起这件礼物在等回执（ticket 26）：收到就删件，串门结束还没收到就退包。
+      // 显式礼物（脚本入口）也登记：对方确认收到了就该说一句，哪怕背包里本来没有它。
+      // 键一律小写：回执里的 giftId 由协议层归一，这里不能因为调用方传了大写而漏认。
+      const giftId = typeof sent.gift.id === 'string' ? sent.gift.id.toLowerCase() : ''
+      if (giftId !== '') {
+        outboundGifts.set(giftId, {
+          deviceId,
+          visitId,
+          nickname: begun.visit.nickname
+        })
+      }
+    }
 
     if (sent.giftDropped && carried !== null) {
       // 编码层把礼物丢掉了：它根本没上路，退回 idle，不占着“正在捎出”。
@@ -1515,6 +1551,8 @@ export function createService (ctx, options = {}) {
     if (gift === undefined || gift === null || !isVisitId(gift.id)) return
     // ticket 24 只会发文件礼物；接收/拉取是 ticket 25 的事。在那之前让卡片停在 pending，
     // 而不是拿文件礼物去写字条、把它标成没取到。
+    // ticket 26: 回执 —— 文件拉取在「临时文件 rename 成功」之后调同一个
+    // `sendGiftReceipt(packet.deviceId, packet.visitId, gift.id)`；失败（failed/refused）不发。
     if (gift.kind !== 'text') return
     const saved = gifts === null
       ? { ok: false, error: 'starting' }
@@ -1528,6 +1566,10 @@ export function createService (ctx, options = {}) {
     room.markGiftStatus(packet.deviceId, gift.id, saved.ok ? 'received' : 'failed')
     if (!saved.ok) {
       warn(ctx, '字条没写进 gifts（' + saved.error + '）：卡片会显示“没取到”')
+    } else {
+      // **真的写进 gifts/ 之后**才回执（SPEC v4）。重试报文会再写一次、再发一次，
+      // receipts 表按 giftId 去重，不会重启一轮重发。
+      sendGiftReceipt(packet.deviceId, packet.visitId, gift.id)
     }
     // 状态变了要让桌面场景跟上（签名里含 controls.gifts）。
     flushRoomEffects()
@@ -1591,6 +1633,11 @@ export function createService (ctx, options = {}) {
     }
     for (const recall of room.drainVisitRecalls()) queueRecall(recall)
     runRecallRetries()
+    // ticket 26：回执的重发（接收方）与串门结束后的退包（发起方）。
+    // 两件事都按 gift/visit 幂等，放在这个统一出口，onPeer / tick / action 都覆盖到。
+    runReceiptRetries()
+    reconcileOutboundGifts()
+    noteEndedInboundGifts()
     // 谁在/谁走/动作变了都可能从这里经过：让桌面场景跟上（没变就不发）。
     syncDesktop()
     return records.length
@@ -1634,6 +1681,168 @@ export function createService (ctx, options = {}) {
       }
       recall.attempts += 1
       recall.nextAt += recallRetryMs
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // ticket 26：送达回执与退包
+  // -------------------------------------------------------------------------
+
+  /**
+   * 回执的通用出口：接收方**真的把东西写进 `gifts/` 之后**调用。
+   *
+   * 字条现在就走这里；ticket 25 的文件拉取在「临时文件 rename 成功」之后调
+   * 同一个函数（`sendGiftReceipt(deviceId, visitId, giftId)`）即可，
+   * 不要在文件分支另写一套重发。
+   *
+   * 发三次、间隔约 400ms（与 recall 同一套路）。回执没有 ack：重复到达在发起方
+   * 是幂等的，所以这里只要「发出去过就登记」——同一件礼物重复写盘不会重启一轮重发。
+   */
+  function sendGiftReceipt (deviceId, visitId, giftId) {
+    if (disposed || discovery === null || identity === null) return false
+    if (typeof deviceId !== 'string' || !isVisitId(visitId) || !isVisitId(giftId)) return false
+    const id = giftId.toLowerCase()
+    if (receipts.has(id)) return true
+    const receipt = {
+      deviceId,
+      visitId: visitId.toLowerCase(),
+      attempts: 1,
+      nextAt: 0,
+      deadline: 0
+    }
+    if (!sendGiftReceiptPacket(receipt, id)) return false
+    const now = Date.now()
+    receipt.nextAt = now + receiptRetryMs
+    receipt.deadline = now + receiptTimeoutMs
+    receipts.set(id, receipt)
+    return true
+  }
+
+  function sendGiftReceiptPacket (receipt, giftId) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendTo(receipt.deviceId, encodeGiftReceived({
+        deviceId: identity.deviceId,
+        visitId: receipt.visitId,
+        giftId
+      }))
+    } catch {
+      return false
+    }
+  }
+
+  /** 回执的重发计时器（由 visitTimer 每 200ms 驱动一次）；有界、幂等。 */
+  function runReceiptRetries () {
+    if (receipts.size === 0) return
+    const now = Date.now()
+    for (const [giftId, receipt] of receipts) {
+      if (receipt.attempts >= receiptAttempts || now >= receipt.deadline) {
+        receipts.delete(giftId)
+        continue
+      }
+      if (now < receipt.nextAt) continue
+      if (!sendGiftReceiptPacket(receipt, giftId)) {
+        // 对方离线/不再放行：再发也不会到，收手。
+        receipts.delete(giftId)
+        continue
+      }
+      receipt.attempts += 1
+      receipt.nextAt += receiptRetryMs
+    }
+  }
+
+  /**
+   * 收到回执（ticket 26）：只认自己登记过的那一件，而且 deviceId / visitId 都要对得上。
+   *
+   * 幂等靠这张表：第一次就把条目摘掉，重复回执到这里就是 no-op（不重复删、不重复提示）。
+   * 摘掉之后再 await 背包，所以 `reconcileOutboundGifts` 不会把同一件当“没送到”退回去。
+   */
+  function handleGiftReceived (packet) {
+    const giftId = typeof packet?.giftId === 'string' ? packet.giftId.trim().toLowerCase() : ''
+    const pending = outboundGifts.get(giftId)
+    if (pending === undefined) return false
+    if (pending.deviceId !== packet.deviceId || pending.visitId !== packet.visitId) return false
+    outboundGifts.delete(giftId)
+    void confirmOutboundGift(giftId, pending)
+    return true
+  }
+
+  async function confirmOutboundGift (giftId, pending) {
+    if (backpack !== null) await backpack.confirmOut(giftId, pending.visitId)
+    if (disposed) return
+    // 对方确认收到了：东西从背包删掉，并在本机说一句。显式礼物本来就不在背包里，
+    // 但「收下了」仍然是这条回执带来的事实。
+    room.noteGiftReceived(pending.nickname)
+    refreshBringWindow()
+    flushRoomEffects()
+  }
+
+  /**
+   * 发起方的退包（ticket 26）：只要 room 里那次出门已经不在了，还没等到回执的礼物
+   * 就退回背包。
+   *
+   * 这是**唯一**的退包入口，所以不用在 finishOutbound / failOutbound / tick /
+   * observeVisitRecall 里各挂一次：这些结束点（回家 / 送客 / 到期 / 失联 / 请求中
+   * 被对方 recall / 本地召回）的终点都是 `state.out` 变成 null，而每个终点后面都会走
+   * `flushRoomEffects`（tick、action、onPeer 都一样）。`dispose` 另算，见
+   * `releaseOutboundGiftsOnDispose`。
+   */
+  function reconcileOutboundGifts () {
+    if (outboundGifts.size === 0) return 0
+    const out = room.outboundVisit()
+    let released = 0
+    for (const [giftId, pending] of outboundGifts) {
+      if (out !== null && out.visitId === pending.visitId) continue
+      // 先摘表再 await：连续两次 flush 不会把同一件退两遍、说两句。
+      outboundGifts.delete(giftId)
+      void releaseOutboundGift(pending)
+      released += 1
+    }
+    return released
+  }
+
+  async function releaseOutboundGift (pending) {
+    if (backpack === null) return
+    const released = await backpack.releaseOutByVisit(pending.visitId)
+    if (disposed || !released.ok || released.released.length === 0) return
+    // 真的从 out 退回了一件才说；显式礼物本来就不在背包里，不该说“退回背包”。
+    room.noteGiftNotReceived()
+    refreshBringWindow()
+    flushRoomEffects()
+  }
+
+  /**
+   * 送客提醒（ticket 26）：入站串门结束（送客 / 对方召回 / 失联 / 名单收紧）时，
+   * 若这件礼物真的收下过（有 meta）且一次都没打开过（`meta.opened === false`），
+   * 说一句「…捎来的东西还在 gifts 里。」
+   *
+   * `opened` 只存在磁盘上，所以这一步必须留在 service；room 只把“谁带着哪件走了”
+   * 交出来（`drainEndedInboundGifts`）。
+   */
+  function noteEndedInboundGifts () {
+    for (const ended of room.drainEndedInboundGifts()) {
+      const record = gifts?.lookup(ended.giftId) ?? null
+      if (record === null || record.opened !== false) continue
+      room.noteGiftLeftBehind(ended.nickname)
+    }
+  }
+
+  /**
+   * 卸载也算一次串门结束（ticket 26）：还没回执的礼物写回 idle。
+   * 下一次启动的 `load()` 本来也会把遗留 `out` 归一成 idle；这里先写回去，
+   * 是为了进程退出后立刻打开 backpack.json 看到的状态就是对的。
+   */
+  function releaseOutboundGiftsOnDispose () {
+    if (backpack === null || outboundGifts.size === 0) return
+    const visitIds = new Set([...outboundGifts.values()].map((pending) => pending.visitId))
+    outboundGifts.clear()
+    for (const visitId of visitIds) {
+      try {
+        const pending = backpack.releaseOutByVisit(visitId)
+        if (pending !== null && typeof pending?.catch === 'function') pending.catch(() => {})
+      } catch {
+        // 卸载路径不能因为磁盘失败抛出去；下一次启动的归一化会兜住。
+      }
     }
   }
 
@@ -1682,6 +1891,10 @@ export function createService (ctx, options = {}) {
       skinFetcher = null
       visitorSkins.clear()
       skinPool = []
+      // ticket 26：回执不再发了；还没回执的礼物先写回 idle，再放开背包引用。
+      receipts.clear()
+      releaseOutboundGiftsOnDispose()
+      outboundGifts.clear()
       gifts = null
       backpack = null
       request = null

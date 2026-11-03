@@ -6,7 +6,7 @@
  * - 只认本文件列出的字段，多余的字段在重建对象时被丢弃；
  * - 版本、类型、deviceId、visitId、port 逐项校验，昵称清洗 + 截断，动画名只允许安全文件名；
  * - 每种报文只写自己那几个字段：beacon/beacon-ack 是身份，heartbeat 是动作意图，
- *   visit-request/ack/deny/recall 是一次串门的生命周期；
+ *   visit-request/ack/deny/recall 是一次串门的生命周期，gift-received 是礼物的送达回执；
  * - 任何校验失败都只返回 `{ ok: false }`，不抛异常、不写盘、不读本机状态。
  *
  * 协议本身不传素材本体、不传坐标、不传项目或会话信息（ADR-0003）。素材只传引用：
@@ -61,6 +61,7 @@ export const PEER_LOST_MS = 2 * 60 * 1000
  * 串门走现有 UDP socket，不另开 TCP 监听（见 docs/protocol.md 的“为什么是 UDP”）。
  * 类型集按生命周期固定：请求 → ack/deny，任一方可发 recall，收到 recall 的一方回一条
  * `visit-recall-ack` 作为回执（recall 也会丢，发起方要靠它停止重试）。
+ * `gift-received` 是礼物自己的回执（ticket 26），与串门生命周期无关。
  */
 export const PACKET_TYPES = Object.freeze([
   'beacon',
@@ -70,7 +71,8 @@ export const PACKET_TYPES = Object.freeze([
   'visit-ack',
   'visit-deny',
   'visit-recall',
-  'visit-recall-ack'
+  'visit-recall-ack',
+  'gift-received'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -79,6 +81,8 @@ const VISIT_TYPES = new Set([
   'visit-recall',
   'visit-recall-ack'
 ])
+// `gift-received` **故意不在 VISIT_TYPES 里**：那条分支只重建 v/type/deviceId/visitId，
+// 塞进去 giftId 会被吃掉。编码与解析各有一条自己的分支（ticket 26）。
 /**
  * visit-deny 的理由是固定枚举，不是自由文本：
  * - not-admitted：本机没放行这位邻居（默认，也兼容不带 reason 的旧报文）
@@ -264,6 +268,7 @@ export function resolvePort (env = process.env) {
  *   visit-request           → { v, type, deviceId, visitId, nickname, anim[, action, semantic, say, skinPort, skinId, gift] }
  *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
+ *   gift-received           → { v, type, deviceId, visitId, giftId }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
@@ -298,6 +303,7 @@ function buildPacket ({
   anim,
   visitId,
   reason,
+  giftId,
   action,
   semantic,
   say,
@@ -337,6 +343,11 @@ function buildPacket ({
     const safeReason = reason === undefined ? 'not-admitted' : reason
     if (!isVisitDenyReason(safeReason)) throw new Error('protocol: invalid deny reason')
     packet = { ...base, visitId: visitId.toLowerCase(), reason: safeReason }
+  } else if (type === 'gift-received') {
+    // 自己的分支，别并进 VISIT_TYPES：那条只写四个字段，giftId 会在这里消失。
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
+    packet = { ...base, visitId: visitId.toLowerCase(), giftId: giftId.toLowerCase() }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -428,6 +439,15 @@ export function encodeVisitRecall ({ deviceId, visitId } = {}) {
 /** 收到 recall 的回执：让发起方立刻停止重发（它可能有两次重试在路上）。 */
 export function encodeVisitRecallAck ({ deviceId, visitId } = {}) {
   return encodePacket({ type: 'visit-recall-ack', deviceId, visitId })
+}
+
+/**
+ * 礼物的送达回执（ticket 26）：接收方**真的写进 `gifts/` 之后**才发。
+ * 发起方收到才把背包那件删掉，所以 `giftId` 是这条报文的全部意义——
+ * `visitId` 只用来核对“是不是这次串门带出去的那一件”。
+ */
+export function encodeGiftReceived ({ deviceId, visitId, giftId } = {}) {
+  return encodePacket({ type: 'gift-received', deviceId, visitId, giftId })
 }
 
 function fail (reason) {
@@ -523,6 +543,23 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         deviceId: raw.deviceId.toLowerCase(),
         visitId: raw.visitId.toLowerCase(),
         reason
+      }
+    }
+  }
+
+  // 送达回执（ticket 26）：多一个 giftId，且**不能**落进下面 VISIT_TYPES 那条分支
+  // （那里只重建四个字段，giftId 会被吃掉）。和 ack/recall 一样，别的字段一律丢弃。
+  if (raw.type === 'gift-received') {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    if (!isVisitId(raw.giftId)) return fail('gift-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase(),
+        giftId: raw.giftId.toLowerCase()
       }
     }
   }

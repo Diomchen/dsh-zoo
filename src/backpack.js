@@ -33,8 +33,9 @@ import {
  *   - 单件坏掉只跳过那件；超过两件按 `at` 留最旧的两件（并告警一次）；
  *   - 写盘失败只告警一次：本次运行内存里照常有背包，重启后可能丢。
  *
- * `out` 是「正在捎出，等回执」（回执在 ticket 26）：这类件**不可撤**——东西可能已经在
- * 对方磁盘上了。启动时把遗留的 `out` 归一成 `idle`：那次串门不可能还活着。
+ * `out` 是「正在捎出，等回执」（ticket 26）：这类件**不可撤**——东西可能已经在
+ * 对方磁盘上了。收到回执才 `confirmOut` 删掉；串门结束还没回执就 `releaseOutByVisit`
+ * 退回 `idle`。启动时把遗留的 `out` 归一成 `idle`：那次串门不可能还活着。
  */
 
 export const BACKPACK_FILE = 'backpack.json'
@@ -346,7 +347,7 @@ class BackpackStore {
 
   /**
    * 没发出去/整包超限被编码层丢掉：这一件还在本机，退回 idle。
-   * 真正「到了对方家但没回执」的退包是 ticket 26 的事，这里只处理“根本没出门”。
+   * 真正「到了对方家但没回执」的退包走 `releaseOutByVisit`（ticket 26）。
    */
   releaseOut (giftId, visitId = null) {
     return this.#enqueue(() => this.#releaseOut(giftId, visitId))
@@ -364,6 +365,59 @@ class BackpackStore {
     delete item.visitId
     const persisted = await this.#persist()
     return { ok: true, item: copyItem(item), persisted }
+  }
+
+  /**
+   * 收到回执（ticket 26）：**删掉**这一件（不是退回 idle）。
+   * 只有 `out` 能这样删——idle 件走 `remove`，免得一条伪造的回执把还没出门的东西吃掉；
+   * `visitId` 可选，给了就要求对得上（同一件礼物只可能属于一次串门）。
+   */
+  confirmOut (giftId, visitId = null) {
+    return this.#enqueue(() => this.#confirmOut(giftId, visitId))
+  }
+
+  async #confirmOut (giftId, visitId) {
+    if (!isVisitId(giftId)) return { ok: false, error: 'bad-gift', persisted: false }
+    if (visitId !== null && !isVisitId(visitId)) return { ok: false, error: 'bad-visit-id', persisted: false }
+    const id = giftId.toLowerCase()
+    const index = this.#items.findIndex((item) => item.id === id)
+    if (index < 0) return { ok: false, error: 'gift-not-found', persisted: false }
+    const item = this.#items[index]
+    if (item.state !== 'out') return { ok: false, error: 'not-out', persisted: false }
+    if (visitId !== null && item.visitId !== visitId.toLowerCase()) {
+      return { ok: false, error: 'not-out', persisted: false }
+    }
+    this.#items.splice(index, 1)
+    const persisted = await this.#persist()
+    return { ok: true, item: copyItem({ ...item, state: 'idle' }), count: this.#items.length, persisted }
+  }
+
+  /**
+   * 串门结束还没收到回执（ticket 26）：把这次带出去的 `out` 件全部退回 `idle`。
+   *
+   * 按 `visitId` 而不是 giftId 回退，是因为结束点只知道串门 id（回家 / 送客 / 到期 /
+   * 失联 / 被对方 recall 都可能发生在收到回执之前）。返回 `{ ok, released: [...] }`；
+   * 一件都没有（比如回执已经先到了）就是 `ok:false, released: []`——调用方据此不重复提示。
+   */
+  releaseOutByVisit (visitId) {
+    return this.#enqueue(() => this.#releaseOutByVisit(visitId))
+  }
+
+  async #releaseOutByVisit (visitId) {
+    if (!isVisitId(visitId)) return { ok: false, error: 'bad-visit-id', released: [], persisted: false }
+    const id = visitId.toLowerCase()
+    const released = []
+    for (const item of this.#items) {
+      if (item.state !== 'out' || item.visitId !== id) continue
+      item.state = 'idle'
+      delete item.visitId
+      released.push(copyItem(item))
+    }
+    if (released.length === 0) {
+      return { ok: false, error: 'not-out', released: [], persisted: false }
+    }
+    const persisted = await this.#persist()
+    return { ok: true, released, count: this.#items.length, persisted }
   }
 
   /**
