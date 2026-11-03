@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
 import { join } from 'node:path'
 
@@ -7,7 +8,7 @@ import { createBackpackStore } from './backpack.js'
 import { createDesktop } from './desktop.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
-import { backpackErrorText, giftPrepareFailedText } from './gift-copy.js'
+import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
   GIFT_RATE_PER_DAY,
@@ -358,8 +359,8 @@ export function createService (ctx, options = {}) {
 
     // 手动「串门」：可以指定 deviceId，也可以不带——后者是 ticket 11 的按钮路径，
     // 由宿主随机挑一位在线且互相放行的邻居。手动永远不受总开关/活动窗口限制。
-    // `gift` 是脚本/内部入口的一次性礼物（ticket 23 起保留）；不传时 ticket 24 的背包
-    // 会按「先放的先带走」自动捎上最旧的一件。手动与自发走同一条 `startOutboundVisit`。
+    // 礼物只从背包来（票 24）：按「先放的先带走」取 `at` 最小的一件。
+    // 手动与自发走同一条 `startOutboundVisit`。
     if (action === 'visit') {
       let deviceId
       if (body?.deviceId === undefined || body?.deviceId === null) {
@@ -370,10 +371,7 @@ export function createService (ctx, options = {}) {
         deviceId = actionDeviceId(body.deviceId)
         if (deviceId === null) return { ok: false, error: 'bad-device-id' }
       }
-      const gift = body?.gift !== null && typeof body?.gift === 'object' && !Array.isArray(body.gift)
-        ? body.gift
-        : null
-      return startOutboundVisit(deviceId, gift)
+      return startOutboundVisit(deviceId)
     }
 
     // 礼物卡上的四个动作（ticket 23）：只认本地页面/桌面控件；UDP 永远走不到这里。
@@ -548,17 +546,22 @@ export function createService (ctx, options = {}) {
    *
    * 路径从不来自请求体：`giftId` → 礼物 store 里的记录 → `notePath`/`dirPath`。
    * 错误码只用 SPEC 的那几个：bad-gift / gift-not-found / open-failed。
+   *
+   * 「扔掉」是唯一不需要磁盘记录的例外：卡片还在 pending / receiving / failed / refused
+   * 时本来就没有 `meta.json`，但用户仍然要能把它扔掉。
    */
   async function handleGiftAction (action, rawGiftId) {
     const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim() : ''
     if (!isVisitId(giftId)) return { ok: false, error: 'bad-gift' }
     // 没初始化 = 本次运行没有可用的礼物目录；对调用方而言与“这件东西不在了”没有区别。
     const record = gifts?.lookup(giftId) ?? null
-    if (record === null) return { ok: false, error: 'gift-not-found' }
 
     if (action === 'gift-discard') {
       // 卡片先消失、黑名单先记住（这一件重发也不会再出现）。
-      room.discardGift(record.from.deviceId, giftId)
+      room.discardGift(record?.from.deviceId ?? null, giftId)
+      // 没有磁盘记录（还没落盘 / 落盘失败 / 本次运行没有 store）：认这次「扔掉」，
+      // 只拉黑并摘掉卡片，不删任何文件；返回 ok 让渲染端不必等一个不存在的目录。
+      if (record === null) return { ok: true, action, giftId }
       // 删除以宿主为准：它拿得到绝对路径、也不依赖 helper 是否活着（HTTP 路径同样要能扔）。
       // helper 那条 gift-discard 仍然发一条：同一台桌面上的文件操作就走同一条出口，
       // 命令是幂等的（rm -rf），宿主已经删掉时它什么也不做。
@@ -576,6 +579,9 @@ export function createService (ctx, options = {}) {
       }
       return { ok: true, action, giftId }
     }
+
+    // 打开/显示/复制都需要磁盘记录：路径与正文从 store 来，没有记录就是“这件东西不在了”。
+    if (record === null) return { ok: false, error: 'gift-not-found' }
 
     // 打开/显示/复制都需要 Electron 主进程：宿主进程自己没有 shell 与剪贴板。
     if (desktop === null) return { ok: false, error: 'open-failed' }
@@ -602,7 +608,15 @@ export function createService (ctx, options = {}) {
     if (action === 'gift-copy') {
       // 只有字条有正文可复制；文件礼物的卡片不显示「复制」，这里仍然明确拒绝。
       if (record.kind !== 'text') return { ok: false, error: 'not-implemented' }
-      if (typeof desktop.giftCopy !== 'function' || desktop.giftCopy(record.text) !== true) {
+      // 规格要求「宿主读文件 → copy 命令」：用户手改过 note.txt 之后，复制到的是当前内容。
+      // 读失败（文件被删/权限/目录）才回退到内存里那份，至少还能复制到收到时的正文。
+      let text = record.text
+      try {
+        text = await readFile(record.notePath, 'utf8')
+      } catch {
+        // 磁盘读不到：保留内存值。
+      }
+      if (typeof desktop.giftCopy !== 'function' || desktop.giftCopy(text) !== true) {
         return { ok: false, error: 'open-failed' }
       }
       // 复制没有可见状态变化：明确回一句，渲染端才会冒泡，不然用户不知道点没点上。
@@ -1580,19 +1594,19 @@ export function createService (ctx, options = {}) {
    * 开始一次出门的唯一入口：手动按钮与自发策略共用同一条路径。
    * 生成 visitId、写 room 状态、发第一包、登记重试计时器；失败时由 room 给一句人话。
    *
-   * `explicitGift` 是脚本/内部入口的一次性礼物（ticket 23 起保留）；不传就按背包
-   * 「先放的先带走」取最旧的一件。编码层判定带不带得上，重发必须带同一个 gift 对象。
+   * 礼物只从背包来（票 24）：按「先放的先带走」取 `at` 最小的一件；背包空就空手出门。
+   * 编码层判定带不带得上，重发必须带同一个 gift 对象。
    */
-  async function startOutboundVisit (deviceId, explicitGift = null) {
+  async function startOutboundVisit (deviceId) {
     const visitId = randomUUID()
-    let gift = explicitGift ?? null
+    let gift = null
     // 背包里被选中的那一件；只有真的发出去才留在 out，发不出去立刻放回 idle。
     let carried = null
     let skipped = null
 
-    // 没有显式礼物时，按「先放的先带走」从背包取最旧的一件。
+    // 按「先放的先带走」从背包取最旧的一件。
     // 文件件的 size/sha256 在这里（发送那一刻）才读；读不出来就空手出门，东西留在背包。
-    if (gift === null && backpack !== null) {
+    if (backpack !== null) {
       const picked = backpack.oldestIdle()
       if (picked !== null) {
         const prepared = await backpack.prepareGift(picked)
@@ -1646,7 +1660,6 @@ export function createService (ctx, options = {}) {
     }
     if (sent.gift !== null && sent.gift !== undefined) {
       // 从这一刻起这件礼物在等回执（ticket 26）：收到就删件，串门结束还没收到就退包。
-      // 显式礼物（脚本入口）也登记：对方确认收到了就该说一句，哪怕背包里本来没有它。
       // 键一律小写：回执里的 giftId 由协议层归一，这里不能因为调用方传了大写而漏认。
       const giftId = typeof sent.gift.id === 'string' ? sent.gift.id.toLowerCase() : ''
       if (giftId !== '') {
@@ -2090,8 +2103,7 @@ export function createService (ctx, options = {}) {
   async function confirmOutboundGift (giftId, pending) {
     if (backpack !== null) await backpack.confirmOut(giftId, pending.visitId)
     if (disposed) return
-    // 对方确认收到了：东西从背包删掉，并在本机说一句。显式礼物本来就不在背包里，
-    // 但「收下了」仍然是这条回执带来的事实。
+    // 对方确认收到了：东西从背包删掉，并在本机说一句「收下了」。
     room.noteGiftReceived(pending.nickname)
     refreshBringWindow()
     flushRoomEffects()
@@ -2125,7 +2137,7 @@ export function createService (ctx, options = {}) {
     if (backpack === null) return
     const released = await backpack.releaseOutByVisit(pending.visitId)
     if (disposed || !released.ok || released.released.length === 0) return
-    // 真的从 out 退回了一件才说；显式礼物本来就不在背包里，不该说“退回背包”。
+    // 真的从 out 退回了一件才说；没退到东西时不该凭空说“退回背包”。
     room.noteGiftNotReceived()
     refreshBringWindow()
     flushRoomEffects()

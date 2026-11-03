@@ -131,7 +131,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `unbring` | `{ "giftId": "<uuid>" }` | 从背包撤掉；只有 `idle` 件能撤，`out` 中的东西可能已经在对方磁盘上 |
 | `gift-open` | `{ "giftId": "<uuid>" }` | 用系统程序打开（字条=`note.txt`，文件=本体）；**永不自动打开** |
 | `gift-reveal` | `{ "giftId": "<uuid>" }` | 在文件夹里显示 |
-| `gift-discard` | `{ "giftId": "<uuid>" }` | 扔掉：立刻整目录删除，并记进本次运行的黑名单 |
+| `gift-discard` | `{ "giftId": "<uuid>" }` | 扔掉：有磁盘记录就立刻整目录删除；没有记录（`pending` / `receiving` / `failed` / `refused`）只拉黑、不碰文件。两种情况都记进本次运行的黑名单 |
 | `gift-copy` | `{ "giftId": "<uuid>" }` | 字条正文进剪贴板；文件没有可复制正文，明确拒绝 |
 
 ### 名字只有一份（ADR-0007）
@@ -373,7 +373,7 @@ v1 把心跳影子画成“访客”；v2 不画它。它现在是**在线/互�
 
 ## 礼物字段（`visit-request.gift`，ticket 23 / 25）
 
-礼物只随串门走：它只出现在 `visit-request` 里，一次串门最多一件。没有单独的「送礼」报文。
+礼物只随串门走：它只出现在 `visit-request` 里，一次串门最多一件。没有单独的礼物报文。
 
 ```json
 { "id": "<uuid>", "kind": "text", "text": "给你留了张便条…" }

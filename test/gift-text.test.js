@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { GIFT_STATUSES, giftStatusText, giftTitleText, isGiftStatus } from '../src/gift-copy.js'
+import { GIFT_STATUSES, giftStatusText, giftTitleText, isGiftStatus } from '../src/gift-text.js'
 
 test('giftTitleText：字条/文件两种说法，昵称照协议清洗，缺失退到「邻居」', () => {
   assert.equal(giftTitleText('楼下的柯基'), '「楼下的柯基」捎来一张字条')
@@ -31,7 +31,7 @@ test('状态文案：五种状态齐全；received 不给解释，failed/refused
 })
 
 test('背包文案：五个错误码都有人话；文件没带上时带名字且不猜原因', async () => {
-  const copy = await import('../src/gift-copy.js')
+  const copy = await import('../src/gift-text.js')
   assert.match(copy.backpackErrorText('backpack-full'), /两件/)
   assert.match(copy.backpackErrorText('too-large'), /16 MB/)
   assert.match(copy.backpackErrorText('no-such-file'), /不在了/)

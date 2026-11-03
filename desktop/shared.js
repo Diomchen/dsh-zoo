@@ -162,8 +162,21 @@
    */
   const MAX_NAME_LENGTH = 32
   /**
-   * 字条正文上限（码点），与 `src/protocol.js` 的 `MAX_GIFT_TEXT` 同一个数。
-   * helper 是另一个进程，各自守自己的边界：宿主已经清过一遍，这里再夹一次。
+   * 礼物/背包上限为什么在 shared.js 里再抄一遍：
+   *
+   * `desktop/shared.js` 是**普通 script**——渲染端用 `<script>` 加载、主进程直接读，
+   * 不能 import `src/protocol.js` 那套 ESM；helper 又是另一个进程，必须自己守边界。
+   * 所以这几个数与宿主同源，但两侧的失败策略刻意不同，改的时候别只改一边：
+   *
+   *   - 字条超 500 码点：宿主 `sanitizeNote` 与背包 `normalizeBringInput` **丢弃**
+   *     （这次不带/不收）；渲染端 `normalizeNoteText` 只**截断**——已经收到的卡片
+   *     不能因为显示层超限而整张消失。
+   *   - 文件名超 120 码点：宿主 `sanitizeGiftName` **截断**（名字只给人看）；
+   *     渲染端 `normalizeGiftName` 返回 null、**丢掉整张卡**（文件卡没有名字就画不出来）。
+   *   - 文件 >16 MiB：宿主 `normalizeGift` **丢弃**这件礼物；渲染端同样丢卡
+   *     （卡片要显示大小，缺了就没有意义）。
+   *   - 背包 >2 件：宿主 `backpack.add` 拒绝并回 `backpack-full`；渲染端只画宿主下发的
+   *     前两件，多出来的不显示（列表本身有界，不做静默替换）。
    */
   const MAX_GIFT_TEXT_LENGTH = 500
   /** 背包上限（件），与 `src/backpack.js` 的 `MAX_BACKPACK_ITEMS` 同一个数。 */
@@ -174,7 +187,7 @@
   const MAX_GIFT_NAME_LENGTH = 120
   /** 一次场景最多几件礼物（≤ 访客数）；上限只为让一条消息有界，不表达产品限额。 */
   const MAX_GIFT_ITEMS = 64
-  /** 礼物的状态词表，与 `src/gift-copy.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
+  /** 礼物的状态词表，与 `src/gift-text.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
   const GIFT_STATUSES = ['pending', 'receiving', 'received', 'failed', 'refused']
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */

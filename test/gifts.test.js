@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import test from 'node:test'
@@ -10,6 +10,7 @@ import {
   GIFTS_DIR,
   META_FILE,
   NOTE_FILE,
+  ORPHAN_DIR_TTL_MS,
   createGiftStore,
   giftDirName,
   giftDirPath,
@@ -223,6 +224,35 @@ test('createGiftStore：markOpened 落盘；discard 整目录删除且幂等失�
   assert.equal(await readdir(join(dir, GIFTS_DIR)).then((list) => list.length), 0)
   assert.deepEqual(await store.discard(id), { ok: false, error: 'gift-not-found' })
   assert.deepEqual(await store.discard('gift-1'), { ok: false, error: 'bad-gift' })
+})
+
+test('createGiftStore：载入时清掉没有有效 meta 且超过 1 小时的孤儿目录；新目录不动', async (t) => {
+  const dir = await tempDir(t)
+  const warnings = []
+  const store = await createGiftStore(dir, { log: { warn: (line) => warnings.push(line) } })
+  const keptId = randomUUID()
+  const kept = await store.receiveText({ id: keptId, from: from(), text: '正常礼物', receivedAt: T0 })
+  assert.equal(kept.ok, true)
+
+  const giftsDir = join(dir, GIFTS_DIR)
+  // 中断的下载：目录里只有一个 .part，没有 meta.json。
+  const oldOrphan = join(giftsDir, giftDirName(randomUUID(), T0))
+  await mkdir(oldOrphan, { recursive: true })
+  await writeFile(join(oldOrphan, 'dead.part'), 'partial', 'utf8')
+  const oldAt = new Date(Date.now() - ORPHAN_DIR_TTL_MS - 60_000)
+  await utimes(oldOrphan, oldAt, oldAt)
+
+  // 刚写了一半的新目录：同样没有 meta，但 mtime 很新，绝不能动。
+  const newOrphan = join(giftsDir, giftDirName(randomUUID(), T0 + 1))
+  await mkdir(newOrphan, { recursive: true })
+  await writeFile(join(newOrphan, 'live.part'), 'partial', 'utf8')
+
+  const reloaded = await createGiftStore(dir, { log: { warn: (line) => warnings.push(line) } })
+  assert.deepEqual(reloaded.list().map((gift) => gift.id), [keptId], '有效礼物照常读回')
+  const dirs = await readdir(giftsDir)
+  assert.equal(dirs.includes(basename(oldOrphan)), false, '超过 1 小时的孤儿目录被清掉')
+  assert.equal(dirs.includes(basename(newOrphan)), true, '刚写了一半的新目录不动')
+  assert.equal(warnings.filter((line) => /中断的下载目录/.test(line)).length, 1, '清理只告警一次')
 })
 
 test('createGiftStore：gifts 路径被文件占住时只返回 write 失败，不抛、不内伤', async (t) => {

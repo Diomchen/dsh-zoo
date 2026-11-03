@@ -140,7 +140,8 @@ GET /local-pet-gift/<giftId>   → 文件本体
 - 动作（走既有 action 事件，宿主只认本地来路）：
   `gift-open` / `gift-reveal` / `gift-discard`，字条另有 `gift-copy`。
 - **卡片跟着访客**：访客回家/被送客/失联 → 卡片收起。`gift-discard` 之后永不再出现。
-- 送客时若这件礼物一次都没打开过，冒一句：「「楼下的柯基」捎来的东西还在 gifts 里。」
+- 入站串门结束时（送客 / 对方召回 / 失联 / 清场）若这件礼物一次都没打开过，
+  冒一句：「「楼下的柯基」捎来的东西还在 gifts 里。」
 
 ### 跨进程字段要过的四道白名单
 
@@ -165,7 +166,10 @@ GET /local-pet-gift/<giftId>   → 文件本体
   receivedAt, opened }`。字条正文在这里留一份，`note.txt` 是给人看的那份。
 - 单件 ≤16 MiB；`gifts/` 总量 ≤500 MiB 且 ≤200 件，超了按 `receivedAt` 删最旧（整目录删）。
 - 同一邻居 ≤10 件/小时、≤50 件/天；超了 `refused`（原因 `rate`），不落盘、不回执。
-- 「扔掉」= 立即删目录，并记进本次运行的黑名单，卡片立刻消失。
+- 「扔掉」= 有磁盘记录就立即删目录；没有记录（`pending` / `receiving` / `failed` / `refused`）
+  只拉黑、不碰文件。两种情况都记进本次运行的黑名单，卡片立刻消失。
+- 载入 `gifts/` 时清掉**没有有效 `meta.json` 且 mtime 超过 1 小时**的目录（拉取中断留下的
+  `.part`）；刚写了一半的新目录不动。运行中的限额清理仍然不删陌生目录。
 
 ## 记录与状态出口
 
@@ -190,8 +194,8 @@ GET /local-pet-gift/<giftId>   → 文件本体
 | `unbring` | `{ giftId }` | 从背包撤掉（仅 `idle`） |
 | `gift-open` | `{ giftId }` | 用系统程序打开（字条=note.txt，文件=本体） |
 | `gift-reveal` | `{ giftId }` | 在文件夹里显示 |
-| `gift-discard` | `{ giftId }` | 扔掉（删目录） |
-| `gift-copy` | `{ giftId }` | 字条正文进剪贴板（宿主读文件 → 新命令 `copy-text` → helper 的 `clipboard.writeText`） |
+| `gift-discard` | `{ giftId }` | 扔掉：有磁盘记录删目录，没有记录只拉黑（卡片一样立刻消失） |
+| `gift-copy` | `{ giftId }` | 字条正文进剪贴板（宿主读 `note.txt` → `gift-copy` 命令 → helper 的 `clipboard.writeText`） |
 
   错误码：`bad-gift` / `too-large` / `backpack-full` / `no-such-file` / `gift-not-found` /
   `open-failed` / `gift-out`.
@@ -201,7 +205,7 @@ GET /local-pet-gift/<giftId>   → 文件本体
 - 礼物路由**不信任报文里的任何路径**；只读背包登记的本机绝对路径。
 - 只连私网/回环地址（复用 `isPrivateAddress`）。
 - 大小与 sha256 双校验；不符不落盘；先写临时文件再 rename，不产生半个文件。
-- 文件名清洗：去路径分隔符、控制字符、前导点，≤120 码点，空则 `file-<id>`；
+- 文件名清洗：去路径分隔符、控制字符、前导点，≤120 码点，空则 `file`；
   目录已存在就加后缀，绝不覆盖已有礼物。
 - **永不自动打开、永不执行**；卡片用 `textContent`，不渲染 HTML/Markdown。
 - 连接 5s / 总计 20s 超时；单件 16 MiB；每来源失败后冷却 60s。
@@ -230,7 +234,7 @@ GET /local-pet-gift/<giftId>   → 文件本体
 ## Out of Scope
 
 - 文件夹、多选、URL/链接卡片、礼物历史界面。
-- 「只送礼不串门」、递给访客带回家、回礼确认。
+- 「只把东西带过去、人不进门」、递给访客带回家、回礼确认。
 - 单独的「不收礼物」开关。
 - 礼物内容的端到端加密（局域网信任模型未变）。
 - 大于 16 MB 的文件（请用别的工具）。

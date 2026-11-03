@@ -44,7 +44,7 @@
 > 三次始终用 `request.gift` 里同一个对象，不会在重试里重算 hash。
 > **宿主**：`POST /local-pet/action` 新增 `bring`（不带物品 = 打开小窗；带 `{kind,text|path}`
 > 或小窗的 `gift` = 放进背包）与 `unbring`；错误码 `bad-gift` / `too-large` / `backpack-full` /
-> `no-such-file` / `gift-out` / `gift-not-found`，文案统一在 `src/gift-copy.js`。
+> `no-such-file` / `gift-out` / `gift-not-found`，文案统一在 `src/gift-text.js`。
 > `startOutboundVisit` 变 async（文件要 stat/hash），自动串门也 await 同一条路径。
 > **小窗**：`desktop/gift.html|gift.js|gift-preload.js`，独立 preload、focusable、无边框透明、
 > `hadFocus` 后才按失焦关、提交后 10s 超时；桥只有
@@ -56,7 +56,7 @@
 > `desktop/shared.js` 的 `MENU_TOOL_IDS`）都加上了「带派」，点一级工具项只发一个空 `bring`。
 > **测试**：新增 `test/backpack.test.js`（14）、`test/bring-e2e.test.js`（4：背包动作/错误码/
 > 小窗提交回路、出门带最旧一件且三次重发同一对象、文件元数据在发送时才算、源文件消失不挡串门），
-> 另在 `test/desktop.test.js`（5）、`test/gift-copy.test.js`（1）、`test/protocol-gift.test.js`（1）
+> 另在 `test/desktop.test.js`（5）、`test/gift-text.test.js`（1）、`test/protocol-gift.test.js`（1）
 > 补了白名单/编码/文案；`npm test` 全绿 **391** 条（原 366 + 新 25）。
 > **冒烟**：`npm run smoke:desktop` 全量通过 360 项断言（本机 Chromium sandbox 起不来，
 > 需同时带 `LOCAL_PET_SMOKE_NO_SANDBOX=1 LOCAL_PET_HELPER_NO_SANDBOX=1`）。

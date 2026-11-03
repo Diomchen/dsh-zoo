@@ -34,6 +34,10 @@ import {
  * 剪一次，超了按 `receivedAt` 删最旧的整个目录。先写后剪的顺序是刻意的——限额再紧也不能
  * 让刚到的这一件写不进去。清理只删有合法 meta 的目录（以及能读出 meta 的目录），
  * 正在下载的目录一律跳过。
+ *
+ * 载入时另清一类：**没有有效 meta.json 且 mtime 超过 1 小时**的目录。拉取中断会留下
+ * 只有 `.part` 的目录，`#pruneDisk` 按“不删陌生目录”的规矩永远不碰它们；载入这一刻
+ * 还没有任何下载在进行，正好按年龄清掉。刚写了一半的新目录 mtime 很新，不会被误删。
  */
 
 export const GIFTS_DIR = 'gifts'
@@ -46,6 +50,8 @@ export const MAX_GIFT_INDEX = 200
 export const MAX_GIFT_TOTAL_BYTES = 500 * 1024 * 1024
 /** `gifts/` 目录数上限（SPEC v4「存储与限额」）：200 件。 */
 export const MAX_GIFT_COUNT = MAX_GIFT_INDEX
+/** 载入时清理“中断的下载目录”的年龄门槛：mtime 超过 1 小时才算孤儿。 */
+export const ORPHAN_DIR_TTL_MS = 60 * 60 * 1000
 
 /** 目录名：`20261103-153245-ab12cd12`，可读的时间前缀 + gift id 前 8 位。 */
 const GIFT_DIR_RE = /^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$/
@@ -197,9 +203,10 @@ class GiftStore {
 
   /** 启动时把已经收到的礼物读回索引；坏一条只跳过那一条。 */
   async load () {
+    const giftsDir = join(this.#dir, GIFTS_DIR)
     let entries
     try {
-      entries = await readdir(join(this.#dir, GIFTS_DIR), { withFileTypes: true })
+      entries = await readdir(giftsDir, { withFileTypes: true })
     } catch (error) {
       if (error?.code !== 'ENOENT') {
         this.#warnOnce('read', '礼物目录读不出来，本次按“没有礼物”运行（' + errorName(error) + '）')
@@ -208,22 +215,41 @@ class GiftStore {
     }
 
     let dropped = 0
+    let pruned = 0
+    const now = Date.now()
     for (const entry of entries) {
       if (!entry.isDirectory() || !isGiftDirName(entry.name)) continue
-      let raw
+      const dirPath = join(giftsDir, entry.name)
+      let raw = null
       try {
-        raw = JSON.parse(await readFile(join(this.#dir, GIFTS_DIR, entry.name, META_FILE), 'utf8'))
+        raw = JSON.parse(await readFile(join(dirPath, META_FILE), 'utf8'))
       } catch {
-        dropped += 1
-        continue
+        // 缺 meta / 坏 JSON：先当成“没有有效 meta”，下面再按年龄决定清不清。
       }
-      const meta = normalizeGiftMeta(raw)
+      const meta = raw === null ? null : normalizeGiftMeta(raw)
       // meta 里的 dir 必须就是所在的目录：防一份复制来的 meta 指向别处。
       if (meta === null || meta.dir !== entry.name) {
+        // 拉取中断留下的 .part 目录：没有有效 meta，mtime 又超过 1 小时 = 没人还在写。
+        // 新开/刚写了一半的目录 mtime 很新，这里绝不动它们。
+        if (await isStaleGiftOrphan(dirPath, now)) {
+          try {
+            await rm(dirPath, { recursive: true, force: true })
+            pruned += 1
+            continue
+          } catch {
+            // 删不掉就按普通坏目录跳过；下次载入再试。
+          }
+        }
         dropped += 1
         continue
       }
       this.#index.set(meta.id, this.#record(meta.id, meta))
+    }
+    if (pruned > 0) {
+      this.#warnOnce(
+        'orphan',
+        '清掉了 ' + pruned + ' 个中断的下载目录（没有有效 meta.json 且超过 1 小时）'
+      )
     }
     if (dropped > 0) {
       this.#warnOnce('meta', '礼物目录里有 ' + dropped + ' 份 meta.json 读不出来，已跳过（东西还在磁盘上）')
@@ -522,7 +548,8 @@ class GiftStore {
    * 三个“绝不”：
    *   - 绝不删刚写进来的这一件（`keepDirName`）——先写后剪就是为了它一定能落盘；
    *   - 绝不删正在下载的目录（`#pendingFiles` 里还有它的落点）；
-   *   - 绝不删没有合法 meta 的陌生目录（读不出 `receivedAt` 就不知道谁更旧）。
+   *   - 绝不删没有合法 meta 的陌生目录（读不出 `receivedAt` 就不知道谁更旧）；
+   *     载入时的孤儿清理是唯一的例外，见 `load()`。
    * 清理失败只告警一次，不影响这次收礼物。
    */
   async #pruneDisk (keepDirName = null) {
@@ -728,4 +755,16 @@ function normalizeFileGift (input) {
 
 function errorName (error) {
   return error?.code || (error instanceof Error ? error.name : 'unknown')
+}
+
+/**
+ * 载入时的孤儿目录判定：没有有效 meta.json，且**目录本身的 mtime** 超过 1 小时。
+ * 只用于 load（此时不可能有下载在进行）；运行中的 `#pruneDisk` 仍然不删陌生目录。
+ */
+async function isStaleGiftOrphan (dirPath, now = Date.now()) {
+  try {
+    return now - (await stat(dirPath)).mtimeMs > ORPHAN_DIR_TTL_MS
+  } catch {
+    return false
+  }
 }

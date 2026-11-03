@@ -39,7 +39,7 @@
 > 新模块 `src/gifts.js` 负责落盘 `<dataDir>/gifts/<yyyyMMdd>-<HHmmss>-<id前8位>/note.txt`
 > （目录名由 `receivedAt` 的本地时间 + id 前 8 位推出，meta 记录 `id`/`dir`），两个文件都
 > tmp + rename，meta 坏了只跳过并告警一次，路径只由校验过的目录名拼出来。
-> `src/gift-copy.js` 是标题/状态文案唯一表（failed/refused 预留、措辞不猜原因）。
+> `src/gift-text.js` 是标题/状态文案唯一表（failed/refused 预留、措辞不猜原因）。
 > `controls.gifts` 在 `src/desktop-pets.js` 由 visitor 推出（访客走了卡片自然没有），
 > `desktop/shared.js` 的 `emptyControls`/`normalizeControls`/helper 事件/命令白名单四处都放行
 > 礼物字段与 giftId。
@@ -72,8 +72,9 @@
 > 留给后面票的坑：
 > - `gift.kind` 现在只认 `'text'`；文件礼物（25）要同时扩 `normalizeGift`、`gifts.js` 的 meta、
 >   `room.visitorGift`、`shared.normalizeControls` 与渲染端的 kind 分支，**四处都改才不会静默丢**。
-> - `visit` action 现在接受一个内部/脚本用的 `gift` 参数（本票用它验完整条线）；24 做背包时
->   把它换成「背包里 at 最小的那件」，重发仍要带同一件（`request.gift` 已经这么存）。
+> - `visit` action 曾接受一个内部/脚本用的 `gift` 参数（本票用它验完整条线）；24 把它换成
+>   「背包里 at 最小的那件」，本次评审把临时入口整个删掉——礼物只能从背包来，
+>   重发仍要带同一件（`request.gift` 已经这么存）。
 > - `meta.opened` 已经在 gift-open 成功时落盘，26 的「送客时提醒一次」可以直接用。
 > - `gifts` 磁盘限额/按 receivedAt 删最旧、`/local-pet/state` 的 `backpack`/`gifts` 列表、
 >   `visits.json` 的 `gift` 字段都还没做（27）；store 已有 `list()` 与 200 条内存索引。
