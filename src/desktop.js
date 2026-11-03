@@ -524,13 +524,41 @@ export function createDesktop (options = {}) {
    * 让 helper 去拒等于把一条垃圾行留在两进程之间。
    */
   function openUrl (url) {
-    const normalized = shared.normalizeHostCommand({ type: 'open-url', url })
+    return sendHostCommand({ type: 'open-url', url })
+  }
+
+  /**
+   * 宿主 → helper 的命令统一从这里过白名单再写管道。坏路径/坏文本在**发出去之前**
+   * 就被丢掉，不会把一行垃圾留在两个进程之间。
+   */
+  function sendHostCommand (command) {
+    const normalized = shared.normalizeHostCommand(command)
     if (normalized.ok !== true) return false
     try {
       return send(normalized.command)
     } catch {
       return false
     }
+  }
+
+  /**
+   * 礼物卡的系统动作（ticket 23）：打开便条 / 在文件夹里显示 / 复制正文 / 删掉礼物目录。
+   * 路径由宿主从礼物 store 里取，渲染端只发 giftId；helper 只负责执行。
+   */
+  function giftOpen (filePath) {
+    return sendHostCommand({ type: 'gift-open', path: filePath })
+  }
+
+  function giftReveal (filePath) {
+    return sendHostCommand({ type: 'gift-reveal', path: filePath })
+  }
+
+  function giftCopy (text) {
+    return sendHostCommand({ type: 'gift-copy', text })
+  }
+
+  function giftDiscard (dirPath) {
+    return sendHostCommand({ type: 'gift-discard', path: dirPath })
   }
 
   function show () {
@@ -709,6 +737,10 @@ export function createDesktop (options = {}) {
     hide,
     reload,
     openUrl,
+    giftOpen,
+    giftReveal,
+    giftCopy,
+    giftDiscard,
     actionResult,
     shot,
     requestStatus,

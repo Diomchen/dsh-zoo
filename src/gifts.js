@@ -1,0 +1,391 @@
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
+import { isDeviceId, isVisitId, normalizeNickname, sanitizeNote } from './protocol.js'
+
+/**
+ * 入站礼物的落盘：`<dataDir>/gifts/<dir>/note.txt` + `meta.json`。
+ *
+ * 目录名的选择（SPEC v4 的两处说法在票 23 里这样统一）：
+ *   - **wire 上的 `gift.id` 是 UUID**（复用 `isVisitId`），也是 action 里唯一的键；
+ *   - 磁盘目录用人能读的时间前缀：`20261103-153245-ab12cd12`（`receivedAt` 的本地时间 +
+ *     id 前 8 位），`meta.json` 里同时记 `id` 与 `dir`。这样在 Finder 里翻 `gifts/`
+ *     能看出“什么时候收到的”，而所有查找仍然只按 UUID。
+ *
+ * 安全与容错：
+ *   - 拼路径只用**校验过的目录名**（`^\\d{8}-\\d{6}-[0-9a-f]{8}(-\\d+)?$`），
+ *     报文里的任何字符串都不会进 `join()`；
+ *   - 两个文件都先写同目录的 `.tmp-<uuid>` 再 rename，不留半个文件；
+ *   - 文件坏了 / 读不出来只跳过那一条，告警一次；礼物坏了最多让一张卡变 `failed`，
+ *     绝不把串门拖下水（ADR-0011）。
+ *
+ * 目录已存在时：同一 `gift.id` 的重试**原地覆盖**（幂等）；不同 id 撞名就加后缀，
+ * 绝不覆盖别人已经收到的礼物。
+ */
+
+export const GIFTS_DIR = 'gifts'
+export const NOTE_FILE = 'note.txt'
+export const META_FILE = 'meta.json'
+export const GIFT_META_VERSION = 1
+/** 内存索引上限（/state 与 action 都只服务最近的礼物）；磁盘清理由 ticket 27 做。 */
+export const MAX_GIFT_INDEX = 200
+
+/** 目录名：`20261103-153245-ab12cd12`，可读的时间前缀 + gift id 前 8 位。 */
+const GIFT_DIR_RE = /^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$/
+const FALLBACK_NICKNAME = '邻居'
+
+function pad (value, width = 2) {
+  return String(value).padStart(width, '0')
+}
+
+/**
+ * 由 `receivedAt` 的**本地时间**与 gift id 推出目录名。
+ * 本地时间不是逻辑必需，但把人真正翻文件夹的那一刻变得可读；真正的键始终是 meta 里的 id。
+ */
+export function giftDirName (giftId, receivedAt) {
+  if (!isVisitId(giftId)) return null
+  const at = Number.isFinite(receivedAt) && receivedAt > 0 ? receivedAt : Date.now()
+  const date = new Date(at)
+  const stamp = String(date.getFullYear()) +
+    pad(date.getMonth() + 1) +
+    pad(date.getDate()) + '-' +
+    pad(date.getHours()) +
+    pad(date.getMinutes()) +
+    pad(date.getSeconds())
+  return stamp + '-' + giftId.toLowerCase().slice(0, 8)
+}
+
+/** 合法的磁盘目录名（也是 load 与 discard 的唯一路径来源）。 */
+export function isGiftDirName (value) {
+  return typeof value === 'string' && GIFT_DIR_RE.test(value)
+}
+
+/** 目录名 → 绝对路径；非法名字返回 null，调用方据此拒绝，而不是拼一个奇怪的路径。 */
+export function giftDirPath (dataDir, dirName) {
+  if (typeof dataDir !== 'string' || dataDir === '') return null
+  if (!isGiftDirName(dirName)) return null
+  return join(dataDir, GIFTS_DIR, dirName)
+}
+
+/**
+ * 读回来的 `meta.json` 白名单。形状不对返回 null，由 store 跳过并告警一次。
+ * `version` 缺省容忍（手改过的老文件），但明确写了别的版本就不认。
+ */
+export function normalizeGiftMeta (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (value.version !== undefined && value.version !== GIFT_META_VERSION) return null
+  if (!isVisitId(value.id)) return null
+  if (!isGiftDirName(value.dir)) return null
+  const from = value.from
+  if (from === null || typeof from !== 'object' || Array.isArray(from)) return null
+  if (!isDeviceId(from.deviceId)) return null
+  // 本版本只会写 kind:'text'；文件礼物（ticket 25）会加自己的分支，旧端读到就跳过。
+  if (value.kind !== 'text') return null
+  const text = sanitizeNote(value.text)
+  if (text === null) return null
+  const receivedAt = Number(value.receivedAt)
+  if (!Number.isFinite(receivedAt) || receivedAt <= 0) return null
+  return {
+    id: value.id.toLowerCase(),
+    dir: value.dir,
+    from: {
+      deviceId: from.deviceId.toLowerCase(),
+      nickname: normalizeNickname(from.nickname) ?? FALLBACK_NICKNAME
+    },
+    kind: 'text',
+    text,
+    receivedAt: Math.floor(receivedAt),
+    opened: value.opened === true
+  }
+}
+
+export async function createGiftStore (dir, { log } = {}) {
+  if (typeof dir !== 'string' || dir === '') throw new Error('gifts: missing data directory')
+  const store = new GiftStore({ dir, log })
+  await store.load()
+  return store
+}
+
+class GiftStore {
+  #dir
+  #log
+  /** giftId（小写 UUID）→ 记录；记录里的 dir/路径只由校验过的目录名拼出来。 */
+  #index = new Map()
+  #warned = new Set()
+  /**
+   * 串行化所有写操作。同一个 gift.id 的重试报文可能先后脚到达：两条异步链都先看到
+   * “目录还不存在”，就会各建一个目录（第二条加后缀）。串起来之后第二条看到的是
+   * 第一条写好的索引，原地覆盖——幂等这件事必须在**异步并发**下也成立。
+   */
+  #chain = Promise.resolve()
+
+  constructor ({ dir, log }) {
+    this.#dir = dir
+    this.#log = log
+  }
+
+  #enqueue (task) {
+    const run = this.#chain.then(task, task)
+    this.#chain = run.then(() => {}, () => {})
+    return run
+  }
+
+  /** 启动时把已经收到的礼物读回索引；坏一条只跳过那一条。 */
+  async load () {
+    let entries
+    try {
+      entries = await readdir(join(this.#dir, GIFTS_DIR), { withFileTypes: true })
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.#warnOnce('read', '礼物目录读不出来，本次按“没有礼物”运行（' + errorName(error) + '）')
+      }
+      return
+    }
+
+    let dropped = 0
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !isGiftDirName(entry.name)) continue
+      let raw
+      try {
+        raw = JSON.parse(await readFile(join(this.#dir, GIFTS_DIR, entry.name, META_FILE), 'utf8'))
+      } catch {
+        dropped += 1
+        continue
+      }
+      const meta = normalizeGiftMeta(raw)
+      // meta 里的 dir 必须就是所在的目录：防一份复制来的 meta 指向别处。
+      if (meta === null || meta.dir !== entry.name) {
+        dropped += 1
+        continue
+      }
+      this.#index.set(meta.id, this.#record(meta.id, meta))
+    }
+    if (dropped > 0) {
+      this.#warnOnce('meta', '礼物目录里有 ' + dropped + ' 份 meta.json 读不出来，已跳过（东西还在磁盘上）')
+    }
+    this.#pruneIndex()
+  }
+
+  /** 只读副本；找不到返回 null。 */
+  lookup (giftId) {
+    if (!isVisitId(giftId)) return null
+    const record = this.#index.get(giftId.toLowerCase())
+    return record === undefined ? null : copyRecord(record)
+  }
+
+  /** 最近的礼物，最新在前（/local-pet/state 用，ticket 27 接）。 */
+  list () {
+    return [...this.#index.values()]
+      .map(copyRecord)
+      .sort((left, right) => right.receivedAt - left.receivedAt)
+  }
+
+  /**
+   * 收下一张字条：写 `note.txt` + `meta.json`。
+   * 任何失败都只回 `{ ok:false }`，由调用方把卡片标成 failed；异常绝不冒到串门流程里。
+   */
+  receiveText (input = {}) {
+    return this.#enqueue(() => this.#receiveText(input))
+  }
+
+  async #receiveText ({ id, from, text, receivedAt } = {}) {
+    if (!isVisitId(id)) return { ok: false, error: 'bad-gift' }
+    const giftId = id.toLowerCase()
+    const note = sanitizeNote(text)
+    const deviceId = isDeviceId(from?.deviceId) ? from.deviceId.toLowerCase() : null
+    if (note === null || deviceId === null) return { ok: false, error: 'bad-gift' }
+    const nickname = normalizeNickname(from?.nickname) ?? FALLBACK_NICKNAME
+    const at = Number.isFinite(receivedAt) && receivedAt > 0 ? Math.floor(receivedAt) : Date.now()
+
+    const existing = this.#index.get(giftId)
+    let allocated = null
+    try {
+      if (existing !== undefined) {
+        allocated = { dirPath: existing.dirPath, dirName: existing.dirName, created: false }
+      } else {
+        await mkdir(join(this.#dir, GIFTS_DIR), { recursive: true, mode: 0o700 })
+        allocated = await allocateDir(join(this.#dir, GIFTS_DIR), giftDirName(giftId, at), giftId)
+      }
+      const meta = {
+        version: GIFT_META_VERSION,
+        id: giftId,
+        dir: allocated.dirName,
+        from: { deviceId, nickname },
+        kind: 'text',
+        text: note,
+        receivedAt: at,
+        // 同一件礼物被重发/重试时保留“已经打开过”，不该又变回没看过。
+        opened: existing?.opened === true
+      }
+      await writeFileAtomic(join(allocated.dirPath, NOTE_FILE), note + '\n')
+      await writeFileAtomic(join(allocated.dirPath, META_FILE), JSON.stringify(meta, null, 2) + '\n')
+
+      const record = this.#record(giftId, {
+        id: giftId,
+        dir: allocated.dirName,
+        from: meta.from,
+        kind: 'text',
+        text: note,
+        receivedAt: at,
+        opened: meta.opened
+      })
+      this.#index.set(giftId, record)
+      this.#pruneIndex()
+      return { ok: true, gift: copyRecord(record) }
+    } catch (error) {
+      // 只清掉这次新开的目录；已有礼物（重试写失败）留原样，别把上次那份也删了。
+      if (allocated?.created === true) {
+        await rm(allocated.dirPath, { recursive: true, force: true }).catch(() => {})
+      }
+      this.#warnOnce('write', '礼物写不进去，这张卡片会显示“没取到”（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+  }
+
+  /** 「打开」成功后记一笔；写不进 meta 不影响东西已经被系统打开。 */
+  markOpened (giftId) {
+    return this.#enqueue(() => this.#markOpened(giftId))
+  }
+
+  async #markOpened (giftId) {
+    if (!isVisitId(giftId)) return false
+    const record = this.#index.get(giftId.toLowerCase())
+    if (record === undefined) return false
+    if (record.opened) return true
+    const meta = {
+      version: GIFT_META_VERSION,
+      id: record.id,
+      dir: record.dirName,
+      from: { ...record.from },
+      kind: 'text',
+      text: record.text,
+      receivedAt: record.receivedAt,
+      opened: true
+    }
+    try {
+      await writeFileAtomic(record.metaPath, JSON.stringify(meta, null, 2) + '\n')
+      record.opened = true
+      return true
+    } catch (error) {
+      this.#warnOnce('opened', '礼物的 opened 标记没写进去（东西本身还在）' + '（' + errorName(error) + '）')
+      return false
+    }
+  }
+
+  /** 扔掉 = 立即整目录删除；磁盘删掉了才从索引里拿掉，失败时卡片仍在、还能重试。 */
+  discard (giftId) {
+    return this.#enqueue(() => this.#discard(giftId))
+  }
+
+  async #discard (giftId) {
+    if (!isVisitId(giftId)) return { ok: false, error: 'bad-gift' }
+    const id = giftId.toLowerCase()
+    const record = this.#index.get(id)
+    if (record === undefined) return { ok: false, error: 'gift-not-found' }
+    try {
+      await rm(record.dirPath, { recursive: true, force: true })
+    } catch (error) {
+      this.#warnOnce('discard', '礼物删不掉（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+    this.#index.delete(id)
+    return { ok: true }
+  }
+
+  /**
+   * 只从索引里忘掉（helper 已经代为删除目录时用）。
+   * 卡片立刻消失，但不假装磁盘已经干净——那条事实由 helper 的删除负责。
+   */
+  forget (giftId) {
+    if (!isVisitId(giftId)) return false
+    return this.#index.delete(giftId.toLowerCase())
+  }
+
+  #record (giftId, meta) {
+    const dirPath = giftDirPath(this.#dir, meta.dir)
+    return {
+      id: giftId,
+      dirName: meta.dir,
+      dirPath,
+      notePath: join(dirPath, NOTE_FILE),
+      metaPath: join(dirPath, META_FILE),
+      from: { ...meta.from },
+      kind: meta.kind,
+      text: meta.text,
+      receivedAt: meta.receivedAt,
+      opened: meta.opened === true
+    }
+  }
+
+  #pruneIndex () {
+    if (this.#index.size <= MAX_GIFT_INDEX) return
+    const overflow = [...this.#index.values()]
+      .sort((left, right) => left.receivedAt - right.receivedAt)
+      .slice(0, this.#index.size - MAX_GIFT_INDEX)
+    for (const record of overflow) this.#index.delete(record.id)
+  }
+
+  #warnOnce (key, message) {
+    if (this.#warned.has(key)) return
+    this.#warned.add(key)
+    try {
+      this.#log?.warn?.(message)
+    } catch {
+      // 日志不能反过来把插件搞崩
+    }
+  }
+}
+
+/** 同一 giftId 重试原地复用；不同 id 撞名加后缀，绝不覆盖已有的礼物。 */
+async function allocateDir (giftsDir, baseName, giftId) {
+  const base = isGiftDirName(baseName) ? baseName : giftDirName(giftId, Date.now())
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const name = attempt === 0 ? base : base + '-' + String(attempt + 1)
+    const dirPath = join(giftsDir, name)
+    try {
+      await mkdir(dirPath, { recursive: false, mode: 0o700 })
+      return { dirPath, dirName: name, created: true }
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      try {
+        const raw = JSON.parse(await readFile(join(dirPath, META_FILE), 'utf8'))
+        if (raw?.id === giftId) return { dirPath, dirName: name, created: false }
+      } catch {
+        // 空目录或坏 meta：换后缀，别把别人的东西盖掉
+      }
+    }
+  }
+  throw new Error('gifts: directory name conflict')
+}
+
+/** tmp + rename：同目录内 rename 是原子的，不会留下半个 note.txt / meta.json。 */
+async function writeFileAtomic (path, text) {
+  const tmp = path + '.tmp-' + randomUUID()
+  try {
+    await writeFile(tmp, text, { encoding: 'utf8', mode: 0o600 })
+    await rename(tmp, path)
+  } catch (error) {
+    await rm(tmp, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+function copyRecord (record) {
+  return {
+    id: record.id,
+    dirName: record.dirName,
+    dirPath: record.dirPath,
+    notePath: record.notePath,
+    metaPath: record.metaPath,
+    from: { ...record.from },
+    kind: record.kind,
+    text: record.text,
+    receivedAt: record.receivedAt,
+    opened: record.opened
+  }
+}
+
+function errorName (error) {
+  return error?.code || (error instanceof Error ? error.name : 'unknown')
+}

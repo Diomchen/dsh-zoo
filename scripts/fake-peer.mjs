@@ -7,6 +7,7 @@
 // 用法：
 //   node scripts/fake-peer.mjs                       # 默认 45872，对端 45871
 //   node scripts/fake-peer.mjs --name 隔壁的小鲸鱼
+//   node scripts/fake-peer.mjs --gift $'给你留了张便条\n第二行'   # 串门时捎一条字条
 //
 // 然后在桌面的放行卡片上点「接受」（或走 /local-pet/action 的 admit），
 // 它的宠物就会出现在你的桌面上。
@@ -28,8 +29,9 @@ import {
   encodePacket,
   encodeVisitAck,
   encodeVisitRecallAck,
-  encodeVisitRequest,
-  parsePacket
+  encodeVisitRequestDetailed,
+  parsePacket,
+  sanitizeNote
 } from '../src/protocol.js'
 
 const args = parseArgs(process.argv.slice(2))
@@ -47,6 +49,15 @@ const skinPort = args['skin-port'] === undefined ? undefined : Number(args['skin
 const skinId = args['skin-id'] === undefined ? undefined : cleanId(args['skin-id'])
 const semantic = args.semantic ? clean(args.semantic, 16) : undefined
 let sayText = args.say ? clean(args.say, 80) : null
+// --gift：串门时捎一条字条（ticket 23）。正文按协议同一套规则清洗：保留换行、≤500 码点。
+// 超长不是截断而是“这次不带”——和真插件的行为保持一致。
+let giftText = null
+if (typeof args.gift === 'string') {
+  giftText = sanitizeNote(args.gift)
+  if (giftText === null) {
+    console.log('[假邻居] --gift 空着或超过 500 字，这条字条不会带上（串门照常）。')
+  }
+}
 const deviceId = randomUUID()
 const autoVisit = args['auto-visit'] === undefined ? null : Number(args['auto-visit'])
 
@@ -217,12 +228,26 @@ function outboundVisit () {
     return console.log('[假邻居] 你还没放行我。先用 /local-pet/action 的 admit 放行，再让我串门。')
   }
   const visitId = randomUUID()
-  send(
-    encodeVisitRequest({ deviceId, visitId, nickname, anim, ...petFields() }),
-    state.endpoint.address,
-    state.endpoint.port
+  // 每次串门一件新礼物：gift.id 是 UUID，对端拿它当目录与 action 的键。
+  const gift = giftText === null
+    ? null
+    : { id: randomUUID(), kind: 'text', text: giftText }
+  const built = encodeVisitRequestDetailed({
+    deviceId,
+    visitId,
+    nickname,
+    anim,
+    ...petFields(),
+    gift
+  })
+  send(built.data, state.endpoint.address, state.endpoint.port)
+  if (built.giftDropped && gift !== null) {
+    console.log('[假邻居] 字条太长、整包装不下：这次没带上（串门仍会照常到达）。')
+  }
+  console.log(
+    '[假邻居] 发出串门请求' + (gift === null ? '' : '（捎了一张字条）') +
+    '：等你的桌面上出现一位"来访"的客人。'
   )
-  console.log('[假邻居] 发出串门请求：等你的桌面上出现一位"来访"的客人。')
 }
 
 function reasonText (reason) {

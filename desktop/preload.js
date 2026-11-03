@@ -10,7 +10,8 @@
  *   光标可能离开命中矩形，主进程在此期间不得翻回穿透；租约靠心跳续期，pointerup/cancel/blur、
  *   弹层关闭/超时由渲染端主动释放；
  * - requestAction(payload)：把一次按钮点击作为**申请**交给宿主（visit/recall/end-visit/admit/
- *   reject/dismiss），渲染端永远不直接改状态；
+ *   reject/dismiss/rename/gift-*），渲染端永远不直接改状态；礼物动作只带 giftId，
+ *   文件的绝对路径不会出现在渲染进程里；
  * - onActionResult(handler)：宿主对某次申请的答复（ok + 人话 notice）；失败必须能冒泡；
  * - onScene(handler)：接收宿主下发的场景 v3（已经过 desktop/shared.js 归一化，含 menu）。
  */
@@ -51,7 +52,9 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
       deviceId: payload.deviceId,
       // 动作点播要带名字（右键菜单的「动作」那一支）；其它动作这里是 undefined。
       name: payload.name,
-      nickname: payload.nickname
+      nickname: payload.nickname,
+      // 礼物四动作只带 giftId（UUID）；路径与磁盘操作全在宿主/主进程那边。
+      giftId: payload.giftId
     })
   },
   /**

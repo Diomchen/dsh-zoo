@@ -131,7 +131,22 @@
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
    * （装了 dsh-pet 就写它的配置，见 ADR-0007）。
    */
-  const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss', 'rename']
+  const CONTROL_ACTIONS = [
+    'visit',
+    'recall',
+    'end-visit',
+    'admit',
+    'reject',
+    'dismiss',
+    'rename',
+    // ticket 23：礼物卡上的四个动作。渲染端只发 giftId，路径与磁盘操作全在宿主。
+    'gift-open',
+    'gift-reveal',
+    'gift-copy',
+    'gift-discard'
+  ]
+  /** 这四个动作必须带 giftId；其余动作带了也会被丢掉。 */
+  const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard']
   /** 菜单项的动作（ticket 22）：点播 / 重载配置 / 打开软件。同样只是一次「申请」。 */
   const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site']
   /** helper → 宿主能报的全部动作：控件 + 菜单。 */
@@ -143,6 +158,15 @@
    * 显示得比广播长，就等于又造出两个名字（ADR-0007）。
    */
   const MAX_NAME_LENGTH = 32
+  /**
+   * 字条正文上限（码点），与 `src/protocol.js` 的 `MAX_GIFT_TEXT` 同一个数。
+   * helper 是另一个进程，各自守自己的边界：宿主已经清过一遍，这里再夹一次。
+   */
+  const MAX_GIFT_TEXT_LENGTH = 500
+  /** 一次场景最多几件礼物（≤ 访客数）；上限只为让一条消息有界，不表达产品限额。 */
+  const MAX_GIFT_ITEMS = 64
+  /** 礼物的状态词表，与 `src/gift-copy.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
+  const GIFT_STATUSES = ['pending', 'receiving', 'received', 'failed', 'refused']
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
@@ -203,6 +227,18 @@
     return /^[A-Za-z0-9._:-]+$/.test(id) ? id : null
   }
 
+  /**
+   * 礼物 id 是 wire 上的 UUID（与 visitId/deviceId 同一种形状）。这里不复用 `normalizeId`：
+   * 那个入口还给动画名/诊断 id 用，宽松得多；礼物 id 会被拼进宿主侧的目录查找，必须严格。
+   */
+  function normalizeGiftId (value) {
+    if (typeof value !== 'string') return null
+    const id = value.trim()
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+      ? id.toLowerCase()
+      : null
+  }
+
   function normalizeToken (value) {
     if (typeof value === 'number' && Number.isFinite(value)) return value
     if (typeof value !== 'string') return null
@@ -216,6 +252,28 @@
     const text = value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()
     if (text === '') return fallback
     return text.length > maxLength ? text.slice(0, maxLength) : text
+  }
+
+  /**
+   * 字条正文（ticket 23）：与 `normalizeText` 相反，**保留换行**——便条的多行是内容本身。
+   * 去掉其余控制字符与双向覆盖符，首尾裁掉，按码点夹到 500。
+   *
+   * 这里用“截断”而不是宿主的“超限丢弃”：宿主已经按 500 校验过，渲染端再超只可能是
+   * 坏数据/手改场景，截断能让卡片继续画出来，不会把整张卡丢掉。
+   */
+  function normalizeNoteText (value, maxLength = MAX_GIFT_TEXT_LENGTH) {
+    if (typeof value !== 'string') return null
+    if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+    // eslint-disable-next-line no-control-regex
+    const text = value
+      .replace(/\r\n?/g, '\n')
+      .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, '')
+      .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')
+      .trim()
+    if (text === '') return null
+    const limit = Number.isInteger(maxLength) && maxLength > 0 ? maxLength : MAX_GIFT_TEXT_LENGTH
+    const chars = Array.from(text)
+    return chars.length > limit ? chars.slice(0, limit).join('') : text
   }
 
   function normalizeLabel (value, fallback) {
@@ -387,6 +445,7 @@
    *   recall   { enabled, nickname }      召回入口（自己出门时桌面没有 self，需要常驻小胶囊）
    *   visitors [{ deviceId, label }]      可以送客的访客（item id 是 visitor:<deviceId>）
    *   street   [{ deviceId, label, action, canVisit, blockedReason }]  邻居面板那一排房子（ticket 21）
+   *   gifts    [{ deviceId, giftId, kind, status, title, text?, statusText? }]  贴着访客的礼物卡（ticket 23）
    *   prompt   { deviceId, nickname }     放行卡队首；null 表示没有待决定的新邻居
    *   notice   { text, at }               最近一条人话提示（异步失败也靠它冒泡）
    */
@@ -396,6 +455,7 @@
       recall: { enabled: false, nickname: null },
       visitors: [],
       street: [],
+      gifts: [],
       prompt: null,
       notice: null
     }
@@ -448,6 +508,42 @@
           canVisit: candidate.canVisit === true,
           // 认不出的理由不猜：房子照样画，只是点不了（渲染端统一按“现在去不了”处理）。
           blockedReason: STREET_REASONS.has(candidate.blockedReason) ? candidate.blockedReason : null
+        })
+      }
+    }
+
+    // 礼物卡（ticket 23）：宿主已经按 visitor 算好标题/正文/状态，这里只做形状校验。
+    // 一张坏卡只丢它自己；deviceId/giftId 认不出来就没法落回访客身上，整张丢。
+    const seenGifts = new Set()
+    if (Array.isArray(raw.gifts)) {
+      for (const candidate of raw.gifts) {
+        if (controls.gifts.length >= MAX_GIFT_ITEMS) break
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+        const deviceId = normalizeId(candidate.deviceId)
+        const giftId = normalizeGiftId(candidate.giftId)
+        // 本版本只画字条；文件礼物（ticket 25）会带来 name/size/thumb，这个分支再扩。
+        if (deviceId === null || giftId === null || candidate.kind !== 'text') continue
+        if (seenGifts.has(giftId)) continue
+        const status = typeof candidate.status === 'string' && GIFT_STATUSES.includes(candidate.status)
+          ? candidate.status
+          : null
+        if (status === null) continue
+        seenGifts.add(giftId)
+        const title = normalizeText(candidate.title, '捎来一件东西', MAX_LABEL_LENGTH * 3)
+        // 正文只在该收到时出现；别的状态下即便宿主误发也不画。
+        const text = status === 'received' ? normalizeNoteText(candidate.text) : null
+        // received 不需要解释（正文就是内容）；别的状态才画一行“怎么了”。
+        const statusText = status === 'received'
+          ? null
+          : normalizeText(candidate.statusText, null, MAX_REASON_LENGTH * 2)
+        controls.gifts.push({
+          deviceId,
+          giftId,
+          kind: 'text',
+          status,
+          title,
+          ...(text === null ? {} : { text }),
+          ...(statusText === null ? {} : { statusText })
         })
       }
     }
@@ -908,6 +1004,22 @@
         if (url === null) return { ok: false, error: 'bad-url' }
         return { ok: true, command: { type, id, url } }
       }
+      /**
+       * 礼物卡的系统动作（ticket 23）：路径只由宿主给，渲染端连字符串都拿不到。
+       * 三个带路径的命令共用 `normalizePath`（必须是绝对路径）；`gift-copy` 只带正文。
+       */
+      case 'gift-open':
+      case 'gift-reveal':
+      case 'gift-discard': {
+        const path = normalizePath(raw.path)
+        if (path === null) return { ok: false, error: 'bad-path' }
+        return { ok: true, command: { type, id, path } }
+      }
+      case 'gift-copy': {
+        const text = normalizeNoteText(raw.text)
+        if (text === null) return { ok: false, error: 'bad-text' }
+        return { ok: true, command: { type, id, text } }
+      }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
@@ -1117,6 +1229,10 @@
         // `visit` 是「可能带对象」：邻居面板点某一户就带 deviceId；不带则由宿主随机挑。
         const deviceId = needsDevice || action === 'visit' ? normalizeId(raw.deviceId) : null
         if (needsDevice && deviceId === null) return { ok: false, error: 'bad-device-id' }
+        // 礼物动作只带 giftId（UUID），路径永远不出渲染端。
+        const needsGift = GIFT_ACTIONS.includes(action)
+        const giftId = needsGift ? normalizeGiftId(raw.giftId) : null
+        if (needsGift && giftId === null) return { ok: false, error: 'bad-gift' }
         // 只有改名带正文：清洗交给宿主（那里有 normalizeNickname），这里只做长度兜底，
         // 免得渲染端一个粘贴把一行 JSON 撑成几兆。
         const nickname = action === 'rename' && typeof raw.nickname === 'string'
@@ -1125,7 +1241,7 @@
         // 点播带动画名；名字必须是安全的动画名，否则整条事件丢掉（宿主还得再校验一遍）。
         const name = action === 'play-anim' ? normalizeAnim(raw.name) : null
         if (action === 'play-anim' && name === null) return { ok: false, error: 'bad-name' }
-        return { ok: true, event: { type, id, action, deviceId, nickname, ...(name === null ? {} : { name }) } }
+        return { ok: true, event: { type, id, action, deviceId, nickname, ...(name === null ? {} : { name }), ...(giftId === null ? {} : { giftId }) } }
       }
       case 'pong':
         return { ok: true, event: { type, id } }
@@ -1495,18 +1611,24 @@
     PET_ROLES,
     SCENE_VERSION,
     CONTROL_ACTIONS,
+    GIFT_ACTIONS,
+    GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
     MAX_ACTION_TEXT,
     MAX_NAME_LENGTH,
+    MAX_GIFT_TEXT_LENGTH,
+    MAX_GIFT_ITEMS,
     PET_COLORS,
     IDLE_CLIPS,
     PHYSICS,
     isFiniteNumber,
     clampNumber,
     normalizeId,
+    normalizeGiftId,
     normalizeLabel,
+    normalizeNoteText,
     normalizeAnim,
     normalizeRole,
     normalizeSemantic,

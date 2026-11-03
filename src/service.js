@@ -6,6 +6,7 @@ import shared from '../desktop/shared.js'
 import { createDesktop } from './desktop.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
+import { createGiftStore } from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
 import { dataDir, dshPetConfigPath } from './paths.js'
 import { resolveDshPetAssetDirs } from './pet-assets.js'
@@ -26,8 +27,9 @@ import {
   encodeVisitDeny,
   encodeVisitRecall,
   encodeVisitRecallAck,
-  encodeVisitRequest,
+  encodeVisitRequestDetailed,
   isDeviceId,
+  isVisitId,
   normalizeNickname,
   resolvePort
 } from './protocol.js'
@@ -107,6 +109,8 @@ export function createService (ctx, options = {}) {
   let discovery = null
   let peers = null
   let visits = null
+  // 入站礼物的落盘（ticket 23）；起不来只意味着“这次运行收不到字条”，串门照常。
+  let gifts = null
   let settings = null
   let bridge = null
   let desktop = null
@@ -288,6 +292,9 @@ export function createService (ctx, options = {}) {
 
     // 手动「串门」：可以指定 deviceId，也可以不带——后者是 ticket 11 的按钮路径，
     // 由宿主随机挑一位在线且互相放行的邻居。手动永远不受总开关/活动窗口限制。
+    //
+    // `gift` 是 ticket 23 的内部/脚本入口：一次性捎一条字条，验证“走线 → 对端落盘”的整条路。
+    // ticket 24 的背包会从这里接进来（先放的先带走），所以入口本身不会变。
     if (action === 'visit') {
       let deviceId
       if (body?.deviceId === undefined || body?.deviceId === null) {
@@ -298,7 +305,17 @@ export function createService (ctx, options = {}) {
         deviceId = actionDeviceId(body.deviceId)
         if (deviceId === null) return { ok: false, error: 'bad-device-id' }
       }
-      return startOutboundVisit(deviceId)
+      const gift = body?.gift !== null && typeof body?.gift === 'object' && !Array.isArray(body.gift)
+        ? body.gift
+        : null
+      return startOutboundVisit(deviceId, gift)
+    }
+
+    // 礼物卡上的四个动作（ticket 23）：只认本地页面/桌面控件；UDP 永远走不到这里。
+    // giftId 是协议里的 UUID，路径由宿主从礼物 store 取，渲染端/请求体都拿不到路径。
+    if (action === 'gift-open' || action === 'gift-reveal' ||
+      action === 'gift-copy' || action === 'gift-discard') {
+      return handleGiftAction(action, body?.giftId)
     }
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
@@ -416,6 +433,71 @@ export function createService (ctx, options = {}) {
     return { ok: false, error: 'not-implemented', action }
   }
 
+  /**
+   * 礼物卡的系统动作（ticket 23）。只认本地来路：桌面控件的 action 与
+   * `POST /local-pet/action` 都会到这里，UDP 报文没有入口。
+   *
+   * 路径从不来自请求体：`giftId` → 礼物 store 里的记录 → `notePath`/`dirPath`。
+   * 错误码只用 SPEC 的那几个：bad-gift / gift-not-found / open-failed。
+   */
+  async function handleGiftAction (action, rawGiftId) {
+    const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim() : ''
+    if (!isVisitId(giftId)) return { ok: false, error: 'bad-gift' }
+    // 没初始化 = 本次运行没有可用的礼物目录；对调用方而言与“这件东西不在了”没有区别。
+    const record = gifts?.lookup(giftId) ?? null
+    if (record === null) return { ok: false, error: 'gift-not-found' }
+
+    if (action === 'gift-discard') {
+      // 卡片先消失、黑名单先记住（这一件重发也不会再出现）。
+      room.discardGift(record.from.deviceId, giftId)
+      // 删除以宿主为准：它拿得到绝对路径、也不依赖 helper 是否活着（HTTP 路径同样要能扔）。
+      // helper 那条 gift-discard 仍然发一条：同一台桌面上的文件操作就走同一条出口，
+      // 命令是幂等的（rm -rf），宿主已经删掉时它什么也不做。
+      const removed = await gifts.discard(giftId)
+      if (!removed.ok) {
+        warn(ctx, '礼物目录没删掉（' + removed.error + '）：' + record.dirPath)
+        return { ok: false, error: 'open-failed', notice: '这件东西删不掉，文件可能正被别的程序占用。' }
+      }
+      if (desktop !== null && typeof desktop.giftDiscard === 'function') {
+        try {
+          desktop.giftDiscard(record.dirPath)
+        } catch {
+          // helper 不在/管道断了都无所谓：目录已经在上面删掉了。
+        }
+      }
+      return { ok: true, action, giftId }
+    }
+
+    // 打开/显示/复制都需要 Electron 主进程：宿主进程自己没有 shell 与剪贴板。
+    if (desktop === null) return { ok: false, error: 'open-failed' }
+
+    if (action === 'gift-open') {
+      if (typeof desktop.giftOpen !== 'function' || desktop.giftOpen(record.notePath) !== true) {
+        return { ok: false, error: 'open-failed' }
+      }
+      // opened 只用于 ticket 26 的“送客时提醒一次”；写不进去不影响东西已经被打开。
+      await gifts.markOpened(giftId)
+      return { ok: true, action, giftId }
+    }
+
+    if (action === 'gift-reveal') {
+      if (typeof desktop.giftReveal !== 'function' || desktop.giftReveal(record.notePath) !== true) {
+        return { ok: false, error: 'open-failed' }
+      }
+      return { ok: true, action, giftId }
+    }
+
+    if (action === 'gift-copy') {
+      if (typeof desktop.giftCopy !== 'function' || desktop.giftCopy(record.text) !== true) {
+        return { ok: false, error: 'open-failed' }
+      }
+      // 复制没有可见状态变化：明确回一句，渲染端才会冒泡，不然用户不知道点没点上。
+      return { ok: true, action, giftId, notice: '字条已经复制到剪贴板。' }
+    }
+
+    return { ok: false, error: 'not-implemented', action }
+  }
+
   async function start () {
     try {
       // 先把放行/拒绝名单读进内存，再开始发现：重启后第一次广播就不会再问。
@@ -446,6 +528,15 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
       room.setVisitRecords(visits?.records() ?? [])
+
+      // 礼物也只降级、不挡启动：gifts 目录读不出来时，收到字条会变成一张 failed 卡。
+      try {
+        gifts = await createGiftStore(dir, { log })
+      } catch (error) {
+        gifts = null
+        warn(ctx, '礼物目录初始化失败，本次收到的字条不会落盘：' + message(error))
+      }
+      if (disposed) return
 
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
@@ -823,7 +914,9 @@ export function createService (ctx, options = {}) {
         // 动作点播要带名字；其余动作这里是 undefined，与 HTTP 那条路同形。
         name: event.name ?? undefined,
         // 只有改名带正文；其余动作这里是 undefined，与 HTTP 那条路同形。
-        nickname: event.nickname ?? undefined
+        nickname: event.nickname ?? undefined,
+        // 礼物四动作只带 giftId（UUID）；路径由宿主查 store，渲染端从来不知道。
+        giftId: event.giftId ?? undefined
       })
     } catch (error) {
       warn(ctx, '桌面控件动作失败（' + event.action + '）：' + message(error))
@@ -872,6 +965,8 @@ export function createService (ctx, options = {}) {
     if (error === 'no-origin') return '拿不到 DSH 的地址，开不了软件。'
     if (error === 'desktop-off') return '桌面层没有在运行，开不了软件。'
     if (error === 'open-failed') return '系统没有接受这个打开请求。'
+    if (error === 'gift-not-found') return '这件东西已经不在了。'
+    if (error === 'bad-gift') return '这张礼物卡已经不在了。'
     if (error === 'dsh-pet-no-pet') return 'dsh-pet 里还没有宠物，没地方存这个名字。'
     return '这次操作没有完成，稍后再试。'
   }
@@ -1124,7 +1219,8 @@ export function createService (ctx, options = {}) {
           request = null
         } else {
           while (request.attempts < visitAttempts && now >= request.nextAt) {
-            sendVisitRequest(request.visitId)
+            // 重发必须带同一件字条；丢了就整条串门都没了意义（ticket 24 的退包也靠这条）。
+            sendVisitRequest(request.visitId, request.gift ?? null)
             request.attempts += 1
             request.nextAt += visitRetryMs
           }
@@ -1149,12 +1245,16 @@ export function createService (ctx, options = {}) {
   /**
    * 开始一次出门的唯一入口：手动按钮与自发策略共用同一条路径。
    * 生成 visitId、写 room 状态、发第一包、登记重试计时器；失败时由 room 给一句人话。
+   *
+   * `gift` 是这次捎的字条（ticket 23）：由编码层判定带不带得上，重发必须带同一件。
+   * ticket 24 会从背包里取最旧的一件填进来；这里不关心它从哪来。
    */
-  function startOutboundVisit (deviceId) {
+  function startOutboundVisit (deviceId, gift = null) {
     const visitId = randomUUID()
     const begun = room.beginVisit(deviceId, { visitId })
     if (!begun.ok) return begun
-    if (!sendVisitRequest(visitId)) {
+    const sent = sendVisitRequest(visitId, gift)
+    if (!sent.ok) {
       request = null
       const failed = room.failOutboundVisit('peer-offline')
       return {
@@ -1170,15 +1270,22 @@ export function createService (ctx, options = {}) {
       visitId,
       attempts: 1,
       nextAt: now + visitRetryMs,
-      deadline: now + visitTimeoutMs
+      deadline: now + visitTimeoutMs,
+      // 只留真的带上的那一件：整包超限被丢掉之后再重试也不该反复撞同一面墙。
+      gift: sent.gift
     }
+    // 字条没带上（太长/坏形状/整包超 4 KiB）：串门照常，但必须在本机说一句，
+    // 不能让人以为东西已经送出去了。
+    const notice = sent.giftDropped ? room.noteGiftDropped() : null
     return {
       ok: true,
       action: 'visit',
       deviceId,
       visitId,
       phase: 'requesting',
-      nickname: begun.visit.nickname
+      nickname: begun.visit.nickname,
+      giftDropped: sent.giftDropped,
+      ...(notice === null ? {} : { notice: notice.text })
     }
   }
 
@@ -1186,14 +1293,18 @@ export function createService (ctx, options = {}) {
    * 发一次 visit-request。只走 discovery.sendTo()：先过 mayTalkTo，
    * 再按 deviceId 查地址；没地址（刚离线）返回 false，由调用方明确报 peer-offline。
    */
-  function sendVisitRequest (visitId) {
-    if (disposed || discovery === null || identity === null) return false
+  function sendVisitRequest (visitId, gift = null) {
+    if (disposed || discovery === null || identity === null) {
+      return { ok: false, gift: null, giftDropped: false }
+    }
     const out = room.outboundVisit()
-    if (out === null || out.visitId !== visitId) return false
+    if (out === null || out.visitId !== visitId) {
+      return { ok: false, gift: null, giftDropped: false }
+    }
     const pet = room.snapshot().self.pet
-    let data
+    let built
     try {
-      data = encodeVisitRequest({
+      built = encodeVisitRequestDetailed({
         deviceId: identity.deviceId,
         visitId,
         nickname: identity.nickname,
@@ -1202,23 +1313,63 @@ export function createService (ctx, options = {}) {
         semantic: pet?.semantic ?? null,
         say: pet?.say ?? null,
         skinPort: skinRef?.port,
-        skinId: skinRef?.id
+        skinId: skinRef?.id,
+        gift
       })
     } catch {
-      return false
+      return { ok: false, gift: null, giftDropped: false }
     }
+    let sent = false
     try {
-      return discovery.sendTo(out.deviceId, data)
+      sent = discovery.sendTo(out.deviceId, built.data)
     } catch {
-      return false
+      sent = false
+    }
+    return {
+      ok: sent,
+      // 带上了就原样留给重试；被编码层丢掉（太长/坏形状/超 4 KiB）就不再重带。
+      gift: sent && !built.giftDropped ? gift : null,
+      giftDropped: built.giftDropped
     }
   }
 
   /** 收到请求：放行且开关开 → ack；否则 deny（带理由，走 sendReply 例外）。 */
   function handleVisitRequest (packet) {
     const result = room.observeVisitRequest(packet)
-    if (result.reply === 'ack') sendVisitAck(result.deviceId, result.visitId)
-    else if (result.reply === 'deny') sendVisitDeny(result.deviceId, result.visitId, result.reason)
+    if (result.reply !== 'ack') {
+      if (result.reply === 'deny') sendVisitDeny(result.deviceId, result.visitId, result.reason)
+      return
+    }
+    // ack 先发：串门本身不等待磁盘。字条在后台落盘，写成功才把卡片从 pending 推到 received。
+    sendVisitAck(result.deviceId, result.visitId)
+    if (packet.gift !== undefined && packet.gift !== null) {
+      // 已经「扔掉」的那一件：对方没收到 ack 又重发时，绝不再写回磁盘、也绝不再长卡片。
+      if (!room.isGiftDiscarded(packet.gift.id)) void receiveGift(packet)
+    }
+  }
+
+  /**
+   * 字条落盘（ticket 23）。失败只让这一张卡 `failed`，不影响已经 ack 的串门。
+   * 重试报文会再写一次同一个目录：store 对同一 gift.id 是幂等的。
+   */
+  async function receiveGift (packet) {
+    const gift = packet.gift
+    if (gift === undefined || gift === null || !isVisitId(gift.id)) return
+    const saved = gifts === null
+      ? { ok: false, error: 'starting' }
+      : await gifts.receiveText({
+        id: gift.id,
+        from: { deviceId: packet.deviceId, nickname: packet.nickname },
+        text: gift.text,
+        receivedAt: Date.now()
+      })
+    if (disposed) return
+    room.markGiftStatus(packet.deviceId, gift.id, saved.ok ? 'received' : 'failed')
+    if (!saved.ok) {
+      warn(ctx, '字条没写进 gifts（' + saved.error + '）：卡片会显示“没取到”')
+    }
+    // 状态变了要让桌面场景跟上（签名里含 controls.gifts）。
+    flushRoomEffects()
   }
 
   function sendVisitAck (deviceId, visitId) {
@@ -1370,6 +1521,7 @@ export function createService (ctx, options = {}) {
       skinFetcher = null
       visitorSkins.clear()
       skinPool = []
+      gifts = null
       request = null
       recalls.clear()
       discovery?.dispose()

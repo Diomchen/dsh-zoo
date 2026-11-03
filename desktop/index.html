@@ -415,6 +415,47 @@
       .lp-card-actions .lp-btn {
         flex: 1;
       }
+      /* 礼物卡（ticket 23）：比放行卡宽一点，正文最多 8 行；全文用「打开」看 note.txt。
+         便条的换行是内容本身（pre-wrap），不能用 .lp-card-text 的单行样式。 */
+      .lp-gift-card {
+        width: 252px;
+      }
+      .lp-gift-card .lp-card-title {
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+      .lp-gift-text {
+        margin: 5px 0 7px;
+        font-size: 11.5px;
+        line-height: 1.55;
+        color: rgba(244, 248, 255, 0.88);
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 8;
+        overflow: hidden;
+      }
+      .lp-gift-text[hidden] {
+        display: none;
+      }
+      .lp-gift-status {
+        margin: 5px 0 7px;
+        font-size: 10.5px;
+        line-height: 1.45;
+        color: rgba(244, 248, 255, 0.66);
+      }
+      .lp-gift-status[hidden] {
+        display: none;
+      }
+      .lp-gift-actions {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 6px;
+      }
+      .lp-gift-actions .lp-btn {
+        padding: 6px 8px;
+      }
       .lp-x {
         appearance: none;
         flex: none;

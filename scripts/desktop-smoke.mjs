@@ -1734,6 +1734,117 @@ async function verifyStreetStability () {
   return null
 }
 
+// ---------------------------------------------------------------------------
+// 礼物卡（ticket 23）：字条卡片 / 复制 / 扔掉
+// ---------------------------------------------------------------------------
+
+async function verifyGifts () {
+  const client = createHelperClient((line) => info(line))
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  const workArea = ready.workArea
+  const visitorId = '55555555-5555-4555-8555-555555555555'
+  const giftId = '66666666-6666-4666-8666-666666666666'
+  const outside = { x: workArea.x + 8, y: workArea.y + 8 }
+  const giftText = '第一行：到你家门口了\n第二行：带了张便条\n第三行：记得看'
+
+  // 冒烟只走合成输入：真实鼠标/焦点事件不能干扰点击。
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+
+  const sceneWithGift = () => shared.petScene([
+    { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
+    { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
+  ], workArea, {
+    reset: true,
+    controls: {
+      visit: { enabled: false, reason: null },
+      recall: { enabled: false, nickname: null },
+      visitors: [{ deviceId: visitorId, label: '阿蟹' }],
+      street: [],
+      prompt: null,
+      notice: null,
+      gifts: [{
+        deviceId: visitorId,
+        giftId,
+        kind: 'text',
+        status: 'received',
+        title: '「阿蟹」捎来一张字条',
+        text: giftText
+      }]
+    }
+  })
+
+  client.send({ type: 'update', scene: sceneWithGift() })
+  await sleep(1800)
+
+  let state = await client.rendererState()
+  assert(state.controls.gifts.length === 1, '场景里的一张礼物卡被画出来')
+  assert(state.controls.gifts[0].giftId === giftId, '卡片带着 giftId（' + state.controls.gifts[0].giftId + '）')
+  assert(state.controls.gifts[0].title === '「阿蟹」捎来一张字条', '标题来自宿主')
+  assert(state.controls.gifts[0].text === giftText, '正文保留换行、没有被折成一行')
+  const cardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + giftId)
+  const copyRect = state.uiRects.find((rect) => rect.id === 'ui:gift-btn:gift-copy:' + giftId)
+  const discardRect = state.uiRects.find((rect) => rect.id === 'ui:gift-btn:gift-discard:' + giftId)
+  assert(Boolean(cardRect), '礼物卡有独立命中矩形')
+  assert(Boolean(copyRect) && Boolean(discardRect), '礼物卡按钮的矩形带 giftId（两张卡不撞名）')
+  assert(Boolean(state.uiRects.find((rect) => rect.id === 'ui:gift-bridge:' + giftId)), '卡片与访客之间有桥接矩形')
+  const current = await client.status()
+  assert(current.overlayRects >= 6, '礼物卡 + 按钮 + 桥接都进了 overlay-rects（' + current.overlayRects + ' 块）')
+
+  // 截图：卡片真的被画出来（不是只有矩形）。
+  mkdirSync(OUT_DIR, { recursive: true })
+  const pngPath = join(OUT_DIR, 'gift-card.png')
+  let start = client.mark()
+  client.send({ type: 'shot', id: 'shot-gift', path: pngPath })
+  const shot = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-gift', 8000, '礼物卡截图')
+  assert(shot.width > 0 && existsSync(pngPath), '礼物卡截图落盘：' + pngPath)
+  const verified = verifyShot(pngPath, pngPath + '.json', 2)
+  assertControlPixels(verified, [cardRect, copyRect, discardRect])
+
+  // 点「复制」：请求只带 giftId；宿主回 ok + 一句人话，渲染端要冒泡。
+  const copyPoint = rectCenterScreen(copyRect, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: copyPoint.x, y: copyPoint.y })
+  const copyAction = await client.waitFrom(start, (event) => event.type === 'action', 3000, '复制申请')
+  assert(copyAction.action === 'gift-copy', '点「复制」→ 宿主收到 gift-copy')
+  assert(copyAction.giftId === giftId, '礼物动作带 giftId（' + copyAction.giftId + '）')
+  assert(typeof copyAction.id === 'string' && copyAction.id !== '', 'action 带 id，宿主才能对上是哪一次点击')
+  client.send({ type: 'action-result', id: copyAction.id, ok: true, notice: '字条已经复制到剪贴板。' })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.notice !== null && /复制到剪贴板/.test(snapshot.controls.notice.text)
+  }, 2500, '复制成功的气泡')
+  state = await client.rendererState()
+  assert(state.controls.gifts.length === 1, '复制之后卡片还在')
+
+  // 点「扔掉」：宿主 ok 之后场景里不再有这件礼物 → 卡片与矩形一起收起。
+  const discardPoint = rectCenterScreen(discardRect, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: discardPoint.x, y: discardPoint.y })
+  const discardAction = await client.waitFrom(start, (event) => event.type === 'action', 3000, '扔掉申请')
+  assert(discardAction.action === 'gift-discard', '点「扔掉」→ 宿主收到 gift-discard')
+  assert(discardAction.giftId === giftId, '扔掉带的是这一张卡的 giftId')
+  client.send({ type: 'action-result', id: discardAction.id, ok: true })
+  const withoutGift = sceneWithGift()
+  withoutGift.controls.gifts = []
+  client.send({ type: 'update', scene: withoutGift })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.gifts.length === 0 &&
+      !snapshot.uiRects.some((rect) => rect.id.startsWith('ui:gift:'))
+  }, 2500, '扔掉后卡片消失')
+  state = await client.rendererState()
+  assert(state.controls.gifts.length === 0, '扔掉之后卡片从场景里消失')
+  assert(!state.uiRects.some((rect) => rect.id.startsWith('ui:gift')), '礼物卡的所有命中矩形都撤掉了')
+
+  // 光标移开 → 恢复穿透（没关掉的控件不该把整窗一直按着）。
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  await waitUntil(async () => (await client.status()).ignoring === true, 3000, '礼物卡收起后恢复穿透')
+
+  return { pngPath, sidecarPath: pngPath + '.json', verified }
+}
+
 async function verifyManager () {
   const infos = []
   const warns = []
@@ -1895,6 +2006,7 @@ try {
   const controls = wants('controls') ? await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 街道面板 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls) : null
   if (wants('menu')) await run('右键菜单：只挂自己 / 三级级联 / 点一项就申请点播 / 访客不弹', verifyMenu)
   if (wants('street')) await run('街道：人多时面板不跳、点谁就是谁', verifyStreetStability)
+  const gifts = wants('gift') ? await run('礼物卡：字条卡片 / 复制 / 扔掉 / 命中矩形', verifyGifts) : null
   if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
   const notes = standalone === null ? null : writeNoteScreenshots(standalone.verified)
@@ -1912,6 +2024,7 @@ try {
   console.log('\n通过（' + checks + ' 项断言' + (ONLY === null ? '，全部段落' : '，只跑了 ' + ONLY) + '）。')
   console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
   if (controls !== null) console.log('控件截图：' + controls.pngPath)
+  if (gifts !== null) console.log('礼物卡截图：' + gifts.pngPath)
   if (standalone !== null) console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {
   exitCode = 1

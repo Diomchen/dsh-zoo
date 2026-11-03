@@ -20,6 +20,12 @@ export const MAX_LABEL = 64
 export const MAX_ANIMATION = 64
 /** 跨端气泡最多 80 个码点；再长就不像“随口一句”，也给了滥用一个上限。 */
 export const MAX_SAY = 80
+/**
+ * 字条正文最多 500 个码点（SPEC v4）。
+ * 上限不按字节：一条 500 字的中文便条 JSON 后约 1.5 KiB，塞得进 4 KiB 的 UDP 包；
+ * 文件礼物走拉取（ticket 25），报文里只放元数据。
+ */
+export const MAX_GIFT_TEXT = 500
 /** 气泡最多活 30 秒；过期就不再显示，避免一条旧话挂在别人桌面上。 */
 export const SAY_MAX_AGE_MS = 30 * 1000
 /** 语义标签是固定小表：不认识的动作名靠它画一个通用表情。 */
@@ -79,6 +85,11 @@ const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/g
 const BIDI_RE = /[\u202a-\u202e\u2066-\u2069]/g
+/**
+ * 字条正文的控制字符：**保留换行**（\u000a），其余 C0/C1 与 DEL 全部去掉。
+ * 便条是唯一允许多行的跨端文本：换行是它的一半意思，折叠掉就成了一行摘要。
+ */
+const NOTE_CONTROL_RE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g
 
 /** 清理本地或远端文本：去掉控制字符与双向覆盖符，折叠空白，按码点截断。 */
 export function sanitizeLabel (value, max = MAX_NICKNAME) {
@@ -158,6 +169,45 @@ export function normalizeSay (value, now = Date.now()) {
   return { text, until: Math.min(Math.floor(until), now + SAY_MAX_AGE_MS) }
 }
 
+/**
+ * 字条正文的清洗：**保留换行**，去掉其余控制字符与双向覆盖符，首尾空白裁掉。
+ *
+ * 与 `sanitizeLabel` 的差别只有两处，但都很关键：
+ *   - 换行留着（便条是多行的，折成一行等于替用户改稿）；
+ *   - 超过上限返回 null，**不截断**。字条是一整段话，截一半比不带更糟；
+ *     调用方据此决定“这条礼物不收 / 这次不带”，而不是悄悄改字。
+ */
+export function sanitizeNote (value, max = MAX_GIFT_TEXT) {
+  if (typeof value !== 'string') return null
+  if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+  const clean = value
+    .replace(/\r\n?/g, '\n')
+    .replace(NOTE_CONTROL_RE, '')
+    .replace(BIDI_RE, '')
+    .trim()
+  if (clean === '') return null
+  const limit = Number.isInteger(max) && max > 0 ? max : MAX_GIFT_TEXT
+  if (Array.from(clean).length > limit) return null
+  return clean
+}
+
+/**
+ * 串门捎的礼物（ADR-0011）。v1 只有字条这一种；文件礼物的 `kind:'file'` 由 ticket 25 加进来。
+ *
+ * **校验不过返回 null，由调用方把整个 `gift` 字段丢掉，串门照常。**
+ * 这与 `anim` 非法就整包丢是相反的策略：动画是这次串门的“外观”，坏了可以退回待机；
+ * 便条只是搭车的一件东西，为它把一次串门搞砸，代价和收益完全不对等。
+ */
+export function normalizeGift (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!isVisitId(value.id)) return null
+  // kind 只认本版本真的能收下的那一种；未来加 'file' 时，旧端的表现就是“这次没有礼物”。
+  if (value.kind !== 'text') return null
+  const text = sanitizeNote(value.text)
+  if (text === null) return null
+  return { id: value.id.toLowerCase(), kind: 'text', text }
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.LOCAL_PET_PORT
@@ -170,16 +220,36 @@ export function resolvePort (env = process.env) {
  * 构造一个只含白名单字段的报文。字段顺序与字段集按类型固定，便于测试和抓包对照：
  *   beacon / beacon-ack     → { v, type, deviceId, nickname, port[, skinPort, skinId] }
  *   heartbeat               → { v, type, deviceId, anim[, action, semantic, say, skinPort, skinId] }
- *   visit-request           → { v, type, deviceId, visitId, nickname, anim[, action, semantic, say, skinPort, skinId] }
+ *   visit-request           → { v, type, deviceId, visitId, nickname, anim[, action, semantic, say, skinPort, skinId, gift] }
  *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
  * （这是程序错误，不是网络输入）。
- * 本机动画名/动作名/气泡非法时不抛：降级成“不带这个字段”，让对端自己放待机。
+ * 本机动画名/动作名/气泡/字条非法时不抛：降级成“不带这个字段”，让对端自己放待机。
+ * 字条是唯一会因**整包体积**被丢掉的字段——见 `buildPacket` 的 4 KiB 兜底。
  */
-export function encodePacket ({
+export function encodePacket (options = {}) {
+  return buildPacket(options).data
+}
+
+/**
+ * 带字条的串门请求：除了字节，还回一个 `giftDropped`。
+ *
+ * 4 KiB 是 UDP 的硬上限，而一批便条不该把一次串门搞砸。所以编码层自己先试带 gift 的包，
+ * 超了就把 gift 摘掉重编一次，并告诉调用方“这次没带上”——service 据此在本机说一句话。
+ * 这个判断必须在这一层做：`encodePacket` 超限只有一个裸 `throw`，在 service 里 catch
+ * 之后分不清是字条太大、还是身份/昵称坏了，只能猜。
+ *
+ * `maxBytes` 只给单测用：500 码点的字条最坏（emoji）约 3 KiB，正常触不到 4 KiB，
+ * 防御路径要把上限调小才测得到。
+ */
+export function encodeVisitRequestDetailed (options = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
+  return buildPacket({ ...options, type: 'visit-request' }, { maxBytes })
+}
+
+function buildPacket ({
   type,
   deviceId,
   nickname,
@@ -192,8 +262,9 @@ export function encodePacket ({
   say,
   skinPort,
   skinId,
+  gift,
   now = Date.now()
-} = {}) {
+} = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
   if (!isDeviceId(deviceId)) throw new Error('protocol: invalid deviceId')
 
@@ -235,9 +306,23 @@ export function encodePacket ({
     packet = { ...base, nickname: safeNickname, port, ...skin }
   }
 
-  const data = Buffer.from(JSON.stringify(packet), 'utf8')
-  if (data.length > MAX_PACKET_BYTES) throw new Error('protocol: packet too large')
-  return data
+  let giftDropped = false
+  if (type === 'visit-request' && gift !== undefined && gift !== null) {
+    const safeGift = normalizeGift(gift)
+    if (safeGift === null) giftDropped = true
+    else packet = { ...packet, gift: safeGift }
+  }
+
+  let data = Buffer.from(JSON.stringify(packet), 'utf8')
+  if (data.length > maxBytes && packet.gift !== undefined) {
+    // 兜底：字条再重要也不值得让串门失败。丢掉它、重编一次，串门本身一个字段都不动。
+    const { gift: _dropped, ...withoutGift } = packet
+    packet = withoutGift
+    data = Buffer.from(JSON.stringify(packet), 'utf8')
+    giftDropped = true
+  }
+  if (data.length > maxBytes) throw new Error('protocol: packet too large')
+  return { data, giftDropped }
 }
 
 /** 心跳/串门请求共用的可选字段；非法值只是不带，不整包失败。 */
@@ -265,8 +350,12 @@ export function encodeHeartbeat ({ deviceId, anim, action, semantic, say, skinPo
   return encodePacket({ type: 'heartbeat', deviceId, anim, action, semantic, say, skinPort, skinId, now })
 }
 
-/** ticket 05 的窄入口：串门请求只带昵称、动作和串门 id（外加可选的 skin/状态）。 */
-export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action, semantic, say, skinPort, skinId, now } = {}) {
+/**
+ * ticket 05 的窄入口：串门请求只带昵称、动作和串门 id（外加可选的 skin/状态与字条）。
+ * 需要知道“礼物到底带没带上”的调用方用 `encodeVisitRequestDetailed`；这里保持
+ * “返回一串字节”的老契约，超限时字条会被静默丢掉（串门本身仍然成功）。
+ */
+export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action, semantic, say, skinPort, skinId, gift, now } = {}) {
   return encodePacket({
     type: 'visit-request',
     deviceId,
@@ -278,6 +367,7 @@ export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action,
     say,
     skinPort,
     skinId,
+    gift,
     now
   })
 }
@@ -355,11 +445,14 @@ export function parsePacket (input, { now = Date.now() } = {}) {
   }
 
   // 串门请求带昵称与动作名；昵称仍要清洗，动作名非法整包丢（与心跳一致）。
+  // 礼物是**例外**：gift 校验不过只丢这个字段，串门照常（见 normalizeGift 的注释）。
+  // anim 是这次串门的“外观”，退化一下还能画；一道便条却只是搭车的东西。
   if (raw.type === 'visit-request') {
     if (!isVisitId(raw.visitId)) return fail('visit-id')
     const nickname = normalizeNickname(raw.nickname)
     if (nickname === null) return fail('nickname')
     if (raw.anim !== null && !isSafeAnimationName(raw.anim)) return fail('anim')
+    const gift = normalizeGift(raw.gift)
     return {
       ok: true,
       packet: {
@@ -370,7 +463,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         nickname,
         anim: raw.anim === null ? null : raw.anim.trim(),
         ...petExtras({ action: raw.action, semantic: raw.semantic, say: raw.say, now }),
-        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
+        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId }),
+        ...(gift === null ? {} : { gift })
       }
     }
   }

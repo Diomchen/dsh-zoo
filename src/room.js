@@ -9,6 +9,7 @@ import {
   isSafeAnimationName,
   isVisitId,
   normalizeAnimation,
+  normalizeGift,
   normalizeNickname,
   normalizeSay,
   normalizeSemantic,
@@ -19,6 +20,7 @@ import {
   VISIT_RECORD_LIMIT,
   normalizeVisitRecord
 } from './visit-record.js'
+import { isGiftStatus } from './gift-copy.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -106,12 +108,25 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *   不创建访客；发现、心跳和本机出门都不受影响。
  * - autoVisit 只影响**自发出门**：关掉时手动「串门」照常可用。
  * - 两个开关都是本机动作，落盘由 service 交给 src/settings.js；UDP 报文永远改不了它们。
+ *
+ * ticket 23（带派·字条）的边界：
+ * - 礼物挂在**这一次访客**上（`visitor.gift`），不是独立列表：访客回家/被送客/失联时
+ *   卡片跟着消失，不需要第二套生命周期。
+ * - 协议层已经清过一次；这里再过一遍 `normalizeGift` 是防御（room 也会被单测直接喂），
+ *   非法就当成“这次没有礼物”，绝不因此不建访客。
+ * - 只有 service 能改礼物状态（写盘成功 → received、失败 → failed）；room 不碰磁盘。
+ * - 「扔掉」之后本次运行内**永不再出现**：discardedGifts 记住 giftId，重试报文也带不回来。
  */
 
 export const MAX_PROMPTS = 8
 /** 同时出现在桌面上的心跳影子上限；它只是“谁在线”，不是串门访客。 */
 export const MAX_GUESTS = 8
 export const MAX_NOTICES = 10
+/**
+ * 「扔掉过」的 giftId 记忆上限。一次运行里丢掉两百件之后，最旧的那条被忘掉——
+ * 它对应的访客早就走了，重发的报文也不会再带同一个 UUID。
+ */
+export const MAX_DISCARDED_GIFTS = 200
 /** 点“稍后再说”后，同一位邻居至少安静这么久再问（它消失后重新出现则立刻重问）。 */
 export const PROMPT_SNOOZE_MS = 10 * 60 * 1000
 
@@ -154,7 +169,9 @@ export function createRoom ({
     activity: { session: null, pointer: null },
     lastPolicyDecision: null,
     // 「一次场景画不下所有访客」的提示只提醒一次；拥挤解除后才能再提醒。
-    overflowNotified: false
+    overflowNotified: false,
+    // ticket 23：被主人「扔掉」的 giftId。重试/重放同一份报文也不会再长出卡片。
+    discardedGifts: new Set()
   }
 
   function nowMs () {
@@ -376,7 +393,32 @@ export function createRoom ({
       since: visitor.since,
       // 入站访客没有时间上限：endsAt 固定为 null，客户端不要画倒计时。
       lastSeen: visitor.lastSeen,
-      endsAt: null
+      endsAt: null,
+      // 只加字段、不改名：没有礼物的访客，快照形状与 ticket 10 完全一致。
+      ...(visitor.gift === undefined ? {} : { gift: { ...visitor.gift } })
+    }
+  }
+
+  /**
+   * 入站礼物：协议层已经清洗过一遍，这里再过一遍白名单（room 也会被单测直接喂）。
+   * 返回的状态永远是 pending——真正收下要等 service 把 note.txt 写成功。
+   */
+  function visitorGift (value) {
+    const gift = normalizeGift(value)
+    if (gift === null) return null
+    // 扔掉过的东西不再长回来，哪怕对方重发同一条报文。
+    if (state.discardedGifts.has(gift.id)) return null
+    return { id: gift.id, kind: gift.kind, text: gift.text, status: 'pending' }
+  }
+
+  function rememberDiscardedGift (giftId) {
+    if (!isVisitId(giftId)) return
+    state.discardedGifts.delete(giftId)
+    state.discardedGifts.add(giftId)
+    while (state.discardedGifts.size > MAX_DISCARDED_GIFTS) {
+      const oldest = state.discardedGifts.values().next().value
+      if (oldest === undefined) break
+      state.discardedGifts.delete(oldest)
     }
   }
 
@@ -1048,6 +1090,9 @@ export function createRoom ({
      * 来源会得到 ack，其余回 not-admitted（明确失败）。deny 都不创建访客、不写记录。
      * 同一来源的重复请求（重试）按 visitId 幂等处理：原地刷新 id/动作/lastSeen，
      * 不重置 since，也绝不多写一条记录。
+     *
+     * 礼物（ticket 23）只是访客身上的一个可选字段：坏 gift 在协议层已经被丢掉，
+     * 这里再丢一次也**不影响 ack**——访客该进门还是进门。
      */
     observeVisitRequest (peer, at = clock()) {
       if (peer === null || typeof peer !== 'object') {
@@ -1073,6 +1118,7 @@ export function createRoom ({
         neighbor?.nickname ?? state.trust.allowed.get(deviceId) ?? peer.nickname
       ) ?? FALLBACK_NICKNAME
       const anim = normalizeAnimation(peer.anim)
+      const gift = visitorGift(peer.gift)
 
       const existing = state.visitors.get(deviceId)
       if (existing !== undefined) {
@@ -1082,6 +1128,10 @@ export function createRoom ({
         existing.nickname = nickname
         existing.anim = anim
         existing.lastSeen = now
+        // 重发的是同一件礼物：状态（可能已经 received）原样保留，绝不退回 pending，
+        // 否则每丢一包 ack，桌面上的卡片就会闪一下“正在收下”。
+        // 换了一件新的：换卡；没带礼物：这次访客身上原来那件留着（东西已经在磁盘上了）。
+        if (gift !== null && existing.gift?.id !== gift.id) existing.gift = gift
         refreshNeighbor(deviceId, now)
         return {
           reply: 'ack',
@@ -1100,7 +1150,8 @@ export function createRoom ({
         nickname,
         anim,
         since: now,
-        lastSeen: now
+        lastSeen: now,
+        ...(gift === null ? {} : { gift })
       }
       state.visitors.set(deviceId, visitor)
       refreshNeighbor(deviceId, now)
@@ -1147,6 +1198,54 @@ export function createRoom ({
         nickname: visitor.nickname,
         record
       }
+    },
+
+    /**
+     * service 把字条写进磁盘之后回报状态（ticket 23）。只认这位访客身上的那一件：
+     * 访客已经走了 / 礼物已经被换掉 / giftId 对不上，都返回 false 而不是顺手造一张卡。
+     *
+     * status 由 gift-copy 的固定词表校验；presentation 的文案表同时是这里的状态词表，
+     * 免得两处各有一份、迟早对不上。
+     */
+    markGiftStatus (rawDeviceId, rawGiftId, status) {
+      if (!isGiftStatus(status)) return false
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      if (deviceId === null) return false
+      const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
+      if (!isVisitId(giftId)) return false
+      const visitor = state.visitors.get(deviceId)
+      if (visitor === undefined || visitor.gift === undefined) return false
+      if (visitor.gift.id !== giftId) return false
+      visitor.gift.status = status
+      return true
+    },
+
+    /**
+     * 主人点了「扔掉」：卡片立刻消失，并记住这个 giftId（本次运行内不再出现）。
+     * 磁盘删除由 service 负责；这里只改内存，磁盘不归它管。
+     */
+    discardGift (rawDeviceId, rawGiftId) {
+      const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
+      if (!isVisitId(giftId)) return false
+      rememberDiscardedGift(giftId)
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      if (deviceId === null) return false
+      const visitor = state.visitors.get(deviceId)
+      if (visitor === undefined || visitor.gift === undefined) return false
+      if (visitor.gift.id !== giftId) return false
+      delete visitor.gift
+      return true
+    },
+
+    /** 这件礼物是不是已经被「扔掉」了：service 据此不再把重试报文重新写回磁盘。 */
+    isGiftDiscarded (rawGiftId) {
+      const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
+      return isVisitId(giftId) && state.discardedGifts.has(giftId)
+    },
+
+    /** 本机这次的礼物没带上（太长/整包超 4 KiB）：留一句人话，串门照常。 */
+    noteGiftDropped (at = clock()) {
+      return pushNotice('字条太长了，这次没带上。', at)
     },
 
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */
@@ -1263,6 +1362,7 @@ export function createRoom ({
       state.activity.pointer = null
       state.lastPolicyDecision = null
       state.overflowNotified = false
+      state.discardedGifts.clear()
       state.self.pet = null
       state.self.bridge = { ...IDLE_BRIDGE }
     }
