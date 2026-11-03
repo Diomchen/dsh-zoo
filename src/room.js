@@ -20,7 +20,7 @@ import {
   VISIT_RECORD_LIMIT,
   normalizeVisitRecord
 } from './visit-record.js'
-import { giftDroppedText, isGiftStatus } from './gift-copy.js'
+import { giftDroppedText, isGiftReason, isGiftStatus } from './gift-copy.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -401,14 +401,18 @@ export function createRoom ({
 
   /**
    * 入站礼物：协议层已经清洗过一遍，这里再过一遍白名单（room 也会被单测直接喂）。
-   * 返回的状态永远是 pending——真正收下要等 service 把 note.txt 写成功。
+   * 返回的状态永远是 pending——真正收下要等 service 把 note.txt/文件写成功。
+   * 文件礼物只带 name/size（渲染端要画文件名与大小）；sha256 与路径都不进快照。
    */
   function visitorGift (value) {
     const gift = normalizeGift(value)
     if (gift === null) return null
     // 扔掉过的东西不再长回来，哪怕对方重发同一条报文。
     if (state.discardedGifts.has(gift.id)) return null
-    return { id: gift.id, kind: gift.kind, text: gift.text, status: 'pending' }
+    if (gift.kind === 'file') {
+      return { id: gift.id, kind: 'file', name: gift.name, size: gift.size, status: 'pending' }
+    }
+    return { id: gift.id, kind: 'text', text: gift.text, status: 'pending' }
   }
 
   function rememberDiscardedGift (giftId) {
@@ -1201,13 +1205,14 @@ export function createRoom ({
     },
 
     /**
-     * service 把字条写进磁盘之后回报状态（ticket 23）。只认这位访客身上的那一件：
+     * service 把字条/文件写进磁盘之后回报状态（ticket 23 / 25）。只认这位访客身上的那一件：
      * 访客已经走了 / 礼物已经被换掉 / giftId 对不上，都返回 false 而不是顺手造一张卡。
      *
      * status 由 gift-copy 的固定词表校验；presentation 的文案表同时是这里的状态词表，
-     * 免得两处各有一份、迟早对不上。
+     * 免得两处各有一份、迟早对不上。`reason`（ticket 25）只用于 failed/refused 的状态行，
+     * 取值同样来自固定词表，绝不把任意字符串带进快照。
      */
-    markGiftStatus (rawDeviceId, rawGiftId, status) {
+    markGiftStatus (rawDeviceId, rawGiftId, status, reason = null) {
       if (!isGiftStatus(status)) return false
       const deviceId = normalizeDeviceId(rawDeviceId)
       if (deviceId === null) return false
@@ -1217,6 +1222,11 @@ export function createRoom ({
       if (visitor === undefined || visitor.gift === undefined) return false
       if (visitor.gift.id !== giftId) return false
       visitor.gift.status = status
+      if (typeof reason === 'string' && isGiftReason(reason) && (status === 'failed' || status === 'refused')) {
+        visitor.gift.reason = reason
+      } else {
+        delete visitor.gift.reason
+      }
       return true
     },
 

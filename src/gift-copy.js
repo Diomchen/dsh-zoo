@@ -34,6 +34,25 @@ export function isGiftStatus (value) {
 }
 
 /**
+ * 文件礼物失败原因的固定词表（ticket 25）。reason 只决定状态行的一句话，
+ * 不进 wire、不进 /state、也绝不来自远端字符串。（限额的 `rate` 留给 ticket 27。）
+ */
+export const GIFT_REASONS = Object.freeze([
+  'timeout',
+  'no-port',
+  'checksum',
+  'too-large',
+  'refused',
+  'write'
+])
+
+const REASON_SET = new Set(GIFT_REASONS)
+
+export function isGiftReason (value) {
+  return typeof value === 'string' && REASON_SET.has(value)
+}
+
+/**
  * 卡片标题。kind 目前只有 'text'；文件礼物是 ticket 25 的事，
  * 这里先按词表给出一个不丢信息的说法，免得 25 再补一遍标题。
  */
@@ -45,13 +64,24 @@ export function giftTitleText (nickname, kind = 'text') {
 
 /**
  * 状态行。received 返回 null（卡片正文就是内容本身）。
- * failed / refused 的措辞刻意模糊：这一票没有失败原因可依据。
+ * failed / refused 在知道原因时给一句具体的；不知道原因时仍然刻意模糊——
+ * 网络、端口、防火墙、限额都能造成同一个可见结果，猜错比不说更糟。
  */
-export function giftStatusText (status) {
+export function giftStatusText (status, reason = null) {
   if (status === 'pending') return '刚到，正在收下…'
   if (status === 'receiving') return '正在取回…'
-  if (status === 'failed') return '这件东西没取到。可能是对方没开端口，也可能只是网络或版本对不上。'
-  if (status === 'refused') return '这件东西没收下。'
+  if (status === 'failed') {
+    if (reason === 'no-port') return '对方没开素材端口，东西取不回来。'
+    if (reason === 'timeout') return '对方一直没回应，这次没取到。'
+    if (reason === 'checksum') return '取回来的东西和对方说的对不上，没敢收下。'
+    if (reason === 'too-large') return '这件东西超过 16 MB，没收下。'
+    if (reason === 'write') return '东西没能写进本地。'
+    return '这件东西没取到。可能是对方没开端口，也可能只是网络或版本对不上。'
+  }
+  if (status === 'refused') {
+    if (reason === 'too-large') return '这件东西超过 16 MB，没收下。'
+    return '这件东西没收下。'
+  }
   return null
 }
 

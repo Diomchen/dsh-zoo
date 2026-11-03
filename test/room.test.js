@@ -811,3 +811,39 @@ test('noteGiftDropped：字条没带上时留一句人话，不影响任何串�
   assert.equal(room.snapshot().notices[0].text, notice.text)
   assert.deepEqual(room.snapshot().visitors, [])
 })
+
+// ---------------------------------------------------------------------------
+// ticket 25：文件礼物挂在访客上（name/size/status/reason）
+// ---------------------------------------------------------------------------
+
+test('文件礼物：访客身上只留 name/size，走 pending → receiving → received；理由只认词表', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  const giftId = randomUUID()
+  const sha = 'sha256:' + 'a'.repeat(64)
+  room.observeVisitRequest(giftVisit(id, {
+    gift: { id: giftId, kind: 'file', name: '../报价单.pdf', size: 23194, sha256: sha }
+  }), T0)
+
+  const gift = room.snapshot().visitors[0].gift
+  assert.deepEqual(gift, {
+    id: giftId,
+    kind: 'file',
+    name: '报价单.pdf',
+    size: 23194,
+    status: 'pending'
+  })
+  // 路径与 sha256 都不进快照：渲染端不需要，也不该拿到。
+  assert.equal('path' in gift, false)
+  assert.equal('sha256' in gift, false)
+
+  assert.equal(room.markGiftStatus(id, giftId, 'receiving'), true)
+  assert.equal(room.snapshot().visitors[0].gift.status, 'receiving')
+  // failed/refused 才记理由，且只认固定词表；未知理由被丢掉。
+  assert.equal(room.markGiftStatus(id, giftId, 'failed', 'checksum'), true)
+  assert.equal(room.snapshot().visitors[0].gift.reason, 'checksum')
+  assert.equal(room.markGiftStatus(id, giftId, 'failed', 'made-up'), true)
+  assert.equal('reason' in room.snapshot().visitors[0].gift, false)
+  assert.equal(room.markGiftStatus(id, giftId, 'received'), true)
+  assert.equal('reason' in room.snapshot().visitors[0].gift, false)
+})

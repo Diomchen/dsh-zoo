@@ -103,8 +103,16 @@ export function resolveElectronBinary ({ env = process.env, platform = process.p
  * `assetRoots` 是宿主解析好的 dsh-pet 素材目录（绝对路径，按优先级排列）。helper 的页面是
  * file://，拿不到 DSH 的 HTTP 路由，所以它要注册 localpet:// 协议，根目录只能从 argv 拿。
  * `cacheRoot` 是远端素材的本地缓存目录（helper 只读，不联网）。
+ * `giftsRoot` 是收到的礼物根目录（`<dataDir>/gifts`）：helper 只读它，给缩略图用（ticket 25）。
  */
-export function buildHelperArgs ({ helperPath, hostPid, debug = false, assetRoots = [], cacheRoot = null } = {}) {
+export function buildHelperArgs ({
+  helperPath,
+  hostPid,
+  debug = false,
+  assetRoots = [],
+  cacheRoot = null,
+  giftsRoot = null
+} = {}) {
   const args = [String(helperPath)]
   if (Number.isInteger(hostPid) && hostPid > 0) {
     args.push('--local-pet-host-pid', String(hostPid))
@@ -117,6 +125,12 @@ export function buildHelperArgs ({ helperPath, hostPid, debug = false, assetRoot
     const dir = cacheRoot.trim()
     if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {
       args.push('--local-pet-cache', dir)
+    }
+  }
+  if (typeof giftsRoot === 'string') {
+    const dir = giftsRoot.trim()
+    if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {
+      args.push('--local-pet-gifts', dir)
     }
   }
   const seen = new Set()

@@ -15,7 +15,7 @@
 
 import shared from '../desktop/shared.js'
 import { isGiftStatus, giftStatusText, giftTitleText } from './gift-copy.js'
-import { isDeviceId, isVisitId } from './protocol.js'
+import { isDeviceId, isVisitId, sanitizeGiftName } from './protocol.js'
 import { MAX_STREET, isBlockedReason } from './street.js'
 import { isVisitReason, visitReasonText } from './visit-copy.js'
 
@@ -136,15 +136,16 @@ function streetFromSnapshot (snapshot) {
 }
 
 /**
- * 访客身上的礼物 → 桌面卡片（ticket 23）。
+ * 访客身上的礼物 → 桌面卡片（ticket 23 / 25）。
  *
  * 卡片**跟着访客**：这里按 `snapshot.visitors` 走，访客一走这张卡自然就不输出了，
  * 渲染端不需要另一套“什么时候收起卡片”的规则。标题与状态文案在宿主算好，
  * 渲染端只画（`gift-copy.js` 是唯一文案表）。
  *
- * 本版本只认 `kind:'text'`；文件礼物（ticket 25）会带 name/size/thumb，在这里补一支。
+ * 文件礼物额外带 name/size；`thumb` 只在**真的收下**且扩展名是 jpg/png/gif/webp 时给，
+ * 地址由 service 注入的 `thumbOf(giftId)` 算（目录名+文件名都来自礼物 store）。
  */
-function giftsFromSnapshot (snapshot) {
+function giftsFromSnapshot (snapshot, { thumbOf = null } = {}) {
   const gifts = []
   const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
   for (const visitor of visitors) {
@@ -155,13 +156,36 @@ function giftsFromSnapshot (snapshot) {
     const gift = visitor.gift
     if (gift === null || typeof gift !== 'object') continue
     if (!isVisitId(gift.id)) continue
-    if (gift.kind !== 'text') continue
     if (!isGiftStatus(gift.status)) continue
     const label = shared.normalizeLabel(visitor.nickname, '邻居')
-    const statusText = giftStatusText(gift.status)
+    const giftId = gift.id.toLowerCase()
+    const statusText = giftStatusText(gift.status, gift.reason ?? null)
+    if (gift.kind === 'file') {
+      // 文件名与大小缺一个就画不出文件卡，整张丢掉（room 永远给全，这里防的是手改/旧快照）。
+      const name = sanitizeGiftName(gift.name)
+      const size = Number.isInteger(gift.size) && gift.size > 0 ? gift.size : null
+      if (name === null || size === null) continue
+      const thumb = gift.status === 'received' && isThumbName(name) && typeof thumbOf === 'function'
+        ? thumbOf(giftId)
+        : null
+      gifts.push({
+        deviceId,
+        giftId,
+        kind: 'file',
+        status: gift.status,
+        title: giftTitleText(label, 'file'),
+        name,
+        size,
+        // 缩略图只给真的能画的图片；其余一律给文件图标（渲染端只按有没有 thumb 画）。
+        ...(typeof thumb === 'string' && thumb !== '' ? { thumb } : {}),
+        ...(statusText === null ? {} : { statusText })
+      })
+      continue
+    }
+    if (gift.kind !== 'text') continue
     gifts.push({
       deviceId,
-      giftId: gift.id.toLowerCase(),
+      giftId,
       kind: 'text',
       status: gift.status,
       title: giftTitleText(label, 'text'),
@@ -171,6 +195,11 @@ function giftsFromSnapshot (snapshot) {
     })
   }
   return gifts
+}
+
+/** 只有这四种扩展名能在卡片上画缩略图（与 desktop/main.js 的协议白名单同一个口径）。 */
+function isThumbName (name) {
+  return /\.(?:jpe?g|png|gif|webp)$/i.test(name)
 }
 
 /**
@@ -183,7 +212,7 @@ function giftsFromSnapshot (snapshot) {
  * @param {object} snapshot room.snapshot()
  * @returns {object} 与 shared.emptyControls() 同形状的归一化控件状态
  */
-export function controlsFromSnapshot (snapshot) {
+export function controlsFromSnapshot (snapshot, options = {}) {
   const controls = shared.emptyControls()
   if (snapshot === null || typeof snapshot !== 'object') return controls
 
@@ -222,7 +251,7 @@ export function controlsFromSnapshot (snapshot) {
   }
 
   controls.street = streetFromSnapshot(snapshot)
-  controls.gifts = giftsFromSnapshot(snapshot)
+  controls.gifts = giftsFromSnapshot(snapshot, options)
 
   const prompt = snapshot.prompt !== null && typeof snapshot.prompt === 'object' ? snapshot.prompt : null
   if (prompt !== null) {

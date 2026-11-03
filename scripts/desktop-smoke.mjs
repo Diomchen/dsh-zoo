@@ -37,6 +37,9 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
 const OUT_DIR = join(tmpdir(), 'dsh-local-pet-desktop-smoke-' + process.pid)
 const NOTES_DIR = join(ROOT, '.scratch', 'local-pet', 'notes')
+/** ticket 25：礼物缩略图走 helper 的 localpet://gifts 根；冒烟自己造一个真目录 + 真 PNG。 */
+const GIFTS_ROOT = join(OUT_DIR, 'gifts')
+const GIFT_THUMB_DIR = '20261103-153245-ab12cd12'
 const WRITE_NOTES = process.env.LOCAL_PET_SMOKE_NOTES === '1'
 const ASSET_ROOTS = resolveDshPetAssetDirs({ env: process.env })
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -430,6 +433,21 @@ function assertControlPixels (verified, rects) {
     assert(pixels > pw * ph * 0.25,
       '控件 ' + rect.id + ' 在截图里有可见像素（' + pixels + '/' + (pw * ph) + '）')
   }
+}
+
+/** 礼物卡截图笔记（ticket 25）：合成到棋盘格上，再按卡片矩形裁一圈，方便直接看。 */
+function writeGiftNote (verified, rect, fileName) {
+  if (!WRITE_NOTES) return null
+  mkdirSync(NOTES_DIR, { recursive: true })
+  const composite = compositeOverCheckerboard(verified.image)
+  const margin = 28
+  const px = Math.max(0, Math.floor((rect.x - margin) * verified.scaleX))
+  const py = Math.max(0, Math.floor((rect.y - margin) * verified.scaleY))
+  const pw = Math.min(composite.width - px, Math.ceil((rect.width + margin * 2) * verified.scaleX))
+  const ph = Math.min(composite.height - py, Math.ceil((rect.height + margin * 2) * verified.scaleY))
+  const path = join(NOTES_DIR, fileName)
+  writeFileSync(path, encodePng(downscale(cropImage(composite, px, py, pw, ph), 2)))
+  return path
 }
 
 function writeControlNotes (verified, noticeVerified) {
@@ -1764,7 +1782,23 @@ async function verifyStreetStability () {
 // ---------------------------------------------------------------------------
 
 async function verifyGifts () {
-  const client = createHelperClient((line) => info(line))
+  // 缩略图要真的是一张图：先写进 gifts 根，再让渲染端通过 localpet://gifts/<目录>/<文件> 读它。
+  const giftDir = join(GIFTS_ROOT, GIFT_THUMB_DIR)
+  mkdirSync(giftDir, { recursive: true })
+  const thumbFile = join(giftDir, '照片.png')
+  const thumbImage = { width: 96, height: 64, data: Buffer.alloc(96 * 64 * 4) }
+  for (let y = 0; y < thumbImage.height; y += 1) {
+    for (let x = 0; x < thumbImage.width; x += 1) {
+      const index = (y * thumbImage.width + x) * 4
+      thumbImage.data[index] = 60 + Math.round((x / thumbImage.width) * 160)
+      thumbImage.data[index + 1] = 120
+      thumbImage.data[index + 2] = 200
+      thumbImage.data[index + 3] = 255
+    }
+  }
+  writeFileSync(thumbFile, encodePng(thumbImage))
+
+  const client = createHelperClient((line) => info(line), ['--local-pet-gifts', GIFTS_ROOT])
   const readyMark = client.mark()
   const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
   const workArea = ready.workArea
@@ -1777,7 +1811,15 @@ async function verifyGifts () {
   client.send({ type: 'debug-lock-input', locked: true })
   await sleep(150)
 
-  const sceneWithGift = () => shared.petScene([
+  const textGift = {
+    deviceId: visitorId,
+    giftId,
+    kind: 'text',
+    status: 'received',
+    title: '「阿蟹」捎来一张字条',
+    text: giftText
+  }
+  const sceneWithGift = (gift = textGift) => shared.petScene([
     { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
     { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
   ], workArea, {
@@ -1789,14 +1831,7 @@ async function verifyGifts () {
       street: [],
       prompt: null,
       notice: null,
-      gifts: [{
-        deviceId: visitorId,
-        giftId,
-        kind: 'text',
-        status: 'received',
-        title: '「阿蟹」捎来一张字条',
-        text: giftText
-      }]
+      gifts: [gift]
     }
   })
 
@@ -1863,11 +1898,98 @@ async function verifyGifts () {
   assert(state.controls.gifts.length === 0, '扔掉之后卡片从场景里消失')
   assert(!state.uiRects.some((rect) => rect.id.startsWith('ui:gift')), '礼物卡的所有命中矩形都撤掉了')
 
+  // -----------------------------------------------------------------------
+  // ticket 25：文件卡片 + 图片缩略图。
+  // 缩略图是 localpet://gifts（CSP img-src 必须放行），用 rendererState 的
+  // thumb.loaded 证明图片真的解码成功；截图侧再确认卡片画出来了。
+  // -----------------------------------------------------------------------
+  const imageGiftId = '77777777-7777-4777-8777-777777777777'
+  const imageGift = {
+    deviceId: visitorId,
+    giftId: imageGiftId,
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '照片.png',
+    size: 2048,
+    thumb: 'localpet://gifts/' + GIFT_THUMB_DIR + '/' + encodeURIComponent('照片.png')
+  }
+  client.send({ type: 'update', scene: sceneWithGift(imageGift) })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    const card = snapshot.controls.gifts[0]
+    return card?.kind === 'file' && card.thumb?.loaded === true
+  }, 3000, '图片缩略图解码成功')
+  // 宠物刚被 reset 重新出生，卡片跟着访客移动；等物理稳定再取矩形/截图，否则矩形会过期。
+  await sleep(1800)
+  state = await client.rendererState()
+  assert(state.controls.gifts[0].kind === 'file', '文件卡片画出来了（kind=file）')
+  assert(state.controls.gifts[0].name === '照片.png', '卡片带文件名（' + state.controls.gifts[0].name + '）')
+  assert(state.controls.gifts[0].size === 2048, '卡片带文件大小')
+  assert(state.controls.gifts[0].thumb !== null && state.controls.gifts[0].thumb.loaded === true,
+    'localpet://gifts 的缩略图真的解码了（CSP + 协议都通）')
+  assert(state.controls.gifts[0].copyVisible === false, '文件卡片不显示「复制」')
+  const imageCardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + imageGiftId)
+  assert(Boolean(imageCardRect), '文件卡片有独立命中矩形')
+  const imagePath = join(OUT_DIR, 'gift-image.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-gift-image', path: imagePath })
+  const imageShotEvent = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-gift-image', 8000, '图片礼物卡截图')
+  assert(imageShotEvent.width > 0 && existsSync(imagePath), '图片礼物卡截图落盘：' + imagePath)
+  const imageVerified = verifyShot(imagePath, imagePath + '.json', 2)
+  assertControlPixels(imageVerified, [imageCardRect])
+
+  // 非图片文件：没有 thumb，渲染端画文件图标 + 文件名 + 大小。
+  const fileGiftId = '88888888-8888-4888-8888-888888888888'
+  const fileGift = {
+    deviceId: visitorId,
+    giftId: fileGiftId,
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '报价单.pdf',
+    size: 23194
+  }
+  client.send({ type: 'update', scene: sceneWithGift(fileGift) })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.gifts[0]?.giftId === fileGiftId && snapshot.controls.gifts[0]?.thumb === null
+  }, 3000, '非图片文件卡片（没有缩略图）')
+  await sleep(1800)
+  state = await client.rendererState()
+  assert(state.controls.gifts[0].name === '报价单.pdf', '非图片文件卡片显示文件名')
+  const fileCardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + fileGiftId)
+  assert(Boolean(fileCardRect), '非图片文件卡片有命中矩形')
+  const filePath = join(OUT_DIR, 'gift-file.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-gift-file', path: filePath })
+  const fileShotEvent = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-gift-file', 8000, '文件礼物卡截图')
+  assert(fileShotEvent.width > 0 && existsSync(filePath), '文件礼物卡截图落盘：' + filePath)
+  const fileVerified = verifyShot(filePath, filePath + '.json', 2)
+  assertControlPixels(fileVerified, [fileCardRect])
+
+  // 截图存进仓库的 notes 目录（25- 前缀，棋盘格合成 + 卡片特写），方便人工复核。
+  const noteCard = writeGiftNote(verified, cardRect, '25-gift-card.png')
+  const noteImage = writeGiftNote(imageVerified, imageCardRect, '25-gift-image.png')
+  const noteFile = writeGiftNote(fileVerified, fileCardRect, '25-gift-file.png')
+  if (noteImage !== null) info('截图笔记：' + noteImage + ' / ' + noteFile)
+
   // 光标移开 → 恢复穿透（没关掉的控件不该把整窗一直按着）。
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
   await waitUntil(async () => (await client.status()).ignoring === true, 3000, '礼物卡收起后恢复穿透')
 
-  return { pngPath, sidecarPath: pngPath + '.json', verified }
+  return {
+    pngPath,
+    sidecarPath: pngPath + '.json',
+    verified,
+    imagePath,
+    filePath,
+    imageVerified,
+    fileVerified,
+    noteCard,
+    noteImage,
+    noteFile
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2152,7 +2274,11 @@ try {
   console.log('\n通过（' + checks + ' 项断言' + (ONLY === null ? '，全部段落' : '，只跑了 ' + ONLY) + '）。')
   console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
   if (controls !== null) console.log('控件截图：' + controls.pngPath)
-  if (gifts !== null) console.log('礼物卡截图：' + gifts.pngPath)
+  if (gifts !== null) {
+    console.log('礼物卡截图：' + gifts.pngPath)
+    console.log('图片礼物卡截图：' + gifts.imagePath)
+    console.log('文件礼物卡截图：' + gifts.filePath)
+  }
   if (bring !== null) {
     console.log('带派小窗截图：' + bring.pngPath)
     if (bring.notePath !== null) console.log('  带派小窗（棋盘格合成）: ' + bring.notePath)
