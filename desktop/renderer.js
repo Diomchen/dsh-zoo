@@ -855,6 +855,8 @@
       grid,
       more,
       actions: new Map(),
+      order: [],
+      rows: new Map(),
       showBlocked: false,
       openedAt: performance.now(),
       lastActiveAt: performance.now()
@@ -888,13 +890,12 @@
     street.head.textContent = ''
     const title = document.createElement('span')
     title.className = 'lp-street-title'
+    const visitable = rows.filter((row) => row.canVisit === true)
     if (away) {
       title.textContent = '宠物正在「' + (awayName === null ? '邻居' : awayName) + '」家'
-      const recall = makeButton('召回', 'recall')
       street.head.appendChild(title)
-      street.head.appendChild(recall)
+      street.head.appendChild(makeButton('召回', 'recall'))
     } else {
-      const visitable = rows.filter((row) => row.canVisit === true)
       title.textContent = '邻居'
       const sub = document.createElement('span')
       sub.className = 'lp-street-sub'
@@ -903,29 +904,79 @@
       street.head.appendChild(sub)
     }
 
-    street.grid.textContent = ''
-    const previous = street.actions
-    const next = new Map()
-    const visitable = rows.filter((row) => row.canVisit === true)
     const blocked = rows.filter((row) => row.canVisit !== true)
+    const rowsById = new Map(rows.map((row) => [row.deviceId, row]))
 
-    for (const row of visitable) {
-      const house = buildHouse(row)
-      street.grid.appendChild(house)
-      next.set(row.deviceId, row.action)
+    // 顺序冻结（bug 修复）：面板开着的时候，已经在这条街上的人不动位置，新来的排到队尾。
+    // 宿主每来一轮心跳都会按 lastSeen 重排一次；照搬那个顺序，房子就在光标底下换位置，
+    // 于是点空或者点到隔壁。
+    const alive = new Set(rowsById.keys())
+    street.order = street.order.filter((deviceId) => alive.has(deviceId))
+    for (const row of rows) {
+      if (!street.order.includes(row.deviceId)) street.order.push(row.deviceId)
+    }
+
+    // 就地更新，不重建节点（bug 修复之二）：光标底下那个元素被换成新节点，
+    // 一次 click 的 pointerdown/pointerup 就落在两个元素上，浏览器干脆不派发 click。
+    const wanted = []
+    const peeked = []
+    for (const deviceId of street.order) {
+      const row = rowsById.get(deviceId)
+      if (row === undefined) continue
+      if (row.canVisit !== true && street.showBlocked !== true) continue
+      let entry = street.rows.get(deviceId)
+      if (entry === undefined || entry.canVisit !== (row.canVisit === true)) {
+        const el = buildHouse(row)
+        entry = {
+          el,
+          canVisit: row.canVisit === true,
+          name: el.querySelector('.lp-house-name'),
+          doing: el.querySelector('.lp-house-doing'),
+          face: el.querySelector('.lp-face')
+        }
+        street.rows.set(deviceId, entry)
+      }
+      if (entry.name.textContent !== row.label) entry.name.textContent = row.label
+      if (entry.el.title !== row.label) entry.el.title = row.label
+      const text = row.canVisit === true
+        ? (typeof row.action === 'string' && row.action !== '' ? row.action : '在附近')
+        : streetStatusText(row)
+      if (entry.doing.textContent !== text) entry.doing.textContent = text
+      wanted.push(entry.el)
       // 谁换了动作，哪户探个头：面板因此是活的，又不会一直吵。
-      if (previous.has(row.deviceId) && previous.get(row.deviceId) !== row.action) peekHouse(house)
+      if (row.canVisit === true) {
+        const seen = street.actions.get(deviceId)
+        if (seen !== undefined && seen !== row.action && row.action !== null) peeked.push(entry.el)
+      }
+      street.actions.set(deviceId, row.action)
     }
-    if (street.showBlocked) {
-      for (const row of blocked) street.grid.appendChild(buildHouse(row))
+    for (const deviceId of [...street.actions.keys()]) {
+      if (!alive.has(deviceId)) street.actions.delete(deviceId)
     }
-    if (visitable.length === 0) {
-      const empty = document.createElement('div')
-      empty.className = 'lp-street-empty'
-      empty.textContent = away ? '它现在在外面。' : '这条街还只有你一家。'
-      street.grid.appendChild(empty)
+
+    for (const [deviceId, entry] of [...street.rows]) {
+      if (!wanted.includes(entry.el)) {
+        entry.el.remove()
+        street.rows.delete(deviceId)
+      }
     }
-    street.actions = next
+
+    // 顺序没变就一个字都不动 DOM：每 2 秒一轮心跳都重排一次，悬停和探头会被打断。
+    const current = [...street.grid.children]
+    const sameOrder = wanted.length > 0 &&
+      current.length === wanted.length &&
+      current.every((el, index) => el === wanted[index])
+    if (!sameOrder) {
+      street.grid.textContent = ''
+      for (const el of wanted) street.grid.appendChild(el)
+      if (wanted.length === 0) {
+        const empty = document.createElement('div')
+        empty.className = 'lp-street-empty'
+        empty.textContent = away ? '它现在在外面。' : '这条街还只有你一家。'
+        street.grid.appendChild(empty)
+      }
+    }
+    for (const el of peeked) peekHouse(el)
 
     street.more.hidden = blocked.length === 0 || away
     street.more.textContent = street.showBlocked

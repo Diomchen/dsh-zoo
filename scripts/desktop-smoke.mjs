@@ -304,8 +304,19 @@ function verifyShot (pngPath, sidecarPath, expectedPets, options = {}) {
   const corner = pixelAt(image, 2, 2)
   assert(corner[3] === 0, '窗口背景是透明的（左上角 alpha=0）')
   const transparent = countTransparent(image)
-  assert(transparent / (image.width * image.height) > 0.9,
-    '整张图 >90% 像素透明（' + ((transparent / (image.width * image.height)) * 100).toFixed(2) + '%）')
+  // 透明比例的下限必须跟着场景走：街/放行卡/宠物在工作区里占的面积是固定的，屏幕越小占比越大
+  // （1280×672 上光「街 + 放行卡」就 >10%）。固定 90% 在小屏上会误判成「画满了整屏」。
+  let occupied = 0
+  const uiRects = sidecar.renderer !== null && Array.isArray(sidecar.renderer.uiRects)
+    ? sidecar.renderer.uiRects
+    : []
+  for (const r of uiRects) occupied += r.width * r.height
+  for (const pet of pets) occupied += pet.width * pet.height
+  const budget = Math.min(0.9, (occupied / (bounds.width * bounds.height)) * 1.6 + 0.04)
+  const transparentFraction = transparent / (image.width * image.height)
+  assert(transparentFraction > 1 - budget,
+    '整张图 >' + Math.round((1 - budget) * 100) + '% 像素透明（' +
+    (transparentFraction * 100).toFixed(2) + '%，占用预算 ' + Math.round(budget * 100) + '%）')
 
   for (const pet of pets) {
     assert(pet.x >= 0 && pet.y >= 0 &&
@@ -1017,7 +1028,12 @@ async function verifyHelper () {
   assert(current.focused === false, '窗口不抢焦点（focused=false）')
   assert(current.focusable === false, '窗口不可聚焦（focusable=false）')
   assert(current.alwaysOnTop === true, '窗口置顶（alwaysOnTop=true）')
-  assert(current.allWorkspaces === true, '窗口显示在所有工作区（allWorkspaces=true）')
+  // Windows 上 setVisibleOnAllWorkspaces 是空操作（helper 里显式跳过），只在 macOS 断言 == true。
+  assert(
+    process.platform === 'win32' ? current.allWorkspaces === false : current.allWorkspaces === true,
+    process.platform === 'win32'
+      ? 'Windows 不调用 setVisibleOnAllWorkspaces（allWorkspaces=false）'
+      : '窗口显示在所有工作区（allWorkspaces=true）')
   assert(current.bounds.width === workArea.width && current.bounds.height === workArea.height,
     '窗口尺寸等于工作区，不越界')
   // 冒烟只走合成 PointerEvent：锁住真实输入，环境里的鼠标/焦点事件不能干扰用例。
@@ -1363,12 +1379,144 @@ async function waitUntil (predicate, timeoutMs, label) {
   throw new Error('等待超时：' + label)
 }
 
+// ---------------------------------------------------------------------------
+// 3) 邻居面板的稳定性：人多时面板不许自己动，点谁就是谁
+// ---------------------------------------------------------------------------
+
+/**
+ * 这是 bug 的回归用例：邻居一多，每来一轮心跳宿主就会按 lastSeen 重排一次，
+ * 面板跟着重建 → 房子在光标底下挪位置，点空或者点到隔壁。
+ *
+ * 断言的是用户看得见的两件事：面板开着时同一户的位置不动；点下去收到的 deviceId 是那一户。
+ */
+async function verifyStreetStability () {
+  const client = createHelperClient((line) => info(line))
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  const workArea = ready.workArea
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+
+  const ids = Array.from({ length: 6 }, (_, index) =>
+    '77777777-7777-4777-8777-' + String(index).padStart(12, '0'))
+
+  const streetRows = (order) => order.map((index) => ({
+    deviceId: ids[index],
+    label: '邻居' + index,
+    action: '在改那个 bug',
+    canVisit: true,
+    blockedReason: null
+  }))
+
+  const sceneWith = (order) => shared.petScene([
+    { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] }
+  ], workArea, {
+    reset: false,
+    controls: {
+      visit: { enabled: true, reason: null },
+      recall: { enabled: false, nickname: null },
+      visitors: [],
+      street: streetRows(order),
+      prompt: null,
+      notice: null
+    }
+  })
+
+  client.send({ type: 'update', scene: sceneWith([0, 1, 2, 3, 4, 5]) })
+  await sleep(1800)
+
+  let state = await client.rendererState()
+  const self = state.pets.find((pet) => pet.id === 'self')
+  const selfCenter = screenCenter(self, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: selfCenter.x, y: selfCenter.y })
+  await waitUntil(async () => (await client.rendererState()).controls.popover !== null, 3000, '悬停后弹层出现')
+
+  state = await client.rendererState()
+  const visitButton = state.uiRects.find((rect) => rect.id === 'ui:btn:open-street')
+  assert(Boolean(visitButton), '「串门」按钮有命中矩形')
+  const visitPoint = rectCenterScreen(visitButton, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: visitPoint.x, y: visitPoint.y })
+  await waitUntil(async () => (await client.rendererState()).controls.streetOpen === true, 3000, '面板打开')
+
+  // 光标停在面板里，免得面板因为“离开”自己关掉。
+  state = await client.rendererState()
+  const panelRect = state.uiRects.find((rect) => rect.id === 'ui:street')
+  assert(Boolean(panelRect), '面板有命中矩形')
+  const panelPoint = rectCenterScreen(panelRect, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: panelPoint.x, y: panelPoint.y })
+  await sleep(120)
+
+  const rectOf = (snapshot, deviceId) =>
+    snapshot.uiRects.find((rect) => rect.id === 'ui:street:visit:' + deviceId)
+
+  state = await client.rendererState()
+  const before = new Map(ids.map((id) => [id, rectOf(state, id)]))
+  assert(ids.every((id) => before.get(id) !== undefined), '六户人家都在面板里')
+  const panelBefore = panelRect
+
+  // 心跳让 lastSeen 变，宿主每一轮都重排一次——这正是人多时发生的事。
+  // 每一轮都要查：面板开着的时候，同一户的位置不许动。
+  const drifted = []
+  for (let round = 1; round <= 8; round += 1) {
+    client.send({ type: 'update', scene: sceneWith(round % 2 === 0 ? [0, 1, 2, 3, 4, 5] : [5, 4, 3, 2, 1, 0]) })
+    await sleep(260)
+    const now = await client.rendererState()
+    const movedIds = ids.filter((id) => {
+      const first = before.get(id)
+      const rect = rectOf(now, id)
+      return rect === undefined || first.x !== rect.x || first.y !== rect.y
+    })
+    const panel = now.uiRects.find((rect) => rect.id === 'ui:street')
+    const panelMoved = panel === undefined || panel.x !== panelBefore.x || panel.y !== panelBefore.y
+    if (movedIds.length > 0 || panelMoved) {
+      drifted.push('第' + round + '轮：' + (movedIds.length > 0 ? movedIds.length + '户' : '') +
+        (panelMoved ? '面板' : ''))
+    }
+  }
+  assert(drifted.length === 0,
+    '面板开着时邻居的位置不该因为别人的心跳而移动（' + drifted.join('；') + '）')
+
+  // 点最上面那一户：收到的必须就是它。
+  const target = before.get(ids[0])
+  const point = rectCenterScreen(target, workArea)
+  const start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: point.x, y: point.y })
+  const action = await client.waitFrom(start, (event) => event.type === 'action', 3000, '串门申请')
+  assert(action.deviceId === ids[0],
+    '点谁就是谁（点了 ' + ids[0] + '，收到 ' + action.deviceId + '）')
+  client.send({ type: 'action-result', id: action.id, ok: true })
+
+  // 另一半症状：点击正好赶上一轮刷新。更新和点击挤在一起，click 既不能丢也不能错。
+  client.send({ type: 'debug-dispatch', phase: 'move', x: selfCenter.x, y: selfCenter.y })
+  await waitUntil(async () => (await client.rendererState()).controls.popover !== null, 3000, '再次打开弹层')
+  state = await client.rendererState()
+  const visitAgain = state.uiRects.find((rect) => rect.id === 'ui:btn:open-street')
+  client.send({ type: 'debug-dispatch', phase: 'click', x: rectCenterScreen(visitAgain, workArea).x,
+    y: rectCenterScreen(visitAgain, workArea).y })
+  await waitUntil(async () => (await client.rendererState()).controls.streetOpen === true, 3000, '面板再次打开')
+
+  state = await client.rendererState()
+  const again = state.uiRects.find((rect) => rect.id === 'ui:street:visit:' + ids[0])
+  assert(Boolean(again), '重开的面板里仍能找到最上面那一户')
+  const midPoint = rectCenterScreen(again, workArea)
+  client.send({ type: 'update', scene: sceneWith([5, 4, 3, 2, 1, 0]) })
+  const inflightStart = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: midPoint.x, y: midPoint.y })
+  const inflight = await client.waitFrom(inflightStart, (event) => event.type === 'action', 3000, '抢在刷新里点击')
+  assert(inflight.deviceId === ids[0],
+    '刷新和点击挤在一起也不能点错（点了 ' + ids[0] + '，收到 ' + inflight.deviceId + '）')
+  client.send({ type: 'action-result', id: inflight.id, ok: true })
+
+  client.send({ type: 'quit' })
+  return null
+}
+
 async function verifyManager () {
   const infos = []
   const warns = []
   const manager = createDesktop({
     desktopHost: true,
-    platform: 'darwin',
+    platform: process.platform,
     debug: true,
     assetRoots: ASSET_ROOTS,
     log: { info: (line) => { infos.push(line); info(line) }, warn: (line) => { warns.push(line); info(line) } }
@@ -1428,7 +1576,7 @@ async function verifyManager () {
   const missingWarns = []
   const missing = createDesktop({
     desktopHost: true,
-    platform: 'darwin',
+    platform: process.platform,
     env: { DSH_HOME: '/nonexistent-dsh-home-for-smoke' },
     exists: () => false,
     log: { info: () => {}, warn: (line) => missingWarns.push(line) }
@@ -1450,7 +1598,7 @@ async function verifyHostKill () {
 import { createDesktop } from ${JSON.stringify(new URL('../src/desktop.js', import.meta.url).href)}
 const manager = createDesktop({
   desktopHost: true,
-  platform: 'darwin',
+  platform: process.platform,
   assetRoots: ${JSON.stringify(ASSET_ROOTS)},
   log: { info() {}, warn() {} }
 })
@@ -1522,6 +1670,7 @@ try {
   if (wants('svg')) await run('降级：没有 dsh-pet 素材时退到内置 SVG 色块', verifySvgFallback)
   if (wants('helper')) await run('helper：点击穿透 / 输入租约 / 物理 / 场景 v2 / 截图 / quit', verifyHelper)
   const controls = wants('controls') ? await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 街道面板 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls) : null
+  if (wants('street')) await run('街道：人多时面板不跳、点谁就是谁', verifyStreetStability)
   if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
   const notes = standalone === null ? null : writeNoteScreenshots(standalone.verified)
