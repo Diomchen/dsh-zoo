@@ -47,7 +47,7 @@ if (electronApi === null || typeof electronApi !== 'object' || typeof electronAp
   process.exit(3)
 }
 
-const { app, BrowserWindow, ipcMain, protocol, screen, shell } = electronApi
+const { app, BrowserWindow, clipboard, ipcMain, protocol, screen, shell } = electronApi
 const shared = require('./shared.js')
 
 const APP_NAME = 'dsh-local-pet-desktop'
@@ -747,6 +747,13 @@ ipcMain.on('local-pet:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '这个操作缺少对象，稍后再试。', error: 'bad-device-id' })
     return
   }
+  // 礼物动作只认 UUID 形状的 giftId：路径永远不出渲染端，宿主拿它自己查目录。
+  const needsGift = shared.GIFT_ACTIONS.includes(action)
+  const giftId = needsGift ? shared.normalizeGiftId(payload?.giftId) : null
+  if (needsGift && giftId === null) {
+    sendActionResult({ id, ok: false, notice: '这张礼物卡已经不在了。', error: 'bad-gift' })
+    return
+  }
   // 点播要带动画名：只收安全的动画名，名字由宿主再去 dsh-pet 那边校验一次。
   const name = action === 'play-anim' ? shared.normalizeAnim(payload?.name) : null
   if (action === 'play-anim' && name === null) {
@@ -754,7 +761,14 @@ ipcMain.on('local-pet:action', (event, payload) => {
     return
   }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
-  const written = writeEvent({ type: 'action', id, action, deviceId, ...(name === null ? {} : { name }) })
+  const written = writeEvent({
+    type: 'action',
+    id,
+    action,
+    deviceId,
+    ...(name === null ? {} : { name }),
+    ...(giftId === null ? {} : { giftId })
+  })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
 
@@ -1155,6 +1169,51 @@ function applyCommand (command) {
       })
       return
     }
+    case 'gift-open': {
+      // 打开便条：交给系统默认程序。shell.openPath 返回空串才是成功，非空是错误文案。
+      const target = typeof command.path === 'string' ? command.path : ''
+      void shell.openPath(target).then((failure) => {
+        if (typeof failure === 'string' && failure !== '') {
+          writeEvent({ type: 'error', id: command.id, code: 'open-failed', message: failure.slice(0, 200) })
+        }
+      }).catch((error) => {
+        writeEvent({ type: 'error', id: command.id, code: 'open-failed', message: String(error?.message ?? error).slice(0, 200) })
+      })
+      return
+    }
+    case 'gift-reveal': {
+      // 在 Finder/资源管理器里显示：只定位，不执行、不打开。
+      try {
+        shell.showItemInFolder(typeof command.path === 'string' ? command.path : '')
+      } catch (error) {
+        writeEvent({ type: 'error', id: command.id, code: 'reveal-failed', message: String(error?.message ?? error).slice(0, 200) })
+      }
+      return
+    }
+    case 'gift-copy': {
+      // 剪贴板只有主进程有（渲染端是 file:// 普通页面），所以复制也走宿主 → helper 这一路。
+      if (typeof command.text === 'string' && command.text !== '') {
+        try {
+          clipboard.writeText(command.text)
+        } catch (error) {
+          writeEvent({ type: 'error', id: command.id, code: 'copy-failed', message: String(error?.message ?? error).slice(0, 200) })
+        }
+      }
+      return
+    }
+    case 'gift-discard': {
+      // 「扔掉」= 立即删掉**这一件**礼物的目录。路径由宿主解析；这里再确认一次
+      // 目标就是某 gifts 目录下的一级子目录——一个坏路径不该变成“删任意目录”。
+      const target = typeof command.path === 'string' ? command.path : ''
+      if (!isGiftDirPath(target)) {
+        writeEvent({ type: 'error', id: command.id, code: 'bad-path', message: 'not a gift directory' })
+        return
+      }
+      void fsp.rm(target, { recursive: true, force: true }).catch((error) => {
+        writeEvent({ type: 'error', id: command.id, code: 'discard-failed', message: String(error?.message ?? error).slice(0, 200) })
+      })
+      return
+    }
     case 'shot':
       if (!rendererReady) {
         writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'renderer not ready' })
@@ -1394,6 +1453,19 @@ function writeEvent (event) {
     shutdown(1)
     return false
   }
+}
+
+/**
+ * 只接受 `<任意>/gifts/<一个目录>` 这种目标：`gift-discard` 是破坏性操作，
+ * 主进程不能因为宿主给错一个路径就把别的东西删了（宿主那一侧也会再校验）。
+ */
+function isGiftDirPath (value) {
+  if (typeof value !== 'string' || value === '') return false
+  if (!path.isAbsolute(value)) return false
+  const resolved = path.resolve(value)
+  if (resolved === path.parse(resolved).root) return false
+  if (path.basename(path.dirname(resolved)) !== 'gifts') return false
+  return path.basename(resolved) !== '' && path.basename(resolved) !== '.' && path.basename(resolved) !== '..'
 }
 
 function reportError (code, error) {

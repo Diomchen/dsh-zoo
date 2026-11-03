@@ -1434,3 +1434,159 @@ test('manager：openUrl 只把 http(s) 地址写进管道，坏地址不写', as
   assert.equal(manager.openUrl('file:///etc/passwd'), false)
   assert.equal(children[0].parsedLines().at(-1).type, 'open-url')
 })
+
+// ---------------------------------------------------------------------------
+// ticket 23：礼物卡的四道白名单
+// ---------------------------------------------------------------------------
+
+test('normalizeNoteText：保留换行、去控制字符与双向覆盖符，按码点截到 500', () => {
+  assert.equal(
+    shared.normalizeNoteText('  第一行\r\n第二行\t\u0000\n\n第三行  '),
+    '第一行\n第二行\n\n第三行'
+  )
+  assert.equal(shared.normalizeNoteText('正常\u202e文字'), '正常文字')
+  assert.equal(shared.normalizeNoteText('   '), null)
+  assert.equal(shared.normalizeNoteText(null), null)
+  const long = '喵'.repeat(shared.MAX_GIFT_TEXT_LENGTH + 20)
+  assert.equal(Array.from(shared.normalizeNoteText(long)).length, shared.MAX_GIFT_TEXT_LENGTH)
+  assert.equal(shared.MAX_GIFT_TEXT_LENGTH, 500, '与 src/protocol.js 的 MAX_GIFT_TEXT 同一个数')
+})
+
+test('场景 controls.gifts：只认字条 + 已知状态 + UUID，正文只在 received 时保留', () => {
+  const deviceId = '33333333-3333-4333-8333-333333333333'
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  const scene = shared.normalizeScene({
+    items: [],
+    controls: {
+      gifts: [
+        {
+          deviceId,
+          giftId,
+          kind: 'text',
+          status: 'received',
+          title: '  「阿蟹」捎来一张字条  ',
+          text: '  第一行\r\n第二行  ',
+          statusText: '不该出现'
+        },
+        { deviceId, giftId, kind: 'text', status: 'pending', title: '重复', text: '重复' },
+        { deviceId: 'bad id', giftId, kind: 'text', status: 'received', title: 'x' },
+        { deviceId, giftId: 'gift-1', kind: 'text', status: 'received', title: 'x' },
+        { deviceId, giftId: '66666666-6666-4666-8666-666666666666', kind: 'file', status: 'received', title: 'x' },
+        { deviceId, giftId: '77777777-7777-4777-8777-777777777777', kind: 'text', status: 'lost', title: 'x' },
+        null,
+        'nope'
+      ]
+    }
+  })
+  assert.deepEqual(scene.controls.gifts, [{
+    deviceId,
+    giftId,
+    kind: 'text',
+    status: 'received',
+    title: '「阿蟹」捎来一张字条',
+    text: '第一行\n第二行'
+  }])
+
+  // 非 received 时正文不画；状态行保留，标题缺省有一句兜底。
+  const pending = shared.normalizeScene({
+    items: [],
+    controls: {
+      gifts: [{
+        deviceId,
+        giftId,
+        kind: 'text',
+        status: 'pending',
+        title: '',
+        text: '还没写完',
+        statusText: '  刚到，正在收下…  '
+      }]
+    }
+  }).controls.gifts
+  assert.deepEqual(pending, [{
+    deviceId,
+    giftId,
+    kind: 'text',
+    status: 'pending',
+    title: '捎来一件东西',
+    statusText: '刚到，正在收下…'
+  }])
+  assert.deepEqual(shared.emptyControls().gifts, [])
+})
+
+test('helper 动作：礼物四动作必须带 giftId；别的动作带上也会被丢掉', () => {
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  for (const action of shared.GIFT_ACTIONS) {
+    const ok = shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action, giftId })
+    assert.equal(ok.ok, true, action)
+    assert.equal(ok.event.giftId, giftId)
+    assert.equal(ok.event.deviceId, null)
+    assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action }).ok, false, action + ' 缺 giftId')
+    assert.equal(
+      shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action, giftId: 'not a uuid' }).ok,
+      false,
+      action + ' 坏 giftId'
+    )
+  }
+  // visit 不是礼物动作：即便坏字段也直接丢掉，不影响事件本身。
+  const visit = shared.normalizeHelperEvent({ type: 'action', id: 'act-2', action: 'visit', giftId })
+  assert.equal(visit.ok, true)
+  assert.equal('giftId' in visit.event, false)
+})
+
+test('宿主命令：gift-open/reveal/discard 只收绝对路径；gift-copy 只收清洗后的字条', () => {
+  for (const type of ['gift-open', 'gift-reveal', 'gift-discard']) {
+    const ok = shared.normalizeHostCommand({ type, id: 'cmd-1', path: '/Users/me/.dsh/gifts/20261103-153245-ab12cd12/note.txt' })
+    assert.equal(ok.ok, true, type)
+    assert.deepEqual(ok.command, {
+      type,
+      id: 'cmd-1',
+      path: '/Users/me/.dsh/gifts/20261103-153245-ab12cd12/note.txt'
+    })
+    assert.equal(shared.normalizeHostCommand({ type, path: 'relative/note.txt' }).ok, false, type)
+    assert.equal(shared.normalizeHostCommand({ type }).ok, false, type)
+  }
+  const copy = shared.normalizeHostCommand({ type: 'gift-copy', id: 'cmd-2', text: ' 第一行\r\n第二行 ' })
+  assert.equal(copy.ok, true)
+  assert.deepEqual(copy.command, { type: 'gift-copy', id: 'cmd-2', text: '第一行\n第二行' })
+  assert.equal(shared.normalizeHostCommand({ type: 'gift-copy', text: '   ' }).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'gift-copy', text: 42 }).ok, false)
+})
+
+test('manager：gift-open/reveal/discard 只写绝对路径，gift-copy 只写清洗后的正文', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4300 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4300, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+  const notePath = '/Users/me/.dsh/local-pet/gifts/20261103-153245-ab12cd12/note.txt'
+
+  assert.equal(manager.giftOpen(notePath), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-open', id: null, path: notePath })
+  assert.equal(manager.giftReveal(notePath), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-reveal', id: null, path: notePath })
+  assert.equal(manager.giftDiscard('/Users/me/.dsh/local-pet/gifts/20261103-153245-ab12cd12'), true)
+  assert.equal(children[0].parsedLines().at(-1).type, 'gift-discard')
+  assert.equal(manager.giftCopy('第一行\r\n第二行'), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-copy', id: null, text: '第一行\n第二行' })
+
+  // 相对路径 / 空正文在白名单处就被丢掉，写不进管道。
+  assert.equal(manager.giftOpen('relative/note.txt'), false)
+  assert.equal(manager.giftCopy('   '), false)
+  assert.equal(children[0].parsedLines().at(-1).type, 'gift-copy')
+})

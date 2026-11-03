@@ -763,3 +763,58 @@ test('controlsFromSnapshot：街上的每一户都送到桌面，去不了的带
   // 旧快照没有 street：街道是空的，不抛。
   assert.deepEqual(controlsFromSnapshot(snapshotWith()).street, [])
 })
+
+test('controlsFromSnapshot：礼物卡跟着访客；正文只在 received 时给，文案来自宿主', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  const withGift = (gift) => snapshotWith({
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
+  })
+
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'text', text: '第一行\n第二行', status: 'received'
+  })).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'text',
+    status: 'received',
+    title: '「阿蟹」捎来一张字条',
+    text: '第一行\n第二行'
+  }])
+
+  // 还没写完磁盘：不画正文（给一半会骗人），只画状态行。
+  const pending = controlsFromSnapshot(withGift({
+    id: giftId, kind: 'text', text: '第一行\n第二行', status: 'pending'
+  })).gifts
+  assert.deepEqual(pending, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'text',
+    status: 'pending',
+    title: '「阿蟹」捎来一张字条',
+    statusText: '刚到，正在收下…'
+  }])
+
+  // 坏 gift 只丢这张卡：id 不是 UUID / 未知状态 / 未知 kind / 没有访客。
+  for (const bad of [
+    { id: 'gift-1', kind: 'text', text: 'x', status: 'received' },
+    { id: giftId, kind: 'text', text: 'x', status: 'lost' },
+    { id: giftId, kind: 'file', text: 'x', status: 'received' },
+    { id: giftId, kind: 'text', text: 'x' }
+  ]) {
+    assert.deepEqual(controlsFromSnapshot(withGift(bad)).gifts, [], JSON.stringify(bad))
+  }
+  assert.deepEqual(controlsFromSnapshot(snapshotWith()).gifts, [])
+  assert.deepEqual(controlsFromSnapshot(null).gifts, [])
+})
+
+test('controlsFromSnapshot：礼物卡没有独立生命周期——访客走了卡片就不在', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const gift = { id: '55555555-5555-4555-8555-555555555555', kind: 'text', text: 'x', status: 'received' }
+  const present = controlsFromSnapshot(snapshotWith({
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
+  }))
+  assert.equal(present.gifts.length, 1)
+  const gone = controlsFromSnapshot(snapshotWith({ visitors: [] }))
+  assert.deepEqual(gone.gifts, [])
+})

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 import { GUEST_TTL_MS, MAX_NEIGHBORS, NEIGHBOR_TTL_MS } from '../src/protocol.js'
@@ -682,4 +683,131 @@ test('self-state：全非法返回 false，不覆盖已有快照', () => {
   room.setSelfPet({ name: '小蓝', anim: null })
   assert.equal(room.setSelfState({ action: '../x', semantic: 'nope', say: { text: '', until: T0 + 1 } }), false)
   assert.deepEqual(room.snapshot().self.pet, { name: '小蓝', anim: null })
+})
+
+// ---------------------------------------------------------------------------
+// ticket 23：串门捎来的字条
+// ---------------------------------------------------------------------------
+
+function giftRoom (deviceId, nickname = '阿蟹') {
+  const room = roomAt()
+  room.setIdentity({ deviceId: randomUUID(), nickname: '我' })
+  room.setTrust({ allowed: { [deviceId]: nickname } })
+  return room
+}
+
+function giftVisit (deviceId, overrides = {}) {
+  return {
+    deviceId,
+    visitId: randomUUID(),
+    nickname: '阿蟹',
+    anim: null,
+    ...overrides
+  }
+}
+
+test('访客身上的礼物：state=received 前是 pending，正文按协议清洗、换行保留', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  const giftId = randomUUID()
+  const result = room.observeVisitRequest(giftVisit(id, {
+    gift: { id: giftId, kind: 'text', text: '  第一行\n第二行\u202e  ' }
+  }), T0)
+  assert.equal(result.reply, 'ack')
+  const visitor = room.snapshot().visitors[0]
+  assert.deepEqual(visitor.gift, {
+    id: giftId,
+    kind: 'text',
+    text: '第一行\n第二行',
+    status: 'pending'
+  })
+
+  // 写盘成功之后由 service 回报 received；状态进快照，其余字段一个不动。
+  assert.equal(room.markGiftStatus(id, giftId, 'received'), true)
+  assert.equal(room.snapshot().visitors[0].gift.status, 'received')
+
+  // 幂等重试：同一个 giftId 不把状态打回 pending，也不重置 since。
+  const since = room.snapshot().visitors[0].since
+  room.observeVisitRequest(giftVisit(id, { gift: { id: giftId, kind: 'text', text: '第一行\n第二行' } }), T0 + 5000)
+  const again = room.snapshot().visitors[0]
+  assert.equal(again.gift.status, 'received')
+  assert.equal(again.since, since)
+})
+
+test('坏礼物不建卡片，但访客照常进门；换一件新礼物才换卡', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  const result = room.observeVisitRequest(giftVisit(id, {
+    gift: { id: 'not-a-uuid', kind: 'text', text: 'x' }
+  }), T0)
+  assert.equal(result.reply, 'ack')
+  assert.equal(room.snapshot().visitors.length, 1)
+  assert.equal('gift' in room.snapshot().visitors[0], false)
+
+  const first = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: first, kind: 'text', text: '旧的' } }), T0 + 1000)
+  assert.equal(room.snapshot().visitors[0].gift.id, first)
+
+  const second = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: second, kind: 'text', text: '新的' } }), T0 + 2000)
+  const gift = room.snapshot().visitors[0].gift
+  assert.equal(gift.id, second)
+  assert.equal(gift.text, '新的')
+  assert.equal(gift.status, 'pending')
+})
+
+test('markGiftStatus 只认这位访客身上的那一件；未知状态/坏 id 一律 false', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  const giftId = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: giftId, kind: 'text', text: 'x' } }), T0)
+
+  assert.equal(room.markGiftStatus(id, randomUUID(), 'received'), false)
+  assert.equal(room.markGiftStatus(randomUUID(), giftId, 'received'), false)
+  assert.equal(room.markGiftStatus(id, giftId, 'lost'), false)
+  assert.equal(room.markGiftStatus(id, giftId, 'received'), true)
+  assert.equal(room.markGiftStatus(id, 'gift-1', 'failed'), false)
+})
+
+test('扔掉之后卡片立刻消失，且重试报文也不会再长回来', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  const giftId = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: giftId, kind: 'text', text: 'x' } }), T0)
+  assert.equal(room.discardGift(id, giftId), true)
+  assert.equal('gift' in room.snapshot().visitors[0], false)
+  assert.equal(room.markGiftStatus(id, giftId, 'received'), false)
+
+  // 对方没收到 ack 又重发同一条请求：礼物已经扔掉，卡片不许复活。
+  room.observeVisitRequest(giftVisit(id, { gift: { id: giftId, kind: 'text', text: 'x' } }), T0 + 3000)
+  assert.equal('gift' in room.snapshot().visitors[0], false)
+
+  // 换一件新的仍然可以收：黑名单只针对扔掉的那一个 id。
+  const other = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: other, kind: 'text', text: 'y' } }), T0 + 4000)
+  assert.equal(room.snapshot().visitors[0].gift.id, other)
+})
+
+test('访客回家/送客/失联时礼物一起消失：卡片跟着访客，不需要第二套生命周期', () => {
+  const id = randomUUID()
+  const room = giftRoom(id, '阿蟹')
+  const giftId = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: giftId, kind: 'text', text: 'x' } }), T0)
+  assert.equal(room.snapshot().visitors[0].gift.id, giftId)
+  room.endInboundVisit(id, T0 + 1000)
+  assert.deepEqual(room.snapshot().visitors, [])
+
+  // 再来一次，靠失联清场：礼物同样不留在快照里。
+  const secondGift = randomUUID()
+  room.observeVisitRequest(giftVisit(id, { gift: { id: secondGift, kind: 'text', text: 'y' } }), T0 + 2000)
+  room.tick(T0 + 2000 + 2 * 60 * 1000 + 1)
+  assert.deepEqual(room.snapshot().visitors, [])
+})
+
+test('noteGiftDropped：字条没带上时留一句人话，不影响任何串门状态', () => {
+  const room = roomAt()
+  const notice = room.noteGiftDropped(T0)
+  assert.match(notice.text, /字条太长了，这次没带上/)
+  assert.equal(room.snapshot().notices[0].text, notice.text)
+  assert.deepEqual(room.snapshot().visitors, [])
 })
