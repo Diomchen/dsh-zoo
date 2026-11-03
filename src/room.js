@@ -20,6 +20,7 @@ import {
   normalizeVisitRecord
 } from './visit-record.js'
 import { visitReasonText } from './visit-copy.js'
+import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
   eligibleVisitTargets,
   isVisitPolicyReason,
@@ -135,6 +136,8 @@ export function createRoom ({
     selfState: { action: null, semantic: null, say: null, at: 0 },
     neighbors: new Map(),
     guests: new Map(),
+    // 「十分钟内最后见过谁」：邻居表 30 秒就清人，掉线灰态靠这张表记住（ticket 20）。
+    recentSeen: new Map(),
     visitors: new Map(),
     out: null,
     visits: [],
@@ -176,6 +179,35 @@ export function createRoom ({
 
   function stampOf (value) {
     return Number.isFinite(value) ? value : nowMs()
+  }
+
+  /**
+   * 记一次「最后见到」。邻居表 30 秒就清人，但街上要灰着留十分钟（ticket 20），
+   * 所以这里另记一份：昵称、最后时刻、以及最后一次知道的信任状态。
+   */
+  function rememberSeen ({ deviceId, nickname, lastSeen, status } = {}) {
+    if (typeof deviceId !== 'string' || deviceId === '') return
+    if (!Number.isFinite(lastSeen)) return
+    if (!state.recentSeen.has(deviceId) && state.recentSeen.size >= MAX_NEIGHBORS) {
+      // 满了就丢最旧的一条。上限与邻居表同一个数：街上的十六个名额是渲染端的边界。
+      let oldestId = null
+      let oldest = Infinity
+      for (const [id, seen] of state.recentSeen) {
+        if (seen.lastSeen < oldest) {
+          oldest = seen.lastSeen
+          oldestId = id
+        }
+      }
+      if (oldestId !== null) state.recentSeen.delete(oldestId)
+    }
+    state.recentSeen.set(deviceId, { deviceId, nickname, lastSeen, status })
+  }
+
+  /** 信任变了：只纠正记忆里的状态，不伪造一次见面。 */
+  function retrustSeen (deviceId, status) {
+    const seen = state.recentSeen.get(deviceId)
+    if (seen === undefined) return
+    seen.status = status
   }
 
   /** 本机活动的两个来源各自保存“最近一次”；快照里取更近的那个。 */
@@ -466,6 +498,10 @@ export function createRoom ({
       // 信任一变，旧的“对方放行了我”就不再可信：等下一次心跳重新证明。
       neighbor.heartbeatAt = 0
     }
+    // 街上那一户的灰态理由要跟着信任走：刚放行的人不该继续写着“还没放行你”。
+    // 但只改状态，不动 lastSeen——放行不是一次“见到他”，编一个时间出来会让他
+    // 在街上多赖十分钟。
+    retrustSeen(deviceId, status)
     // 拒绝是即时的：不用等 30 秒 TTL，那位的心跳影子与串门访客现在就离开桌面。
     if (status === 'denied') {
       state.guests.delete(deviceId)
@@ -484,6 +520,7 @@ export function createRoom ({
   return {
     snapshot () {
       const activity = activityInfo()
+      const targets = currentVisitTargets()
       return {
         version: 1,
         self: {
@@ -514,7 +551,15 @@ export function createRoom ({
           lastDepartureAt: state.lastDepartureAt,
           lastDecision: copyDecision(state.lastPolicyDecision)
         },
-        visitTargets: currentVisitTargets(),
+        visitTargets: targets,
+        // 街上每一户：能去的在前，去不了的各有理由（ticket 20）。只读视图，远端写不进来。
+        street: streetFrom({
+          now: nowMs(),
+          targets,
+          neighbors: [...state.neighbors.values()],
+          guests: [...state.guests.values()],
+          recentSeen: [...state.recentSeen.values()]
+        }),
         // 「串门」为什么没有目标：no-admitted / no-online / null（有目标）。
         // 和 noVisitTarget() 的 notice 用同一个判定，按钮的置灰理由因此不会和气泡打架。
         visitBlockedReason: visitBlockedReason()
@@ -739,6 +784,7 @@ export function createRoom ({
         if (!Number.isFinite(existing.heartbeatAt)) existing.heartbeatAt = 0
         // 队列满时没排上的邻居，等下一次广播再试（不重复入队）。
         if (existing.status === 'pending') enqueuePrompt(deviceId)
+        rememberSeen({ deviceId, nickname, lastSeen, status: existing.status })
         return
       }
       if (state.neighbors.size >= MAX_NEIGHBORS) return
@@ -748,6 +794,7 @@ export function createRoom ({
         : state.trust.denied.has(deviceId) ? 'denied' : 'pending'
       state.neighbors.set(deviceId, { deviceId, nickname, status, lastSeen, port, heartbeatAt: 0 })
       if (status === 'pending') enqueuePrompt(deviceId)
+      rememberSeen({ deviceId, nickname, lastSeen, status })
     },
 
     /**
@@ -768,17 +815,25 @@ export function createRoom ({
       const nickname = normalizeNickname(neighbor?.nickname ?? state.trust.allowed.get(deviceId))
       if (nickname === null) return false
       const anim = normalizeAnimation(peer.anim)
+      // 心跳带来的不止动作片段：动作名和一句话都留着，街上的那一户要念出来（ticket 20）。
+      const action = normalizeAnimation(peer.action)
+      const say = normalizeSay(peer.say, nowMs())
       const lastSeen = Number.isFinite(at) ? at : clock()
 
       const existing = state.guests.get(deviceId)
       if (existing !== undefined) {
         existing.nickname = nickname
         existing.anim = anim
+        existing.action = action
+        existing.say = say
         existing.lastSeen = lastSeen
       } else {
         if (state.guests.size >= MAX_GUESTS) evictStalestGuest()
-        state.guests.set(deviceId, { deviceId, nickname, anim, since: lastSeen, lastSeen })
+        state.guests.set(deviceId, {
+          deviceId, nickname, anim, action, say, since: lastSeen, lastSeen
+        })
       }
+      rememberSeen({ deviceId, nickname, lastSeen, status: 'allowed' })
 
       const visiting = state.visitors.get(deviceId)
       if (visiting !== undefined) {
@@ -1167,6 +1222,11 @@ export function createRoom ({
       for (const [deviceId, guest] of state.guests) {
         if (now - guest.lastSeen >= GUEST_TTL_MS) state.guests.delete(deviceId)
       }
+      for (const [deviceId, seen] of state.recentSeen) {
+        if (!Number.isFinite(seen.lastSeen) || now - seen.lastSeen > STALE_KEEP_MS) {
+          state.recentSeen.delete(deviceId)
+        }
+      }
       let removed = 0
       for (const [deviceId, neighbor] of state.neighbors) {
         if (now - neighbor.lastSeen >= NEIGHBOR_TTL_MS) {
@@ -1184,6 +1244,7 @@ export function createRoom ({
     dispose () {
       state.neighbors.clear()
       state.guests.clear()
+      state.recentSeen.clear()
       state.visitors.clear()
       state.out = null
       state.visits.length = 0

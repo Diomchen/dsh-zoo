@@ -170,6 +170,12 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   包含实际使用的活动信号（`session` / `pointer` / `none`）。
 - `snapshot.visitTargets` 是同一套筛选规则算出的“现在可以手动去谁家”；
   手动按钮可以用它决定置灰。
+- `snapshot.street` 是桌面邻居面板读的**派生视图**（ticket 20），形状
+  `[ { deviceId, nickname, action, say, anim, canVisit, blockedReason, lastSeen } ]`：
+  能去的在前、各自按 `lastSeen` 倒序，最多 16 户；`canVisit` 就是 `visitTargets` 的成员关系，
+  不另立判定。`blockedReason` 只会是 `not-admitted` / `not-mutual` / `peer-offline` 之一。
+  它**不上线**：不新增报文字段，远端无论发什么都写不进来；掉线的邻居靠内存里的
+  `recentSeen` 灰着留 10 分钟，过后自动消失。
 
 ## 心跳影子（ticket 04，`snapshot.guests`）
 
