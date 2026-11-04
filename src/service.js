@@ -295,7 +295,17 @@ export function createService (ctx, options = {}) {
         status,
         helperStatus,
         // ticket 31：dsh-pet 也在画的时候给一条提示；不在画就是 null。
-        dualLayer: dualLayerAdvisory({ desktopRunning: true, bridge: self.bridge, pet: self.pet })
+        dualLayer: dualLayerAdvisory({ desktopRunning: true, bridge: self.bridge, pet: self.pet }),
+        // 提示只在启动时打印一行，而宿主 stdout 不落盘（0.4.2 现场就卡在这里）：
+        // 把「提示过没有」也放进出口，才能核对「只出现一次」而不必去翻日志。
+        dualLayerNoted,
+        // dualLayer 的判据同样放出来。单机复现不了「关掉 helper」那一态（宿主会立刻拉起），
+        // 所以让人一眼看出此刻是哪一层在画、为什么提示是 null。
+        dshPet: {
+          reachable: self.bridge?.ok === true,
+          reason: typeof self.bridge?.reason === 'string' ? self.bridge.reason : null,
+          name: typeof self.pet?.name === 'string' ? self.pet.name : null
+        }
       })
     }
   }))

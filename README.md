@@ -285,7 +285,12 @@ pkill -f "local-pet/desktop/main.js"
 `ignoring` / `trustedInputs` / `busy`。一边在宠物上按左键一边刷新——`trustedInputs` 不动，
 说明真实左键根本没进渲染端（窗口层的问题，右键「重载配置」重启 helper 通常能恢复）；
 `trustedInputs` 涨了而 `busy` 不立，问题就在渲染端。把这三个数连同 `lastTrustedInputAgeMs`
-一起记下来。
+一起记下来。三个数是**零增长**还是**涨了不立**，决定下一步查窗口层还是渲染端，别混着报。
+
+Windows 上还有一种假失败要先排除：冒烟里的真实左键走 `scripts/win32-sendinput.ps1`
+（`SetCursorPos` + `SendInput`），它自己失败时冒烟现在会直说——`真实光标移动脚本正常退出`
+/ `真实拖拽脚本正常退出` 两条断言里的 `code` 不是 0、或者 `timedOut` 是 `true`，说明问题在
+脚本（锁屏、UAC 安全桌面把输入吞了、PowerShell 卡住），不在产品。
 
 ## 已知限制
 
@@ -294,6 +299,10 @@ pkill -f "local-pet/desktop/main.js"
   是上面那层——症状像「宠物拖不动」，其实是在拖另一只。真遇到时 `/local-pet/desktop` 的
   `dualLayer` 字段会给提示，启动日志里也有一行。**只留一个桌面层**：关掉 dsh-pet 的桌面窗，
   或者用 `{"desktop": false}` / `LOCAL_PET_DESKTOP=0` 关掉这一层。
+  同一个出口里还有两项，供没有日志可翻的时候核对：`dualLayerNoted`（那行提示打印过没有，
+  只打一次）和 `dshPet { reachable, reason, name }`（`dualLayer` 的判据：dsh-pet 够不够得着、
+  为什么够不着、它在画谁）。要看到 `dualLayer: null` 得让 `/dsh-pet-7340/state` 真的不通
+  （停掉 dsh-pet 插件）；**只关它的 helper 没用**，宿主 300ms 就把它拉回来。
 - `dsh-pet` **不上报随机待机动画**。**本机自己那只**的桌面影子只镜像被 `/anim` 点播过的动作；
   其余时间从本机素材源的动作池里轮播（dsh-pet 装上后是 106 段，按视频时长 4–12 秒换一段），
   所以动作种类够了，但仍然是“轮播”，不是和 dsh-pet 本体同一条随机链、不会每一帧同步。
@@ -410,6 +419,18 @@ env -u ELECTRON_RUN_AS_NODE \
 ```
 
 协议、点击穿透裁定、场景 v3、素材协议的细节见 [`desktop/README.md`](desktop/README.md)。
+
+冒烟里有两类断言值得知道怎么读：
+
+- **等状态，不等事件。** helper 的 `hit` 事件只在点击穿透**真的翻转**时发一条
+  （`desktop/main.js` 的 `setIgnore()` 发现状态没变就直接返回），所以「穿透已经落定、再去
+  挪光标」不会再有新事件。冒烟用 `expectIgnoring()`：事件能到就用事件（带 `reason` 证据），
+  到不了就用 `/local-pet/desktop` 的状态兜底。只等事件会假超时——0.4.2 现场那次
+  「拖拽结束交还穿透」重跑即通过就是这个坑。
+- **Windows 的真实左键走 `scripts/win32-sendinput.ps1`**（`SetCursorPos` + 真 `SendInput`
+  + DPI 感知）。这一段只在 `process.platform === 'win32'` 时跑，`npm test` 用
+  [`test/win32-sendinput.test.js`](test/win32-sendinput.test.js) 守住它的三条最小约定
+  （真 SendInput / 有 DPI 声明 / 按下前挪过光标刷新 hover）。
 
 ## 开发
 

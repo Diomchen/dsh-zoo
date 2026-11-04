@@ -962,6 +962,9 @@ test('自动串门关着时不订阅 session/event；打开后订阅，关掉退
 
 test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提示并打一行日志', async (t) => {
   const dir = await tempDir(t)
+  // 名字来自 dsh-pet 的配置（ADR-0007），不是 /state；这里给一份，出口才能带上是谁在画。
+  const petConfigPath = join(dir, 'main-config.jsonc')
+  await writeFile(petConfigPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
   const server = createServer((req, res) => {
     if (req.url !== '/dsh-pet-7340/state') {
       res.statusCode = 404
@@ -981,7 +984,7 @@ test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提�
     network: false,
     petBridge: true,
     bridgePollMs: 20,
-    petConfigPath: join(dir, 'missing.jsonc'),
+    petConfigPath,
     // 桌面层只需要“在跑”：真正的 helper 启不启得来与这条提示无关。
     desktopFactory: () => ({
       start: () => ({ ok: true, pid: 4242 }),
@@ -1004,7 +1007,17 @@ test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提�
   assert.equal(res.status, 200)
   assert.equal(res.body.dualLayer.code, 'dual-desktop-layer')
   assert.match(res.body.dualLayer.note, /dsh-pet/)
+  assert.equal(res.body.dualLayerNoted, true, '提示已经打印过，出口要如实说')
+  assert.equal(res.body.dshPet.reachable, true, '判据里 dsh-pet 是可达的')
+  assert.equal(res.body.dshPet.name, '蓝毛小女仆', '判据里带上 dsh-pet 那边是谁在画（名字来自它的配置）')
   assert.ok(warnings.some((line) => /dsh-pet 也在画/.test(line)), '桌面层起来时应该打一行警告')
+
+  // 「只提示一次」：桥接每 20ms 一轮，日志不能跟着长。宿主 stdout 不落盘，
+  // 所以这里用警告条数 + dualLayerNoted 两个可观测出口一起断言。
+  await delay(200)
+  assert.equal(warnings.filter((line) => /dsh-pet 也在画/.test(line)).length, 1,
+    '提示只打印一次（' + warnings.length + ' 行警告总共）')
+  assert.equal((await call(service, '/local-pet/desktop')).body.dualLayerNoted, true, '再问一次仍然是「提示过」')
 })
 
 test('双桌面层：dsh-pet 够不着时 /local-pet/desktop 的 dualLayer 是 null', async (t) => {
@@ -1033,4 +1046,9 @@ test('双桌面层：dsh-pet 够不着时 /local-pet/desktop 的 dualLayer 是 n
   const res = await call(service, '/local-pet/desktop')
   assert.equal(res.status, 200)
   assert.equal(res.body.dualLayer, null)
+  // 0.4.2 现场卡在「没有出现 null 态」：现在出口直接说明为什么是 null。
+  assert.equal(res.body.dshPet.reachable, false, '判据里 dsh-pet 不可达')
+  assert.equal(typeof res.body.dshPet.reason, 'string', '不可达时要给原因（' + res.body.dshPet.reason + '）')
+  assert.equal(res.body.dshPet.name, null, '不可达时没有宠物名')
+  assert.equal(res.body.dualLayerNoted, false, '没提示过就不该说提示过')
 })

@@ -14,6 +14,13 @@
  *   5. 场景 v2：宿主删/加宠物、改动作，渲染端跟着增删，reset 会重新出生；
  *   6. 生命周期：quit / 崩溃重启 / dispose / 宿主被 SIGKILL 都不留进程。
  *
+ * 断言约定：**等状态，不等事件**。helper 的 `hit` 只在点击穿透真的翻转时发一条
+ * （desktop/main.js 的 setIgnore() 状态没变就直接 return），所以先落定、后挪光标的场合不会
+ * 再有新事件——这类地方用 expectIgnoring()（事件优先、状态兜底），只等事件会假超时。
+ *
+ * Windows 上多一段真实左键（ticket 30）：scripts/win32-sendinput.ps1，真 SendInput + DPI 感知，
+ * 会真的移动光标约 2 秒；那一段只在 process.platform === 'win32' 时跑。
+ *
  * 抓图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）。设
  *   LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop
  * 会把整窗（棋盘格合成）和宠物特写写进 .scratch/local-pet/notes/。
@@ -623,6 +630,32 @@ async function leavePointer (client, point) {
   client.send({ type: 'debug-dispatch', phase: 'move', x: point.x, y: point.y })
   client.send({ type: 'pointer', x: point.x, y: point.y })
   return client.waitStatus((status) => status.ignoring === true, 2500, '恢复穿透')
+}
+
+/**
+ * 把主进程光标挪到 point，等「窗口是否可交互」落到 expected。
+ *
+ * 为什么不只等 hit 事件：desktop/main.js 的 emitHit 只在 ignoring **真的翻转**时发一条
+ * （setIgnore 看到状态没变就直接 return）。pointerup 之后主进程可能已经因为「光标下没有活矩形」
+ * 翻转成穿透了，这时再挪光标不会有新事件——只等事件就会假超时。0.4.2 现场那次
+ * 「等待超时：拖拽结束交还穿透」重跑即通过，就是这个竞态，不是产品缺陷。
+ *
+ * 事件能到就优先用事件（保留 reason 证据），到不了就退回状态断言（穿透状态本身就是事实）。
+ */
+async function expectIgnoring (client, point, expected, timeoutMs, label) {
+  const start = client.mark()
+  client.send({ type: 'pointer', x: point.x, y: point.y })
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    for (let index = start; index < client.events.length; index += 1) {
+      const event = client.events[index]
+      if (event.type === 'hit' && event.interactive === expected) return { via: 'hit', event }
+    }
+    const status = await client.status()
+    if (status.ignoring !== expected) return { via: 'status', status }
+    await sleep(25)
+  }
+  throw new Error('等待超时：' + label)
 }
 
 // ---------------------------------------------------------------------------
@@ -1238,9 +1271,8 @@ async function verifyHelper () {
   current = await client.waitStatus((status) => status.busy === false, 2500, '拖拽结束释放租约')
   assert(current.busy === false, 'pointerup 立刻释放租约（不再靠租约兜底）')
   // 没有租约兜底之后，光标一移开就必须立刻回穿透。
-  start = client.mark()
-  client.send({ type: 'pointer', x: outside.x, y: outside.y })
-  await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === false, 2500, '拖拽结束交还穿透')
+  const released = await expectIgnoring(client, outside, false, 2500, '拖拽结束交还穿透')
+  if (released.via === 'status') info('穿透在 mark 之前就已经落定（不会有新的 hit 事件），按状态判定')
   current = await client.status()
   assert(current.busy === false, 'pointerup 后 busy 释放')
   assert(current.ignoring === true, 'pointerup 后恢复穿透')
@@ -1434,7 +1466,7 @@ async function verifyHelper () {
   assert(kicked.rendererRects >= 1, 'kick 之后命中矩形还在')
 
   if (process.platform === 'win32') {
-    // 真 OS 左键：SetCursorPos + mouse_event 走 Windows 输入队列，不是 Electron 的
+    // 真 OS 左键：SetCursorPos + SendInput 走 Windows 输入队列，不是 Electron 的
     // sendInputEvent。这是唯一能覆盖「窗口说可交互、左键却没进来」的路径。
     const primary = Array.isArray(ready.displays) ? ready.displays.find((display) => display.primary) : null
     const scale = primary !== null && Number.isFinite(primary.scaleFactor) && primary.scaleFactor > 0
@@ -1451,13 +1483,14 @@ async function verifyHelper () {
       '-File', script, '-Mode', mode, '-X', String(px), '-Y', String(py), ...extra
     ], { windowsHide: true, stdio: 'ignore' })
 
-    // 子进程卡住不能把整条冒烟挂死：15s 兜底，断言自己会说话。
+    // 子进程卡住不能把整条冒烟挂死：15s 兜底。退出码也要看——脚本自己失败时（锁屏、
+    // UAC 安全桌面把 SendInput 吞掉，脚本 exit 2），只等 busy 的断言只会给一个含糊的超时。
     const runAndWait = (child) => Promise.race([
-      new Promise((resolve) => child.once('exit', resolve)),
-      sleep(15000)
+      new Promise((resolve) => child.once('exit', (code) => resolve({ code, timedOut: false }))),
+      sleep(15000).then(() => ({ code: null, timedOut: true }))
     ])
-    const moved = runSendInput('move')
-    await runAndWait(moved)
+    const moved = await runAndWait(runSendInput('move'))
+    assert(moved.timedOut === false && moved.code === 0, '真实光标移动脚本正常退出（' + JSON.stringify(moved) + '）')
     await client.waitStatus((status) => status.hoverInside === true && status.ignoring === false,
       3000, '真实光标进入命中区')
 
@@ -1473,8 +1506,9 @@ async function verifyHelper () {
       busySeen = (await client.status()).busy === true
       if (!busySeen) await sleep(40)
     }
-    await runAndWait(drag)
+    const dragged = await runAndWait(drag)
     await sleep(350)
+    assert(dragged.timedOut === false && dragged.code === 0, '真实拖拽脚本正常退出（' + JSON.stringify(dragged) + '）')
     assert(busySeen, '真实左键按下进入拖拽（busy=true）')
     assert((await client.status()).busy === false, '松手后输入租约释放')
     const afterX = (await client.rendererState()).pets.find((pet) => pet.id === 'self').x
