@@ -149,6 +149,12 @@ let sceneAt = 0
 /** 渲染端上报的当前素材与失败集合；只用于诊断（宿主 /local-pet/desktop 能读到）。 */
 let lastMedia = null
 const mediaHistory = []
+/**
+ * 真实左键的到达次数（ticket 30）。渲染端只在 `isTrusted` 的 pointerdown上报一次；
+ * 现场用它对账「窗口显示可交互，点击却根本没进来」。
+ */
+let trustedDowns = 0
+let lastTrustedInputAt = 0
 let rendererReady = false
 let quitting = false
 let readySent = false
@@ -755,18 +761,20 @@ ipcMain.on('local-pet:renderer-ready', (event) => {
 // 渲染端的素材诊断：当前在播哪一段、哪些片段已经失败。只进内存，不落盘。
 ipcMain.on('local-pet:media', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
-  if (payload === null || typeof payload !== 'object') return
-  const entry = {
-    clip: typeof payload.clip === 'string' ? payload.clip.slice(0, 64) : null,
-    source: typeof payload.source === 'string' ? payload.source.slice(0, 16) : null,
-    failed: Array.isArray(payload.failed)
-      ? payload.failed.filter((item) => typeof item === 'string').slice(-16)
-      : [],
-    at: Date.now()
-  }
+  const entry = shared.normalizeMediaReport(payload, Date.now())
+  if (entry === null) return
   lastMedia = entry
   mediaHistory.push(entry)
   while (mediaHistory.length > 20) mediaHistory.shift()
+})
+
+// 渲染端的「可信输入」心跳（ticket 30）：真实左键有没有到过渲染端，只有它知道。
+ipcMain.on('local-pet:input', (event, payload) => {
+  if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
+  const report = shared.normalizeInputReport(payload)
+  if (report === null) return
+  lastTrustedInputAt = Date.now()
+  if (report.type === 'down') trustedDowns += 1
 })
 
 ipcMain.on('local-pet:rects', (event, payload) => {
@@ -1692,6 +1700,13 @@ function applyCommand (command) {
       void lockRendererInput(debugInputLocked)
       applyDecision(debugInputLocked ? 'debug-lock-input' : 'debug-unlock-input')
       return
+    case 'debug-kick-input':
+      if (!debugEnabled) return
+      // 把「穿透 → 可交互」整条重放一遍（两次真 native 调用）。光标不在命中区时踢完仍是穿透，
+      // applyDecision 会重新裁定，不会把整块桌面交出去。Windows 上输入状态卡死时用这个踢。
+      setIgnore(true, 'debug-kick-input')
+      applyDecision('debug-kick-input')
+      return
     default:
       return
   }
@@ -1809,6 +1824,9 @@ function statusEvent (id) {
     busyFrozen: busy.frozen,
     rendererRects: rendererRects.length,
     rendererRectsAgeMs: rendererRectsAt > 0 ? now - rendererRectsAt : null,
+    // ticket 30：可信左键到了几次、最后一次到现在多久——「可交互但点不进来」就看这两个数。
+    trustedInputs: trustedDowns,
+    lastTrustedInputAgeMs: lastTrustedInputAt > 0 ? now - lastTrustedInputAt : null,
     media: lastMedia,
     mediaHistory: mediaHistory.slice(),
     overlayRects: overlayRects.length,

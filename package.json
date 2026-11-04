@@ -22,6 +22,7 @@
     "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --test test/*.test.js",
     "install:profile": "node scripts/install.mjs",
     "uninstall:profile": "node scripts/uninstall.mjs",
+    "stop-helper": "node scripts/stop-helper.mjs",
     "fake-peer": "node scripts/fake-peer.mjs",
     "smoke:desktop": "node scripts/desktop-smoke.mjs",
     "pack:release": "npm pack"

@@ -35,14 +35,22 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
   setBusy (busy) {
     ipcRenderer.send('local-pet:busy', { busy: busy === true })
   },
-  /** 素材诊断：当前在播哪一段、失败集合；只进主进程内存，供宿主排查用。 */
+  /**
+   * 素材诊断：当前在播哪一段、失败集合、readyState / visibility；只进主进程内存，供宿主排查用。
+   * 这里**不**逐字段挑形状：白名单只在 `desktop/shared.js` 的 `normalizeMediaReport` 收一次
+   * （主进程收到 ipc 时再调）。preload 也抄一份，就会像 ticket 28 一样——加了字段，其中一处悄悄漏掉。
+   */
   reportMedia (payload) {
     if (payload === null || typeof payload !== 'object') return
-    ipcRenderer.send('local-pet:media', {
-      clip: typeof payload.clip === 'string' ? payload.clip : null,
-      source: typeof payload.source === 'string' ? payload.source : null,
-      failed: Array.isArray(payload.failed) ? payload.failed : []
-    })
+    ipcRenderer.send('local-pet:media', payload)
+  },
+  /**
+   * 可信输入（ticket 30）：只报 down/up，主进程用它判断真实左键有没有到渲染端。
+   * 同 reportMedia：形状不在这里挑，归一化在 desktop/shared.js。
+   */
+  reportInput (payload) {
+    if (payload === null || typeof payload !== 'object') return
+    ipcRenderer.send('local-pet:input', payload)
   },
   requestAction (payload) {
     if (payload === null || typeof payload !== 'object') return

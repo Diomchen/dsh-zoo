@@ -2099,6 +2099,9 @@
       if (video.dataset.clip === pet.media.clip) {
         pet.media.source = 'video'
         pet.media.durationMs = Number.isFinite(video.duration) ? video.duration * 1000 : 0
+        // 成功也要回报（ticket 28）：以前只在开始加载时报一次 loading，
+        // `/local-pet/desktop` 的 media.source 就永远停在 loading，看着像素材坏了。
+        reportMedia(pet, pet.media.clip, 'video')
       }
     })
     video.addEventListener('error', () => {
@@ -2110,6 +2113,7 @@
       pet.media.clip = null
       pet.media.source = 'pending'
       pet.media.nextIdleAt = 0
+      reportMedia(pet, failedClip, 'pending')
       // 立刻走降级链：动作 → 下一段待机 → SVG。
       updateMedia(pet, performance.now())
     })
@@ -2208,6 +2212,7 @@
       pet.media.clip = null
       pet.media.source = 'pending'
       pet.media.nextIdleAt = 0
+      reportMedia(pet, typeof key === 'string' ? key : null, 'pending')
       return
     }
     const video = ensureVideo(pet)
@@ -2231,6 +2236,9 @@
       api.reportMedia({
         clip,
         source,
+        // 诊断用：文件读不出来时 readyState 卡在 0；窗口被遮挡/隐藏时 visibility 是 hidden。
+        readyState: pet.video !== null ? pet.video.readyState : null,
+        visibility: document.visibilityState,
         failed: [...pet.media.failed].slice(-16)
       })
     } catch {
@@ -2289,9 +2297,11 @@
     if (media.clip !== null && media.source === 'loading' && media.clipStartedAt > 0 &&
       now - media.clipStartedAt > 4000) {
       media.failed.add(media.clip)
+      const stuck = media.clip
       media.clip = null
       media.source = 'pending'
       media.nextIdleAt = 0
+      reportMedia(pet, stuck, 'pending')
     }
     // 远端自带素材优先；失败/没有 src 时再用本机同名素材。
     if (src !== null && !media.failed.has(src)) {
@@ -2496,6 +2506,23 @@
     if (drag === null) return
     finishDrag(event.clientX, event.clientY)
   })
+  /**
+   * 真实输入的心跳（ticket 30）：只数 `isTrusted` 的按下/抬起，合成事件一律不算。
+   * 冒烟锁住输入时也不数——那是测试在用 sendInputEvent 驱动，不是人真的点了。
+   */
+  function onTrustedPointer (event) {
+    if (!event.isTrusted || inputLocked) return
+    if (typeof api?.reportInput !== 'function') return
+    try {
+      api.reportInput({ type: event.type === 'pointerdown' ? 'down' : 'up' })
+    } catch {
+      // 诊断坏了不能影响输入
+    }
+  }
+
+  window.addEventListener('pointerdown', onTrustedPointer, { capture: true, passive: true })
+  window.addEventListener('pointerup', onTrustedPointer, { capture: true, passive: true })
+
   window.addEventListener('pointercancel', () => abortDrag())
   window.addEventListener('mouseup', (event) => {
     if (inputLocked && event.isTrusted) return

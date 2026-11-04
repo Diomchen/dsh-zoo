@@ -195,6 +195,29 @@ node scripts/uninstall.mjs          # 摘掉登记与链接；<DSH_HOME>/local-p
 
 如果 DSH 自己被卡住，把 profile 的 `package.json` 从 `.bak` 还原即可。
 
+## 升级
+
+**首次从 0.4.0 及更早升到 0.4.1：先停一次 helper，再换包。** 之后就不需要这一步了。
+
+0.4.1 把 helper 的工作目录挪出了包目录（[ADR-0012](docs/adr/0012-helper-cwd-outside-package.md)），
+但**已经在跑的那个旧 helper 改不了自己的 cwd**——它还站在包里的 `desktop/` 上。Windows 删不掉
+任何进程的当前工作目录，于是 `pnpm add` 替换这个包时会 `ERR_PNPM_EPERM`，最坏把包删残
+（51 个文件剩 36 个，`cordis.patch.yml` 与 `desktop/` 消失，下次启动宠物直接不见、界面上没有任何错误）。
+
+顺序：**退出 DSH → 停 helper → 换包 → 开 DSH**。宿主还开着的话，helper 被杀掉会被立刻重新拉起，
+包还是被占着。helper 通常会跟着宿主一起退；没退的（或者你先 `SIGSTOP` 了宿主）就用下面这步清掉。
+
+```sh
+node scripts/stop-helper.mjs --dry-run   # 先看它会停谁
+node scripts/stop-helper.mjs             # 停掉（SIGTERM，2s 不退再 SIGKILL）
+```
+
+Windows 上它走 `Get-CimInstance Win32_Process`，macOS/Linux 走 `ps`；认的是宿主拉 helper 时加的
+`--local-pet-host-pid`，不会误伤别的 Electron 进程。
+
+0.4.1 起的 helper cwd 在系统临时目录，**跑着也能整体替换**（现场实测 2.5s 一次，包不掉文件）。
+这条只对「新起的 helper」成立——旧进程的 cwd 是生下来那一刻定死的。
+
 ## 打包与分发
 
 ```sh
@@ -258,8 +281,19 @@ macOS 是 `~/.dsh/electron/Electron.app`，Windows 是 `%USERPROFILE%\.dsh\elect
 pkill -f "local-pet/desktop/main.js"
 ```
 
+如果症状是「宠物看得见，但拖不动」：打开 `/local-pet/desktop`，看 `helperStatus` 里的
+`ignoring` / `trustedInputs` / `busy`。一边在宠物上按左键一边刷新——`trustedInputs` 不动，
+说明真实左键根本没进渲染端（窗口层的问题，右键「重载配置」重启 helper 通常能恢复）；
+`trustedInputs` 涨了而 `busy` 不立，问题就在渲染端。把这三个数连同 `lastTrustedInputAgeMs`
+一起记下来。
+
 ## 已知限制
 
+- **同时装 `dsh-pet` 与 `dsh-local-pet` 会画两只桌面宠物。** 两个 helper 都是全屏透明、
+  默认点穿的置顶层，命中区只覆盖各自的宠物；两只位置重叠时，看到的是下面那只、拖到的可能
+  是上面那层——症状像「宠物拖不动」，其实是在拖另一只。真遇到时 `/local-pet/desktop` 的
+  `dualLayer` 字段会给提示，启动日志里也有一行。**只留一个桌面层**：关掉 dsh-pet 的桌面窗，
+  或者用 `{"desktop": false}` / `LOCAL_PET_DESKTOP=0` 关掉这一层。
 - `dsh-pet` **不上报随机待机动画**。**本机自己那只**的桌面影子只镜像被 `/anim` 点播过的动作；
   其余时间从本机素材源的动作池里轮播（dsh-pet 装上后是 106 段，按视频时长 4–12 秒换一段），
   所以动作种类够了，但仍然是“轮播”，不是和 dsh-pet 本体同一条随机链、不会每一帧同步。

@@ -959,3 +959,78 @@ test('自动串门关着时不订阅 session/event；打开后订阅，关掉退
   assert.equal(off.status, 200)
   assert.equal(handlers.has('session/event'), false, '关掉后必须退订')
 })
+
+test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提示并打一行日志', async (t) => {
+  const dir = await tempDir(t)
+  const server = createServer((req, res) => {
+    if (req.url !== '/dsh-pet-7340/state') {
+      res.statusCode = 404
+      res.end('no')
+      return
+    }
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({ counter: 1, pets: { main: { anim: { counter: 1, data: { name: '写代码' } } } } }))
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+
+  const { ctx, routes, warnings } = fakeCtx()
+  ctx.webServer.getOrigin = () => origin
+  const service = createService(ctx, {
+    dataDir: dir,
+    network: false,
+    petBridge: true,
+    bridgePollMs: 20,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    // 桌面层只需要“在跑”：真正的 helper 启不启得来与这条提示无关。
+    desktopFactory: () => ({
+      start: () => ({ ok: true, pid: 4242 }),
+      update: () => true,
+      resync: () => true,
+      status: () => ({ running: true, ready: true }),
+      requestStatus: async () => ({ ok: true, status: {} }),
+      dispose () {}
+    })
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  await service.ready
+
+  const deadline = Date.now() + 2000
+  while (service.snapshot().self.pet === null && Date.now() < deadline) await delay(10)
+  assert.notEqual(service.snapshot().self.pet, null, '桥接应该读到 dsh-pet 的宠物')
+
+  const res = await call(service, '/local-pet/desktop')
+  assert.equal(res.status, 200)
+  assert.equal(res.body.dualLayer.code, 'dual-desktop-layer')
+  assert.match(res.body.dualLayer.note, /dsh-pet/)
+  assert.ok(warnings.some((line) => /dsh-pet 也在画/.test(line)), '桌面层起来时应该打一行警告')
+})
+
+test('双桌面层：dsh-pet 够不着时 /local-pet/desktop 的 dualLayer 是 null', async (t) => {
+  const dir = await tempDir(t)
+  const { ctx, routes } = fakeCtx()
+  const service = createService(ctx, {
+    dataDir: dir,
+    network: false,
+    petBridge: true,
+    bridgePollMs: 20,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: () => ({
+      start: () => ({ ok: true, pid: 4242 }),
+      update: () => true,
+      resync: () => true,
+      status: () => ({ running: true, ready: true }),
+      requestStatus: async () => ({ ok: true, status: {} }),
+      dispose () {}
+    })
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  await service.ready
+  await delay(80)
+
+  const res = await call(service, '/local-pet/desktop')
+  assert.equal(res.status, 200)
+  assert.equal(res.body.dualLayer, null)
+})

@@ -67,6 +67,8 @@
   const MAX_PATH_LENGTH = 1024
   const MAX_ERROR_LENGTH = 500
   const MAX_NOTICE_LENGTH = 200
+  /** 素材诊断（ipc `local-pet:media`）：同样来自渲染端，按不可信输入裁。 */
+  const MAX_MEDIA_FAILED = 16
   /** 街上最多几户。与 src/street.js 的 MAX_STREET 同一个数：跨进程各自守自己的边界。 */
   const MAX_STREET_ITEMS = 16
   /** 街上「去不了」的三种理由；与 src/street.js 的 blockedReason 同一套词。 */
@@ -1012,6 +1014,67 @@
     return rects
   }
 
+  /**
+   * 渲染端上报的素材诊断（ipc `local-pet:media`）→ 主进程 `helperStatus.media` 的那一条。
+   *
+   * 现场只有这一个探针能回答「宠物到底画出来没有」，所以它必须跟着**每一次**状态变化走：
+   * 开始加载报 `loading`，`loadeddata` 报 `video`，降级报 `pending` / `svg`。
+   * 以前只在开始加载时报一次，`video` 永远不回报，于是状态里长期停在 `loading`——
+   * 看起来像素材坏了，其实只是探针不会说「好了」。
+   *
+   * `readyState` / `visibility` 是给「为什么没画出来」用的：文件读不出来时 `readyState`
+   * 卡在 0，窗口被遮挡/隐藏时 `visibility` 是 `hidden`。渲染端不可信，字符串一律走
+   * `normalizeToken`（空、超长、控制字符都判无效），不截断——截断会把脏数据洗成看起来合法的名字。
+   *
+   * 这是**唯一**一处收这个形状的地方：preload 原样转交、主进程与宿主都调它。
+   * 各写一份白名单就会像 ticket 28 一样：加了字段，其中一处悄悄削掉。
+   *
+   * @param {unknown} raw
+   * @param {number} [at] 上报时刻；主进程收 ipc 时传 `Date.now()`，宿主侧用上报里带的那个
+   * @returns {{clip:string|number|null,source:string|null,readyState:number|null,visibility:string|null,failed:string[],at:number|null}|null}
+   */
+  function normalizeMediaReport (raw, at) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const failed = []
+    if (Array.isArray(raw.failed)) {
+      for (const item of raw.failed.slice(-MAX_MEDIA_FAILED)) {
+        if (typeof item !== 'string') continue
+        const name = normalizeToken(item)
+        if (name !== null) failed.push(name)
+      }
+    }
+    const readyState = Number.isInteger(raw.readyState) && raw.readyState >= 0 && raw.readyState <= 4
+      ? raw.readyState
+      : null
+    const visibility = raw.visibility === 'visible' || raw.visibility === 'hidden' || raw.visibility === 'prerender'
+      ? raw.visibility
+      : null
+    return {
+      clip: normalizeToken(raw.clip),
+      source: normalizeToken(raw.source),
+      readyState,
+      visibility,
+      failed,
+      at: Number.isFinite(at) ? at : (isFiniteNumber(raw.at) ? raw.at : null)
+    }
+  }
+
+  /**
+   * 渲染端上报的「可信输入」（ipc `local-pet:input`，ticket 30）。
+   *
+   * 现场出现过「窗口显示可交互、右键能开菜单，真实左键却进不了渲染端」。`ignoring=false`
+   * 只说明我们把 `WS_EX_TRANSPARENT` 摘了，`busy=false` 只说明租约没立起来——中间没有任何
+   * 东西能证明「点击真的到过渲染端」。这个计数器就是那个东西：只有 `isTrusted` 的按下才报。
+   *
+   * @param {unknown} raw
+   * @returns {{type:'down'|'up'}|null}
+   */
+  function normalizeInputReport (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    if (raw.type !== 'down' && raw.type !== 'up') return null
+    return { type: raw.type }
+  }
+
   /** 编码一行；超长返回 null，调用方必须放弃发送（而不是把管道写坏）。 */
   function encodeMessage (message) {
     if (message === null || typeof message !== 'object') return null
@@ -1233,28 +1296,11 @@
       }
       case 'debug-lock-input':
         return { ok: true, command: { type, id, locked: raw.locked !== false } }
+      case 'debug-kick-input':
+        // 不重启地重放一次「穿透 → 可交互」；只有 helper 是 debug 模式才认（见 desktop/main.js）。
+        return { ok: true, command: { type, id } }
       default:
         return { ok: false, error: 'unknown-type' }
-    }
-  }
-
-  /** 素材诊断：helper 的 status 里带当前 clip 与最近切换记录；这里也走白名单。 */
-  function normalizeMedia (raw) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const clip = normalizeToken(raw.clip)
-    const source = normalizeToken(raw.source)
-    const failed = []
-    if (Array.isArray(raw.failed)) {
-      for (const item of raw.failed.slice(-16)) {
-        const name = normalizeToken(item)
-        if (name !== null) failed.push(name)
-      }
-    }
-    return {
-      clip: clip ?? null,
-      source: source ?? null,
-      failed,
-      at: isFiniteNumber(raw.at) ? raw.at : null
     }
   }
 
@@ -1264,9 +1310,11 @@
     return {
       ignoring: raw.ignoring !== false,
       sceneItems: Number.isInteger(raw.sceneItems) && raw.sceneItems >= 0 ? raw.sceneItems : 0,
-      media: normalizeMedia(raw.media),
+      media: normalizeMediaReport(raw.media),
       mediaHistory: Array.isArray(raw.mediaHistory)
-        ? raw.mediaHistory.slice(-20).map(normalizeMedia).filter((entry) => entry !== null)
+        ? raw.mediaHistory.slice(-20)
+            .map((entry) => normalizeMediaReport(entry))
+            .filter((entry) => entry !== null)
         : [],
       hoverInside: raw.hoverInside === true,
       lastHoverAgeMs: isFiniteNumber(raw.lastHoverAgeMs) && raw.lastHoverAgeMs >= 0
@@ -1280,6 +1328,11 @@
       busyAgeMs: isFiniteNumber(raw.busyAgeMs) && raw.busyAgeMs >= 0 ? raw.busyAgeMs : null,
       busyHeldMs: isFiniteNumber(raw.busyHeldMs) && raw.busyHeldMs >= 0 ? raw.busyHeldMs : null,
       busyBlocked: raw.busyBlocked === true,
+      // ticket 30：可信左键到了几次、最后一次多久之前——「可交互但点不进来」就看这两个数。
+      trustedInputs: Number.isInteger(raw.trustedInputs) && raw.trustedInputs >= 0 ? raw.trustedInputs : 0,
+      lastTrustedInputAgeMs: isFiniteNumber(raw.lastTrustedInputAgeMs) && raw.lastTrustedInputAgeMs >= 0
+        ? raw.lastTrustedInputAgeMs
+        : null,
       busyCapMs: isFiniteNumber(raw.busyCapMs) && raw.busyCapMs >= 0 ? raw.busyCapMs : null,
       busyFrozen: raw.busyFrozen === true,
       rendererRects: Number.isInteger(raw.rendererRects) && raw.rendererRects >= 0 ? raw.rendererRects : 0,
@@ -1836,6 +1889,8 @@
     normalizeRect,
     normalizePoint,
     normalizeRects,
+    normalizeMediaReport,
+    normalizeInputReport,
     clipRectToArea,
     normalizeScene,
     normalizeControls,

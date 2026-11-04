@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import shared from '../desktop/shared.js'
 import { createBackpackStore } from './backpack.js'
+import { dualLayerAdvisory } from './desktop-advisory.js'
 import { createDesktop } from './desktop.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
@@ -156,6 +157,8 @@ export function createService (ctx, options = {}) {
   let desktopHelperPid = null
   let desktopSceneSignature = null
   let desktopSyncTimer = null
+  // 「两个桌面层同时在画」只提示一次（ticket 31）：每轮轮询都刷一行日志没人看。
+  let dualLayerNoted = false
   // 对外素材源（ticket 15）：端口与源 id 随 beacon/心跳广告；起不来就是 null。
   let skinServer = null
   let skinRef = null
@@ -286,7 +289,14 @@ export function createService (ctx, options = {}) {
       } catch {
         helperStatus = null
       }
-      sendJson(res, 200, { running: true, status, helperStatus })
+      const self = room.snapshot().self
+      sendJson(res, 200, {
+        running: true,
+        status,
+        helperStatus,
+        // ticket 31：dsh-pet 也在画的时候给一条提示；不在画就是 null。
+        dualLayer: dualLayerAdvisory({ desktopRunning: true, bridge: self.bridge, pet: self.pet })
+      })
     }
   }))
 
@@ -878,6 +888,7 @@ export function createService (ctx, options = {}) {
             if (disposed) return
             room.setSelfPet(result.pet)
             room.setBridge(result.bridge)
+            noteDualLayer()
             // 名字的真相在 dsh-pet：配置里那只换了名字，本机跟着换（ADR-0007）。
             mirrorPetName(result.pet?.name)
             // 动作变了就立刻补发心跳，不等下一次 2 秒节拍：
@@ -1079,6 +1090,23 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 「dsh-pet 也在画」只提示一次（ticket 31）：桥接每轮都可能回调，日志不能每轮一条；
+   * 提示本身由 src/desktop-advisory.js 决定（纯函数，单测在那边）。
+   */
+  function noteDualLayer () {
+    if (dualLayerNoted) return
+    const self = room.snapshot().self
+    const advisory = dualLayerAdvisory({
+      desktopRunning: desktop !== null,
+      bridge: self.bridge,
+      pet: self.pet
+    })
+    if (advisory === null) return
+    dualLayerNoted = true
+    log.warn(advisory.note)
+  }
+
+  /**
    * 桌面层是**尽力而为**的一层：宿主不是桌面版、不是 macOS、没有 Electron、helper 崩了，
    * 都只让宠物不显示。这里绝不把异常抛回 start()，也不 await 它的启动（窗口就绪是异步的）。
    * 测试用 options.desktopFactory 注入假实现，options.desktop === false 直接跳过。
@@ -1170,6 +1198,7 @@ export function createService (ctx, options = {}) {
         return
       }
       log.info('桌面宠物窗口已启动')
+      noteDualLayer()
     } catch (error) {
       // 桌面层永远只能是「锦上添花」：初始化失败 = 这一行日志 + 没有宠物。
       try {

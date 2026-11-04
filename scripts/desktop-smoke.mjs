@@ -1093,6 +1093,19 @@ async function verifyHelper () {
     assert(state.pets.every((pet) => pet.source === 'video'),
       '宠物素材经 localpet:// 加载成功（' + state.pets.map((pet) => pet.clip).join(', ') + '）')
   }
+  // ticket 28：`/local-pet/desktop` 的 `helperStatus.media` 是现场唯一的素材探针。
+  // 它以前只在「开始加载」时报一次 loading，loadeddata 之后从不回报，于是永远显示 loading——
+  // 现场据此以为 live scene 没画出来。这里断言它跟得上真实状态（渲染端那三只已经是 video）。
+  // `media` 是「最近一次上报」，三只宠物各自轮播，所以等它落到一段 video 上，别和轮播赛跑。
+  const mediaStatus = (await client.waitStatus(
+    (status) => status.media !== null && status.media.source === 'video',
+    4000,
+    'status.media 跟上 video'
+  )).media
+  assert(mediaStatus.readyState !== null && mediaStatus.readyState >= 2,
+    'status.media 带得动诊断（readyState=' + mediaStatus.readyState + '）')
+  assert(mediaStatus.visibility === 'visible',
+    'status.media 报出文档可见性（' + mediaStatus.visibility + '，窗口 visible=' + (await client.status()).visible + '）')
   assert(state.pets.every((pet) => Number.isFinite(pet.vx) && Number.isFinite(pet.vy)), '速度是有限数')
 
   // 渲染端悬停路径（真实输入管线）：sendInputEvent 的合成 mousemove → 渲染端 hover → IPC。
@@ -1383,6 +1396,93 @@ async function verifyHelper () {
   assert(shot.width > 0 && shot.height > 0, 'shot 返回像素尺寸 ' + shot.width + '×' + shot.height)
   const verified = verifyShot(pngPath, pngPath + '.json', 3)
   info('交互截图：' + pngPath)
+
+  // ---------------------------------------------------------------------------
+  // ticket 30：真实左键的到达（合成的 vs 走真实管线的 vs 真 OS 的）
+  // ---------------------------------------------------------------------------
+  client.send({ type: 'debug-lock-input', locked: false })
+  await sleep(150)
+  state = await client.rendererState()
+  const trustPet = state.pets.find((pet) => pet.id === 'self')
+  assert(trustPet !== undefined, '有 self 可以按')
+  const trustPoint = screenCenter(trustPet, workArea)
+  const trustBefore = (await client.status()).trustedInputs
+
+  // 合成 pointerdown（executeJavaScript 造的事件，isTrusted=false）不该计数
+  client.send({ type: 'debug-dispatch', phase: 'down', x: trustPoint.x, y: trustPoint.y })
+  await sleep(120)
+  assert((await client.status()).trustedInputs === trustBefore, '合成 pointerdown 不计入可信输入')
+  client.send({ type: 'debug-dispatch', phase: 'up', x: trustPoint.x, y: trustPoint.y })
+  await sleep(80)
+
+  // sendInputEvent 走的是真实输入管线（isTrusted=true）→ 会计数
+  client.send({ type: 'debug-input', action: 'down', x: trustPoint.x, y: trustPoint.y })
+  await sleep(150)
+  const trustAfter = (await client.status()).trustedInputs
+  assert(trustAfter > trustBefore,
+    '走真实输入管线的左键计入 trustedInputs（' + trustBefore + ' → ' + trustAfter + '）')
+  client.send({ type: 'debug-input', action: 'up', x: trustPoint.x, y: trustPoint.y })
+  await sleep(120)
+
+  // 输入态卡住时的踢法：不重启，重放一次 setIgnoreMouseEvents(true → false)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: trustPoint.x, y: trustPoint.y })
+  await client.waitStatus((status) => status.ignoring === false, 2000, '光标进命中区后窗口可交互')
+  client.send({ type: 'debug-kick-input' })
+  await sleep(250)
+  const kicked = await client.status()
+  assert(kicked.ignoring === false, 'kick 之后窗口仍然可交互（穿透状态被正确重放）')
+  assert(kicked.rendererRects >= 1, 'kick 之后命中矩形还在')
+
+  if (process.platform === 'win32') {
+    // 真 OS 左键：SetCursorPos + mouse_event 走 Windows 输入队列，不是 Electron 的
+    // sendInputEvent。这是唯一能覆盖「窗口说可交互、左键却没进来」的路径。
+    const primary = Array.isArray(ready.displays) ? ready.displays.find((display) => display.primary) : null
+    const scale = primary !== null && Number.isFinite(primary.scaleFactor) && primary.scaleFactor > 0
+      ? primary.scaleFactor
+      : 1
+    const home = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+    assert(home !== undefined, 'Windows：有 self 可以按')
+    const center = screenCenter(home, workArea)
+    const px = Math.round(center.x * scale)
+    const py = Math.round(center.y * scale)
+    const script = join(ROOT, 'scripts', 'win32-sendinput.ps1')
+    const runSendInput = (mode, extra = []) => spawn('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+      '-File', script, '-Mode', mode, '-X', String(px), '-Y', String(py), ...extra
+    ], { windowsHide: true, stdio: 'ignore' })
+
+    // 子进程卡住不能把整条冒烟挂死：15s 兜底，断言自己会说话。
+    const runAndWait = (child) => Promise.race([
+      new Promise((resolve) => child.once('exit', resolve)),
+      sleep(15000)
+    ])
+    const moved = runSendInput('move')
+    await runAndWait(moved)
+    await client.waitStatus((status) => status.hoverInside === true && status.ignoring === false,
+      3000, '真实光标进入命中区')
+
+    const beforeX = (await client.rendererState()).pets.find((pet) => pet.id === 'self').x
+    const drag = runSendInput('drag', [
+      '-ToX', String(px + Math.round(90 * scale)),
+      '-ToY', String(py),
+      '-HoldMs', '600'
+    ])
+    let busySeen = false
+    const dragDeadline = Date.now() + 2500
+    while (Date.now() < dragDeadline && !busySeen) {
+      busySeen = (await client.status()).busy === true
+      if (!busySeen) await sleep(40)
+    }
+    await runAndWait(drag)
+    await sleep(350)
+    assert(busySeen, '真实左键按下进入拖拽（busy=true）')
+    assert((await client.status()).busy === false, '松手后输入租约释放')
+    const afterX = (await client.rendererState()).pets.find((pet) => pet.id === 'self').x
+    assert(Math.abs(afterX - beforeX) > 20,
+      '真实拖拽让宠物真的动了（' + Math.round(beforeX) + ' → ' + Math.round(afterX) + '）')
+  } else {
+    info('真实 OS 左键（SendInput）用例只在 Windows 上跑，这次跳过')
+  }
 
   // quit：进程自己退出
   const exitPromise = client.exited
