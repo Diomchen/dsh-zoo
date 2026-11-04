@@ -65,7 +65,8 @@ test('manifest 带 size/idle 和每个文件的 sha256', async (t) => {
   const manifest = await response.json()
   assert.equal(manifest.v, 1)
   assert.equal(manifest.id, 'test')
-  assert.equal(manifest.name, '测试皮肤')
+  // 清单里的名字就是源 id：不给皮肤另起显示名（ticket 33）
+  assert.equal(manifest.name, 'test')
   assert.equal(manifest.size, 220)
   assert.equal(manifest.idle, 'A')
   assert.deepEqual(manifest.actions.A, { file: 'A.webm', loop: true, hash: sha256(a) })

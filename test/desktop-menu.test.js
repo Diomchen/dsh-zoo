@@ -137,3 +137,22 @@ test('菜单：use-skin 只带素材源 id，形状不对整条拒绝', () => {
     )
   }
 })
+
+test('场景带素材根目录：只认绝对路径，空/null 表示这次没说', () => {
+  const scene = shared.normalizeScene({
+    items: [],
+    assetRoots: ['/skins/cat', 'relative/dir', '/skins/cat', '', '/skins/fish']
+  })
+  assert.deepEqual(scene.assetRoots, ['/skins/cat', '/skins/fish'])
+
+  // 旧宿主不带这个字段：必须是 null（helper 沿用启动参数），不能是空数组把根清掉。
+  assert.equal(shared.normalizeScene({ items: [] }).assetRoots, null)
+  assert.equal(shared.normalizeScene({ items: [], assetRoots: [] }).assetRoots, null)
+  assert.equal(shared.normalizeScene({ items: [], assetRoots: 'x' }).assetRoots, null)
+})
+
+test('petScene：换皮时把当前那张皮的目录带下去', () => {
+  const scene = shared.petScene([], { width: 800, height: 600 }, { assetRoots: ['/skins/cat'] })
+  assert.deepEqual(scene.assetRoots, ['/skins/cat'])
+  assert.equal(shared.petScene([], { width: 800, height: 600 }).assetRoots, null)
+})

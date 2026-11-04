@@ -35,7 +35,7 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
   （分类 → 动画名，分类照 `dsh-pet` 的 `animations` 配置；没装 dsh-pet 时退到本机素材源
   的平铺清单）。点一项动画名会 `POST dsh-pet /anim` 点播本体（ADR-0009），不可达时
   只在本机播一次并冒一句人话。`skin.json` 里有两张以上皮时，还会多一个「外观」二级菜单：
-  点一张就换过去（当前那张打勾，`POST /local-pet/action {action:"use-skin", skinId}`），
+  点一张就换过去（菜单里列的是**源 id**，也就是插件名；当前那张打勾，`POST /local-pet/action {action:"use-skin", skinId}`），
   只换外观和动作——名字、身份、串门记录和礼物一个字不动（ADR-0013）。菜单只挂自己：访客和空白桌面都不弹。菜单矩形进
   `overlay-rects`，**点菜单外不关菜单**（那一击要落到桌面），收起靠点中一项 / 移开 / 12 秒超时。
 - **点击穿透**：窗口默认整窗 `setIgnoreMouseEvents(true, { forward: true })`；只有光标
@@ -165,7 +165,7 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
 `GET /local-pet/state` 多三项（只对本机页面/回环可用）：
 
 ```json
-"skin":     { "id": "cat", "name": "橘猫", "size": 462, "idle": "待机" },   // 没有素材源时是 null
+"skin":     { "id": "maodie-pet", "size": 462, "idle": "待机" },   // 没有素材源时是 null
 "backpack": [ { "id": "…", "kind": "text", "text": "…", "at": 1700000000000, "state": "idle" } ],
 "gifts":    [ { "id": "…", "from": { "deviceId": "…", "nickname": "…" }, "kind": "file",
                 "name": "报价单.pdf", "size": 23194, "at": 1700000000000,

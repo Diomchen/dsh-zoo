@@ -254,6 +254,26 @@
     return /^[A-Za-z0-9._:-]+$/.test(id) ? id : null
   }
 
+  /**
+   * 本机素材目录（ticket 33）：宿主把「当前那张皮」的目录随场景下发，
+   * helper 只认绝对路径、最多 8 个。空数组/null = 这次场景没说，沿用启动参数。
+   */
+  function normalizeAssetRoots (value) {
+    if (!Array.isArray(value)) return null
+    const roots = []
+    for (const candidate of value) {
+      if (roots.length >= 8) break
+      if (typeof candidate !== 'string') continue
+      const root = candidate.trim()
+      if (root === '' || !root.startsWith('/')) continue
+      if (/[\u0000-\u001f\u007f]/.test(root)) continue
+      if (roots.includes(root)) continue
+      roots.push(root)
+    }
+    // 一个可用的根都没有 = 这次没说（不是"把根清空"）：helper 要能沿用启动参数。
+    return roots.length === 0 ? null : roots
+  }
+
   /** 素材源 id：短标识符，形状与宿主 `src/protocol.js` 的 normalizeSkinId 一致。 */
   function normalizeSkinId (value) {
     if (typeof value !== 'string') return null
@@ -863,7 +883,9 @@
       items,
       controls: normalizeControls(raw !== null && typeof raw === 'object' ? raw.controls : null),
       // v3：右键菜单的内容。旧场景没有这个字段 → 空菜单，渲染端不弹。
-      menu: normalizeMenu(raw !== null && typeof raw === 'object' ? raw.menu : null)
+      menu: normalizeMenu(raw !== null && typeof raw === 'object' ? raw.menu : null),
+      // ticket 33：当前那张皮的素材目录。缺省 null = 没变，helper 沿用已有的根。
+      assetRoots: normalizeAssetRoots(raw !== null && typeof raw === 'object' ? raw.assetRoots : null)
     }
   }
 
@@ -873,7 +895,8 @@
       reset: false,
       items: [],
       controls: emptyControls(),
-      menu: emptyMenu()
+      menu: emptyMenu(),
+      assetRoots: null
     }
   }
 
@@ -984,7 +1007,8 @@
       reset: options.reset === true,
       items,
       controls: normalizeControls(options.controls),
-      menu: normalizeMenu(options.menu)
+      menu: normalizeMenu(options.menu),
+      assetRoots: normalizeAssetRoots(options.assetRoots)
     }
   }
 
@@ -1903,6 +1927,7 @@
     normalizeId,
     normalizeGiftId,
     normalizeSkinId,
+    normalizeAssetRoots,
     normalizeGiftName,
     normalizeGiftSize,
     normalizeGiftThumb,

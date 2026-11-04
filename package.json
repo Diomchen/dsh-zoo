@@ -1,6 +1,6 @@
 {
   "name": "dsh-local-pet",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "让同一局域网里的 DSH 宠物互相看得见，并且能互相串门。",
   "type": "module",

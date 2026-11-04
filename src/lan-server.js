@@ -86,7 +86,7 @@ export async function startLanServer (options = {}) {
     const body = {
       v: 1,
       id: source.id,
-      name: typeof source.name === 'string' && source.name !== '' ? source.name : source.id,
+      name: source.id,
       size: Number.isInteger(source.size) ? source.size : 462,
       idle: idleOf(source, actions),
       actions

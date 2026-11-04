@@ -4,7 +4,7 @@ import { isAbsolute, join } from 'node:path'
 
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { dataDir as defaultDataDir } from './paths.js'
-import { MAX_LABEL, isSafeAnimationName } from './protocol.js'
+import { isSafeAnimationName } from './protocol.js'
 
 /**
  * 本机素材源注册表。
@@ -140,7 +140,8 @@ export async function loadSkinSources (options = {}) {
     const manifest = {
       v: 1,
       id: normalized.id,
-      name: normalized.name,
+      // 清单里的名字就是 id：皮的身份只有一份，别在别处再编一个（ADR-0007 的同一条道理）。
+      name: normalized.id,
       size: normalized.size,
       idle,
       actions: Object.fromEntries(ids.map((id) => [id, { file: actions[id].file, loop: !onceSet.has(id) }]))
@@ -149,7 +150,6 @@ export async function loadSkinSources (options = {}) {
     usedIds.add(normalized.id)
     sources.push({
       id: normalized.id,
-      name: normalized.name,
       size: normalized.size,
       dirs: normalized.dirs,
       idle,
@@ -186,9 +186,6 @@ function normalizeEntry (raw, home, warn) {
     warn('bad-id', id === '' ? '(empty)' : id)
     return null
   }
-  const name = typeof raw.name === 'string' && raw.name.trim() !== ''
-    ? Array.from(raw.name.trim()).slice(0, MAX_LABEL).join('')
-    : id
   const size = raw.size === undefined ? DEFAULT_SIZE : Number(raw.size)
   if (!Number.isInteger(size) || size < MIN_SIZE || size > MAX_SIZE) {
     warn('bad-size', id)
@@ -226,7 +223,7 @@ function normalizeEntry (raw, home, warn) {
     once.push(name)
   }
 
-  return { id, name, size, dirs, idle, once }
+  return { id, size, dirs, idle, once }
 }
 
 /** 待机动作：声明的 → dsh-pet 的老名字 → 字母序第一段。声明坏了只告警一次。 */

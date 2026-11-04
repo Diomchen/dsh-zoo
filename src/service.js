@@ -196,6 +196,8 @@ export function createService (ctx, options = {}) {
   // 皮只决定外观和动作，不动 identity / peers / visits / backpack / 礼物（ADR-0013）。
   let skinSources = []
   let activeSkin = null
+  /** dsh-pet 的老素材目录：没有皮时用它兜底（懒解析一次）。 */
+  let fallbackAssetRoots = null
   // 右键菜单（ticket 22）：工具项 + 动作分类，随场景一起下发；dsh-pet 的配置读不到就退平铺。
   let desktopMenu = { tools: [], groups: [] }
   let tickTimer = null
@@ -565,7 +567,7 @@ export function createService (ctx, options = {}) {
       // 当前那张皮（ticket 32）：换皮只看这一项，别的状态都不该动。
       skin: activeSkin === null
         ? null
-        : { id: activeSkin.id, name: activeSkin.name, size: activeSkin.size, idle: activeSkin.idle },
+        : { id: activeSkin.id, size: activeSkin.size, idle: activeSkin.idle },
       backpack: backpack?.items() ?? [],
       gifts: recentGifts()
     }
@@ -823,13 +825,13 @@ export function createService (ctx, options = {}) {
       if (disposed) return
       room.setIdentity(identity)
 
+      // 皮是本地资源，跟联不联网无关：先读注册表，桌面层才知道该画谁的素材（ticket 33）。
+      await loadSkin()
       // 桌面层（ticket 07）：一个全屏透明 helper + 一个占位方块。
       // 它坏了/起不来都只是「没有宠物」，这里不 await、不抛，网络与信任逻辑完全不受影响。
       startDesktopLayer()
       if (disposed) return
 
-      // 皮是本地资源，跟联不联网无关：先读注册表，菜单才有降级清单可用（ticket 32）。
-      await loadSkin()
       // 菜单的内容依赖素材源（降级清单）与 DSH 地址，所以在素材源之后建。
       await refreshDesktopMenu()
       if (disposed) return
@@ -990,9 +992,27 @@ export function createService (ctx, options = {}) {
     return desktopMenu
   }
 
-  /** 菜单「外观」里的候选：id 给动作、label 给人看。 */
+  /**
+   * 当前这张皮的素材目录（ticket 33）：没有皮时退回 dsh-pet 的那套，行为与 0.4 相同。
+   * helper 只认绝对路径；渲染端的 `localpet://asset/<动作>.webm` 就在这些目录里找。
+   */
+  function assetRootsFor (skin) {
+    if (fallbackAssetRoots === null) {
+      fallbackAssetRoots = Array.isArray(options.dshPetAssets)
+        ? options.dshPetAssets.slice()
+        : resolveDshPetAssetDirs({ env })
+    }
+    if (skin !== null && Array.isArray(skin.dirs) && skin.dirs.length > 0) return skin.dirs.slice()
+    return fallbackAssetRoots
+  }
+
+  /**
+   * 菜单「外观」里的候选：只有 id。
+   * 不另起一个显示名——「橘猫」是我们替它编的，换只动物就没词可用了；
+   * 皮的身份证是它的源 id（也就是插件名），邻居看到的 skinId 也是它。
+   */
   function skinChoices () {
-    return skinSources.map((source) => ({ id: source.id, label: source.name }))
+    return skinSources.map((source) => ({ id: source.id }))
   }
 
   /**
@@ -1218,9 +1238,7 @@ export function createService (ctx, options = {}) {
       const factory = typeof options.desktopFactory === 'function' ? options.desktopFactory : createDesktop
       // 素材目录在宿主侧解析（不硬编码 profile 路径）；helper 只收到绝对路径。
       // 解析失败/没装 dsh-pet → 空数组 → 渲染端退内置色块，串门不受影响。
-      const assetRoots = Array.isArray(options.dshPetAssets)
-        ? options.dshPetAssets.slice()
-        : resolveDshPetAssetDirs({ env })
+      const assetRoots = assetRootsFor(activeSkin)
       if (assetRoots.length === 0) {
         log.info('没找到 dsh-pet 素材目录，桌面宠物先用内置色块（串门不受影响）')
       }
@@ -1335,10 +1353,12 @@ export function createService (ctx, options = {}) {
     // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 localpet:// URL。
     const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
-    const signature = JSON.stringify({ pets, controls, menu: desktopMenu })
+    const assetRoots = assetRootsFor(activeSkin)
+    // 目录也进签名：两张皮的素材同名但不同目录时，换皮必须让渲染端跟着换根（ticket 33）。
+    const signature = JSON.stringify({ pets, controls, menu: desktopMenu, assetRoots })
     if (!reset && signature === desktopSceneSignature) return false
     desktopSceneSignature = signature
-    const scene = shared.petScene(pets, desktopWorkArea, { reset, controls, menu: desktopMenu })
+    const scene = shared.petScene(pets, desktopWorkArea, { reset, controls, menu: desktopMenu, assetRoots })
     try {
       if (reset && typeof desktop.resync === 'function') return desktop.resync(scene)
       return desktop.update(scene)

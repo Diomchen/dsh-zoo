@@ -370,7 +370,7 @@ v1 把心跳影子画成“访客”；v2 不画它。它现在是**在线/互�
   形状与 `visits.json` 完全一致（`in` / `out` 都写）。
 - `GET /local-pet/state` 是**本机**的状态出口：在 `snapshot` 之外多 `backpack` / `gifts` /
   `skin` 三项（见 README 的「带派」与「换皮」段）。`skin` 是当前那张皮
-  `{ id, name, size, idle }`（没有素材源时是 `null`）。它们只反映本机的背包、已收下的礼物
+  `{ id, size, idle }`（没有素材源时是 `null`）。它们只反映本机的背包、已收下的礼物
   与当前皮，不是线路协议的一部分，远端写不进来。
 
 ## 礼物字段（`visit-request.gift`，ticket 23 / 25）

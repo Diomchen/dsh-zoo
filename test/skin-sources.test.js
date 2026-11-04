@@ -64,7 +64,9 @@ test('skin.json 可以列多个源，动作 id 就是文件名去掉 .webm', asy
 
   assert.deepEqual(result.sources.map((s) => s.id), ['corgi', 'cat'])
   assert.equal(result.sources[0].size, 220)
-  assert.equal(result.sources[0].name, '柯基')
+  // `name` 不再是皮的字段：身份证就是 id，清单里也照抄 id（ticket 33）。
+  assert.equal(result.sources[0].name, undefined)
+  assert.equal(result.sources[0].manifest.name, 'corgi')
   assert.equal(result.sources[1].size, 462)
   assert.deepEqual(Object.keys(result.sources[1].actions), ['sleep'])
   assert.equal(result.sources[0].manifest.idle, 'idle')

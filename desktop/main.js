@@ -83,7 +83,7 @@ const isShotMode = typeof options.shot === 'string' && options.shot !== ''
 const debugEnabled = options.debug || process.env.LOCAL_PET_DESKTOP_DEBUG === '1'
 const hostPid = isShotMode ? 0 : (options.hostPid > 0 ? options.hostPid : parseHostPid(process.env.LOCAL_PET_HOST_PID))
 /** 只接受绝对路径；相对路径会让协议根目录取决于 helper 的 cwd，没有意义。 */
-const assetRoots = (Array.isArray(options.assets) ? options.assets : [])
+let assetRoots = (Array.isArray(options.assets) ? options.assets : [])
   .filter((dir) => typeof dir === 'string' && dir !== '' && path.isAbsolute(dir))
   .slice(0, 8)
 /** 远端素材缓存目录：只允许绝对路径，helper 只读它，不联网。 */
@@ -1448,6 +1448,11 @@ function applyCommand (command) {
     case 'update': {
       scene = command.scene
       sceneAt = Date.now()
+      // ticket 33：换皮之后素材目录跟着场景走。空数组 = 这次没说，沿用启动参数
+      // （旧宿主不会带这个字段，helper 不能因此把根目录清空）。
+      if (Array.isArray(scene.assetRoots) && scene.assetRoots.length > 0) {
+        assetRoots = scene.assetRoots
+      }
       pruneRendererRects()
       if (command.scene.reset === true) {
         // 整包重出生：旧控件的矩形对新场景没有意义，先作废，等渲染端重建后再报。
