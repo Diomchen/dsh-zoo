@@ -1052,3 +1052,46 @@ test('双桌面层：dsh-pet 够不着时 /local-pet/desktop 的 dualLayer 是 n
   assert.equal(res.body.dshPet.name, null, '不可达时没有宠物名')
   assert.equal(res.body.dualLayerNoted, false, '没提示过就不该说提示过')
 })
+
+test('双桌面层：配置还在但 /state 不通时，dshPet.name 不能顶配置里的名字', async (t) => {
+  const dir = await tempDir(t)
+  // 0.4.3 现场：把 dsh-pet 从 profile 里去掉后，它的配置文件还在，桥接按配置回落到
+  // 「鱼姐」当 self.pet。于是出口一边说 dsh-pet 不可达，一边又说它在画谁——判据自相矛盾。
+  const petConfigPath = join(dir, 'main-config.jsonc')
+  await writeFile(petConfigPath, '{"pets":[{"id":"main","name":"鱼姐"}]}', 'utf8')
+  const server = createServer((req, res) => {
+    res.statusCode = 404
+    res.end('no')
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+
+  const { ctx, routes } = fakeCtx()
+  ctx.webServer.getOrigin = () => origin
+  const service = createService(ctx, {
+    dataDir: dir,
+    network: false,
+    petBridge: true,
+    bridgePollMs: 20,
+    petConfigPath,
+    desktopFactory: () => ({
+      start: () => ({ ok: true, pid: 4242 }),
+      update: () => true,
+      resync: () => true,
+      status: () => ({ running: true, ready: true }),
+      requestStatus: async () => ({ ok: true, status: {} }),
+      dispose () {}
+    })
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  await service.ready
+  await delay(80)
+
+  const res = await call(service, '/local-pet/desktop')
+  assert.equal(res.status, 200)
+  assert.equal(res.body.dualLayer, null)
+  assert.equal(res.body.dshPet.reachable, false, '判据里 dsh-pet 不可达')
+  assert.equal(res.body.dshPet.reason, 'unreachable', '配置在、路由不通')
+  assert.equal(res.body.dshPet.name, null, '不可达时名字要清空：配置里的残留不算它在画')
+})

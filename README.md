@@ -300,8 +300,10 @@ Windows 上还有一种假失败要先排除：冒烟里的真实左键走 `scri
   `dualLayer` 字段会给提示，启动日志里也有一行。**只留一个桌面层**：关掉 dsh-pet 的桌面窗，
   或者用 `{"desktop": false}` / `LOCAL_PET_DESKTOP=0` 关掉这一层。
   同一个出口里还有两项，供没有日志可翻的时候核对：`dualLayerNoted`（那行提示打印过没有，
-  只打一次）和 `dshPet { reachable, reason, name }`（`dualLayer` 的判据：dsh-pet 够不够得着、
-  为什么够不着、它在画谁）。要看到 `dualLayer: null` 得让 `/dsh-pet-7340/state` 真的不通
+  只打一次；`null` 态没提示过，所以是 `false`）和 `dshPet { reachable, reason, name }`
+  （`dualLayer` 的判据：dsh-pet 够不够得着、为什么够不着、它在画谁）。`reachable=false` 时
+  `name` 也是 `null`——桥接会按配置把名字降级回 `self.pet`，但那不是「它在画谁」。
+  要看到 `dualLayer: null` 得让 `/dsh-pet-7340/state` 真的不通
   （停掉 dsh-pet 插件）；**只关它的 helper 没用**，宿主 300ms 就把它拉回来。
 - `dsh-pet` **不上报随机待机动画**。**本机自己那只**的桌面影子只镜像被 `/anim` 点播过的动作；
   其余时间从本机素材源的动作池里轮播（dsh-pet 装上后是 106 段，按视频时长 4–12 秒换一段），

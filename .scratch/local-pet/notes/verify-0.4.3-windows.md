@@ -68,12 +68,15 @@ ok  真实拖拽脚本正常退出（{"code":0,"timedOut":false}）
 
    ```json
    "dualLayer": null,
-   "dualLayerNoted": true,
+   "dualLayerNoted": false,
    "dshPet": { "reachable": false, "reason": "unreachable", "name": null }
    ```
 
    `reason` 会告诉你差在哪：`not-installed`（连配置都没了）、`unreachable`（配置在、路由不通）、
    `starting`（还没拿到 DSH 的 origin）、`no-pet`（路由通了但 dsh-pet 里没有宠物）。
+   `dualLayerNoted` 是「**这个进程里**提示打印过没有」：null 态没有可提示的对象，所以是
+   `false`；重启后第一次真的两个都在画时才会变 `true`（第 4 节）。旧稿这里写成 `true`
+   是清单笔误——`name` 同理，够不着时不能拿配置里的残留名字冒充「它在画谁」。
 3. 把 `dsh-pet` 插件装回去、重启，`dualLayer` 应立刻回到对象态，`dshPet.reachable` 变 `true`、
    `name` 是 dsh-pet 那边那只的名字。
 

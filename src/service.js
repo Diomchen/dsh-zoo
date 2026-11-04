@@ -290,6 +290,7 @@ export function createService (ctx, options = {}) {
         helperStatus = null
       }
       const self = room.snapshot().self
+      const dshPetReachable = self.bridge?.ok === true
       sendJson(res, 200, {
         running: true,
         status,
@@ -302,9 +303,11 @@ export function createService (ctx, options = {}) {
         // dualLayer 的判据同样放出来。单机复现不了「关掉 helper」那一态（宿主会立刻拉起），
         // 所以让人一眼看出此刻是哪一层在画、为什么提示是 null。
         dshPet: {
-          reachable: self.bridge?.ok === true,
+          reachable: dshPetReachable,
           reason: typeof self.bridge?.reason === 'string' ? self.bridge.reason : null,
-          name: typeof self.pet?.name === 'string' ? self.pet.name : null
+          // 不可达时 self.pet 会按配置回落成 dsh-pet 那只的名字（桥接的降级行为），
+          // 但那不是「它在画谁」：名字跟着 reachable 一起清空，出口才和 dualLayer 同一套判据。
+          name: dshPetReachable && typeof self.pet?.name === 'string' ? self.pet.name : null
         }
       })
     }
