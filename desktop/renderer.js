@@ -1544,6 +1544,8 @@
   function buildGiftCard (gift) {
     const el = document.createElement('div')
     el.className = 'lp-card lp-gift-card'
+    // 卡片右上角的小邮票按 kind 写「信」或「件」（纯装饰，内容仍以标题为准）。
+    el.dataset.kind = gift.kind === 'file' ? 'file' : 'text'
     el.setAttribute('role', 'dialog')
     el.setAttribute('aria-label', gift.title)
 
@@ -1637,6 +1639,7 @@
     entry.size = gift.size ?? null
     if (entry.signature === signature) return
     entry.signature = signature
+    entry.el.dataset.kind = gift.kind === 'file' ? 'file' : 'text'
     entry.titleEl.textContent = gift.title
     entry.el.setAttribute('aria-label', gift.title)
     const isFile = gift.kind === 'file'

@@ -302,6 +302,9 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   宿主开窗，并用 `bring-window` 把背包内容（id/kind/文案/state，**没有路径**）交给 helper。
 - 小窗（`gift.html`，380×480，无边框、置顶、`focusable: true`）显示字条框（≤500，实时字数）、
   选文件按钮与背包列表；`out` 中的条目不可撤。
+- 视觉与邻居面板同一套「奶油纸 + 粗墨线 + 贴纸投影」：窗口上沿一条和纸胶带、标题旁一个
+  小包裹 mascot、右上角一枚按 kind 写「信 / 件」的小邮票。全部是内联 SVG / CSS，
+  CSP 不需要放行 `img-src`，也没有任何网络请求；礼物卡同样用这套纸片样式。
 - 文件选择只由主进程 `dialog.showOpenDialog` 完成；渲染端只看到名字/大小，提交时主进程
   还会核对「就是刚才选中的那个绝对路径」。
 - 小窗桥只有 `ready / submit / cancel / remove / onInit / onResult` 六个原语，没有 Node 能力。

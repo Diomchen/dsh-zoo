@@ -15,6 +15,8 @@ const form = document.getElementById('form')
 const textEl = document.getElementById('text')
 const counterEl = document.getElementById('counter')
 const countEl = document.getElementById('count')
+// 数量胶囊里还有一个小背包图标：只改文字节点，别把图标一起抹掉。
+const countTextEl = document.getElementById('count-text') ?? countEl
 const itemsEl = document.getElementById('items')
 const pickedEl = document.getElementById('picked')
 const clearPickedButton = document.getElementById('clear-picked')
@@ -59,7 +61,8 @@ function updateCounter () {
     ? state.maxTextLength
     : 500
   counterEl.textContent = used + '/' + limit
-  counterEl.style.color = used > limit ? '#b42318' : '#94a3b8'
+  // 默认色在样式表里；超限才写内联色，清回空串就回到默认。
+  counterEl.style.color = used > limit ? '#b5645b' : ''
 }
 
 function formatSize (bytes) {
@@ -70,10 +73,17 @@ function formatSize (bytes) {
   return value + ' B'
 }
 
-function itemLabel (item) {
-  if (item.kind === 'file') return '文件：' + (typeof item.name === 'string' && item.name !== '' ? item.name : 'file')
+function itemName (item) {
+  if (item.kind === 'file') {
+    return typeof item.name === 'string' && item.name !== '' ? item.name : '文件'
+  }
   const text = typeof item.text === 'string' ? item.text.replace(/\s+/g, ' ').trim() : ''
-  return '字条：' + (text === '' ? '（空）' : text)
+  return text === '' ? '（空字条）' : text
+}
+
+/** 给屏幕阅读器/悬浮提示的完整说明：图标只是装饰，kind 不能丢。 */
+function itemLabel (item) {
+  return (item.kind === 'file' ? '文件：' : '字条：') + itemName(item)
 }
 
 function renderItems () {
@@ -82,16 +92,19 @@ function renderItems () {
   if (items.length === 0) {
     const row = document.createElement('li')
     row.className = 'empty-row'
-    row.textContent = '背包是空的。'
+    row.textContent = '背包空空的，放一件吧。'
     itemsEl.appendChild(row)
     return
   }
   for (const item of items) {
     if (item === null || typeof item !== 'object' || typeof item.id !== 'string') continue
     const row = document.createElement('li')
+    // 图标由 CSS 按 kind 画出来；这里只写 kind，不往文案里塞符号。
+    row.dataset.kind = item.kind === 'file' ? 'file' : 'text'
+    row.setAttribute('aria-label', itemLabel(item))
     const label = document.createElement('span')
     label.className = 'item-text'
-    label.textContent = itemLabel(item)
+    label.textContent = itemName(item)
     label.title = itemLabel(item)
     row.appendChild(label)
 
@@ -140,8 +153,10 @@ function renderPicked () {
 function render () {
   const items = Array.isArray(state.items) ? state.items : []
   const max = Number.isInteger(state.maxItems) && state.maxItems > 0 ? state.maxItems : 2
-  countEl.textContent = '背包 ' + items.length + '/' + max
+  countTextEl.textContent = '背包 ' + items.length + '/' + max
   const full = items.length >= max
+  // 背包满了就收起右下角的「慢递」邮戳（CSS 只认这个数，不猜 DOM）。
+  form.dataset.count = String(items.length)
   const pickedTooBig = state.picked !== null && typeof state.picked === 'object' &&
     Number.isFinite(state.maxFileBytes) && state.maxFileBytes > 0 &&
     Number(state.picked.size) > state.maxFileBytes

@@ -304,6 +304,7 @@ pkill -f "local-pet/desktop/main.js"
   最近的整窗截图：`.scratch/local-pet/notes/11-desktop-controls-composited.png`；
   宠物特写：`.scratch/local-pet/notes/11-desktop-controls-crop-composited.png`；
   失败气泡：`.scratch/local-pet/notes/11-desktop-controls-notice-composited.png`；
+  「带派」小窗：`.scratch/local-pet/notes/27-bring-window.png`（380×480 真窗口）；
   礼物卡（字条 / 图片 / 文件）：`.scratch/local-pet/notes/25-gift-card.png`、
   `25-gift-image.png`、`25-gift-file.png`。
 
