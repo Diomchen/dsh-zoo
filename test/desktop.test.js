@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { existsSync } from 'node:fs'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, relative } from 'node:path'
 import { PassThrough } from 'node:stream'
 import test from 'node:test'
 
@@ -588,6 +589,34 @@ test('manager：Windows 宿主照样起 helper（不再被 darwin-only 的闸门
   assert.equal(spawnCalls.length, 1)
   assert.equal(spawnCalls[0].command, '/tmp/dsh-home/electron/electron.exe')
   assert.equal(warns.length, 0)
+  manager.dispose()
+})
+
+test('manager：helper 的 cwd 在包外——包被占着也不耽误下次安装替换它', () => {
+  const spawnCalls = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'win32',
+    env: { DSH_HOME: '/tmp/dsh-home' },
+    exists: (candidate) => candidate === '/tmp/dsh-home/electron/electron.exe',
+    spawn: (command, args, options) => {
+      spawnCalls.push({ command, args, options })
+      return fakeChild(2002)
+    },
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000
+  })
+  assert.equal(manager.start().ok, true)
+  const cwd = spawnCalls[0].options.cwd
+
+  // 反例：cwd 落在包内时，Windows 删不掉任何进程的当前目录，
+  // pnpm 替换这个包会先删掉里面的文件、再在删目录时失败——包被删残（ADR-0012）。
+  const packageRoot = dirname(dirname(HELPER_MAIN))
+  const rel = relative(packageRoot, cwd)
+  assert.ok(rel === '' ? false : isAbsolute(rel) || rel.startsWith('..'), 'helper 的 cwd 必须在包外，实际是 ' + cwd)
+
+  assert.equal(cwd, tmpdir())
+  assert.equal(existsSync(cwd), true, 'cwd 必须真实存在，否则 spawn 直接 ENOENT')
   manager.dispose()
 })
 

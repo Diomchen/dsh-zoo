@@ -12,6 +12,7 @@
  */
 
 import { spawn as nodeSpawn } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -34,6 +35,15 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url))
 /** 包内的 helper 主进程；不经 npm 解析，打包时随 files 一起带上。 */
 export const HELPER_MAIN = join(HERE, '..', 'desktop', 'main.js')
+/**
+ * helper 的工作目录，在包外。
+ *
+ * Windows 上删不掉任何进程的当前工作目录：helper 活着时 cwd 若落在包内
+ * （以前是 `<pkg>/desktop`），这个装好的包就再也换不掉——pnpm 替换它时会
+ * 先删掉包里的文件、再在删目录时 EPERM，包被删残（ADR-0012）。
+ * helper 的资源一律走 `__dirname`，不靠 cwd，所以挪出来没有副作用。
+ */
+export const HELPER_CWD = tmpdir()
 export const HELPER_STDERR_BUFFER = 8
 
 function noop () {}
@@ -189,7 +199,7 @@ export function createDesktop (options = {}) {
     let spawned = null
     try {
       spawned = spawnFn(availability.path, args, {
-        cwd: dirname(helperMain),
+        cwd: HELPER_CWD,
         env: helperEnv(env, hostPid),
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true
