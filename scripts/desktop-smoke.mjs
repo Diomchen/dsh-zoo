@@ -37,6 +37,9 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
 const OUT_DIR = join(tmpdir(), 'dsh-local-pet-desktop-smoke-' + process.pid)
 const NOTES_DIR = join(ROOT, '.scratch', 'local-pet', 'notes')
+/** ticket 25：礼物缩略图走 helper 的 localpet://gifts 根；冒烟自己造一个真目录 + 真 PNG。 */
+const GIFTS_ROOT = join(OUT_DIR, 'gifts')
+const GIFT_THUMB_DIR = '20261103-153245-ab12cd12'
 const WRITE_NOTES = process.env.LOCAL_PET_SMOKE_NOTES === '1'
 const ASSET_ROOTS = resolveDshPetAssetDirs({ env: process.env })
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -430,6 +433,21 @@ function assertControlPixels (verified, rects) {
     assert(pixels > pw * ph * 0.25,
       '控件 ' + rect.id + ' 在截图里有可见像素（' + pixels + '/' + (pw * ph) + '）')
   }
+}
+
+/** 礼物卡截图笔记（ticket 25）：合成到棋盘格上，再按卡片矩形裁一圈，方便直接看。 */
+function writeGiftNote (verified, rect, fileName) {
+  if (!WRITE_NOTES) return null
+  mkdirSync(NOTES_DIR, { recursive: true })
+  const composite = compositeOverCheckerboard(verified.image)
+  const margin = 28
+  const px = Math.max(0, Math.floor((rect.x - margin) * verified.scaleX))
+  const py = Math.max(0, Math.floor((rect.y - margin) * verified.scaleY))
+  const pw = Math.min(composite.width - px, Math.ceil((rect.width + margin * 2) * verified.scaleX))
+  const ph = Math.min(composite.height - py, Math.ceil((rect.height + margin * 2) * verified.scaleY))
+  const path = join(NOTES_DIR, fileName)
+  writeFileSync(path, encodePng(downscale(cropImage(composite, px, py, pw, ph), 2)))
+  return path
 }
 
 function writeControlNotes (verified, noticeVerified) {
@@ -1401,6 +1419,7 @@ async function verifyMenu () {
     menu: {
       tools: [
         { id: 'open-site', label: '打开软件' },
+        { id: 'bring', label: '带派' },
         { id: 'home', label: '回到初始位置' },
         { id: 'reload', label: '重载配置' }
       ],
@@ -1429,7 +1448,8 @@ async function verifyMenu () {
   assert(state.menu.panels.length === 1, '一级只有一个面板（' + state.menu.panels.length + '）')
   const rowLabels = state.menu.rows.map((row) => row.label)
   assert(rowLabels.includes('打开软件') && rowLabels.includes('回到初始位置') && rowLabels.includes('重载配置'),
-    '一级有 tool 三件套：' + rowLabels.join('/'))
+    '一级有工具项三件套：' + rowLabels.join('/'))
+  assert(rowLabels.includes('带派'), '一级有「带派」（' + rowLabels.join('/') + '）')
   assert(rowLabels.includes('动作'), '一级有「动作」')
 
   // 矩形是异步过 IPC 的：等主进程真的按新矩形翻成可交互，再看数量。
@@ -1587,6 +1607,29 @@ async function verifyMenu () {
   assert(Math.abs(homed.x - homed.spawnX) <= 2 && Math.abs(homed.y - homed.spawnY) <= 2,
     '「回到初始位置」把这一只放回出生点（' + homed.x + ',' + homed.y + ' → ' + homed.spawnX + ',' + homed.spawnY + '）')
 
+  // 「带派」（ticket 24）：点一级工具项只发一个空动作，开窗是宿主的事。
+  const bringCenter = await petCenterNow()
+  client.send({ type: 'debug-dispatch', phase: 'context', x: bringCenter.x, y: bringCenter.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu !== null
+  }, 3000, '为「带派」展开菜单')
+  state = await client.rendererState()
+  const bringRow = state.menu.rows.find((row) => row.kind === 'tool' && row.label === '带派')
+  assert(Boolean(bringRow), '菜单里有「带派」')
+  const bringPoint = rectCenterScreen(bringRow, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: bringPoint.x, y: bringPoint.y })
+  const bringRequest = await client.waitFrom(
+    start,
+    (event) => event.type === 'action' && event.action === 'bring',
+    3000,
+    '「带派」申请'
+  )
+  assert(bringRequest.deviceId === null, '「带派」不夹带邻居身份')
+  assert(bringRequest.gift === undefined, '右键「带派」只请求开窗，不带礼物')
+  await waitUntil(async () => (await client.rendererState()).menu === null, 2000, '点完收起菜单')
+
   // 右键访客：不出菜单（也不吞鼠标）
   state = await client.rendererState()
   const visitor = state.pets.find((pet) => pet.id.startsWith('visitor:'))
@@ -1732,6 +1775,323 @@ async function verifyStreetStability () {
 
   client.send({ type: 'quit' })
   return null
+}
+
+// ---------------------------------------------------------------------------
+// 礼物卡（ticket 23）：字条卡片 / 复制 / 扔掉
+// ---------------------------------------------------------------------------
+
+async function verifyGifts () {
+  // 缩略图要真的是一张图：先写进 gifts 根，再让渲染端通过 localpet://gifts/<目录>/<文件> 读它。
+  const giftDir = join(GIFTS_ROOT, GIFT_THUMB_DIR)
+  mkdirSync(giftDir, { recursive: true })
+  const thumbFile = join(giftDir, '照片.png')
+  const thumbImage = { width: 96, height: 64, data: Buffer.alloc(96 * 64 * 4) }
+  for (let y = 0; y < thumbImage.height; y += 1) {
+    for (let x = 0; x < thumbImage.width; x += 1) {
+      const index = (y * thumbImage.width + x) * 4
+      thumbImage.data[index] = 60 + Math.round((x / thumbImage.width) * 160)
+      thumbImage.data[index + 1] = 120
+      thumbImage.data[index + 2] = 200
+      thumbImage.data[index + 3] = 255
+    }
+  }
+  writeFileSync(thumbFile, encodePng(thumbImage))
+
+  const client = createHelperClient((line) => info(line), ['--local-pet-gifts', GIFTS_ROOT])
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  const workArea = ready.workArea
+  const visitorId = '55555555-5555-4555-8555-555555555555'
+  const giftId = '66666666-6666-4666-8666-666666666666'
+  const outside = { x: workArea.x + 8, y: workArea.y + 8 }
+  const giftText = '第一行：到你家门口了\n第二行：带了张便条\n第三行：记得看'
+
+  // 冒烟只走合成输入：真实鼠标/焦点事件不能干扰点击。
+  client.send({ type: 'debug-lock-input', locked: true })
+  await sleep(150)
+
+  const textGift = {
+    deviceId: visitorId,
+    giftId,
+    kind: 'text',
+    status: 'received',
+    title: '「阿蟹」捎来一张字条',
+    text: giftText
+  }
+  const sceneWithGift = (gift = textGift) => shared.petScene([
+    { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
+    { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
+  ], workArea, {
+    reset: true,
+    controls: {
+      visit: { enabled: false, reason: null },
+      recall: { enabled: false, nickname: null },
+      visitors: [{ deviceId: visitorId, label: '阿蟹' }],
+      street: [],
+      prompt: null,
+      notice: null,
+      gifts: [gift]
+    }
+  })
+
+  client.send({ type: 'update', scene: sceneWithGift() })
+  await sleep(1800)
+
+  let state = await client.rendererState()
+  assert(state.controls.gifts.length === 1, '场景里的一张礼物卡被画出来')
+  assert(state.controls.gifts[0].giftId === giftId, '卡片带着 giftId（' + state.controls.gifts[0].giftId + '）')
+  assert(state.controls.gifts[0].title === '「阿蟹」捎来一张字条', '标题来自宿主')
+  assert(state.controls.gifts[0].text === giftText, '正文保留换行、没有被折成一行')
+  const cardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + giftId)
+  const copyRect = state.uiRects.find((rect) => rect.id === 'ui:gift-btn:gift-copy:' + giftId)
+  const discardRect = state.uiRects.find((rect) => rect.id === 'ui:gift-btn:gift-discard:' + giftId)
+  assert(Boolean(cardRect), '礼物卡有独立命中矩形')
+  assert(Boolean(copyRect) && Boolean(discardRect), '礼物卡按钮的矩形带 giftId（两张卡不撞名）')
+  assert(Boolean(state.uiRects.find((rect) => rect.id === 'ui:gift-bridge:' + giftId)), '卡片与访客之间有桥接矩形')
+  const current = await client.status()
+  assert(current.overlayRects >= 6, '礼物卡 + 按钮 + 桥接都进了 overlay-rects（' + current.overlayRects + ' 块）')
+
+  // 截图：卡片真的被画出来（不是只有矩形）。
+  mkdirSync(OUT_DIR, { recursive: true })
+  const pngPath = join(OUT_DIR, 'gift-card.png')
+  let start = client.mark()
+  client.send({ type: 'shot', id: 'shot-gift', path: pngPath })
+  const shot = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-gift', 8000, '礼物卡截图')
+  assert(shot.width > 0 && existsSync(pngPath), '礼物卡截图落盘：' + pngPath)
+  const verified = verifyShot(pngPath, pngPath + '.json', 2)
+  assertControlPixels(verified, [cardRect, copyRect, discardRect])
+
+  // 点「复制」：请求只带 giftId；宿主回 ok + 一句人话，渲染端要冒泡。
+  const copyPoint = rectCenterScreen(copyRect, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: copyPoint.x, y: copyPoint.y })
+  const copyAction = await client.waitFrom(start, (event) => event.type === 'action', 3000, '复制申请')
+  assert(copyAction.action === 'gift-copy', '点「复制」→ 宿主收到 gift-copy')
+  assert(copyAction.giftId === giftId, '礼物动作带 giftId（' + copyAction.giftId + '）')
+  assert(typeof copyAction.id === 'string' && copyAction.id !== '', 'action 带 id，宿主才能对上是哪一次点击')
+  client.send({ type: 'action-result', id: copyAction.id, ok: true, notice: '字条已经复制到剪贴板。' })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.notice !== null && /复制到剪贴板/.test(snapshot.controls.notice.text)
+  }, 2500, '复制成功的气泡')
+  state = await client.rendererState()
+  assert(state.controls.gifts.length === 1, '复制之后卡片还在')
+
+  // 点「扔掉」：宿主 ok 之后场景里不再有这件礼物 → 卡片与矩形一起收起。
+  const discardPoint = rectCenterScreen(discardRect, workArea)
+  start = client.mark()
+  client.send({ type: 'debug-dispatch', phase: 'click', x: discardPoint.x, y: discardPoint.y })
+  const discardAction = await client.waitFrom(start, (event) => event.type === 'action', 3000, '扔掉申请')
+  assert(discardAction.action === 'gift-discard', '点「扔掉」→ 宿主收到 gift-discard')
+  assert(discardAction.giftId === giftId, '扔掉带的是这一张卡的 giftId')
+  client.send({ type: 'action-result', id: discardAction.id, ok: true })
+  const withoutGift = sceneWithGift()
+  withoutGift.controls.gifts = []
+  client.send({ type: 'update', scene: withoutGift })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.gifts.length === 0 &&
+      !snapshot.uiRects.some((rect) => rect.id.startsWith('ui:gift:'))
+  }, 2500, '扔掉后卡片消失')
+  state = await client.rendererState()
+  assert(state.controls.gifts.length === 0, '扔掉之后卡片从场景里消失')
+  assert(!state.uiRects.some((rect) => rect.id.startsWith('ui:gift')), '礼物卡的所有命中矩形都撤掉了')
+
+  // -----------------------------------------------------------------------
+  // ticket 25：文件卡片 + 图片缩略图。
+  // 缩略图是 localpet://gifts（CSP img-src 必须放行），用 rendererState 的
+  // thumb.loaded 证明图片真的解码成功；截图侧再确认卡片画出来了。
+  // -----------------------------------------------------------------------
+  const imageGiftId = '77777777-7777-4777-8777-777777777777'
+  const imageGift = {
+    deviceId: visitorId,
+    giftId: imageGiftId,
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '照片.png',
+    size: 2048,
+    thumb: 'localpet://gifts/' + GIFT_THUMB_DIR + '/' + encodeURIComponent('照片.png')
+  }
+  client.send({ type: 'update', scene: sceneWithGift(imageGift) })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    const card = snapshot.controls.gifts[0]
+    return card?.kind === 'file' && card.thumb?.loaded === true
+  }, 3000, '图片缩略图解码成功')
+  // 宠物刚被 reset 重新出生，卡片跟着访客移动；等物理稳定再取矩形/截图，否则矩形会过期。
+  await sleep(1800)
+  state = await client.rendererState()
+  assert(state.controls.gifts[0].kind === 'file', '文件卡片画出来了（kind=file）')
+  assert(state.controls.gifts[0].name === '照片.png', '卡片带文件名（' + state.controls.gifts[0].name + '）')
+  assert(state.controls.gifts[0].size === 2048, '卡片带文件大小')
+  assert(state.controls.gifts[0].thumb !== null && state.controls.gifts[0].thumb.loaded === true,
+    'localpet://gifts 的缩略图真的解码了（CSP + 协议都通）')
+  assert(state.controls.gifts[0].copyVisible === false, '文件卡片不显示「复制」')
+  const imageCardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + imageGiftId)
+  assert(Boolean(imageCardRect), '文件卡片有独立命中矩形')
+  const imagePath = join(OUT_DIR, 'gift-image.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-gift-image', path: imagePath })
+  const imageShotEvent = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-gift-image', 8000, '图片礼物卡截图')
+  assert(imageShotEvent.width > 0 && existsSync(imagePath), '图片礼物卡截图落盘：' + imagePath)
+  const imageVerified = verifyShot(imagePath, imagePath + '.json', 2)
+  assertControlPixels(imageVerified, [imageCardRect])
+
+  // 非图片文件：没有 thumb，渲染端画文件图标 + 文件名 + 大小。
+  const fileGiftId = '88888888-8888-4888-8888-888888888888'
+  const fileGift = {
+    deviceId: visitorId,
+    giftId: fileGiftId,
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '报价单.pdf',
+    size: 23194
+  }
+  client.send({ type: 'update', scene: sceneWithGift(fileGift) })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.gifts[0]?.giftId === fileGiftId && snapshot.controls.gifts[0]?.thumb === null
+  }, 3000, '非图片文件卡片（没有缩略图）')
+  await sleep(1800)
+  state = await client.rendererState()
+  assert(state.controls.gifts[0].name === '报价单.pdf', '非图片文件卡片显示文件名')
+  const fileCardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + fileGiftId)
+  assert(Boolean(fileCardRect), '非图片文件卡片有命中矩形')
+  const filePath = join(OUT_DIR, 'gift-file.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-gift-file', path: filePath })
+  const fileShotEvent = await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-gift-file', 8000, '文件礼物卡截图')
+  assert(fileShotEvent.width > 0 && existsSync(filePath), '文件礼物卡截图落盘：' + filePath)
+  const fileVerified = verifyShot(filePath, filePath + '.json', 2)
+  assertControlPixels(fileVerified, [fileCardRect])
+
+  // 截图存进仓库的 notes 目录（25- 前缀，棋盘格合成 + 卡片特写），方便人工复核。
+  const noteCard = writeGiftNote(verified, cardRect, '25-gift-card.png')
+  const noteImage = writeGiftNote(imageVerified, imageCardRect, '25-gift-image.png')
+  const noteFile = writeGiftNote(fileVerified, fileCardRect, '25-gift-file.png')
+  if (noteImage !== null) info('截图笔记：' + noteImage + ' / ' + noteFile)
+
+  // 光标移开 → 恢复穿透（没关掉的控件不该把整窗一直按着）。
+  client.send({ type: 'pointer', x: outside.x, y: outside.y })
+  await waitUntil(async () => (await client.status()).ignoring === true, 3000, '礼物卡收起后恢复穿透')
+
+  return {
+    pngPath,
+    sidecarPath: pngPath + '.json',
+    verified,
+    imagePath,
+    filePath,
+    imageVerified,
+    fileVerified,
+    noteCard,
+    noteImage,
+    noteFile
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2.5) 「带派」小窗（ticket 24）：真窗口打开 + 背包列表 + 截图
+// ---------------------------------------------------------------------------
+
+async function verifyBringWindow () {
+  const client = createHelperClient((line) => info(line))
+  const readyMark = client.mark()
+  const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
+  assert(ready.workArea.width > 0, '带派小窗用例拿到工作区')
+
+  client.send({
+    type: 'update',
+    scene: shared.petScene([
+      { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] }
+    ], ready.workArea)
+  })
+  await sleep(800)
+
+  const idleFile = '99999999-9999-4999-8999-999999999998'
+  // 宿主交下来的背包快照：一件能撤的文件 → 截图里能看到列表、可用的撤掉按钮与可用的提交按钮。
+  client.send({
+    type: 'bring-window',
+    open: true,
+    items: [
+      { id: idleFile, kind: 'file', name: '报价单.pdf', state: 'idle' }
+    ]
+  })
+  await client.waitStatus((status) => status.bringOpen === true, 5000, '「带派」小窗打开')
+  await sleep(900)
+
+  const pngPath = join(OUT_DIR, 'bring.png')
+  const start = client.mark()
+  client.send({ type: 'shot', id: 'smoke-bring-shot', path: pngPath, window: 'bring' })
+  const shot = await client.waitFrom(start, (event) => event.type === 'shot', 6000, '「带派」小窗截图')
+  assert(shot.width > 0 && shot.height > 0, '「带派」小窗有真实尺寸（' + shot.width + '×' + shot.height + '）')
+  assert(existsSync(pngPath), '「带派」小窗截图落盘：' + pngPath)
+
+  const image = decodePng(readFileSync(pngPath))
+  assert(image.width >= 300 && image.height >= 300, '截图尺寸与窗口一致（' + image.width + '×' + image.height + '）')
+  let visible = 0
+  for (let index = 3; index < image.data.length; index += 4) {
+    if (image.data[index] > 16) visible += 1
+  }
+  assert(visible > image.width * image.height * 0.2,
+    '小窗里画出了可见内容（' + visible + '/' + (image.width * image.height) + ' px）')
+
+  let notePath = null
+  if (WRITE_NOTES) {
+    mkdirSync(NOTES_DIR, { recursive: true })
+    const composite = compositeOverCheckerboard(image)
+    notePath = join(NOTES_DIR, '12-bring-window-composited.png')
+    writeFileSync(notePath, encodePng(composite))
+    info('带派小窗截图笔记：' + notePath)
+  }
+
+  // 撤掉：点列表里的「撤掉」，helper 必须报一条带 giftId 的 unbring 申请。
+  const removeMark = client.mark()
+  client.send({ type: 'debug-gift-remove', id: 'smoke-bring-remove' })
+  let removeRequest
+  try {
+    removeRequest = await client.waitFrom(
+      removeMark,
+      (event) => event.type === 'action' && event.action === 'unbring',
+      5000,
+      '「撤掉」申请'
+    )
+  } catch (error) {
+    console.error('[diag] events=' + JSON.stringify(client.events.slice(-8)))
+    throw error
+  }
+  assert(removeRequest.giftId === idleFile, '「撤掉」带的是那一条的 giftId（' + removeRequest.giftId + '）')
+  client.send({ type: 'action-result', id: removeRequest.id, ok: true })
+
+  // 小窗 → 主进程 → 宿主：在真渲染进程里填字条并点提交，helper 必须报一条 action 申请。
+  const submitText = '从窗口里放进来的字条'
+  const actionMark = client.mark()
+  client.send({ type: 'debug-gift-submit', id: 'smoke-bring-submit', text: submitText })
+  const action = await client.waitFrom(
+    actionMark,
+    (event) => event.type === 'action' && event.action === 'bring',
+    5000,
+    '「带派」小窗提交为一次 action 申请'
+  )
+  assert(typeof action.id === 'string' && action.id !== '', '提交申请带 action id')
+  assert(
+    JSON.stringify(action.gift) === JSON.stringify({ kind: 'text', text: submitText }),
+    '申请里带的就是窗口里写的那段字条（' + JSON.stringify(action.gift) + '）'
+  )
+  assert(action.deviceId === null, '带派申请不夹带邻居身份')
+
+  // 宿主答复成功：主进程应该把这扇窗关掉（“放进背包”成功即收窗）。
+  const closeMark = client.mark()
+  client.send({ type: 'action-result', id: action.id, ok: true })
+  await client.waitStatus((status) => status.bringOpen === false, 4000, '提交成功后小窗关闭')
+  assert(closeMark > 0, '关窗走的是 action-result（先记了事件起点）')
+
+  client.send({ type: 'quit' })
+  const exit = await Promise.race([client.exited, sleep(10000).then(() => null)])
+  assert(exit !== null, '带派小窗用例结束后 helper 自己退出')
+  return { pngPath, notePath }
 }
 
 async function verifyManager () {
@@ -1895,6 +2255,8 @@ try {
   const controls = wants('controls') ? await run('控件：悬停弹层 / 点击穿透（A2）/ 租约 fail-closed（A3）/ 街道面板 / 串门申请 / 失败气泡 / 放行卡 / 送客 / 召回', verifyControls) : null
   if (wants('menu')) await run('右键菜单：只挂自己 / 三级级联 / 点一项就申请点播 / 访客不弹', verifyMenu)
   if (wants('street')) await run('街道：人多时面板不跳、点谁就是谁', verifyStreetStability)
+  const gifts = wants('gift') ? await run('礼物卡：字条卡片 / 复制 / 扔掉 / 命中矩形', verifyGifts) : null
+  const bring = wants('bring') ? await run('带派小窗：真窗口打开 / 背包列表 / 截图 / 退出', verifyBringWindow) : null
   if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
   const notes = standalone === null ? null : writeNoteScreenshots(standalone.verified)
@@ -1912,6 +2274,15 @@ try {
   console.log('\n通过（' + checks + ' 项断言' + (ONLY === null ? '，全部段落' : '，只跑了 ' + ONLY) + '）。')
   console.log('交互截图：' + join(OUT_DIR, 'helper.png'))
   if (controls !== null) console.log('控件截图：' + controls.pngPath)
+  if (gifts !== null) {
+    console.log('礼物卡截图：' + gifts.pngPath)
+    console.log('图片礼物卡截图：' + gifts.imagePath)
+    console.log('文件礼物卡截图：' + gifts.filePath)
+  }
+  if (bring !== null) {
+    console.log('带派小窗截图：' + bring.pngPath)
+    if (bring.notePath !== null) console.log('  带派小窗（棋盘格合成）: ' + bring.notePath)
+  }
   if (standalone !== null) console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {
   exitCode = 1

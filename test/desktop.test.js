@@ -1434,3 +1434,407 @@ test('manager：openUrl 只把 http(s) 地址写进管道，坏地址不写', as
   assert.equal(manager.openUrl('file:///etc/passwd'), false)
   assert.equal(children[0].parsedLines().at(-1).type, 'open-url')
 })
+
+// ---------------------------------------------------------------------------
+// ticket 23：礼物卡的四道白名单
+// ---------------------------------------------------------------------------
+
+test('normalizeNoteText：保留换行、去控制字符与双向覆盖符，按码点截到 500', () => {
+  assert.equal(
+    shared.normalizeNoteText('  第一行\r\n第二行\t\u0000\n\n第三行  '),
+    '第一行\n第二行\n\n第三行'
+  )
+  assert.equal(shared.normalizeNoteText('正常\u202e文字'), '正常文字')
+  assert.equal(shared.normalizeNoteText('   '), null)
+  assert.equal(shared.normalizeNoteText(null), null)
+  const long = '喵'.repeat(shared.MAX_GIFT_TEXT_LENGTH + 20)
+  assert.equal(Array.from(shared.normalizeNoteText(long)).length, shared.MAX_GIFT_TEXT_LENGTH)
+  assert.equal(shared.MAX_GIFT_TEXT_LENGTH, 500, '与 src/protocol.js 的 MAX_GIFT_TEXT 同一个数')
+})
+
+test('场景 controls.gifts：只认字条 + 已知状态 + UUID，正文只在 received 时保留', () => {
+  const deviceId = '33333333-3333-4333-8333-333333333333'
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  const scene = shared.normalizeScene({
+    items: [],
+    controls: {
+      gifts: [
+        {
+          deviceId,
+          giftId,
+          kind: 'text',
+          status: 'received',
+          title: '  「阿蟹」捎来一张字条  ',
+          text: '  第一行\r\n第二行  ',
+          statusText: '不该出现'
+        },
+        { deviceId, giftId, kind: 'text', status: 'pending', title: '重复', text: '重复' },
+        { deviceId: 'bad id', giftId, kind: 'text', status: 'received', title: 'x' },
+        { deviceId, giftId: 'gift-1', kind: 'text', status: 'received', title: 'x' },
+        { deviceId, giftId: '66666666-6666-4666-8666-666666666666', kind: 'file', status: 'received', title: 'x' },
+        { deviceId, giftId: '77777777-7777-4777-8777-777777777777', kind: 'text', status: 'lost', title: 'x' },
+        null,
+        'nope'
+      ]
+    }
+  })
+  assert.deepEqual(scene.controls.gifts, [{
+    deviceId,
+    giftId,
+    kind: 'text',
+    status: 'received',
+    title: '「阿蟹」捎来一张字条',
+    text: '第一行\n第二行'
+  }])
+
+  // 非 received 时正文不画；状态行保留，标题缺省有一句兜底。
+  const pending = shared.normalizeScene({
+    items: [],
+    controls: {
+      gifts: [{
+        deviceId,
+        giftId,
+        kind: 'text',
+        status: 'pending',
+        title: '',
+        text: '还没写完',
+        statusText: '  刚到，正在收下…  '
+      }]
+    }
+  }).controls.gifts
+  assert.deepEqual(pending, [{
+    deviceId,
+    giftId,
+    kind: 'text',
+    status: 'pending',
+    title: '捎来一件东西',
+    statusText: '刚到，正在收下…'
+  }])
+  assert.deepEqual(shared.emptyControls().gifts, [])
+})
+
+test('helper 动作：礼物四动作必须带 giftId；别的动作带上也会被丢掉', () => {
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  for (const action of shared.GIFT_ACTIONS) {
+    const ok = shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action, giftId })
+    assert.equal(ok.ok, true, action)
+    assert.equal(ok.event.giftId, giftId)
+    assert.equal(ok.event.deviceId, null)
+    assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action }).ok, false, action + ' 缺 giftId')
+    assert.equal(
+      shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action, giftId: 'not a uuid' }).ok,
+      false,
+      action + ' 坏 giftId'
+    )
+  }
+  // visit 不是礼物动作：即便坏字段也直接丢掉，不影响事件本身。
+  const visit = shared.normalizeHelperEvent({ type: 'action', id: 'act-2', action: 'visit', giftId })
+  assert.equal(visit.ok, true)
+  assert.equal('giftId' in visit.event, false)
+})
+
+test('宿主命令：gift-open/reveal/discard 只收绝对路径；gift-copy 只收清洗后的字条', () => {
+  for (const type of ['gift-open', 'gift-reveal', 'gift-discard']) {
+    const ok = shared.normalizeHostCommand({ type, id: 'cmd-1', path: '/Users/me/.dsh/gifts/20261103-153245-ab12cd12/note.txt' })
+    assert.equal(ok.ok, true, type)
+    assert.deepEqual(ok.command, {
+      type,
+      id: 'cmd-1',
+      path: '/Users/me/.dsh/gifts/20261103-153245-ab12cd12/note.txt'
+    })
+    assert.equal(shared.normalizeHostCommand({ type, path: 'relative/note.txt' }).ok, false, type)
+    assert.equal(shared.normalizeHostCommand({ type }).ok, false, type)
+  }
+  const copy = shared.normalizeHostCommand({ type: 'gift-copy', id: 'cmd-2', text: ' 第一行\r\n第二行 ' })
+  assert.equal(copy.ok, true)
+  assert.deepEqual(copy.command, { type: 'gift-copy', id: 'cmd-2', text: '第一行\n第二行' })
+  assert.equal(shared.normalizeHostCommand({ type: 'gift-copy', text: '   ' }).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'gift-copy', text: 42 }).ok, false)
+})
+
+test('manager：gift-open/reveal/discard 只写绝对路径，gift-copy 只写清洗后的正文', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4300 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4300, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+  const notePath = '/Users/me/.dsh/local-pet/gifts/20261103-153245-ab12cd12/note.txt'
+
+  assert.equal(manager.giftOpen(notePath), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-open', id: null, path: notePath })
+  assert.equal(manager.giftReveal(notePath), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-reveal', id: null, path: notePath })
+  assert.equal(manager.giftDiscard('/Users/me/.dsh/local-pet/gifts/20261103-153245-ab12cd12'), true)
+  assert.equal(children[0].parsedLines().at(-1).type, 'gift-discard')
+  assert.equal(manager.giftCopy('第一行\r\n第二行'), true)
+  assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-copy', id: null, text: '第一行\n第二行' })
+
+  // 相对路径 / 空正文在白名单处就被丢掉，写不进管道。
+  assert.equal(manager.giftOpen('relative/note.txt'), false)
+  assert.equal(manager.giftCopy('   '), false)
+  assert.equal(children[0].parsedLines().at(-1).type, 'gift-copy')
+})
+
+// ---------------------------------------------------------------------------
+// ticket 24：背包小窗的桥与宿主命令
+// ---------------------------------------------------------------------------
+
+test('normalizeBringGift：字条 ≤500 保留换行；文件只认绝对路径；多出的字段丢掉', () => {
+  assert.deepEqual(shared.normalizeBringGift({ kind: 'text', text: '  第一行\r\n第二行  ' }), {
+    kind: 'text',
+    text: '第一行\n第二行'
+  })
+  assert.deepEqual(shared.normalizeBringGift({ kind: 'file', path: '/Users/me/a.pdf', text: 'x' }), {
+    kind: 'file',
+    path: '/Users/me/a.pdf'
+  })
+  assert.equal(shared.normalizeBringGift({ kind: 'text', text: '字'.repeat(501) }), null)
+  assert.equal(shared.normalizeBringGift({ kind: 'text', text: '  ' }), null)
+  assert.equal(shared.normalizeBringGift({ kind: 'file', path: 'relative.pdf' }), null)
+  assert.equal(shared.normalizeBringGift({ pick: true }), null)
+  assert.equal(shared.normalizeBringGift(null), null)
+})
+
+test('bring-window：窗口只拿 id/kind/文案/state，路径与多余物品都被丢掉', () => {
+  const id = '55555555-5555-4555-8555-555555555555'
+  const command = shared.normalizeHostCommand({
+    type: 'bring-window',
+    open: true,
+    items: [
+      { id, kind: 'text', text: ' 第一行\r\n第二行 ', state: 'idle', path: '/tmp/secret' },
+      { id, kind: 'file', name: '../报价单.pdf', state: 'out', path: '/tmp/secret' },
+      { id: 'not-a-uuid', kind: 'text', text: '坏' },
+      { id, kind: 'movie', text: '坏' }
+    ]
+  })
+  assert.equal(command.ok, true)
+  assert.deepEqual(command.command.items, [
+    { id, kind: 'text', text: '第一行\n第二行', state: 'idle' },
+    { id, kind: 'file', name: '../报价单.pdf', state: 'out' }
+  ])
+  assert.equal('path' in command.command.items[0], false)
+  assert.equal(command.command.open, true)
+  assert.equal(command.command.count, 2)
+  assert.equal(command.command.maxItems, shared.MAX_BACKPACK_ITEMS)
+  assert.equal(command.command.maxTextLength, shared.MAX_GIFT_TEXT_LENGTH)
+  assert.equal(command.command.maxFileBytes, shared.MAX_GIFT_FILE_BYTES)
+
+  // open:false = 只刷新；缺省是 false。
+  assert.equal(shared.normalizeHostCommand({ type: 'bring-window', items: [] }).command.open, false)
+  // 超过两件只留前两件（上限由 shared 自己定，不信宿主）。
+  const capped = shared.normalizeHostCommand({
+    type: 'bring-window',
+    items: Array.from({ length: 5 }, (_, index) => ({
+      id: '6666666' + String(index) + '-6666-4666-8666-666666666666',
+      kind: 'text',
+      text: '第' + index
+    }))
+  }).command
+  assert.equal(capped.items.length, shared.MAX_BACKPACK_ITEMS)
+})
+
+test('helper 动作：bring 可带物品也可空手（开窗）；unbring 必须带 giftId', () => {
+  const gift = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-bring',
+    action: 'bring',
+    gift: { kind: 'text', text: '带去的东西' }
+  })
+  assert.equal(gift.ok, true)
+  assert.deepEqual(gift.event.gift, { kind: 'text', text: '带去的东西' })
+  assert.equal('giftId' in gift.event, false)
+
+  // 右键菜单的 bring 没有物品：这是“开窗”申请，不能被当成坏礼物。
+  const empty = shared.normalizeHelperEvent({ type: 'action', id: 'act-open', action: 'bring' })
+  assert.equal(empty.ok, true)
+  assert.equal('gift' in empty.event, false)
+
+  assert.deepEqual(shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-bad',
+    action: 'bring',
+    gift: { kind: 'file', path: 'relative.pdf' }
+  }), { ok: false, error: 'bad-gift' })
+
+  const unbring = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-unbring',
+    action: 'unbring',
+    giftId: '77777777-7777-4777-8777-777777777777'
+  })
+  assert.equal(unbring.ok, true)
+  assert.equal(unbring.event.giftId, '77777777-7777-4777-8777-777777777777')
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-unbring', action: 'unbring' }).ok, false)
+
+  // 新动作都进了帮助侧白名单：渲染端菜单/小窗才发得出来。
+  assert.equal(shared.DESKTOP_ACTIONS.includes('bring'), true)
+  assert.equal(shared.DESKTOP_ACTIONS.includes('unbring'), true)
+  assert.equal(shared.MENU_TOOL_IDS.includes('bring'), true)
+})
+
+test('status 白名单放行 bringOpen：冒烟能等到「带派」小窗真的打开', () => {
+  const status = shared.normalizeHelperEvent({
+    type: 'status',
+    id: 'status-1',
+    bringOpen: true,
+    renameOpen: false,
+    ignored: 'x'
+  })
+  assert.equal(status.ok, true)
+  assert.equal(status.event.status.bringOpen, true)
+  assert.equal(status.event.status.renameOpen, false)
+  assert.equal('ignored' in status.event.status, false)
+})
+
+test('manager：bringWindow 把背包快照写进管道，路径不在命令里', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4400 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4400, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+
+  const id = '88888888-8888-4888-8888-888888888888'
+  assert.equal(manager.bringWindow({
+    open: true,
+    items: [{ id, kind: 'text', text: '一条字条', state: 'idle' }]
+  }), true)
+  const command = children[0].parsedLines().at(-1)
+  assert.equal(command.type, 'bring-window')
+  assert.equal(command.open, true)
+  assert.deepEqual(command.items, [{ id, kind: 'text', text: '一条字条', state: 'idle' }])
+  assert.equal(command.maxItems, shared.MAX_BACKPACK_ITEMS)
+
+  assert.equal(manager.bringWindow({ open: false, items: [] }), true)
+  assert.equal(children[0].parsedLines().at(-1).open, false)
+})
+
+// ---------------------------------------------------------------------------
+// ticket 25：文件礼物的跨进程字段（helpers 白名单 + helper argv）
+// ---------------------------------------------------------------------------
+
+test('场景 controls.gifts：文件卡带 name/size；thumb 只给 received 且只认 localpet://gifts', () => {
+  const deviceId = '55555555-5555-4555-8555-555555555555'
+  const dir = '20261103-153245-ab12cd12'
+  const thumb = 'localpet://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
+  const scene = shared.normalizeScene({
+    v: 3,
+    items: [],
+    controls: {
+      gifts: [
+        {
+          deviceId,
+          giftId: '66666666-6666-4666-8666-666666666666',
+          kind: 'file',
+          status: 'received',
+          title: '「阿蟹」捎来一个文件',
+          name: '照片.PNG',
+          size: 23194,
+          thumb
+        },
+        {
+          // pending 时的 thumb 一律画不出来。
+          deviceId,
+          giftId: '77777777-7777-4777-8777-777777777777',
+          kind: 'file',
+          status: 'pending',
+          title: 'x',
+          name: '照片.PNG',
+          size: 1,
+          thumb
+        },
+        {
+          // 只认宿主生成的 localpet://gifts 地址。
+          deviceId,
+          giftId: '88888888-8888-4888-8888-888888888888',
+          kind: 'file',
+          status: 'received',
+          title: 'x',
+          name: '照片.PNG',
+          size: 1,
+          thumb: 'http://evil/gifts/x.png'
+        },
+        {
+          // 缺 size 的文件卡画不出来。
+          deviceId,
+          giftId: '99999999-9999-4999-8999-999999999999',
+          kind: 'file',
+          status: 'received',
+          title: 'x',
+          name: '照片.PNG'
+        },
+        {
+          // 路径分隔符/前导点在名字里：这个字段本身就不合法。
+          deviceId,
+          giftId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+          kind: 'file',
+          status: 'received',
+          title: 'x',
+          name: '../照片.PNG',
+          size: 1
+        }
+      ]
+    }
+  })
+  const byId = (id) => scene.controls.gifts.find((gift) => gift.giftId === id)
+  // 合法的文件卡原样保留。
+  assert.deepEqual(byId('66666666-6666-4666-8666-666666666666'), {
+    deviceId,
+    giftId: '66666666-6666-4666-8666-666666666666',
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '照片.PNG',
+    size: 23194,
+    thumb
+  })
+  // pending 时不画缩略图，但卡片本身还在。
+  assert.equal('thumb' in byId('77777777-7777-4777-8777-777777777777'), false)
+  // 坏 thumb 只丢 thumb，不丢整张卡。
+  assert.equal('thumb' in byId('88888888-8888-4888-8888-888888888888'), false)
+  // 名字会被清洗（去路径分隔符/前导点）。
+  assert.equal(byId('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa').name, '照片.PNG')
+  // 缺 size 的卡片画不出来，整张丢掉。
+  assert.equal(byId('99999999-9999-4999-8999-999999999999'), undefined)
+  assert.equal(scene.controls.gifts.length, 4)
+})
+
+test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后', () => {
+  assert.deepEqual(
+    buildHelperArgs({ helperPath: '/h', cacheRoot: '/tmp/skin-cache', giftsRoot: '/tmp/data/gifts' }),
+    ['/h', '--local-pet-cache', '/tmp/skin-cache', '--local-pet-gifts', '/tmp/data/gifts']
+  )
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: 'relative/gifts' }), ['/h'])
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: '' }), ['/h'])
+})

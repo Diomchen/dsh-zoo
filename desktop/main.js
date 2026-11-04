@@ -47,8 +47,10 @@ if (electronApi === null || typeof electronApi !== 'object' || typeof electronAp
   process.exit(3)
 }
 
-const { app, BrowserWindow, ipcMain, protocol, screen, shell } = electronApi
+const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol, screen, shell } = electronApi
 const shared = require('./shared.js')
+// `localpet://gifts/...` 的路径白名单（ticket 25）：纯函数，单独一份、可单测。
+const giftPath = require('./gift-path.js')
 
 const APP_NAME = 'dsh-local-pet-desktop'
 const HOST_STALE_MS = 30000
@@ -58,6 +60,8 @@ const SHOT_MEDIA_WAIT_MS = 3000
 const ASSET_SCHEME = 'localpet'
 const ASSET_HOST = 'asset'
 const CACHE_HOST = 'cache'
+/** 礼物缩略图主机：与 asset/cache 同一套注册好的 localpet:// scheme，只多一个 host。 */
+const GIFT_HOST = 'gifts'
 const MAX_ASSET_BYTES = 8 * 1024 * 1024
 const MAX_ASSET_NAME = 200
 
@@ -85,6 +89,13 @@ const assetRoots = (Array.isArray(options.assets) ? options.assets : [])
 /** 远端素材缓存目录：只允许绝对路径，helper 只读它，不联网。 */
 const cacheRoot = typeof options.cache === 'string' && options.cache !== '' && path.isAbsolute(options.cache)
   ? options.cache
+  : null
+/**
+ * 礼物根目录（ticket 25）：宿主把 `<dataDir>/gifts` 当 argv 传进来；helper 只读它，
+ * 只为 `localpet://gifts/<目录>/<图片>` 服务。没传 = 不注册这条读路径（所有 gifts URL 404）。
+ */
+const giftsRoot = typeof options.gifts === 'string' && options.gifts !== '' && path.isAbsolute(options.gifts)
+  ? options.gifts
   : null
 if (isShotMode && !path.isAbsolute(options.shot)) {
   process.stderr.write('[local-pet helper] --local-pet-shot 需要绝对路径：' + options.shot + '\n')
@@ -115,6 +126,22 @@ let renamePendingId = null
 let renameTimer = null
 /** 改名申请的流水号，只用于给 action id 起个不重复的名字。 */
 let renameSeq = 0
+/**
+ * 「带派」小窗（ticket 24）。和改名窗一样是独立、可聚焦、失焦即关的小窗；
+ * 它只负责输入与展示，背包内容与增删都在宿主。
+ */
+let giftWin = null
+/** 宿主交下来的背包快照（items/限额），窗口打开或刷新时原样转发给它。 */
+let giftState = { items: [], count: 0, maxItems: 2, maxTextLength: 500, maxFileBytes: 0 }
+/** 用户在主进程的文件选择器里刚选中的文件；只有这个路径能被提交，渲染端不能自己编。 */
+let giftPicked = null
+/** 系统文件对话框开着时窗口会失焦：这期间绝不按 blur 关窗。 */
+let giftPicking = false
+/** 正在等宿主答复的那次 bring/unbring（action id）与它的计时器。 */
+let giftPending = null
+let giftTimer = null
+/** 「带派」申请的流水号，只用于给 action id 起个不重复的名字。 */
+let giftSeq = 0
 /** 主显示器工作区（DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
 let workArea = null
 let scene = shared.emptyScene()
@@ -355,7 +382,10 @@ async function handleAssetRequest (request) {
     } catch {
       return textResponse(400, 'bad asset url')
     }
-    if (url.protocol !== ASSET_SCHEME + ':' || (url.hostname !== ASSET_HOST && url.hostname !== CACHE_HOST)) {
+    if (url.protocol !== ASSET_SCHEME + ':') return textResponse(404, 'unknown asset')
+    // 礼物缩略图（ticket 25）：host=gifts，路径恰好两段；守卫与夹取都在 gift-path.js 里。
+    if (url.hostname === GIFT_HOST) return handleGiftRequest(url)
+    if (url.hostname !== ASSET_HOST && url.hostname !== CACHE_HOST) {
       return textResponse(404, 'unknown asset')
     }
     let name
@@ -403,6 +433,49 @@ async function handleAssetRequest (request) {
 
 function textResponse (status, body) {
   return new Response(body, { status, headers: { 'content-type': 'text/plain; charset=utf-8' } })
+}
+
+/**
+ * `localpet://gifts/<礼物目录>/<图片>`（ticket 25）。
+ * 只认两层、只认四种图片扩展名、只认 gifts 根目录下的文件；读不到一律 404（不区分原因）。
+ * 这条路径只给缩略图用：卡片上的「打开」走宿主通过 gift-open 命令送来的绝对路径，不经过 URL。
+ */
+async function handleGiftRequest (url) {
+  try {
+    if (giftsRoot === null) return textResponse(404, 'gift not found')
+    const parts = url.pathname.replace(/^\/+/, '').split('/')
+    if (parts.length !== 2) return textResponse(404, 'gift not found')
+    let dirName
+    let fileName
+    try {
+      dirName = decodeURIComponent(parts[0])
+      fileName = decodeURIComponent(parts[1])
+    } catch {
+      return textResponse(400, 'bad gift name')
+    }
+    const file = giftPath.resolveGiftFile(giftsRoot, dirName, fileName)
+    if (file === null) return textResponse(404, 'gift not found')
+    let info
+    try {
+      info = await fsp.stat(file)
+    } catch {
+      return textResponse(404, 'gift not found')
+    }
+    if (!info.isFile() || info.size <= 0 || info.size > giftPath.MAX_GIFT_IMAGE_BYTES) {
+      return textResponse(404, 'gift not found')
+    }
+    const data = await fsp.readFile(file)
+    return new Response(new Uint8Array(data), {
+      headers: {
+        'content-type': giftPath.contentTypeOf(fileName) ?? 'application/octet-stream',
+        'content-length': String(data.length),
+        // 缩略图跟着这次收到的礼物走：礼物被扔掉/换掉时不要拿缓存里的旧图。
+        'cache-control': 'no-store'
+      }
+    })
+  } catch {
+    return textResponse(404, 'gift not found')
+  }
 }
 
 function isSafeAssetName (name) {
@@ -747,6 +820,13 @@ ipcMain.on('local-pet:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '这个操作缺少对象，稍后再试。', error: 'bad-device-id' })
     return
   }
+  // 礼物动作只认 UUID 形状的 giftId：路径永远不出渲染端，宿主拿它自己查目录。
+  const needsGift = shared.GIFT_ACTIONS.includes(action)
+  const giftId = needsGift ? shared.normalizeGiftId(payload?.giftId) : null
+  if (needsGift && giftId === null) {
+    sendActionResult({ id, ok: false, notice: '这张礼物卡已经不在了。', error: 'bad-gift' })
+    return
+  }
   // 点播要带动画名：只收安全的动画名，名字由宿主再去 dsh-pet 那边校验一次。
   const name = action === 'play-anim' ? shared.normalizeAnim(payload?.name) : null
   if (action === 'play-anim' && name === null) {
@@ -754,7 +834,14 @@ ipcMain.on('local-pet:action', (event, payload) => {
     return
   }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
-  const written = writeEvent({ type: 'action', id, action, deviceId, ...(name === null ? {} : { name }) })
+  const written = writeEvent({
+    type: 'action',
+    id,
+    action,
+    deviceId,
+    ...(name === null ? {} : { name }),
+    ...(giftId === null ? {} : { giftId })
+  })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
 
@@ -829,6 +916,58 @@ ipcMain.on('local-pet:rename-submit', (event, payload) => {
   }
 })
 
+// ---------------------------------------------------------------------------
+// 「带派」小窗的 IPC：只认这扇窗自己的 webContents
+// ---------------------------------------------------------------------------
+
+ipcMain.on('local-pet:gift-ready', (event) => {
+  if (!isGiftSender(event)) return
+  sendGiftInit()
+})
+
+ipcMain.on('local-pet:gift-cancel', (event) => {
+  if (!isGiftSender(event)) return
+  closeGiftWindow('cancel')
+})
+
+ipcMain.on('local-pet:gift-submit', (event, payload) => {
+  if (!isGiftSender(event)) return
+  if (giftPending !== null) return
+  // 选文件不是一次提交：主进程开系统文件选择器，选完把名字/大小推回窗里。
+  // 这样 bridge 只需要 submit 一个入口，不必再给渲染端任何 Node 能力。
+  if (payload !== null && typeof payload === 'object' && payload.pick === true) {
+    void pickGiftFile()
+    return
+  }
+  const gift = shared.normalizeBringGift(payload)
+  if (gift === null) {
+    sendGiftResult({ ok: false, code: 'bad-gift' })
+    return
+  }
+  // 文件必须是刚才在主进程里选中的那一个：渲染端不能自己编路径。
+  if (gift.kind === 'file' && (giftPicked === null || giftPicked.path !== gift.path)) {
+    sendGiftResult({ ok: false, code: 'bad-gift' })
+    return
+  }
+  startGiftPending('bring', { action: 'bring', gift })
+})
+
+ipcMain.on('local-pet:gift-remove', (event, payload) => {
+  if (!isGiftSender(event)) return
+  if (giftPending !== null) return
+  const giftId = shared.normalizeGiftId(payload?.giftId)
+  if (giftId === null) {
+    sendGiftResult({ ok: false, code: 'bad-gift' })
+    return
+  }
+  startGiftPending('unbring', { action: 'unbring', giftId })
+})
+
+/** 四条「带派」IPC 共用的一行守卫：只认小窗自己的 webContents。 */
+function isGiftSender (event) {
+  return giftWin !== null && !giftWin.isDestroyed() && event.sender === giftWin.webContents
+}
+
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
@@ -861,6 +1000,13 @@ function sendActionResult (result) {
 const RENAME_WIDTH = 360
 const RENAME_HEIGHT = 168
 const RENAME_TIMEOUT_MS = 10000
+/**
+ * 「带派」小窗（ticket 24）：比改名窗高，要放下字条、选文件按钮和背包列表。
+ * 同样是一扇可聚焦的小窗——主窗永远 focusable:false（ADR-0005）。
+ */
+const GIFT_WIDTH = 380
+const GIFT_HEIGHT = 480
+const GIFT_TIMEOUT_MS = 10000
 
 /** 自己那只宠物最近的命中矩形（窗口局部 DIP）；`normalizeRects` 输出的是扁平矩形。 */
 function selfPetRect () {
@@ -1004,6 +1150,201 @@ function sendRenameResult (result) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 「带派」小窗（ticket 24）
+//
+// 和改名窗同一套安全模型：独立 preload、只收键盘、只把「申请」交给主进程；
+// 背包内容由宿主算好下发（窗口不读盘、不拼路径），文件选择只能走主进程的
+// `dialog.showOpenDialog`——渲染端拿不到任意文件路径的入口。
+// ---------------------------------------------------------------------------
+
+/** 贴着宠物开窗；没有命中矩形（宠物刚出门/还没画出来）就落在工作区中央。 */
+function giftBounds () {
+  const area = workArea ?? screen.getPrimaryDisplay().workArea
+  const pet = selfPetRect()
+  if (pet === null) {
+    return {
+      x: Math.round(area.x + (area.width - GIFT_WIDTH) / 2),
+      y: Math.round(area.y + (area.height - GIFT_HEIGHT) / 2)
+    }
+  }
+  const petX = area.x + pet.x
+  const petY = area.y + pet.y
+  const x = Math.round(Math.min(
+    Math.max(area.x + 8, petX + pet.width / 2 - GIFT_WIDTH / 2),
+    area.x + area.width - GIFT_WIDTH - 8
+  ))
+  const above = petY - GIFT_HEIGHT - 12
+  const below = petY + pet.height + 12
+  const y = Math.round(above >= area.y + 8
+    ? above
+    : Math.min(Math.max(area.y + 8, below), area.y + area.height - GIFT_HEIGHT - 8))
+  return { x, y }
+}
+
+function openGiftWindow () {
+  if (giftWin !== null && !giftWin.isDestroyed()) {
+    giftWin.focus()
+    // 已经开着：把最新背包推一遍（可能刚在别处放进/撤掉了一件）。
+    sendGiftInit()
+    return true
+  }
+  if (win === null || win.isDestroyed()) return false
+  const created = new BrowserWindow({
+    ...giftBounds(),
+    width: GIFT_WIDTH,
+    height: GIFT_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: true,
+    focusable: true,
+    acceptFirstMouse: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'gift-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      devTools: debugEnabled,
+      spellcheck: false
+    }
+  })
+  giftWin = created
+  giftPicked = null
+  giftPicking = false
+  giftPending = null
+  clearGiftTimer()
+  try {
+    created.setAlwaysOnTop(true, process.platform === 'darwin' ? 'floating' : 'screen-saver')
+  } catch {
+    // 置顶已由构造参数保证
+  }
+  created.webContents.on('context-menu', (event) => event.preventDefault())
+  // 和改名窗同一条原因：小窗刚建出来时的一次 blur 不该把它直接关掉。
+  let hadFocus = false
+  created.on('focus', () => { hadFocus = true })
+  created.on('blur', () => {
+    // 选文件时系统对话框会让窗口短暂失焦：那不是“用户点了别处”。
+    if (hadFocus && !giftPicking) closeGiftWindow('blur')
+  })
+  created.on('closed', () => {
+    if (giftWin === created) giftWin = null
+    clearGiftTimer()
+  })
+  created.once('ready-to-show', () => {
+    if (giftWin !== created || created.isDestroyed()) return
+    created.show()
+    created.focus()
+  })
+  created.loadFile(path.join(__dirname, 'gift.html')).catch(() => closeGiftWindow('load-failed'))
+  return true
+}
+
+function closeGiftWindow (reason) {
+  if (reason !== 'submit') giftPending = null
+  clearGiftTimer()
+  const target = giftWin
+  giftWin = null
+  giftPicked = null
+  if (target === null || target.isDestroyed()) return
+  try {
+    target.destroy()
+  } catch {
+    // 已经没了
+  }
+}
+
+function clearGiftTimer () {
+  if (giftTimer === null) return
+  clearTimeout(giftTimer)
+  giftTimer = null
+}
+
+function sendGiftInit () {
+  if (giftWin === null || giftWin.isDestroyed()) return
+  try {
+    giftWin.webContents.send('local-pet:gift-init', {
+      ...giftState,
+      picked: giftPicked
+    })
+  } catch {
+    // 页面还没挂上：ready 会再来一次
+  }
+}
+
+function sendGiftResult (result) {
+  if (giftWin === null || giftWin.isDestroyed()) return
+  try {
+    giftWin.webContents.send('local-pet:gift-result', result)
+  } catch {
+    // 窗口刚被关掉：结果没人接就算了
+  }
+}
+
+/**
+ * 把一次 bring/unbring 交给宿主，并等 action-result。
+ * 和改名共用同一条 action-result 通道：id 对得上才收，成功关窗、失败留在窗里说人话。
+ */
+function startGiftPending (action, event) {
+  giftSeq += 1
+  const id = 'gift-' + String(giftSeq) + '-' + Date.now().toString(36)
+  giftPending = { id, action }
+  clearGiftTimer()
+  giftTimer = setTimeout(() => {
+    if (giftPending === null || giftPending.id !== id) return
+    giftPending = null
+    sendGiftResult({ ok: false, code: 'timeout' })
+  }, GIFT_TIMEOUT_MS)
+  giftTimer.unref?.()
+  const written = writeEvent({ ...event, type: 'action', id })
+  if (!written) {
+    clearGiftTimer()
+    giftPending = null
+    sendGiftResult({ ok: false, code: 'host-unavailable' })
+  }
+}
+
+/**
+ * 文件选择只能从这里发生：主进程拿到绝对路径，渲染端只看到名字与大小。
+ * 提交时还会再核对一次「就是这个路径」，防止渲染端自己编一个。
+ */
+async function pickGiftFile () {
+  if (giftWin === null || giftWin.isDestroyed()) return
+  let result
+  giftPicking = true
+  try {
+    result = await dialog.showOpenDialog(giftWin, { properties: ['openFile'] })
+  } catch {
+    giftPicking = false
+    sendGiftResult({ ok: false, code: 'pick-failed' })
+    return
+  } finally {
+    giftPicking = false
+  }
+  if (giftWin === null || giftWin.isDestroyed()) return
+  giftWin.focus()
+  if (result === null || typeof result !== 'object' || result.canceled === true) return
+  const filePath = Array.isArray(result.filePaths) ? result.filePaths[0] : null
+  if (typeof filePath !== 'string' || filePath === '') return
+  let info
+  try {
+    info = await fsp.stat(filePath)
+  } catch {
+    sendGiftResult({ ok: false, code: 'no-such-file' })
+    return
+  }
+  giftPicked = { path: filePath, name: path.basename(filePath), size: info.size }
+  sendGiftInit()
+}
+
 function pruneRendererRects () {
   if (rendererRects.length === 0) return
   const ids = new Set(scene.items.map((item) => item.id))
@@ -1116,6 +1457,23 @@ function applyCommand (command) {
         }
         return
       }
+      // 「带派」小窗（ticket 24）：bring 成功就关窗；unbring 成功留在窗里刷新列表，
+      // 失败一律把宿主的 notice（或错误码）交回窗口。
+      if (giftPending !== null && command.id === giftPending.id) {
+        const pending = giftPending
+        giftPending = null
+        clearGiftTimer()
+        if (pending.action === 'bring' && command.ok === true) {
+          closeGiftWindow('submit')
+        } else {
+          sendGiftResult({
+            ok: command.ok === true,
+            notice: command.notice,
+            code: command.error
+          })
+        }
+        return
+      }
       sendActionResult({
         id: command.id,
         ok: command.ok === true,
@@ -1131,8 +1489,27 @@ function applyCommand (command) {
     case 'hide':
       forceIgnore('hide')
       closeRenameWindow('hide')
+      closeGiftWindow('hide')
       if (win !== null && !win.isDestroyed()) win.hide()
       return
+    case 'bring-window': {
+      // 宿主交下来的背包快照（ticket 24）：不落盘、不拼路径，只转发给窗口。
+      giftState = {
+        items: command.items,
+        count: command.count,
+        maxItems: command.maxItems,
+        maxTextLength: command.maxTextLength,
+        maxFileBytes: command.maxFileBytes
+      }
+      if (command.open === true) {
+        if (!openGiftWindow()) {
+          writeEvent({ type: 'error', id: command.id, code: 'bring-window-failed', message: 'cannot open bring window' })
+        }
+      } else if (giftWin !== null && !giftWin.isDestroyed()) {
+        sendGiftInit()
+      }
+      return
+    }
     case 'quit':
       shutdown(0)
       return
@@ -1155,7 +1532,61 @@ function applyCommand (command) {
       })
       return
     }
+    case 'gift-open': {
+      // 打开便条：交给系统默认程序。shell.openPath 返回空串才是成功，非空是错误文案。
+      const target = typeof command.path === 'string' ? command.path : ''
+      void shell.openPath(target).then((failure) => {
+        if (typeof failure === 'string' && failure !== '') {
+          writeEvent({ type: 'error', id: command.id, code: 'open-failed', message: failure.slice(0, 200) })
+        }
+      }).catch((error) => {
+        writeEvent({ type: 'error', id: command.id, code: 'open-failed', message: String(error?.message ?? error).slice(0, 200) })
+      })
+      return
+    }
+    case 'gift-reveal': {
+      // 在 Finder/资源管理器里显示：只定位，不执行、不打开。
+      try {
+        shell.showItemInFolder(typeof command.path === 'string' ? command.path : '')
+      } catch (error) {
+        writeEvent({ type: 'error', id: command.id, code: 'reveal-failed', message: String(error?.message ?? error).slice(0, 200) })
+      }
+      return
+    }
+    case 'gift-copy': {
+      // 剪贴板只有主进程有（渲染端是 file:// 普通页面），所以复制也走宿主 → helper 这一路。
+      if (typeof command.text === 'string' && command.text !== '') {
+        try {
+          clipboard.writeText(command.text)
+        } catch (error) {
+          writeEvent({ type: 'error', id: command.id, code: 'copy-failed', message: String(error?.message ?? error).slice(0, 200) })
+        }
+      }
+      return
+    }
+    case 'gift-discard': {
+      // 「扔掉」= 立即删掉**这一件**礼物的目录。路径由宿主解析；这里再确认一次
+      // 目标就是某 gifts 目录下的一级子目录——一个坏路径不该变成“删任意目录”。
+      const target = typeof command.path === 'string' ? command.path : ''
+      if (!isGiftDirPath(target)) {
+        writeEvent({ type: 'error', id: command.id, code: 'bad-path', message: 'not a gift directory' })
+        return
+      }
+      void fsp.rm(target, { recursive: true, force: true }).catch((error) => {
+        writeEvent({ type: 'error', id: command.id, code: 'discard-failed', message: String(error?.message ?? error).slice(0, 200) })
+      })
+      return
+    }
     case 'shot':
+      // 冒烟可以点名抓「带派」小窗；主窗没就绪不影响那扇窗的截图。
+      if (command.window === 'bring') {
+        if (giftWin === null || giftWin.isDestroyed()) {
+          writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'bring window not open' })
+          return
+        }
+        void captureTo(command.path, command.id, 'bring')
+        return
+      }
       if (!rendererReady) {
         writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'renderer not ready' })
         return
@@ -1195,6 +1626,42 @@ function applyCommand (command) {
       dispatchInRenderer(command.phase, command.point)
       applyDecision('debug-dispatch-' + command.phase)
       return
+    case 'debug-gift-submit': {
+      // 冒烟用：在「带派」小窗里填一段字条并按提交。走的是和用户一模一样的
+      // form submit 处理器，验证「窗口 → 主进程 → 宿主」那条申请链路。
+      if (!debugEnabled) return
+      if (giftWin === null || giftWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'bring window not open' })
+        return
+      }
+      const text = typeof command.text === 'string' ? command.text : ''
+      const script = '(() => {' +
+        'const el = document.getElementById("text");' +
+        'if (!el) return false;' +
+        'el.value = ' + JSON.stringify(text) + ';' +
+        'el.dispatchEvent(new Event("input"));' +
+        'document.getElementById("form").requestSubmit();' +
+        'return true;' +
+        '})()'
+      void giftWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-gift-remove': {
+      // 冒烟用：在「带派」小窗里点第一个可撤的「撤掉」，验窗口 → 主进程 → 宿主的 unbring。
+      if (!debugEnabled) return
+      if (giftWin === null || giftWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'bring window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const button = Array.from(document.querySelectorAll(".items .btn.remove")).find((item) => !item.disabled);' +
+        'if (!button) return false;' +
+        'button.click();' +
+        'return true;' +
+        '})()'
+      void giftWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
     case 'debug-freeze-hover':
       if (!debugEnabled) return
       hover.frozen = command.frozen === true
@@ -1350,6 +1817,8 @@ function statusEvent (id) {
     focused: win !== null && !win.isDestroyed() && win.isFocused(),
     /** 改名小窗是否开着；主窗的 focusable 永远是 false，两者互不影响。 */
     renameOpen: renameWin !== null && !renameWin.isDestroyed(),
+    /** 「带派」小窗是否开着（ticket 24）；冒烟用它等窗口真的出来。 */
+    bringOpen: giftWin !== null && !giftWin.isDestroyed(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
     alwaysOnTop: winFlag((candidate) => candidate.isAlwaysOnTop()),
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
@@ -1396,6 +1865,19 @@ function writeEvent (event) {
   }
 }
 
+/**
+ * 只接受 `<任意>/gifts/<一个目录>` 这种目标：`gift-discard` 是破坏性操作，
+ * 主进程不能因为宿主给错一个路径就把别的东西删了（宿主那一侧也会再校验）。
+ */
+function isGiftDirPath (value) {
+  if (typeof value !== 'string' || value === '') return false
+  if (!path.isAbsolute(value)) return false
+  const resolved = path.resolve(value)
+  if (resolved === path.parse(resolved).root) return false
+  if (path.basename(path.dirname(resolved)) !== 'gifts') return false
+  return path.basename(resolved) !== '' && path.basename(resolved) !== '.' && path.basename(resolved) !== '..'
+}
+
 function reportError (code, error) {
   const message = error instanceof Error ? error.message : String(error)
   writeEvent({ type: 'error', code, message: message.slice(0, shared.MAX_ERROR_LENGTH) })
@@ -1406,8 +1888,9 @@ function reportError (code, error) {
 // 截图（唯一能看到窗口的办法：这台机器上截不了真实屏幕）
 // ---------------------------------------------------------------------------
 
-async function captureTo (filePath, id) {
-  const image = await capturePage()
+async function captureTo (filePath, id, target = 'main') {
+  // 冒烟可以点名抓「带派」小窗：主窗与它各自 capturePage，别把两扇窗的坐标混在一起。
+  const image = await capturePage(target === 'bring' ? giftWin : win)
   if (image === null) {
     writeEvent({ type: 'error', id, code: 'shot-failed', message: 'capturePage failed' })
     return null
@@ -1453,12 +1936,12 @@ async function shotSidecar (image) {
   }
 }
 
-async function capturePage () {
-  if (win === null || win.isDestroyed()) return null
+async function capturePage (target = win) {
+  if (target === null || target.isDestroyed()) return null
   let timer = null
   try {
     return await Promise.race([
-      win.webContents.capturePage(),
+      target.webContents.capturePage(),
       new Promise((resolve) => {
         timer = setTimeout(() => resolve(null), 5000)
         timer.unref?.()
@@ -1538,6 +2021,7 @@ function shutdown (code) {
   }
   stopTimers()
   closeRenameWindow('shutdown')
+  closeGiftWindow('shutdown')
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()
   } catch {
@@ -1590,7 +2074,8 @@ function parseArgs (argv) {
     hostPid: 0,
     debug: false,
     assets: [],
-    cache: null
+    cache: null,
+    gifts: null
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -1619,6 +2104,11 @@ function parseArgs (argv) {
       index += 1
     } else if (arg.startsWith('--local-pet-cache=')) {
       parsed.cache = arg.slice('--local-pet-cache='.length)
+    } else if (arg === '--local-pet-gifts') {
+      if (typeof argv[index + 1] === 'string') parsed.gifts = argv[index + 1]
+      index += 1
+    } else if (arg.startsWith('--local-pet-gifts=')) {
+      parsed.gifts = arg.slice('--local-pet-gifts='.length)
     } else if (arg === '--local-pet-debug') {
       parsed.debug = true
     }

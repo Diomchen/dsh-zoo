@@ -1,4 +1,4 @@
-# 桌面 helper（ticket 07–11）
+# 桌面 helper（ticket 07–27）
 
 宿主是 `ELECTRON_RUN_AS_NODE=1` 的纯 Node，拿不到 `BrowserWindow`。这个目录是另起的
 Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与宿主只通过 stdin/stdout 的 JSON 行
@@ -9,7 +9,7 @@ Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与�
   `setBusy` / `requestAction` / `onActionResult` / `onScene`
 - `index.html` + `renderer.js` — 透明画布；每只宠物一个 DOM 节点，60fps 本地物理；
   悬停/点击控件（串门/召回/送客/放行卡/提示气泡）也在这里
-- `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v2（含 `controls`）、物理、
+- `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v3（含 `controls` / `menu`）、物理、
   命中判定、穿透裁定
 
 ## 怎么跑
@@ -47,6 +47,10 @@ debug 模式 = `--local-pet-debug` **或** 环境变量 `LOCAL_PET_DESKTOP_DEBUG
 （`$DSH_HOME/dsh-pet/main-animation/webm` → 包内 `assets/webm` → `profiles/*/node_modules/...`），
 **不写死 profile 名**。没有素材时宠物退成内置 SVG 色块，串门不受影响。
 
+`--local-pet-gifts <dir>`（ticket 25）是收到的礼物根目录（宿主传 `<dataDir>/gifts`），
+只用于 `localpet://gifts/...` 的**缩略图**读取；不传时这条读路径不注册（所有 gifts URL 404）。
+它和 `--local-pet-assets` 一样是绝对路径，helper 不自己拼数据目录。
+
 真机冒烟（不进 `npm test`；没有 Electron 时应该跳过）：
 
 ```bash
@@ -75,7 +79,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `update` | `scene` | 替换整个场景 v3（含 `controls` / `menu`）；按新场景 + 渲染端矩形重新复核光标 |
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
 | `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行 |
-| `shot` | `id?`, `path`（绝对路径） | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件 |
+| `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
+| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` 抓的是「带派」小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
 | `quit` | — | 优雅退出 |
@@ -93,13 +98,15 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-freeze-busy` | `frozen` | 模拟渲染端卡死：不再接受 busy 续期，已有租约按时间戳自然过期 |
 | `debug-busy-max` | `ms`（0 = 恢复默认） | 调试/冒烟：临时缩短连续租约硬上限（200ms..60s），用来几秒内验证 fail-closed |
 | `debug-lock-input` | `locked` | 调试/冒烟：锁住真实鼠标/焦点事件，只接受 `debug-dispatch` 的合成输入（同时清掉悬停与租约） |
+| `debug-gift-submit` | `text` | 调试/冒烟：在「带派」小窗里填一段字条并按提交（走真实 form submit 处理器），验窗口 → 主进程 → 宿主的申请链路 |
+| `debug-gift-remove` | — | 调试/冒烟：点「带派」小窗背包列表里第一个可撤的「撤掉」 |
 
 ## 右键菜单（ticket 22）
 
 菜单内容由宿主随场景下发（`scene.menu`），helper 只画：
 
 - 只挂**自己**（`role: 'self'`）；访客和空白桌面都不弹，也不吞鼠标。
-- 一级 = 工具项（`open-site` / `home` / `reload`）+「动作」；二级 = 分类；三级 = 动画名。
+- 一级 = 工具项（`open-site` / `bring` / `home` / `reload`）+「动作」；二级 = 分类；三级 = 动画名。
 - 每级是**平级面板**：贴右/贴下自动翻到另一侧，各自独立滚动；面板矩形进 `overlay-rects`，
   一级面板与宠物之间有桥接矩形。
 - 菜单打开时宠物停住（不飞、不漫游、不轮播换段）。
@@ -116,12 +123,12 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
-| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?` | 渲染端控件/菜单申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名），helper 只截长度/校验形状，清洗交给宿主 |
+| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），helper 只校验形状，清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
 | `pong` | `id?` | 对 `ping` |
-| `status` | `id?`, `status` | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` 等 |
+| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` 等 |
 
 `ready` 里的 `workArea` 是**主屏**工作区（DIP）。窗口 bounds 永远等于它；场景坐标是窗口局部
 CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿主/测试，换算成了屏幕坐标。
@@ -130,7 +137,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 `waiting-for-confirmation` / `stale-renderer-confirmation` / `no-scene` / `scene-updated` /
 `renderer-busy` / `renderer-idle` / `renderer-rects` / `hide` / `blur` / `display-changed` 等。
 
-## 场景协议 v2（`update.scene`）
+## 场景协议 v3（`update.scene`）
 
 ```json
 {
@@ -160,9 +167,13 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
     "visit": { "enabled": true, "reason": null },
     "recall": { "enabled": false, "nickname": null },
     "visitors": [{ "deviceId": "6f1c…", "label": "阿蟹" }],
+    "gifts": [{ "deviceId": "6f1c…", "giftId": "…", "kind": "file", "name": "照片.png",
+                "title": "「阿蟹」捎来一个文件", "status": "received",
+                "thumb": "localpet://gifts/20261103-153245-ab12cd/照片.png" }],
     "prompt": { "deviceId": "9a2b…", "nickname": "泡泡" },
     "notice": { "text": "「阿蟹」没有回应，宠物先留在家里了。", "at": 1762000000000 }
-  }
+  },
+  "menu": { "tools": [], "groups": [] }
 }
 ```
 
@@ -172,9 +183,14 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - `recall`：自己出门时桌面没有 `self`，渲染端用一个常驻「召回」胶囊代替；
   `nickname` 用来显示“在「阿蟹」家”。
 - `visitors`：当前可送客的访客；`item.id` 是 `visitor:<deviceId>`，两边按 deviceId 对上。
+- `gifts`：贴着访客的礼物卡（ticket 23/25）。状态与标题由宿主算好；`text` 只在
+  `received` 时给，`thumb` 只给图片且只接受 `localpet://gifts/...`。卡片/按钮/桥接矩形
+  都进 `overlay-rects`，按钮 id 带 `giftId`，两张卡不会撞名。
 - `prompt`：放行 FIFO 队首；渲染端在宠物旁边画 接受 / 拒绝 / 稍后再说，绝不遮挡宠物本体。
 - `notice`：最近一条人话提示。异步失败（超时、对方失联、被送客）不经过 `action-result`，
   渲染端靠 `notice.at` 变化冒泡；超过 30s 的旧 notice 不会在 helper 重启后重新弹出。
+- `menu`（ticket 22）：右键自己的宠物时画的一级工具项 + 「动作」三级树；内容由宿主下发，
+  渲染端只画、只发申请。
 
 位置仍是渲染端拥有；`controls` 只描述“能点什么、为什么不能点”，点击只发 `action` 申请。
 
@@ -184,7 +200,8 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   （`src/desktop.js` 的 `manager.resync(scene)`）。
 - **尺寸**：`width`/`height` 是整只宠物的命中矩形；渲染端用同一个矩形做物理边界和上报。
 - **谁在画**：宿主目前只下发 `self` / `visitor`（心跳影子不下发，它不是访客）；
-  场景协议仍接受 `guest` 给截图/演示用。`kind` 留了 `card` 给 ticket 11。
+  场景协议仍接受 `guest` 给截图/演示用。`kind` 留了 `card` 给 ticket 11，但礼物卡走的是
+  `controls.gifts`，**不**塞进 `items`。
 - **动作降级**：`anim` 是 dsh-pet 动画名；渲染端先试它，404/解码失败退到内置待机片段轮播，
   全失败才画带昵称的 SVG 色块。
 - `items` 上限 256；重复 `id`、未知 `kind`、非正尺寸、非 `#rrggbb` 颜色都会被丢弃/回落。
@@ -229,13 +246,21 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 ## 素材协议 `localpet://`
 
 页面是 `file://`，拿不到 DSH 的 `/dsh-pet-7340/thumb/...`。主进程在 app ready 前把
-`localpet` 注册成 standard/secure/stream scheme，再从宿主传入的绝对目录里只读地取
-`localpet://asset/<encodeURIComponent(动画名)>.webm`：
+`localpet` 注册成 standard/secure/stream scheme，再从宿主传入的绝对目录里只读地取：
 
-- 只接受 `<name>.webm`，拒绝 `/`、`\`、控制字符、以 `.` 开头的名字；解析后必须仍在素材根内。
+- `localpet://asset/<encodeURIComponent(动画名)>.webm` —— 宠物素材（ticket 07–17）；
+- `localpet://gifts/<礼物目录>/<图片文件名>` —— 礼物缩略图（ticket 25）。只认**两层**路径：
+  第一层必须是礼物目录名（`^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$`），文件名只认
+  `jpg/jpeg/png/gif/webp`，解析后必须仍在 `--local-pet-gifts` 根内；不列目录、不返回
+  非图片文件。`desktop/index.html` 的 CSP 为此在 `img-src` 里加了 `localpet:`。
+
+素材（WebM）一侧的规则：
+
+- 素材只接受 `<name>.webm`，拒绝 `/`、`\`、控制字符、以 `.` 开头的名字；解析后必须仍在素材根内。
 - 单文件上限 8 MiB；支持 `Range`（206）让 `<video>` 边下边播/循环。
 - 根目录按优先级查找（用户素材覆盖包内素材），找不到就 404 → 渲染端降级。
-- 页面 CSP 只放行 `media-src localpet:`，没有网络、没有新端口。
+- 礼物缩略图只读不做 Range：图片是完整返回的，且只用于 `<img>`。
+- 页面 CSP 放行 `media-src localpet:` 与 `img-src localpet:`，没有网络、没有新端口。
 
 ## 进程存亡
 
@@ -267,6 +292,24 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - 主窗的穿透/租约状态**完全不受影响**：小窗是另一个 BrowserWindow，关掉它不会改动任何
   `ignoreState` / `busy`。
 
+## 带派小窗（ticket 24）
+
+背包是宿主的东西（`<dataDir>/backpack.json`），helper 只负责画与收输入；访客捎来的
+礼物卡由场景 `controls.gifts` 下发（宿主管状态与文案），缩略图走
+`localpet://gifts/<礼物目录>/<图片>`，与素材读路径同一套夹取规则。
+
+- 右键自己那只 → 一级工具项「带派」→ 渲染端只发一个**空** `{action:'bring'}`；
+  宿主开窗，并用 `bring-window` 把背包内容（id/kind/文案/state，**没有路径**）交给 helper。
+- 小窗（`gift.html`，380×480，无边框、置顶、`focusable: true`）显示字条框（≤500，实时字数）、
+  选文件按钮与背包列表；`out` 中的条目不可撤。
+- 文件选择只由主进程 `dialog.showOpenDialog` 完成；渲染端只看到名字/大小，提交时主进程
+  还会核对「就是刚才选中的那个绝对路径」。
+- 小窗桥只有 `ready / submit / cancel / remove / onInit / onResult` 六个原语，没有 Node 能力。
+- 提交走 `{type:'action', action:'bring', gift}` 或 `{action:'unbring', giftId}`；宿主的
+  `action-result` 按 action id 认领：`bring` 成功关窗，失败留在窗里显示 `notice`；
+  `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
+- 只有这扇窗自己的 `webContents` 能发 `local-pet:gift-*`（`isGiftSender`），与改名窗同一个模型。
+
 ## 多显示器 / 分辨率
 
 窗口只覆盖主屏工作区；其它屏不显示。插入/拔出/改分辨率会重发 `ready`，宿主重算窗口 bounds。
@@ -276,7 +319,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 ## 已知限制
 
 - `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/改名/放行卡）都是鼠标点击，没有
-  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是**改名小窗**（见下）。
+  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是**改名小窗**与**带派小窗**（见下）。
 - 悬停弹层依赖渲染端收到 `pointermove`；macOS 上 `forward: true` 失效时，主进程仍能靠 300ms
   兜底让弹层打开后的按钮可点，但“悬停即出现”本身可能延迟到兜底接管。
 - 控件位置每 100ms 跟一次宠物；宠物被快速拖动时弹层会有一点跟手延迟（不影响点击）。

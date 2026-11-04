@@ -85,7 +85,7 @@
   const MAX_MENU_TOOLS = 8
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  const MENU_TOOL_IDS = ['open-site', 'home', 'reload']
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'home', 'reload']
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -131,9 +131,27 @@
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
    * （装了 dsh-pet 就写它的配置，见 ADR-0007）。
    */
-  const CONTROL_ACTIONS = ['visit', 'recall', 'end-visit', 'admit', 'reject', 'dismiss', 'rename']
-  /** 菜单项的动作（ticket 22）：点播 / 重载配置 / 打开软件。同样只是一次「申请」。 */
-  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site']
+  const CONTROL_ACTIONS = [
+    'visit',
+    'recall',
+    'end-visit',
+    'admit',
+    'reject',
+    'dismiss',
+    'rename',
+    // ticket 23：礼物卡上的四个动作。渲染端只发 giftId，路径与磁盘操作全在宿主。
+    'gift-open',
+    'gift-reveal',
+    'gift-copy',
+    'gift-discard',
+    // ticket 24：右键「带派」只发一个空动作，由宿主开小窗；unbring 才带 giftId。
+    'bring',
+    'unbring'
+  ]
+  /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
+  const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
+  /** 菜单项的动作（ticket 22 / 24）：点播 / 重载配置 / 打开软件 / 带派。同样只是一次「申请」。 */
+  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring']
   /** helper → 宿主能报的全部动作：控件 + 菜单。 */
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
@@ -143,6 +161,34 @@
    * 显示得比广播长，就等于又造出两个名字（ADR-0007）。
    */
   const MAX_NAME_LENGTH = 32
+  /**
+   * 礼物/背包上限为什么在 shared.js 里再抄一遍：
+   *
+   * `desktop/shared.js` 是**普通 script**——渲染端用 `<script>` 加载、主进程直接读，
+   * 不能 import `src/protocol.js` 那套 ESM；helper 又是另一个进程，必须自己守边界。
+   * 所以这几个数与宿主同源，但两侧的失败策略刻意不同，改的时候别只改一边：
+   *
+   *   - 字条超 500 码点：宿主 `sanitizeNote` 与背包 `normalizeBringInput` **丢弃**
+   *     （这次不带/不收）；渲染端 `normalizeNoteText` 只**截断**——已经收到的卡片
+   *     不能因为显示层超限而整张消失。
+   *   - 文件名超 120 码点：宿主 `sanitizeGiftName` **截断**（名字只给人看）；
+   *     渲染端 `normalizeGiftName` 返回 null、**丢掉整张卡**（文件卡没有名字就画不出来）。
+   *   - 文件 >16 MiB：宿主 `normalizeGift` **丢弃**这件礼物；渲染端同样丢卡
+   *     （卡片要显示大小，缺了就没有意义）。
+   *   - 背包 >2 件：宿主 `backpack.add` 拒绝并回 `backpack-full`；渲染端只画宿主下发的
+   *     前两件，多出来的不显示（列表本身有界，不做静默替换）。
+   */
+  const MAX_GIFT_TEXT_LENGTH = 500
+  /** 背包上限（件），与 `src/backpack.js` 的 `MAX_BACKPACK_ITEMS` 同一个数。 */
+  const MAX_BACKPACK_ITEMS = 2
+  /** 单件文件礼物上限，与 `src/protocol.js` 的 `MAX_GIFT_BYTES` 同一个数。 */
+  const MAX_GIFT_FILE_BYTES = 16 * 1024 * 1024
+  /** 文件礼物名字上限（码点），与 `src/protocol.js` 的 `MAX_GIFT_NAME` 同一个数。 */
+  const MAX_GIFT_NAME_LENGTH = 120
+  /** 一次场景最多几件礼物（≤ 访客数）；上限只为让一条消息有界，不表达产品限额。 */
+  const MAX_GIFT_ITEMS = 64
+  /** 礼物的状态词表，与 `src/gift-text.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
+  const GIFT_STATUSES = ['pending', 'receiving', 'received', 'failed', 'refused']
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
@@ -203,6 +249,55 @@
     return /^[A-Za-z0-9._:-]+$/.test(id) ? id : null
   }
 
+  /**
+   * 礼物 id 是 wire 上的 UUID（与 visitId/deviceId 同一种形状）。这里不复用 `normalizeId`：
+   * 那个入口还给动画名/诊断 id 用，宽松得多；礼物 id 会被拼进宿主侧的目录查找，必须严格。
+   */
+  function normalizeGiftId (value) {
+    if (typeof value !== 'string') return null
+    const id = value.trim()
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+      ? id.toLowerCase()
+      : null
+  }
+
+  /**
+   * 文件礼物的名字（ticket 25）：与 `src/protocol.js` 的 `sanitizeGiftName` 同一口径——
+   * 去掉路径分隔符、控制字符、双向覆盖符与前导点；超长/为空就丢掉这张卡。
+   * 这个名字只用来显示，不参与拼路径；但跨进程边界各自守一次，别让宿主的新版本带坏 helper。
+   */
+  function normalizeGiftName (value) {
+    if (typeof value !== 'string') return null
+    if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+    const clean = value
+      .replace(/[\\/]/g, '')
+      // eslint-disable-next-line no-control-regex
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, '')
+      .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')
+      .trim()
+      .replace(/^\.+/, '')
+      .trim()
+    if (clean === '') return null
+    const chars = Array.from(clean)
+    return chars.length > MAX_GIFT_NAME_LENGTH ? null : clean
+  }
+
+  /** 文件大小：正整数且 ≤16 MiB；别的值整张卡丢掉（卡片要显示大小，缺了就没意义）。 */
+  function normalizeGiftSize (value) {
+    return Number.isInteger(value) && value > 0 && value <= MAX_GIFT_FILE_BYTES ? value : null
+  }
+
+  /**
+   * 缩略图地址只接受宿主生成的 `localpet://gifts/<目录>/<文件名>`（目录名是固定形状，
+   * 文件名是 encodeURIComponent 过的）。渲染端拿不到别的 URL，也不许自己拼。
+   */
+  function normalizeGiftThumb (value) {
+    if (typeof value !== 'string' || value.length > 2048) return null
+    return /^localpet:\/\/gifts\/\d{8}-\d{6}-[0-9a-f]{8}(?:-\d+)?\/[^\u0000-\u001f/\\]{1,1024}$/.test(value)
+      ? value
+      : null
+  }
+
   function normalizeToken (value) {
     if (typeof value === 'number' && Number.isFinite(value)) return value
     if (typeof value !== 'string') return null
@@ -218,8 +313,101 @@
     return text.length > maxLength ? text.slice(0, maxLength) : text
   }
 
+  /**
+   * 字条正文（ticket 23）：与 `normalizeText` 相反，**保留换行**——便条的多行是内容本身。
+   * 去掉其余控制字符与双向覆盖符，首尾裁掉，按码点夹到 500。
+   *
+   * 这里用“截断”而不是宿主的“超限丢弃”：宿主已经按 500 校验过，渲染端再超只可能是
+   * 坏数据/手改场景，截断能让卡片继续画出来，不会把整张卡丢掉。
+   */
+  function normalizeNoteText (value, maxLength = MAX_GIFT_TEXT_LENGTH) {
+    if (typeof value !== 'string') return null
+    if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+    // eslint-disable-next-line no-control-regex
+    const text = value
+      .replace(/\r\n?/g, '\n')
+      .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g, '')
+      .replace(/[\u202a-\u202e\u2066-\u2069]/g, '')
+      .trim()
+    if (text === '') return null
+    const limit = Number.isInteger(maxLength) && maxLength > 0 ? maxLength : MAX_GIFT_TEXT_LENGTH
+    const chars = Array.from(text)
+    return chars.length > limit ? chars.slice(0, limit).join('') : text
+  }
+
   function normalizeLabel (value, fallback) {
     return normalizeText(value, fallback, MAX_LABEL_LENGTH)
+  }
+
+  /**
+   * 背包里的字条正文（ticket 24）：和卡片一样保留换行，但**超 500 码点返回 null**，
+   * 不学 `normalizeNoteText` 的截断——「带派」小窗里少一个字都算替用户改稿。
+   */
+  function normalizeBackpackText (value) {
+    if (typeof value !== 'string') return null
+    // 先按同一套清洗（给一个足够大的上限）再数码点；超过 500 就是错误。
+    const text = normalizeNoteText(value, MAX_GIFT_TEXT_LENGTH * 8)
+    if (text === null || Array.from(text).length > MAX_GIFT_TEXT_LENGTH) return null
+    return text
+  }
+
+  /**
+   * 「带派」小窗提交的物品（ticket 24）：`{kind:'text',text}` 或 `{kind:'file',path}`。
+   * 文件路径只来自主进程的 `dialog.showOpenDialog`；宿主还会再 stat 一次。
+   */
+  function normalizeBringGift (value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+    if (value.kind === 'text') {
+      const text = normalizeBackpackText(value.text)
+      return text === null ? null : { kind: 'text', text }
+    }
+    if (value.kind === 'file') {
+      const path = normalizePath(value.path)
+      return path === null ? null : { kind: 'file', path }
+    }
+    return null
+  }
+
+  /** 背包小窗里的一条：只带 id/kind/显示文案/state，**绝不带路径**（路径只活在宿主）。 */
+  function normalizeBringWindowItem (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeGiftId(raw.id)
+    if (id === null) return null
+    const state = raw.state === 'out' ? 'out' : 'idle'
+    if (raw.kind === 'text') {
+      const text = normalizeNoteText(raw.text)
+      if (text === null) return null
+      return { id, kind: 'text', text, state }
+    }
+    if (raw.kind === 'file') {
+      const name = normalizeText(raw.name, 'file', MAX_GIFT_NAME_LENGTH)
+      return { id, kind: 'file', name, state }
+    }
+    return null
+  }
+
+  /**
+   * 宿主 → helper 的「带派」小窗状态（ticket 24）。`open:true` = 打开/聚焦这扇窗；
+   * `open:false` = 只刷新已开着的窗（撤掉一件之后）。上限由 shared 自己定，
+   * 不信任宿主传来的数字。
+   */
+  function normalizeBringWindow (raw) {
+    const items = []
+    if (Array.isArray(raw.items)) {
+      for (const candidate of raw.items) {
+        if (items.length >= MAX_BACKPACK_ITEMS) break
+        const item = normalizeBringWindowItem(candidate)
+        if (item !== null) items.push(item)
+      }
+    }
+    return {
+      open: raw.open === true,
+      items,
+      count: items.length,
+      maxItems: MAX_BACKPACK_ITEMS,
+      maxTextLength: MAX_GIFT_TEXT_LENGTH,
+      maxFileBytes: MAX_GIFT_FILE_BYTES
+    }
   }
 
   /** 动画名会拼进 `localpet://asset/<name>.webm`：和宿主协议层同一套字符约束。 */
@@ -387,6 +575,7 @@
    *   recall   { enabled, nickname }      召回入口（自己出门时桌面没有 self，需要常驻小胶囊）
    *   visitors [{ deviceId, label }]      可以送客的访客（item id 是 visitor:<deviceId>）
    *   street   [{ deviceId, label, action, canVisit, blockedReason }]  邻居面板那一排房子（ticket 21）
+   *   gifts    [{ deviceId, giftId, kind, status, title, text?, statusText? }]  贴着访客的礼物卡（ticket 23）
    *   prompt   { deviceId, nickname }     放行卡队首；null 表示没有待决定的新邻居
    *   notice   { text, at }               最近一条人话提示（异步失败也靠它冒泡）
    */
@@ -396,6 +585,7 @@
       recall: { enabled: false, nickname: null },
       visitors: [],
       street: [],
+      gifts: [],
       prompt: null,
       notice: null
     }
@@ -448,6 +638,63 @@
           canVisit: candidate.canVisit === true,
           // 认不出的理由不猜：房子照样画，只是点不了（渲染端统一按“现在去不了”处理）。
           blockedReason: STREET_REASONS.has(candidate.blockedReason) ? candidate.blockedReason : null
+        })
+      }
+    }
+
+    // 礼物卡（ticket 23 / 25）：宿主已经按 visitor 算好标题/正文/大小/状态，这里只做形状校验。
+    // 一张坏卡只丢它自己；deviceId/giftId 认不出来就没法落回访客身上，整张丢。
+    const seenGifts = new Set()
+    if (Array.isArray(raw.gifts)) {
+      for (const candidate of raw.gifts) {
+        if (controls.gifts.length >= MAX_GIFT_ITEMS) break
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+        const deviceId = normalizeId(candidate.deviceId)
+        const giftId = normalizeGiftId(candidate.giftId)
+        const kind = candidate.kind === 'text' || candidate.kind === 'file' ? candidate.kind : null
+        if (deviceId === null || giftId === null || kind === null) continue
+        if (seenGifts.has(giftId)) continue
+        const status = typeof candidate.status === 'string' && GIFT_STATUSES.includes(candidate.status)
+          ? candidate.status
+          : null
+        if (status === null) continue
+        const title = normalizeText(candidate.title, '捎来一件东西', MAX_LABEL_LENGTH * 3)
+        // received 不需要解释（正文/文件本身就是内容）；别的状态才画一行“怎么了”。
+        const statusText = status === 'received'
+          ? null
+          : normalizeText(candidate.statusText, null, MAX_REASON_LENGTH * 2)
+        if (kind === 'file') {
+          const name = normalizeGiftName(candidate.name)
+          const size = normalizeGiftSize(candidate.size)
+          // 文件名/大小缺一个就画不出文件卡，整张丢掉（宁可没有，也不画一张半截的卡）。
+          if (name === null || size === null) continue
+          // 缩略图只在真的收下时才给；pending/receiving 时宿主即使误发也不画。
+          const thumb = status === 'received' ? normalizeGiftThumb(candidate.thumb) : null
+          seenGifts.add(giftId)
+          controls.gifts.push({
+            deviceId,
+            giftId,
+            kind: 'file',
+            status,
+            title,
+            name,
+            size,
+            ...(thumb === null ? {} : { thumb }),
+            ...(statusText === null ? {} : { statusText })
+          })
+          continue
+        }
+        seenGifts.add(giftId)
+        // 正文只在该收到时出现；别的状态下即便宿主误发也不画。
+        const text = status === 'received' ? normalizeNoteText(candidate.text) : null
+        controls.gifts.push({
+          deviceId,
+          giftId,
+          kind: 'text',
+          status,
+          title,
+          ...(text === null ? {} : { text }),
+          ...(statusText === null ? {} : { statusText })
         })
       }
     }
@@ -908,10 +1155,34 @@
         if (url === null) return { ok: false, error: 'bad-url' }
         return { ok: true, command: { type, id, url } }
       }
-      case 'shot': {
+      /**
+       * 礼物卡的系统动作（ticket 23）：路径只由宿主给，渲染端连字符串都拿不到。
+       * 三个带路径的命令共用 `normalizePath`（必须是绝对路径）；`gift-copy` 只带正文。
+       */
+      case 'gift-open':
+      case 'gift-reveal':
+      case 'gift-discard': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
         return { ok: true, command: { type, id, path } }
+      }
+      case 'gift-copy': {
+        const text = normalizeNoteText(raw.text)
+        if (text === null) return { ok: false, error: 'bad-text' }
+        return { ok: true, command: { type, id, text } }
+      }
+      /**
+       * 「带派」小窗（ticket 24）：宿主把背包内容 + 限额交给 helper。
+       * `open:true` 打开/聚焦；`open:false` 只刷新已开着的窗（撤掉一件之后）。
+       * 路径不在这个命令里：窗口只发 giftId，删除由宿主查背包。
+       */
+      case 'bring-window':
+        return { ok: true, command: { type, id, ...normalizeBringWindow(raw) } }
+      case 'shot': {
+        const path = normalizePath(raw.path)
+        if (path === null) return { ok: false, error: 'bad-path' }
+        const window = raw.window === 'bring' ? 'bring' : null
+        return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
         if (raw.clear === true) return { ok: true, command: { type, id, point: null } }
@@ -936,6 +1207,13 @@
       case 'debug-rename':
         // 冒烟用：开/关改名小窗（它没有渲染端可点击的关闭按钮，测试只能从这里关）。
         return { ok: true, command: { type, id, close: raw.close === true } }
+      case 'debug-gift-submit':
+        // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
+        if (typeof raw.text !== 'string') return { ok: false, error: 'bad-text' }
+        return { ok: true, command: { type, id, text: raw.text.slice(0, MAX_GIFT_TEXT_LENGTH * 2) } }
+      case 'debug-gift-remove':
+        // 冒烟用：点背包列表里第一个可撤的「撤掉」（out 中的按钮是禁用的）。
+        return { ok: true, command: { type, id } }
       case 'debug-dispatch': {
         const phase = typeof raw.phase === 'string' ? raw.phase.trim().toLowerCase() : ''
         if (!['down', 'move', 'up', 'click', 'context', 'blur'].includes(phase)) return { ok: false, error: 'bad-phase' }
@@ -1016,6 +1294,7 @@
       focused: raw.focused === true,
       focusable: raw.focusable === true,
       renameOpen: raw.renameOpen === true,
+      bringOpen: raw.bringOpen === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -1117,6 +1396,17 @@
         // `visit` 是「可能带对象」：邻居面板点某一户就带 deviceId；不带则由宿主随机挑。
         const deviceId = needsDevice || action === 'visit' ? normalizeId(raw.deviceId) : null
         if (needsDevice && deviceId === null) return { ok: false, error: 'bad-device-id' }
+        // 礼物动作只带 giftId（UUID），路径永远不出渲染端。
+        const needsGift = GIFT_ACTIONS.includes(action)
+        const giftId = needsGift ? normalizeGiftId(raw.giftId) : null
+        if (needsGift && giftId === null) return { ok: false, error: 'bad-gift' }
+        // 「带派」小窗的提交（ticket 24）：只有 bring 带物品正文；菜单上的 bring 不带，
+        // 那一条由宿主用来打开小窗。字段不合法的提交整条拒绝，不做半截猜测。
+        let gift = null
+        if (action === 'bring' && raw.gift !== undefined && raw.gift !== null) {
+          gift = normalizeBringGift(raw.gift)
+          if (gift === null) return { ok: false, error: 'bad-gift' }
+        }
         // 只有改名带正文：清洗交给宿主（那里有 normalizeNickname），这里只做长度兜底，
         // 免得渲染端一个粘贴把一行 JSON 撑成几兆。
         const nickname = action === 'rename' && typeof raw.nickname === 'string'
@@ -1125,7 +1415,19 @@
         // 点播带动画名；名字必须是安全的动画名，否则整条事件丢掉（宿主还得再校验一遍）。
         const name = action === 'play-anim' ? normalizeAnim(raw.name) : null
         if (action === 'play-anim' && name === null) return { ok: false, error: 'bad-name' }
-        return { ok: true, event: { type, id, action, deviceId, nickname, ...(name === null ? {} : { name }) } }
+        return {
+          ok: true,
+          event: {
+            type,
+            id,
+            action,
+            deviceId,
+            nickname,
+            ...(name === null ? {} : { name }),
+            ...(giftId === null ? {} : { giftId }),
+            ...(gift === null ? {} : { gift })
+          }
+        }
       }
       case 'pong':
         return { ok: true, event: { type, id } }
@@ -1495,18 +1797,34 @@
     PET_ROLES,
     SCENE_VERSION,
     CONTROL_ACTIONS,
+    GIFT_ACTIONS,
+    GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
     MAX_ACTION_TEXT,
     MAX_NAME_LENGTH,
+    MAX_GIFT_TEXT_LENGTH,
+    MAX_GIFT_ITEMS,
+    MAX_BACKPACK_ITEMS,
+    MAX_GIFT_FILE_BYTES,
+    MAX_GIFT_NAME_LENGTH,
     PET_COLORS,
     IDLE_CLIPS,
     PHYSICS,
     isFiniteNumber,
     clampNumber,
     normalizeId,
+    normalizeGiftId,
+    normalizeGiftName,
+    normalizeGiftSize,
+    normalizeGiftThumb,
     normalizeLabel,
+    normalizeNoteText,
+    normalizeBackpackText,
+    normalizeBringGift,
+    normalizeBringWindowItem,
+    normalizeBringWindow,
     normalizeAnim,
     normalizeRole,
     normalizeSemantic,

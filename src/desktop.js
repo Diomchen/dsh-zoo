@@ -61,6 +61,7 @@ function safe (fn, fallback) {
  * @param {Function} [options.exists] 路径存在性注入
  * @param {string[]} [options.assetRoots] 宿主解析好的 dsh-pet 素材目录（helper 的 localpet:// 根）
  * @param {string} [options.cacheRoot] 远端素材缓存目录（helper 的 localpet://cache 根）
+ * @param {string} [options.giftsRoot] 收到的礼物根目录（helper 的 localpet://gifts 根，ticket 25）
  * @param {Function} [options.onEvent] 收到 helper 事件（ready/hit/...）时回调；异常被吞
  */
 export function createDesktop (options = {}) {
@@ -80,6 +81,8 @@ export function createDesktop (options = {}) {
   const hostPid = Number.isInteger(options.hostPid) && options.hostPid > 0 ? options.hostPid : process.pid
   const assetRoots = Array.isArray(options.assetRoots) ? options.assetRoots.slice() : []
   const cacheRoot = typeof options.cacheRoot === 'string' && options.cacheRoot !== '' ? options.cacheRoot : null
+  /** ticket 25：礼物根目录，只给 helper 的 `localpet://gifts/...` 缩略图用。 */
+  const giftsRoot = typeof options.giftsRoot === 'string' && options.giftsRoot !== '' ? options.giftsRoot : null
   const debug = options.debug === true
   const pingMs = Number.isFinite(options.pingMs) && options.pingMs >= 100 ? options.pingMs : DESKTOP_PING_MS
   const pongTimeoutMs = Number.isFinite(options.pongTimeoutMs) && options.pongTimeoutMs >= 5000
@@ -181,7 +184,7 @@ export function createDesktop (options = {}) {
     if (disposed || child !== null || availability === null || !availability.ok) {
       return { ok: false, reason: 'not-running' }
     }
-    const args = buildHelperArgs({ helperPath: helperMain, hostPid, debug, assetRoots, cacheRoot })
+    const args = buildHelperArgs({ helperPath: helperMain, hostPid, debug, assetRoots, cacheRoot, giftsRoot })
     policy.onStart(now())
     let spawned = null
     try {
@@ -524,13 +527,54 @@ export function createDesktop (options = {}) {
    * 让 helper 去拒等于把一条垃圾行留在两进程之间。
    */
   function openUrl (url) {
-    const normalized = shared.normalizeHostCommand({ type: 'open-url', url })
+    return sendHostCommand({ type: 'open-url', url })
+  }
+
+  /**
+   * 宿主 → helper 的命令统一从这里过白名单再写管道。坏路径/坏文本在**发出去之前**
+   * 就被丢掉，不会把一行垃圾留在两个进程之间。
+   */
+  function sendHostCommand (command) {
+    const normalized = shared.normalizeHostCommand(command)
     if (normalized.ok !== true) return false
     try {
       return send(normalized.command)
     } catch {
       return false
     }
+  }
+
+  /**
+   * 礼物卡的系统动作（ticket 23）：打开便条 / 在文件夹里显示 / 复制正文 / 删掉礼物目录。
+   * 路径由宿主从礼物 store 里取，渲染端只发 giftId；helper 只负责执行。
+   */
+  function giftOpen (filePath) {
+    return sendHostCommand({ type: 'gift-open', path: filePath })
+  }
+
+  function giftReveal (filePath) {
+    return sendHostCommand({ type: 'gift-reveal', path: filePath })
+  }
+
+  function giftCopy (text) {
+    return sendHostCommand({ type: 'gift-copy', text })
+  }
+
+  function giftDiscard (dirPath) {
+    return sendHostCommand({ type: 'gift-discard', path: dirPath })
+  }
+
+  /**
+   * 「带派」小窗（ticket 24）：把背包内容 + 限额交给 helper。
+   * `open:true` 打开/聚焦，`open:false` 只刷新已经开着的那扇（撤掉一件之后）。
+   * 窗口只发 giftId / 选中的绝对路径，删除与统计都在宿主。
+   */
+  function bringWindow (payload = {}) {
+    return sendHostCommand({
+      type: 'bring-window',
+      open: payload?.open === true,
+      items: Array.isArray(payload?.items) ? payload.items : []
+    })
   }
 
   function show () {
@@ -649,6 +693,7 @@ export function createDesktop (options = {}) {
       lastEvent,
       lastStatus,
       assetRoots: assetRoots.slice(),
+      giftsRoot,
       stderr: stderrLines.slice(),
       debug: debugLines.slice()
     }
@@ -709,6 +754,11 @@ export function createDesktop (options = {}) {
     hide,
     reload,
     openUrl,
+    giftOpen,
+    giftReveal,
+    giftCopy,
+    giftDiscard,
+    bringWindow,
     actionResult,
     shot,
     requestStatus,

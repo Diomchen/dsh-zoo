@@ -9,6 +9,7 @@ import {
   isSafeAnimationName,
   isVisitId,
   normalizeAnimation,
+  normalizeGift,
   normalizeNickname,
   normalizeSay,
   normalizeSemantic,
@@ -17,8 +18,17 @@ import {
 import {
   MAX_VISIT_RECORD_MS,
   VISIT_RECORD_LIMIT,
+  normalizeVisitGift,
   normalizeVisitRecord
 } from './visit-record.js'
+import {
+  giftDroppedText,
+  giftLeftBehindText,
+  giftNotReceivedText,
+  giftReceivedText,
+  isGiftReason,
+  isGiftStatus
+} from './gift-text.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -53,7 +63,8 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子，v2 不渲染
  *     visitors:  [ { deviceId, nickname, anim, visitId, since, lastSeen, endsAt: null } ],
  *                 // 入站串门访客：没有时间上限，只靠心跳存活与「送客」结束
- *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs } ],
+ *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs,
+ *                    gift?: { kind: 'text'|'file', name? } } ],
  *     prompt:    { deviceId, nickname } | null,   // 放行 FIFO 的队首；其余排队等待
  *     notices:   [ { text, at } ],
  *     acceptVisits: true,                         // 本机桌面是否接受入站串门
@@ -100,18 +111,37 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *   后交给 src/visits.js，room 自己不碰磁盘。
  * - 记录最多保留 VISIT_RECORD_LIMIT 条，丢掉最旧的；快照只给最近 5 条。
  * - 记录损坏/不可写时，visits.json 由 store 降级；这里始终有一份内存记录可用。
+ * - 每条记录还可带一个可选的礼物摘要（ticket 27）：只记 kind 与文件名，不记字条正文。
  *
  * 桌面开关（ticket 02 用户故事 22）：
  * - acceptVisits 只挡**入站串门请求**：关掉时回一条带 visits-off 理由的 deny，
  *   不创建访客；发现、心跳和本机出门都不受影响。
  * - autoVisit 只影响**自发出门**：关掉时手动「串门」照常可用。
  * - 两个开关都是本机动作，落盘由 service 交给 src/settings.js；UDP 报文永远改不了它们。
+ *
+ * ticket 23（带派·字条）的边界：
+ * - 礼物挂在**这一次访客**上（`visitor.gift`），不是独立列表：访客回家/被送客/失联时
+ *   卡片跟着消失，不需要第二套生命周期。
+ * - 协议层已经清过一次；这里再过一遍 `normalizeGift` 是防御（room 也会被单测直接喂），
+ *   非法就当成“这次没有礼物”，绝不因此不建访客。
+ * - 只有 service 能改礼物状态（写盘成功 → received、失败 → failed）；room 不碰磁盘。
+ * - 「扔掉」之后本次运行内**永不再出现**：discardedGifts 记住 giftId，重试报文也带不回来。
  */
 
 export const MAX_PROMPTS = 8
 /** 同时出现在桌面上的心跳影子上限；它只是“谁在线”，不是串门访客。 */
 export const MAX_GUESTS = 8
 export const MAX_NOTICES = 10
+/**
+ * 「扔掉过」的 giftId 记忆上限。一次运行里丢掉两百件之后，最旧的那条被忘掉——
+ * 它对应的访客早就走了，重发的报文也不会再带同一个 UUID。
+ */
+export const MAX_DISCARDED_GIFTS = 200
+/**
+ * 「刚结束的入站串门身上那件礼物」的传递队列上限（ticket 26）。service 每次
+ * flush 都会取走；给个上限只是为了让 room 的内存永远有界。
+ */
+const MAX_ENDED_INBOUND_GIFTS = 32
 /** 点“稍后再说”后，同一位邻居至少安静这么久再问（它消失后重新出现则立刻重问）。 */
 export const PROMPT_SNOOZE_MS = 10 * 60 * 1000
 
@@ -143,6 +173,9 @@ export function createRoom ({
     visits: [],
     completedVisits: [],
     pendingRecalls: [],
+    // ticket 26：结束的入站串门身上那件礼物（送客 / 对方召回 / 失联）。
+    // 只有 service 知道磁盘上的 meta.opened，所以这里只负责“交给它”。
+    endedInboundGifts: [],
     trust: { allowed: new Map(), denied: new Map() },
     prompts: [],
     promptSet: new Set(),
@@ -154,7 +187,9 @@ export function createRoom ({
     activity: { session: null, pointer: null },
     lastPolicyDecision: null,
     // 「一次场景画不下所有访客」的提示只提醒一次；拥挤解除后才能再提醒。
-    overflowNotified: false
+    overflowNotified: false,
+    // ticket 23：被主人「扔掉」的 giftId。重试/重放同一份报文也不会再长出卡片。
+    discardedGifts: new Set()
   }
 
   function nowMs () {
@@ -376,7 +411,55 @@ export function createRoom ({
       since: visitor.since,
       // 入站访客没有时间上限：endsAt 固定为 null，客户端不要画倒计时。
       lastSeen: visitor.lastSeen,
-      endsAt: null
+      endsAt: null,
+      // 只加字段、不改名：没有礼物的访客，快照形状与 ticket 10 完全一致。
+      ...(visitor.gift === undefined ? {} : { gift: { ...visitor.gift } })
+    }
+  }
+
+  /**
+   * 入站礼物：协议层已经清洗过一遍，这里再过一遍白名单（room 也会被单测直接喂）。
+   * 返回的状态永远是 pending——真正收下要等 service 把 note.txt/文件写成功。
+   * 文件礼物只带 name/size（渲染端要画文件名与大小）；sha256 与路径都不进快照。
+   */
+  function visitorGift (value) {
+    const gift = normalizeGift(value)
+    if (gift === null) return null
+    // 扔掉过的东西不再长回来，哪怕对方重发同一条报文。
+    if (state.discardedGifts.has(gift.id)) return null
+    if (gift.kind === 'file') {
+      return { id: gift.id, kind: 'file', name: gift.name, size: gift.size, status: 'pending' }
+    }
+    return { id: gift.id, kind: 'text', text: gift.text, status: 'pending' }
+  }
+
+  function rememberDiscardedGift (giftId) {
+    if (!isVisitId(giftId)) return
+    state.discardedGifts.delete(giftId)
+    state.discardedGifts.add(giftId)
+    while (state.discardedGifts.size > MAX_DISCARDED_GIFTS) {
+      const oldest = state.discardedGifts.values().next().value
+      if (oldest === undefined) break
+      state.discardedGifts.delete(oldest)
+    }
+  }
+
+  /**
+   * 入站串门结束了（送客 / 对方召回 / 失联 / 名单收紧）：如果访客身上还有一件礼物，
+   * 记下“谁捎来的、哪一件”，交给 service 去查 `meta.opened`。
+   *
+   * room 不碰磁盘，所以这里刻意不判断“要不要提醒”——只传递事实。
+   * 每取走一次就清空（见 `drainEndedInboundGifts`），不会在快照里重复。
+   */
+  function rememberEndedInboundGift (visitor) {
+    if (visitor?.gift === undefined) return
+    state.endedInboundGifts.push({
+      deviceId: visitor.deviceId,
+      nickname: visitor.nickname,
+      giftId: visitor.gift.id
+    })
+    while (state.endedInboundGifts.length > MAX_ENDED_INBOUND_GIFTS) {
+      state.endedInboundGifts.shift()
     }
   }
 
@@ -385,7 +468,9 @@ export function createRoom ({
       direction: record.direction,
       nickname: record.nickname,
       startedAt: record.startedAt,
-      durationMs: record.durationMs
+      durationMs: record.durationMs,
+      // 可选字段只加不改：没有礼物的记录与 ticket 06 的形状完全一致。
+      ...(record.gift === undefined ? {} : { gift: { ...record.gift } })
     }
   }
 
@@ -407,7 +492,12 @@ export function createRoom ({
     }
   }
 
-  function recordVisit (direction, nickname, startedAt, endedAt) {
+  /**
+   * 写一条完成的串门记录（in / out 都走这里）。
+   * `gift` 是可选的第 5 个参数：来访者身上那件礼物，或这次出门带在路上的那一件。
+   * 只留 kind 与文件名；非法/没有就只是少一个字段，记录本身照写。
+   */
+  function recordVisit (direction, nickname, startedAt, endedAt, gift = null) {
     const start = Number.isFinite(startedAt) ? Math.max(0, startedAt) : nowMs()
     const end = Number.isFinite(endedAt) ? Math.max(start, endedAt) : nowMs()
     const record = {
@@ -416,6 +506,8 @@ export function createRoom ({
       startedAt: start,
       durationMs: Math.min(Math.max(0, end - start), MAX_VISIT_RECORD_MS)
     }
+    const cleanGift = normalizeVisitGift(gift)
+    if (cleanGift !== null) record.gift = cleanGift
     state.visits.unshift(record)
     if (state.visits.length > VISIT_RECORD_LIMIT) state.visits.length = VISIT_RECORD_LIMIT
     // room 不落盘：完成的记录排队，service 在 tick/action 之后交给 visits.json。
@@ -435,7 +527,7 @@ export function createRoom ({
     state.out = null
     let record = null
     if (wasActive) {
-      record = recordVisit('out', out.nickname, out.startedAt, at)
+      record = recordVisit('out', out.nickname, out.startedAt, at, out.gift)
       if (notifyRemote) state.pendingRecalls.push({ deviceId: out.deviceId, visitId: out.visitId })
     }
     if (notice !== null) pushNotice(notice, at)
@@ -447,7 +539,8 @@ export function createRoom ({
     const visitor = state.visitors.get(deviceId)
     if (visitor === undefined) return null
     state.visitors.delete(deviceId)
-    return recordVisit('in', visitor.nickname, visitor.since, at)
+    rememberEndedInboundGift(visitor)
+    return recordVisit('in', visitor.nickname, visitor.since, at, visitor.gift)
   }
 
   /**
@@ -934,7 +1027,10 @@ export function createRoom ({
         phase: 'requesting',
         startedAt: now,
         endsAt: null,
-        lastSeen: now
+        lastSeen: now,
+        // 这次出门捎的东西（ticket 27）。只进记录、不进快照；sendVisitRequest 成功后才由
+        // service 用 markOutboundGift 填上（编码层丢掉 gift 时就不会误记成“带上了”）。
+        gift: null
       }
       // 冷却从“开始出门”算，而不是从 ack 算：即使这次请求最终失败，
       // 宠物也已经试过一次，不该在 30 秒后的下一轮策略里再试一次。
@@ -1031,7 +1127,8 @@ export function createRoom ({
       const visitor = state.visitors.get(deviceId)
       if (visitor !== undefined) {
         state.visitors.delete(deviceId)
-        const record = recordVisit('in', visitor.nickname, visitor.since, now)
+        rememberEndedInboundGift(visitor)
+        const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
         return {
           ok: true,
           side: 'in',
@@ -1048,6 +1145,9 @@ export function createRoom ({
      * 来源会得到 ack，其余回 not-admitted（明确失败）。deny 都不创建访客、不写记录。
      * 同一来源的重复请求（重试）按 visitId 幂等处理：原地刷新 id/动作/lastSeen，
      * 不重置 since，也绝不多写一条记录。
+     *
+     * 礼物（ticket 23）只是访客身上的一个可选字段：坏 gift 在协议层已经被丢掉，
+     * 这里再丢一次也**不影响 ack**——访客该进门还是进门。
      */
     observeVisitRequest (peer, at = clock()) {
       if (peer === null || typeof peer !== 'object') {
@@ -1073,6 +1173,7 @@ export function createRoom ({
         neighbor?.nickname ?? state.trust.allowed.get(deviceId) ?? peer.nickname
       ) ?? FALLBACK_NICKNAME
       const anim = normalizeAnimation(peer.anim)
+      const gift = visitorGift(peer.gift)
 
       const existing = state.visitors.get(deviceId)
       if (existing !== undefined) {
@@ -1082,6 +1183,10 @@ export function createRoom ({
         existing.nickname = nickname
         existing.anim = anim
         existing.lastSeen = now
+        // 重发的是同一件礼物：状态（可能已经 received）原样保留，绝不退回 pending，
+        // 否则每丢一包 ack，桌面上的卡片就会闪一下“正在收下”。
+        // 换了一件新的：换卡；没带礼物：这次访客身上原来那件留着（东西已经在磁盘上了）。
+        if (gift !== null && existing.gift?.id !== gift.id) existing.gift = gift
         refreshNeighbor(deviceId, now)
         return {
           reply: 'ack',
@@ -1100,7 +1205,8 @@ export function createRoom ({
         nickname,
         anim,
         since: now,
-        lastSeen: now
+        lastSeen: now,
+        ...(gift === null ? {} : { gift })
       }
       state.visitors.set(deviceId, visitor)
       refreshNeighbor(deviceId, now)
@@ -1138,7 +1244,8 @@ export function createRoom ({
 
       const now = stampOf(at)
       state.visitors.delete(deviceId)
-      const record = recordVisit('in', visitor.nickname, visitor.since, now)
+      rememberEndedInboundGift(visitor)
+      const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
       state.pendingRecalls.push({ deviceId: visitor.deviceId, visitId: visitor.visitId })
       return {
         ok: true,
@@ -1147,6 +1254,112 @@ export function createRoom ({
         nickname: visitor.nickname,
         record
       }
+    },
+
+    /**
+     * service 把字条/文件写进磁盘之后回报状态（ticket 23 / 25）。只认这位访客身上的那一件：
+     * 访客已经走了 / 礼物已经被换掉 / giftId 对不上，都返回 false 而不是顺手造一张卡。
+     *
+     * status 由 gift-text 的固定词表校验；presentation 的文案表同时是这里的状态词表，
+     * 免得两处各有一份、迟早对不上。`reason`（ticket 25）只用于 failed/refused 的状态行，
+     * 取值同样来自固定词表，绝不把任意字符串带进快照。
+     */
+    markGiftStatus (rawDeviceId, rawGiftId, status, reason = null) {
+      if (!isGiftStatus(status)) return false
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      if (deviceId === null) return false
+      const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
+      if (!isVisitId(giftId)) return false
+      const visitor = state.visitors.get(deviceId)
+      if (visitor === undefined || visitor.gift === undefined) return false
+      if (visitor.gift.id !== giftId) return false
+      visitor.gift.status = status
+      if (typeof reason === 'string' && isGiftReason(reason) && (status === 'failed' || status === 'refused')) {
+        visitor.gift.reason = reason
+      } else {
+        delete visitor.gift.reason
+      }
+      return true
+    },
+
+    /**
+     * 主人点了「扔掉」：卡片立刻消失，并记住这个 giftId（本次运行内不再出现）。
+     * 磁盘删除由 service 负责；这里只改内存，磁盘不归它管。
+     *
+     * `deviceId` 可以为空：礼物还没落盘（pending / receiving / failed / refused）时，
+     * service 查不到 `from.deviceId`，这时按 giftId 找到那张卡——卡片必须能扔掉。
+     */
+    discardGift (rawDeviceId, rawGiftId) {
+      const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
+      if (!isVisitId(giftId)) return false
+      rememberDiscardedGift(giftId)
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      let visitor = null
+      if (deviceId !== null) {
+        visitor = state.visitors.get(deviceId) ?? null
+      } else {
+        for (const candidate of state.visitors.values()) {
+          if (candidate.gift?.id === giftId) {
+            visitor = candidate
+            break
+          }
+        }
+      }
+      if (visitor === null || visitor.gift === undefined) return false
+      if (visitor.gift.id !== giftId) return false
+      delete visitor.gift
+      return true
+    },
+
+    /** 这件礼物是不是已经被「扔掉」了：service 据此不再把重试报文重新写回磁盘。 */
+    isGiftDiscarded (rawGiftId) {
+      const giftId = typeof rawGiftId === 'string' ? rawGiftId.trim().toLowerCase() : ''
+      return isVisitId(giftId) && state.discardedGifts.has(giftId)
+    },
+
+    /** 本机这次的礼物没带上（太长/整包超 4 KiB）：留一句人话，串门照常。 */
+    noteGiftDropped (at = clock()) {
+      return pushNotice(giftDroppedText(), at)
+    },
+
+    /**
+     * 背包里那件东西这次带不上（文件被删/读不了）：留一句人话，串门照常。
+     * 文案由 service 从 `gift-text.js` 取，room 只负责排进快照。
+     */
+    noteGiftMissed (text, at = clock()) {
+      if (typeof text !== 'string' || text.trim() === '') return null
+      return pushNotice(text.trim(), at)
+    },
+
+    /** 对方回执到了（ticket 26）：发起方把「收下了」说一句。 */
+    noteGiftReceived (nickname, at = clock()) {
+      return pushNotice(giftReceivedText(nickname), at)
+    },
+
+    /** 串门结束还没等到回执（ticket 26）：东西已经退回背包，这一句必须说清楚。 */
+    noteGiftNotReceived (at = clock()) {
+      return pushNotice(giftNotReceivedText(), at)
+    },
+
+    /**
+     * 送客提醒（ticket 26）：这件礼物一次都没打开过，东西还留在 gifts 里。
+     * “到底打没打开”在磁盘的 meta.json 上，所以判断留给 service，这里只说一句。
+     */
+    noteGiftLeftBehind (nickname, at = clock()) {
+      return pushNotice(giftLeftBehindText(nickname), at)
+    },
+
+    /**
+     * 记下这次出门真正带上路的那件礼物（ticket 27）。由 service 在 visit-request
+     * 编码成功之后调用：编码层丢掉 gift 时传 null，记录里就不会出现一件没带上的东西。
+     * 只认当前这次 visitId，迟到/旧的调用什么也不改。
+     */
+    markOutboundGift (rawVisitId, gift) {
+      const visitId = normalizeVisitId(rawVisitId)
+      if (visitId === null || state.out === null || state.out.visitId !== visitId) return false
+      const clean = normalizeVisitGift(gift)
+      state.out.gift = clean
+      return true
     },
 
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */
@@ -1166,6 +1379,16 @@ export function createRoom ({
       const recalls = state.pendingRecalls
       state.pendingRecalls = []
       return recalls
+    },
+
+    /**
+     * 刚结束的入站串门身上那件礼物（ticket 26）。service 取走后查 meta.opened，
+     * 决定要不要留一句「捎来的东西还在 gifts 里」。
+     */
+    drainEndedInboundGifts () {
+      const ended = state.endedInboundGifts
+      state.endedInboundGifts = []
+      return ended
     },
 
     /**
@@ -1214,7 +1437,8 @@ export function createRoom ({
       for (const [deviceId, visitor] of state.visitors) {
         if (now - visitor.lastSeen >= lostMs) {
           state.visitors.delete(deviceId)
-          recordVisit('in', visitor.nickname, visitor.since, now)
+          rememberEndedInboundGift(visitor)
+          recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
           pushNotice(`「${visitor.nickname}」失联了，访客已经离开。`, now)
         }
       }
@@ -1250,6 +1474,7 @@ export function createRoom ({
       state.visits.length = 0
       state.completedVisits.length = 0
       state.pendingRecalls.length = 0
+      state.endedInboundGifts.length = 0
       state.trust.allowed.clear()
       state.trust.denied.clear()
       state.prompts.length = 0
@@ -1263,6 +1488,7 @@ export function createRoom ({
       state.activity.pointer = null
       state.lastPolicyDecision = null
       state.overflowNotified = false
+      state.discardedGifts.clear()
       state.self.pet = null
       state.self.bridge = { ...IDLE_BRIDGE }
     }

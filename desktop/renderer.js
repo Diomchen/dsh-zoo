@@ -88,6 +88,8 @@
     menu: null, // { petId, root, panels: [{ level, el }], openedAt, lastActiveAt, leaveTimer }
     street: null, // { petId, el, head, title, grid, more, actions, showBlocked, openedAt, lastActiveAt }
     prompt: null, // { key, deviceId, nickname, el }
+    // ticket 23：giftId → { el, deviceId, giftId, status, titleEl, bodyEl, statusEl, signature }
+    gifts: new Map(),
     recall: null, // { el }
     notice: null, // { text, at, el, timer }
     hiddenPromptKey: null,
@@ -267,6 +269,21 @@
       rects.push(promptRect)
       for (const button of ui.prompt.el.querySelectorAll('[data-lp-action]')) {
         add('ui:btn:' + button.dataset.lpAction, button)
+      }
+    }
+
+    // 礼物卡（ticket 23）：矩形与按钮都带 giftId；桥接矩形把它和**那位访客**连起来。
+    for (const entry of ui.gifts.values()) {
+      const rect = rectOf('ui:gift:' + entry.giftId, entry.el)
+      if (rect === null) continue
+      const pet = pets.get('visitor:' + entry.deviceId)
+      if (pet !== undefined) {
+        const bridge = shared.unionRect([rect, anchorOfPet(pet)])
+        if (bridge !== null) rects.push({ id: 'ui:gift-bridge:' + entry.giftId, ...bridge })
+      }
+      rects.push(rect)
+      for (const button of entry.el.querySelectorAll('[data-lp-action]')) {
+        add('ui:gift-btn:' + button.dataset.lpAction + ':' + entry.giftId, button)
       }
     }
 
@@ -625,6 +642,8 @@
     button.textContent = label
     button.dataset.lpAction = action
     if (typeof options.deviceId === 'string' && options.deviceId !== '') button.dataset.lpDevice = options.deviceId
+    // 礼物按钮必须带 giftId：矩形 id 与 action 都要能落回具体那一张卡（两张卡不撞名）。
+    if (typeof options.giftId === 'string' && options.giftId !== '') button.dataset.lpGift = options.giftId
     if (options.disabled === true) {
       button.dataset.disabled = 'true'
       button.dataset.reason = typeof options.reason === 'string' ? options.reason : ''
@@ -999,7 +1018,8 @@
       if (pet !== undefined) homePet(pet)
       return
     }
-    if (id === 'reload' || id === 'open-site') requestAction(id)
+    // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
+    if (id === 'reload' || id === 'open-site' || id === 'bring') requestAction(id)
   }
 
   /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */
@@ -1475,6 +1495,209 @@
   }
 
   // -------------------------------------------------------------------------
+  // 礼物卡（ticket 23）
+  //
+  // 卡片贴在**那位访客**旁边，不是贴在自己旁边：礼物是“谁捎来的”，不是“给我的提醒”。
+  // 内容全部来自 scene.controls.gifts（标题/正文/状态文案由宿主算好），渲染端只画。
+  // 矩形进 overlay-rects（卡 + 按钮 + 与访客之间的桥接），整窗其余部分照旧穿透。
+  // -------------------------------------------------------------------------
+
+  function giftSignature (gift) {
+    return JSON.stringify({
+      title: gift.title,
+      kind: gift.kind,
+      text: gift.text ?? null,
+      name: gift.name ?? null,
+      size: gift.size ?? null,
+      thumb: gift.thumb ?? null,
+      status: gift.status,
+      statusText: gift.statusText ?? null
+    })
+  }
+
+  /** 文件大小只给人看个量级；精确字节数没有意义，也不该让卡片挤成一团。 */
+  function formatFileSize (bytes) {
+    if (!Number.isInteger(bytes) || bytes <= 0) return ''
+    if (bytes < 1024) return bytes + ' B'
+    if (bytes < 1024 * 1024) {
+      return (bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0) + ' KB'
+    }
+    return (bytes / (1024 * 1024)).toFixed(bytes < 10 * 1024 * 1024 ? 1 : 0) + ' MB'
+  }
+
+  function setGiftButtonsEnabled (entry, enabled) {
+    for (const button of entry.el.querySelectorAll('[data-lp-action]')) {
+      // 「扔掉」在哪种状态下都该能点：写坏了的礼物更需要能清理掉。
+      const allowed = enabled || button.dataset.lpAction === 'gift-discard'
+      button.dataset.disabled = allowed ? 'false' : 'true'
+      button.setAttribute('aria-disabled', allowed ? 'false' : 'true')
+      if (!allowed) {
+        button.title = '东西还没收下，稍等一下。'
+        button.dataset.reason = '东西还没收下，稍等一下。'
+      } else {
+        button.removeAttribute('title')
+        delete button.dataset.reason
+      }
+    }
+  }
+
+  function buildGiftCard (gift) {
+    const el = document.createElement('div')
+    el.className = 'lp-card lp-gift-card'
+    el.setAttribute('role', 'dialog')
+    el.setAttribute('aria-label', gift.title)
+
+    const head = document.createElement('div')
+    head.className = 'lp-card-head'
+    const title = document.createElement('div')
+    title.className = 'lp-card-title'
+    head.appendChild(title)
+
+    // 正文走 textContent + CSS pre-wrap：便条的换行是内容，不能被折掉，也绝不解析 HTML。
+    const body = document.createElement('p')
+    body.className = 'lp-gift-text'
+
+    // 文件卡（ticket 25）：缩略图只在宿主给了 thumb 时出现；没有就画文件图标 + 名字 + 大小。
+    // 图片同样走 textContent/URL 白名单：src 来自宿主校验过的 localpet://gifts/...
+    const fileBox = document.createElement('div')
+    fileBox.className = 'lp-gift-file'
+    fileBox.hidden = true
+    const thumb = document.createElement('img')
+    thumb.className = 'lp-gift-thumb'
+    thumb.alt = ''
+    thumb.draggable = false
+    thumb.hidden = true
+    const fileRow = document.createElement('div')
+    fileRow.className = 'lp-gift-file-row'
+    const fileIcon = document.createElement('span')
+    fileIcon.className = 'lp-gift-file-icon'
+    fileIcon.setAttribute('aria-hidden', 'true')
+    fileIcon.textContent = '▤'
+    const fileMeta = document.createElement('span')
+    fileMeta.className = 'lp-gift-file-meta'
+    const fileName = document.createElement('span')
+    fileName.className = 'lp-gift-file-name'
+    const fileSize = document.createElement('span')
+    fileSize.className = 'lp-gift-file-size'
+    fileMeta.appendChild(fileName)
+    fileMeta.appendChild(fileSize)
+    fileRow.appendChild(fileIcon)
+    fileRow.appendChild(fileMeta)
+    fileBox.appendChild(thumb)
+    fileBox.appendChild(fileRow)
+
+    const status = document.createElement('p')
+    status.className = 'lp-gift-status'
+
+    const actions = document.createElement('div')
+    actions.className = 'lp-card-actions lp-gift-actions'
+    actions.appendChild(makeButton('打开', 'gift-open', { giftId: gift.giftId }))
+    // 只有字条有正文可复制；文件卡的按钮在 update 里隐藏（不留一个点了没用的按钮）。
+    const copyButton = makeButton('复制', 'gift-copy', { giftId: gift.giftId })
+    actions.appendChild(copyButton)
+    actions.appendChild(makeButton('在文件夹里显示', 'gift-reveal', { giftId: gift.giftId }))
+    actions.appendChild(makeButton('扔掉', 'gift-discard', { giftId: gift.giftId, tone: 'danger' }))
+
+    el.appendChild(head)
+    el.appendChild(body)
+    el.appendChild(fileBox)
+    el.appendChild(status)
+    el.appendChild(actions)
+    el.addEventListener('pointerdown', (event) => event.stopPropagation())
+    uiLayer.appendChild(el)
+
+    const entry = {
+      el,
+      giftId: gift.giftId,
+      deviceId: gift.deviceId,
+      status: gift.status,
+      kind: gift.kind,
+      name: gift.name ?? null,
+      size: gift.size ?? null,
+      titleEl: title,
+      bodyEl: body,
+      fileEl: fileBox,
+      thumbEl: thumb,
+      fileNameEl: fileName,
+      fileSizeEl: fileSize,
+      copyButton,
+      statusEl: status,
+      signature: ''
+    }
+    updateGiftCard(entry, gift)
+    return entry
+  }
+
+  function updateGiftCard (entry, gift) {
+    const signature = giftSignature(gift)
+    entry.deviceId = gift.deviceId
+    entry.status = gift.status
+    entry.kind = gift.kind
+    entry.name = gift.name ?? null
+    entry.size = gift.size ?? null
+    if (entry.signature === signature) return
+    entry.signature = signature
+    entry.titleEl.textContent = gift.title
+    entry.el.setAttribute('aria-label', gift.title)
+    const isFile = gift.kind === 'file'
+    entry.bodyEl.textContent = isFile ? '' : (gift.text ?? '')
+    entry.bodyEl.hidden = isFile || gift.text === undefined
+    entry.fileEl.hidden = !isFile
+    if (isFile) {
+      entry.fileNameEl.textContent = gift.name ?? '文件'
+      const sizeText = formatFileSize(gift.size)
+      entry.fileSizeEl.textContent = sizeText
+      entry.fileSizeEl.hidden = sizeText === ''
+      if (typeof gift.thumb === 'string' && gift.thumb !== '') {
+        if (entry.thumbEl.getAttribute('src') !== gift.thumb) entry.thumbEl.setAttribute('src', gift.thumb)
+        entry.thumbEl.hidden = false
+      } else {
+        entry.thumbEl.hidden = true
+        entry.thumbEl.removeAttribute('src')
+      }
+    } else {
+      entry.thumbEl.hidden = true
+      entry.thumbEl.removeAttribute('src')
+    }
+    entry.copyButton.hidden = isFile
+    entry.statusEl.textContent = gift.statusText ?? ''
+    entry.statusEl.hidden = gift.statusText === undefined
+    setGiftButtonsEnabled(entry, gift.status === 'received')
+  }
+
+  function hideGiftCard (giftId) {
+    const entry = ui.gifts.get(giftId)
+    if (entry === undefined) return
+    ui.gifts.delete(giftId)
+    try {
+      entry.el.remove()
+    } catch {
+      // 已经没了
+    }
+  }
+
+  /**
+   * 卡片集合完全由 scene.controls.gifts 决定：
+   *   - 礼物没了 / 访客不在了 → 收起（访客离开时宿主自然不再输出这张卡）；
+   *   - 同一 giftId 只画一张，标题/正文/状态原地更新，不重建 DOM（不打断点击）。
+   */
+  function syncGifts () {
+    const gifts = Array.isArray(scene.controls.gifts) ? scene.controls.gifts : []
+    const alive = new Set()
+    for (const gift of gifts) {
+      // 卡片跟着访客：访客没被画出来（场景放不下/已经走了）就不单独留一张卡。
+      if (!pets.has('visitor:' + gift.deviceId)) continue
+      alive.add(gift.giftId)
+      const existing = ui.gifts.get(gift.giftId)
+      if (existing === undefined) ui.gifts.set(gift.giftId, buildGiftCard(gift))
+      else updateGiftCard(existing, gift)
+    }
+    for (const giftId of [...ui.gifts.keys()]) {
+      if (!alive.has(giftId)) hideGiftCard(giftId)
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // 召回胶囊（自己出门时桌面没有 self）
   // -------------------------------------------------------------------------
 
@@ -1596,6 +1819,20 @@
       if (rect !== null) occupied.push(rect)
     }
 
+    // 礼物卡插在放行卡之后：锚点是**那位访客**，不是自己（礼物是“谁捎来的”）。
+    for (const entry of [...ui.gifts.values()]) {
+      const pet = pets.get('visitor:' + entry.deviceId)
+      if (pet === undefined) {
+        hideGiftCard(entry.giftId)
+        continue
+      }
+      const rect = positionFloating(entry.el, anchorOfPet(pet), {
+        avoid: petRects.concat(occupied),
+        gap: UI_GAP
+      })
+      if (rect !== null) occupied.push(rect)
+    }
+
     if (ui.popover !== null) {
       const pet = pets.get(ui.popover.petId)
       if (pet === undefined) {
@@ -1642,6 +1879,7 @@
       else if (ui.popover.signature !== popoverSignature()) closePopover('controls-changed')
     }
     syncPrompt()
+    syncGifts()
     syncStreet()
     syncRecallChip()
     syncNotice()
@@ -1658,6 +1896,7 @@
     if (action === 'end-visit') return '这位访客已经不在桌面上了。'
     if (action === 'admit' || action === 'reject') return '这位邻居已经不在了，刷新后再试。'
     if (action === 'dismiss') return '这张卡片暂时关不掉，稍后再试。'
+    if (action.startsWith('gift-')) return '这张礼物卡已经不在了。'
     return ACTION_FAILED_NOTICE
   }
 
@@ -1677,6 +1916,10 @@
         ui.hiddenPromptKey = pending.deviceId
         hidePrompt({ forget: false })
       }
+      // 成功也允许宿主带一句话（例如“字条已经复制到剪贴板”）：复制这种动作没有
+      // 可见状态变化，不给一句反馈就和没点一样。
+      const notice = typeof result.notice === 'string' ? result.notice.trim() : ''
+      if (notice !== '') showNotice(notice)
       return
     }
     if (pending.prompt) {
@@ -1712,6 +1955,8 @@
       deviceId: typeof deviceId === 'string' && deviceId !== '' ? deviceId : undefined,
       // 点播要带名字；其余动作为 undefined。
       name: typeof options.name === 'string' && options.name !== '' ? options.name : undefined,
+      // 礼物动作只带 giftId；路径与磁盘操作全在宿主那边，渲染端连字符串都拿不到。
+      giftId: typeof options.giftId === 'string' && options.giftId !== '' ? options.giftId : undefined,
       // 失败时的本机兜底（点播不可达 → 本机播一次）。只能影响本地表现，绝不能改状态。
       fallback: typeof options.fallback === 'function' ? options.fallback : null,
       prompt: options.prompt === true,
@@ -1736,7 +1981,13 @@
       return
     }
     try {
-      api.requestAction({ id, action, deviceId: pending.deviceId, name: pending.name })
+      api.requestAction({
+        id,
+        action,
+        deviceId: pending.deviceId,
+        name: pending.name,
+        giftId: pending.giftId
+      })
     } catch {
       settleAction(id, { ok: false, notice: ACTION_FAILED_NOTICE })
     }
@@ -1757,6 +2008,13 @@
         ? button.dataset.reason
         : fallbackNoticeFor(action)
       showNotice(reason)
+      return
+    }
+    if (action.startsWith('gift-')) {
+      // 礼物动作：只把 giftId 交给宿主。卡片/磁盘状态等宿主回灌，渲染端不自己改。
+      const giftId = typeof button.dataset.lpGift === 'string' ? button.dataset.lpGift : ''
+      if (giftId === '') return
+      requestAction(action, undefined, { giftId })
       return
     }
     if (action === 'open-street') {
@@ -2335,7 +2593,7 @@
     // 窗口翻回穿透——菜单画着，点击却落到后面的 app 上（用户报的"点了没反应、穿透"）。
     // reportOverlayRects 自己按 300ms 节流，逐帧调用不会刷屏。
     if (ui.popover !== null || ui.prompt !== null || ui.recall !== null || ui.notice !== null ||
-      ui.menu !== null || ui.street !== null) {
+      ui.menu !== null || ui.street !== null || ui.gifts.size > 0) {
       layoutUi(false)
       reportOverlayRects(false)
     }
@@ -2538,6 +2796,34 @@
             label: row.label,
             canVisit: row.canVisit
           })),
+          gifts: [...ui.gifts.values()].map((entry) => {
+            const box = entry.el.getBoundingClientRect()
+            return {
+              giftId: entry.giftId,
+              deviceId: entry.deviceId,
+              kind: entry.kind,
+              name: entry.name,
+              size: entry.size,
+              status: entry.status,
+              title: entry.titleEl.textContent,
+              text: entry.bodyEl.textContent,
+              statusText: entry.statusEl.hidden ? null : entry.statusEl.textContent,
+              // 缩略图诊断：loaded=true 才证明 CSP + localpet://gifts 协议真的把图喂进了 <img>。
+              thumb: entry.thumbEl.hidden
+                ? null
+                : {
+                    src: entry.thumbEl.getAttribute('src'),
+                    loaded: entry.thumbEl.complete && entry.thumbEl.naturalWidth > 0,
+                    width: entry.thumbEl.naturalWidth,
+                    height: entry.thumbEl.naturalHeight
+                  },
+              copyVisible: entry.copyButton.hidden !== true,
+              x: round(box.left),
+              y: round(box.top),
+              width: round(box.width),
+              height: round(box.height)
+            }
+          }),
           streetOpen: ui.street !== null,
           streetShowBlocked: ui.street === null ? false : ui.street.showBlocked,
           recallChip: ui.recall === null ? null : { nickname: scene.controls.recall.nickname },

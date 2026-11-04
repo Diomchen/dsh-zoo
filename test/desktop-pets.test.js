@@ -763,3 +763,122 @@ test('controlsFromSnapshot：街上的每一户都送到桌面，去不了的带
   // 旧快照没有 street：街道是空的，不抛。
   assert.deepEqual(controlsFromSnapshot(snapshotWith()).street, [])
 })
+
+test('controlsFromSnapshot：礼物卡跟着访客；正文只在 received 时给，文案来自宿主', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  const withGift = (gift) => snapshotWith({
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
+  })
+
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'text', text: '第一行\n第二行', status: 'received'
+  })).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'text',
+    status: 'received',
+    title: '「阿蟹」捎来一张字条',
+    text: '第一行\n第二行'
+  }])
+
+  // 还没写完磁盘：不画正文（给一半会骗人），只画状态行。
+  const pending = controlsFromSnapshot(withGift({
+    id: giftId, kind: 'text', text: '第一行\n第二行', status: 'pending'
+  })).gifts
+  assert.deepEqual(pending, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'text',
+    status: 'pending',
+    title: '「阿蟹」捎来一张字条',
+    statusText: '刚到，正在收下…'
+  }])
+
+  // 坏 gift 只丢这张卡：id 不是 UUID / 未知状态 / 未知 kind / 没有访客。
+  for (const bad of [
+    { id: 'gift-1', kind: 'text', text: 'x', status: 'received' },
+    { id: giftId, kind: 'text', text: 'x', status: 'lost' },
+    { id: giftId, kind: 'file', text: 'x', status: 'received' },
+    { id: giftId, kind: 'text', text: 'x' }
+  ]) {
+    assert.deepEqual(controlsFromSnapshot(withGift(bad)).gifts, [], JSON.stringify(bad))
+  }
+  assert.deepEqual(controlsFromSnapshot(snapshotWith()).gifts, [])
+  assert.deepEqual(controlsFromSnapshot(null).gifts, [])
+})
+
+test('controlsFromSnapshot：礼物卡没有独立生命周期——访客走了卡片就不在', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const gift = { id: '55555555-5555-4555-8555-555555555555', kind: 'text', text: 'x', status: 'received' }
+  const present = controlsFromSnapshot(snapshotWith({
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
+  }))
+  assert.equal(present.gifts.length, 1)
+  const gone = controlsFromSnapshot(snapshotWith({ visitors: [] }))
+  assert.deepEqual(gone.gifts, [])
+})
+
+// ---------------------------------------------------------------------------
+// ticket 25：文件礼物的卡片（name/size/thumb/失败原因）
+// ---------------------------------------------------------------------------
+
+test('controlsFromSnapshot：文件卡片带 name/size；缩略图只在 received 且是图片时给', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  const dir = '20261103-153245-ab12cd12'
+  const thumb = 'localpet://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
+  const thumbOf = (id) => (id === giftId ? thumb : null)
+  const withGift = (gift) => snapshotWith({
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
+  })
+
+  // 图片 + received：给缩略图；正文永远没有。
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'file', name: '照片.PNG', size: 23194, status: 'received'
+  }), { thumbOf }).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '照片.PNG',
+    size: 23194,
+    thumb
+  }])
+
+  // 非图片：不给 thumb（渲染端画文件图标）。
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'file', name: '报价单.pdf', size: 1024, status: 'received'
+  }), { thumbOf }).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'file',
+    status: 'received',
+    title: '「阿蟹」捎来一个文件',
+    name: '报价单.pdf',
+    size: 1024
+  }])
+
+  // 还没收下：不给 thumb，状态行来自固定词表；失败原因只认词表里的值。
+  const failed = controlsFromSnapshot(withGift({
+    id: giftId, kind: 'file', name: '照片.PNG', size: 23194, status: 'failed', reason: 'no-port'
+  }), { thumbOf }).gifts
+  assert.equal(failed.length, 1)
+  assert.equal('thumb' in failed[0], false)
+  assert.equal(failed[0].statusText, '对方没开素材端口，东西取不回来。')
+
+  const refused = controlsFromSnapshot(withGift({
+    id: giftId, kind: 'file', name: '照片.PNG', size: 23194, status: 'refused', reason: 'too-large'
+  }), { thumbOf }).gifts
+  assert.equal(refused[0].statusText, '这件东西超过 16 MB，没收下。')
+
+  // 文件卡缺 name 或 size 就整张丢掉（画不出半截卡）。
+  for (const bad of [
+    { id: giftId, kind: 'file', name: '照片.PNG', status: 'received' },
+    { id: giftId, kind: 'file', size: 10, status: 'received' },
+    { id: giftId, kind: 'file', name: '照片.PNG', size: 0, status: 'received' }
+  ]) {
+    assert.deepEqual(controlsFromSnapshot(withGift(bad), { thumbOf }).gifts, [], JSON.stringify(bad))
+  }
+})

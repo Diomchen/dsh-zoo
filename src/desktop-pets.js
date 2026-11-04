@@ -14,7 +14,8 @@
  */
 
 import shared from '../desktop/shared.js'
-import { isDeviceId } from './protocol.js'
+import { isGiftStatus, giftStatusText, giftTitleText } from './gift-text.js'
+import { isDeviceId, isVisitId, sanitizeGiftName } from './protocol.js'
 import { MAX_STREET, isBlockedReason } from './street.js'
 import { isVisitReason, visitReasonText } from './visit-copy.js'
 
@@ -107,16 +108,6 @@ export function droppedVisitors (snapshot) {
 }
 
 /**
- * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
- * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
- *
- * 文案必须是人话——渲染端只负责显示，不猜 error code；失败/置灰都不允许静默。
- * 渲染端只会把这些按钮点击翻译成 action 申请，状态变化仍然等下一次快照。
- *
- * @param {object} snapshot room.snapshot()
- * @returns {object} 与 shared.emptyControls() 同形状的归一化控件状态
- */
-/**
  * 快照的 `street` → 渲染端能画的一排房子（ticket 20/21）。
  *
  * 只做搬运和清洗：昵称、动作名、能不能去、为什么不能去。顺序就是宿主给的顺序
@@ -144,7 +135,84 @@ function streetFromSnapshot (snapshot) {
   return rows
 }
 
-export function controlsFromSnapshot (snapshot) {
+/**
+ * 访客身上的礼物 → 桌面卡片（ticket 23 / 25）。
+ *
+ * 卡片**跟着访客**：这里按 `snapshot.visitors` 走，访客一走这张卡自然就不输出了，
+ * 渲染端不需要另一套“什么时候收起卡片”的规则。标题与状态文案在宿主算好，
+ * 渲染端只画（`gift-text.js` 是唯一文案表）。
+ *
+ * 文件礼物额外带 name/size；`thumb` 只在**真的收下**且扩展名是 jpg/png/gif/webp 时给，
+ * 地址由 service 注入的 `thumbOf(giftId)` 算（目录名+文件名都来自礼物 store）。
+ */
+function giftsFromSnapshot (snapshot, { thumbOf = null } = {}) {
+  const gifts = []
+  const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
+  for (const visitor of visitors) {
+    if (gifts.length >= shared.MAX_GIFT_ITEMS) break
+    if (visitor === null || typeof visitor !== 'object') continue
+    const deviceId = deviceIdOf(visitor.deviceId)
+    if (deviceId === null) continue
+    const gift = visitor.gift
+    if (gift === null || typeof gift !== 'object') continue
+    if (!isVisitId(gift.id)) continue
+    if (!isGiftStatus(gift.status)) continue
+    const label = shared.normalizeLabel(visitor.nickname, '邻居')
+    const giftId = gift.id.toLowerCase()
+    const statusText = giftStatusText(gift.status, gift.reason ?? null)
+    if (gift.kind === 'file') {
+      // 文件名与大小缺一个就画不出文件卡，整张丢掉（room 永远给全，这里防的是手改/旧快照）。
+      const name = sanitizeGiftName(gift.name)
+      const size = Number.isInteger(gift.size) && gift.size > 0 ? gift.size : null
+      if (name === null || size === null) continue
+      const thumb = gift.status === 'received' && isThumbName(name) && typeof thumbOf === 'function'
+        ? thumbOf(giftId)
+        : null
+      gifts.push({
+        deviceId,
+        giftId,
+        kind: 'file',
+        status: gift.status,
+        title: giftTitleText(label, 'file'),
+        name,
+        size,
+        // 缩略图只给真的能画的图片；其余一律给文件图标（渲染端只按有没有 thumb 画）。
+        ...(typeof thumb === 'string' && thumb !== '' ? { thumb } : {}),
+        ...(statusText === null ? {} : { statusText })
+      })
+      continue
+    }
+    if (gift.kind !== 'text') continue
+    gifts.push({
+      deviceId,
+      giftId,
+      kind: 'text',
+      status: gift.status,
+      title: giftTitleText(label, 'text'),
+      // 正文只在本机真的收下之后才给：pending 时 note.txt 还没写完，给一半会骗人。
+      ...(gift.status === 'received' ? { text: gift.text } : {}),
+      ...(statusText === null ? {} : { statusText })
+    })
+  }
+  return gifts
+}
+
+/** 只有这四种扩展名能在卡片上画缩略图（与 desktop/main.js 的协议白名单同一个口径）。 */
+function isThumbName (name) {
+  return /\.(?:jpe?g|png|gif|webp)$/i.test(name)
+}
+
+/**
+ * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
+ * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
+ *
+ * 文案必须是人话——渲染端只负责显示，不猜 error code；失败/置灰都不允许静默。
+ * 渲染端只会把这些按钮点击翻译成 action 申请，状态变化仍然等下一次快照。
+ *
+ * @param {object} snapshot room.snapshot()
+ * @returns {object} 与 shared.emptyControls() 同形状的归一化控件状态
+ */
+export function controlsFromSnapshot (snapshot, options = {}) {
   const controls = shared.emptyControls()
   if (snapshot === null || typeof snapshot !== 'object') return controls
 
@@ -183,6 +251,7 @@ export function controlsFromSnapshot (snapshot) {
   }
 
   controls.street = streetFromSnapshot(snapshot)
+  controls.gifts = giftsFromSnapshot(snapshot, options)
 
   const prompt = snapshot.prompt !== null && typeof snapshot.prompt === 'object' ? snapshot.prompt : null
   if (prompt !== null) {

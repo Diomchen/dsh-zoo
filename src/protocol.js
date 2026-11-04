@@ -6,7 +6,7 @@
  * - 只认本文件列出的字段，多余的字段在重建对象时被丢弃；
  * - 版本、类型、deviceId、visitId、port 逐项校验，昵称清洗 + 截断，动画名只允许安全文件名；
  * - 每种报文只写自己那几个字段：beacon/beacon-ack 是身份，heartbeat 是动作意图，
- *   visit-request/ack/deny/recall 是一次串门的生命周期；
+ *   visit-request/ack/deny/recall 是一次串门的生命周期，gift-received 是礼物的送达回执；
  * - 任何校验失败都只返回 `{ ok: false }`，不抛异常、不写盘、不读本机状态。
  *
  * 协议本身不传素材本体、不传坐标、不传项目或会话信息（ADR-0003）。素材只传引用：
@@ -20,6 +20,19 @@ export const MAX_LABEL = 64
 export const MAX_ANIMATION = 64
 /** 跨端气泡最多 80 个码点；再长就不像“随口一句”，也给了滥用一个上限。 */
 export const MAX_SAY = 80
+/**
+ * 字条正文最多 500 个码点（SPEC v4）。
+ * 上限不按字节：一条 500 字的中文便条 JSON 后约 1.5 KiB，塞得进 4 KiB 的 UDP 包；
+ * 文件礼物走拉取（ticket 25），报文里只放元数据。
+ */
+export const MAX_GIFT_TEXT = 500
+/**
+ * 文件礼物（ticket 24 起发、ticket 25 收）：单件上限 16 MiB，文件名最多 120 个码点。
+ * 报文里只放元数据（name/size/sha256），本体永远走 HTTP 拉取（ADR-0011）。
+ */
+export const MAX_GIFT_NAME = 120
+export const MAX_GIFT_BYTES = 16 * 1024 * 1024
+const GIFT_SHA256_RE = /^sha256:[0-9a-f]{64}$/
 /** 气泡最多活 30 秒；过期就不再显示，避免一条旧话挂在别人桌面上。 */
 export const SAY_MAX_AGE_MS = 30 * 1000
 /** 语义标签是固定小表：不认识的动作名靠它画一个通用表情。 */
@@ -48,6 +61,7 @@ export const PEER_LOST_MS = 2 * 60 * 1000
  * 串门走现有 UDP socket，不另开 TCP 监听（见 docs/protocol.md 的“为什么是 UDP”）。
  * 类型集按生命周期固定：请求 → ack/deny，任一方可发 recall，收到 recall 的一方回一条
  * `visit-recall-ack` 作为回执（recall 也会丢，发起方要靠它停止重试）。
+ * `gift-received` 是礼物自己的回执（ticket 26），与串门生命周期无关。
  */
 export const PACKET_TYPES = Object.freeze([
   'beacon',
@@ -57,7 +71,8 @@ export const PACKET_TYPES = Object.freeze([
   'visit-ack',
   'visit-deny',
   'visit-recall',
-  'visit-recall-ack'
+  'visit-recall-ack',
+  'gift-received'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -66,6 +81,8 @@ const VISIT_TYPES = new Set([
   'visit-recall',
   'visit-recall-ack'
 ])
+// `gift-received` **故意不在 VISIT_TYPES 里**：那条分支只重建 v/type/deviceId/visitId，
+// 塞进去 giftId 会被吃掉。编码与解析各有一条自己的分支（ticket 26）。
 /**
  * visit-deny 的理由是固定枚举，不是自由文本：
  * - not-admitted：本机没放行这位邻居（默认，也兼容不带 reason 的旧报文）
@@ -79,6 +96,11 @@ const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const CONTROL_RE = /[\u0000-\u001f\u007f-\u009f]/g
 const BIDI_RE = /[\u202a-\u202e\u2066-\u2069]/g
+/**
+ * 字条正文的控制字符：**保留换行**（\u000a），其余 C0/C1 与 DEL 全部去掉。
+ * 便条是唯一允许多行的跨端文本：换行是它的一半意思，折叠掉就成了一行摘要。
+ */
+const NOTE_CONTROL_RE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/g
 
 /** 清理本地或远端文本：去掉控制字符与双向覆盖符，折叠空白，按码点截断。 */
 export function sanitizeLabel (value, max = MAX_NICKNAME) {
@@ -158,6 +180,79 @@ export function normalizeSay (value, now = Date.now()) {
   return { text, until: Math.min(Math.floor(until), now + SAY_MAX_AGE_MS) }
 }
 
+/**
+ * 字条正文的清洗：**保留换行**，去掉其余控制字符与双向覆盖符，首尾空白裁掉。
+ *
+ * 与 `sanitizeLabel` 的差别只有两处，但都很关键：
+ *   - 换行留着（便条是多行的，折成一行等于替用户改稿）；
+ *   - 超过上限返回 null，**不截断**。字条是一整段话，截一半比不带更糟；
+ *     调用方据此决定“这条礼物不收 / 这次不带”，而不是悄悄改字。
+ */
+export function sanitizeNote (value, max = MAX_GIFT_TEXT) {
+  if (typeof value !== 'string') return null
+  if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+  const clean = value
+    .replace(/\r\n?/g, '\n')
+    .replace(NOTE_CONTROL_RE, '')
+    .replace(BIDI_RE, '')
+    .trim()
+  if (clean === '') return null
+  const limit = Number.isInteger(max) && max > 0 ? max : MAX_GIFT_TEXT
+  if (Array.from(clean).length > limit) return null
+  return clean
+}
+
+/**
+ * 文件礼物的名字：去掉路径分隔符、控制字符、双向覆盖符与前导点，最多 120 码点。
+ * 空名返回 null，由 `normalizeGift` 退成 `file`——名字只是给人看的，不该让整件礼物作废。
+ *
+ * 这个名字**不参与拼路径**：接收端目录名由 `receivedAt` + id 推出来（ticket 25），
+ * 所以「去路径分隔符」是双保险，不是唯一防线。
+ */
+export function sanitizeGiftName (value) {
+  if (typeof value !== 'string') return null
+  if (typeof value.isWellFormed === 'function' && !value.isWellFormed()) return null
+  const clean = value
+    .replace(/[\\/]/g, '')
+    .replace(CONTROL_RE, '')
+    .replace(BIDI_RE, '')
+    .trim()
+    .replace(/^\.+/, '')
+    .trim()
+  if (clean === '') return null
+  const chars = Array.from(clean)
+  return chars.length > MAX_GIFT_NAME ? chars.slice(0, MAX_GIFT_NAME).join('') : clean
+}
+
+/**
+ * 串门捎的礼物（ADR-0011）：`kind:'text'` 是内联字条，`kind:'file'` 只有元数据
+ * （name/size/sha256），本体由接收方在访客抵达时向发起方拉取（ticket 25）。
+ *
+ * **校验不过返回 null，由调用方把整个 `gift` 字段丢掉，串门照常。**
+ * 这与 `anim` 非法就整包丢是相反的策略：动画是这次串门的“外观”，坏了可以退回待机；
+ * 便条/文件只是搭车的一件东西，为它把一次串门搞砸，代价和收益完全不对等。
+ */
+export function normalizeGift (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!isVisitId(value.id)) return null
+  const id = value.id.toLowerCase()
+  if (value.kind === 'text') {
+    const text = sanitizeNote(value.text)
+    if (text === null) return null
+    return { id, kind: 'text', text }
+  }
+  if (value.kind === 'file') {
+    const name = sanitizeGiftName(value.name) ?? 'file'
+    const size = Number(value.size)
+    // `1 … 16 MiB`：0 字节的文件不叫礼物，也会让接收端的 sha256 校验没有意义。
+    if (!Number.isInteger(size) || size <= 0 || size > MAX_GIFT_BYTES) return null
+    if (typeof value.sha256 !== 'string' || !GIFT_SHA256_RE.test(value.sha256)) return null
+    return { id, kind: 'file', name, size, sha256: value.sha256 }
+  }
+  // 认识的 kind 就这两种；别的值整条 gift 丢掉（旧端读到新 kind 也是这条路径）。
+  return null
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.LOCAL_PET_PORT
@@ -170,16 +265,37 @@ export function resolvePort (env = process.env) {
  * 构造一个只含白名单字段的报文。字段顺序与字段集按类型固定，便于测试和抓包对照：
  *   beacon / beacon-ack     → { v, type, deviceId, nickname, port[, skinPort, skinId] }
  *   heartbeat               → { v, type, deviceId, anim[, action, semantic, say, skinPort, skinId] }
- *   visit-request           → { v, type, deviceId, visitId, nickname, anim[, action, semantic, say, skinPort, skinId] }
+ *   visit-request           → { v, type, deviceId, visitId, nickname, anim[, action, semantic, say, skinPort, skinId, gift] }
  *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
+ *   gift-received           → { v, type, deviceId, visitId, giftId }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
  * （这是程序错误，不是网络输入）。
- * 本机动画名/动作名/气泡非法时不抛：降级成“不带这个字段”，让对端自己放待机。
+ * 本机动画名/动作名/气泡/字条非法时不抛：降级成“不带这个字段”，让对端自己放待机。
+ * 字条是唯一会因**整包体积**被丢掉的字段——见 `buildPacket` 的 4 KiB 兜底。
  */
-export function encodePacket ({
+export function encodePacket (options = {}) {
+  return buildPacket(options).data
+}
+
+/**
+ * 带字条的串门请求：除了字节，还回一个 `giftDropped`。
+ *
+ * 4 KiB 是 UDP 的硬上限，而一批便条不该把一次串门搞砸。所以编码层自己先试带 gift 的包，
+ * 超了就把 gift 摘掉重编一次，并告诉调用方“这次没带上”——service 据此在本机说一句话。
+ * 这个判断必须在这一层做：`encodePacket` 超限只有一个裸 `throw`，在 service 里 catch
+ * 之后分不清是字条太大、还是身份/昵称坏了，只能猜。
+ *
+ * `maxBytes` 只给单测用：500 码点的字条最坏（emoji）约 3 KiB，正常触不到 4 KiB，
+ * 防御路径要把上限调小才测得到。
+ */
+export function encodeVisitRequestDetailed (options = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
+  return buildPacket({ ...options, type: 'visit-request' }, { maxBytes })
+}
+
+function buildPacket ({
   type,
   deviceId,
   nickname,
@@ -187,13 +303,15 @@ export function encodePacket ({
   anim,
   visitId,
   reason,
+  giftId,
   action,
   semantic,
   say,
   skinPort,
   skinId,
+  gift,
   now = Date.now()
-} = {}) {
+} = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
   if (!isDeviceId(deviceId)) throw new Error('protocol: invalid deviceId')
 
@@ -225,6 +343,11 @@ export function encodePacket ({
     const safeReason = reason === undefined ? 'not-admitted' : reason
     if (!isVisitDenyReason(safeReason)) throw new Error('protocol: invalid deny reason')
     packet = { ...base, visitId: visitId.toLowerCase(), reason: safeReason }
+  } else if (type === 'gift-received') {
+    // 自己的分支，别并进 VISIT_TYPES：那条只写四个字段，giftId 会在这里消失。
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
+    packet = { ...base, visitId: visitId.toLowerCase(), giftId: giftId.toLowerCase() }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -235,9 +358,23 @@ export function encodePacket ({
     packet = { ...base, nickname: safeNickname, port, ...skin }
   }
 
-  const data = Buffer.from(JSON.stringify(packet), 'utf8')
-  if (data.length > MAX_PACKET_BYTES) throw new Error('protocol: packet too large')
-  return data
+  let giftDropped = false
+  if (type === 'visit-request' && gift !== undefined && gift !== null) {
+    const safeGift = normalizeGift(gift)
+    if (safeGift === null) giftDropped = true
+    else packet = { ...packet, gift: safeGift }
+  }
+
+  let data = Buffer.from(JSON.stringify(packet), 'utf8')
+  if (data.length > maxBytes && packet.gift !== undefined) {
+    // 兜底：字条再重要也不值得让串门失败。丢掉它、重编一次，串门本身一个字段都不动。
+    const { gift: _dropped, ...withoutGift } = packet
+    packet = withoutGift
+    data = Buffer.from(JSON.stringify(packet), 'utf8')
+    giftDropped = true
+  }
+  if (data.length > maxBytes) throw new Error('protocol: packet too large')
+  return { data, giftDropped }
 }
 
 /** 心跳/串门请求共用的可选字段；非法值只是不带，不整包失败。 */
@@ -265,8 +402,12 @@ export function encodeHeartbeat ({ deviceId, anim, action, semantic, say, skinPo
   return encodePacket({ type: 'heartbeat', deviceId, anim, action, semantic, say, skinPort, skinId, now })
 }
 
-/** ticket 05 的窄入口：串门请求只带昵称、动作和串门 id（外加可选的 skin/状态）。 */
-export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action, semantic, say, skinPort, skinId, now } = {}) {
+/**
+ * ticket 05 的窄入口：串门请求只带昵称、动作和串门 id（外加可选的 skin/状态与字条）。
+ * 需要知道“礼物到底带没带上”的调用方用 `encodeVisitRequestDetailed`；这里保持
+ * “返回一串字节”的老契约，超限时字条会被静默丢掉（串门本身仍然成功）。
+ */
+export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action, semantic, say, skinPort, skinId, gift, now } = {}) {
   return encodePacket({
     type: 'visit-request',
     deviceId,
@@ -278,6 +419,7 @@ export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action,
     say,
     skinPort,
     skinId,
+    gift,
     now
   })
 }
@@ -297,6 +439,15 @@ export function encodeVisitRecall ({ deviceId, visitId } = {}) {
 /** 收到 recall 的回执：让发起方立刻停止重发（它可能有两次重试在路上）。 */
 export function encodeVisitRecallAck ({ deviceId, visitId } = {}) {
   return encodePacket({ type: 'visit-recall-ack', deviceId, visitId })
+}
+
+/**
+ * 礼物的送达回执（ticket 26）：接收方**真的写进 `gifts/` 之后**才发。
+ * 发起方收到才把背包那件删掉，所以 `giftId` 是这条报文的全部意义——
+ * `visitId` 只用来核对“是不是这次串门带出去的那一件”。
+ */
+export function encodeGiftReceived ({ deviceId, visitId, giftId } = {}) {
+  return encodePacket({ type: 'gift-received', deviceId, visitId, giftId })
 }
 
 function fail (reason) {
@@ -355,11 +506,14 @@ export function parsePacket (input, { now = Date.now() } = {}) {
   }
 
   // 串门请求带昵称与动作名；昵称仍要清洗，动作名非法整包丢（与心跳一致）。
+  // 礼物是**例外**：gift 校验不过只丢这个字段，串门照常（见 normalizeGift 的注释）。
+  // anim 是这次串门的“外观”，退化一下还能画；一道便条却只是搭车的东西。
   if (raw.type === 'visit-request') {
     if (!isVisitId(raw.visitId)) return fail('visit-id')
     const nickname = normalizeNickname(raw.nickname)
     if (nickname === null) return fail('nickname')
     if (raw.anim !== null && !isSafeAnimationName(raw.anim)) return fail('anim')
+    const gift = normalizeGift(raw.gift)
     return {
       ok: true,
       packet: {
@@ -370,7 +524,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         nickname,
         anim: raw.anim === null ? null : raw.anim.trim(),
         ...petExtras({ action: raw.action, semantic: raw.semantic, say: raw.say, now }),
-        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
+        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId }),
+        ...(gift === null ? {} : { gift })
       }
     }
   }
@@ -388,6 +543,23 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         deviceId: raw.deviceId.toLowerCase(),
         visitId: raw.visitId.toLowerCase(),
         reason
+      }
+    }
+  }
+
+  // 送达回执（ticket 26）：多一个 giftId，且**不能**落进下面 VISIT_TYPES 那条分支
+  // （那里只重建四个字段，giftId 会被吃掉）。和 ack/recall 一样，别的字段一律丢弃。
+  if (raw.type === 'gift-received') {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    if (!isVisitId(raw.giftId)) return fail('gift-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase(),
+        giftId: raw.giftId.toLowerCase()
       }
     }
   }
