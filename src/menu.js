@@ -16,6 +16,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { stripJsonComments } from './pet-bridge.js'
+import { MAX_LABEL, normalizeSkinId } from './protocol.js'
 
 /** 与 dsh-pet `shared/menu.ts` 的 EVENT_LABELS 对齐。 */
 export const MENU_EVENT_LABELS = Object.freeze({
@@ -27,6 +28,8 @@ export const MENU_EVENT_LABELS = Object.freeze({
 /** 菜单最多几组 / 每组最多几项：跟着场景一起下发，别把一条 IPC 撑爆。 */
 export const MAX_MENU_GROUPS = 24
 export const MAX_MENU_ACTIONS = 256
+/** 「外观」里最多列几张皮：与素材源的注册表上限一致。 */
+export const MAX_MENU_SKINS = 16
 
 /** 一级工具项。id 是渲染端认的固定集合，文案在这里定。 */
 export const MENU_TOOL_LABELS = Object.freeze({
@@ -120,12 +123,39 @@ export function menuTools ({ hasOrigin = false } = {}) {
   return tools
 }
 
-/** 合成完整菜单：工具 + 动作分类。两条素材路都空时只剩工具项。 */
-export function buildMenu ({ animations = null, pool = [], hasOrigin = false } = {}) {
+/**
+ * 「外观」的候选（ticket 32）：只列注册表里真实存在的源。
+ * id 是动作参数，label 只给人看；坏条目丢自己，绝不让整份菜单消失。
+ */
+export function menuSkins (skins) {
+  const list = []
+  if (!Array.isArray(skins)) return list
+  const seen = new Set()
+  for (const candidate of skins) {
+    if (list.length >= MAX_MENU_SKINS) break
+    if (candidate === null || typeof candidate !== 'object') continue
+    const id = normalizeSkinId(candidate.id)
+    if (id === null || seen.has(id)) continue
+    const label = typeof candidate.label === 'string' && candidate.label.trim() !== ''
+      ? Array.from(candidate.label.trim()).slice(0, MAX_LABEL).join('')
+      : id
+    seen.add(id)
+    list.push({ id, label })
+  }
+  return list
+}
+
+/** 合成完整菜单：工具 + 动作分类 + 外观。三条路都空时只剩工具项。 */
+export function buildMenu ({ animations = null, pool = [], hasOrigin = false, skins = [], activeSkin = null } = {}) {
   const groups = groupsFromAnimations(animations)
+  const choices = menuSkins(skins)
   return {
     tools: menuTools({ hasOrigin }),
-    groups: groups.length > 0 ? groups : groupsFromPool(pool)
+    groups: groups.length > 0 ? groups : groupsFromPool(pool),
+    skins: choices,
+    activeSkin: typeof activeSkin === 'string' && choices.some((choice) => choice.id === activeSkin)
+      ? activeSkin
+      : null
   }
 }
 

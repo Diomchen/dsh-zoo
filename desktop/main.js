@@ -841,6 +841,12 @@ ipcMain.on('local-pet:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '这个动作没有名字，播不了。', error: 'bad-name' })
     return
   }
+  // 换皮只带素材源 id（ticket 32）：注册表在宿主那边，这里只守 id 的形状。
+  const skinId = action === 'use-skin' ? shared.normalizeSkinId(payload?.skinId) : null
+  if (action === 'use-skin' && skinId === null) {
+    sendActionResult({ id, ok: false, notice: '这个外观没有名字，换不了。', error: 'bad-skin-id' })
+    return
+  }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
   const written = writeEvent({
     type: 'action',
@@ -848,6 +854,7 @@ ipcMain.on('local-pet:action', (event, payload) => {
     action,
     deviceId,
     ...(name === null ? {} : { name }),
+    ...(skinId === null ? {} : { skinId }),
     ...(giftId === null ? {} : { giftId })
   })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })

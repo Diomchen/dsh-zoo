@@ -236,3 +236,61 @@ test('待机池过滤掉点击回应/拖拽/事件/文字类，只留日常动�
   }
   assert.deepEqual(idlePoolOf(source), ['写代码', '吃西瓜', '待机呼吸休闲'].sort())
 })
+
+test('皮可以自己指定待机动作：别的素材包不叫「待机呼吸休闲」', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, SKIN_FILE), JSON.stringify({
+    sources: [{ id: 'cat', dir: '/skins/cat', idle: '待机' }]
+  }), 'utf8')
+
+  const result = await loadSkinSources({
+    dataDir: dir,
+    resolveDshPetDirs: () => [],
+    readdir: fakeReaddir({ '/skins/cat': ['待机.webm', '伸爪拍屏幕.webm', '追尾巴.webm'] })
+  })
+
+  assert.deepEqual(result.warnings, [])
+  assert.equal(result.sources[0].idle, '待机')
+  assert.equal(result.sources[0].manifest.idle, '待机')
+})
+
+test('待机动作声明了但目录里没有：告警一次，回落到字母序第一段', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, SKIN_FILE), JSON.stringify({
+    sources: [{ id: 'cat', dir: '/skins/cat', idle: '不存在的动作' }]
+  }), 'utf8')
+
+  const result = await loadSkinSources({
+    dataDir: dir,
+    resolveDshPetDirs: () => [],
+    readdir: fakeReaddir({ '/skins/cat': ['哈气.webm', '伸爪拍屏幕.webm'] })
+  })
+
+  assert.deepEqual(result.warnings.map((w) => w.code), ['bad-idle'])
+  // 没有声明、也没有「待机呼吸休闲」时，仍是字母序第一段（码点序：伸 < 哈）。
+  assert.equal(result.sources[0].idle, '伸爪拍屏幕')
+})
+
+test('一次性动作不进待机池，清单里也不再标 loop', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, SKIN_FILE), JSON.stringify({
+    sources: [{ id: 'cat', dir: '/skins/cat', idle: '待机', once: ['喷火', '打滚晒太阳', '没有这段'] }]
+  }), 'utf8')
+
+  const result = await loadSkinSources({
+    dataDir: dir,
+    resolveDshPetDirs: () => [],
+    readdir: fakeReaddir({
+      '/skins/cat': ['待机.webm', '喷火.webm', '打滚晒太阳.webm', '东张西望.webm']
+    })
+  })
+
+  const [source] = result.sources
+  assert.deepEqual(result.warnings.map((w) => w.code), ['bad-once'])
+  assert.deepEqual(source.once, ['喷火', '打滚晒太阳'])
+  assert.equal(source.manifest.actions['喷火'].loop, false)
+  assert.equal(source.manifest.actions['待机'].loop, true)
+
+  const { idlePoolOf } = await import('../src/skin-sources.js')
+  assert.deepEqual(idlePoolOf(source), ['东张西望', '待机'])
+})

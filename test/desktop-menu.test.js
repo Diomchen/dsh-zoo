@@ -43,14 +43,14 @@ test('菜单：空分类不出现，动画名去重且过安全名校验', () =>
 
 test('菜单：整份坏数据 → 空菜单，不抛', () => {
   for (const bad of [null, undefined, 42, 'menu', [], { tools: 'x', groups: {} }]) {
-    assert.deepEqual(shared.normalizeMenu(bad), { tools: [], groups: [] })
+    assert.deepEqual(shared.normalizeMenu(bad), { tools: [], groups: [], skins: [], activeSkin: null })
   }
 })
 
 test('菜单：场景 v3 带 menu；旧场景没有这个字段时是空菜单', () => {
   const fresh = shared.normalizeScene({ items: [] })
   assert.equal(fresh.version, 3)
-  assert.deepEqual(fresh.menu, { tools: [], groups: [] })
+  assert.deepEqual(fresh.menu, { tools: [], groups: [], skins: [], activeSkin: null })
 
   const scene = shared.normalizeScene({
     items: [],
@@ -99,4 +99,41 @@ test('菜单：子菜单以父项那条为锚点，贴右侧展开', () => {
   const parent = { x: 40, y: 80, width: 160, height: 26 }
   const sub = shared.placeMenu(parent, { width: 180, height: 260 }, area)
   assert.deepEqual({ x: sub.x, y: sub.y }, { x: 40 + 160 + 2, y: 80 })
+})
+
+test('菜单：外观候选与当前项都从宿主下发，坏条目只丢自己', () => {
+  const menu = shared.normalizeMenu({
+    skins: [
+      { id: 'fish', label: '鱼' },
+      { id: 'cat', label: '猫' },
+      { id: 'bad id', label: '带空格' },
+      { id: 'fish', label: '重复' },
+      { id: 'nil' }
+    ],
+    activeSkin: 'cat'
+  })
+  assert.deepEqual(menu.skins, [
+    { id: 'fish', label: '鱼' },
+    { id: 'cat', label: '猫' }
+  ])
+  assert.equal(menu.activeSkin, 'cat')
+
+  // 当前项不在候选里 → 当作没有，菜单不会给一个不存在的皮打勾。
+  assert.equal(shared.normalizeMenu({ skins: [{ id: 'fish', label: '鱼' }], activeSkin: 'ghost' }).activeSkin, null)
+})
+
+test('菜单：use-skin 只带素材源 id，形状不对整条拒绝', () => {
+  assert.equal(shared.DESKTOP_ACTIONS.includes('use-skin'), true)
+  assert.equal(shared.MENU_ACTION_IDS.includes('use-skin'), true)
+
+  const ok = shared.normalizeHelperEvent({ type: 'action', id: 'act-1', action: 'use-skin', skinId: 'cat' })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.event.skinId, 'cat')
+
+  for (const bad of [undefined, null, '', '../etc', 'a'.repeat(33)]) {
+    assert.deepEqual(
+      shared.normalizeHelperEvent({ type: 'action', id: 'act-2', action: 'use-skin', skinId: bad }),
+      { ok: false, error: 'bad-skin-id' }
+    )
+  }
 })

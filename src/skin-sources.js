@@ -12,6 +12,9 @@ import { MAX_LABEL, isSafeAnimationName } from './protocol.js'
  * 一个「源」= 一组覆盖目录 + 一个基准尺寸 + 一份动作清单。dsh-pet 只是其中一个源
  * （自动注册）；别的宠物插件只要把自己的素材目录写进 `<dataDir>/skin.json`，就也是源。
  *
+ * ticket 32 起每条源还可以声明两个可选项：`idle`（这张皮的待机动作名）和
+ * `once`（一次性动作名；不进闲时轮播）。两条都是"声明了才生效"，缺省行为一个字不变。
+ *
  * 这一层只读本机文件，不起 HTTP、不碰协议——对外供源是下一步（ticket 15）。
  * 任何坏配置都只跳过那一个源并记一条告警，绝不让发现/串门/桌面跟着坏。
  */
@@ -23,6 +26,8 @@ export const MIN_SIZE = 32
 export const MAX_SIZE = 2048
 export const MAX_SKIN_SOURCES = 16
 export const MAX_SKIN_DIRS = 8
+/** 一张皮最多认这么多「一次性动作」：skin.json 是本地文件，但也别让它无限长。 */
+export const MAX_SKIN_ONCE = 64
 /** dsh-pet 的待机动作；没有它时退到排序后的第一个动作。 */
 export const IDLE_ACTION = '待机呼吸休闲'
 
@@ -122,14 +127,23 @@ export async function loadSkinSources (options = {}) {
     }
     const actions = scanned.actions
 
-    const idle = Object.prototype.hasOwnProperty.call(actions, IDLE_ACTION) ? IDLE_ACTION : ids[0]
+    // 待机动作：皮自己声明的优先（别的素材包不叫「待机呼吸休闲」），坏声明只告警不失败。
+    const idle = resolveIdle(normalized, actions, ids, warn)
+    // 一次性动作（ticket 32）：不进闲时轮播，清单里也不再标 loop。
+    const once = []
+    for (const name of normalized.once) {
+      if (Object.prototype.hasOwnProperty.call(actions, name)) once.push(name)
+    }
+    if (once.length !== normalized.once.length) warn('bad-once', normalized.id)
+    const onceSet = new Set(once)
+
     const manifest = {
       v: 1,
       id: normalized.id,
       name: normalized.name,
       size: normalized.size,
       idle,
-      actions: Object.fromEntries(ids.map((id) => [id, { file: actions[id].file, loop: true }]))
+      actions: Object.fromEntries(ids.map((id) => [id, { file: actions[id].file, loop: !onceSet.has(id) }]))
     }
 
     usedIds.add(normalized.id)
@@ -138,6 +152,8 @@ export async function loadSkinSources (options = {}) {
       name: normalized.name,
       size: normalized.size,
       dirs: normalized.dirs,
+      idle,
+      once,
       actions,
       manifest
     })
@@ -191,7 +207,36 @@ function normalizeEntry (raw, home, warn) {
     warn('bad-dir', id)
     return null
   }
-  return { id, name, size, dirs }
+
+  // 待机动作：给不叫「待机呼吸休闲」的素材包一个明说的位置；是不是真存在，扫完目录才知道。
+  const idle = typeof raw.idle === 'string' && raw.idle.trim() !== '' && isSafeAnimationName(raw.idle)
+    ? raw.idle.trim()
+    : null
+  // 一次性动作：数组或单个字符串都收，名字过安全校验，去重；不存在的名字扫完再报。
+  const once = []
+  const onceSeen = new Set()
+  const rawOnce = Array.isArray(raw.once) ? raw.once : [raw.once]
+  for (const value of rawOnce) {
+    if (once.length >= MAX_SKIN_ONCE) break
+    if (typeof value !== 'string') continue
+    if (!isSafeAnimationName(value)) continue
+    const name = value.trim()
+    if (name === '' || onceSeen.has(name)) continue
+    onceSeen.add(name)
+    once.push(name)
+  }
+
+  return { id, name, size, dirs, idle, once }
+}
+
+/** 待机动作：声明的 → dsh-pet 的老名字 → 字母序第一段。声明坏了只告警一次。 */
+function resolveIdle (entry, actions, ids, warn) {
+  if (entry.idle !== null) {
+    if (Object.prototype.hasOwnProperty.call(actions, entry.idle)) return entry.idle
+    warn('bad-idle', entry.id)
+  }
+  if (Object.prototype.hasOwnProperty.call(actions, IDLE_ACTION)) return IDLE_ACTION
+  return ids[0]
 }
 
 function expandDir (value, home) {
@@ -254,8 +299,10 @@ export function idlePoolOf (source) {
   if (source === null || typeof source !== 'object') return []
   const actions = source.actions
   if (actions === null || typeof actions !== 'object' || Array.isArray(actions)) return []
+  const once = new Set(Array.isArray(source.once) ? source.once : [])
   const pool = []
   for (const name of Object.keys(actions)) {
+    if (once.has(name)) continue
     if (IDLE_EXCLUDE_PREFIXES.some((prefix) => name.startsWith(prefix))) continue
     if (IDLE_EXCLUDE_EXACT.has(name)) continue
     pool.push(name)

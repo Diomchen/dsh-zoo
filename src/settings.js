@@ -1,6 +1,8 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import { normalizeSkinId } from './protocol.js'
+
 /**
  * 本机桌面开关：<dataDir>/settings.json。
  *
@@ -9,10 +11,13 @@ import { join } from 'node:path'
  *   - `autoVisits`（默认关）：允不允许我的宠物**自己**偶尔出门串门（ticket 09）。
  *   - `desktop`（默认开）：桌面层总闸。置顶全屏窗在你这台机器上行为不对时，把它写成 false
  *     再重启，宠物不显示、其它一切照常——不需要环境变量，也不需要卸载插件。
+ *   - `activeSource`（默认空 = 第一条）：当前那张皮的素材源 id（ticket 32 / ADR-0013）。
+ *     它只决定"用哪张皮"，名字、身份、串门记录、礼物都不随它变。
  *       {
  *         "version": 1,
  *         "acceptVisits": true,
- *         "autoVisits": false
+ *         "autoVisits": false,
+ *         "activeSource": "maodie"
  *       }
  *
  * `acceptVisits` 关掉时只拒绝**入站串门请求**：邻居灯、发现广播、心跳和本机出门照旧。
@@ -45,6 +50,7 @@ class SettingsStore {
   #acceptVisits = DEFAULT_ACCEPT_VISITS
   #autoVisits = DEFAULT_AUTO_VISITS
   #desktop = true
+  #activeSource = null
   #warned = new Set()
   #writeChain = Promise.resolve()
 
@@ -88,6 +94,13 @@ class SettingsStore {
       if (typeof raw.desktop === 'boolean') this.#desktop = raw.desktop
       else this.#warnOnce('shape', '桌面开关形状不对，desktop 先按默认值运行')
     }
+    // 当前皮：只认素材源 id 那个形状。指向一个不存在的源不是这里的事——
+    // 注册表才知道有哪些源，由 service 回落到第一条并告警（ticket 32）。
+    if (raw.activeSource !== undefined && raw.activeSource !== null) {
+      const id = normalizeSkinId(raw.activeSource)
+      if (id === null) this.#warnOnce('shape', '桌面开关形状不对，activeSource 先按默认值运行')
+      else this.#activeSource = id
+    }
   }
 
   get acceptVisits () {
@@ -100,6 +113,11 @@ class SettingsStore {
 
   get desktop () {
     return this.#desktop
+  }
+
+  /** 当前那张皮的源 id；null = 还没选过，取注册表第一条。 */
+  get activeSource () {
+    return this.#activeSource
   }
 
   /**
@@ -118,6 +136,15 @@ class SettingsStore {
     return this.#persist()
   }
 
+  /** 换皮（ticket 32）：只写这一项，别的字段一个都不碰。 */
+  async setActiveSource (id) {
+    if (typeof id !== 'string') return false
+    const normalized = normalizeSkinId(id)
+    if (normalized === null) return false
+    this.#activeSource = normalized
+    return this.#persist()
+  }
+
   #persist () {
     // 串行化写入：连点开关时，后一次不会读到前一次写了一半的文件。
     const task = this.#writeChain.then(() => this.#write(), () => this.#write())
@@ -132,7 +159,9 @@ class SettingsStore {
         desktop: this.#desktop,
         version: SETTINGS_VERSION,
         acceptVisits: this.#acceptVisits,
-        autoVisits: this.#autoVisits
+        autoVisits: this.#autoVisits,
+        // 没选过就不写这一行：老文件与旧版本看起来一模一样。
+        ...(this.#activeSource === null ? {} : { activeSource: this.#activeSource })
       }, null, 2) + '\n'
       await writeFile(join(this.#dir, SETTINGS_FILE), body, { encoding: 'utf8', mode: 0o600 })
       return true

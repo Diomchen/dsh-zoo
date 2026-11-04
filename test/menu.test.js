@@ -115,3 +115,29 @@ test('读动画配置：素材目录旁边的 config.jsonc，剥注释；坏文�
   assert.equal(await readAnimationsConfig([]), null)
   assert.equal(await readAnimationsConfig(null), null)
 })
+
+test('菜单「外观」：只列合法 id，当前那张带 activeSkin', () => {
+  const menu = buildMenu({
+    animations: { idle: ['东张西望'] },
+    skins: [
+      { id: 'fish', label: '鱼' },
+      { id: 'cat', label: '猫' },
+      { id: '../etc', label: '非法' },
+      { id: 'fish', label: '重复' },
+      { id: 'no-label' }
+    ],
+    activeSkin: 'cat'
+  })
+
+  assert.deepEqual(menu.skins, [
+    { id: 'fish', label: '鱼' },
+    { id: 'cat', label: '猫' },
+    { id: 'no-label', label: 'no-label' }
+  ])
+  assert.equal(menu.activeSkin, 'cat')
+})
+
+test('菜单「外观」：activeSkin 不在候选里就当没有，别画错勾', () => {
+  const menu = buildMenu({ skins: [{ id: 'fish', label: '鱼' }], activeSkin: 'ghost' })
+  assert.equal(menu.activeSkin, null)
+})

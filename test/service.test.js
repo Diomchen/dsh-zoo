@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { BACKPACK_FILE } from '../src/backpack.js'
 import { IDENTITY_FILE, defaultNickname } from '../src/identity.js'
 import { PEERS_FILE } from '../src/peers.js'
+import { SKIN_FILE } from '../src/skin-sources.js'
 import { PEER_LOST_MS, isDeviceId, normalizeNickname } from '../src/protocol.js'
 import { createService } from '../src/service.js'
 import { DEFAULT_ACCEPT_VISITS, DEFAULT_AUTO_VISITS, SETTINGS_FILE, SETTINGS_VERSION } from '../src/settings.js'
@@ -1094,4 +1096,149 @@ test('双桌面层：配置还在但 /state 不通时，dshPet.name 不能顶配
   assert.equal(res.body.dshPet.reachable, false, '判据里 dsh-pet 不可达')
   assert.equal(res.body.dshPet.reason, 'unreachable', '配置在、路由不通')
   assert.equal(res.body.dshPet.name, null, '不可达时名字要清空：配置里的残留不算它在画')
+})
+
+/** 两张皮：第一张是 dsh-pet 的老形状，第二张是别人的（自己的待机名 + 一次性动作）。 */
+async function skinFixture (dir) {
+  const fish = join(dir, 'skin-fish')
+  const cat = join(dir, 'skin-cat')
+  await mkdir(fish, { recursive: true })
+  await mkdir(cat, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeFile(join(fish, '东张西望.webm'), 'fish')
+  await writeFile(join(cat, '待机.webm'), 'cat')
+  await writeFile(join(cat, '喷火.webm'), 'cat')
+  await writeFile(join(dir, SKIN_FILE), JSON.stringify({
+    sources: [
+      { id: 'fish', name: '鱼', dirs: [fish] },
+      { id: 'cat', name: '猫', dirs: [cat], idle: '待机', once: ['喷火'] }
+    ]
+  }), 'utf8')
+  return { fish, cat }
+}
+
+test('换皮：use-skin 切到第二张皮，只写 settings.json，身份与记录一字不动', async (t) => {
+  const dir = await tempDir(t)
+  await skinFixture(dir)
+  // dsh-pet 的配置也放一份：换皮绝不许碰它（ADR-0013 §决定 4）。
+  const petConfig = join(dir, 'dsh-pet-config.jsonc')
+  await writeFile(petConfig, JSON.stringify({ pets: [{ id: 'main', name: '鱼姐' }] }), 'utf8')
+
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktop: false,
+    petConfigPath: petConfig
+  })
+  await service.ready
+
+  const files = [IDENTITY_FILE, PEERS_FILE, VISITS_FILE, BACKPACK_FILE, petConfig]
+  const before = new Map()
+  for (const file of files) before.set(file, await readFile(join(dir, file), 'utf8').catch(() => null))
+
+  const state = await call(service, '/local-pet/state')
+  assert.equal(state.body.skin.id, 'fish')
+
+  const result = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'use-skin', skinId: 'cat' }
+  })
+  assert.equal(result.status, 200)
+  assert.equal(result.body.ok, true)
+  assert.equal(result.body.skin, 'cat')
+  assert.equal(result.body.persisted, true)
+
+  const after = await call(service, '/local-pet/state')
+  assert.equal(after.body.skin.id, 'cat')
+  assert.equal(after.body.skin.idle, '待机')
+
+  const settings = JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8'))
+  assert.equal(settings.activeSource, 'cat')
+
+  for (const file of files) {
+    assert.equal(await readFile(join(dir, file), 'utf8').catch(() => null), before.get(file), file + ' 不该被换皮改写')
+  }
+})
+
+test('换皮：未知 id 明确失败，当前那张皮不变', async (t) => {
+  const dir = await tempDir(t)
+  await skinFixture(dir)
+  const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
+  await service.ready
+
+  const result = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'use-skin', skinId: 'ghost' }
+  })
+  assert.equal(result.status, 409)
+  assert.equal(result.body.ok, false)
+  assert.equal(result.body.error, 'unknown-skin')
+
+  const state = await call(service, '/local-pet/state')
+  assert.equal(state.body.skin.id, 'fish')
+})
+
+test('activeSource 指向一个已经不存在的源：回落第一条并告警', async (t) => {
+  const dir = await tempDir(t)
+  await skinFixture(dir)
+  await writeFile(join(dir, SETTINGS_FILE), JSON.stringify({
+    version: SETTINGS_VERSION,
+    acceptVisits: true,
+    autoVisits: false,
+    activeSource: 'ghost'
+  }), 'utf8')
+
+  const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
+  await service.ready
+
+  const state = await call(service, '/local-pet/state')
+  assert.equal(state.body.skin.id, 'fish')
+  assert.ok(
+    service.warnings.some((line) => line.includes('activeSource')),
+    '应该告警一次，说明回落了：' + JSON.stringify(service.warnings)
+  )
+})
+
+/** 桌面 helper 的最小替身：只为把「右键菜单 → 宿主」这条事件回路跑起来。 */
+function desktopDouble () {
+  const calls = { results: [] }
+  let onEvent = null
+  return {
+    calls,
+    factory (options) {
+      onEvent = options.onEvent
+      return {
+        start () { return { ok: true, pid: 4242 } },
+        update () { return true },
+        resync () { return true },
+        actionResult (id, result) { calls.results.push({ id, result }) },
+        dispose () {}
+      }
+    },
+    emit (event) { onEvent?.(event) }
+  }
+}
+
+test('换皮：桌面右键那条路（action 事件带 skinId）也能切，结果回给 helper', async (t) => {
+  const dir = await tempDir(t)
+  await skinFixture(dir)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+
+  desktop.emit({ type: 'action', id: 'act-skin-1', action: 'use-skin', skinId: 'cat' })
+
+  const deadline = Date.now() + 1000
+  while (desktop.calls.results.length === 0 && Date.now() < deadline) await delay(10)
+
+  assert.equal(desktop.calls.results.length, 1)
+  assert.equal(desktop.calls.results[0].id, 'act-skin-1')
+  assert.equal(desktop.calls.results[0].result.ok, true)
+
+  const state = await call(service, '/local-pet/state')
+  assert.equal(state.body.skin.id, 'cat')
 })

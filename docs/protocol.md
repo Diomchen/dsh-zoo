@@ -133,6 +133,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `gift-reveal` | `{ "giftId": "<uuid>" }` | 在文件夹里显示 |
 | `gift-discard` | `{ "giftId": "<uuid>" }` | 扔掉：有磁盘记录就立刻整目录删除；没有记录（`pending` / `receiving` / `failed` / `refused`）只拉黑、不碰文件。两种情况都记进本次运行的黑名单 |
 | `gift-copy` | `{ "giftId": "<uuid>" }` | 字条正文进剪贴板；文件没有可复制正文，明确拒绝 |
+| `use-skin` | `{ "skinId": "<源 id>" }` | 换成本机素材注册表里的另一张皮（ticket 32 / ADR-0013）：只换外观、动作和对外 `skinId`；名字、身份、串门记录、礼物不动。未知 id `409 unknown-skin` |
 
 ### 名字只有一份（ADR-0007）
 
@@ -367,9 +368,10 @@ v1 把心跳影子画成“访客”；v2 不画它。它现在是**在线/互�
 - 快照只给最近 5 条（`snapshot.visits`，最新在前）：`visits.json` 仍保留 200 条，
   只是 `snapshot` 这一层不把全部历史交给客户端。快照里的记录同样可能带 `gift`，
   形状与 `visits.json` 完全一致（`in` / `out` 都写）。
-- `GET /local-pet/state` 是**本机**的状态出口：在 `snapshot` 之外多 `backpack` 与
-  `gifts` 两项（见 README 的「带派」段）。它们只反映本机磁盘上的背包与已收下的礼物，
-  不是线路协议的一部分，远端写不进来。
+- `GET /local-pet/state` 是**本机**的状态出口：在 `snapshot` 之外多 `backpack` / `gifts` /
+  `skin` 三项（见 README 的「带派」与「换皮」段）。`skin` 是当前那张皮
+  `{ id, name, size, idle }`（没有素材源时是 `null`）。它们只反映本机的背包、已收下的礼物
+  与当前皮，不是线路协议的一部分，远端写不进来。
 
 ## 礼物字段（`visit-request.gift`，ticket 23 / 25）
 

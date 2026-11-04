@@ -35,6 +35,7 @@ import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
   MAX_GIFT_BYTES,
+  normalizeSkinId,
   PEER_LOST_MS,
   VISIT_MAX_MS,
   encodeGiftReceived,
@@ -189,8 +190,12 @@ export function createService (ctx, options = {}) {
   // 文件礼物的拉取客户端（ticket 25）；没有网络时是 null。
   let giftFetcher = null
   // 本机宠物的待机池：dsh-pet 那一整套动作名；桌面只拿它轮播，不猜、不点播。
-  // 测试可以注入 options.skinPool；生产由 startSkinSource 从注册表填。
+  // 测试可以注入 options.skinPool；生产由 loadSkin() 从注册表填。
   let skinPool = Array.isArray(options.skinPool) ? options.skinPool.slice() : []
+  // 注册表与当前那张皮（ticket 32）：idlePool、对外 skinId、菜单里的「外观」都从这里来。
+  // 皮只决定外观和动作，不动 identity / peers / visits / backpack / 礼物（ADR-0013）。
+  let skinSources = []
+  let activeSkin = null
   // 右键菜单（ticket 22）：工具项 + 动作分类，随场景一起下发；dsh-pet 的配置读不到就退平铺。
   let desktopMenu = { tools: [], groups: [] }
   let tickTimer = null
@@ -516,6 +521,26 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'reload' }
     }
 
+    // 换皮（ticket 32 / ADR-0013）：只换外观和动作，名字、身份、串门记录、礼物一个字不动。
+    // 落盘只写 settings.json 的 activeSource；写不进去也照样换，只是回报 persisted:false。
+    if (action === 'use-skin') {
+      if (settings === null) return { ok: false, error: 'starting' }
+      // HTTP 与桌面控件两条路都带 `skinId`：和 deviceId / giftId 同一个命名习惯，
+      // 别再让一条路叫 id、另一条叫 skinId（那正是最早那个 bug）。
+      const id = normalizeSkinId(body?.skinId)
+      if (id === null) return { ok: false, error: 'bad-skin-id' }
+      if (!skinSources.some((source) => source.id === id)) return { ok: false, error: 'unknown-skin' }
+      const persisted = await settings.setActiveSource(id)
+      applySkin(skinSources, id)
+      await refreshDesktopMenu()
+      // 场景签名里带着 idlePool 与菜单：清掉它，否则同一张皮换了动作池不会下发。
+      desktopSceneSignature = null
+      syncDesktop()
+      // 立刻补发心跳：邻居下一次取素材就用新 id，不用等 2 秒节拍。
+      sendHeartbeats()
+      return { ok: true, action: 'use-skin', skin: id, persisted }
+    }
+
     // 「打开软件」：地址由宿主给（渲染端不传 URL），只交给主进程的默认浏览器。
     if (action === 'open-site') {
       const url = dshOrigin(ctx)
@@ -537,6 +562,10 @@ export function createService (ctx, options = {}) {
   function stateView () {
     return {
       ...room.snapshot(),
+      // 当前那张皮（ticket 32）：换皮只看这一项，别的状态都不该动。
+      skin: activeSkin === null
+        ? null
+        : { id: activeSkin.id, name: activeSkin.name, size: activeSkin.size, idle: activeSkin.idle },
       backpack: backpack?.items() ?? [],
       gifts: recentGifts()
     }
@@ -799,6 +828,8 @@ export function createService (ctx, options = {}) {
       startDesktopLayer()
       if (disposed) return
 
+      // 皮是本地资源，跟联不联网无关：先读注册表，菜单才有降级清单可用（ticket 32）。
+      await loadSkin()
       // 菜单的内容依赖素材源（降级清单）与 DSH 地址，所以在素材源之后建。
       await refreshDesktopMenu()
       if (disposed) return
@@ -814,7 +845,7 @@ export function createService (ctx, options = {}) {
           cooldownMs: options.giftCooldownMs
         })
         // 先起素材源，再起发现：beacon 的第一拍就能带上 skinPort。
-        await startSkinSource()
+        await serveSkin()
         if (disposed) return
         // 素材源读完才知道降级清单（skinPool）；菜单要在这之后再建一次。
         await refreshDesktopMenu()
@@ -944,12 +975,66 @@ export function createService (ctx, options = {}) {
     } catch {
       animations = null
     }
+    // 两条素材路共用同一份「外观」信息：读不到 dsh-pet 的 animations 时只少掉动作分类。
+    const common = {
+      pool: skinPool,
+      hasOrigin: dshOrigin(ctx) !== null,
+      skins: skinChoices(),
+      activeSkin: activeSkin === null ? null : activeSkin.id
+    }
     try {
-      desktopMenu = buildMenu({ animations, pool: skinPool, hasOrigin: dshOrigin(ctx) !== null })
+      desktopMenu = buildMenu({ ...common, animations })
     } catch {
-      desktopMenu = buildMenu({ pool: skinPool, hasOrigin: dshOrigin(ctx) !== null })
+      desktopMenu = buildMenu(common)
     }
     return desktopMenu
+  }
+
+  /** 菜单「外观」里的候选：id 给动作、label 给人看。 */
+  function skinChoices () {
+    return skinSources.map((source) => ({ id: source.id, label: source.name }))
+  }
+
+  /**
+   * 换掉当前那张皮（ticket 32 / ADR-0013）：只改「用哪个源」。
+   * 身份、邻居、串门记录、背包、礼物一律不碰；唯一写盘的地方是 settings.json。
+   * `preferredId` 指向不存在的源时回落第一条并告警——坏配置只让选择失效，不让宠物消失。
+   */
+  function applySkin (sources, preferredId) {
+    skinSources = Array.isArray(sources) ? sources : []
+    const wanted = typeof preferredId === 'string' ? preferredId : null
+    const chosen = wanted === null
+      ? null
+      : skinSources.find((source) => source.id === wanted) ?? null
+    if (wanted !== null && chosen === null) {
+      log.warn('素材源：activeSource 指向不存在的源（' + wanted + '），先用第一条')
+    }
+    activeSkin = chosen ?? skinSources[0] ?? null
+    skinPool = activeSkin === null ? [] : idlePoolOf(activeSkin)
+    // 端口不变，换的只是对外广告的那个 id：邻居按新 id 重新取清单和素材。
+    if (skinRef !== null) {
+      skinRef = activeSkin === null ? { port: skinRef.port } : { port: skinRef.port, id: activeSkin.id }
+    }
+    return activeSkin
+  }
+
+  /**
+   * 读本机素材注册表并应用「当前那张皮」（ticket 32）。
+   *
+   * 这件事**不依赖网络**：待机池、对外广告的 skinId、右键菜单的降级清单都从这里来，
+   * 所以 `network:false` 的进程（测试、离线）也该有皮。起端口是下一步 `serveSkin()`。
+   */
+  async function loadSkin () {
+    try {
+      const loaded = await loadSkinSources({ dataDir: dir, env })
+      for (const warning of loaded.warnings) {
+        log.warn('素材源：' + warning.code + (warning.detail === undefined ? '' : '（' + warning.detail + '）'))
+      }
+      // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
+      applySkin(loaded.sources, settings === null ? null : settings.activeSource)
+    } catch (error) {
+      log.warn('素材源没起来（不影响串门）：' + message(error))
+    }
   }
 
   /**
@@ -957,21 +1042,15 @@ export function createService (ctx, options = {}) {
    * 起不来只影响「访客能不能拿我的素材 / 文件礼物」，不影响发现/串门/桌面。
    *
    * **服务器无条件起**：没有素材源的用户也要有礼物端口（ADR-0011 唯一的新入站面），
-   * 所以这里不再因为 `sources` 为空而 return；空源只是让 skin 路由一律 404。
-   * `options.skinServer === false` 是测试用的逃生开关（不起端口，beacon 也不带 skinPort）。
+   * 空源只是让 skin 路由一律 404。`options.skinServer === false` 是测试用的逃生开关
+   * （不起端口，beacon 也不带 skinPort）。
    */
-  async function startSkinSource () {
+  async function serveSkin () {
+    if (options.skinServer === false) return
     try {
-      const loaded = await loadSkinSources({ dataDir: dir, env })
-      for (const warning of loaded.warnings) {
-        log.warn('素材源：' + warning.code + (warning.detail === undefined ? '' : '（' + warning.detail + '）'))
-      }
-      // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
-      skinPool = loaded.sources.length > 0 ? idlePoolOf(loaded.sources[0]) : []
-      if (options.skinServer === false) return
       const requested = Number.isInteger(options.skinPort) ? options.skinPort : resolveSkinPort(env)
       skinServer = await startLanServer({
-        sources: loaded.sources,
+        sources: skinSources,
         port: requested,
         host: '0.0.0.0',
         log,
@@ -985,9 +1064,9 @@ export function createService (ctx, options = {}) {
       // 端口总有；源 id 可能没有（没装素材源时 beacon/心跳/串门请求只带 skinPort）。
       skinRef = {
         port: skinServer.port,
-        ...(loaded.sources.length > 0 ? { id: loaded.sources[0].id } : {})
+        ...(activeSkin === null ? {} : { id: activeSkin.id })
       }
-      log.info(loaded.sources.length > 0
+      log.info(activeSkin !== null
         ? '素材源已对外：' + skinRef.id + ' @ ' + skinRef.port
         : '礼物端口已对外：' + skinRef.port + '（没有素材源）')
     } catch (error) {
@@ -1286,6 +1365,8 @@ export function createService (ctx, options = {}) {
         name: event.name ?? undefined,
         // 只有改名带正文；其余动作这里是 undefined，与 HTTP 那条路同形。
         nickname: event.nickname ?? undefined,
+        // 换皮带素材源 id（ticket 32）；注册表在宿主，渲染端只传一个短标识符。
+        skinId: event.skinId ?? undefined,
         // 礼物四动作只带 giftId（UUID）；路径由宿主查 store，渲染端从来不知道。
         giftId: event.giftId ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
@@ -1328,6 +1409,9 @@ export function createService (ctx, options = {}) {
     if (error === 'not-implemented') return '这个操作暂不支持。'
     // 改名（ADR-0007）：两种失败都要能说清“为什么没生效”，而不是一句“稍后再试”。
     if (error === 'bad-nickname') return '这个名字不行：要么是空的，要么太长。'
+    // 换皮（ticket 32）：注册表里没有这个 id，多半是 skin.json 改了还没重载。
+    if (error === 'unknown-skin') return '这张皮已经不在了，先「重载配置」再看。'
+    if (error === 'bad-skin-id') return '这个外观 id 不合法。'
     if (error === 'dsh-pet-unreachable') return 'dsh-pet 没有响应，名字没有改（它还开着吗？）。'
     if (error === 'dsh-pet-write-failed') return 'dsh-pet 没有接受这次改名，名字没有变。'
     if (error === 'anim-no-pet') return 'dsh-pet 里还没有宠物，这个动作只在本机播了一次。'

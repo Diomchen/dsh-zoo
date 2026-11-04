@@ -152,8 +152,11 @@
   ]
   /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
   const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
-  /** 菜单项的动作（ticket 22 / 24）：点播 / 重载配置 / 打开软件 / 带派。同样只是一次「申请」。 */
-  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring']
+  /** 菜单项的动作（ticket 22 / 24 / 32）：点播 / 重载配置 / 打开软件 / 带派 / 换皮。同样只是一次「申请」。 */
+  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring', 'use-skin']
+  /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
+  const MAX_SKIN_CHOICES = 16
+  const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
   /** helper → 宿主能报的全部动作：控件 + 菜单。 */
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
@@ -249,6 +252,13 @@
     if (id === '' || id.length > MAX_ID_LENGTH) return null
     // id 只用来做键和日志，限制成可安全打印的字符集。
     return /^[A-Za-z0-9._:-]+$/.test(id) ? id : null
+  }
+
+  /** 素材源 id：短标识符，形状与宿主 `src/protocol.js` 的 normalizeSkinId 一致。 */
+  function normalizeSkinId (value) {
+    if (typeof value !== 'string') return null
+    // 与宿主一致：不 trim。带空白的 id 在两边都不是同一个 id。
+    return SKIN_ID_RE.test(value) ? value : null
   }
 
   /**
@@ -727,11 +737,13 @@
    * 形状刻意扁平，渲染端不做任何"拼菜单"的判断：
    *   tools  [{ id, label, hint? }]                 一级工具项，id ∈ MENU_TOOL_IDS
    *   groups [{ label, actions: [动画名] }]          「动作」下的分类；空分类不出现
+   *   skins  [{ id, label }]                        「外观」的候选（ticket 32）；当前那张打勾
+   *   activeSkin  string|null                       当前那张皮的 id
    *
    * 菜单是高频交互入口：一条坏数据只能丢自己，绝不能让整份菜单消失。
    */
   function emptyMenu () {
-    return { tools: [], groups: [] }
+    return { tools: [], groups: [], skins: [], activeSkin: null }
   }
 
   function normalizeMenu (raw) {
@@ -779,6 +791,23 @@
         menu.groups.push({ label, actions })
       }
     }
+
+    const seenSkins = new Set()
+    if (Array.isArray(raw.skins)) {
+      for (const candidate of raw.skins) {
+        if (menu.skins.length >= MAX_SKIN_CHOICES) break
+        if (candidate === null || typeof candidate !== 'object') continue
+        const id = normalizeSkinId(candidate.id)
+        if (id === null || seenSkins.has(id)) continue
+        const label = normalizeText(candidate.label, null, MAX_LABEL_LENGTH)
+        if (label === null) continue
+        seenSkins.add(id)
+        menu.skins.push({ id, label })
+      }
+    }
+    // 当前那张皮：只认真的在候选里的 id，否则当作"没有当前项"。
+    const active = normalizeSkinId(raw.activeSkin)
+    menu.activeSkin = active !== null && seenSkins.has(active) ? active : null
 
     return menu
   }
@@ -1468,6 +1497,9 @@
         // 点播带动画名；名字必须是安全的动画名，否则整条事件丢掉（宿主还得再校验一遍）。
         const name = action === 'play-anim' ? normalizeAnim(raw.name) : null
         if (action === 'play-anim' && name === null) return { ok: false, error: 'bad-name' }
+        // 换皮只带素材源 id（ticket 32）：注册表在宿主那边，这里只守形状。
+        const skinId = action === 'use-skin' ? normalizeSkinId(raw.skinId) : null
+        if (action === 'use-skin' && skinId === null) return { ok: false, error: 'bad-skin-id' }
         return {
           ok: true,
           event: {
@@ -1477,6 +1509,7 @@
             deviceId,
             nickname,
             ...(name === null ? {} : { name }),
+            ...(skinId === null ? {} : { skinId }),
             ...(giftId === null ? {} : { giftId }),
             ...(gift === null ? {} : { gift })
           }
@@ -1869,6 +1902,7 @@
     clampNumber,
     normalizeId,
     normalizeGiftId,
+    normalizeSkinId,
     normalizeGiftName,
     normalizeGiftSize,
     normalizeGiftThumb,

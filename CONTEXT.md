@@ -8,13 +8,27 @@
 规格见 [SPEC v4](.scratch/local-pet/SPEC-v4.md)；票 23–27 在
 [`.scratch/local-pet/issues/`](.scratch/local-pet/issues/)。
 
-注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段），它们与这里的“邻居 / 访客 / 名字”同义，不算违反。
+「皮」与「身份」的切分见 [ADR-0013](docs/adr/0013-skin-switch-keeps-identity.md)：换皮只换外观和动作。
+
+注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
 
 ## Language
 
 **宠物 (Pet)**：
 一台机器在局域网里的化身，有名字、外观和少量状态；一个 DSH 实例只养一只。
+一只宠物 = 一份**身份** + 当前那张**皮**：换皮不改身份。
 _Avoid_: 桌宠, 头像, avatar, companion, 吉祥物
+
+**身份 (Identity)**：
+这台机器留在局域网里的持续部分：不随外观变化的设备标识、名字、放行过的邻居、串门记录、背包和收到的礼物。
+换皮不动它。
+_Avoid_: 账号, 用户, profile, 用户资料
+
+**皮 (Skin)**：
+本机宠物此刻用的那套素材：一个动作目录（每个动作一段 WebM）+ 一个默认尺寸。
+换皮只换动作和外观，不动名字、身份、串门记录与礼物。与「外观包」是同一个形状的两个方向：
+外观包是客人带来的，皮是我自己正在用的。
+_Avoid_: 皮肤, 主题, skin, 皮肤包
 
 **名字 (Name)**：
 这只宠物叫什么。桌面上写着的、邻居在局域网里看到的，是同一个；一只宠物只有一个名字。
@@ -106,4 +120,5 @@ _Avoid_: 色块, 占位, placeholder, 兜底形象
 
 **素材源 (Source)**：
 一台机器上能对外提供外观包的那一小块只读服务；端口随 beacon 广播，只在局域网内可达。
+一台机器可以有多个源，只有一个是当前那张**皮**。
 _Avoid_: 服务器, 仓库, CDN, 素材库

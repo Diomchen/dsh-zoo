@@ -835,6 +835,8 @@
       petId: pet.id,
       root,
       panels: [],
+      // 一级的两个分支共用 1/2 级面板：branch 决定 1 级画分类还是画「外观」（ticket 32）。
+      branch: 'anim',
       groupIndex: 0,
       hoverRow: null,
       openedAt: performance.now(),
@@ -907,6 +909,10 @@
       row.dataset.menuId = options.id
     } else if (options.kind === 'branch') {
       row.dataset.menuKind = 'branch'
+      row.dataset.menuBranch = options.branch === 'skin' ? 'skin' : 'anim'
+    } else if (options.kind === 'skin') {
+      row.dataset.menuKind = 'skin'
+      row.dataset.menuId = options.id
     } else if (options.kind === 'group') {
       row.dataset.menuKind = 'group'
       row.dataset.menuGroup = String(options.index)
@@ -943,7 +949,22 @@
         panel.appendChild(menuRow(tool.label, { kind: 'tool', id: tool.id, hint: tool.hint }))
       }
       if (menu.groups.length > 0) {
-        panel.appendChild(menuRow('动作', { kind: 'branch', arrow: true }))
+        panel.appendChild(menuRow('动作', { kind: 'branch', branch: 'anim', arrow: true }))
+      }
+      // 只有一张皮时不出现「外观」：一个选项的菜单只是噪音（ticket 32）。
+      if (menu.skins.length > 1) {
+        panel.appendChild(menuRow('外观', { kind: 'branch', branch: 'skin', arrow: true }))
+      }
+      return panel
+    }
+    const branch = ui.menu === null ? 'anim' : ui.menu.branch
+    if (level === 1 && branch === 'skin') {
+      for (const skin of menu.skins) {
+        panel.appendChild(menuRow(skin.label, {
+          kind: 'skin',
+          id: skin.id,
+          hint: skin.id === menu.activeSkin ? '✓' : undefined
+        }))
       }
       return panel
     }
@@ -977,6 +998,7 @@
     const level = panel === null ? 0 : Number(panel.dataset.level)
     const rect = row.getBoundingClientRect()
     if (kind === 'branch') {
+      ui.menu.branch = row.dataset.menuBranch === 'skin' ? 'skin' : 'anim'
       openMenuPanel(1, { x: rect.right, y: rect.top, width: 0, height: 0 })
     } else if (kind === 'group') {
       ui.menu.groupIndex = Number(row.dataset.menuGroup)
@@ -1008,6 +1030,12 @@
       const petId = ui.menu.petId
       closeMenu('action')
       playAnimFromMenu(petId, name)
+    }
+    if (kind === 'skin') {
+      // 换皮只发一条申请：注册表、落盘和场景重建都在宿主那边（ADR-0013）。
+      const skinId = row.dataset.menuId
+      closeMenu('action')
+      requestAction('use-skin', undefined, { skinId })
     }
     // branch / group 只是展开，点击不收起
   }
@@ -1958,6 +1986,8 @@
       deviceId: typeof deviceId === 'string' && deviceId !== '' ? deviceId : undefined,
       // 点播要带名字；其余动作为 undefined。
       name: typeof options.name === 'string' && options.name !== '' ? options.name : undefined,
+      // 换皮只带素材源 id（ticket 32）；其余动作为 undefined。
+      skinId: typeof options.skinId === 'string' && options.skinId !== '' ? options.skinId : undefined,
       // 礼物动作只带 giftId；路径与磁盘操作全在宿主那边，渲染端连字符串都拿不到。
       giftId: typeof options.giftId === 'string' && options.giftId !== '' ? options.giftId : undefined,
       // 失败时的本机兜底（点播不可达 → 本机播一次）。只能影响本地表现，绝不能改状态。
@@ -1989,6 +2019,7 @@
         action,
         deviceId: pending.deviceId,
         name: pending.name,
+        skinId: pending.skinId,
         giftId: pending.giftId
       })
     } catch {

@@ -60,6 +60,8 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
       deviceId: payload.deviceId,
       // 动作点播要带名字（右键菜单的「动作」那一支）；其它动作这里是 undefined。
       name: payload.name,
+      // 换皮只带素材源 id（右键菜单的「外观」那一支）；其它动作这里是 undefined。
+      skinId: payload.skinId,
       nickname: payload.nickname,
       // 礼物四动作只带 giftId（UUID）；路径与磁盘操作全在宿主/主进程那边。
       giftId: payload.giftId
