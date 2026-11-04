@@ -22,8 +22,10 @@ dsh-pet 的桌面右键菜单是 per-pet 的，一级是工具项（打开软件
 
 - **只挂自己（self）**。右键落在自己的宠物上出菜单；访客、空白桌面都不出。
 - **工具项三个**：
-  - 「打开软件」——主进程 `shell.openExternal`，地址由宿主给（`ctx.webServer.getOrigin()`），
-    渲染端不传 URL；
+  - 「打开软件」——主进程 `shell.openExternal`，地址由宿主给，渲染端不传 URL。
+    宿主交出去的是**带 launch token 的登录地址**
+    （`ctx.connection.authenticatedUrl(ctx.webServer.getOrigin())`）：DSH 的 Web 层只认
+    `GET /?token=…`，裸 origin 会停在 401（见文末修订）；
   - 「回到初始位置」——渲染端本地把这一只的 body 放回它自己的出生点（宿主场景里的 `x/y`），
     不动场景、不牵连访客，也不用那个全场景 `reset`；
   - 「重载配置」——宿主重读 `settings.json` + `skin.json`（素材源）、重建场景、重启 helper。
@@ -55,3 +57,17 @@ dsh-pet 的桌面右键菜单是 per-pet 的，一级是工具项（打开软件
   读不到时降级成平铺，不阻塞其他功能。
 - 「重载配置」让手改 `settings.json` / `skin.json` 后不用重启整个 DSH，但也意味着"配置随时可能
   在两次读之间变"，所有读配置的地方仍按"可能读到旧的"处理。
+
+## 修订（用户报「打开软件停在 401 页」，2026-11-04）
+
+**症状**：右键宠物 →「打开软件」→ 浏览器地址栏是 `127.0.0.1:<port>`，页面原文
+`dsh web authentication required; reopen the URL printed by dsh web.`
+
+**根因**：DSH 的 Web 认证要的是 `/` 上带本次进程 launch token 的登录地址；`webServer.getOrigin()`
+给的是裸 origin，请求在 `authorizeIndex` 就被 401 挡下。dsh-pet 自己用的是
+`ctx.connection.authenticatedUrl(origin)`，本插件漏了这一步。
+
+**决定**：`dshOrigin()` 取到 origin 后先过 `ctx.connection.authenticatedUrl()`；拿不到
+`connection`（老宿主 / 没有 Web 载体）或它抛错，才退回裸 origin——那种宿主本来也没有这层认证。
+回归断言在 `test/open-site-auth.test.js`：把 `desktop.openUrl` 收到的那条地址真发一次 HTTP，
+必须是 303（带 token）而不是 401。

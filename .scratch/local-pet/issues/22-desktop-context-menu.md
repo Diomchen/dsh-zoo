@@ -76,3 +76,16 @@
 > `reportOverlayRects(false)`（自带 300ms 节流），保证 age 远小于 900ms。
 > 同一个坑也影响"打开超过 900ms 的弹层按钮"，一并修好。
 > 这条同样只有真窗口能锁住（跨进程 + 主进程时钟），回归断言留在冒烟里。
+
+> 修复三（用户报「右键 → 打开软件 → 浏览器停在 401 页」）：
+> 现场原文 `dsh web authentication required; reopen the URL printed by dsh web.`。
+> 回路 = `test/open-site-auth.test.js`：起一个按 DSH `browser-auth` 契约回话的服务器
+> （`GET /?token=…` → 303 + Cookie，其余 → 401 原文），走真 `POST /local-pet/action`
+> 拿 `desktop.openUrl` 收到的那条地址再发一次 HTTP，先红后绿。
+> 探针（对正在跑的 DSH）：`curl http://127.0.0.1:57783/` → 401 + 上面那句；
+> 而 DSH 自己的 `dsh web` 打印/打开的是 `?token=<launch token>` 的登录地址。
+> 根因：`dshOrigin()` 只交 `webServer.getOrigin()` 的裸 origin，认证在 `authorizeIndex`
+> 就被挡下；dsh-pet 用的是 `ctx.connection.authenticatedUrl(origin)`，local-pet 漏了。
+> 修法：`dshOrigin()` 过一层 `authenticatedUrl`（`ctx.get('connection')` 现取；拿不到或抛错
+> 才退回裸 origin），helper 的白名单原样保留 query，地址只交给 `shell.openExternal`。
+> 顺带确认：`normalizeHostCommand({type:'open-url'})` 不会吃掉 `?token=`，所以问题不在 helper。

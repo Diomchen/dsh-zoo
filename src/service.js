@@ -2257,8 +2257,19 @@ export function createService (ctx, options = {}) {
 /**
  * DSH 自己的 GUI 地址（菜单里的「打开软件」要打开它）。
  * 只认 http(s)；取不到就返回 null，这一项就不出现在菜单里。
+ *
+ * 地址还要过一次 `connection.authenticatedUrl`：DSH 的 Web 层只认 `GET /?token=…`
+ * 那条登录地址（换一次 Cookie 再 303 到干净的 `./`），裸 origin 一律 401——
+ * 浏览器上就是「dsh web authentication required; reopen the URL printed by dsh web.」。
+ * 拿不到 connection（老宿主 / 没有 Web 载体）才退回裸 origin，那种宿主本来就没这层认证。
  */
 function dshOrigin (ctx) {
+  const origin = dshListenerOrigin(ctx)
+  return origin === null ? null : authenticatedUrl(ctx, origin)
+}
+
+/** webServer 的裸 origin：文档化的 `getOrigin()`，未绑定时退回 `.port`。 */
+function dshListenerOrigin (ctx) {
   const server = ctx?.webServer
   try {
     if (typeof server?.getOrigin === 'function') {
@@ -2273,6 +2284,25 @@ function dshOrigin (ctx) {
   }
   const port = server?.port
   return Number.isInteger(port) && port > 0 ? `http://127.0.0.1:${port}` : null
+}
+
+/**
+ * 把一条干净的浏览器地址换成 DSH 的登录地址（本进程 launch token 进 `?token=`）。
+ * 用 `ctx.get('connection')` 现取：插件只 inject 了 webServer，不该为了一个菜单项
+ * 把整只插件的启动绑在 connection 上。任何一步不成，退回原地址。
+ */
+function authenticatedUrl (ctx, baseUrl) {
+  try {
+    const connection = typeof ctx?.get === 'function' ? ctx.get('connection') : ctx?.connection
+    const mint = connection?.authenticatedUrl
+    if (typeof mint !== 'function') return baseUrl
+    const value = mint.call(connection, baseUrl)
+    if (typeof value !== 'string' || value === '') return baseUrl
+    const parsed = new URL(value)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? parsed.toString() : baseUrl
+  } catch {
+    return baseUrl
+  }
 }
 
 /**

@@ -78,7 +78,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `hide` | — | 先恢复穿透并入租约再隐藏 |
 | `update` | `scene` | 替换整个场景 v3（含 `controls` / `menu`）；按新场景 + 渲染端矩形重新复核光标 |
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
-| `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行 |
+| `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行。地址可能带 DSH 的 launch token：helper 只转交，不写日志、也不回传给渲染端 |
 | `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
 | `shot` | `id?`, `path`（绝对路径）, `window?:'bring'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` 抓的是「带派」小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
