@@ -944,6 +944,20 @@
    * @param {{x?:number,y?:number,width:number,height:number}} workArea
    * @param {{size?:number,reset?:boolean,controls?:object}} [options]
    */
+  /**
+   * 皮给的尺寸是**相对比例**（ticket 35 / ADR-0013 §决定 7）：`462` 为 1.0。
+   * 462 是 `src/skin-sources.js` 的 `DEFAULT_SIZE`，这里是普通 script，只能各写一份。
+   */
+  const SKIN_BASE_SIZE = 462
+  const SKIN_SCALE_MIN = 0.5
+  const SKIN_SCALE_MAX = 2
+
+  /** 逐只的显示比例：没给 `size`（访客 / 老场景）就是 1.0。 */
+  function scaleFactorOf (size) {
+    if (!Number.isInteger(size) || size <= 0) return 1
+    return clampNumber(size / SKIN_BASE_SIZE, SKIN_SCALE_MIN, SKIN_SCALE_MAX)
+  }
+
   function petScene (pets, workArea, options = {}) {
     const area = normalizeArea(workArea)
     const list = []
@@ -963,6 +977,8 @@
           label: normalizeLabel(raw.label, role === 'self' ? '我' : '邻居'),
           anim: normalizeAnim(raw.anim),
           ...(idlePool === null ? {} : { idlePool }),
+          // 皮自带的尺寸（ticket 35）：只有本机那只带，访客没有皮。
+          ...(Number.isInteger(raw.size) && raw.size > 0 ? { size: raw.size } : {}),
           color: normalizeColor(raw.color)
         })
       }
@@ -970,24 +986,38 @@
 
     const sizeOption = Number(options.size)
     const base = Math.round(Math.min(area.width, area.height) * 0.12)
-    let size = Number.isFinite(sizeOption) && sizeOption >= 16
+    const baseSize = Number.isFinite(sizeOption) && sizeOption >= 16
       ? Math.round(sizeOption)
       : base
-    size = clampNumber(size, 16, 176)
-    size = Math.min(size, Math.floor(area.width), Math.floor(area.height))
-    let labelHeight = clampNumber(Math.round(size * 0.22), 14, 32)
-    if (size + labelHeight > area.height) labelHeight = Math.max(0, Math.floor(area.height - size))
-    const width = Math.max(1, size)
-    const height = Math.max(1, Math.min(area.height, size + labelHeight))
     const margin = clampNumber(Math.round(Math.min(area.width, area.height) * 0.035), 8, 48)
-    const span = Math.max(0, area.width - margin * 2 - width)
-    const ground = groundY({ height }, area)
     const count = list.length
 
+    // 每只自己的包围盒（ticket 35）：基准尺寸 × 这张皮的比例。两只都是 462 时与旧行为逐像素相同。
+    const boxes = list.map((pet) => {
+      const size = clampNumber(
+        Math.round(baseSize * scaleFactorOf(pet.size)),
+        16,
+        Math.max(16, Math.min(Math.floor(area.width), Math.floor(area.height)))
+      )
+      let labelHeight = clampNumber(Math.round(size * 0.22), 14, 32)
+      if (size + labelHeight > area.height) labelHeight = Math.max(0, Math.floor(area.height - size))
+      return {
+        width: Math.max(1, size),
+        height: Math.max(1, Math.min(area.height, size + labelHeight))
+      }
+    })
+
+    // 按累加宽度排（票 35 §布局）：全部一样宽时，下面的公式与旧的 `margin + span*i/(n-1)` 等价。
+    const totalWidth = boxes.reduce((sum, box) => sum + box.width, 0)
+    const gap = count <= 1 ? 0 : Math.max(0, (area.width - margin * 2 - totalWidth) / (count - 1))
+    let cursor = margin
+
     const items = list.map((pet, index) => {
+      const box = boxes[index]
       const x = count <= 1
-        ? Math.round((area.width - width) / 2)
-        : Math.round(margin + (span * index) / (count - 1))
+        ? Math.round((area.width - box.width) / 2)
+        : Math.round(clampNumber(cursor, 0, Math.max(0, area.width - box.width)))
+      cursor += box.width + gap
       return {
         id: pet.id,
         kind: 'pet',
@@ -995,9 +1025,9 @@
         anim: pet.anim,
         ...(pet.idlePool === undefined ? {} : { idlePool: pet.idlePool }),
         x,
-        y: ground,
-        width,
-        height,
+        y: groundY({ height: box.height }, area),
+        width: box.width,
+        height: box.height,
         label: pet.label,
         color: pet.color
       }

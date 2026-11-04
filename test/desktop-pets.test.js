@@ -882,3 +882,48 @@ test('controlsFromSnapshot：文件卡片带 name/size；缩略图只在 receive
     assert.deepEqual(controlsFromSnapshot(withGift(bad), { thumbOf }).gifts, [], JSON.stringify(bad))
   }
 })
+
+test('皮自带尺寸：比例按 462 算，两只宠物各按自己的宽度排开、共用一条地平线', () => {
+  const area = { width: 1440, height: 900 }
+  const scene = shared.petScene([
+    { id: 'self', role: 'self', label: '我', size: 693 },   // 1.5×
+    { id: 'visitor:a', role: 'guest', label: '阿蟹' }        // 没带 size → 1.0
+  ], area)
+
+  const [self, guest] = scene.items
+  assert.ok(self.width > guest.width, '大皮应当更宽：' + self.width + ' vs ' + guest.width)
+  assert.equal(self.width, Math.round(guest.width * 1.5), '693/462 = 1.5')
+  assert.equal(self.x, Math.round(900 * 0.035), '第一只从 margin 开始（工作区短边 3.5%，夹在 8..48）')
+  assert.ok(self.x < guest.x, '按宽度顺序排开')
+  assert.ok(self.x + self.width <= guest.x, '两只不重叠')
+  // 同一块地面：包围盒底边对齐（高度含标签，所以看 y+height）。
+  assert.equal(self.y + self.height, guest.y + guest.height)
+})
+
+test('皮自带尺寸：462 是 1.0，与不带 size 的老场景逐像素相同', () => {
+  const area = { width: 1440, height: 900 }
+  const withSize = shared.petScene([
+    { id: 'self', role: 'self', label: '我', size: 462 },
+    { id: 'visitor:a', role: 'guest', label: '阿蟹' },
+    { id: 'visitor:b', role: 'guest', label: '泡泡' }
+  ], area)
+  const without = shared.petScene([
+    { id: 'self', role: 'self', label: '我' },
+    { id: 'visitor:a', role: 'guest', label: '阿蟹' },
+    { id: 'visitor:b', role: 'guest', label: '泡泡' }
+  ], area)
+  assert.deepEqual(withSize.items.map((item) => [item.x, item.y, item.width, item.height]),
+    without.items.map((item) => [item.x, item.y, item.width, item.height]))
+})
+
+test('皮自带尺寸：离谱的比例被夹住，不会把宠物撑出工作区', () => {
+  const area = { width: 800, height: 600 }
+  const scene = shared.petScene([
+    { id: 'huge', role: 'self', label: '我', size: 100000 },
+    { id: 'tiny', role: 'guest', label: '小', size: 1 }
+  ], area)
+  const [huge, tiny] = scene.items
+  assert.ok(huge.width <= 600, '不能超过工作区短边：' + huge.width)
+  assert.ok(tiny.width >= 16, '再小也有下限：' + tiny.width)
+  assert.ok(huge.x >= 0 && huge.x + huge.width <= area.width)
+})

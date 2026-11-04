@@ -1201,7 +1201,7 @@ test('activeSource 指向一个已经不存在的源：回落第一条并告警'
 
 /** 桌面 helper 的最小替身：只为把「右键菜单 → 宿主」这条事件回路跑起来。 */
 function desktopDouble () {
-  const calls = { results: [] }
+  const calls = { results: [], scenes: [] }
   let onEvent = null
   return {
     calls,
@@ -1209,8 +1209,8 @@ function desktopDouble () {
       onEvent = options.onEvent
       return {
         start () { return { ok: true, pid: 4242 } },
-        update () { return true },
-        resync () { return true },
+        update (scene) { calls.scenes.push(scene); return true },
+        resync (scene) { calls.scenes.push(scene); return true },
         actionResult (id, result) { calls.results.push({ id, result }) },
         dispose () {}
       }
@@ -1299,4 +1299,34 @@ test('重载配置：当前那张皮被删掉就回落第一条并告警', async
     service.warnings.some((line) => line.includes('activeSource')),
     '应该告警说明回落了：' + JSON.stringify(service.warnings)
   )
+})
+
+test('皮自带尺寸：场景里只有 self 带 size，换皮后跟着变', async (t) => {
+  const dir = await tempDir(t)
+  const fish = join(dir, 'skin-fish')
+  const cat = join(dir, 'skin-cat')
+  await mkdir(fish, { recursive: true })
+  await mkdir(cat, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeFile(join(cat, '待机.webm'), 'cat')
+  await writeSkins(dir, [
+    { id: 'fish', dirs: [fish], size: 462 },
+    { id: 'cat', dirs: [cat], size: 693, idle: '待机' }
+  ])
+
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+  desktop.emit({ type: 'ready', pid: 4242, workArea: { x: 0, y: 30, width: 1440, height: 900 } })
+
+  // 场景里不传原始的 size，直接给算好的包围盒（基准 = 工作区短边 12% = 108）。
+  const widthOfSelf = () => desktop.calls.scenes.at(-1).items.find((item) => item.role === 'self').width
+  assert.equal(widthOfSelf(), 108, '462 是 1.0')
+
+  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
+  assert.equal(widthOfSelf(), 162, '693/462 = 1.5，换皮后场景跟着变')
 })

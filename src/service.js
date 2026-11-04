@@ -1339,9 +1339,12 @@ export function createService (ctx, options = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
     const snapshot = room.snapshot()
     const pets = petsFromSnapshot(snapshot).map((pet) => {
-      // 本机宠物：把 dsh-pet 的一整套动作名交给渲染端轮播，不再只轮 3 段待机。
+      // 本机宠物：把当前这张皮的动作名交给渲染端轮播，并带上它的尺寸（票 32 / 35）。
       if (pet.role === 'self') {
-        return skinPool.length === 0 ? pet : { ...pet, idlePool: skinPool }
+        const sized = activeSkin === null || !Number.isInteger(activeSkin.size)
+          ? pet
+          : { ...pet, size: activeSkin.size }
+        return skinPool.length === 0 ? sized : { ...sized, idlePool: skinPool }
       }
       if (pet.role !== 'visitor') return pet
       const key = pet.id.startsWith('visitor:') ? pet.id.slice('visitor:'.length) : null
