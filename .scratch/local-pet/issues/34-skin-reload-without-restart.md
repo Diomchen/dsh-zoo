@@ -5,7 +5,7 @@
 
 **Blocked by:** 32（换皮本身）、33（素材根目录随皮走）
 
-**Status:** open
+**Status:** done
 
 来由：2026-11-04 现场。为了换一张皮，这一轮重启了三次 DSH——因为素材源清单只在
 `startService` 里读一次（`loadSkin()`），而「重载配置」只重读 `settings.json`。
@@ -15,22 +15,31 @@
 manifest 与 sha256 也按源 id 缓存（`manifests` / `hashesBySource`）。只重读注册表不换表，
 邻居拿到的还是旧清单。
 
-- [ ] `lan-server` 的源索引用 `let` 持有，新增 `setSources(next)`：重建 `byId` 与
+- [x] `lan-server` 的源索引用 `let` 持有，新增 `setSources(next)`：重建 `byId` 与
       `fallbackSource`，不动端口、不重启服务器
-- [ ] manifest 与 sha256 缓存改成按**源对象**（`WeakMap`）而不是按 id：换了目录的源
+- [x] manifest 与 sha256 缓存改成按**源对象**（`WeakMap`）而不是按 id：换了目录的源
       自然重算，没换的照旧命中
-- [ ] `service.loadSkin()` 在 `applySkin()` 之后调 `skinServer.setSources(skinSources)`
+- [x] `service.loadSkin()` 在 `applySkin()` 之后调 `skinServer.setSources(skinSources)`
       （`serveSkin()` 还没跑时是 `null`，跳过）
-- [ ] 「重载配置」在 `refreshDesktopMenu()` 之前补一次 `await loadSkin()`
-- [ ] 重载后当前皮不存在了：`applySkin()` 已有的回落 + 告警照常生效，并且要补发心跳
+- [x] 「重载配置」在 `refreshDesktopMenu()` 之前补一次 `await loadSkin()`
+- [x] 重载后当前皮不存在了：`applySkin()` 已有的回落 + 告警照常生效，并且要补发心跳
       （`skinRef.id` 变了）
-- [ ] 场景签名已经含 `idlePool` / `assetRoots` / 菜单（票 32/33），重载后自动重发，不另加
-- [ ] 单测：`lan-server` 换表后新源可取、删掉的源 404；`service` 写一个新的 `skin.json`
+- [x] 场景签名已经含 `idlePool` / `assetRoots` / 菜单（票 32/33），重载后自动重发，不另加
+- [x] 单测：`lan-server` 换表后新源可取、删掉的源 404；`service` 写一个新的 `skin.json`
       再发 `reload`，`state.skin` 与菜单跟着变
-- [ ] 全量测试全绿
+- [x] 全量测试全绿
 
 > 不做：监听 `skin.json` 的文件变化（那要再加一个 fs watcher，和「重载配置」这条显式路径
 > 重复）；主动把新素材推给访客（他们按 `skinId` 缓存，下次取自然更新）。
 
 > 验收：开着 DSH，在 `skin.json` 里加第三条源 → 右键「重载配置」→「外观」里多出它，
 > 点一下就能切，全程不退出应用。
+
+> 完成情况：`lan-server` 的 `byId` / `fallbackSource` 从 `const` 改成 `let`，新增
+> `setSources(next)`；`manifests` 与 `hashesBySource` 从按 id 的 `Map` 换成按源对象的
+> `WeakMap`——换了目录的源是新对象，自然重算，没变的源照旧命中（不重算整批 sha256）。
+> `skinId` 从快照字段改成 getter，换表后跟着走。
+> `loadSkin()` 在 `applySkin()` 之后把新表交给正在跑的那个端口；「重载配置」先
+> `loadSkin()` 再重建菜单，最后补发心跳（`skinRef.id` 可能变了）。
+> 测试：`test/lan-server.test.js` 2 条（换表/按对象缓存），`test/service.test.js` 2 条
+> （重载后能切新源、当前皮被删就回落）。全量 503 项。

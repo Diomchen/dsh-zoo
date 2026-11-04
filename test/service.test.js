@@ -1242,3 +1242,61 @@ test('换皮：桌面右键那条路（action 事件带 skinId）也能切，结
   const state = await call(service, '/local-pet/state')
   assert.equal(state.body.skin.id, 'cat')
 })
+
+async function writeSkins (dir, entries) {
+  await writeFile(join(dir, SKIN_FILE), JSON.stringify({ sources: entries }), 'utf8')
+}
+
+test('重载配置会重读 skin.json：新加的皮立刻能切，不用重启', async (t) => {
+  const dir = await tempDir(t)
+  const fish = join(dir, 'skin-fish')
+  const cat = join(dir, 'skin-cat')
+  await mkdir(fish, { recursive: true })
+  await mkdir(cat, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeFile(join(cat, '待机.webm'), 'cat')
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
+
+  const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
+  await service.ready
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+
+  // 新加一条源，然后走「重载配置」——不重启进程。
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }, { id: 'cat', dirs: [cat], idle: '待机' }])
+  const reloaded = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+  assert.equal(reloaded.status, 200)
+  assert.equal(reloaded.body.ok, true)
+
+  const switched = await call(service, '/local-pet/action', {
+    method: 'POST',
+    body: { action: 'use-skin', skinId: 'cat' }
+  })
+  assert.equal(switched.status, 200)
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'cat')
+})
+
+test('重载配置：当前那张皮被删掉就回落第一条并告警', async (t) => {
+  const dir = await tempDir(t)
+  const fish = join(dir, 'skin-fish')
+  const cat = join(dir, 'skin-cat')
+  await mkdir(fish, { recursive: true })
+  await mkdir(cat, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeFile(join(cat, '待机.webm'), 'cat')
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }, { id: 'cat', dirs: [cat], idle: '待机' }])
+
+  const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
+  await service.ready
+  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'cat')
+
+  // 猫那条源被删了：重载之后应当回落第一条，而不是留在一个不存在的皮上。
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
+  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+  assert.ok(
+    service.warnings.some((line) => line.includes('activeSource')),
+    '应该告警说明回落了：' + JSON.stringify(service.warnings)
+  )
+})

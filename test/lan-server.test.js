@@ -267,3 +267,56 @@ test('礼物路由：文件超过 16 MiB → 413（先于 410 的大小判定）
   await writeFile(file, Buffer.alloc(MAX_GIFT_FILE_BYTES + 1, 1))
   assert.equal((await fetch(url(server, GIFT_ROUTE + '/' + giftId))).status, 413)
 })
+
+test('setSources：换表之后新源可取、删掉的源 404，端口不动', async (t) => {
+  const dir = await tempDir(t)
+  const a = Buffer.from('webm-A')
+  const c = Buffer.from('webm-C')
+  await writeFile(join(dir, 'A.webm'), a)
+  await writeFile(join(dir, 'C.webm'), c)
+
+  const first = {
+    id: 'first',
+    dirs: [dir],
+    actions: { A: { file: 'A.webm', dir } }
+  }
+  const second = {
+    id: 'second',
+    dirs: [dir],
+    actions: { C: { file: 'C.webm', dir } }
+  }
+
+  const server = await start(t, { sources: [first] })
+  const port = server.port
+  assert.equal(server.skinId, 'first')
+  assert.equal((await fetch(url(server, '/local-pet-skin/second/manifest'))).status, 404)
+
+  const applied = server.setSources([second])
+  assert.deepEqual(applied, { count: 1, fallback: 'second' })
+  assert.equal(server.port, port, '换表不换端口')
+  assert.equal(server.skinId, 'second')
+
+  const manifest = await (await fetch(url(server, '/local-pet-skin/second/manifest'))).json()
+  assert.equal(manifest.id, 'second')
+  assert.deepEqual(manifest.actions.C, { file: 'C.webm', loop: true, hash: sha256(c) })
+
+  // 默认路由跟着换表走；被删掉的那张皮 404。
+  assert.equal((await (await fetch(url(server, '/local-pet-skin/manifest'))).json()).id, 'second')
+  assert.equal((await fetch(url(server, '/local-pet-skin/first/manifest'))).status, 404)
+  assert.equal((await fetch(url(server, '/local-pet-skin/second/asset/C'))).status, 200)
+})
+
+test('setSources：同一个源对象不必重算 sha256（按对象缓存）', async (t) => {
+  const dir = await tempDir(t)
+  const bytes = Buffer.from('webm-A')
+  await writeFile(join(dir, 'A.webm'), bytes)
+  const source = { id: 'same', dirs: [dir], actions: { A: { file: 'A.webm', dir } } }
+
+  const server = await start(t, { sources: [source] })
+  const first = await (await fetch(url(server, '/local-pet-skin/same/manifest'))).json()
+
+  // 换表时把同一个对象再放回去：清单必须逐字节一致（命中缓存，不重算）。
+  server.setSources([source])
+  const second = await (await fetch(url(server, '/local-pet-skin/same/manifest'))).json()
+  assert.deepEqual(second, first)
+})

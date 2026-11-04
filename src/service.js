@@ -516,10 +516,14 @@ export function createService (ctx, options = {}) {
         warn(ctx, '重载设置失败：' + message(error))
         return { ok: false, error: 'reload-failed' }
       }
+      // 重载配置也重读素材注册表（ticket 34）：改 skin.json 不用退出 DSH。
+      await loadSkin()
       await refreshDesktopMenu()
       desktopSceneSignature = null
       syncDesktop({ reset: true })
       if (desktop !== null && typeof desktop.reload === 'function') desktop.reload()
+      // 皮可能换了（旧的那条源被删掉 → 回落第一条）：邻居那边也要知道新的 skinId。
+      sendHeartbeats()
       return { ok: true, action: 'reload' }
     }
 
@@ -1052,6 +1056,9 @@ export function createService (ctx, options = {}) {
       }
       // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
       applySkin(loaded.sources, settings === null ? null : settings.activeSource)
+      // 注册表换了：对外供源跟着换表，邻居下次取到的就是新清单（ticket 34）。
+      // 端口还没起（启动早期 / skinServer:false）时是 null，跳过。
+      skinServer?.setSources(skinSources)
     } catch (error) {
       log.warn('素材源没起来（不影响串门）：' + message(error))
     }

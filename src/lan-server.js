@@ -61,21 +61,40 @@ export async function startLanServer (options = {}) {
    */
   const lookupGift = typeof options.lookupGift === 'function' ? options.lookupGift : null
 
-  const byId = new Map()
-  for (const source of sources) {
-    if (source === null || typeof source !== 'object') continue
-    if (typeof source.id !== 'string' || !SOURCE_ID.test(source.id)) continue
-    if (!source.actions || typeof source.actions !== 'object') continue
-    if (!byId.has(source.id)) byId.set(source.id, source)
+  /** 建一张「源 id → 源」的表；坏条目只丢自己。 */
+  function indexSources (list) {
+    const map = new Map()
+    for (const source of Array.isArray(list) ? list : []) {
+      if (source === null || typeof source !== 'object') continue
+      if (typeof source.id !== 'string' || !SOURCE_ID.test(source.id)) continue
+      if (!source.actions || typeof source.actions !== 'object') continue
+      if (!map.has(source.id)) map.set(source.id, source)
+    }
+    return map
   }
-  /** 素材源可以为空：礼物路由仍然要活着。 */
-  const fallbackSource = [...byId.values()][0] ?? null
 
-  const hashesBySource = new Map()
-  const manifests = new Map()
+  let byId = indexSources(sources)
+  /** 素材源可以为空：礼物路由仍然要活着。 */
+  let fallbackSource = [...byId.values()][0] ?? null
+
+  // 缓存按**源对象**而不是按 id（ticket 34）：重载之后换了目录的源是个新对象，自然重算；
+  // 没变的源（同一个对象）照旧命中，不必把整批 sha256 重算一遍。
+  const hashesBySource = new WeakMap()
+  const manifests = new WeakMap()
+
+  /**
+   * 换表（ticket 34）：不重启端口，只把「当前这批源」换掉。
+   * 端口与在途请求都不受影响；下一次请求看到的就是新表。
+   */
+  function setSources (next) {
+    byId = indexSources(next)
+    fallbackSource = [...byId.values()][0] ?? null
+    return { count: byId.size, fallback: fallbackSource === null ? null : fallbackSource.id }
+  }
 
   async function manifestOf (source) {
-    if (manifests.has(source.id)) return manifests.get(source.id)
+    const cached = manifests.get(source)
+    if (cached !== undefined) return cached
     const hashes = await hashActions(source)
     const actions = {}
     for (const id of Object.keys(source.actions).sort()) {
@@ -93,12 +112,13 @@ export async function startLanServer (options = {}) {
     }
     const hash = 'sha256:' + createHash('sha256').update(JSON.stringify(body)).digest('hex')
     const manifest = { ...body, hash }
-    manifests.set(source.id, manifest)
+    manifests.set(source, manifest)
     return manifest
   }
 
   async function hashActions (source) {
-    if (hashesBySource.has(source.id)) return hashesBySource.get(source.id)
+    const cached = hashesBySource.get(source)
+    if (cached !== undefined) return cached
     const hashes = new Map()
     for (const [id, entry] of Object.entries(source.actions)) {
       if (entry === null || typeof entry !== 'object') continue
@@ -110,7 +130,7 @@ export async function startLanServer (options = {}) {
         log.warn?.('素材源：读不到 ' + entry.file + '，manifest 里先不列它')
       }
     }
-    hashesBySource.set(source.id, hashes)
+    hashesBySource.set(source, hashes)
     return hashes
   }
 
@@ -243,7 +263,10 @@ export async function startLanServer (options = {}) {
     port: bound.port,
     host,
     /** 有素材源才有这个 id；没有源时只广告端口（beacon 的 skinId 缺省）。 */
-    skinId: fallbackSource === null ? null : fallbackSource.id,
+    get skinId () {
+      return fallbackSource === null ? null : fallbackSource.id
+    },
+    setSources,
     close: () => new Promise((resolve) => bound.server.close(() => resolve()))
   }
 }
