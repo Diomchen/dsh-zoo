@@ -29,8 +29,10 @@
 - [x] `onPeer` 的 else 兜底是 `observeBeacon`：忘了加分支不会报错，只会被当 beacon 静默吞
 - [x] 退包/收回执要覆盖**所有**结束点，特别注意 `observeVisitRecall` 里「请求中被对方 recall」直接 `state.out=null`（绕过 `finishOutbound`），以及 `dispose`
 - [x] 重发照抄 `recalls` 那套：`receipts` Map + `sendGiftReceipt` + `runReceiptRetries`，`dispose` 里记得清
-- [ ] 冒烟：送达后的「收下了」气泡与没送达的「没送到」气泡各一张截图
-      （按分工没跑，父 agent 统一跑）
+- [x] 冒烟：送达后的「收下了」气泡与没送达的「没送到」气泡各一张截图
+      （gift 段新增两例，文案直接取 `src/gift-text.js` 的真身：
+       `.scratch/local-pet/notes/26-gift-notice-received.png` /
+       `26-gift-notice-not-received.png`；gift 段 96 项断言）
 
 > 完成情况：送达以对方回执为准，这条链路已经通了（ticket 26）。
 > **协议**：`PACKET_TYPES` 加 `gift-received`；`encodeGiftReceived` 与 `parsePacket` 各有一条

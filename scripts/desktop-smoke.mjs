@@ -31,6 +31,7 @@ import { deflateSync, inflateSync } from 'node:zlib'
 import shared from '../desktop/shared.js'
 import { createDesktop, HELPER_MAIN } from '../src/desktop.js'
 import { buildHelperArgs, helperEnv, resolveElectronBinary } from '../src/desktop-launch.js'
+import { giftNotReceivedText, giftReceivedText } from '../src/gift-text.js'
 import { resolveDshPetAssetDirs } from '../src/pet-assets.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -433,6 +434,23 @@ function assertControlPixels (verified, rects) {
     assert(pixels > pw * ph * 0.25,
       '控件 ' + rect.id + ' 在截图里有可见像素（' + pixels + '/' + (pw * ph) + '）')
   }
+}
+
+/** 气泡截图笔记（ticket 26）：按自己那只宠物的位置裁一圈，把贴在它边上的气泡一起框进来。 */
+function writeNoticeNote (verified, fileName) {
+  if (!WRITE_NOTES) return null
+  mkdirSync(NOTES_DIR, { recursive: true })
+  const composite = compositeOverCheckerboard(verified.image)
+  const pet = verified.pets.find((candidate) => candidate.role === 'self') ?? verified.pets[0]
+  // 气泡固定在自己宠物的上方/右侧，给足余量；宠物贴在窗口边缘时按窗口夹取。
+  const margin = { left: 40, top: 300, right: 760, bottom: 60 }
+  const px = Math.max(0, Math.floor((pet.x - margin.left) * verified.scaleX))
+  const py = Math.max(0, Math.floor((pet.y - margin.top) * verified.scaleY))
+  const pw = Math.min(composite.width - px, Math.ceil((pet.width + margin.left + margin.right) * verified.scaleX))
+  const ph = Math.min(composite.height - py, Math.ceil((pet.height + margin.top + margin.bottom) * verified.scaleY))
+  const path = join(NOTES_DIR, fileName)
+  writeFileSync(path, encodePng(downscale(cropImage(composite, px, py, pw, ph), 2)))
+  return path
 }
 
 /** 礼物卡截图笔记（ticket 25）：合成到棋盘格上，再按卡片矩形裁一圈，方便直接看。 */
@@ -1973,6 +1991,48 @@ async function verifyGifts () {
   const noteImage = writeGiftNote(imageVerified, imageCardRect, '25-gift-image.png')
   const noteFile = writeGiftNote(fileVerified, fileCardRect, '25-gift-file.png')
   if (noteImage !== null) info('截图笔记：' + noteImage + ' / ' + noteFile)
+
+  // 送达到没送达的两句气泡（ticket 26）：宿主给 `controls.notice`，渲染端只负责冒泡。
+  // 文案直接用 `src/gift-text.js` 的真身，别在这里重写一遍中文——两处各写一句迟早不一样。
+  const noticeShots = []
+  for (const [suffix, text] of [
+    ['received', giftReceivedText('阿蟹')],
+    ['not-received', giftNotReceivedText()]
+  ]) {
+    client.send({
+      type: 'update',
+      scene: shared.petScene([
+        { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] }
+      ], workArea, {
+        reset: false,
+        controls: {
+          visit: { enabled: true, reason: null },
+          recall: { enabled: false, nickname: null },
+          visitors: [],
+          street: [],
+          prompt: null,
+          gifts: [],
+          notice: { text, at: Date.now() }
+        }
+      })
+    })
+    await sleep(700)
+    const noticeState = await client.rendererState()
+    assert(noticeState.controls.notice !== null && noticeState.controls.notice.text === text,
+      '礼物气泡进到渲染端（' + suffix + '）')
+    const noticePath = join(OUT_DIR, 'gift-notice-' + suffix + '.png')
+    const noticeMark = client.mark()
+    client.send({ type: 'shot', id: 'shot-gift-notice-' + suffix, path: noticePath })
+    const noticeShot = await client.waitFrom(
+      noticeMark,
+      (event) => event.type === 'shot' && event.id === 'shot-gift-notice-' + suffix,
+      8000,
+      '礼物气泡截图 ' + suffix
+    )
+    assert(noticeShot.width > 0 && existsSync(noticePath), '礼物气泡截图落盘：' + noticePath)
+    const note = writeNoticeNote(verifyShot(noticePath, noticePath + '.json', 1), '26-gift-notice-' + suffix + '.png')
+    if (note !== null) noticeShots.push(note)
+  }
 
   // 光标移开 → 恢复穿透（没关掉的控件不该把整窗一直按着）。
   client.send({ type: 'pointer', x: outside.x, y: outside.y })
