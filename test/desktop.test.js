@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -900,6 +900,17 @@ function fakeCtx () {
   }
 }
 
+/**
+ * 这些测试断言“没有意外警告”，但不能依赖开发机上装没装 dsh-pet：
+ * 给一个最小的素材源（一个 idle.webm），让 loadSkinSources 不去报 no-dsh-pet。
+ */
+async function assetEnv (t) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-assets-'))
+  await writeFile(join(dir, 'idle.webm'), Buffer.from('webm'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  return { ...process.env, DSH_ZOO_DSH_PET_ASSETS: dir }
+}
+
 test('service：桌面层启动、ready 时下发占位场景、dispose 收掉；desktop:false 完全不碰', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
@@ -916,9 +927,11 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
     }
   }
   const { ctx, warnings } = fakeCtx()
+  const env = await assetEnv(t)
   const service = createService(ctx, {
     network: false,
     petBridge: false,
+    env,
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
     desktopFactory: factory,
@@ -949,6 +962,7 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
   const service2 = createService(ctx2, {
     network: false,
     petBridge: false,
+    env,
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
     desktop: false,
@@ -994,6 +1008,7 @@ test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作�
   const service = createService(ctx, {
     network: false,
     petBridge: false,
+    env: await assetEnv(t),
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
     desktopFactory: factory,
@@ -1055,6 +1070,7 @@ test('service：桌面控件申请走同一套 action 并回 action-result；失
   const service = createService(ctx, {
     network: false,
     petBridge: false,
+    env: await assetEnv(t),
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
     desktopFactory: factory,
@@ -1281,6 +1297,7 @@ test('service：访客超出场景上限时不静默丢宠物，宿主给一条�
   const service = createService(ctx, {
     network: false,
     petBridge: false,
+    env: await assetEnv(t),
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
     desktopFactory: factory,

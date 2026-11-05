@@ -44,6 +44,13 @@ async function tempDir (t) {
   return dir
 }
 
+/** 测试不该依赖开发机上装没装 dsh-pet：给一个最小素材源，避免 no-dsh-pet 警告。 */
+async function assetEnv (t) {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, 'idle.webm'), Buffer.from('webm'))
+  return { ...process.env, DSH_ZOO_DSH_PET_ASSETS: dir }
+}
+
 function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -527,7 +534,8 @@ test('visits.json 不可写：串门照常完成，记录留在内存且只告�
 
   const service = makeService(t, {
     dataDir: dir,
-    petConfigPath: join(dir, 'missing.jsonc')
+    petConfigPath: join(dir, 'missing.jsonc'),
+    env: await assetEnv(t)
   })
   await service.ready
   assert.deepEqual(service.warnings, [])
@@ -605,7 +613,8 @@ test('老 settings.json 没有 autoVisits：按默认关运行，不告警', asy
 
   const service = makeService(t, {
     dataDir: dir,
-    petConfigPath: join(dir, 'missing.jsonc')
+    petConfigPath: join(dir, 'missing.jsonc'),
+    env: await assetEnv(t)
   })
   await service.ready
   assert.equal(service.snapshot().acceptVisits, false)
