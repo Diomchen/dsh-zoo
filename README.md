@@ -1,5 +1,8 @@
 # dsh-zoo
 
+[![CI](https://github.com/Diomchen/dsh-zoo/actions/workflows/ci.yml/badge.svg)](https://github.com/Diomchen/dsh-zoo/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Diomchen/dsh-zoo?display_name=tag&sort=semver)](https://github.com/Diomchen/dsh-zoo/releases/latest)
+
 把同一局域网里的 DSH 宠物连起来：自己的宠物活在桌面上，邻居的宠物会来串门，你的宠物也会出门。
 
 dsh-zoo 负责**发现、放行、串门、桌面画布、礼物和记录**；宠物的名字、动作和外观来自 `dsh-pet`。
@@ -286,6 +289,7 @@ npm run fake-peer -- --gift $'给你留了张便条\n第二行'
 - 桌面 helper、点击穿透、场景 v3、素材协议：[`desktop/README.md`](desktop/README.md)
 - 领域词汇：[`CONTEXT.md`](CONTEXT.md)
 - 决策记录：[`docs/adr/`](docs/adr/)
+- 发布与上架 dsh-market：[`docs/release.md`](docs/release.md)
 - 开发笔记与验收截图：[`.scratch/dsh-zoo/`](.scratch/dsh-zoo/)
 
 ## 许可证
