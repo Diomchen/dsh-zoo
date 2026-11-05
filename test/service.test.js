@@ -1493,3 +1493,87 @@ test('扫描外观：同一个素材目录已经手写成别的 id，就不要�
   const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
   assert.deepEqual(saved.sources.map((s) => s.id), ['maodie-pet'], '不能多出一条指向同一目录的外观')
 })
+
+test('扫描外观：手改过 skin.json 还没重载，也要按磁盘上的内容判重', async (t) => {
+  const home = await tempDir(t)
+  const dir = join(home, 'local-pet')
+  const fish = join(dir, 'skin-fish')
+  await mkdir(fish, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
+  await petPackFixture(home)
+
+  const service = makeService(t, {
+    dataDir: dir,
+    env: { DSH_HOME: home },
+    skinServer: false,
+    desktop: false,
+    petConfigPath: join(home, 'missing.jsonc')
+  })
+  await service.ready
+  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+
+  // 手动把猫删掉，不按「重载配置」——进程里的缓存还认为它在。
+  const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
+  await writeSkins(dir, saved.sources.filter((entry) => entry.id !== 'maodie'))
+
+  const again = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.deepEqual(again.body.added, ['maodie'], '不能拿旧缓存判重，否则刚删掉的源永远补不回来')
+})
+
+test('扫描外观：文件在这之后才被改坏，也要报 409 而不是"没有新素材"', async (t) => {
+  const home = await tempDir(t)
+  const dir = join(home, 'local-pet')
+  const fish = join(dir, 'skin-fish')
+  await mkdir(fish, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
+  await petPackFixture(home)
+
+  const service = makeService(t, {
+    dataDir: dir,
+    env: { DSH_HOME: home },
+    skinServer: false,
+    desktop: false,
+    petConfigPath: join(home, 'missing.jsonc')
+  })
+  await service.ready
+  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+
+  // 扫描过一次之后把文件写坏；此时缓存里猫是"已知"，但文件已经读不出来了。
+  await writeFile(join(dir, SKIN_FILE), '{ 坏掉了', 'utf8')
+  const broken = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.equal(broken.status, 409)
+  assert.equal(broken.body.error, 'skin-file-broken')
+  assert.equal(await readFile(join(dir, SKIN_FILE), 'utf8'), '{ 坏掉了', '坏文件不能被覆盖')
+})
+
+test('扫描外观：干净机器上没有 skin.json 时，要把自动源一起写进去（别把鱼弄丢）', async (t) => {
+  const home = await tempDir(t)
+  const dir = join(home, 'local-pet')
+  await mkdir(dir, { recursive: true })
+  // 自动源 = dsh-pet 的用户素材目录；有它才会自动注册成第一张皮。
+  const auto = join(home, 'dsh-pet', 'main-animation', 'webm')
+  await mkdir(auto, { recursive: true })
+  await writeFile(join(auto, '待机呼吸休闲.webm'), 'fish')
+  await petPackFixture(home)
+
+  const service = makeService(t, {
+    dataDir: dir,
+    env: { DSH_HOME: home },
+    skinServer: false,
+    desktop: false,
+    petConfigPath: join(home, 'missing.jsonc')
+  })
+  await service.ready
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'dsh-pet')
+
+  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.equal(scanned.status, 200)
+  assert.deepEqual(scanned.body.added, ['maodie'])
+  assert.match(scanned.body.notice, /加入 1 张/)
+
+  const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
+  assert.deepEqual(saved.sources.map((s) => s.id), ['dsh-pet', 'maodie'], '自动源要一起写进去，否则鱼会消失')
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'dsh-pet', '扫描不该顺手换掉当前皮')
+})

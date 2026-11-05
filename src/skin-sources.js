@@ -311,6 +311,36 @@ export function idlePoolOf (source) {
 
 
 /**
+ * 读 `skin.json` 里现有的条目，**坏文件直接抛**（ticket 38）。
+ *
+ * 和 `loadSkinSources` 的"坏文件回落自动源"分工不同：那是为了让宠物活着，
+ * 这是为了让一次显式的写操作知道自己会不会踩到坏文件。
+ *
+ * @returns {Promise<{exists:boolean, entries:Array<object>}>}
+ */
+export async function readSkinEntries (dir, options = {}) {
+  const readFileImpl = typeof options.readFile === 'function' ? options.readFile : readFile
+  const file = join(dir, SKIN_FILE)
+  let raw
+  try {
+    raw = await readFileImpl(file, 'utf8')
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { exists: false, entries: [] }
+    throw error
+  }
+  const { list } = parseSkinDoc(raw)
+  return { exists: true, entries: list }
+}
+
+/** 裸数组与 `{ sources }` 都认；返回形状 + 条目（形状要保留给写回用）。 */
+function parseSkinDoc (text) {
+  const doc = JSON.parse(stripBom(text))
+  const isArray = Array.isArray(doc)
+  const list = isArray ? doc.slice() : (Array.isArray(doc?.sources) ? doc.sources.slice() : [])
+  return { isArray, list }
+}
+
+/**
  * 把扫到的素材包**追加**进 `skin.json`（ticket 37）。
  *
  * 只做加法：已存在的 id 一律跳过，所以连点十次和点一次结果一样；文件本身的形状
@@ -330,10 +360,7 @@ export async function appendSkinSources (dir, entries, options = {}) {
     if (error?.code !== 'ENOENT') throw error
   }
 
-  let doc = null
-  if (raw !== null) doc = JSON.parse(stripBom(raw))
-  const isArray = Array.isArray(doc)
-  const list = isArray ? doc.slice() : (Array.isArray(doc?.sources) ? doc.sources.slice() : [])
+  const { isArray, list } = raw === null ? { isArray: false, list: [] } : parseSkinDoc(raw)
   const seen = new Set()
   for (const item of list) {
     if (typeof item?.id === 'string') seen.add(item.id)

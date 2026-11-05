@@ -31,7 +31,7 @@ import { buildMenu, readAnimationsConfig } from './menu.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import { resolveSkinPort, startLanServer } from './lan-server.js'
-import { appendSkinSources, idlePoolOf, loadSkinSources } from './skin-sources.js'
+import { appendSkinSources, idlePoolOf, loadSkinSources, readSkinEntries } from './skin-sources.js'
 import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -566,15 +566,45 @@ export function createService (ctx, options = {}) {
         warn(ctx, '扫描素材包失败：' + message(error))
         return { ok: false, error: 'scan-failed' }
       }
-      const knownIds = new Set(skinSources.map((source) => source.id))
+      // 判重必须对着**磁盘上的** skin.json，不能拿进程里的缓存：用户可能刚删掉一条、
+      // 还没按「重载配置」（Windows 现场）。先读文件，坏文件在这里就要报 409。
+      let existing
+      try {
+        existing = await readSkinEntries(dir)
+      } catch (error) {
+        warn(ctx, '读 skin.json 失败：' + message(error))
+        return { ok: false, error: 'skin-file-broken' }
+      }
+      // 文件不存在时才需要"当前生效的源"（拿来一起写进新文件）；这一步会重读注册表，
+      // 所以放在校验之后——坏文件不该先把当前皮悄悄换掉再失败。
+      if (!existing.exists) await loadSkin()
+
+      // skin.json 不存在时，注册表就是自动源（dsh-pet 的素材）。新建这个文件会把自动源
+      // 顶掉，所以要把当前生效的那些条目一起写进去——否则在干净机器上"扫一下"会把鱼弄丢、
+      // 还会顺手把宠物换成猫。
+      const base = existing.exists ? existing.entries : skinSources.map(skinEntryOf)
+      const knownIds = new Set()
+      for (const entry of base) {
+        if (typeof entry?.id === 'string') knownIds.add(entry.id)
+      }
       // 不只按 id 去重：同一个素材目录可能已经被手写成一个别的 id（现场就有
       // `maodie-pet` 和扫出来的 `maodie` 指同一个目录），再按 id 判会多出一条重复外观。
       const knownDirs = new Set()
-      for (const source of skinSources) {
-        for (const dir of Array.isArray(source.dirs) ? source.dirs : []) knownDirs.add(skinDirKey(dir))
+      for (const entry of base) {
+        for (const dir of Array.isArray(entry?.dirs) ? entry.dirs : []) knownDirs.add(skinDirKey(dir))
       }
       const fresh = found.packs.filter((pack) =>
         !knownIds.has(pack.id) && !pack.dirs.some((dir) => knownDirs.has(skinDirKey(dir))))
+
+      // 文件不存在时要连自动源一起写进去；已经存在就只追加新的。空数组 = 只校验不落盘。
+      const entries = existing.exists ? fresh : [...base, ...fresh]
+      let written
+      try {
+        written = await appendSkinSources(dir, entries)
+      } catch (error) {
+        warn(ctx, '写 skin.json 失败：' + message(error))
+        return { ok: false, error: 'skin-file-broken' }
+      }
       if (fresh.length === 0) {
         return {
           ok: true,
@@ -584,18 +614,11 @@ export function createService (ctx, options = {}) {
           notice: found.packs.length === 0 ? '没找到任何宠物包。' : '没有发现新的素材包。'
         }
       }
-      let written
-      try {
-        written = await appendSkinSources(dir, fresh)
-      } catch (error) {
-        warn(ctx, '写 skin.json 失败：' + message(error))
-        return { ok: false, error: 'skin-file-broken' }
-      }
       await loadSkin()
       await refreshDesktopMenu()
       desktopSceneSignature = null
       syncDesktop()
-      const ids = written.added.map((entry) => entry.id)
+      const ids = fresh.map((pack) => pack.id)
       return {
         ok: true,
         action: 'scan-skins',
@@ -1078,6 +1101,15 @@ export function createService (ctx, options = {}) {
    */
   function skinChoices () {
     return skinSources.map((source) => ({ id: source.id }))
+  }
+
+  /** 把当前生效的源写成 `skin.json` 里的一行（新建文件时用）。 */
+  function skinEntryOf (source) {
+    const entry = { id: source.id, dirs: Array.isArray(source.dirs) ? source.dirs.slice() : [] }
+    if (Number.isInteger(source.size)) entry.size = source.size
+    if (typeof source.idle === 'string' && source.idle !== '') entry.idle = source.idle
+    if (Array.isArray(source.once) && source.once.length > 0) entry.once = source.once.slice()
+    return entry
   }
 
   /** 目录去重用的键：同一台机器上大小写不敏感（Windows 的盘符与路径大小写可以随手写）。 */
