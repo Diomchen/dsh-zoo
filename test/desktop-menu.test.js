@@ -47,6 +47,20 @@ test('菜单：整份坏数据 → 空菜单，不抛', () => {
   }
 })
 
+test('菜单：actionsLocal 只在为真时出现，老场景形状不变', () => {
+  const local = shared.normalizeMenu({
+    groups: [{ label: '动作', actions: ['喷火'] }],
+    actionsLocal: true
+  })
+  assert.equal(local.actionsLocal, true)
+
+  // 假值/坏值一律当作 dsh-pet 的点播路径；不能因为一个字符串就切成本地播放。
+  for (const value of [false, 'true', 1, null]) {
+    const menu = shared.normalizeMenu({ groups: [{ label: '动作', actions: ['喷火'] }], actionsLocal: value })
+    assert.equal(menu.actionsLocal, undefined, String(value))
+  }
+})
+
 test('菜单：场景 v3 带 menu；旧场景没有这个字段时是空菜单', () => {
   const fresh = shared.normalizeScene({ items: [] })
   assert.equal(fresh.version, 3)
@@ -65,10 +79,16 @@ test('菜单：场景 v3 带 menu；旧场景没有这个字段时是空菜单',
 
 test('菜单：petScene 把 menu 原样带进场景', () => {
   const scene = shared.petScene([], { width: 800, height: 600 }, {
-    menu: { tools: [{ id: 'reload', label: '重载配置' }], groups: [{ label: '动作', actions: ['螃蟹走路'] }] }
+    menu: {
+      tools: [{ id: 'reload', label: '重载配置' }],
+      groups: [{ label: '动作', actions: ['螃蟹走路'] }],
+      actionsLocal: true
+    }
   })
   assert.deepEqual(scene.menu.tools, [{ id: 'reload', label: '重载配置' }])
   assert.deepEqual(scene.menu.groups, [{ label: '动作', actions: ['螃蟹走路'] }])
+  // 换皮后「动作」走本机播放：这个标记必须穿过场景，否则渲染端还会去问 /anim。
+  assert.equal(scene.menu.actionsLocal, true)
 })
 
 test('菜单：默认贴在指针右侧；右边放不下翻到左侧', () => {

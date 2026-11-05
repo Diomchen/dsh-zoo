@@ -650,6 +650,28 @@ test('helper argv：素材目录只接受绝对路径、去重、最多 8 个，
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', assetRoots: null }), ['/h'])
 })
 
+test('petScene：访客的远端素材地址与语义 fallback 必须传下去（宿主的 src 不能在这里丢）', () => {
+  const hash = 'b'.repeat(64)
+  const src = 'dshzoo://cache/' + hash + '.webm'
+  const scene = shared.petScene([
+    { id: 'visitor:x', role: 'visitor', label: '柯基', anim: '东张西望', src, fallback: 'sleeping' },
+    { id: 'self', role: 'self', label: '小蓝', anim: null }
+  ], AREA)
+
+  const visitor = scene.items.find((item) => item.id === 'visitor:x')
+  assert.equal(visitor.src, src)
+  assert.equal(visitor.fallback, 'sleeping')
+  // 本机宠物没有远端地址；没给的字段不要凭空长出来
+  const self = scene.items.find((item) => item.id === 'self')
+  assert.equal(self.src, undefined)
+  assert.equal(self.fallback, undefined)
+  // helper 侧归一化不能把这两个字段改掉
+  const normalized = shared.normalizeScene(JSON.parse(JSON.stringify(scene)))
+  const roundTrip = normalized.items.find((item) => item.id === 'visitor:x')
+  assert.equal(roundTrip.src, src)
+  assert.equal(roundTrip.fallback, 'sleeping')
+})
+
 test('场景 item 保留合法的 cache src 与语义 fallback，非法值丢掉', () => {
   const hash = 'a'.repeat(64)
   const scene = shared.normalizeScene({

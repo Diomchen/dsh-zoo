@@ -92,6 +92,31 @@ test('buildMenu：dsh-pet 在就用它的分类；不在就退平铺；两条都
   const bare = buildMenu({})
   assert.deepEqual(bare.groups, [])
   assert.deepEqual(bare.tools.map((tool) => tool.id), ['bring', 'home', 'reload', 'scan-skins'])
+  assert.equal(withPet.actionsLocal, undefined, 'dsh-pet 那张皮不带本地播放标记')
+})
+
+test('buildMenu：当前是别人的皮时，「动作」列这张皮自己的动作并标成本地播放', () => {
+  const menu = buildMenu({
+    // 就算读到了 dsh-pet 的 animations，也不许用它顶掉这张皮的动作。
+    animations: ANIMATIONS,
+    pool: ['待机'],
+    actions: ['待机', '喷火', '打滚'],
+    actionsLocal: true,
+    skins: [{ id: 'maodie-pet', label: 'maodie-pet' }],
+    activeSkin: 'maodie-pet'
+  })
+
+  assert.deepEqual(menu.groups, [{ label: '动作', actions: ['待机', '喷火', '打滚'] }])
+  assert.equal(menu.actionsLocal, true)
+  // 一次性动作（喷火）也要能被手动点，不能因为不进待机池就从菜单里消失。
+  assert.ok(menu.groups[0].actions.includes('喷火'))
+  assert.equal(menu.activeSkin, 'maodie-pet')
+})
+
+test('buildMenu：本地动作清单为空时才退到待机池，不出现空菜单', () => {
+  const menu = buildMenu({ actions: [], actionsLocal: true, pool: ['待机'] })
+  assert.deepEqual(menu.groups, [{ label: '动作', actions: ['待机'] }])
+  assert.equal(menu.actionsLocal, true)
 })
 
 test('读动画配置：素材目录旁边的 config.jsonc，剥注释；坏文件跳过看下一个源', async (t) => {

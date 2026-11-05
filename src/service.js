@@ -31,7 +31,7 @@ import { buildMenu, readAnimationsConfig } from './menu.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import { resolveSkinPort, startLanServer } from './lan-server.js'
-import { appendSkinSources, idlePoolOf, loadSkinSources, readSkinEntries } from './skin-sources.js'
+import { DEFAULT_SKIN_ID, appendSkinSources, idlePoolOf, loadSkinSources, readSkinEntries } from './skin-sources.js'
 import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -1070,20 +1070,33 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 重建右键菜单（ticket 22）：dsh-pet 的 animations 优先，读不到退到本机素材源平铺。
-   * 任何失败都只让菜单变短，不影响桌面/串门。
+   * 重建右键菜单（ticket 22）：dsh-pet 那张皮用它的 animations，别人的皮用皮自己的动作；
+   * 前者读不到时退到本机待机池。任何失败都只让菜单变短，不影响桌面/串门。
+   *
+   * 换皮之后「动作」必须跟着皮走（现场反馈）：dsh-pet 那张皮仍用它的分类和 `/anim`；
+   * 别的皮列自己目录里的动作，点击在本机播——`/anim` 只认 dsh-pet 自己的名字，
+   * 把别人的动作名送过去只会被拒，再冒一句没必要的失败提示。
    */
   async function refreshDesktopMenu () {
+    const actionsLocal = activeSkin !== null && activeSkin.id !== DEFAULT_SKIN_ID
     let animations = null
-    try {
-      const found = await readAnimationsConfig(resolveDshPetAssetDirs({ env }))
-      animations = found?.animations ?? null
-    } catch {
-      animations = null
+    if (!actionsLocal) {
+      try {
+        const found = await readAnimationsConfig(assetRootsFor(activeSkin))
+        animations = found?.animations ?? null
+      } catch {
+        animations = null
+      }
     }
+    const actions = activeSkin === null || activeSkin.actions === null ||
+      typeof activeSkin.actions !== 'object' || Array.isArray(activeSkin.actions)
+      ? []
+      : Object.keys(activeSkin.actions).sort()
     // 两条素材路共用同一份「外观」信息：读不到 dsh-pet 的 animations 时只少掉动作分类。
     const common = {
       pool: skinPool,
+      actions,
+      actionsLocal,
       hasOrigin: dshOrigin(ctx) !== null,
       skins: skinChoices(),
       activeSkin: activeSkin === null ? null : activeSkin.id
@@ -1225,7 +1238,11 @@ export function createService (ctx, options = {}) {
   /**
    * 访客素材（ticket 17）：按对方广告的 skinPort/skinId 异步拉当前动作。
    * 失败只影响这一只访客的“皮”，它仍然以通用小人出现；不阻塞心跳/串门。
-   * 同一只访客同一个动作 60 秒内不重复拉（失败也有冷却，见 skin-fetch）。
+   * 同一只访客、同一张皮、同一个动作 60 秒内不重复拉（失败也有冷却，见 skin-fetch）。
+   *
+   * `skinId` / `skinPort` 必须进节流键：换皮之后心跳里的动作名常常一个字都没变
+   * （本机宠物大多在待机），只看动作就会把旧皮的缓存地址一直用下去——
+   * 现场反馈的「我改了皮肤再串门，别人那里不变」就是这一条。
    */
   function noteVisitorSkin (packet) {
     if (skinFetcher === null || discovery === null) return
@@ -1236,7 +1253,9 @@ export function createService (ctx, options = {}) {
     const semantic = packet.semantic ?? 'other'
     const at = Date.now()
     const previous = visitorSkins.get(packet.deviceId)
-    if (previous !== undefined && previous.action === action && previous.semantic === semantic &&
+    const sameSkin = previous !== undefined &&
+      previous.skinId === packet.skinId && previous.port === packet.skinPort
+    if (sameSkin && previous.action === action && previous.semantic === semantic &&
       at - previous.at < 60000) return
 
     skinFetcher.resolve({
@@ -1246,7 +1265,14 @@ export function createService (ctx, options = {}) {
       action
     }).then((result) => {
       if (disposed) return
-      const next = { action, semantic, fallback: semantic, at: Date.now() }
+      const next = {
+        skinId: packet.skinId,
+        port: packet.skinPort,
+        action,
+        semantic,
+        fallback: semantic,
+        at: Date.now()
+      }
       if (result !== null) next.src = result.url
       visitorSkins.set(packet.deviceId, next)
       syncDesktop()

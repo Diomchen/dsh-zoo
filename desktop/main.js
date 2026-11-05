@@ -407,7 +407,10 @@ async function handleAssetRequest (request) {
     const data = await fsp.readFile(file)
     const headers = {
       'content-type': 'video/webm',
-      'cache-control': 'public, max-age=300',
+      // 本机素材按**动作名**寻址（dshzoo://asset/<名字>.webm）：换皮之后同名动作可能指向
+      // 另一个目录里的另一份文件。缓存住的话，切换后点了同名动作还会播旧皮那一段。
+      // 远端缓存按内容哈希寻址，内容不会变，照旧可以缓存。
+      'cache-control': url.hostname === CACHE_HOST ? 'public, max-age=300' : 'no-store',
       'accept-ranges': 'bytes'
     }
     const range = parseByteRange(request.headers.get('range'), data.length)

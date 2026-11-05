@@ -1292,6 +1292,40 @@ test('换皮：桌面右键那条路（action 事件带 skinId）也能切，结
   assert.equal(state.body.skin.id, 'cat')
 })
 
+test('换皮后「动作」菜单跟着皮走：列新皮的动作，并标记成本机播放', async (t) => {
+  const dir = await tempDir(t)
+  await skinFixture(dir)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+  // 场景要等 helper 报工作区才会下发；没有 ready 的话 syncDesktop 是 no-op。
+  desktop.emit({ type: 'ready', pid: 4242, workArea: { x: 0, y: 0, width: 1200, height: 800 } })
+  await delay(30)
+
+  const first = desktop.calls.scenes.at(-1)
+  assert.ok(first, 'ready 后应下发场景')
+  assert.equal(first.menu.actionsLocal, true, '非 dsh-pet 的皮，动作在本机播')
+  assert.equal(first.menu.activeSkin, 'fish')
+  assert.deepEqual(first.menu.groups, [{ label: '动作', actions: ['东张西望', '待机呼吸休闲'] }])
+
+  const switched = await call(service, '/dsh-zoo/action', {
+    method: 'POST',
+    body: { action: 'use-skin', skinId: 'cat' }
+  })
+  assert.equal(switched.status, 200)
+  await delay(30)
+
+  const next = desktop.calls.scenes.at(-1)
+  assert.equal(next.menu.activeSkin, 'cat')
+  assert.equal(next.menu.actionsLocal, true)
+  // 喷火是一次性动作：不在待机池里，但右键必须能点。
+  assert.deepEqual(next.menu.groups, [{ label: '动作', actions: ['喷火', '待机'] }])
+})
+
 async function writeSkins (dir, entries) {
   await writeFile(join(dir, SKIN_FILE), JSON.stringify({ sources: entries }), 'utf8')
 }

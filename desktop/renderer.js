@@ -1069,6 +1069,12 @@
   function playAnimFromMenu (petId, name) {
     const pet = pets.get(petId)
     if (pet === undefined) return
+    // 「动作」来自当前这张皮时，名字只在皮自己的目录里存在（dsh-pet 不认识）。
+    // 直接在本机播：送 `/anim` 只会被拒，再冒一句没必要的失败提示。
+    if (scene.menu.actionsLocal === true) {
+      playLocalAnim(pet, name)
+      return
+    }
     const fallback = () => playLocalAnim(pet, name)
     // 先申请本体的点播；宿主说不行（没装/不可达/被拒）再退成本机播一次。
     requestAction('play-anim', undefined, { name, fallback })

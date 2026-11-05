@@ -149,9 +149,25 @@ export function menuSkins (skins) {
   return list
 }
 
-/** 合成完整菜单：工具 + 动作分类 + 外观。三条路都空时只剩工具项。 */
-export function buildMenu ({ animations = null, pool = [], hasOrigin = false, skins = [], activeSkin = null } = {}) {
-  const groups = groupsFromAnimations(animations)
+/**
+ * 合成完整菜单：工具 + 动作分类 + 外观。三条路都空时只剩工具项。
+ *
+ * 「动作」有两个来源（[ADR-0013](../../docs/adr/0013-skin-switch-keeps-identity.md) 的皮自带动作）：
+ * - 当前皮是 dsh-pet：分类/标签照抄它自己的 animations，点了走 `/anim`；
+ * - 当前皮是别人的：`actionsLocal` 为真，列出这张皮里的**全部**动作（含一次性动作），
+ *   点了在本机播——dsh-pet 不认识这些名字，送去 `/anim` 只会被拒。
+ * 两者都不给时仍退到 `pool`（本机待机池），保持 0.4 的降级行为。
+ */
+export function buildMenu ({
+  animations = null,
+  pool = [],
+  actions = [],
+  actionsLocal = false,
+  hasOrigin = false,
+  skins = [],
+  activeSkin = null
+} = {}) {
+  const groups = actionsLocal === true ? groupsFromPool(actions) : groupsFromAnimations(animations)
   const choices = menuSkins(skins)
   return {
     tools: menuTools({ hasOrigin }),
@@ -159,7 +175,9 @@ export function buildMenu ({ animations = null, pool = [], hasOrigin = false, sk
     skins: choices,
     activeSkin: typeof activeSkin === 'string' && choices.some((choice) => choice.id === activeSkin)
       ? activeSkin
-      : null
+      : null,
+    // 只有为真时才出现在菜单里：老场景没有这个字段，渲染端按「dsh-pet 点播」处理。
+    ...(actionsLocal === true ? { actionsLocal: true } : {})
   }
 }
 

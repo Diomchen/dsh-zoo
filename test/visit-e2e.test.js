@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import dgram from 'node:dgram'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -754,4 +754,96 @@ test('送客的 recall 丢第一包：重发到达后对方立刻回家，记录
   assert.ok(record.durationMs <= Date.now() - startedAt)
   await waitFor(() => b.snapshot().visits.length === 1)
   assert.equal(b.snapshot().visits[0].direction, 'in')
+})
+
+/**
+ * 现场反馈（2026-11-05）：我改了皮肤再串门，别人那里不变；改了皮肤后动作也不跟着换。
+ *
+ * 这条走完整的跨机链路：A 的素材源 → B 的 skin-fetch 落缓存 → B 的桌面场景。
+ * 断言的是**访客在别人桌面上真的用自己的素材**（src），并且在 A 换皮后跟着换。
+ */
+test('访客换皮：邻居桌面拿到的是访客自己的素材，换皮后 src 立刻跟着换', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-zoo-skin-visit-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const fishDir = join(root, 'fish')
+  const catDir = join(root, 'cat')
+  const dirA = join(root, 'a')
+  const dirB = join(root, 'b')
+  for (const dir of [fishDir, catDir, dirA, dirB]) await mkdir(dir, { recursive: true })
+
+  // 两张皮的待机动作名不同：dsh-pet 的「待机呼吸休闲」和 maodie 的「待机」。
+  const EBML = Buffer.from([0x1a, 0x45, 0xdf, 0xa3])
+  const fishBytes = Buffer.concat([EBML, Buffer.from('fish-idle')])
+  const catBytes = Buffer.concat([EBML, Buffer.from('cat-idle')])
+  await writeFile(join(fishDir, '待机呼吸休闲.webm'), fishBytes)
+  await writeFile(join(catDir, '待机.webm'), catBytes)
+  await writeFile(join(dirA, 'skin.json'), JSON.stringify({
+    sources: [
+      { id: 'fish', dirs: [fishDir], size: 462 },
+      { id: 'cat', dirs: [catDir], size: 462, idle: '待机' }
+    ]
+  }))
+  const urlOf = (bytes) => 'dshzoo://cache/' + createHash('sha256').update(bytes).digest('hex') + '.webm'
+  const fishUrl = urlOf(fishBytes)
+  const catUrl = urlOf(catBytes)
+
+  // 两台机器都不去碰开发机上真实装没装 dsh-pet 的目录。
+  const env = { ...process.env, DSH_ZOO_DSH_PET_ASSETS: fishDir }
+  const [portA, portB] = await distinctPorts(2)
+
+  const bScenes = []
+  let bDesktop = null
+  const b = makeService(t, twoInstanceOptions(dirB, portB, portA, {
+    env,
+    heartbeatIntervalMs: 100,
+    beaconIntervalMs: 500,
+    desktopSyncMs: 20,
+    desktopFactory (options) {
+      bDesktop = options
+      return {
+        start () { return { ok: true, pid: 7001 } },
+        update (scene) { bScenes.push(scene); return true },
+        resync (scene) { bScenes.push(scene); return true },
+        actionResult () {},
+        dispose () {}
+      }
+    }
+  }))
+  await b.ready
+  assert.ok(bDesktop, 'B 的桌面层应该拿到工厂参数')
+  bDesktop.onEvent({ type: 'ready', pid: 7001, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+
+  const a = makeService(t, twoInstanceOptions(dirA, portA, portB, {
+    env,
+    heartbeatIntervalMs: 100,
+    beaconIntervalMs: 500,
+    // 这条用例要在一次串门里完成“到达 → 换皮 → 邻居重取”，不能撞上 600ms 的到期。
+    visitMaxMs: 60000,
+    skinServer: true,
+    skinPort: 0
+  }))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1, 5000)
+
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal((await callAction(a, { action: 'admit', deviceId: bId })).status, 200)
+  assert.equal((await callAction(b, { action: 'admit', deviceId: aId })).status, 200)
+  assert.equal((await callAction(a, { action: 'visit', deviceId: bId })).status, 200)
+
+  const visitorItem = () => bScenes.at(-1)?.items.find((item) => item.role === 'visitor')
+  await waitFor(() => b.snapshot().visitors.length === 1, 3000)
+  await waitFor(() => visitorItem()?.src === fishUrl, 3000)
+
+  // A 换皮：同一只宠物、同一次串门，只换外观和动作。
+  const switched = await callAction(a, { action: 'use-skin', skinId: 'cat' })
+  assert.equal(switched.status, 200)
+  assert.equal(switched.body.skin, 'cat')
+  assert.equal(a.snapshot().skin.id, 'cat')
+
+  // 60 秒节流不能成为“别人那里不更新”的理由：心跳一来就该按新 skinId 重取。
+  await waitFor(() => visitorItem()?.src === catUrl, 3000)
+  assert.equal(visitorItem().label, b.snapshot().visitors[0].nickname)
+  // 名字、身份、这次串门都没被换皮影响（ADR-0013）。
+  assert.equal(b.snapshot().visitors[0].deviceId, aId)
 })

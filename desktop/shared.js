@@ -765,6 +765,8 @@
    *   groups [{ label, actions: [动画名] }]          「动作」下的分类；空分类不出现
    *   skins  [{ id, label }]                        「外观」的候选（ticket 32）；当前那张打勾
    *   activeSkin  string|null                       当前那张皮的 id
+   *   actionsLocal  true（可缺省）                   「动作」来自当前这张皮，点了在本机播；
+   *                                                 缺省 = dsh-pet 的动作，走 `/anim` 点播
    *
    * 菜单是高频交互入口：一条坏数据只能丢自己，绝不能让整份菜单消失。
    */
@@ -834,6 +836,10 @@
     // 当前那张皮：只认真的在候选里的 id，否则当作"没有当前项"。
     const active = normalizeSkinId(raw.activeSkin)
     menu.activeSkin = active !== null && seenSkins.has(active) ? active : null
+
+    // 动作的来源跟着皮走：只有宿主明说「这些动作在当前皮里」才置真。
+    // 缺省不写这个字段，老场景/老宿主的形状一个字不变。
+    if (raw.actionsLocal === true) menu.actionsLocal = true
 
     return menu
   }
@@ -946,7 +952,7 @@
    *
    * 纯函数，不读时钟/随机数：同一份 pets + workArea 永远得到同一份场景。
    *
-   * @param {Array<{id:string,role?:string,label?:string,anim?:string|null,color?:string}>} pets
+   * @param {Array<{id:string,role?:string,label?:string,anim?:string|null,color?:string,src?:string,fallback?:string}>} pets
    * @param {{x?:number,y?:number,width:number,height:number}} workArea
    * @param {{size?:number,reset?:boolean,controls?:object}} [options]
    */
@@ -977,12 +983,19 @@
         seen.add(id)
         const role = normalizeRole(raw.role) ?? 'guest'
         const idlePool = normalizeIdlePool(raw.idlePool)
+        // 访客自己的素材（ticket 17）：宿主把拉到的 cache URL 放在 pets 里，
+        // 这里必须原样带下去，否则渲染端看不到 src，只能拿本机同名动作顶替。
+        const src = normalizeAssetUrl(raw.src)
+        // 语义标签给不认识这张皮的桌面画通用表情；与 src 同一条路。
+        const fallback = normalizeSemantic(raw.fallback)
         list.push({
           id,
           role,
           label: normalizeLabel(raw.label, role === 'self' ? '我' : '邻居'),
           anim: normalizeAnim(raw.anim),
           ...(idlePool === null ? {} : { idlePool }),
+          ...(src === null ? {} : { src }),
+          ...(fallback === null ? {} : { fallback }),
           // 皮自带的尺寸（ticket 35）：只有本机那只带，访客没有皮。
           ...(Number.isInteger(raw.size) && raw.size > 0 ? { size: raw.size } : {}),
           color: normalizeColor(raw.color)
@@ -1030,6 +1043,8 @@
         role: pet.role,
         anim: pet.anim,
         ...(pet.idlePool === undefined ? {} : { idlePool: pet.idlePool }),
+        ...(pet.src === undefined ? {} : { src: pet.src }),
+        ...(pet.fallback === undefined ? {} : { fallback: pet.fallback }),
         x,
         y: groundY({ height: box.height }, area),
         width: box.width,
