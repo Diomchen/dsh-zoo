@@ -254,6 +254,10 @@
     return /^[A-Za-z0-9._:-]+$/.test(id) ? id : null
   }
 
+  function isAbsolutePath (value) {
+    return value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith('\\\\')
+  }
+
   /**
    * 本机素材目录（ticket 33）：宿主把「当前那张皮」的目录随场景下发，
    * helper 只认绝对路径、最多 8 个。空数组/null = 这次场景没说，沿用启动参数。
@@ -265,7 +269,9 @@
       if (roots.length >= 8) break
       if (typeof candidate !== 'string') continue
       const root = candidate.trim()
-      if (root === '' || !root.startsWith('/')) continue
+      // 绝对路径的三种写法：POSIX `/`、盘符 `C:\` / `C:/`、UNC `\\server\share`。
+      // 只认 `/` 会让整套换皮在 Windows 上静默失效（宿主发下去、helper 全丢掉）。
+      if (root === '' || !isAbsolutePath(root)) continue
       if (/[\u0000-\u001f\u007f]/.test(root)) continue
       if (roots.includes(root)) continue
       roots.push(root)

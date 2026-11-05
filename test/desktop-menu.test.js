@@ -145,6 +145,13 @@ test('场景带素材根目录：只认绝对路径，空/null 表示这次没�
   })
   assert.deepEqual(scene.assetRoots, ['/skins/cat', '/skins/fish'])
 
+  // Windows 的绝对路径也要认：只认 `/` 会让换皮在 Windows 上静默失效。
+  const win = shared.normalizeScene({
+    items: [],
+    assetRoots: ['C:\\pets\\maodie', 'D:/pets/cat', '\\\\nas\\pets', 'pets\\relative']
+  })
+  assert.deepEqual(win.assetRoots, ['C:\\pets\\maodie', 'D:/pets/cat', '\\\\nas\\pets'])
+
   // 旧宿主不带这个字段：必须是 null（helper 沿用启动参数），不能是空数组把根清掉。
   assert.equal(shared.normalizeScene({ items: [] }).assetRoots, null)
   assert.equal(shared.normalizeScene({ items: [], assetRoots: [] }).assetRoots, null)
