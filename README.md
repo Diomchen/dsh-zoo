@@ -31,7 +31,9 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
   **登录地址**：`ctx.connection.authenticatedUrl()` 给这次进程的 launch token，换一次 Cookie
   再 303 到干净地址；直接开裸 origin 会被 401 挡在门外）、
   「回到初始位置」（这只回到自己的出生点）、「重载配置」（重读 `settings.json` +
-  `skin.json`，重建场景并重启 helper，不占崩溃退避次数），以及「动作」三级树
+  `skin.json`，重建场景并重启 helper，不占崩溃退避次数）、
+  「扫描外观」（扫 `dsh-pet` 的宠物包目录 `~/.dsh/dsh-pet/pet/`，把没见过的素材追加进
+  `skin.json`；只在你按的时候发生，界面不会自己长出东西来），以及「动作」三级树
   （分类 → 动画名，分类照 `dsh-pet` 的 `animations` 配置；没装 dsh-pet 时退到本机素材源
   的平铺清单）。点一项动画名会 `POST dsh-pet /anim` 点播本体（ADR-0009），不可达时
   只在本机播一次并冒一句人话。`skin.json` 里有两张以上皮时，还会多一个「外观」二级菜单：

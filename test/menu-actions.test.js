@@ -272,6 +272,6 @@ test('渲染端场景：没有 dsh-pet 时菜单只剩工具项，且永远有�
   await service.ready
   desktop.ready()
   const scene = calls.updates[calls.updates.length - 1]
-  assert.deepEqual(scene.menu.tools.map((tool) => tool.id), ['bring', 'home', 'reload'])
+  assert.deepEqual(scene.menu.tools.map((tool) => tool.id), ['bring', 'home', 'reload', 'scan-skins'])
   assert.deepEqual(scene.menu.groups, [])
 })

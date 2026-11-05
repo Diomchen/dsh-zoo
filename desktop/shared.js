@@ -87,7 +87,7 @@
   const MAX_MENU_TOOLS = 8
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'home', 'reload']
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'home', 'reload', 'scan-skins']
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -153,7 +153,7 @@
   /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
   const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
   /** 菜单项的动作（ticket 22 / 24 / 32）：点播 / 重载配置 / 打开软件 / 带派 / 换皮。同样只是一次「申请」。 */
-  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring', 'use-skin']
+  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins']
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
   const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/

@@ -1047,7 +1047,8 @@
       return
     }
     // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
-    if (id === 'reload' || id === 'open-site' || id === 'bring') requestAction(id)
+    // 扫描外观（ticket 37）：和「重载配置」一样只是一次申请，扫与写全在宿主那边。
+    if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins') requestAction(id)
   }
 
   /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */

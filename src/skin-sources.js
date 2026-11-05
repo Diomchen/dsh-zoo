@@ -1,10 +1,11 @@
-import { readFile, readdir } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { dataDir as defaultDataDir } from './paths.js'
 import { parseJsonText } from './json-text.js'
+import { stripBom } from './json-text.js'
 import { isSafeAnimationName } from './protocol.js'
 
 /**
@@ -306,4 +307,52 @@ export function idlePoolOf (source) {
     pool.push(name)
   }
   return pool.sort()
+}
+
+
+/**
+ * 把扫到的素材包**追加**进 `skin.json`（ticket 37）。
+ *
+ * 只做加法：已存在的 id 一律跳过，所以连点十次和点一次结果一样；文件本身的形状
+ * （裸数组还是 `{ sources }`）原样保留。文件坏了就抛——这是一次显式的用户动作，
+ * 宁可报错也不能把人家写坏的配置覆盖掉。
+ */
+export async function appendSkinSources (dir, entries, options = {}) {
+  const readFileImpl = typeof options.readFile === 'function' ? options.readFile : readFile
+  const writeFileImpl = typeof options.writeFile === 'function' ? options.writeFile : writeFile
+  const mkdirImpl = typeof options.mkdir === 'function' ? options.mkdir : mkdir
+  const file = join(dir, SKIN_FILE)
+
+  let raw = null
+  try {
+    raw = await readFileImpl(file, 'utf8')
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error
+  }
+
+  let doc = null
+  if (raw !== null) doc = JSON.parse(stripBom(raw))
+  const isArray = Array.isArray(doc)
+  const list = isArray ? doc.slice() : (Array.isArray(doc?.sources) ? doc.sources.slice() : [])
+  const seen = new Set()
+  for (const item of list) {
+    if (typeof item?.id === 'string') seen.add(item.id)
+  }
+
+  const added = []
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (typeof entry?.id !== 'string' || seen.has(entry.id)) continue
+    const next = { id: entry.id, dirs: entry.dirs }
+    if (Number.isInteger(entry.size)) next.size = entry.size
+    if (typeof entry.idle === 'string' && entry.idle !== '') next.idle = entry.idle
+    seen.add(entry.id)
+    added.push(next)
+    list.push(next)
+  }
+  if (added.length === 0) return { added, file }
+
+  await mkdirImpl(dir, { recursive: true, mode: 0o700 })
+  const body = isArray ? list : { sources: list }
+  await writeFileImpl(file, JSON.stringify(body, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 })
+  return { added, file }
 }

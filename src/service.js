@@ -1,12 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { hostname } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import shared from '../desktop/shared.js'
 import { createBackpackStore } from './backpack.js'
 import { dualLayerAdvisory } from './desktop-advisory.js'
 import { createDesktop } from './desktop.js'
+import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
@@ -22,7 +23,7 @@ import {
   createGiftStore
 } from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
-import { dataDir, dshPetConfigPath } from './paths.js'
+import { dataDir, dshHome, dshPetConfigPath } from './paths.js'
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
@@ -30,7 +31,7 @@ import { buildMenu, readAnimationsConfig } from './menu.js'
 import { writePetName } from './pet-name-write.js'
 import { createSettingsStore } from './settings.js'
 import { resolveSkinPort, startLanServer } from './lan-server.js'
-import { idlePoolOf, loadSkinSources } from './skin-sources.js'
+import { appendSkinSources, idlePoolOf, loadSkinSources } from './skin-sources.js'
 import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
@@ -551,6 +552,62 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'use-skin', skin: id, persisted }
     }
 
+    // 「扫描外观」（ticket 37）：扫 dsh-pet 的宠物包目录，把没见过的素材追加进 skin.json。
+    // 只在你按的时候发生——插件加载路径上没有任何自动扫描。
+    if (action === 'scan-skins') {
+      if (settings === null) return { ok: false, error: 'starting' }
+      let found
+      try {
+        found = await discoverPetPacks({
+          petDir: join(dshHome(env), 'dsh-pet', 'pet'),
+          warn: (code, detail) => log.warn('素材包扫描：' + code + (detail === undefined ? '' : '（' + detail + '）'))
+        })
+      } catch (error) {
+        warn(ctx, '扫描素材包失败：' + message(error))
+        return { ok: false, error: 'scan-failed' }
+      }
+      const knownIds = new Set(skinSources.map((source) => source.id))
+      // 不只按 id 去重：同一个素材目录可能已经被手写成一个别的 id（现场就有
+      // `maodie-pet` 和扫出来的 `maodie` 指同一个目录），再按 id 判会多出一条重复外观。
+      const knownDirs = new Set()
+      for (const source of skinSources) {
+        for (const dir of Array.isArray(source.dirs) ? source.dirs : []) knownDirs.add(skinDirKey(dir))
+      }
+      const fresh = found.packs.filter((pack) =>
+        !knownIds.has(pack.id) && !pack.dirs.some((dir) => knownDirs.has(skinDirKey(dir))))
+      if (fresh.length === 0) {
+        return {
+          ok: true,
+          action: 'scan-skins',
+          added: [],
+          found: found.packs.length,
+          notice: found.packs.length === 0 ? '没找到任何宠物包。' : '没有发现新的素材包。'
+        }
+      }
+      let written
+      try {
+        written = await appendSkinSources(dir, fresh)
+      } catch (error) {
+        warn(ctx, '写 skin.json 失败：' + message(error))
+        return { ok: false, error: 'skin-file-broken' }
+      }
+      await loadSkin()
+      await refreshDesktopMenu()
+      desktopSceneSignature = null
+      syncDesktop()
+      const ids = written.added.map((entry) => entry.id)
+      return {
+        ok: true,
+        action: 'scan-skins',
+        added: ids,
+        found: found.packs.length,
+        persisted: ids.length > 0,
+        notice: ids.length === 0
+          ? '没有发现新的素材包。'
+          : '加入 ' + ids.length + ' 张外观：' + ids.join('、') + '。右键「外观」可以切换。'
+      }
+    }
+
     // 「打开软件」：地址由宿主给（渲染端不传 URL），只交给主进程的默认浏览器。
     if (action === 'open-site') {
       const url = dshOrigin(ctx)
@@ -1023,6 +1080,12 @@ export function createService (ctx, options = {}) {
     return skinSources.map((source) => ({ id: source.id }))
   }
 
+  /** 目录去重用的键：同一台机器上大小写不敏感（Windows 的盘符与路径大小写可以随手写）。 */
+  function skinDirKey (dir) {
+    const resolved = resolve(dir)
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
+  }
+
   /**
    * 换掉当前那张皮（ticket 32 / ADR-0013）：只改「用哪个源」。
    * 身份、邻居、串门记录、背包、礼物一律不碰；唯一写盘的地方是 settings.json。
@@ -1417,11 +1480,9 @@ export function createService (ctx, options = {}) {
       result = { ok: false, error: 'action-failed' }
     }
     if (disposed) return
-    const notice = result?.ok === true
-      ? null
-      : (typeof result?.notice === 'string' && result.notice.trim() !== ''
-          ? result.notice
-          : desktopActionNotice(result?.error))
+    // 成功也允许带一句话（「扫描外观」加了几张要说得出来）；失败优先用宿主给的 notice。
+    const explicit = typeof result?.notice === 'string' && result.notice.trim() !== '' ? result.notice : null
+    const notice = result?.ok === true ? explicit : (explicit ?? desktopActionNotice(result?.error))
     try {
       const target = desktop ?? manager
       if (target !== null && typeof target.actionResult === 'function') {
@@ -1452,6 +1513,8 @@ export function createService (ctx, options = {}) {
     // 换皮（ticket 32）：注册表里没有这个 id，多半是 skin.json 改了还没重载。
     if (error === 'unknown-skin') return '这张皮已经不在了，先「重载配置」再看。'
     if (error === 'bad-skin-id') return '这个外观 id 不合法。'
+    if (error === 'skin-file-broken') return 'skin.json 改坏了，先修好它再扫描。'
+    if (error === 'scan-failed') return '扫描素材包失败了，稍后再试。'
     if (error === 'dsh-pet-unreachable') return 'dsh-pet 没有响应，名字没有改（它还开着吗？）。'
     if (error === 'dsh-pet-write-failed') return 'dsh-pet 没有接受这次改名，名字没有变。'
     if (error === 'anim-no-pet') return 'dsh-pet 里还没有宠物，这个动作只在本机播了一次。'

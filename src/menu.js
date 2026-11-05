@@ -37,7 +37,9 @@ export const MENU_TOOL_LABELS = Object.freeze({
   'open-site': '打开软件',
   bring: '带派',
   home: '回到初始位置',
-  reload: '重载配置'
+  reload: '重载配置',
+  // ticket 37：扫 dsh-pet 的宠物包目录，把没见过的素材加进 skin.json。
+  'scan-skins': '扫描外观'
 })
 
 /**
@@ -121,6 +123,7 @@ export function menuTools ({ hasOrigin = false } = {}) {
   tools.push({ id: 'bring', label: MENU_TOOL_LABELS.bring })
   tools.push({ id: 'home', label: MENU_TOOL_LABELS.home })
   tools.push({ id: 'reload', label: MENU_TOOL_LABELS.reload })
+  tools.push({ id: 'scan-skins', label: MENU_TOOL_LABELS['scan-skins'] })
   return tools
 }
 

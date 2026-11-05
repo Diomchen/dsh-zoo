@@ -1390,3 +1390,106 @@ test('诊断出口带「外观」菜单的内容，菜单不用打开也能核�
   assert.deepEqual(after.body.menuSkins, ['fish', 'cat'])
   assert.equal(after.body.menuActiveSkin, 'cat')
 })
+
+/** 造一个 dsh-pet 的宠物包目录：<home>/dsh-pet/pet/<id>-config.json + <id>-animation/ */
+async function petPackFixture (home, id = 'maodie') {
+  const petDir = join(home, 'dsh-pet', 'pet')
+  const animDir = join(petDir, id + '-animation')
+  await mkdir(animDir, { recursive: true })
+  await writeFile(join(animDir, '待机.webm'), 'cat')
+  await writeFile(join(animDir, '踩奶.webm'), 'cat')
+  await writeFile(join(petDir, id + '-config.json'), JSON.stringify({
+    pets: [{ id, name: '橘猫', size: 400, display: 'desktop' }],
+    animations: { idle: ['待机'] }
+  }), 'utf8')
+  return petDir
+}
+
+test('扫描外观：把没见过的宠物包写进 skin.json，不认识的目录一个不碰', async (t) => {
+  const home = await tempDir(t)
+  const dir = join(home, 'local-pet')
+  const fish = join(dir, 'skin-fish')
+  await mkdir(fish, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
+  await petPackFixture(home)
+
+  const service = makeService(t, {
+    dataDir: dir,
+    env: { DSH_HOME: home },
+    skinServer: false,
+    desktop: false,
+    petConfigPath: join(home, 'missing.jsonc')
+  })
+  await service.ready
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+
+  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.equal(scanned.status, 200)
+  assert.equal(scanned.body.ok, true)
+  assert.deepEqual(scanned.body.added, ['maodie'])
+  assert.match(scanned.body.notice, /maodie/)
+
+  const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
+  assert.deepEqual(saved.sources.map((s) => s.id), ['fish', 'maodie'])
+  assert.deepEqual(saved.sources[1].dirs, [join(home, 'dsh-pet', 'pet', 'maodie-animation')])
+  assert.equal(saved.sources[1].size, 400)
+  assert.equal(saved.sources[1].idle, '待机')
+  // 当前那张皮不变：扫描只加，不替你选。
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+
+  // 连点第二次：什么都不加（幂等）。
+  const again = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.equal(again.status, 200)
+  assert.deepEqual(again.body.added, [])
+  assert.match(again.body.notice, /没有发现新的素材包/)
+})
+
+test('扫描外观：skin.json 改坏了就明确失败，不覆盖它', async (t) => {
+  const home = await tempDir(t)
+  const dir = join(home, 'local-pet')
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, SKIN_FILE), '{ 这不是 json', 'utf8')
+  await petPackFixture(home)
+
+  const service = makeService(t, {
+    dataDir: dir,
+    env: { DSH_HOME: home },
+    skinServer: false,
+    desktop: false,
+    petConfigPath: join(home, 'missing.jsonc')
+  })
+  await service.ready
+
+  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.equal(scanned.status, 409)
+  assert.equal(scanned.body.error, 'skin-file-broken')
+  assert.equal(await readFile(join(dir, SKIN_FILE), 'utf8'), '{ 这不是 json', '坏文件必须原样留着')
+})
+
+test('扫描外观：同一个素材目录已经手写成别的 id，就不要再加一条重复的', async (t) => {
+  const home = await tempDir(t)
+  const dir = join(home, 'local-pet')
+  await mkdir(dir, { recursive: true })
+  await petPackFixture(home)
+
+  // 现场就长这样：手写的 id 叫 maodie-pet，扫出来的是 config 里的 maodie，目录是同一个。
+  await writeSkins(dir, [{ id: 'maodie-pet', dirs: [join(home, 'dsh-pet', 'pet', 'maodie-animation')] }])
+
+  const service = makeService(t, {
+    dataDir: dir,
+    env: { DSH_HOME: home },
+    skinServer: false,
+    desktop: false,
+    petConfigPath: join(home, 'missing.jsonc')
+  })
+  await service.ready
+
+  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  assert.equal(scanned.status, 200)
+  assert.deepEqual(scanned.body.added, [])
+  assert.match(scanned.body.notice, /没有发现新的素材包/)
+
+  const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
+  assert.deepEqual(saved.sources.map((s) => s.id), ['maodie-pet'], '不能多出一条指向同一目录的外观')
+})
