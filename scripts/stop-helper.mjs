@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /**
- * 停掉正在跑的 local-pet 桌面 helper。
+ * 停掉正在跑的 dsh-zoo 桌面 helper。
  *
  * 什么时候要用它：**首次**从 ≤0.4.0 升到 0.4.1。0.4.1 起 helper 的 cwd 在包外
  * （`os.tmpdir()`，ADR-0012），但已经在跑的那个旧 helper 改不了自己的 cwd——它还站在
  * 包里的 `desktop/` 上。Windows 删不掉任何进程的当前工作目录，于是 `pnpm add` 替换
- * 这个包时仍会 `ERR_PNPM_EPERM`，最坏把包删残（见 .scratch/local-pet/notes/
+ * 这个包时仍会 `ERR_PNPM_EPERM`，最坏把包删残（见 .scratch/dsh-zoo/notes/
  * upstream-rename-overwrite-eperm.md）。新 helper 起来之后就不需要它了。
  *
  * 用法：
@@ -71,7 +71,7 @@ export async function main (argv = process.argv.slice(2), {
   }
 
   if (helpers.length === 0) {
-    console.log('[stop-helper] 没有在跑的 local-pet helper，什么都不用做。')
+    console.log('[stop-helper] 没有在跑的 dsh-zoo helper，什么都不用做。')
     return 0
   }
 

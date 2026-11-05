@@ -16,7 +16,9 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const PKG = 'dsh-local-pet'
+const PKG = 'dsh-zoo'
+/** 改名前的包名：装新包时顺手摘掉，避免 DSH 同时加载两份、画两只桌宠。 */
+const LEGACY_PKGS = ['dsh-local-pet']
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 const args = parseArgs(process.argv.slice(2))
@@ -42,14 +44,22 @@ async function main () {
 
   manifest.dependencies = manifest.dependencies ?? {}
   manifest.dependencies[PKG] = 'link:' + REPO
+  const removedDeps = []
+  for (const legacy of LEGACY_PKGS) {
+    if (Object.prototype.hasOwnProperty.call(manifest.dependencies, legacy)) {
+      delete manifest.dependencies[legacy]
+      removedDeps.push(legacy)
+    }
+  }
   manifest.dsh = manifest.dsh ?? {}
   manifest.dsh.profile = manifest.dsh.profile ?? {}
-  const bundles = manifest.dsh.profile.bundles ?? []
+  const bundles = (manifest.dsh.profile.bundles ?? []).filter((name) => !LEGACY_PKGS.includes(name))
   if (!bundles.includes(PKG)) bundles.push(PKG)
   manifest.dsh.profile.bundles = bundles
 
   console.log(`[install] profile : ${profileDir}`)
   console.log(`[install] 依赖     : ${PKG} -> link:${REPO}`)
+  if (removedDeps.length > 0) console.log(`[install] 旧名字   : 摘掉 ${removedDeps.join(', ')}${args['dry-run'] ? '（dry-run 只是展示）' : ''}`)
   console.log(`[install] bundles  : ${bundles.join(' → ')}`)
 
   if (args['dry-run']) {
@@ -66,6 +76,10 @@ async function main () {
     // Windows 上建目录符号链接需要开发者模式/管理员；junction 不需要，效果一样是「指向本仓库」。
     await symlink(REPO, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2) + '\n', 'utf8')
+    for (const legacy of LEGACY_PKGS) {
+      // 旧版本可能是 pnpm 装的真实目录，也可能是 link: 的符号链接；两种都摘掉。
+      await rm(join(profileDir, 'node_modules', legacy), { force: true, recursive: true }).catch(() => {})
+    }
   } catch (error) {
     await writeFile(manifestPath, raw, 'utf8')
     await rm(linkPath, { force: true }).catch(() => {})

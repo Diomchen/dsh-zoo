@@ -13,15 +13,15 @@
 
 const { contextBridge, ipcRenderer } = require('electron')
 
-contextBridge.exposeInMainWorld('localPetGift', {
+contextBridge.exposeInMainWorld('dshZooGift', {
   /** 监听器就位：主进程可以把当前背包推过来了。 */
   ready () {
-    ipcRenderer.send('local-pet:gift-ready')
+    ipcRenderer.send('dsh-zoo:gift-ready')
   },
   submit (gift) {
     if (gift === null || typeof gift !== 'object' || Array.isArray(gift)) return
     // 字段由主进程按 shared.normalizeBringGift 再白名单一遍；这里只挡明显不是对象的东西。
-    ipcRenderer.send('local-pet:gift-submit', {
+    ipcRenderer.send('dsh-zoo:gift-submit', {
       kind: gift.kind,
       text: gift.text,
       path: gift.path,
@@ -30,10 +30,10 @@ contextBridge.exposeInMainWorld('localPetGift', {
   },
   remove (giftId) {
     if (typeof giftId !== 'string') return
-    ipcRenderer.send('local-pet:gift-remove', { giftId })
+    ipcRenderer.send('dsh-zoo:gift-remove', { giftId })
   },
   cancel () {
-    ipcRenderer.send('local-pet:gift-cancel')
+    ipcRenderer.send('dsh-zoo:gift-cancel')
   },
   onInit (handler) {
     if (typeof handler !== 'function') return () => {}
@@ -44,8 +44,8 @@ contextBridge.exposeInMainWorld('localPetGift', {
         // 一个坏处理器不能让窗口卡住
       }
     }
-    ipcRenderer.on('local-pet:gift-init', listener)
-    return () => ipcRenderer.removeListener('local-pet:gift-init', listener)
+    ipcRenderer.on('dsh-zoo:gift-init', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:gift-init', listener)
   },
   onResult (handler) {
     if (typeof handler !== 'function') return () => {}
@@ -56,7 +56,7 @@ contextBridge.exposeInMainWorld('localPetGift', {
         // 同上
       }
     }
-    ipcRenderer.on('local-pet:gift-result', listener)
-    return () => ipcRenderer.removeListener('local-pet:gift-result', listener)
+    ipcRenderer.on('dsh-zoo:gift-result', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:gift-result', listener)
   }
 })

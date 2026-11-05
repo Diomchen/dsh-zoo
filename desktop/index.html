@@ -4,14 +4,14 @@
     <meta charset="utf-8" />
     <!--
       这个页面不联网、不加载远程资源：只允许同目录脚本、内联样式、data: 图片，
-      以及 helper 自己注册的 localpet:// 素材协议（dsh-pet 的 WebM 文件）。
-      礼物缩略图也走 localpet:// gifts 主机，所以 img-src 必须显式放行它，否则会被静默挡掉。
+      以及 helper 自己注册的 dshzoo:// 素材协议（dsh-pet 的 WebM 文件）。
+      礼物缩略图也走 dshzoo:// gifts 主机，所以 img-src 必须显式放行它，否则会被静默挡掉。
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: localpet:; media-src localpet:; connect-src 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: dshzoo:; media-src dshzoo:; connect-src 'none'"
     />
-    <title>dsh-local-pet</title>
+    <title>dsh-zoo</title>
     <style>
       html,
       body {

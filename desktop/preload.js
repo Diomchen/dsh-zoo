@@ -19,21 +19,21 @@
 
 const { contextBridge, ipcRenderer } = require('electron')
 
-contextBridge.exposeInMainWorld('localPetDesktop', {
+contextBridge.exposeInMainWorld('dshZooDesktop', {
   ready () {
-    ipcRenderer.send('local-pet:renderer-ready')
+    ipcRenderer.send('dsh-zoo:renderer-ready')
   },
   reportHover (inside) {
-    ipcRenderer.send('local-pet:hover', { inside: inside === true })
+    ipcRenderer.send('dsh-zoo:hover', { inside: inside === true })
   },
   reportRects (rects) {
-    ipcRenderer.send('local-pet:rects', Array.isArray(rects) ? rects : [])
+    ipcRenderer.send('dsh-zoo:rects', Array.isArray(rects) ? rects : [])
   },
   reportOverlayRects (rects) {
-    ipcRenderer.send('local-pet:overlay-rects', Array.isArray(rects) ? rects : [])
+    ipcRenderer.send('dsh-zoo:overlay-rects', Array.isArray(rects) ? rects : [])
   },
   setBusy (busy) {
-    ipcRenderer.send('local-pet:busy', { busy: busy === true })
+    ipcRenderer.send('dsh-zoo:busy', { busy: busy === true })
   },
   /**
    * 素材诊断：当前在播哪一段、失败集合、readyState / visibility；只进主进程内存，供宿主排查用。
@@ -42,7 +42,7 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
    */
   reportMedia (payload) {
     if (payload === null || typeof payload !== 'object') return
-    ipcRenderer.send('local-pet:media', payload)
+    ipcRenderer.send('dsh-zoo:media', payload)
   },
   /**
    * 可信输入（ticket 30）：只报 down/up，主进程用它判断真实左键有没有到渲染端。
@@ -50,11 +50,11 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
    */
   reportInput (payload) {
     if (payload === null || typeof payload !== 'object') return
-    ipcRenderer.send('local-pet:input', payload)
+    ipcRenderer.send('dsh-zoo:input', payload)
   },
   requestAction (payload) {
     if (payload === null || typeof payload !== 'object') return
-    ipcRenderer.send('local-pet:action', {
+    ipcRenderer.send('dsh-zoo:action', {
       id: payload.id,
       action: payload.action,
       deviceId: payload.deviceId,
@@ -72,7 +72,7 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
    * ——ADR-0005 的安全约定一个字都不动。这里只发一句「请开窗」，开不开由主进程决定。
    */
   openRename () {
-    ipcRenderer.send('local-pet:rename-open')
+    ipcRenderer.send('dsh-zoo:rename-open')
   },
   /**
    * 主进程开不了改名窗时（渲染端还没就绪）的回话。
@@ -87,8 +87,8 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
         // 一个坏处理器不能影响后续提示
       }
     }
-    ipcRenderer.on('local-pet:rename-unavailable', listener)
-    return () => ipcRenderer.removeListener('local-pet:rename-unavailable', listener)
+    ipcRenderer.on('dsh-zoo:rename-unavailable', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:rename-unavailable', listener)
   },
   onActionResult (handler) {
     if (typeof handler !== 'function') return () => {}
@@ -99,8 +99,8 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
         // 一个坏处理器不能让后续结果全部丢失
       }
     }
-    ipcRenderer.on('local-pet:action-result', listener)
-    return () => ipcRenderer.removeListener('local-pet:action-result', listener)
+    ipcRenderer.on('dsh-zoo:action-result', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:action-result', listener)
   },
   onScene (handler) {
     if (typeof handler !== 'function') return () => {}
@@ -111,7 +111,7 @@ contextBridge.exposeInMainWorld('localPetDesktop', {
         // 渲染错误不能让整个窗口停摆：下一次场景更新还会再来
       }
     }
-    ipcRenderer.on('local-pet:scene', listener)
-    return () => ipcRenderer.removeListener('local-pet:scene', listener)
+    ipcRenderer.on('dsh-zoo:scene', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:scene', listener)
   }
 })

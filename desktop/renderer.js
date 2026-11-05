@@ -6,7 +6,7 @@
  *   - 这里决定「在哪/多快/朝哪飞」，逐帧把命中矩形报给主进程（`reportRects`）；
  *   - 主进程用真实光标 + 这份矩形裁定点击穿透，位置过期就 fail-closed 回穿透。
  *
- * 素材：dsh-pet 的 WebM 经 helper 的 `localpet://asset/<name>.webm` 协议加载；
+ * 素材：dsh-pet 的 WebM 经 helper 的 `dshzoo://asset/<name>.webm` 协议加载；
  * 动作取不到 → 轮播真实存在的待机片段 → 仍取不到才画内置 SVG 色块。
  * 页面是 file://，这里**没有** `/dsh-pet-7340/thumb/...` 可用。
  *
@@ -19,16 +19,16 @@
  *   - 点击访客 → 弹层（送客）；放行卡由场景里的 controls.prompt 驱动；
  *   - 弹层**不持有输入租约**：它和宠物之间的 8px 间隙由 overlay 的桥接矩形盖住，
  *     光标离开宠物与弹层后窗口立刻回到穿透——点桌面别处不会被弹层吃掉；
- *   - 弹层/卡片/胶囊的矩形单独上报（local-pet:overlay-rects），主进程只认这些矩形；
+ *   - 弹层/卡片/胶囊的矩形单独上报（dsh-zoo:overlay-rects），主进程只认这些矩形；
  *   - 关闭/离开/失焦/超时/场景 reset 都会撤掉控件矩形；渲染端整个死掉时主进程按矩形过期兜底。
- *   - 点击只是一次**申请**（local-pet:action），状态永远等宿主的场景/action-result 回灌。
+ *   - 点击只是一次**申请**（dsh-zoo:action），状态永远等宿主的场景/action-result 回灌。
  */
 
 ;(function () {
   'use strict'
 
-  const shared = globalThis.LocalPetShared
-  const api = globalThis.localPetDesktop
+  const shared = globalThis.DshZooShared
+  const api = globalThis.dshZooDesktop
   const stage = document.getElementById('stage')
   const uiLayer = document.getElementById('ui-layer')
   if (!shared || !stage || !uiLayer) return
@@ -1589,7 +1589,7 @@
     body.className = 'lp-gift-text'
 
     // 文件卡（ticket 25）：缩略图只在宿主给了 thumb 时出现；没有就画文件图标 + 名字 + 大小。
-    // 图片同样走 textContent/URL 白名单：src 来自宿主校验过的 localpet://gifts/...
+    // 图片同样走 textContent/URL 白名单：src 来自宿主校验过的 dshzoo://gifts/...
     const fileBox = document.createElement('div')
     fileBox.className = 'lp-gift-file'
     fileBox.hidden = true
@@ -2076,7 +2076,7 @@
       // 输入要靠另一扇可聚焦的小窗：主窗 focusable:false，永远收不到键盘。
       closePopover('action')
       if (!api || typeof api.openRename !== 'function') {
-        showNotice('这扇桌面窗口开不了改名框，改用 POST /local-pet/action。')
+        showNotice('这扇桌面窗口开不了改名框，改用 POST /dsh-zoo/action。')
         return
       }
       try {
@@ -2105,7 +2105,7 @@
 
   function assetUrl (clip) {
     try {
-      return 'localpet://asset/' + encodeURIComponent(clip) + '.webm'
+      return 'dshzoo://asset/' + encodeURIComponent(clip) + '.webm'
     } catch {
       // 孤立代理项等非法字符串不能把渲染弄崩
       return null
@@ -2132,7 +2132,7 @@
         pet.media.source = 'video'
         pet.media.durationMs = Number.isFinite(video.duration) ? video.duration * 1000 : 0
         // 成功也要回报（ticket 28）：以前只在开始加载时报一次 loading，
-        // `/local-pet/desktop` 的 media.source 就永远停在 loading，看着像素材坏了。
+        // `/dsh-zoo/desktop` 的 media.source 就永远停在 loading，看着像素材坏了。
         reportMedia(pet, pet.media.clip, 'video')
       }
     })
@@ -2680,7 +2680,7 @@
   rafId = requestAnimationFrame(frame)
 
   // 给调试脚本一个只读探针（不参与判定）。
-  Object.defineProperty(globalThis, '__localPetDebug', {
+  Object.defineProperty(globalThis, '__dshZooDebug', {
     value: Object.freeze({
       scene: () => scene,
       lastPoint: () => pointer,
@@ -2870,7 +2870,7 @@
               title: entry.titleEl.textContent,
               text: entry.bodyEl.textContent,
               statusText: entry.statusEl.hidden ? null : entry.statusEl.textContent,
-              // 缩略图诊断：loaded=true 才证明 CSP + localpet://gifts 协议真的把图喂进了 <img>。
+              // 缩略图诊断：loaded=true 才证明 CSP + dshzoo://gifts 协议真的把图喂进了 <img>。
               thumb: entry.thumbEl.hidden
                 ? null
                 : {

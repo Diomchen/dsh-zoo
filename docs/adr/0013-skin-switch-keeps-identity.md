@@ -8,7 +8,7 @@ ADR-0007 的名字归属不变，但切皮这条路径不许走它的写口。
 ## 背景
 
 这台机器上同时躺着三份宠物素材：`dsh-pet` 的 109 段 WebM、`maodie-pet` 装到
-`~/.dsh/dsh-pet/pet/maodie-animation` 的 32 段橘猫、以及 `dsh-local-pet` 自己现有的那份。
+`~/.dsh/dsh-pet/pet/maodie-animation` 的 32 段橘猫、以及 `dsh-zoo` 自己现有的那份。
 其中只有第一份被用上了。
 
 两个事实让"换皮"变成一个真需求，而不是想象出来的：
@@ -34,11 +34,11 @@ ADR-0007 的名字归属不变，但切皮这条路径不许走它的写口。
    它指着的源不存在时回落第一条，并**把设置改写成本机真正在用的那张**（票 36）：
    设置是"当前皮"的真相，留着一条指向空气的配置就是两处真相。
 3. 换皮只改这一项。`identity.json`、`peers.json`、`visits.json`、`backpack.json`、`gifts/` 一律不写。
-4. 换皮不写 `dsh-pet` 的配置。ADR-0007 开给 local-pet 的写口只有「改名」一条路径。
+4. 换皮不写 `dsh-pet` 的配置。ADR-0007 开给 dsh-zoo 的写口只有「改名」一条路径。
 5. 正在播的动作在新皮里不存在时回落待机，不做别名映射。
 6. 串门进行中切皮：本地立即重建场景并补发心跳；访客端不主动推送，它们按 `skinId` 缓存，下次取。
 7. 皮的 `size` 是**相对比例**，`462`（`DEFAULT_SIZE`）为 1.0，比例夹在 0.5–2
-   （[票 35](../../.scratch/local-pet/issues/35-skin-owns-its-size.md)）。本机宠物按它缩放，
+   （[票 35](../../.scratch/dsh-zoo/issues/35-skin-owns-its-size.md)）。本机宠物按它缩放，
    绝对上限是工作区短边；访客没有本机皮，仍用默认尺寸。
 
 ## 考虑过的选项

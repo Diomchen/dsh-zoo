@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -11,7 +12,7 @@ import { createSkinFetcher, isPrivateAddress, SKIN_CACHE_DIR } from '../src/skin
 const EBML = Buffer.from([0x1a, 0x45, 0xdf, 0xa3])
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-fetch-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-fetch-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -54,7 +55,7 @@ test('私网地址判定：只放行局域网与回环', () => {
   }
 })
 
-test('拉 manifest 与动作，校验 hash 后落缓存并返回 localpet URL', async (t) => {
+test('拉 manifest 与动作，校验 hash 后落缓存并返回 dshzoo URL', async (t) => {
   const { assets, cacheDir, fetcher, server } = await fixture(t)
   const result = await fetcher.resolve({
     address: '127.0.0.1',
@@ -65,7 +66,7 @@ test('拉 manifest 与动作，校验 hash 后落缓存并返回 localpet URL', 
 
   assert.ok(result)
   const hash = createHash('sha256').update(assets.A).digest('hex')
-  assert.equal(result.url, 'localpet://cache/' + hash + '.webm')
+  assert.equal(result.url, 'dshzoo://cache/' + hash + '.webm')
   const cached = await readFile(join(cacheDir, SKIN_CACHE_DIR, hash + '.webm'))
   assert.deepEqual(cached, assets.A)
 
@@ -138,6 +139,62 @@ test('manifest hash 对不上、或素材不是 WebM，都不落盘', async (t) 
   assert.equal(await second.resolve({ address: '127.0.0.1', port: 45873, skinId: 'x', action: 'A' }), null)
   assert.deepEqual(await readdir(join(cacheDir, SKIN_CACHE_DIR)).catch(() => []), [])
   assert.ok(dir)
+})
+
+test('旧版邻居只认 /local-pet-skin：先试新路由，404 后回落旧路由', async (t) => {
+  const cacheDir = await tempDir(t)
+  const asset = Buffer.concat([EBML, Buffer.from('-old-')])
+  const hash = 'sha256:' + createHash('sha256').update(asset).digest('hex')
+  const manifest = {
+    v: 1,
+    id: 'old',
+    size: 220,
+    idle: 'A',
+    actions: { A: { file: 'A.webm', loop: true, hash } },
+    hash
+  }
+  const seen = []
+  const server = createServer((req, res) => {
+    seen.push(req.url)
+    if (req.url === '/local-pet-skin/old/manifest') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify(manifest))
+      return
+    }
+    if (req.url === '/local-pet-skin/old/asset/A') {
+      res.writeHead(200, { 'content-type': 'video/webm', 'content-length': asset.length })
+      res.end(asset)
+      return
+    }
+    res.writeHead(404, { 'content-type': 'text/plain' })
+    res.end('not found')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => {
+    server.closeAllConnections?.()
+    return new Promise((resolve) => server.close(resolve))
+  })
+
+  const fetcher = createSkinFetcher({ dir: cacheDir })
+  const result = await fetcher.resolve({
+    address: '127.0.0.1',
+    port: server.address().port,
+    skinId: 'old',
+    action: 'A'
+  })
+
+  assert.ok(result, '旧路由也要能拉到素材')
+  assert.equal(result.action, 'A')
+  // manifest 先撞新路由的 404，再从旧路由取到；素材沿用取到 manifest 的那条路由。
+  assert.deepEqual(seen, [
+    '/dsh-zoo-skin/old/manifest',
+    '/local-pet-skin/old/manifest',
+    '/local-pet-skin/old/asset/A'
+  ])
+  assert.deepEqual(
+    await readFile(join(cacheDir, SKIN_CACHE_DIR, hash.slice('sha256:'.length) + '.webm')),
+    asset
+  )
 })
 
 test('缓存超过上限时按最旧的文件先删', async (t) => {

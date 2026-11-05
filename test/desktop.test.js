@@ -403,7 +403,7 @@ test('桌面判定：只有 Electron 里的 Node 算桌面宿主；候选路径�
   assert.equal(isDesktopHost({ electron: '' }), false)
   assert.equal(isDesktopHost(undefined), false)
 
-  const candidates = candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home', LOCAL_PET_ELECTRON: '/opt/e' }, platform: 'darwin' })
+  const candidates = candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home', DSH_ZOO_ELECTRON: '/opt/e' }, platform: 'darwin' })
   assert.deepEqual(candidates, [
     '/opt/e',
     '/tmp/dsh-home/electron/Electron.app/Contents/MacOS/Electron'
@@ -415,7 +415,7 @@ test('桌面判定：只有 Electron 里的 Node 算桌面宿主；候选路径�
   ])
   assert.deepEqual(
     candidateElectronPaths({
-      env: { DSH_HOME: '/tmp/dsh-home', LOCAL_PET_ELECTRON: 'C:\\electron\\electron.exe' },
+      env: { DSH_HOME: '/tmp/dsh-home', DSH_ZOO_ELECTRON: 'C:\\electron\\electron.exe' },
       platform: 'win32'
     }),
     ['C:\\electron\\electron.exe', '/tmp/dsh-home/electron/electron.exe']
@@ -436,7 +436,7 @@ test('Electron 解析：平台不符/文件缺失都降级，存在时取第一�
   assert.equal(onWindows.path, '/tmp/dsh-home/electron/electron.exe')
   assert.equal(resolveElectronBinary({ env, platform: 'win32', exists: () => false }).reason, 'electron-missing')
   const resolved = resolveElectronBinary({
-    env: { ...env, LOCAL_PET_ELECTRON: '/opt/custom-electron' },
+    env: { ...env, DSH_ZOO_ELECTRON: '/opt/custom-electron' },
     platform: 'darwin',
     exists: (candidate) => candidate === '/opt/custom-electron'
   })
@@ -446,20 +446,20 @@ test('Electron 解析：平台不符/文件缺失都降级，存在时取第一�
   assert.match(describeUnavailable({ ok: false, reason: 'electron-missing', candidates: ['/nope'] }), /\/nope/)
 })
 
-test('spawn 参数与环境：删掉 ELECTRON_RUN_AS_NODE，参数用 --local-pet- 前缀', () => {
+test('spawn 参数与环境：删掉 ELECTRON_RUN_AS_NODE，参数用 --dsh-zoo- 前缀', () => {
   const base = { PATH: '/bin', ELECTRON_RUN_AS_NODE: '1', KEEP: 'yes' }
   const env = helperEnv(base, 4321)
   assert.equal('ELECTRON_RUN_AS_NODE' in env, false)
   assert.equal(env.KEEP, 'yes')
-  assert.equal(env.LOCAL_PET_HOST_PID, '4321')
+  assert.equal(env.DSH_ZOO_HOST_PID, '4321')
   assert.equal(base.ELECTRON_RUN_AS_NODE, '1')
 
   const args = buildHelperArgs({ helperPath: '/p/desktop/main.js', hostPid: 99, debug: true })
   assert.deepEqual(args, [
     '/p/desktop/main.js',
-    '--local-pet-host-pid',
+    '--dsh-zoo-host-pid',
     '99',
-    '--local-pet-debug'
+    '--dsh-zoo-debug'
   ])
   assert.deepEqual(buildHelperArgs({ helperPath: '/p/main.js' }), ['/p/main.js'])
 })
@@ -628,7 +628,7 @@ test('manager：spawn 参数正确、ready 后补场景、update/shot/status 走
   const manager = createDesktop({
     desktopHost: true,
     platform: 'darwin',
-    env: { DSH_HOME: '/tmp/dsh-home', ELECTRON_RUN_AS_NODE: '1', LOCAL_PET_ELECTRON: '/opt/electron' },
+    env: { DSH_HOME: '/tmp/dsh-home', ELECTRON_RUN_AS_NODE: '1', DSH_ZOO_ELECTRON: '/opt/electron' },
     exists: (candidate) => candidate === '/opt/electron',
     spawn: (command, args, options) => {
       const child = fakeChild(1000 + children.length)
@@ -651,7 +651,7 @@ test('manager：spawn 参数正确、ready 后补场景、update/shot/status 走
   assert.equal(started.pid, 1000)
   assert.equal(spawnCalls.length, 1)
   assert.equal(spawnCalls[0].command, '/opt/electron')
-  assert.deepEqual(spawnCalls[0].args, [HELPER_MAIN, '--local-pet-host-pid', String(process.pid)])
+  assert.deepEqual(spawnCalls[0].args, [HELPER_MAIN, '--dsh-zoo-host-pid', String(process.pid)])
   assert.equal('ELECTRON_RUN_AS_NODE' in spawnCalls[0].options.env, false)
   assert.equal(spawnCalls[0].options.stdio[0], 'pipe')
 
@@ -901,7 +901,7 @@ function fakeCtx () {
 }
 
 test('service：桌面层启动、ready 时下发占位场景、dispose 收掉；desktop:false 完全不碰', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
 
   const calls = { start: 0, dispose: 0, updates: [], resync: 0 }
@@ -960,7 +960,7 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
 })
 
 test('service：桌面工厂抛错只降级成一行告警，服务照常 ready', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const { ctx, warnings } = fakeCtx()
   const service = createService(ctx, {
@@ -977,7 +977,7 @@ test('service：桌面工厂抛错只降级成一行告警，服务照常 ready'
 })
 
 test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作无需逐帧 update）', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-sync-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-sync-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const updates = []
   let captured = null
@@ -1036,7 +1036,7 @@ test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作�
 })
 
 test('service：桌面控件申请走同一套 action 并回 action-result；失败一定带人话 notice', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-desktop-actions-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-actions-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const updates = []
   const results = []
@@ -1116,7 +1116,7 @@ async function waitFor (predicate, timeoutMs) {
   throw new Error('等待超时')
 }
 
-test('LOCAL_PET_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常', async (t) => {
+test('DSH_ZOO_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常', async (t) => {
   for (const value of ['0', 'false', 'off', 'NO']) {
     const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
     t.after(() => rm(dir, { recursive: true, force: true }))
@@ -1127,7 +1127,7 @@ test('LOCAL_PET_DESKTOP 是逃生开关：关闭后不启动 helper，服务照�
       petBridge: false,
       dataDir: dir,
       petConfigPath: join(dir, 'missing.jsonc'),
-      env: { LOCAL_PET_DESKTOP: value },
+      env: { DSH_ZOO_DESKTOP: value },
       desktopFactory: () => { spawned += 1; return null }
     })
     await service.ready
@@ -1136,7 +1136,7 @@ test('LOCAL_PET_DESKTOP 是逃生开关：关闭后不启动 helper，服务照�
   }
 })
 
-test('LOCAL_PET_DESKTOP 为空或其它值时仍然启动桌面层', async (t) => {
+test('DSH_ZOO_DESKTOP 为空或其它值时仍然启动桌面层', async (t) => {
   for (const value of [undefined, '1', 'on']) {
     const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
     t.after(() => rm(dir, { recursive: true, force: true }))
@@ -1147,7 +1147,7 @@ test('LOCAL_PET_DESKTOP 为空或其它值时仍然启动桌面层', async (t) =
       petBridge: false,
       dataDir: dir,
       petConfigPath: join(dir, 'missing.jsonc'),
-      env: value === undefined ? {} : { LOCAL_PET_DESKTOP: value },
+      env: value === undefined ? {} : { DSH_ZOO_DESKTOP: value },
       desktopFactory: () => { spawned += 1; return null }
     })
     await service.ready
@@ -1264,7 +1264,7 @@ test('manager：pong 看门狗——超过 15s 没回 pong 杀掉并按现有退
 // ---------------------------------------------------------------------------
 
 test('service：访客超出场景上限时不静默丢宠物，宿主给一条人话提示（A5）', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-overflow-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-overflow-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const updates = []
   let captured = null
@@ -1376,15 +1376,15 @@ test('normalizeControls：街上的房子去重、封顶十六、认不出的理
 
 test('buildHelperArgs：默认不带 --no-sandbox，只有显式开关才关沙箱', () => {
   const base = { helperPath: '/tmp/helper.js', hostPid: 1 }
-  const previous = process.env.LOCAL_PET_HELPER_NO_SANDBOX
+  const previous = process.env.DSH_ZOO_HELPER_NO_SANDBOX
   try {
-    delete process.env.LOCAL_PET_HELPER_NO_SANDBOX
+    delete process.env.DSH_ZOO_HELPER_NO_SANDBOX
     assert.equal(buildHelperArgs(base).includes('--no-sandbox'), false)
-    process.env.LOCAL_PET_HELPER_NO_SANDBOX = '1'
+    process.env.DSH_ZOO_HELPER_NO_SANDBOX = '1'
     assert.equal(buildHelperArgs(base).includes('--no-sandbox'), true)
   } finally {
-    if (previous === undefined) delete process.env.LOCAL_PET_HELPER_NO_SANDBOX
-    else process.env.LOCAL_PET_HELPER_NO_SANDBOX = previous
+    if (previous === undefined) delete process.env.DSH_ZOO_HELPER_NO_SANDBOX
+    else process.env.DSH_ZOO_HELPER_NO_SANDBOX = previous
   }
 })
 
@@ -1603,13 +1603,13 @@ test('manager：gift-open/reveal/discard 只写绝对路径，gift-copy 只写�
   t.after(() => manager.dispose())
   manager.start()
   children[0].emitLine({ type: 'ready', pid: 4300, workArea: { x: 0, y: 30, width: 100, height: 100 } })
-  const notePath = '/Users/me/.dsh/local-pet/gifts/20261103-153245-ab12cd12/note.txt'
+  const notePath = '/Users/me/.dsh/dsh-zoo/gifts/20261103-153245-ab12cd12/note.txt'
 
   assert.equal(manager.giftOpen(notePath), true)
   assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-open', id: null, path: notePath })
   assert.equal(manager.giftReveal(notePath), true)
   assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-reveal', id: null, path: notePath })
-  assert.equal(manager.giftDiscard('/Users/me/.dsh/local-pet/gifts/20261103-153245-ab12cd12'), true)
+  assert.equal(manager.giftDiscard('/Users/me/.dsh/dsh-zoo/gifts/20261103-153245-ab12cd12'), true)
   assert.equal(children[0].parsedLines().at(-1).type, 'gift-discard')
   assert.equal(manager.giftCopy('第一行\r\n第二行'), true)
   assert.deepEqual(children[0].parsedLines().at(-1), { type: 'gift-copy', id: null, text: '第一行\n第二行' })
@@ -1773,10 +1773,10 @@ test('manager：bringWindow 把背包快照写进管道，路径不在命令里'
 // ticket 25：文件礼物的跨进程字段（helpers 白名单 + helper argv）
 // ---------------------------------------------------------------------------
 
-test('场景 controls.gifts：文件卡带 name/size；thumb 只给 received 且只认 localpet://gifts', () => {
+test('场景 controls.gifts：文件卡带 name/size；thumb 只给 received 且只认 dshzoo://gifts', () => {
   const deviceId = '55555555-5555-4555-8555-555555555555'
   const dir = '20261103-153245-ab12cd12'
-  const thumb = 'localpet://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
+  const thumb = 'dshzoo://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
   const scene = shared.normalizeScene({
     v: 3,
     items: [],
@@ -1804,7 +1804,7 @@ test('场景 controls.gifts：文件卡带 name/size；thumb 只给 received 且
           thumb
         },
         {
-          // 只认宿主生成的 localpet://gifts 地址。
+          // 只认宿主生成的 dshzoo://gifts 地址。
           deviceId,
           giftId: '88888888-8888-4888-8888-888888888888',
           kind: 'file',
@@ -1862,7 +1862,7 @@ test('场景 controls.gifts：文件卡带 name/size；thumb 只给 received 且
 test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后', () => {
   assert.deepEqual(
     buildHelperArgs({ helperPath: '/h', cacheRoot: '/tmp/skin-cache', giftsRoot: '/tmp/data/gifts' }),
-    ['/h', '--local-pet-cache', '/tmp/skin-cache', '--local-pet-gifts', '/tmp/data/gifts']
+    ['/h', '--dsh-zoo-cache', '/tmp/skin-cache', '--dsh-zoo-gifts', '/tmp/data/gifts']
   )
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: 'relative/gifts' }), ['/h'])
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: '' }), ['/h'])

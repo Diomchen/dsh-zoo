@@ -504,11 +504,11 @@ test('动画名只允许安全文件名，不能带路径或控制字符', () =>
 
 test('环境变量只在合法时覆盖默认端口', () => {
   assert.equal(resolvePort({}), DEFAULT_PORT)
-  assert.equal(resolvePort({ LOCAL_PET_PORT: '' }), DEFAULT_PORT)
-  assert.equal(resolvePort({ LOCAL_PET_PORT: '50001' }), 50001)
-  assert.equal(resolvePort({ LOCAL_PET_PORT: '0' }), DEFAULT_PORT)
-  assert.equal(resolvePort({ LOCAL_PET_PORT: '70000' }), DEFAULT_PORT)
-  assert.equal(resolvePort({ LOCAL_PET_PORT: 'abc' }), DEFAULT_PORT)
+  assert.equal(resolvePort({ DSH_ZOO_PORT: '' }), DEFAULT_PORT)
+  assert.equal(resolvePort({ DSH_ZOO_PORT: '50001' }), 50001)
+  assert.equal(resolvePort({ DSH_ZOO_PORT: '0' }), DEFAULT_PORT)
+  assert.equal(resolvePort({ DSH_ZOO_PORT: '70000' }), DEFAULT_PORT)
+  assert.equal(resolvePort({ DSH_ZOO_PORT: 'abc' }), DEFAULT_PORT)
 })
 
 test('默认参数：发现 5 秒、心跳 2 秒、心跳影子 30 秒、出门上限 30 分钟、失联 2 分钟', () => {

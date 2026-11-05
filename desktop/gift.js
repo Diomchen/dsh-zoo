@@ -10,7 +10,7 @@
  */
 'use strict'
 
-const api = window.localPetGift
+const api = window.dshZooGift
 const form = document.getElementById('form')
 const textEl = document.getElementById('text')
 const counterEl = document.getElementById('counter')

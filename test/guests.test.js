@@ -40,7 +40,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-guests-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-guests-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -121,8 +121,8 @@ function heartbeatPayload ({ deviceId, anim }) {
 }
 
 async function callAction (service, body) {
-  const route = service.routes.find((candidate) => candidate.path === '/local-pet/action')
-  assert.ok(route, '应该注册 /local-pet/action')
+  const route = service.routes.find((candidate) => candidate.path === '/dsh-zoo/action')
+  assert.ok(route, '应该注册 /dsh-zoo/action')
   const res = {
     statusCode: 0,
     headers: {},

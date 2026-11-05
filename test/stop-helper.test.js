@@ -12,7 +12,7 @@ test('Windows：走 powershell 的 CIM，不碰 ps', async () => {
   const calls = []
   const stdout = JSON.stringify({
     ProcessId: 40644,
-    CommandLine: '"C:\\electron.exe" "C:\\pkg\\desktop\\main.js" --local-pet-host-pid 1'
+    CommandLine: '"C:\\electron.exe" "C:\\pkg\\desktop\\main.js" --dsh-zoo-host-pid 1'
   })
   const exec = async (command, args) => {
     calls.push({ command, args })
@@ -29,7 +29,7 @@ test('Windows：走 powershell 的 CIM，不碰 ps', async () => {
 
 test('macOS/Linux：走 ps -axo pid=,args=', async () => {
   const calls = []
-  const stdout = '  777 /usr/bin/node scripts/smoke.mjs\n  888 /electron main.js --local-pet-host-pid 1\n'
+  const stdout = '  777 /usr/bin/node scripts/smoke.mjs\n  888 /electron main.js --dsh-zoo-host-pid 1\n'
   const exec = async (command, args) => {
     calls.push({ command, args })
     return { stdout }
@@ -44,7 +44,7 @@ test('macOS/Linux：走 ps -axo pid=,args=', async () => {
 
 test('main：--dry-run 只列不杀', async () => {
   const kills = []
-  const exec = async () => ({ stdout: '  40644 /e main.js --local-pet-host-pid 1\n' })
+  const exec = async () => ({ stdout: '  40644 /e main.js --dsh-zoo-host-pid 1\n' })
 
   const code = await main(['--dry-run'], {
     platform: 'darwin',
@@ -59,7 +59,7 @@ test('main：--dry-run 只列不杀', async () => {
 test('main：先 SIGTERM；宽限期内不退再 SIGKILL；退了就算成功', async () => {
   const kills = []
   let running = true
-  const exec = async () => ({ stdout: '  40644 /e main.js --local-pet-host-pid 1\n' })
+  const exec = async () => ({ stdout: '  40644 /e main.js --dsh-zoo-host-pid 1\n' })
 
   const code = await main([], {
     platform: 'darwin',
@@ -78,7 +78,7 @@ test('main：先 SIGTERM；宽限期内不退再 SIGKILL；退了就算成功', 
 })
 
 test('main：SIGKILL 也停不掉就非零退出（靠调用方看见）', async () => {
-  const exec = async () => ({ stdout: '  40644 /e main.js --local-pet-host-pid 1\n' })
+  const exec = async () => ({ stdout: '  40644 /e main.js --dsh-zoo-host-pid 1\n' })
 
   const code = await main([], {
     platform: 'darwin',

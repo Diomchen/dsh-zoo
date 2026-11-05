@@ -1,4 +1,4 @@
-# local-pet 协议 v1
+# dsh-zoo 协议 v1
 
 本文记录 **ticket 01–27 已落地** 的发现、放行、心跳、串门（含自发出门与访客常驻）、
 串门记录，以及「带派」礼物（wire 字段、拉取路由、送达回执、限额）协议。
@@ -9,7 +9,7 @@ v1 的 GUI 客户端行为（灯条、卡片、同屏 4 位、`expiresAt` 淡出
 
 ## 传输
 
-- UDP4，固定端口 `45871`，可用 `LOCAL_PET_PORT` 覆盖（非法值回落到默认）。
+- UDP4，固定端口 `45871`，可用 `DSH_ZOO_PORT` 覆盖（非法值回落到默认）。
 - 启动时立即广播一次 `beacon`，之后每 **5 秒** 一次，目标 `255.255.255.255:<port>`。
 - 收到 `beacon` 后向来源地址**单播**一条 `beacon-ack`；同一来源 4.5 秒内最多回一次。
 - **放行之后**每 **2 秒** 向每个已放行邻居单播一条 `heartbeat`；放行动作和本机动作
@@ -89,7 +89,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 
 - 第一次见到某个 `deviceId` 时，它进入待放行队列，`snapshot.prompt` 是队首
   `{ deviceId, nickname }`；FIFO 最多 8 位，其余等下一次广播再排。
-- 本机页面通过 `POST /local-pet/action` 发信任动作，`deviceId` 必须是 UUID：
+- 本机页面通过 `POST /dsh-zoo/action` 发信任动作，`deviceId` 必须是 UUID：
   - `{ "action": "admit", "deviceId": "<uuid>" }` → `status: "allowed"`
   - `{ "action": "reject", "deviceId": "<uuid>" }` → `status: "denied"`
   - `{ "action": "dismiss", "deviceId": "<uuid>" }` → 收起卡片，十分钟内不再问同一位
@@ -115,7 +115,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 
 ### 页面动作一览（只接受本地页面）
 
-`POST /local-pet/action`，body 里的 `action` 是固定枚举；远端 UDP 永远走不到这些分支。
+`POST /dsh-zoo/action`，body 里的 `action` 是固定枚举；远端 UDP 永远走不到这些分支。
 未知 action 返回 `409 { "ok": false, "error": "not-implemented" }`。
 
 | action | body | 结果 |
@@ -368,7 +368,7 @@ v1 把心跳影子画成“访客”；v2 不画它。它现在是**在线/互�
 - 快照只给最近 5 条（`snapshot.visits`，最新在前）：`visits.json` 仍保留 200 条，
   只是 `snapshot` 这一层不把全部历史交给客户端。快照里的记录同样可能带 `gift`，
   形状与 `visits.json` 完全一致（`in` / `out` 都写）。
-- `GET /local-pet/state` 是**本机**的状态出口：在 `snapshot` 之外多 `backpack` / `gifts` /
+- `GET /dsh-zoo/state` 是**本机**的状态出口：在 `snapshot` 之外多 `backpack` / `gifts` /
   `skin` 三项（见 README 的「带派」与「换皮」段）。`skin` 是当前那张皮
   `{ id, size, idle }`（没有素材源时是 `null`）。它们只反映本机的背包、已收下的礼物
   与当前皮，不是线路协议的一部分，远端写不进来。
@@ -429,10 +429,10 @@ v1 把心跳影子画成“访客”；v2 不画它。它现在是**在线/互�
 ## 礼物路由（HTTP，只读，ticket 25）
 
 文件本体不进 UDP，由接收方在访客抵达时向对方**拉取**。路由挂在既有的只读素材源上，
-与素材共用同一个端口（默认 `45873`，`LOCAL_PET_SKIN_PORT` 可覆盖）：
+与素材共用同一个端口（默认 `45873`，`DSH_ZOO_SKIN_PORT` 可覆盖）：
 
 ```
-GET /local-pet-gift/<giftId>   → 文件本体
+GET /dsh-zoo-gift/<giftId>   → 文件本体
 ```
 
 - **只在 armed 期间可读**：发起方发出这次 `visit-request` 之后 5 分钟内，且这次串门没有结束。
@@ -443,6 +443,16 @@ GET /local-pet-gift/<giftId>   → 文件本体
 - 超过 16 MiB → `413`；非 GET/HEAD → `405`。
 - 串门结束（回家 / 送客 / 超时 / 失联 / 被拒绝）立即 unarm；5 分钟到点也自然失效。
 - 没装素材源的用户也会监听这个端口——它必须保持**只读、只按 id 白名单、不列目录**。
+
+### 改名前后的路径（ADR-0014）
+
+项目从 `dsh-local-pet` 改名为 `dsh-zoo`，路由随之改成 `/dsh-zoo-skin/*` 与
+`/dsh-zoo-gift/<giftId>`。为了和改名前的邻居混跑：
+
+- 服务端同时接受旧路径 `/local-pet-skin/*`、`/local-pet-gift/<giftId>`；两组都是只读的。
+- 新客户端拉 manifest、素材或礼物文件时先试新路径，`404` 后再回落旧路径；`410` / `413` 等
+  不回落（那是对方给出的真实结论）。
+- 旧路径只用于兼容，不写进 beacon，也不在 README 的新用法里出现。
 
 ## 敌意输入边界（必须保持）
 
@@ -481,7 +491,7 @@ GET /local-pet-gift/<giftId>   → 文件本体
   本机绝对路径，且在 armed 窗口外一律 `404`。这一层是 ADR-0011 唯一新增的局域网攻击面。
 - 协议里永远没有坐标、朝向、拖拽状态、项目名、文件路径或会话内容（ADR-0003）。
   礼物报文只有 `id`/`kind`/`name`/`size`/`sha256`/`text`；本机路径只留在发送端的背包与
-  接收端的 `gifts/` 里，连 `/local-pet/state` 的礼物 `path` 也只是本机回环页面能读到。
+  接收端的 `gifts/` 里，连 `/dsh-zoo/state` 的礼物 `path` 也只是本机回环页面能读到。
 - 礼物**永不自动打开、永不执行**；卡片用 `textContent` 画，不渲染 HTML/Markdown。
 
 ## 为什么串门走 UDP 而不是 TCP

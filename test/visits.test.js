@@ -15,7 +15,7 @@ import { VISIT_RECORD_LIMIT } from '../src/room.js'
 const T0 = 1_700_000_000_000
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-visits-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-visits-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -177,7 +177,7 @@ test('文件写不进去：内存里仍有记录，只告警一次，后续追�
     t.skip('以 root 运行时 chmod 不可靠')
     return
   }
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-visits-ro-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-visits-ro-'))
   t.after(async () => {
     await chmod(dir, 0o700)
     await rm(dir, { recursive: true, force: true })

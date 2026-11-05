@@ -11,7 +11,7 @@ import { VISITS_FILE, createVisitStore } from '../src/visits.js'
 const T0 = 1_700_000_000_000
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-record-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-record-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

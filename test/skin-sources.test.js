@@ -7,7 +7,7 @@ import test from 'node:test'
 import { loadSkinSources, SKIN_FILE } from '../src/skin-sources.js'
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-skin-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-skin-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

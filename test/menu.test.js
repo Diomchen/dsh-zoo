@@ -95,7 +95,7 @@ test('buildMenu：dsh-pet 在就用它的分类；不在就退平铺；两条都
 })
 
 test('读动画配置：素材目录旁边的 config.jsonc，剥注释；坏文件跳过看下一个源', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-menu-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-menu-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
 
   const broken = join(dir, 'broken', 'assets')

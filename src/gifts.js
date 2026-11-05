@@ -264,7 +264,7 @@ class GiftStore {
     return record === undefined ? null : copyRecord(record)
   }
 
-  /** 最近的礼物，最新在前（/local-pet/state 用，ticket 27 接）。 */
+  /** 最近的礼物，最新在前（/dsh-zoo/state 用，ticket 27 接）。 */
   list () {
     return [...this.#index.values()]
       .map(copyRecord)

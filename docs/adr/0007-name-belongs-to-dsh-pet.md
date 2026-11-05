@@ -1,4 +1,4 @@
-# 名字归 dsh-pet，local-pet 只在改名的瞬间写它
+# 名字归 dsh-pet，dsh-zoo 只在改名的瞬间写它
 
 ## Status
 
@@ -6,13 +6,13 @@ accepted — amends ADR-0001
 
 ## 背景
 
-ADR-0001 定的是"只做桥和影子，不写它的配置"。但一只宠物只有一个名字，而它写在 `dsh-pet` 的 `pets[].name` 里：桌面上那个标签、AI 人设里那句「你的名字是 X」、邻居放行卡上的称呼，源头都是它。local-pet 自己也有一份 `identity.nickname`，只在首次运行时从前者抄一次，之后永不跟随——于是在 dsh-pet 设置页改名之后，主人看到的是新名字，邻居看到的还是旧的。
+ADR-0001 定的是"只做桥和影子，不写它的配置"。但一只宠物只有一个名字，而它写在 `dsh-pet` 的 `pets[].name` 里：桌面上那个标签、AI 人设里那句「你的名字是 X」、邻居放行卡上的称呼，源头都是它。dsh-zoo 自己也有一份 `identity.nickname`，只在首次运行时从前者抄一次，之后永不跟随——于是在 dsh-pet 设置页改名之后，主人看到的是新名字，邻居看到的还是旧的。
 
 ## 决定
 
-名字的真相是 `dsh-pet` 的 `pets[].name`。local-pet 的 `identity.nickname` 降级成它的**镜像**：每次配置轮询同步，变了就落盘（dsh-pet 缺席时仍有名字可发）并立刻补发广播。
+名字的真相是 `dsh-pet` 的 `pets[].name`。dsh-zoo 的 `identity.nickname` 降级成它的**镜像**：每次配置轮询同步，变了就落盘（dsh-pet 缺席时仍有名字可发）并立刻补发广播。
 
-改名由 local-pet 发起时，走 dsh-pet 的官方接口 `PUT /dsh-pet-7340/config`：按下的瞬间读一次、只改 `name` 一个字段、立刻写回；失败就整个不改，由调用方给用户明确失败。除这一条路径外，local-pet 对 dsh-pet 仍然只读。
+改名由 dsh-zoo 发起时，走 dsh-pet 的官方接口 `PUT /dsh-pet-7340/config`：按下的瞬间读一次、只改 `name` 一个字段、立刻写回；失败就整个不改，由调用方给用户明确失败。除这一条路径外，dsh-zoo 对 dsh-pet 仍然只读。
 
 ADR-0001 那句「不写它的配置」因此收窄为「不绕过它的 API 直接改文件」。
 

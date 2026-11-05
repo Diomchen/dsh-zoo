@@ -28,7 +28,7 @@ import {
 const T0 = 1_700_000_000_000
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-limits-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-limits-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

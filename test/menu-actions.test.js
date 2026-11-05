@@ -31,7 +31,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-menu-actions-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-menu-actions-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -133,7 +133,7 @@ test('点播：POST 到 dsh-pet 的 /anim?pet=<id>，成功回 ok', async (t) =>
       let body = ''
       req.on('data', (chunk) => { body += chunk })
       req.on('end', () => {
-        // surface=any 是 dsh-pet 的必填参数：local-pet 只镜像 /state，不属于它的任何一端。
+        // surface=any 是 dsh-pet 的必填参数：dsh-zoo 只镜像 /state，不属于它的任何一端。
         assert.match(req.url, /[?&]surface=any(&|$)/)
         seen.push(JSON.parse(body || 'null'))
         res.setHeader('content-type', 'application/json')
@@ -151,7 +151,7 @@ test('点播：POST 到 dsh-pet 的 /anim?pet=<id>，成功回 ok', async (t) =>
   service.ctx.webServer.getOrigin = () => origin
   await service.ready
 
-  const played = await call(service, '/local-pet/action', {
+  const played = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'play-anim', name: '写代码' }
   })
@@ -159,7 +159,7 @@ test('点播：POST 到 dsh-pet 的 /anim?pet=<id>，成功回 ok', async (t) =>
   assert.deepEqual(played.body, { ok: true, action: 'play-anim', name: '写代码' })
   assert.deepEqual(seen, [{ name: '写代码' }])
 
-  const bad = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'play-anim' } })
+  const bad = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'play-anim' } })
   assert.equal(bad.status, 409)
   assert.equal(bad.body.error, 'bad-name')
 })
@@ -184,7 +184,7 @@ test('点播：dsh-pet 拒绝时是 anim-rejected；够不着时是 anim-unreach
   service.ctx.webServer.getOrigin = () => origin
   await service.ready
 
-  const rejected = await call(service, '/local-pet/action', {
+  const rejected = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'play-anim', name: '不存在的动作' }
   })
@@ -195,7 +195,7 @@ test('点播：dsh-pet 拒绝时是 anim-rejected；够不着时是 anim-unreach
   // 没有回环地址 = 够不着
   service.ctx.webServer.getOrigin = () => null
   service.ctx.webServer.port = undefined
-  const unreachable = await call(service, '/local-pet/action', {
+  const unreachable = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'play-anim', name: '写代码' }
   })
@@ -219,7 +219,7 @@ test('重载配置：重读 settings.json、重建场景，并让 helper 重建'
 
   // 手改文件，再点「重载配置」
   await writeFile(join(dir, SETTINGS_FILE), JSON.stringify({ version: 1, acceptVisits: true, autoVisits: true }), 'utf8')
-  const reloaded = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+  const reloaded = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'reload' } })
   assert.equal(reloaded.status, 200)
   assert.deepEqual(reloaded.body, { ok: true, action: 'reload' })
   assert.equal(service.snapshot().acceptVisits, true)
@@ -243,7 +243,7 @@ test('打开软件：地址由宿主给，只交给 helper 的 openUrl；拿不�
   await service.ready
   desktop.ready()
 
-  const openedResult = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'open-site' } })
+  const openedResult = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'open-site' } })
   assert.equal(openedResult.status, 200)
   assert.deepEqual(openedResult.body, { ok: true, action: 'open-site' })
   assert.deepEqual(calls.opened, ['http://127.0.0.1:64071/'])
@@ -254,7 +254,7 @@ test('打开软件：地址由宿主给，只交给 helper 的 openUrl；拿不�
   // 拿不到地址：动作明确失败（不静默）
   service.ctx.webServer.getOrigin = () => null
   service.ctx.webServer.port = undefined
-  const noOrigin = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'open-site' } })
+  const noOrigin = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'open-site' } })
   assert.equal(noOrigin.body.error, 'no-origin')
 })
 

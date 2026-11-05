@@ -2,11 +2,16 @@ import { createHash } from 'node:crypto'
 import { mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
+import { SKIN_ROUTES } from './lan-routes.js'
+
 /**
  * 远端素材拉取（ticket 17）。
  *
  * 访客的本体在对方机器上，素材也在那儿。这里按对方广告的 `skinPort` / `skinId`
  * 拉 manifest 和当前动作，校验后落进本机磁盘缓存；helper 只读缓存，永远不联网。
+ *
+ * 路由先新后旧（`src/lan-routes.js`）：新版本用 `/dsh-zoo-skin`，改名前的邻居（≤0.5.7）只认
+ * `/local-pet-skin`。manifest 从哪条路由取到，后面的素材也跟着走同一条。
  *
  * 安全口径（跨机 HTTP 是新的攻击面）：
  * - 只连私网/回环地址，绝不解析域名；
@@ -89,22 +94,23 @@ export function createSkinFetcher (options = {}) {
 
   async function resolveOnce ({ address, port, skinId, sourceKey, action }) {
     const origin = 'http://' + address + ':' + port
-    const manifest = await loadManifest(origin, skinId, sourceKey)
-    if (manifest === null) return null
+    const loaded = await loadManifest(origin, skinId, sourceKey)
+    if (loaded === null) return null
+    const { manifest, route } = loaded
 
     const chosen = pickAction(manifest, action)
     if (chosen === null) return null
     const entry = manifest.actions[chosen]
     if (entry === null || entry === undefined) return null
     const hex = entry.hash.slice('sha256:'.length)
-    // 扁平缓存：内容寻址，同一个 hash 跨来源共享；helper 的 localpet://cache/<hash>.webm 直接对得上。
+    // 扁平缓存：内容寻址，同一个 hash 跨来源共享；helper 的 dshzoo://cache/<hash>.webm 直接对得上。
     const file = join(dir, SKIN_CACHE_DIR, hex + '.webm')
-    const url = 'localpet://cache/' + hex + '.webm'
+    const url = 'dshzoo://cache/' + hex + '.webm'
 
     if (await isFile(file)) return { url, action: chosen, hash: entry.hash }
 
     const bytes = await fetchBytes(
-      origin + '/local-pet-skin/' + skinId + '/asset/' + encodeURIComponent(chosen),
+      origin + route + '/' + skinId + '/asset/' + encodeURIComponent(chosen),
       maxSkinBytes
     )
     if (bytes === null) return null
@@ -131,18 +137,22 @@ export function createSkinFetcher (options = {}) {
     const cached = manifests.get(sourceKey)
     if (cached !== undefined && now() - cached.at < MANIFEST_TTL_MS) return cached.value
 
-    const bytes = await fetchBytes(origin + '/local-pet-skin/' + skinId + '/manifest', MAX_MANIFEST_BYTES)
-    if (bytes === null) return null
-    let parsed
-    try {
-      parsed = JSON.parse(bytes.toString('utf8'))
-    } catch {
-      return null
+    for (const route of SKIN_ROUTES) {
+      const bytes = await fetchBytes(origin + route + '/' + skinId + '/manifest', MAX_MANIFEST_BYTES)
+      if (bytes === null) continue
+      let parsed
+      try {
+        parsed = JSON.parse(bytes.toString('utf8'))
+      } catch {
+        continue
+      }
+      const manifest = normalizeManifest(parsed)
+      if (manifest === null) continue
+      const value = { manifest, route }
+      manifests.set(sourceKey, { at: now(), value })
+      return value
     }
-    const manifest = normalizeManifest(parsed)
-    if (manifest === null) return null
-    manifests.set(sourceKey, { at: now(), value: manifest })
-    return manifest
+    return null
   }
 
   async function fetchBytes (url, maxBytes) {

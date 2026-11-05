@@ -162,7 +162,7 @@ export function createRoom ({
   const lostMs = positiveMs(peerLostMs, PEER_LOST_MS)
   const state = {
     self: { deviceId: null, nickname: '我', pet: null, bridge: { ...IDLE_BRIDGE } },
-    // 本机插件通过 POST /local-pet/self-state 推来的状态；30 秒内不被 dsh-pet 轮询覆盖。
+    // 本机插件通过 POST /dsh-zoo/self-state 推来的状态；30 秒内不被 dsh-pet 轮询覆盖。
     selfState: { action: null, semantic: null, say: null, at: 0 },
     neighbors: new Map(),
     guests: new Map(),

@@ -8,17 +8,17 @@
 
 const { contextBridge, ipcRenderer } = require('electron')
 
-contextBridge.exposeInMainWorld('localPetRename', {
+contextBridge.exposeInMainWorld('dshZooRename', {
   /** 告诉主进程「监听器已就位，可以发初始名字了」。 */
   ready () {
-    ipcRenderer.send('local-pet:rename-ready')
+    ipcRenderer.send('dsh-zoo:rename-ready')
   },
   submit (nickname) {
     if (typeof nickname !== 'string') return
-    ipcRenderer.send('local-pet:rename-submit', { nickname })
+    ipcRenderer.send('dsh-zoo:rename-submit', { nickname })
   },
   cancel () {
-    ipcRenderer.send('local-pet:rename-cancel')
+    ipcRenderer.send('dsh-zoo:rename-cancel')
   },
   onInit (handler) {
     if (typeof handler !== 'function') return () => {}
@@ -29,8 +29,8 @@ contextBridge.exposeInMainWorld('localPetRename', {
         // 一个坏处理器不能让窗口卡住
       }
     }
-    ipcRenderer.on('local-pet:rename-init', listener)
-    return () => ipcRenderer.removeListener('local-pet:rename-init', listener)
+    ipcRenderer.on('dsh-zoo:rename-init', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:rename-init', listener)
   },
   onResult (handler) {
     if (typeof handler !== 'function') return () => {}
@@ -41,7 +41,7 @@ contextBridge.exposeInMainWorld('localPetRename', {
         // 同上
       }
     }
-    ipcRenderer.on('local-pet:rename-result', listener)
-    return () => ipcRenderer.removeListener('local-pet:rename-result', listener)
+    ipcRenderer.on('dsh-zoo:rename-result', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:rename-result', listener)
   }
 })

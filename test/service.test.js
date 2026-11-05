@@ -39,7 +39,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-service-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-service-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -138,7 +138,7 @@ test('启动后快照有稳定的 deviceId 与可读昵称，dsh-pet 缺失时�
   assert.equal(raw.deviceId, snap.self.deviceId)
   assert.equal(raw.nickname, snap.self.nickname)
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.status, 200)
   assert.equal(state.body.self.deviceId, snap.self.deviceId)
 })
@@ -151,7 +151,7 @@ test('昵称可以通过本地 action 修改并落盘；坏 action 明确失败'
   })
   await service.ready
 
-  const renamed = await call(service, '/local-pet/action', {
+  const renamed = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'rename', nickname: '  新 名字  ' }
   })
@@ -160,7 +160,7 @@ test('昵称可以通过本地 action 修改并落盘；坏 action 明确失败'
   assert.equal(service.snapshot().self.nickname, '新 名字')
   assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '新 名字')
 
-  const bad = await call(service, '/local-pet/action', {
+  const bad = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'rename', nickname: '\u0000\u0007' }
   })
@@ -168,7 +168,7 @@ test('昵称可以通过本地 action 修改并落盘；坏 action 明确失败'
   assert.equal(bad.body.error, 'bad-nickname')
   assert.equal(service.snapshot().self.nickname, '新 名字')
 
-  const unknown = await call(service, '/local-pet/action', {
+  const unknown = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'unknown' }
   })
@@ -186,7 +186,7 @@ test('客厅开关默认开；关掉后落盘，重启仍是关，重新打开�
   assert.equal(DEFAULT_ACCEPT_VISITS, true)
   assert.equal(first.snapshot().acceptVisits, true)
 
-  const off = await call(first, '/local-pet/action', {
+  const off = await call(first, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'accept-visits', enabled: false }
   })
@@ -206,7 +206,7 @@ test('客厅开关默认开；关掉后落盘，重启仍是关，重新打开�
   })
 
   // 非布尔值明确失败，不隐式 toggle。
-  const bad = await call(first, '/local-pet/action', {
+  const bad = await call(first, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'accept-visits', enabled: 'false' }
   })
@@ -223,7 +223,7 @@ test('客厅开关默认开；关掉后落盘，重启仍是关，重新打开�
   await second.ready
   assert.equal(second.snapshot().acceptVisits, false)
 
-  const on = await call(second, '/local-pet/action', {
+  const on = await call(second, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'accept-visits', enabled: true }
   })
@@ -338,7 +338,7 @@ test('第一次见面放行/拒绝都落盘；重启后不再询问', async (t) 
   assert.equal(first.mayTalkTo(allowedId), false)
   assert.equal(first.mayTalkTo(deniedId), false)
 
-  const admitted = await call(first, '/local-pet/action', {
+  const admitted = await call(first, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'admit', deviceId: allowedId }
   })
@@ -351,7 +351,7 @@ test('第一次见面放行/拒绝都落盘；重启后不再询问', async (t) 
   assert.equal(first.mayTalkTo(allowedId), true)
   assert.deepEqual(first.snapshot().prompt, { deviceId: deniedId, nickname: '乙' })
 
-  const rejected = await call(first, '/local-pet/action', {
+  const rejected = await call(first, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'reject', deviceId: deniedId }
   })
@@ -388,7 +388,7 @@ test('第一次见面放行/拒绝都落盘；重启后不再询问', async (t) 
   assert.equal(second.mayTalkTo(allowedId), true)
   assert.equal(second.mayTalkTo(deniedId), false)
 
-  const state = await call(second, '/local-pet/state')
+  const state = await call(second, '/dsh-zoo/state')
   assert.equal(state.status, 200)
   assert.deepEqual(state.body.neighbors.map((neighbor) => neighbor.status), ['allowed', 'denied'])
   assert.equal(state.body.prompt, null)
@@ -411,7 +411,7 @@ test('dismiss action 只让队列前进，不改变信任', async (t) => {
   service.room.observeBeacon({ deviceId: secondId, nickname: '乙', port: 40002 }, now)
   assert.deepEqual(service.snapshot().prompt, { deviceId: firstId, nickname: '甲' })
 
-  const dismissed = await call(service, '/local-pet/action', {
+  const dismissed = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'dismiss', deviceId: firstId }
   })
@@ -425,7 +425,7 @@ test('dismiss action 只让队列前进，不改变信任', async (t) => {
     'pending'
   ])
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.deepEqual(state.body.prompt, { deviceId: secondId, nickname: '乙' })
 })
 
@@ -437,21 +437,21 @@ test('坏的 deviceId / 未知邻居明确失败，不留下半截状态', async
   })
   await service.ready
 
-  const bad = await call(service, '/local-pet/action', {
+  const bad = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'admit', deviceId: 'not-a-uuid' }
   })
   assert.equal(bad.status, 409)
   assert.deepEqual(bad.body, { ok: false, error: 'bad-device-id' })
 
-  const unknown = await call(service, '/local-pet/action', {
+  const unknown = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'reject', deviceId: randomUUID() }
   })
   assert.equal(unknown.status, 409)
   assert.deepEqual(unknown.body, { ok: false, error: 'unknown-neighbor' })
 
-  const badDismiss = await call(service, '/local-pet/action', {
+  const badDismiss = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'dismiss', deviceId: randomUUID() }
   })
@@ -473,7 +473,7 @@ test('损坏的 peers.json 不影响启动，第一次放行仍然可用', async
   const deviceId = randomUUID()
   service.room.observeBeacon({ deviceId, nickname: '甲', port: 40001 }, Date.now())
   assert.deepEqual(service.snapshot().prompt, { deviceId, nickname: '甲' })
-  const admitted = await call(service, '/local-pet/action', {
+  const admitted = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'admit', deviceId }
   })
@@ -564,7 +564,7 @@ test('自动出门默认关；auto-visits action 落盘，重启后保持', asyn
   assert.equal(first.snapshot().autoVisit.enabled, false)
   assert.equal(first.snapshot().autoVisit.activitySource, 'none')
 
-  const bad = await call(first, '/local-pet/action', {
+  const bad = await call(first, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'auto-visits', enabled: 'false' }
   })
@@ -572,7 +572,7 @@ test('自动出门默认关；auto-visits action 落盘，重启后保持', asyn
   assert.deepEqual(bad.body, { ok: false, error: 'bad-enabled' })
   assert.equal(first.snapshot().autoVisit.enabled, false)
 
-  const on = await call(first, '/local-pet/action', {
+  const on = await call(first, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'auto-visits', enabled: true }
   })
@@ -621,7 +621,7 @@ test('session/event 是主活动信号：订阅带 global，任何事件都刷�
   await service.ready
 
   // 默认自动串门关着，不订阅；开了才需要主信号。
-  const enabled = await call(service, '/local-pet/action', {
+  const enabled = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'auto-visits', enabled: true }
   })
@@ -674,7 +674,7 @@ test('session/event 不可用时退回桌面指针：光标进入宠物才算活
   captured.onEvent({ type: 'hit', inside: false, point: { x: 10, y: 20 }, reason: 'outside' })
   assert.equal(service.snapshot().autoVisit.lastActivityAt, pointer.lastActivityAt)
   // 默认自动串门关着，不订阅 session/event；开启后才挂上主信号。
-  const enabled = await call(service, '/local-pet/action', {
+  const enabled = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'auto-visits', enabled: true }
   })
@@ -692,7 +692,7 @@ test('手动串门不带 deviceId：随机挑在线已放行邻居；没有目�
   await service.ready
 
   // 一个都没放行：明确说“还没有人放行你”，不是含糊的超时。
-  const none = await call(service, '/local-pet/action', {
+  const none = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'visit' }
   })
@@ -703,11 +703,11 @@ test('手动串门不带 deviceId：随机挑在线已放行邻居；没有目�
   // 放行了、也收到了广播，但对方还没有心跳 = 还不确定对方放行了我：不指向它。
   const deviceId = randomUUID()
   service.room.observeBeacon({ deviceId, nickname: '甲', port: 40001 }, Date.now())
-  assert.equal((await call(service, '/local-pet/action', {
+  assert.equal((await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'admit', deviceId }
   })).status, 200)
-  const noEvidence = await call(service, '/local-pet/action', {
+  const noEvidence = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'visit' }
   })
@@ -719,7 +719,7 @@ test('手动串门不带 deviceId：随机挑在线已放行邻居；没有目�
   // 所以明确报 peer-offline，而不是含糊的超时。
   assert.equal(service.room.observeHeartbeat({ deviceId, anim: null }, Date.now()), true)
 
-  const offline = await call(service, '/local-pet/action', {
+  const offline = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'visit' }
   })
@@ -740,7 +740,7 @@ test('坏 deviceId 仍然明确失败；不带 deviceId 才是“随机挑一个
   await service.ready
 
   for (const deviceId of ['', 'not-a-uuid', 42]) {
-    const result = await call(service, '/local-pet/action', {
+    const result = await call(service, '/dsh-zoo/action', {
       method: 'POST',
       body: { action: 'visit', deviceId }
     })
@@ -866,7 +866,7 @@ test('改名走 dsh-pet 的 PUT /config：只改 name，三处一起变', async 
   const pet = await fakeDshPet(t, { configPath })
   const service = await petService(t, { dir, configPath, origin: pet.origin })
 
-  const renamed = await call(service, '/local-pet/action', {
+  const renamed = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'rename', nickname: '  新 名字  ' }
   })
@@ -890,7 +890,7 @@ test('dsh-pet 写不进去时改名整个取消，本地一个字段都不动', 
   const pet = await fakeDshPet(t, { configPath, putStatus: 500 })
   const service = await petService(t, { dir, configPath, origin: pet.origin })
 
-  const renamed = await call(service, '/local-pet/action', {
+  const renamed = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'rename', nickname: '新名字' }
   })
@@ -908,7 +908,7 @@ test('dsh-pet 装着但不通：改名明确失败，不回退成只改本地', 
   await writeFile(configPath, '{"pets":[{"id":"main","name":"蓝毛小女仆"}]}', 'utf8')
   const service = await petService(t, { dir, configPath, origin: 'http://127.0.0.1:1' })
 
-  const renamed = await call(service, '/local-pet/action', {
+  const renamed = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'rename', nickname: '新名字' }
   })
@@ -917,12 +917,12 @@ test('dsh-pet 装着但不通：改名明确失败，不回退成只改本地', 
   assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
 })
 
-test('POST /local-pet/self-state：动作进入快照，非法请求 400，非 POST 405', async (t) => {
+test('POST /dsh-zoo/self-state：动作进入快照，非法请求 400，非 POST 405', async (t) => {
   const service = makeService(t)
   await service.ready
   service.room.setSelfPet({ name: '小蓝', anim: '待机呼吸休闲' })
 
-  const ok = await call(service, '/local-pet/self-state', {
+  const ok = await call(service, '/dsh-zoo/self-state', {
     method: 'POST',
     body: { action: '写代码', semantic: 'working', say: '在写代码' }
   })
@@ -933,11 +933,11 @@ test('POST /local-pet/self-state：动作进入快照，非法请求 400，非 P
   assert.equal(pet.semantic, 'working')
   assert.equal(pet.say.text, '在写代码')
 
-  const bad = await call(service, '/local-pet/self-state', { method: 'POST', body: { action: '../x' } })
+  const bad = await call(service, '/dsh-zoo/self-state', { method: 'POST', body: { action: '../x' } })
   assert.equal(bad.status, 400)
   assert.equal(bad.body.error, 'bad-state')
 
-  const wrong = await call(service, '/local-pet/self-state')
+  const wrong = await call(service, '/dsh-zoo/self-state')
   assert.equal(wrong.status, 405)
 })
 
@@ -947,14 +947,14 @@ test('自动串门关着时不订阅 session/event；打开后订阅，关掉退
   const handlers = service.handlers
   assert.equal(handlers.has('session/event'), false, '默认（自动串门关）不该读 DSH 事件流')
 
-  const on = await call(service, '/local-pet/action', {
+  const on = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'auto-visits', enabled: true }
   })
   assert.equal(on.status, 200)
   assert.equal(handlers.has('session/event'), true, '开了自动串门才需要活动信号')
 
-  const off = await call(service, '/local-pet/action', {
+  const off = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'auto-visits', enabled: false }
   })
@@ -962,7 +962,7 @@ test('自动串门关着时不订阅 session/event；打开后订阅，关掉退
   assert.equal(handlers.has('session/event'), false, '关掉后必须退订')
 })
 
-test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提示并打一行日志', async (t) => {
+test('双桌面层：dsh-pet 可达且有宠物时，/dsh-zoo/desktop 带提示并打一行日志', async (t) => {
   const dir = await tempDir(t)
   // 名字来自 dsh-pet 的配置（ADR-0007），不是 /state；这里给一份，出口才能带上是谁在画。
   const petConfigPath = join(dir, 'main-config.jsonc')
@@ -1005,7 +1005,7 @@ test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提�
   while (service.snapshot().self.pet === null && Date.now() < deadline) await delay(10)
   assert.notEqual(service.snapshot().self.pet, null, '桥接应该读到 dsh-pet 的宠物')
 
-  const res = await call(service, '/local-pet/desktop')
+  const res = await call(service, '/dsh-zoo/desktop')
   assert.equal(res.status, 200)
   assert.equal(res.body.dualLayer.code, 'dual-desktop-layer')
   assert.match(res.body.dualLayer.note, /dsh-pet/)
@@ -1019,10 +1019,10 @@ test('双桌面层：dsh-pet 可达且有宠物时，/local-pet/desktop 带提�
   await delay(200)
   assert.equal(warnings.filter((line) => /dsh-pet 也在画/.test(line)).length, 1,
     '提示只打印一次（' + warnings.length + ' 行警告总共）')
-  assert.equal((await call(service, '/local-pet/desktop')).body.dualLayerNoted, true, '再问一次仍然是「提示过」')
+  assert.equal((await call(service, '/dsh-zoo/desktop')).body.dualLayerNoted, true, '再问一次仍然是「提示过」')
 })
 
-test('双桌面层：dsh-pet 够不着时 /local-pet/desktop 的 dualLayer 是 null', async (t) => {
+test('双桌面层：dsh-pet 够不着时 /dsh-zoo/desktop 的 dualLayer 是 null', async (t) => {
   const dir = await tempDir(t)
   const { ctx, routes } = fakeCtx()
   const service = createService(ctx, {
@@ -1045,7 +1045,7 @@ test('双桌面层：dsh-pet 够不着时 /local-pet/desktop 的 dualLayer 是 n
   await service.ready
   await delay(80)
 
-  const res = await call(service, '/local-pet/desktop')
+  const res = await call(service, '/dsh-zoo/desktop')
   assert.equal(res.status, 200)
   assert.equal(res.body.dualLayer, null)
   // 0.4.2 现场卡在「没有出现 null 态」：现在出口直接说明为什么是 null。
@@ -1090,7 +1090,7 @@ test('双桌面层：配置还在但 /state 不通时，dshPet.name 不能顶配
   await service.ready
   await delay(80)
 
-  const res = await call(service, '/local-pet/desktop')
+  const res = await call(service, '/dsh-zoo/desktop')
   assert.equal(res.status, 200)
   assert.equal(res.body.dualLayer, null)
   assert.equal(res.body.dshPet.reachable, false, '判据里 dsh-pet 不可达')
@@ -1136,10 +1136,10 @@ test('换皮：use-skin 切到第二张皮，只写 settings.json，身份与记
   const before = new Map()
   for (const file of files) before.set(file, await readFile(join(dir, file), 'utf8').catch(() => null))
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.body.skin.id, 'fish')
 
-  const result = await call(service, '/local-pet/action', {
+  const result = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'use-skin', skinId: 'cat' }
   })
@@ -1148,7 +1148,7 @@ test('换皮：use-skin 切到第二张皮，只写 settings.json，身份与记
   assert.equal(result.body.skin, 'cat')
   assert.equal(result.body.persisted, true)
 
-  const after = await call(service, '/local-pet/state')
+  const after = await call(service, '/dsh-zoo/state')
   assert.equal(after.body.skin.id, 'cat')
   assert.equal(after.body.skin.idle, '待机')
 
@@ -1166,7 +1166,7 @@ test('换皮：未知 id 明确失败，当前那张皮不变', async (t) => {
   const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
   await service.ready
 
-  const result = await call(service, '/local-pet/action', {
+  const result = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'use-skin', skinId: 'ghost' }
   })
@@ -1174,7 +1174,7 @@ test('换皮：未知 id 明确失败，当前那张皮不变', async (t) => {
   assert.equal(result.body.ok, false)
   assert.equal(result.body.error, 'unknown-skin')
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.body.skin.id, 'fish')
 })
 
@@ -1191,7 +1191,7 @@ test('activeSource 指向一个已经不存在的源：回落第一条并告警'
   const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
   await service.ready
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.body.skin.id, 'fish')
   assert.ok(
     service.warnings.some((line) => line.includes('activeSource')),
@@ -1239,7 +1239,7 @@ test('换皮：桌面右键那条路（action 事件带 skinId）也能切，结
   assert.equal(desktop.calls.results[0].id, 'act-skin-1')
   assert.equal(desktop.calls.results[0].result.ok, true)
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.body.skin.id, 'cat')
 })
 
@@ -1259,20 +1259,20 @@ test('重载配置会重读 skin.json：新加的皮立刻能切，不用重启'
 
   const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
   await service.ready
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'fish')
 
   // 新加一条源，然后走「重载配置」——不重启进程。
   await writeSkins(dir, [{ id: 'fish', dirs: [fish] }, { id: 'cat', dirs: [cat], idle: '待机' }])
-  const reloaded = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+  const reloaded = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'reload' } })
   assert.equal(reloaded.status, 200)
   assert.equal(reloaded.body.ok, true)
 
-  const switched = await call(service, '/local-pet/action', {
+  const switched = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'use-skin', skinId: 'cat' }
   })
   assert.equal(switched.status, 200)
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'cat')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'cat')
 })
 
 test('重载配置：当前那张皮被删掉就回落第一条并告警', async (t) => {
@@ -1287,14 +1287,14 @@ test('重载配置：当前那张皮被删掉就回落第一条并告警', async
 
   const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
   await service.ready
-  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'cat')
+  await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'cat')
 
   // 猫那条源被删了：重载之后应当回落第一条，而不是留在一个不存在的皮上。
   await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
-  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+  await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'reload' } })
 
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'fish')
   assert.ok(
     service.warnings.some((line) => line.includes('activeSource')),
     '应该告警说明回落了：' + JSON.stringify(service.warnings)
@@ -1327,7 +1327,7 @@ test('皮自带尺寸：场景里只有 self 带 size，换皮后跟着变', asy
   const widthOfSelf = () => desktop.calls.scenes.at(-1).items.find((item) => item.role === 'self').width
   assert.equal(widthOfSelf(), 108, '462 是 1.0')
 
-  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
+  await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
   assert.equal(widthOfSelf(), 162, '693/462 = 1.5，换皮后场景跟着变')
 })
 
@@ -1360,12 +1360,12 @@ test('回落时把 activeSource 改写成真正在用的那张（不留两处真
     activeSource: 'ghost'
   }), 'utf8')
 
-  const reloaded = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+  const reloaded = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'reload' } })
   assert.equal(reloaded.status, 200)
 
   const saved = JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8'))
   assert.equal(saved.activeSource, 'fish', 'settings 不该继续指着 ghost')
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'fish')
 })
 
 test('诊断出口带「外观」菜单的内容，菜单不用打开也能核对', async (t) => {
@@ -1380,13 +1380,13 @@ test('诊断出口带「外观」菜单的内容，菜单不用打开也能核�
   await service.ready
   desktop.emit({ type: 'ready', pid: 4242, workArea: { x: 0, y: 30, width: 1440, height: 900 } })
 
-  const before = await call(service, '/local-pet/desktop')
+  const before = await call(service, '/dsh-zoo/desktop')
   assert.deepEqual(before.body.menuSkins, ['fish', 'cat'])
   assert.equal(before.body.menuActiveSkin, 'fish')
 
-  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
+  await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
 
-  const after = await call(service, '/local-pet/desktop')
+  const after = await call(service, '/dsh-zoo/desktop')
   assert.deepEqual(after.body.menuSkins, ['fish', 'cat'])
   assert.equal(after.body.menuActiveSkin, 'cat')
 })
@@ -1407,7 +1407,7 @@ async function petPackFixture (home, id = 'maodie') {
 
 test('扫描外观：把没见过的宠物包写进 skin.json，不认识的目录一个不碰', async (t) => {
   const home = await tempDir(t)
-  const dir = join(home, 'local-pet')
+  const dir = join(home, 'dsh-zoo')
   const fish = join(dir, 'skin-fish')
   await mkdir(fish, { recursive: true })
   await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
@@ -1422,9 +1422,9 @@ test('扫描外观：把没见过的宠物包写进 skin.json，不认识的目�
     petConfigPath: join(home, 'missing.jsonc')
   })
   await service.ready
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'fish')
 
-  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const scanned = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.equal(scanned.status, 200)
   assert.equal(scanned.body.ok, true)
   assert.deepEqual(scanned.body.added, ['maodie'])
@@ -1436,10 +1436,10 @@ test('扫描外观：把没见过的宠物包写进 skin.json，不认识的目�
   assert.equal(saved.sources[1].size, 400)
   assert.equal(saved.sources[1].idle, '待机')
   // 当前那张皮不变：扫描只加，不替你选。
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'fish')
 
   // 连点第二次：什么都不加（幂等）。
-  const again = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const again = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.equal(again.status, 200)
   assert.deepEqual(again.body.added, [])
   assert.match(again.body.notice, /没有发现新的素材包/)
@@ -1447,7 +1447,7 @@ test('扫描外观：把没见过的宠物包写进 skin.json，不认识的目�
 
 test('扫描外观：skin.json 改坏了就明确失败，不覆盖它', async (t) => {
   const home = await tempDir(t)
-  const dir = join(home, 'local-pet')
+  const dir = join(home, 'dsh-zoo')
   await mkdir(dir, { recursive: true })
   await writeFile(join(dir, SKIN_FILE), '{ 这不是 json', 'utf8')
   await petPackFixture(home)
@@ -1461,7 +1461,7 @@ test('扫描外观：skin.json 改坏了就明确失败，不覆盖它', async (
   })
   await service.ready
 
-  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const scanned = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.equal(scanned.status, 409)
   assert.equal(scanned.body.error, 'skin-file-broken')
   assert.equal(await readFile(join(dir, SKIN_FILE), 'utf8'), '{ 这不是 json', '坏文件必须原样留着')
@@ -1469,7 +1469,7 @@ test('扫描外观：skin.json 改坏了就明确失败，不覆盖它', async (
 
 test('扫描外观：同一个素材目录已经手写成别的 id，就不要再加一条重复的', async (t) => {
   const home = await tempDir(t)
-  const dir = join(home, 'local-pet')
+  const dir = join(home, 'dsh-zoo')
   await mkdir(dir, { recursive: true })
   await petPackFixture(home)
 
@@ -1485,7 +1485,7 @@ test('扫描外观：同一个素材目录已经手写成别的 id，就不要�
   })
   await service.ready
 
-  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const scanned = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.equal(scanned.status, 200)
   assert.deepEqual(scanned.body.added, [])
   assert.match(scanned.body.notice, /没有发现新的素材包/)
@@ -1496,7 +1496,7 @@ test('扫描外观：同一个素材目录已经手写成别的 id，就不要�
 
 test('扫描外观：手改过 skin.json 还没重载，也要按磁盘上的内容判重', async (t) => {
   const home = await tempDir(t)
-  const dir = join(home, 'local-pet')
+  const dir = join(home, 'dsh-zoo')
   const fish = join(dir, 'skin-fish')
   await mkdir(fish, { recursive: true })
   await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
@@ -1511,19 +1511,19 @@ test('扫描外观：手改过 skin.json 还没重载，也要按磁盘上的内
     petConfigPath: join(home, 'missing.jsonc')
   })
   await service.ready
-  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
 
   // 手动把猫删掉，不按「重载配置」——进程里的缓存还认为它在。
   const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
   await writeSkins(dir, saved.sources.filter((entry) => entry.id !== 'maodie'))
 
-  const again = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const again = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.deepEqual(again.body.added, ['maodie'], '不能拿旧缓存判重，否则刚删掉的源永远补不回来')
 })
 
 test('扫描外观：文件在这之后才被改坏，也要报 409 而不是"没有新素材"', async (t) => {
   const home = await tempDir(t)
-  const dir = join(home, 'local-pet')
+  const dir = join(home, 'dsh-zoo')
   const fish = join(dir, 'skin-fish')
   await mkdir(fish, { recursive: true })
   await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
@@ -1538,11 +1538,11 @@ test('扫描外观：文件在这之后才被改坏，也要报 409 而不是"�
     petConfigPath: join(home, 'missing.jsonc')
   })
   await service.ready
-  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
 
   // 扫描过一次之后把文件写坏；此时缓存里猫是"已知"，但文件已经读不出来了。
   await writeFile(join(dir, SKIN_FILE), '{ 坏掉了', 'utf8')
-  const broken = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const broken = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.equal(broken.status, 409)
   assert.equal(broken.body.error, 'skin-file-broken')
   assert.equal(await readFile(join(dir, SKIN_FILE), 'utf8'), '{ 坏掉了', '坏文件不能被覆盖')
@@ -1550,7 +1550,7 @@ test('扫描外观：文件在这之后才被改坏，也要报 409 而不是"�
 
 test('扫描外观：干净机器上没有 skin.json 时，要把自动源一起写进去（别把鱼弄丢）', async (t) => {
   const home = await tempDir(t)
-  const dir = join(home, 'local-pet')
+  const dir = join(home, 'dsh-zoo')
   await mkdir(dir, { recursive: true })
   // 自动源 = dsh-pet 的用户素材目录；有它才会自动注册成第一张皮。
   const auto = join(home, 'dsh-pet', 'main-animation', 'webm')
@@ -1566,14 +1566,14 @@ test('扫描外观：干净机器上没有 skin.json 时，要把自动源一起
     petConfigPath: join(home, 'missing.jsonc')
   })
   await service.ready
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'dsh-pet')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'dsh-pet')
 
-  const scanned = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'scan-skins' } })
+  const scanned = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'scan-skins' } })
   assert.equal(scanned.status, 200)
   assert.deepEqual(scanned.body.added, ['maodie'])
   assert.match(scanned.body.notice, /加入 1 张/)
 
   const saved = JSON.parse(await readFile(join(dir, SKIN_FILE), 'utf8'))
   assert.deepEqual(saved.sources.map((s) => s.id), ['dsh-pet', 'maodie'], '自动源要一起写进去，否则鱼会消失')
-  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'dsh-pet', '扫描不该顺手换掉当前皮')
+  assert.equal((await call(service, '/dsh-zoo/state')).body.skin.id, 'dsh-pet', '扫描不该顺手换掉当前皮')
 })

@@ -1,5 +1,5 @@
 /**
- * 桌面层的「共存提示」。现在只有一条：dsh-pet 与 dsh-local-pet 同时在画（ticket 31）。
+ * 桌面层的「共存提示」。现在只有一条：dsh-pet 与 dsh-zoo 同时在画（ticket 31）。
  *
  * 为什么值得提示：两个 helper 都是全屏透明、默认点穿的置顶层，命中区只覆盖各自的宠物。
  * 两只宠物位置重叠时，用户看到的是下面那只、拖到的却是上面那层——症状像「宠物拖不动」，
@@ -10,7 +10,7 @@
 
 export const DUAL_LAYER_NOTE =
   'dsh-pet 也在画桌面宠物：两个透明层重叠时，看到的那只和拖到的那只可能不是同一只。' +
-  '只留一个桌面层——关掉 dsh-pet 的桌面窗，或设 LOCAL_PET_DESKTOP=0 关掉这一层。'
+  '只留一个桌面层——关掉 dsh-pet 的桌面窗，或设 DSH_ZOO_DESKTOP=0 关掉这一层。'
 
 /**
  * @param {{desktopRunning?: boolean, bridge?: {ok?: boolean}|null, pet?: object|null}} [input]

@@ -39,7 +39,7 @@ const SOURCE_ID = /^[A-Za-z0-9_-]{1,32}$/
  * @param {object} [options]
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {string} [options.home] 覆盖用户 home（只用于 `~` 展开；dsh-pet 目录仍按 $DSH_HOME 解析）
- * @param {string} [options.dataDir] 覆盖 `<DSH_HOME>/local-pet`
+ * @param {string} [options.dataDir] 覆盖 `<DSH_HOME>/dsh-zoo`
  * @param {(dir:string)=>Promise<Array<string|{name:string,isFile?:Function,isSymbolicLink?:Function}>>} [options.readdir]
  * @param {(path:string, encoding:string)=>Promise<string>} [options.readFile]
  * @param {(options:{env?:object})=>string[]} [options.resolveDshPetDirs]

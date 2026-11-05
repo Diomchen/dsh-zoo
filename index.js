@@ -1,6 +1,6 @@
 import { createService } from './src/service.js'
 
-export const name = 'local-pet'
+export const name = 'dsh-zoo'
 
 /** 宿主半侧只需要 webserver：给本地浏览器开一个只读入口。 */
 export const inject = ['webServer']
@@ -19,7 +19,7 @@ export function apply (ctx, options = {}) {
   }
 
   try {
-    ctx.effect(() => () => service.dispose(), 'local-pet: lifecycle')
+    ctx.effect(() => () => service.dispose(), 'dsh-zoo: lifecycle')
   } catch (error) {
     warn(ctx, '生命周期挂载失败：' + describe(error))
     service.dispose()
@@ -27,7 +27,7 @@ export function apply (ctx, options = {}) {
 }
 
 function warn (ctx, message) {
-  const line = '[dsh-local-pet] ' + message
+  const line = '[dsh-zoo] ' + message
   try {
     if (typeof ctx?.logger?.warn === 'function') ctx.logger.warn(line)
     else console.warn(line)

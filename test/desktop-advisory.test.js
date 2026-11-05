@@ -4,7 +4,7 @@ import test from 'node:test'
 import { dualLayerAdvisory } from '../src/desktop-advisory.js'
 
 /**
- * dsh-pet 与 dsh-local-pet 同时画桌面宠物时，两个透明置顶层可能重叠：看到的是下面那只、
+ * dsh-pet 与 dsh-zoo 同时画桌面宠物时，两个透明置顶层可能重叠：看到的是下面那只、
  * 拖到的是上面那只（ticket 31）。宿主已经知道 dsh-pet 可不可达，所以能给一条提示——
  * 但只在「确实两层都在画」时给，否则只是噪音。
  */

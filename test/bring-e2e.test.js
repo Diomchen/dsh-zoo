@@ -2,7 +2,7 @@
  * 票 24：背包（发送端）+ 右键「带派」小窗的宿主侧。
  *
  * 覆盖三件事，全部走真实的 service / 磁盘 / UDP：
- *   1. `POST /local-pet/action` 的 bring/unbring 与错误码；菜单 bring 打开小窗并收到背包快照；
+ *   1. `POST /dsh-zoo/action` 的 bring/unbring 与错误码；菜单 bring 打开小窗并收到背包快照；
  *      小窗提交（helper 事件）与宿主 action-result 回路。
  *   2. 出门自动带最旧的一件；三次重发带的是**同一个** gift 对象；out 中不能撤。
  *   3. 文件礼物的 name/size/sha256 在发送那一刻才读；文件消失时空手出门、留在背包、留一句人话。
@@ -49,7 +49,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-bring-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-bring-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -67,8 +67,8 @@ function makeService (t, options = {}) {
 }
 
 async function callAction (service, body) {
-  const route = service.routes.find((candidate) => candidate.path === '/local-pet/action')
-  assert.ok(route, '应该注册 /local-pet/action')
+  const route = service.routes.find((candidate) => candidate.path === '/dsh-zoo/action')
+  assert.ok(route, '应该注册 /dsh-zoo/action')
   const res = {
     statusCode: 0,
     headers: {},

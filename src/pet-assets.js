@@ -2,10 +2,10 @@
  * dsh-pet 素材目录解析。
  *
  * 桌面 helper 是 `file://` 页面，`/dsh-pet-7340/thumb/...` 这种同源 HTTP 路由在它里面
- * 根本不存在；helper 主进程要注册自己的 `localpet://` 协议，就必须知道素材目录在哪。
+ * 根本不存在；helper 主进程要注册自己的 `dshzoo://` 协议，就必须知道素材目录在哪。
  *
  * 这里在**宿主侧**解析，绝不硬编码 `~/.dsh/profiles/desktop`：
- *   1. `LOCAL_PET_DSH_PET_ASSETS`（显式覆盖，`:` 分隔多个目录；测试/特殊安装用）；
+ *   1. `DSH_ZOO_DSH_PET_ASSETS`（显式覆盖，`:` 分隔多个目录；测试/特殊安装用）；
  *   2. `$DSH_HOME/dsh-pet/main-animation/webm`（dsh-pet 的用户自定义素材，优先覆盖包内素材）；
  *   3. 从本模块位置 `require.resolve('dsh-pet/package.json')` —— 插件和 dsh-pet 通常装在
  *      同一个 profile 的 node_modules 里，这是最可靠的一条；
@@ -20,7 +20,7 @@ import { delimiter, dirname, isAbsolute, join } from 'node:path'
 
 import { dshHome } from './paths.js'
 
-export const DSH_PET_ASSET_ENV = 'LOCAL_PET_DSH_PET_ASSETS'
+export const DSH_PET_ASSET_ENV = 'DSH_ZOO_DSH_PET_ASSETS'
 
 const requireFromHere = createRequire(import.meta.url)
 

@@ -69,9 +69,9 @@ function safe (fn, fallback) {
  * @param {boolean} [options.desktopHost] 覆盖桌面版判定（测试/冒烟用）
  * @param {Function} [options.spawn] child_process.spawn 注入
  * @param {Function} [options.exists] 路径存在性注入
- * @param {string[]} [options.assetRoots] 宿主解析好的 dsh-pet 素材目录（helper 的 localpet:// 根）
- * @param {string} [options.cacheRoot] 远端素材缓存目录（helper 的 localpet://cache 根）
- * @param {string} [options.giftsRoot] 收到的礼物根目录（helper 的 localpet://gifts 根，ticket 25）
+ * @param {string[]} [options.assetRoots] 宿主解析好的 dsh-pet 素材目录（helper 的 dshzoo:// 根）
+ * @param {string} [options.cacheRoot] 远端素材缓存目录（helper 的 dshzoo://cache 根）
+ * @param {string} [options.giftsRoot] 收到的礼物根目录（helper 的 dshzoo://gifts 根，ticket 25）
  * @param {Function} [options.onEvent] 收到 helper 事件（ready/hit/...）时回调；异常被吞
  */
 export function createDesktop (options = {}) {
@@ -91,7 +91,7 @@ export function createDesktop (options = {}) {
   const hostPid = Number.isInteger(options.hostPid) && options.hostPid > 0 ? options.hostPid : process.pid
   const assetRoots = Array.isArray(options.assetRoots) ? options.assetRoots.slice() : []
   const cacheRoot = typeof options.cacheRoot === 'string' && options.cacheRoot !== '' ? options.cacheRoot : null
-  /** ticket 25：礼物根目录，只给 helper 的 `localpet://gifts/...` 缩略图用。 */
+  /** ticket 25：礼物根目录，只给 helper 的 `dshzoo://gifts/...` 缩略图用。 */
   const giftsRoot = typeof options.giftsRoot === 'string' && options.giftsRoot !== '' ? options.giftsRoot : null
   const debug = options.debug === true
   const pingMs = Number.isFinite(options.pingMs) && options.pingMs >= 100 ? options.pingMs : DESKTOP_PING_MS

@@ -5,7 +5,7 @@
  *   - Electron 主进程（desktop/main.js，CJS）—— require('./shared.js')；
  *   - 宿主（src/desktop.js，ESM）—— `import shared from '../desktop/shared.js'`（Node 按最近的
  *     desktop/package.json 把它当 CJS，默认导出即 module.exports）；
- *   - 渲染页（desktop/renderer.js，普通 <script>）—— 挂到 globalThis.LocalPetShared。
+ *   - 渲染页（desktop/renderer.js，普通 <script>）—— 挂到 globalThis.DshZooShared。
  * 一份实现、一份测试，避免「主进程的命中判定」和「渲染端的物理/命中」各写一套然后漂移。
  *
  * 坐标约定：
@@ -17,8 +17,8 @@
  *   - 宿主只决定「有谁、叫什么、在播什么」（items 的 id/role/label/anim/color）以及
  *     「能点哪些控件、为什么不能点」（controls，ticket 11），位置只在**新宠物出生**时用
  *     item 的 x/y 作种子；
- *   - 渲染端在本地模拟位置与速度，逐帧把自己的命中矩形报给主进程（ipc `local-pet:rects`）；
- *     弹层/放行卡/召回胶囊的命中矩形走另一条 `local-pet:overlay-rects`；
+ *   - 渲染端在本地模拟位置与速度，逐帧把自己的命中矩形报给主进程（ipc `dsh-zoo:rects`）；
+ *     弹层/放行卡/召回胶囊的命中矩形走另一条 `dsh-zoo:overlay-rects`；
  *   - 主进程不猜渲染端的位置：命中判定只用渲染端最近上报的矩形（过期就 fail-closed 回穿透）；
  *   - `reset: true` 让渲染端把每只宠物按 item 的 x/y 重新出生一次，用于 helper 重启/强制对账。
  *
@@ -38,7 +38,7 @@
   'use strict'
   const api = factory()
   if (typeof module === 'object' && module.exports) module.exports = api
-  if (root) root.LocalPetShared = api
+  if (root) root.DshZooShared = api
 })(typeof globalThis !== 'undefined' ? globalThis : this, function () {
   'use strict'
 
@@ -67,7 +67,7 @@
   const MAX_PATH_LENGTH = 1024
   const MAX_ERROR_LENGTH = 500
   const MAX_NOTICE_LENGTH = 200
-  /** 素材诊断（ipc `local-pet:media`）：同样来自渲染端，按不可信输入裁。 */
+  /** 素材诊断（ipc `dsh-zoo:media`）：同样来自渲染端，按不可信输入裁。 */
   const MAX_MEDIA_FAILED = 16
   /** 街上最多几户。与 src/street.js 的 MAX_STREET 同一个数：跨进程各自守自己的边界。 */
   const MAX_STREET_ITEMS = 16
@@ -201,8 +201,8 @@
   const IDLE_CLIPS = ['东张西望', '原地漂浮踏步', '原地小憩沉眠']
   /** 本机素材池的上限：场景一条消息装得下，也防止宿主误传一个超大数组。 */
   const MAX_IDLE_POOL = 128
-  /** 远端素材只接受 helper 的 cache 协议 URL；本机素材仍走 `localpet://asset/<名字>`。 */
-  const CACHE_ASSET_RE = /^localpet:\/\/cache\/[0-9a-f]{64}\.webm$/
+  /** 远端素材只接受 helper 的 cache 协议 URL；本机素材仍走 `dshzoo://asset/<名字>`。 */
+  const CACHE_ASSET_RE = /^dshzoo:\/\/cache\/[0-9a-f]{64}\.webm$/
   /** 语义标签是固定小表：不认识的动作靠它画一个通用表情。 */
   const SEMANTIC_VALUES = ['working', 'eating', 'sleeping', 'idle', 'other']
   /** 通用小人头顶的短标记；空串表示不画。 */
@@ -326,12 +326,12 @@
   }
 
   /**
-   * 缩略图地址只接受宿主生成的 `localpet://gifts/<目录>/<文件名>`（目录名是固定形状，
+   * 缩略图地址只接受宿主生成的 `dshzoo://gifts/<目录>/<文件名>`（目录名是固定形状，
    * 文件名是 encodeURIComponent 过的）。渲染端拿不到别的 URL，也不许自己拼。
    */
   function normalizeGiftThumb (value) {
     if (typeof value !== 'string' || value.length > 2048) return null
-    return /^localpet:\/\/gifts\/\d{8}-\d{6}-[0-9a-f]{8}(?:-\d+)?\/[^\u0000-\u001f/\\]{1,1024}$/.test(value)
+    return /^dshzoo:\/\/gifts\/\d{8}-\d{6}-[0-9a-f]{8}(?:-\d+)?\/[^\u0000-\u001f/\\]{1,1024}$/.test(value)
       ? value
       : null
   }
@@ -448,7 +448,7 @@
     }
   }
 
-  /** 动画名会拼进 `localpet://asset/<name>.webm`：和宿主协议层同一套字符约束。 */
+  /** 动画名会拼进 `dshzoo://asset/<name>.webm`：和宿主协议层同一套字符约束。 */
   function normalizeAnim (value) {
     if (typeof value !== 'string') return null
     const name = value.trim()
@@ -1104,7 +1104,7 @@
   }
 
   /**
-   * 渲染端上报的素材诊断（ipc `local-pet:media`）→ 主进程 `helperStatus.media` 的那一条。
+   * 渲染端上报的素材诊断（ipc `dsh-zoo:media`）→ 主进程 `helperStatus.media` 的那一条。
    *
    * 现场只有这一个探针能回答「宠物到底画出来没有」，所以它必须跟着**每一次**状态变化走：
    * 开始加载报 `loading`，`loadeddata` 报 `video`，降级报 `pending` / `svg`。
@@ -1149,7 +1149,7 @@
   }
 
   /**
-   * 渲染端上报的「可信输入」（ipc `local-pet:input`，ticket 30）。
+   * 渲染端上报的「可信输入」（ipc `dsh-zoo:input`，ticket 30）。
    *
    * 现场出现过「窗口显示可交互、右键能开菜单，真实左键却进不了渲染端」。`ignoring=false`
    * 只说明我们把 `WS_EX_TRANSPARENT` 摘了，`busy=false` 只说明租约没立起来——中间没有任何

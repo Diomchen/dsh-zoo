@@ -6,6 +6,7 @@ import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 
 import { MAX_GIFT_BYTES, isVisitId } from './protocol.js'
+import { GIFT_ROUTES } from './lan-routes.js'
 import { isPrivateAddress } from './skin-fetch.js'
 
 /**
@@ -18,6 +19,9 @@ import { isPrivateAddress } from './skin-fetch.js'
  *   - 失败只报固定词表里的原因：`timeout / no-port / checksum / too-large / refused / write`；
  *   - 同一来源失败后冷却 60 秒。
  * 唯一复用 `skin-fetch.js` 的只有 `isPrivateAddress`（只连私网/回环，绝不解析域名）。
+ *
+ * 路由先新后旧（`src/lan-routes.js`）：新版本用 `/dsh-zoo-gift`，改名前的邻居（≤0.5.7）只认
+ * `/local-pet-gift`；新路径 404 时再试旧路径，其余状态码不重试（410/413 是真实结论）。
  *
  * 安全底线：地址只来自发现层（UDP 报文的来源地址），端口只来自对方广告的 `skinPort`；
  * 目标路径由宿主从礼物目录推出来，giftId 只参与拼 URL 且必须是 UUID。
@@ -58,6 +62,25 @@ export function createGiftFetcher (options = {}) {
     return { ok: false, error }
   }
 
+  /** 一次 GET；404 时先把响应体关掉，交给调用方决定要不要回落旧路由。 */
+  async function request (url, signal) {
+    const response = await fetchImpl(url, {
+      method: 'GET',
+      cache: 'no-store',
+      signal,
+      headers: { accept: 'application/octet-stream' }
+    })
+    if (response === null || typeof response !== 'object' || response.ok === true) return response
+    if (response.status === 404) {
+      try {
+        await response.body?.cancel?.()
+      } catch {
+        // 已经关了
+      }
+    }
+    return response
+  }
+
   /**
    * 把礼物拉到 `targetPath`。成功时 `targetPath` 已经 rename 到位；
    * 任何失败都不会留下半个文件（`.part` 会被删掉）。
@@ -75,7 +98,9 @@ export function createGiftFetcher (options = {}) {
     if (!isVisitId(giftId)) return fail('refused')
     if (typeof targetPath !== 'string' || targetPath === '') return fail('write')
     const host = address.includes(':') ? '[' + address + ']' : address
-    const url = 'http://' + host + ':' + port + '/local-pet-gift/' + encodeURIComponent(giftId.toLowerCase())
+    const base = 'http://' + host + ':' + port
+    const id = encodeURIComponent(giftId.toLowerCase())
+    const urls = GIFT_ROUTES.map((route) => base + route + '/' + id)
     const key = address + ':' + port
     const cooling = failureOf(key)
     if (cooling !== null) return { ok: false, error: cooling.reason, cooldown: true }
@@ -99,15 +124,14 @@ export function createGiftFetcher (options = {}) {
       }, connectTimeoutMs)
       connectTimer.unref?.()
 
-      response = await fetchImpl(url, {
-        method: 'GET',
-        cache: 'no-store',
-        signal: controller.signal,
-        headers: { accept: 'application/octet-stream' }
-      })
+      response = await request(urls[0], controller.signal)
       if (connectTimer !== null) {
         clearTimeout(connectTimer)
         connectTimer = null
+      }
+      // 旧版邻居不认识新路径：404 才回落，410/413 等都是对方给出的真实结论。
+      if (response !== null && response.ok !== true && response.status === 404 && urls.length > 1) {
+        response = await request(urls[1], controller.signal)
       }
       if (response === null || typeof response !== 'object') return fail('refused', key)
       if (response.ok !== true) {

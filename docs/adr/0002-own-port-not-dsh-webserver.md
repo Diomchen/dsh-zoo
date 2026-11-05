@@ -16,7 +16,7 @@ DSH 的 `ctx.webServer` 可以把路由挂到 GUI 同一个端口上，而且它
 
 ## 考虑过的选项
 
-- **挂 `/local-pet/*` 到 DSH webserver**：零新增端口、零新增生命周期，但把宠物开关和会话访问权绑在一起。放弃。
+- **挂 `/dsh-zoo/*` 到 DSH webserver**：零新增端口、零新增生命周期，但把宠物开关和会话访问权绑在一起。放弃。
 - **走 DSH 的 Peer/principal 模型**：`ctx.remoteAccess` 确实已经能表达"非 owner 的 principal"。但它服务的是"浏览器访问本机 DSH"，不是"两台机器平级对话"，套上去反而更重。
 
 ## 修订（ticket 05 实现时）

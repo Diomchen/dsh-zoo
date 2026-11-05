@@ -603,7 +603,7 @@ test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客�
 // ---------------------------------------------------------------------------
 
 test('素材目录解析：环境覆盖 → 用户素材 → 包解析 → profiles 扫描，profile 名不写死', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-assets-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-assets-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const user = join(dir, 'dsh-pet', 'main-animation', 'webm')
   const packageDir = join(dir, 'custom', 'dsh-pet')
@@ -642,10 +642,10 @@ test('helper argv：素材目录只接受绝对路径、去重、最多 8 个，
   })
   assert.deepEqual(args, [
     '/helper/main.js',
-    '--local-pet-host-pid', '42',
-    '--local-pet-debug',
-    '--local-pet-assets', '/a',
-    '--local-pet-assets', '/b'
+    '--dsh-zoo-host-pid', '42',
+    '--dsh-zoo-debug',
+    '--dsh-zoo-assets', '/a',
+    '--dsh-zoo-assets', '/b'
   ])
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', assetRoots: null }), ['/h'])
 })
@@ -661,7 +661,7 @@ test('场景 item 保留合法的 cache src 与语义 fallback，非法值丢掉
         role: 'visitor',
         label: '柯基',
         anim: null,
-        src: 'localpet://cache/' + hash + '.webm',
+        src: 'dshzoo://cache/' + hash + '.webm',
         fallback: 'sleeping',
         x: 10, y: 10, width: 100, height: 100
       },
@@ -680,7 +680,7 @@ test('场景 item 保留合法的 cache src 与语义 fallback，非法值丢掉
   })
 
   const first = scene.items.find((item) => item.id === 'visitor:x')
-  assert.equal(first.src, 'localpet://cache/' + hash + '.webm')
+  assert.equal(first.src, 'dshzoo://cache/' + hash + '.webm')
   assert.equal(first.fallback, 'sleeping')
   const second = scene.items.find((item) => item.id === 'visitor:y')
   assert.equal(second.src, undefined)
@@ -690,7 +690,7 @@ test('场景 item 保留合法的 cache src 与语义 fallback，非法值丢掉
 test('helper argv 带 cacheRoot：只接受绝对路径', () => {
   assert.deepEqual(
     buildHelperArgs({ helperPath: '/h', cacheRoot: '/tmp/skin-cache' }),
-    ['/h', '--local-pet-cache', '/tmp/skin-cache']
+    ['/h', '--dsh-zoo-cache', '/tmp/skin-cache']
   )
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', cacheRoot: 'relative' }), ['/h'])
 })
@@ -827,7 +827,7 @@ test('controlsFromSnapshot：文件卡片带 name/size；缩略图只在 receive
   const visitorId = '33333333-3333-4333-8333-333333333333'
   const giftId = '55555555-5555-4555-8555-555555555555'
   const dir = '20261103-153245-ab12cd12'
-  const thumb = 'localpet://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
+  const thumb = 'dshzoo://gifts/' + dir + '/' + encodeURIComponent('照片.PNG')
   const thumbOf = (id) => (id === giftId ? thumb : null)
   const withGift = (gift) => snapshotWith({
     visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]

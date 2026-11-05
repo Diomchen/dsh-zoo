@@ -1,5 +1,5 @@
 /**
- * 票 25：`localpet://gifts/<目录>/<文件名>` 的路径白名单。
+ * 票 25：`dshzoo://gifts/<目录>/<文件名>` 的路径白名单。
  *
  * 这条路径是渲染页唯一能直接读到磁盘的入口，所以单测把「目录名形状、文件名、
  * 扩展名白名单、夹取」逐条钉住。模块是 CJS（Electron 主进程 require 它），
@@ -12,7 +12,7 @@ import test from 'node:test'
 import giftPath from '../desktop/gift-path.js'
 
 const DIR = '20261103-153245-ab12cd12'
-const BASE = '/tmp/dsh-local-pet/gifts'
+const BASE = '/tmp/dsh-zoo/gifts'
 
 test('resolveGiftFile：只认两段合法名字，解析出的绝对路径必须在 gifts 根下面', () => {
   assert.equal(

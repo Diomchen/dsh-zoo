@@ -1,12 +1,12 @@
-# local-pet · 局域网 DSH 宠物
+# dsh-zoo · 局域网 DSH 宠物
 
 让局域网里不同机器上的 DSH 宠物互相看得见，并且能互相"串门"的插件。
 
 这份文件只定义这个领域里的词，不放实现细节。
 
 「带派 / 礼物 / 背包 / 礼物卡」的决策见 [ADR-0011](docs/adr/0011-bring-gift-on-visit.md)，
-规格见 [SPEC v4](.scratch/local-pet/SPEC-v4.md)；票 23–27 在
-[`.scratch/local-pet/issues/`](.scratch/local-pet/issues/)。
+规格见 [SPEC v4](.scratch/dsh-zoo/SPEC-v4.md)；票 23–27 在
+[`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
 「皮」与「身份」的切分见 [ADR-0013](docs/adr/0013-skin-switch-keeps-identity.md)：换皮只换外观和动作。
 

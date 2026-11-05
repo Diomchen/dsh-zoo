@@ -56,13 +56,13 @@ export function isDesktopHost (versions = process.versions) {
 
 /**
  * 候选 Electron 路径，按优先级：
- *   1. LOCAL_PET_ELECTRON（显式覆盖，测试/特殊安装用）；
+ *   1. DSH_ZOO_ELECTRON（显式覆盖，测试/特殊安装用）；
  *   2. $DSH_HOME/electron/<平台可执行文件>（这台机器上已有的那份，dsh-pet 下载的就是它）。
  * 只做候选枚举，不判断存在性。
  */
 export function candidateElectronPaths ({ env = process.env, platform = process.platform } = {}) {
   const candidates = []
-  const override = typeof env.LOCAL_PET_ELECTRON === 'string' ? env.LOCAL_PET_ELECTRON.trim() : ''
+  const override = typeof env.DSH_ZOO_ELECTRON === 'string' ? env.DSH_ZOO_ELECTRON.trim() : ''
   if (override !== '') candidates.push(override)
   const relative = ELECTRON_REL[platform]
   if (typeof relative === 'string') {
@@ -97,11 +97,11 @@ export function resolveElectronBinary ({ env = process.env, platform = process.p
 }
 
 /**
- * helper 的 argv。**全部用 --local-pet- 前缀**：Electron/Chromium 会自己消费 --debug 之类的
+ * helper 的 argv。**全部用 --dsh-zoo- 前缀**：Electron/Chromium 会自己消费 --debug 之类的
  * 已知开关（实测 `--debug` 直接让 Electron 以 exit 9 退出），前缀确保它们原样落到 process.argv。
  *
  * `assetRoots` 是宿主解析好的 dsh-pet 素材目录（绝对路径，按优先级排列）。helper 的页面是
- * file://，拿不到 DSH 的 HTTP 路由，所以它要注册 localpet:// 协议，根目录只能从 argv 拿。
+ * file://，拿不到 DSH 的 HTTP 路由，所以它要注册 dshzoo:// 协议，根目录只能从 argv 拿。
  * `cacheRoot` 是远端素材的本地缓存目录（helper 只读，不联网）。
  * `giftsRoot` 是收到的礼物根目录（`<dataDir>/gifts`）：helper 只读它，给缩略图用（ticket 25）。
  */
@@ -115,22 +115,22 @@ export function buildHelperArgs ({
 } = {}) {
   const args = [String(helperPath)]
   if (Number.isInteger(hostPid) && hostPid > 0) {
-    args.push('--local-pet-host-pid', String(hostPid))
+    args.push('--dsh-zoo-host-pid', String(hostPid))
   }
-  if (debug) args.push('--local-pet-debug')
+  if (debug) args.push('--dsh-zoo-debug')
   // 逃生开关：受限环境（容器化 CI、被沙箱住的 runner）里 Chromium 的沙箱起不来，
   // helper 会直接崩。只有显式设了环境变量才关，产品路径默认始终带沙箱。
-  if (process.env.LOCAL_PET_HELPER_NO_SANDBOX === '1') args.push('--no-sandbox')
+  if (process.env.DSH_ZOO_HELPER_NO_SANDBOX === '1') args.push('--no-sandbox')
   if (typeof cacheRoot === 'string') {
     const dir = cacheRoot.trim()
     if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {
-      args.push('--local-pet-cache', dir)
+      args.push('--dsh-zoo-cache', dir)
     }
   }
   if (typeof giftsRoot === 'string') {
     const dir = giftsRoot.trim()
     if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {
-      args.push('--local-pet-gifts', dir)
+      args.push('--dsh-zoo-gifts', dir)
     }
   }
   const seen = new Set()
@@ -141,7 +141,7 @@ export function buildHelperArgs ({
       if (dir === '' || dir.includes('\u0000') || !isAbsolute(dir)) continue
       if (seen.has(dir)) continue
       seen.add(dir)
-      args.push('--local-pet-assets', dir)
+      args.push('--dsh-zoo-assets', dir)
       if (seen.size >= 8) break
     }
   }
@@ -158,7 +158,7 @@ export function buildHelperArgs ({
 export function helperEnv (baseEnv = process.env, hostPid = process.pid) {
   const env = { ...baseEnv }
   delete env.ELECTRON_RUN_AS_NODE
-  if (Number.isInteger(hostPid) && hostPid > 0) env.LOCAL_PET_HOST_PID = String(hostPid)
+  if (Number.isInteger(hostPid) && hostPid > 0) env.DSH_ZOO_HOST_PID = String(hostPid)
   return env
 }
 

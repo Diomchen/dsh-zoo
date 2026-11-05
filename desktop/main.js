@@ -1,5 +1,5 @@
 /**
- * dsh-local-pet 桌面 helper —— Electron 主进程。
+ * dsh-zoo 桌面 helper —— Electron 主进程。
  *
  * 职责：
  *   1. 开**一个**全屏透明、无边框、置顶、不抢焦点的窗口，覆盖主显示器工作区；
@@ -7,7 +7,7 @@
  *      渲染端上报的命中矩形上、并且（a）渲染端在最近 1.2s 内确认过 inside，或（b）渲染端完全
  *      没有消息但光标已停留 300ms（macOS 后台收不到 forward 事件时的兜底），才短暂接管鼠标；
  *      拖拽期间渲染端持有**输入租约**（busy）：位置判定让位，租约过期/pointerup/失焦即交还；
- *   3. 注册 `localpet://asset/<name>.webm` 自定义协议，把宿主传进来的 dsh-pet 素材目录
+ *   3. 注册 `dshzoo://asset/<name>.webm` 自定义协议，把宿主传进来的 dsh-pet 素材目录
  *      只读地喂给 file:// 页面（页面拿不到 DSH 的 HTTP 路由）；
  *   4. 与宿主走 stdin/stdout 的 JSON 行协议（见 desktop/README.md），永不监听端口。
  *
@@ -34,7 +34,7 @@ try {
   electronApi = require('electron')
 } catch (error) {
   process.stderr.write(
-    '[local-pet helper] 启动失败：本进程被以「纯 Node 模式」拉起（ELECTRON_RUN_AS_NODE=' +
+    '[dsh-zoo helper] 启动失败：本进程被以「纯 Node 模式」拉起（ELECTRON_RUN_AS_NODE=' +
     JSON.stringify(process.env.ELECTRON_RUN_AS_NODE ?? null) +
     '）。宿主必须在 spawn 前删除该变量（见 src/desktop-launch.js 的 helperEnv）。原始错误：' +
     (error instanceof Error ? error.message.split('\n')[0] : String(error)) +
@@ -43,24 +43,24 @@ try {
   process.exit(3)
 }
 if (electronApi === null || typeof electronApi !== 'object' || typeof electronApi.app !== 'object') {
-  process.stderr.write('[local-pet helper] 启动失败：require("electron") 没有返回 Electron API。\n')
+  process.stderr.write('[dsh-zoo helper] 启动失败：require("electron") 没有返回 Electron API。\n')
   process.exit(3)
 }
 
 const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol, screen, shell } = electronApi
 const shared = require('./shared.js')
-// `localpet://gifts/...` 的路径白名单（ticket 25）：纯函数，单独一份、可单测。
+// `dshzoo://gifts/...` 的路径白名单（ticket 25）：纯函数，单独一份、可单测。
 const giftPath = require('./gift-path.js')
 
-const APP_NAME = 'dsh-local-pet-desktop'
+const APP_NAME = 'dsh-zoo-desktop'
 const HOST_STALE_MS = 30000
 const HOST_POLL_MS = 2000
 const SHOT_DEFAULT_DELAY_MS = 900
 const SHOT_MEDIA_WAIT_MS = 3000
-const ASSET_SCHEME = 'localpet'
+const ASSET_SCHEME = 'dshzoo'
 const ASSET_HOST = 'asset'
 const CACHE_HOST = 'cache'
-/** 礼物缩略图主机：与 asset/cache 同一套注册好的 localpet:// scheme，只多一个 host。 */
+/** 礼物缩略图主机：与 asset/cache 同一套注册好的 dshzoo:// scheme，只多一个 host。 */
 const GIFT_HOST = 'gifts'
 const MAX_ASSET_BYTES = 8 * 1024 * 1024
 const MAX_ASSET_NAME = 200
@@ -80,8 +80,8 @@ if (process.platform === 'darwin' && app.dock) {
 
 const options = parseArgs(process.argv.slice(2))
 const isShotMode = typeof options.shot === 'string' && options.shot !== ''
-const debugEnabled = options.debug || process.env.LOCAL_PET_DESKTOP_DEBUG === '1'
-const hostPid = isShotMode ? 0 : (options.hostPid > 0 ? options.hostPid : parseHostPid(process.env.LOCAL_PET_HOST_PID))
+const debugEnabled = options.debug || process.env.DSH_ZOO_DESKTOP_DEBUG === '1'
+const hostPid = isShotMode ? 0 : (options.hostPid > 0 ? options.hostPid : parseHostPid(process.env.DSH_ZOO_HOST_PID))
 /** 只接受绝对路径；相对路径会让协议根目录取决于 helper 的 cwd，没有意义。 */
 let assetRoots = (Array.isArray(options.assets) ? options.assets : [])
   .filter((dir) => typeof dir === 'string' && dir !== '' && path.isAbsolute(dir))
@@ -92,17 +92,17 @@ const cacheRoot = typeof options.cache === 'string' && options.cache !== '' && p
   : null
 /**
  * 礼物根目录（ticket 25）：宿主把 `<dataDir>/gifts` 当 argv 传进来；helper 只读它，
- * 只为 `localpet://gifts/<目录>/<图片>` 服务。没传 = 不注册这条读路径（所有 gifts URL 404）。
+ * 只为 `dshzoo://gifts/<目录>/<图片>` 服务。没传 = 不注册这条读路径（所有 gifts URL 404）。
  */
 const giftsRoot = typeof options.gifts === 'string' && options.gifts !== '' && path.isAbsolute(options.gifts)
   ? options.gifts
   : null
 if (isShotMode && !path.isAbsolute(options.shot)) {
-  process.stderr.write('[local-pet helper] --local-pet-shot 需要绝对路径：' + options.shot + '\n')
+  process.stderr.write('[dsh-zoo helper] --dsh-zoo-shot 需要绝对路径：' + options.shot + '\n')
   process.exit(3)
 }
 
-// 自定义协议必须在 app ready 之前声明。standard/secure 让 `localpet://asset/x` 像普通 URL；
+// 自定义协议必须在 app ready 之前声明。standard/secure 让 `dshzoo://asset/x` 像普通 URL；
 // stream 让 <video> 的 Range 请求/边下边播在 Chromium 里正常工作。
 try {
   protocol.registerSchemesAsPrivileged([{
@@ -110,7 +110,7 @@ try {
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true }
   }])
 } catch (error) {
-  process.stderr.write('[local-pet helper] 注册 localpet:// scheme 失败：' + messageOf(error) + '\n')
+  process.stderr.write('[dsh-zoo helper] 注册 dshzoo:// scheme 失败：' + messageOf(error) + '\n')
 }
 
 /** 窗口局部/屏幕 DIP 的换算全部靠它；窗口 = 主显示器工作区。 */
@@ -146,7 +146,7 @@ let giftSeq = 0
 let workArea = null
 let scene = shared.emptyScene()
 let sceneAt = 0
-/** 渲染端上报的当前素材与失败集合；只用于诊断（宿主 /local-pet/desktop 能读到）。 */
+/** 渲染端上报的当前素材与失败集合；只用于诊断（宿主 /dsh-zoo/desktop 能读到）。 */
 let lastMedia = null
 const mediaHistory = []
 /**
@@ -369,7 +369,7 @@ function showWindow () {
 }
 
 // ---------------------------------------------------------------------------
-// localpet://asset/<name>.webm
+// dshzoo://asset/<name>.webm
 // ---------------------------------------------------------------------------
 
 function registerAssetProtocol () {
@@ -442,7 +442,7 @@ function textResponse (status, body) {
 }
 
 /**
- * `localpet://gifts/<礼物目录>/<图片>`（ticket 25）。
+ * `dshzoo://gifts/<礼物目录>/<图片>`（ticket 25）。
  * 只认两层、只认四种图片扩展名、只认 gifts 根目录下的文件；读不到一律 404（不区分原因）。
  * 这条路径只给缩略图用：卡片上的「打开」走宿主通过 gift-open 命令送来的绝对路径，不经过 URL。
  */
@@ -744,7 +744,7 @@ function emitHit (reason) {
 // 渲染端 IPC：命中矩形 / 输入租约 / 悬停确认
 // ---------------------------------------------------------------------------
 
-ipcMain.on('local-pet:renderer-ready', (event) => {
+ipcMain.on('dsh-zoo:renderer-ready', (event) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   rendererReady = true
   busy.active = false
@@ -759,7 +759,7 @@ ipcMain.on('local-pet:renderer-ready', (event) => {
 })
 
 // 渲染端的素材诊断：当前在播哪一段、哪些片段已经失败。只进内存，不落盘。
-ipcMain.on('local-pet:media', (event, payload) => {
+ipcMain.on('dsh-zoo:media', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   const entry = shared.normalizeMediaReport(payload, Date.now())
   if (entry === null) return
@@ -769,7 +769,7 @@ ipcMain.on('local-pet:media', (event, payload) => {
 })
 
 // 渲染端的「可信输入」心跳（ticket 30）：真实左键有没有到过渲染端，只有它知道。
-ipcMain.on('local-pet:input', (event, payload) => {
+ipcMain.on('dsh-zoo:input', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   const report = shared.normalizeInputReport(payload)
   if (report === null) return
@@ -777,7 +777,7 @@ ipcMain.on('local-pet:input', (event, payload) => {
   if (report.type === 'down') trustedDowns += 1
 })
 
-ipcMain.on('local-pet:rects', (event, payload) => {
+ipcMain.on('dsh-zoo:rects', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   // 渲染端是不可信输入：超大/越界的矩形在这里被拒绝或裁到工作区里（fail closed）。
   rendererRects = shared.normalizeRects(payload, { area: localArea() })
@@ -786,7 +786,7 @@ ipcMain.on('local-pet:rects', (event, payload) => {
   applyDecision('renderer-rects')
 })
 
-ipcMain.on('local-pet:overlay-rects', (event, payload) => {
+ipcMain.on('dsh-zoo:overlay-rects', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   overlayRects = shared.normalizeRects(payload, { area: localArea() })
   overlayRectsAt = Date.now()
@@ -794,7 +794,7 @@ ipcMain.on('local-pet:overlay-rects', (event, payload) => {
   applyDecision('renderer-overlays')
 })
 
-ipcMain.on('local-pet:busy', (event, payload) => {
+ipcMain.on('dsh-zoo:busy', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   if (busy.frozen) return
   const next = payload !== null && typeof payload === 'object' && payload.busy === true
@@ -814,7 +814,7 @@ ipcMain.on('local-pet:busy', (event, payload) => {
   applyDecision(next ? 'renderer-busy' : 'renderer-idle')
 })
 
-ipcMain.on('local-pet:action', (event, payload) => {
+ipcMain.on('dsh-zoo:action', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   if (!rendererReady) return
   const id = shared.normalizeId(payload?.id)
@@ -860,7 +860,7 @@ ipcMain.on('local-pet:action', (event, payload) => {
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
 
-ipcMain.on('local-pet:hover', (event, payload) => {
+ipcMain.on('dsh-zoo:hover', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   if (hover.frozen) return
   const inside = payload !== null && typeof payload === 'object' && payload.inside === true
@@ -877,12 +877,12 @@ ipcMain.on('local-pet:hover', (event, payload) => {
 // 改名小窗的 IPC：渲染端只能申请，主进程只转交，真正的写入在宿主那边
 // ---------------------------------------------------------------------------
 
-ipcMain.on('local-pet:rename-open', (event) => {
+ipcMain.on('dsh-zoo:rename-open', (event) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   // 渲染端还没就绪时开不了窗：它已经把弹层关掉了，这里必须回一句，不能静默。
   if (!openRenameWindow()) {
     try {
-      win.webContents.send('local-pet:rename-unavailable')
+      win.webContents.send('dsh-zoo:rename-unavailable')
     } catch {
       // 渲染端正在重启：下一次悬停还会再点一次
     }
@@ -894,17 +894,17 @@ function isRenameSender (event) {
   return renameWin !== null && !renameWin.isDestroyed() && event.sender === renameWin.webContents
 }
 
-ipcMain.on('local-pet:rename-ready', (event) => {
+ipcMain.on('dsh-zoo:rename-ready', (event) => {
   if (!isRenameSender(event)) return
   sendRenameInit()
 })
 
-ipcMain.on('local-pet:rename-cancel', (event) => {
+ipcMain.on('dsh-zoo:rename-cancel', (event) => {
   if (!isRenameSender(event)) return
   closeRenameWindow('cancel')
 })
 
-ipcMain.on('local-pet:rename-submit', (event, payload) => {
+ipcMain.on('dsh-zoo:rename-submit', (event, payload) => {
   if (!isRenameSender(event)) return
   if (renamePendingId !== null) return
   const raw = typeof payload?.nickname === 'string' ? payload.nickname : ''
@@ -935,17 +935,17 @@ ipcMain.on('local-pet:rename-submit', (event, payload) => {
 // 「带派」小窗的 IPC：只认这扇窗自己的 webContents
 // ---------------------------------------------------------------------------
 
-ipcMain.on('local-pet:gift-ready', (event) => {
+ipcMain.on('dsh-zoo:gift-ready', (event) => {
   if (!isGiftSender(event)) return
   sendGiftInit()
 })
 
-ipcMain.on('local-pet:gift-cancel', (event) => {
+ipcMain.on('dsh-zoo:gift-cancel', (event) => {
   if (!isGiftSender(event)) return
   closeGiftWindow('cancel')
 })
 
-ipcMain.on('local-pet:gift-submit', (event, payload) => {
+ipcMain.on('dsh-zoo:gift-submit', (event, payload) => {
   if (!isGiftSender(event)) return
   if (giftPending !== null) return
   // 选文件不是一次提交：主进程开系统文件选择器，选完把名字/大小推回窗里。
@@ -967,7 +967,7 @@ ipcMain.on('local-pet:gift-submit', (event, payload) => {
   startGiftPending('bring', { action: 'bring', gift })
 })
 
-ipcMain.on('local-pet:gift-remove', (event, payload) => {
+ipcMain.on('dsh-zoo:gift-remove', (event, payload) => {
   if (!isGiftSender(event)) return
   if (giftPending !== null) return
   const giftId = shared.normalizeGiftId(payload?.giftId)
@@ -986,7 +986,7 @@ function isGiftSender (event) {
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
-    win.webContents.send('local-pet:scene', scene)
+    win.webContents.send('dsh-zoo:scene', scene)
   } catch {
     // 渲染进程正在重启：下一次 did-finish-load 会重发
   }
@@ -996,7 +996,7 @@ function sendScene () {
 function sendActionResult (result) {
   if (win === null || win.isDestroyed()) return false
   try {
-    win.webContents.send('local-pet:action-result', result)
+    win.webContents.send('dsh-zoo:action-result', result)
     return true
   } catch {
     return false
@@ -1147,7 +1147,7 @@ function clearRenameTimer () {
 function sendRenameInit () {
   if (renameWin === null || renameWin.isDestroyed()) return
   try {
-    renameWin.webContents.send('local-pet:rename-init', {
+    renameWin.webContents.send('dsh-zoo:rename-init', {
       name: currentName(),
       maxLength: shared.MAX_NAME_LENGTH
     })
@@ -1159,7 +1159,7 @@ function sendRenameInit () {
 function sendRenameResult (result) {
   if (renameWin === null || renameWin.isDestroyed()) return
   try {
-    renameWin.webContents.send('local-pet:rename-result', result)
+    renameWin.webContents.send('dsh-zoo:rename-result', result)
   } catch {
     // 窗口刚被关掉：结果没人接就算了
   }
@@ -1286,7 +1286,7 @@ function clearGiftTimer () {
 function sendGiftInit () {
   if (giftWin === null || giftWin.isDestroyed()) return
   try {
-    giftWin.webContents.send('local-pet:gift-init', {
+    giftWin.webContents.send('dsh-zoo:gift-init', {
       ...giftState,
       picked: giftPicked
     })
@@ -1298,7 +1298,7 @@ function sendGiftInit () {
 function sendGiftResult (result) {
   if (giftWin === null || giftWin.isDestroyed()) return
   try {
-    giftWin.webContents.send('local-pet:gift-result', result)
+    giftWin.webContents.send('dsh-zoo:gift-result', result)
   } catch {
     // 窗口刚被关掉：结果没人接就算了
   }
@@ -1422,7 +1422,7 @@ function openHostInput () {
       return fs.createReadStream('', { fd: 0, autoClose: false })
     } catch (error) {
       // 建流失败等于「没有宿主输入」：进程会紧接着自己退出，所以这句不躲在 debug 后面。
-      process.stderr.write('[local-pet helper] 无法从 fd 0 读取，退回 process.stdin：' + messageOf(error) + '\n')
+      process.stderr.write('[dsh-zoo helper] 无法从 fd 0 读取，退回 process.stdin：' + messageOf(error) + '\n')
     }
   }
   return process.stdin
@@ -1432,12 +1432,12 @@ function handleHostLine (line) {
   lastHostLineAt = Date.now()
   const parsed = shared.parseLine(line)
   if (!parsed.ok) {
-    if (debugEnabled) process.stderr.write('[local-pet helper] 忽略非 JSON 行：' + parsed.error + '\n')
+    if (debugEnabled) process.stderr.write('[dsh-zoo helper] 忽略非 JSON 行：' + parsed.error + '\n')
     return
   }
   const normalized = shared.normalizeHostCommand(parsed.value)
   if (!normalized.ok) {
-    if (debugEnabled) process.stderr.write('[local-pet helper] 忽略命令：' + normalized.error + '\n')
+    if (debugEnabled) process.stderr.write('[dsh-zoo helper] 忽略命令：' + normalized.error + '\n')
     return
   }
   applyCommand(normalized.command)
@@ -1751,8 +1751,8 @@ async function lockRendererInput (locked) {
   if (win === null || win.isDestroyed() || !rendererReady) return false
   try {
     return await win.webContents.executeJavaScript(
-      'globalThis.__localPetDebug && typeof globalThis.__localPetDebug.lockInput === "function" ' +
-      '? globalThis.__localPetDebug.lockInput(' + (locked === true ? 'true' : 'false') + ') : false',
+      'globalThis.__dshZooDebug && typeof globalThis.__dshZooDebug.lockInput === "function" ' +
+      '? globalThis.__dshZooDebug.lockInput(' + (locked === true ? 'true' : 'false') + ') : false',
       true
     )
   } catch {
@@ -1773,8 +1773,8 @@ function dispatchInRenderer (phase, point) {
   const bounds = win.getBounds()
   const local = shared.toLocalPoint(point, bounds)
   if (local === null) return
-  const script = 'globalThis.__localPetDebug && typeof globalThis.__localPetDebug.dispatch === "function" ' +
-    '? globalThis.__localPetDebug.dispatch(' + JSON.stringify(phase) + ',' +
+  const script = 'globalThis.__dshZooDebug && typeof globalThis.__dshZooDebug.dispatch === "function" ' +
+    '? globalThis.__dshZooDebug.dispatch(' + JSON.stringify(phase) + ',' +
     JSON.stringify(local.x) + ',' + JSON.stringify(local.y) + ') : false'
   win.webContents.executeJavaScript(script, true).catch(() => {})
 }
@@ -1786,8 +1786,8 @@ async function rendererDebug () {
   try {
     const raw = await Promise.race([
       win.webContents.executeJavaScript(
-        'globalThis.__localPetDebug && typeof globalThis.__localPetDebug.snapshot === "function" ' +
-        '? JSON.stringify(globalThis.__localPetDebug.snapshot()) : null',
+        'globalThis.__dshZooDebug && typeof globalThis.__dshZooDebug.snapshot === "function" ' +
+        '? JSON.stringify(globalThis.__dshZooDebug.snapshot()) : null',
         true
       ),
       new Promise((resolve) => {
@@ -1911,7 +1911,7 @@ function isGiftDirPath (value) {
 function reportError (code, error) {
   const message = error instanceof Error ? error.message : String(error)
   writeEvent({ type: 'error', code, message: message.slice(0, shared.MAX_ERROR_LENGTH) })
-  if (debugEnabled) process.stderr.write('[local-pet helper] ' + code + ': ' + message + '\n')
+  if (debugEnabled) process.stderr.write('[dsh-zoo helper] ' + code + ': ' + message + '\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -2109,37 +2109,37 @@ function parseArgs (argv) {
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
-    if (arg === '--local-pet-shot') {
+    if (arg === '--dsh-zoo-shot') {
       parsed.shot = argv[index + 1] ?? null
       index += 1
-    } else if (arg.startsWith('--local-pet-shot=')) {
-      parsed.shot = arg.slice('--local-pet-shot='.length)
-    } else if (arg === '--local-pet-shot-delay') {
+    } else if (arg.startsWith('--dsh-zoo-shot=')) {
+      parsed.shot = arg.slice('--dsh-zoo-shot='.length)
+    } else if (arg === '--dsh-zoo-shot-delay') {
       parsed.shotDelayMs = parseDelay(argv[index + 1])
       index += 1
-    } else if (arg.startsWith('--local-pet-shot-delay=')) {
-      parsed.shotDelayMs = parseDelay(arg.slice('--local-pet-shot-delay='.length))
-    } else if (arg === '--local-pet-host-pid') {
+    } else if (arg.startsWith('--dsh-zoo-shot-delay=')) {
+      parsed.shotDelayMs = parseDelay(arg.slice('--dsh-zoo-shot-delay='.length))
+    } else if (arg === '--dsh-zoo-host-pid') {
       parsed.hostPid = parseHostPid(argv[index + 1])
       index += 1
-    } else if (arg.startsWith('--local-pet-host-pid=')) {
-      parsed.hostPid = parseHostPid(arg.slice('--local-pet-host-pid='.length))
-    } else if (arg === '--local-pet-assets') {
+    } else if (arg.startsWith('--dsh-zoo-host-pid=')) {
+      parsed.hostPid = parseHostPid(arg.slice('--dsh-zoo-host-pid='.length))
+    } else if (arg === '--dsh-zoo-assets') {
       if (typeof argv[index + 1] === 'string') parsed.assets.push(argv[index + 1])
       index += 1
-    } else if (arg.startsWith('--local-pet-assets=')) {
-      parsed.assets.push(arg.slice('--local-pet-assets='.length))
-    } else if (arg === '--local-pet-cache') {
+    } else if (arg.startsWith('--dsh-zoo-assets=')) {
+      parsed.assets.push(arg.slice('--dsh-zoo-assets='.length))
+    } else if (arg === '--dsh-zoo-cache') {
       if (typeof argv[index + 1] === 'string') parsed.cache = argv[index + 1]
       index += 1
-    } else if (arg.startsWith('--local-pet-cache=')) {
-      parsed.cache = arg.slice('--local-pet-cache='.length)
-    } else if (arg === '--local-pet-gifts') {
+    } else if (arg.startsWith('--dsh-zoo-cache=')) {
+      parsed.cache = arg.slice('--dsh-zoo-cache='.length)
+    } else if (arg === '--dsh-zoo-gifts') {
       if (typeof argv[index + 1] === 'string') parsed.gifts = argv[index + 1]
       index += 1
-    } else if (arg.startsWith('--local-pet-gifts=')) {
-      parsed.gifts = arg.slice('--local-pet-gifts='.length)
-    } else if (arg === '--local-pet-debug') {
+    } else if (arg.startsWith('--dsh-zoo-gifts=')) {
+      parsed.gifts = arg.slice('--dsh-zoo-gifts='.length)
+    } else if (arg === '--dsh-zoo-debug') {
       parsed.debug = true
     }
   }

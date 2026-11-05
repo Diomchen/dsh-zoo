@@ -33,7 +33,7 @@ function encodeJson (value) {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-receipt-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-receipt-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

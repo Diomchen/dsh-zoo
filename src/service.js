@@ -23,7 +23,7 @@ import {
   createGiftStore
 } from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
-import { dataDir, dshHome, dshPetConfigPath } from './paths.js'
+import { dshHome, dshPetConfigPath, legacyDataDir, prepareDataDir } from './paths.js'
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { createPeerStore } from './peers.js'
 import { createPetBridge, readPetConfig } from './pet-bridge.js'
@@ -56,7 +56,7 @@ import { createRoom } from './room.js'
 import { visitReasonText } from './visit-copy.js'
 import { createVisitStore } from './visits.js'
 
-export const ROUTE_PREFIX = '/local-pet'
+export const ROUTE_PREFIX = '/dsh-zoo'
 export const NEIGHBOR_TICK_MS = 1000
 /** 串门请求发三次（首次 + 两次重试），间隔约 600ms；拿不到 ack 就明确超时。 */
 export const VISIT_REQUEST_ATTEMPTS = 3
@@ -95,7 +95,7 @@ export const AUTO_VISIT_LOG_INTERVAL_MS = 5 * 60 * 1000
  * 且这次串门一结束（回家/送客/超时/失联）立刻 unarm。
  */
 export const ARMED_GIFT_MS = 5 * 60 * 1000
-/** `/local-pet/state` 只列最近 20 件收到的礼物（SPEC v4「记录与状态出口」）。 */
+/** `/dsh-zoo/state` 只列最近 20 件收到的礼物（SPEC v4「记录与状态出口」）。 */
 export const STATE_GIFT_LIMIT = 20
 
 /**
@@ -114,9 +114,19 @@ export const STATE_GIFT_LIMIT = 20
  */
 export function createService (ctx, options = {}) {
   const env = options.env ?? process.env
-  const dir = options.dataDir ?? dataDir(env)
-  const configPath = options.petConfigPath ?? dshPetConfigPath(env)
   const log = makeLogger(ctx)
+  // 测试可以显式给 dataDir；生产走一次「旧目录改名」，失败就继续用旧目录。
+  const prepared = options.dataDir === undefined || options.dataDir === null
+    ? prepareDataDir(env)
+    : { dir: options.dataDir, migrated: false, fallback: false }
+  const dir = prepared.dir
+  if (prepared.migrated) {
+    log.info('数据目录已迁移：' + legacyDataDir(env) + ' → ' + dir)
+  } else if (prepared.fallback) {
+    const reason = prepared.error instanceof Error ? prepared.error.message : String(prepared.error)
+    log.warn('旧数据目录改名失败（' + reason + '），继续使用 ' + dir)
+  }
+  const configPath = options.petConfigPath ?? dshPetConfigPath(env)
   const room = createRoom({
     dir,
     log,
@@ -644,7 +654,7 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * `/local-pet/state` 的唯一形状（ticket 27）：room 的纯快照 + 两份磁盘视图。
+   * `/dsh-zoo/state` 的唯一形状（ticket 27）：room 的纯快照 + 两份磁盘视图。
    *
    * 磁盘只在这里读，room 永远不碰 fs。两个字段在任何时候都是数组：
    * store 还没起来/初始化为 null 时就是空数组，绝不出现 `undefined`。
@@ -684,7 +694,7 @@ export function createService (ctx, options = {}) {
 
   /**
    * 礼物卡的系统动作（ticket 23）。只认本地来路：桌面控件的 action 与
-   * `POST /local-pet/action` 都会到这里，UDP 报文没有入口。
+   * `POST /dsh-zoo/action` 都会到这里，UDP 报文没有入口。
    *
    * 路径从不来自请求体：`giftId` → 礼物 store 里的记录 → `notePath`/`dirPath`。
    * 错误码只用 SPEC 的那几个：bad-gift / gift-not-found / open-failed。
@@ -1082,7 +1092,7 @@ export function createService (ctx, options = {}) {
 
   /**
    * 当前这张皮的素材目录（ticket 33）：没有皮时退回 dsh-pet 的那套，行为与 0.4 相同。
-   * helper 只认绝对路径；渲染端的 `localpet://asset/<动作>.webm` 就在这些目录里找。
+   * helper 只认绝对路径；渲染端的 `dshzoo://asset/<动作>.webm` 就在这些目录里找。
    */
   function assetRootsFor (skin) {
     if (fallbackAssetRoots === null) {
@@ -1310,7 +1320,7 @@ export function createService (ctx, options = {}) {
     const record = gifts?.lookup(giftId) ?? null
     if (record === null || record.kind !== 'file') return null
     if (typeof record.dirName !== 'string' || typeof record.name !== 'string') return null
-    return 'localpet://gifts/' + record.dirName + '/' + encodeURIComponent(record.name)
+    return 'dshzoo://gifts/' + record.dirName + '/' + encodeURIComponent(record.name)
   }
 
   /**
@@ -1339,7 +1349,7 @@ export function createService (ctx, options = {}) {
     if (options.desktop === false) return
     // 逃生开关：桌面窗是置顶全屏的，万一它在某台机器上行为不对，用户要能不改一行代码就关掉它。
     if (isDesktopDisabled(options.env ?? process.env)) {
-      log.info('桌面层被 LOCAL_PET_DESKTOP 关闭：宠物不显示，网络与串门仍然工作')
+      log.info('桌面层被 DSH_ZOO_DESKTOP 关闭：宠物不显示，网络与串门仍然工作')
       return
     }
     if (settings !== null && settings.desktop === false) {
@@ -1465,7 +1475,7 @@ export function createService (ctx, options = {}) {
     // 这次同步就把 notice 带进场景；宠物不会静默消失。
     const dropped = droppedVisitors(snapshot)
     if (dropped > 0) room.noteSceneOverflow(dropped)
-    // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 localpet:// URL。
+    // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 dshzoo:// URL。
     const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const assetRoots = assetRootsFor(activeSkin)
@@ -2614,7 +2624,7 @@ function makeLogger (ctx) {
 }
 
 function write (ctx, level, line) {
-  const full = '[dsh-local-pet] ' + line
+  const full = '[dsh-zoo] ' + line
   try {
     const fn = ctx?.logger?.[level]
     if (typeof fn === 'function') fn.call(ctx.logger, full)
@@ -2676,10 +2686,10 @@ function integerOption (value, fallback, min, max) {
 }
 
 /**
- * `LOCAL_PET_DESKTOP=0|false|off` 直接关掉桌面层。
+ * `DSH_ZOO_DESKTOP=0|false|off` 直接关掉桌面层。
  * 置顶全屏窗如果出了意想不到的问题，这是唯一不需要改配置、也不需要卸载插件的出口。
  */
 function isDesktopDisabled (env) {
-  const value = String(env?.LOCAL_PET_DESKTOP ?? '').trim().toLowerCase()
+  const value = String(env?.DSH_ZOO_DESKTOP ?? '').trim().toLowerCase()
   return value === '0' || value === 'false' || value === 'off' || value === 'no'
 }

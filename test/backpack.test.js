@@ -29,7 +29,7 @@ const T0 = 1_700_000_000_000
 const VISIT = '11111111-1111-4111-8111-111111111111'
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-backpack-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-backpack-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

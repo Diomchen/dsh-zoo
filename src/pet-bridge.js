@@ -327,7 +327,7 @@ export function createPetBridge ({
     try {
       const response = await fetchImpl(
         // `surface` 是 dsh-pet 的必填参数（issue #122）：声明"我要哪一端的宠物"。
-        // local-pet 不是它的渲染端，只是镜像 /state，所以这里明说 `any`——
+        // dsh-zoo 不是它的渲染端，只是镜像 /state，所以这里明说 `any`——
         // 只要那只宠物显示在任意一端就受理；display:none 会被它自己拒掉。
         base + DSH_PET_ROUTE + '/anim?pet=' + encodeURIComponent(petId) + '&surface=any',
         {

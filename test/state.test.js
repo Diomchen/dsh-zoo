@@ -1,6 +1,6 @@
 /**
  * 票 27：状态出口。
- * `/local-pet/state` 在 room 快照之外多两项：backpack 与 gifts。
+ * `/dsh-zoo/state` 在 room 快照之外多两项：backpack 与 gifts。
  * 两个字段任何时候都是数组；gifts 只列最近 20 件、最新在前，带 path 与 status。
  */
 import assert from 'node:assert/strict'
@@ -32,7 +32,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-state-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-state-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -99,13 +99,13 @@ test('/state：backpack / gifts 始终是数组；gifts 最近 20 条、最新�
 
   const service = makeService(t, dir)
   // 还没 ready 时也得是数组：store 尚未初始化，字段不能是 undefined。
-  const early = await call(service, '/local-pet/state')
+  const early = await call(service, '/dsh-zoo/state')
   assert.equal(early.status, 200)
   assert.deepEqual(early.body.backpack, [])
   assert.deepEqual(early.body.gifts, [])
 
   await service.ready
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.status, 200)
   assert.deepEqual(state.body.backpack, [])
   assert.equal(Array.isArray(state.body.gifts), true)
@@ -129,18 +129,18 @@ test('/state：bring 之后 backpack 出现 FIFO 顺序的条目；service.snaps
   const service = makeService(t, dir)
   await service.ready
 
-  const first = await call(service, '/local-pet/action', {
+  const first = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'bring', gift: { kind: 'text', text: '先放的' } }
   })
   assert.equal(first.status, 200)
-  const second = await call(service, '/local-pet/action', {
+  const second = await call(service, '/dsh-zoo/action', {
     method: 'POST',
     body: { action: 'bring', gift: { kind: 'text', text: '后放的' } }
   })
   assert.equal(second.status, 200)
 
-  const state = await call(service, '/local-pet/state')
+  const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.body.backpack.length, 2)
   assert.deepEqual(state.body.backpack.map((item) => item.text), ['先放的', '后放的'])
   for (const item of state.body.backpack) {

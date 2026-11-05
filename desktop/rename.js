@@ -6,7 +6,7 @@
  */
 'use strict'
 
-const api = window.localPetRename
+const api = window.dshZooRename
 const form = document.getElementById('form')
 const input = document.getElementById('name')
 const errorEl = document.getElementById('error')

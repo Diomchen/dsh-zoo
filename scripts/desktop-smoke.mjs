@@ -4,7 +4,7 @@
  *
  * 覆盖 ticket 07 + 08 的验收：
  *   1. 宠物真的画出来：截图模式用 capturePage() 抓 PNG + 同名 .json，zlib 自己解 PNG，
- *      断言背景透明、每只宠物的媒体区/昵称条有像素、素材走 localpet://（source=video）；
+ *      断言背景透明、每只宠物的媒体区/昵称条有像素、素材走 dshzoo://（source=video）；
  *   2. 点击穿透：渲染端悬停路径、主进程兜底（forward 失效）、主进程否决（光标真在外面）、
  *      渲染端冻结后 fail-closed；
  *   3. 输入租约：拖拽时把光标移到宠物矩形外，窗口仍保持可交互；pointerup 后立刻交还穿透；
@@ -22,8 +22,8 @@
  * 会真的移动光标约 2 秒；那一段只在 process.platform === 'win32' 时跑。
  *
  * 抓图是这台机器上唯一能看到窗口的办法（没有屏幕录制权限）。设
- *   LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop
- * 会把整窗（棋盘格合成）和宠物特写写进 .scratch/local-pet/notes/。
+ *   DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop
+ * 会把整窗（棋盘格合成）和宠物特写写进 .scratch/dsh-zoo/notes/。
  *
  * 只依赖 node:zlib，不装任何包。
  */
@@ -43,12 +43,12 @@ import { resolveDshPetAssetDirs } from '../src/pet-assets.js'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
-const OUT_DIR = join(tmpdir(), 'dsh-local-pet-desktop-smoke-' + process.pid)
-const NOTES_DIR = join(ROOT, '.scratch', 'local-pet', 'notes')
-/** ticket 25：礼物缩略图走 helper 的 localpet://gifts 根；冒烟自己造一个真目录 + 真 PNG。 */
+const OUT_DIR = join(tmpdir(), 'dsh-zoo-desktop-smoke-' + process.pid)
+const NOTES_DIR = join(ROOT, '.scratch', 'dsh-zoo', 'notes')
+/** ticket 25：礼物缩略图走 helper 的 dshzoo://gifts 根；冒烟自己造一个真目录 + 真 PNG。 */
 const GIFTS_ROOT = join(OUT_DIR, 'gifts')
 const GIFT_THUMB_DIR = '20261103-153245-ab12cd12'
-const WRITE_NOTES = process.env.LOCAL_PET_SMOKE_NOTES === '1'
+const WRITE_NOTES = process.env.DSH_ZOO_SMOKE_NOTES === '1'
 const ASSET_ROOTS = resolveDshPetAssetDirs({ env: process.env })
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const spawned = []
@@ -349,7 +349,7 @@ function verifyShot (pngPath, sidecarPath, expectedPets, options = {}) {
     assert(svgs.length === pets.length, '没有素材时所有宠物都退到内置 SVG 色块')
   } else if (options.source === 'video' || ASSET_ROOTS.length > 0) {
     assert(videos.length === pets.length,
-      '所有宠物都通过 localpet:// 加载了 dsh-pet WebM（' + videos.map((pet) => pet.clip).join(', ') + '）')
+      '所有宠物都通过 dshzoo:// 加载了 dsh-pet WebM（' + videos.map((pet) => pet.clip).join(', ') + '）')
   } else {
     info('没有找到 dsh-pet 素材：宠物退到内置 SVG 色块')
     assert(svgs.length === pets.length, '没有素材时全部退到 SVG')
@@ -529,7 +529,7 @@ function createHelperClient (log, extraArgs = [], clientOptions = {}) {
   assert(resolved.ok, '找到 Electron：' + resolved.path)
   // 某些受限环境（容器、被沙箱化的 CI）里 Chromium 的沙箱起不来，helper 会直接崩。
   // 这是**冒烟专用**的逃生开关，不影响产品里的 helper：默认仍然带沙箱。
-  const noSandbox = process.env.LOCAL_PET_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []
+  const noSandbox = process.env.DSH_ZOO_SMOKE_NO_SANDBOX === '1' ? ['--no-sandbox'] : []
   const args = buildHelperArgs({
     helperPath: HELPER_MAIN,
     hostPid: process.pid,
@@ -665,8 +665,8 @@ async function expectIgnoring (client, point, expected, timeoutMs, label) {
 async function verifyShotMode () {
   const pngPath = join(OUT_DIR, 'standalone.png')
   const client = createHelperClient((line) => info(line), [
-    '--local-pet-shot', pngPath,
-    '--local-pet-shot-delay', '1200'
+    '--dsh-zoo-shot', pngPath,
+    '--dsh-zoo-shot-delay', '1200'
   ])
   const exit = await Promise.race([client.exited, sleep(20000).then(() => null)])
   assert(exit !== null, '截图模式在 20s 内自己退出')
@@ -682,8 +682,8 @@ async function verifyShotMode () {
 async function verifySvgFallback () {
   const pngPath = join(OUT_DIR, 'no-assets.png')
   const client = createHelperClient((line) => info(line), [
-    '--local-pet-shot', pngPath,
-    '--local-pet-shot-delay', '200'
+    '--dsh-zoo-shot', pngPath,
+    '--dsh-zoo-shot-delay', '200'
   ], { withAssets: false })
   const exit = await Promise.race([client.exited, sleep(20000).then(() => null)])
   assert(exit !== null, '无素材的截图模式也在 20s 内退出')
@@ -1124,9 +1124,9 @@ async function verifyHelper () {
   '所有宠物都在工作区内（出生后立即受重力/夹取约束）')
   if (ASSET_ROOTS.length > 0) {
     assert(state.pets.every((pet) => pet.source === 'video'),
-      '宠物素材经 localpet:// 加载成功（' + state.pets.map((pet) => pet.clip).join(', ') + '）')
+      '宠物素材经 dshzoo:// 加载成功（' + state.pets.map((pet) => pet.clip).join(', ') + '）')
   }
-  // ticket 28：`/local-pet/desktop` 的 `helperStatus.media` 是现场唯一的素材探针。
+  // ticket 28：`/dsh-zoo/desktop` 的 `helperStatus.media` 是现场唯一的素材探针。
   // 它以前只在「开始加载」时报一次 loading，loadeddata 之后从不回报，于是永远显示 loading——
   // 现场据此以为 live scene 没画出来。这里断言它跟得上真实状态（渲染端那三只已经是 video）。
   // `media` 是「最近一次上报」，三只宠物各自轮播，所以等它落到一段 video 上，别和轮播赛跑。
@@ -1934,7 +1934,7 @@ async function verifyStreetStability () {
 // ---------------------------------------------------------------------------
 
 async function verifyGifts () {
-  // 缩略图要真的是一张图：先写进 gifts 根，再让渲染端通过 localpet://gifts/<目录>/<文件> 读它。
+  // 缩略图要真的是一张图：先写进 gifts 根，再让渲染端通过 dshzoo://gifts/<目录>/<文件> 读它。
   const giftDir = join(GIFTS_ROOT, GIFT_THUMB_DIR)
   mkdirSync(giftDir, { recursive: true })
   const thumbFile = join(giftDir, '照片.png')
@@ -1950,7 +1950,7 @@ async function verifyGifts () {
   }
   writeFileSync(thumbFile, encodePng(thumbImage))
 
-  const client = createHelperClient((line) => info(line), ['--local-pet-gifts', GIFTS_ROOT])
+  const client = createHelperClient((line) => info(line), ['--dsh-zoo-gifts', GIFTS_ROOT])
   const readyMark = client.mark()
   const ready = await client.waitFrom(readyMark, (event) => event.type === 'ready', 15000, 'ready')
   const workArea = ready.workArea
@@ -2052,7 +2052,7 @@ async function verifyGifts () {
 
   // -----------------------------------------------------------------------
   // ticket 25：文件卡片 + 图片缩略图。
-  // 缩略图是 localpet://gifts（CSP img-src 必须放行），用 rendererState 的
+  // 缩略图是 dshzoo://gifts（CSP img-src 必须放行），用 rendererState 的
   // thumb.loaded 证明图片真的解码成功；截图侧再确认卡片画出来了。
   // -----------------------------------------------------------------------
   const imageGiftId = '77777777-7777-4777-8777-777777777777'
@@ -2064,7 +2064,7 @@ async function verifyGifts () {
     title: '「阿蟹」捎来一个文件',
     name: '照片.png',
     size: 2048,
-    thumb: 'localpet://gifts/' + GIFT_THUMB_DIR + '/' + encodeURIComponent('照片.png')
+    thumb: 'dshzoo://gifts/' + GIFT_THUMB_DIR + '/' + encodeURIComponent('照片.png')
   }
   client.send({ type: 'update', scene: sceneWithGift(imageGift) })
   await waitUntil(async () => {
@@ -2079,7 +2079,7 @@ async function verifyGifts () {
   assert(state.controls.gifts[0].name === '照片.png', '卡片带文件名（' + state.controls.gifts[0].name + '）')
   assert(state.controls.gifts[0].size === 2048, '卡片带文件大小')
   assert(state.controls.gifts[0].thumb !== null && state.controls.gifts[0].thumb.loaded === true,
-    'localpet://gifts 的缩略图真的解码了（CSP + 协议都通）')
+    'dshzoo://gifts 的缩略图真的解码了（CSP + 协议都通）')
   assert(state.controls.gifts[0].copyVisible === false, '文件卡片不显示「复制」')
   const imageCardRect = state.uiRects.find((rect) => rect.id === 'ui:gift:' + imageGiftId)
   assert(Boolean(imageCardRect), '文件卡片有独立命中矩形')
@@ -2420,17 +2420,17 @@ function cleanup () {
 }
 
 /**
- * 只跑某一段（排查用）：`LOCAL_PET_SMOKE_ONLY=controls`。
+ * 只跑某一段（排查用）：`DSH_ZOO_SMOKE_ONLY=controls`。
  * 默认什么都不设就跑全部；跳过任何一段都会在输出里写明，不许静默变成“全绿”。
  */
-const ONLY = typeof process.env.LOCAL_PET_SMOKE_ONLY === 'string' && process.env.LOCAL_PET_SMOKE_ONLY.trim() !== ''
-  ? process.env.LOCAL_PET_SMOKE_ONLY.trim()
+const ONLY = typeof process.env.DSH_ZOO_SMOKE_ONLY === 'string' && process.env.DSH_ZOO_SMOKE_ONLY.trim() !== ''
+  ? process.env.DSH_ZOO_SMOKE_ONLY.trim()
   : null
 
 function wants (name) {
   if (ONLY === null) return true
   const skip = ONLY !== name
-  if (skip) console.log('# 跳过：' + name + '（LOCAL_PET_SMOKE_ONLY=' + ONLY + '）')
+  if (skip) console.log('# 跳过：' + name + '（DSH_ZOO_SMOKE_ONLY=' + ONLY + '）')
   return !skip
 }
 

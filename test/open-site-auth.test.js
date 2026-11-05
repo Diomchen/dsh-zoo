@@ -7,7 +7,7 @@
  * 交出去，而 DSH 的 Web 认证要的是 `/` 上带 `?token=<launch token>` 的那条
  * 登录地址（见 `ctx.connection.authenticatedUrl`），裸 origin 一律 401。
  *
- * 这条回路走的是插件真实的外沿：createService → POST /local-pet/action
+ * 这条回路走的是插件真实的外沿：createService → POST /dsh-zoo/action
  * → desktop.openUrl 收到的那条字符串，再用真 HTTP 去请求它。镜像的是 DSH
  * `browser-auth` 的最小契约：`GET /?token=…` → 303 + 会话 Cookie，缺 token
  * 或 token 不对 → 401 + 上面那句原文。
@@ -104,7 +104,7 @@ async function call (service, path, { method = 'GET', body } = {}) {
 
 /** 起一只带桌面层的服务；`connection` 就是 DSH 宿主会递给插件的那一面。 */
 async function boot (t, connection) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-open-site-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-open-site-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
 
   const server = dshAuthServer()
@@ -149,7 +149,7 @@ test('打开软件：交给浏览器的地址必须带着 DSH 的 launch token�
     }
   })
 
-  const result = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'open-site' } })
+  const result = await call(service, '/dsh-zoo/action', { method: 'POST', body: { action: 'open-site' } })
   assert.equal(result.status, 200, JSON.stringify(result.body))
   assert.deepEqual(result.body, { ok: true, action: 'open-site' })
   assert.equal(opened.length, 1, '应该只交给 helper 一条地址')
@@ -172,14 +172,14 @@ test('打开软件：交给浏览器的地址必须带着 DSH 的 launch token�
 
 test('打开软件：拿不到 connection（或它抛错）就退回裸 origin，不把这一项弄没', async (t) => {
   const absent = await boot(t, undefined)
-  const first = await call(absent.service, '/local-pet/action', { method: 'POST', body: { action: 'open-site' } })
+  const first = await call(absent.service, '/dsh-zoo/action', { method: 'POST', body: { action: 'open-site' } })
   assert.deepEqual(first.body, { ok: true, action: 'open-site' })
   assert.deepEqual(absent.opened, [absent.origin + '/'])
 
   const broken = await boot(t, {
     authenticatedUrl () { throw new Error('connection not ready') }
   })
-  const second = await call(broken.service, '/local-pet/action', { method: 'POST', body: { action: 'open-site' } })
+  const second = await call(broken.service, '/dsh-zoo/action', { method: 'POST', body: { action: 'open-site' } })
   assert.deepEqual(second.body, { ok: true, action: 'open-site' })
   assert.deepEqual(broken.opened, [broken.origin + '/'])
 })

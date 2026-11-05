@@ -323,7 +323,7 @@ test('单播出口先过放行门控，再按 deviceId 找地址', async (t) => 
   await box.next((entry) => entry.parsed.ok && entry.parsed.packet.type === 'beacon-ack')
   await waitFor(() => room.snapshot().neighbors.length === 1)
 
-  const payload = Buffer.from('local-pet-heartbeat', 'utf8')
+  const payload = Buffer.from('dsh-zoo-heartbeat', 'utf8')
   assert.equal(room.mayTalkTo(neighborId), false)
   assert.equal(discovery.sendTo(neighborId, payload), false)
   await assert.rejects(

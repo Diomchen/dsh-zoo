@@ -1,8 +1,8 @@
 {
-  "name": "dsh-local-pet-desktop-helper",
+  "name": "dsh-zoo-desktop-helper",
   "version": "0.1.0",
   "private": true,
-  "description": "dsh-local-pet 的 Electron helper：一个全屏透明、默认点击穿透的窗口。",
+  "description": "dsh-zoo 的 Electron helper：一个全屏透明、默认点击穿透的窗口。",
   "type": "commonjs",
   "main": "main.js"
 }

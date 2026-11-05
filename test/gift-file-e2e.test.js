@@ -54,7 +54,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-gift-file-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-gift-file-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -138,8 +138,8 @@ function visitAckPayload ({ deviceId, visitId }) {
 }
 
 async function callAction (service, body) {
-  const route = service.routes.find((candidate) => candidate.path === '/local-pet/action')
-  assert.ok(route, '应该注册 /local-pet/action')
+  const route = service.routes.find((candidate) => candidate.path === '/dsh-zoo/action')
+  assert.ok(route, '应该注册 /dsh-zoo/action')
   const res = {
     statusCode: 0,
     headers: {},
@@ -207,7 +207,7 @@ async function waitGiftStatus (service, deviceId, status, timeoutMs = 5000) {
 }
 
 async function giftRoute (port, giftId) {
-  return fetch('http://127.0.0.1:' + port + '/local-pet-gift/' + giftId, { cache: 'no-store' })
+  return fetch('http://127.0.0.1:' + port + '/dsh-zoo-gift/' + giftId, { cache: 'no-store' })
 }
 
 /** 起一个只服务这次测试的假礼物源。 */

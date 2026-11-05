@@ -255,7 +255,7 @@ export function normalizeGift (value) {
 
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
-  const raw = env?.LOCAL_PET_PORT
+  const raw = env?.DSH_ZOO_PORT
   if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_PORT
   const port = Number(String(raw).trim())
   return isPort(port) ? port : DEFAULT_PORT

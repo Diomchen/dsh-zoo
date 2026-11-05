@@ -37,7 +37,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 
-namespace LocalPet {
+namespace DshZoo {
   public static class Native {
     [StructLayout(LayoutKind.Sequential)]
     public struct MOUSEINPUT {
@@ -68,21 +68,21 @@ namespace LocalPet {
 }
 '@
 
-[LocalPet.Native]::SetProcessDPIAware() | Out-Null
-[LocalPet.Native]::SetCursorPos($X, $Y) | Out-Null
+[DshZoo.Native]::SetProcessDPIAware() | Out-Null
+[DshZoo.Native]::SetCursorPos($X, $Y) | Out-Null
 Start-Sleep -Milliseconds 150
 
 # 用一次真实移动刷新渲染端 hover 心跳（它是指针事件驱动的，SetCursorPos 同一点不会产生事件）。
-[LocalPet.Native]::SetCursorPos($X + 2, $Y) | Out-Null
+[DshZoo.Native]::SetCursorPos($X + 2, $Y) | Out-Null
 Start-Sleep -Milliseconds 40
-[LocalPet.Native]::SetCursorPos($X, $Y) | Out-Null
+[DshZoo.Native]::SetCursorPos($X, $Y) | Out-Null
 Start-Sleep -Milliseconds 40
 if ($Mode -eq 'move') { exit 0 }
 
 # 主进程兜底是 300ms；留一点余量再按下，否则 down 落到还是穿透的窗口上。
 Start-Sleep -Milliseconds 200
 
-if ([LocalPet.Native]::Mouse(0x0002) -eq 0) {   # MOUSEEVENTF_LEFTDOWN
+if ([DshZoo.Native]::Mouse(0x0002) -eq 0) {   # MOUSEEVENTF_LEFTDOWN
   Write-Error "SendInput LEFTDOWN 被系统吞掉（锁屏 / UAC 安全桌面 / 被拦？）错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
   exit 2
 }
@@ -91,12 +91,12 @@ Start-Sleep -Milliseconds 120
 for ($i = 1; $i -le 8; $i++) {
   $x = [int]($X + ($ToX - $X) * $i / 8)
   $y = [int]($Y + ($ToY - $Y) * $i / 8)
-  [LocalPet.Native]::SetCursorPos($x, $y) | Out-Null
+  [DshZoo.Native]::SetCursorPos($x, $y) | Out-Null
   Start-Sleep -Milliseconds 40
 }
 
 Start-Sleep -Milliseconds $HoldMs
-if ([LocalPet.Native]::Mouse(0x0004) -eq 0) {   # MOUSEEVENTF_LEFTUP
+if ([DshZoo.Native]::Mouse(0x0004) -eq 0) {   # MOUSEEVENTF_LEFTUP
   Write-Error "SendInput LEFTUP 被系统吞掉（按下已经发生过，键盘鼠标可能卡在按下态）"
   exit 2
 }

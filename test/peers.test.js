@@ -10,7 +10,7 @@ import { PEERS_FILE, createPeerStore } from '../src/peers.js'
 const T0 = 1_700_000_000_000
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-peers-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-peers-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

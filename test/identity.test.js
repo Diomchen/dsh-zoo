@@ -12,7 +12,7 @@ import {
 import { isDeviceId } from '../src/protocol.js'
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-identity-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-identity-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -97,7 +97,7 @@ test('镜像：内存立刻生效，落盘是尽力而为，非法名字不生�
 })
 
 test('identity.json 带 BOM 时不能换掉 deviceId', async (t) => {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-identity-bom-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-identity-bom-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const deviceId = '11111111-1111-4111-8111-111111111111'
   await writeFile(join(dir, IDENTITY_FILE), '\uFEFF' + JSON.stringify({ deviceId, nickname: '鱼姐' }), 'utf8')

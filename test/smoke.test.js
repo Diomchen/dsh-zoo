@@ -21,7 +21,7 @@ function fakeCtx () {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-smoke-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-smoke-'))
   t.after(async () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
     await rm(dir, { recursive: true, force: true })
@@ -30,7 +30,7 @@ async function tempDir (t) {
 }
 
 test('插件声明了宿主需要的能力', () => {
-  assert.equal(name, 'local-pet')
+  assert.equal(name, 'dsh-zoo')
   assert.deepEqual(inject, ['webServer'])
 })
 
@@ -44,8 +44,8 @@ test('挂载后注册了快照接口，且快照形状稳定', async (t) => {
     petBridge: false
   })
 
-  const state = routes.find((route) => route.path === '/local-pet/state')
-  assert.ok(state, '应该注册 /local-pet/state')
+  const state = routes.find((route) => route.path === '/dsh-zoo/state')
+  assert.ok(state, '应该注册 /dsh-zoo/state')
 
   const res = await call(state.handler, { method: 'GET' })
   assert.equal(res.status, 200)
@@ -57,13 +57,14 @@ test('挂载后注册了快照接口，且快照形状稳定', async (t) => {
   assert.ok(res.body.self.bridge)
 })
 
-test('坏掉的 webServer 不会把宿主拖下水', () => {
+test('坏掉的 webServer 不会把宿主拖下水', async (t) => {
+  const dir = await tempDir(t)
   const errors = []
   apply({
     webServer: { register () { throw new Error('boom') } },
     effect () {},
     logger: { info () {}, warn (line) { errors.push(line) } }
-  })
+  }, { dataDir: dir })
   assert.equal(errors.length, 1)
   assert.match(errors[0], /初始化失败/)
 })

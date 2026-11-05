@@ -14,7 +14,7 @@ import {
 } from '../src/pet-bridge.js'
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-bridge-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-bridge-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }

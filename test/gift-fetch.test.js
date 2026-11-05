@@ -22,7 +22,7 @@ function sha256 (bytes) {
 }
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-gift-fetch-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-gift-fetch-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -66,7 +66,38 @@ test('正常拉取：流式写盘、sha256 对、没有留下 .part', async (t) 
   assert.deepEqual(result, { ok: true, size: bytes.length, sha256: sha256(bytes) })
   assert.deepEqual(await readFile(target), bytes)
   assert.equal(existsSync(target + '.part'), false)
-  assert.deepEqual(source.hits.paths, ['/local-pet-gift/' + GIFT_ID])
+  assert.deepEqual(source.hits.paths, ['/dsh-zoo-gift/' + GIFT_ID])
+})
+
+test('旧版邻居只认 /local-pet-gift：新路由 404 后再回落旧路由', async (t) => {
+  const dir = await tempDir(t)
+  const target = join(dir, GIFT_ID, '旧礼物.txt')
+  const bytes = Buffer.from('来自旧版本邻居的文件礼物', 'utf8')
+  const source = await start(t, (req, res) => {
+    if (req.url === '/local-pet-gift/' + GIFT_ID) {
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': bytes.length })
+      res.end(bytes)
+      return
+    }
+    res.writeHead(404, { 'content-type': 'text/plain' })
+    res.end('not found')
+  })
+
+  const result = await createGiftFetcher().fetchTo({
+    address: '127.0.0.1',
+    port: source.port,
+    giftId: GIFT_ID,
+    targetPath: target,
+    size: bytes.length,
+    sha256: sha256(bytes)
+  })
+
+  assert.deepEqual(result, { ok: true, size: bytes.length, sha256: sha256(bytes) })
+  assert.deepEqual(await readFile(target), bytes)
+  assert.deepEqual(source.hits.paths, [
+    '/dsh-zoo-gift/' + GIFT_ID,
+    '/local-pet-gift/' + GIFT_ID
+  ])
 })
 
 test('只连私网/回环：公网地址直接 refused，不发请求', async (t) => {

@@ -9,13 +9,15 @@ import test from 'node:test'
 import {
   DEFAULT_SKIN_PORT,
   GIFT_ROUTE,
+  LEGACY_GIFT_ROUTE,
+  LEGACY_SKIN_ROUTE,
   MAX_GIFT_FILE_BYTES,
   resolveSkinPort,
   startLanServer
 } from '../src/lan-server.js'
 
 async function tempDir (t) {
-  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-lan-server-'))
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-lan-server-'))
   t.after(() => rm(dir, { recursive: true, force: true }))
   return dir
 }
@@ -59,7 +61,7 @@ test('manifest 带 size/idle 和每个文件的 sha256', async (t) => {
   const server = await start(t, { sources: [source] })
   assert.equal(server.skinId, 'test', '有源时服务器带上源 id')
 
-  const response = await fetch(url(server, '/local-pet-skin/manifest'))
+  const response = await fetch(url(server, '/dsh-zoo-skin/manifest'))
   assert.equal(response.status, 200)
   assert.match(response.headers.get('content-type'), /application\/json/)
   const manifest = await response.json()
@@ -78,14 +80,14 @@ test('素材按动作 id 取，响应带 webm 类型与长度', async (t) => {
   const { source, a } = await fixture(t)
   const server = await start(t, { sources: [source] })
 
-  const response = await fetch(url(server, '/local-pet-skin/asset/A'))
+  const response = await fetch(url(server, '/dsh-zoo-skin/asset/A'))
   assert.equal(response.status, 200)
   assert.equal(response.headers.get('content-type'), 'video/webm')
   assert.equal(response.headers.get('accept-ranges'), 'bytes')
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), a)
 
   // 也接受带扩展名的写法，方便直接用 manifest 里的 file
-  const withExt = await fetch(url(server, '/local-pet-skin/asset/A.webm'))
+  const withExt = await fetch(url(server, '/dsh-zoo-skin/asset/A.webm'))
   assert.equal(withExt.status, 200)
 })
 
@@ -93,14 +95,14 @@ test('Range 请求回 206 与正确的字节段', async (t) => {
   const { source, b } = await fixture(t)
   const server = await start(t, { sources: [source] })
 
-  const response = await fetch(url(server, '/local-pet-skin/asset/B'), {
+  const response = await fetch(url(server, '/dsh-zoo-skin/asset/B'), {
     headers: { range: 'bytes=2-5' }
   })
   assert.equal(response.status, 206)
   assert.equal(response.headers.get('content-range'), `bytes 2-5/${b.length}`)
   assert.deepEqual(Buffer.from(await response.arrayBuffer()), b.subarray(2, 6))
 
-  const invalid = await fetch(url(server, '/local-pet-skin/asset/B'), {
+  const invalid = await fetch(url(server, '/dsh-zoo-skin/asset/B'), {
     headers: { range: 'bytes=999-' }
   })
   assert.equal(invalid.status, 416)
@@ -111,14 +113,37 @@ test('多源按 id 路由；没登记的源、动作、穿越路径都是 404', 
   const other = { ...source, id: 'other', name: '另一个', actions: { A: source.actions.A } }
   const server = await start(t, { sources: [source, other] })
 
-  assert.equal((await fetch(url(server, '/local-pet-skin/other/manifest'))).status, 200)
-  assert.equal((await fetch(url(server, '/local-pet-skin/nope/manifest'))).status, 404)
-  assert.equal((await fetch(url(server, '/local-pet-skin/asset/../secret'))).status, 404)
-  assert.equal((await fetch(url(server, '/local-pet-skin/asset/..%2Fsecret'))).status, 404)
-  assert.equal((await fetch(url(server, '/local-pet-skin/other/asset/B'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/other/manifest'))).status, 200)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/nope/manifest'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/asset/../secret'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/asset/..%2Fsecret'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/other/asset/B'))).status, 404)
   assert.equal((await fetch(url(server, '/nope'))).status, 404)
-  assert.equal((await fetch(url(server, '/local-pet-skin/manifest'), { method: 'POST' })).status, 405)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/manifest'), { method: 'POST' })).status, 405)
   assert.ok(dir.length > 0)
+})
+
+test('旧版路由 /local-pet-* 仍然可读：manifest、素材与礼物都能取', async (t) => {
+  const { source, a } = await fixture(t)
+  const { bytes, giftId, lookupGift } = await giftFixture(t)
+  const server = await start(t, { sources: [source], lookupGift })
+
+  assert.equal(LEGACY_SKIN_ROUTE, '/local-pet-skin')
+  assert.equal(LEGACY_GIFT_ROUTE, '/local-pet-gift')
+
+  const manifest = await (await fetch(url(server, LEGACY_SKIN_ROUTE + '/manifest'))).json()
+  assert.equal(manifest.id, 'test')
+  const asset = await fetch(url(server, LEGACY_SKIN_ROUTE + '/asset/A'))
+  assert.equal(asset.status, 200)
+  assert.deepEqual(Buffer.from(await asset.arrayBuffer()), a)
+
+  const gift = await fetch(url(server, LEGACY_GIFT_ROUTE + '/' + giftId))
+  assert.equal(gift.status, 200)
+  assert.deepEqual(Buffer.from(await gift.arrayBuffer()), bytes)
+
+  // 旧路径同样只读；方法检查在路由匹配之前。
+  assert.equal((await fetch(url(server, LEGACY_SKIN_ROUTE + '/manifest'), { method: 'POST' })).status, 405)
+  assert.equal((await fetch(url(server, LEGACY_GIFT_ROUTE + '/' + giftId), { method: 'POST' })).status, 405)
 })
 
 test('超过单文件上限的素材被拒绝', async (t) => {
@@ -133,7 +158,7 @@ test('超过单文件上限的素材被拒绝', async (t) => {
   }
   const server = await start(t, { sources: [source], maxFileBytes: 32 })
 
-  const response = await fetch(url(server, '/local-pet-skin/asset/big'))
+  const response = await fetch(url(server, '/dsh-zoo-skin/asset/big'))
   assert.equal(response.status, 413)
 })
 
@@ -167,12 +192,12 @@ test('默认端口常量是 45873', () => {
   assert.equal(DEFAULT_SKIN_PORT, 45873)
 })
 
-test('LOCAL_PET_SKIN_PORT 覆盖默认端口，非法值回落', () => {
+test('DSH_ZOO_SKIN_PORT 覆盖默认端口，非法值回落', () => {
   assert.equal(resolveSkinPort({}), DEFAULT_SKIN_PORT)
-  assert.equal(resolveSkinPort({ LOCAL_PET_SKIN_PORT: '46000' }), 46000)
-  assert.equal(resolveSkinPort({ LOCAL_PET_SKIN_PORT: '0' }), 0)
-  assert.equal(resolveSkinPort({ LOCAL_PET_SKIN_PORT: 'nope' }), DEFAULT_SKIN_PORT)
-  assert.equal(resolveSkinPort({ LOCAL_PET_SKIN_PORT: '70000' }), DEFAULT_SKIN_PORT)
+  assert.equal(resolveSkinPort({ DSH_ZOO_SKIN_PORT: '46000' }), 46000)
+  assert.equal(resolveSkinPort({ DSH_ZOO_SKIN_PORT: '0' }), 0)
+  assert.equal(resolveSkinPort({ DSH_ZOO_SKIN_PORT: 'nope' }), DEFAULT_SKIN_PORT)
+  assert.equal(resolveSkinPort({ DSH_ZOO_SKIN_PORT: '70000' }), DEFAULT_SKIN_PORT)
 })
 
 // ---------------------------------------------------------------------------
@@ -205,7 +230,7 @@ test('没有素材源时服务器照常起：skin 路由 404，礼物路由可�
 
   // 没装 dsh-pet 的用户：素材没有，但礼物端口必须在；源 id 为空（beacon 只带 skinPort）。
   assert.equal(server.skinId, null)
-  assert.equal((await fetch(url(server, '/local-pet-skin/manifest'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/manifest'))).status, 404)
 
   const response = await fetch(url(server, GIFT_ROUTE + '/' + giftId))
   assert.equal(response.status, 200)
@@ -289,21 +314,21 @@ test('setSources：换表之后新源可取、删掉的源 404，端口不动', 
   const server = await start(t, { sources: [first] })
   const port = server.port
   assert.equal(server.skinId, 'first')
-  assert.equal((await fetch(url(server, '/local-pet-skin/second/manifest'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/second/manifest'))).status, 404)
 
   const applied = server.setSources([second])
   assert.deepEqual(applied, { count: 1, fallback: 'second' })
   assert.equal(server.port, port, '换表不换端口')
   assert.equal(server.skinId, 'second')
 
-  const manifest = await (await fetch(url(server, '/local-pet-skin/second/manifest'))).json()
+  const manifest = await (await fetch(url(server, '/dsh-zoo-skin/second/manifest'))).json()
   assert.equal(manifest.id, 'second')
   assert.deepEqual(manifest.actions.C, { file: 'C.webm', loop: true, hash: sha256(c) })
 
   // 默认路由跟着换表走；被删掉的那张皮 404。
-  assert.equal((await (await fetch(url(server, '/local-pet-skin/manifest'))).json()).id, 'second')
-  assert.equal((await fetch(url(server, '/local-pet-skin/first/manifest'))).status, 404)
-  assert.equal((await fetch(url(server, '/local-pet-skin/second/asset/C'))).status, 200)
+  assert.equal((await (await fetch(url(server, '/dsh-zoo-skin/manifest'))).json()).id, 'second')
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/first/manifest'))).status, 404)
+  assert.equal((await fetch(url(server, '/dsh-zoo-skin/second/asset/C'))).status, 200)
 })
 
 test('setSources：同一个源对象不必重算 sha256（按对象缓存）', async (t) => {
@@ -313,10 +338,10 @@ test('setSources：同一个源对象不必重算 sha256（按对象缓存）', 
   const source = { id: 'same', dirs: [dir], actions: { A: { file: 'A.webm', dir } } }
 
   const server = await start(t, { sources: [source] })
-  const first = await (await fetch(url(server, '/local-pet-skin/same/manifest'))).json()
+  const first = await (await fetch(url(server, '/dsh-zoo-skin/same/manifest'))).json()
 
   // 换表时把同一个对象再放回去：清单必须逐字节一致（命中缓存，不重算）。
   server.setSources([source])
-  const second = await (await fetch(url(server, '/local-pet-skin/same/manifest'))).json()
+  const second = await (await fetch(url(server, '/dsh-zoo-skin/same/manifest'))).json()
   assert.deepEqual(second, first)
 })

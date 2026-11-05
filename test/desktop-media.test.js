@@ -4,7 +4,7 @@ import test from 'node:test'
 import shared from '../desktop/shared.js'
 
 /**
- * 渲染端每次换素材都会把当前状态报给主进程，主进程原样塞进 `/local-pet/desktop` 的
+ * 渲染端每次换素材都会把当前状态报给主进程，主进程原样塞进 `/dsh-zoo/desktop` 的
  * `helperStatus.media`。这个字段是现场判断「宠物到底有没有画出来」的唯一探针，
  * 所以它必须跟着真实状态走（ticket 28），而且渲染端是不可信输入（ticket 07 的同一条规矩）。
  */

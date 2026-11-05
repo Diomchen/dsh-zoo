@@ -4,17 +4,21 @@ import { readFile, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 
+import { GIFT_ROUTES, SKIN_ROUTES, matchRoute } from './lan-routes.js'
 import { MAX_GIFT_BYTES, isVisitId } from './protocol.js'
 
 /**
  * 局域网只读服务（ticket 15 的素材源 + ticket 25 的礼物源）。
  *
- * 这是 local-pet 自己开的**只读** HTTP 端口——不能复用 DSH 的 webServer，它只绑
+ * 这是 dsh-zoo 自己开的**只读** HTTP 端口——不能复用 DSH 的 webServer，它只绑
  * 127.0.0.1，邻居访问不到。同一个端口挂两套路由：
- *   GET /local-pet-skin/manifest            → 默认源的 manifest（含每个文件的 sha256）
- *   GET /local-pet-skin/asset/<动作>         → WebM，支持 Range
- *   GET /local-pet-skin/<源 id>/...          → 多源时的显式路由
- *   GET /local-pet-gift/<giftId>             → 文件礼物的本体（只在 armed 期间可读）
+ *   GET /dsh-zoo-skin/manifest            → 默认源的 manifest（含每个文件的 sha256）
+ *   GET /dsh-zoo-skin/asset/<动作>         → WebM，支持 Range
+ *   GET /dsh-zoo-skin/<源 id>/...          → 多源时的显式路由
+ *   GET /dsh-zoo-gift/<giftId>             → 文件礼物的本体（只在 armed 期间可读）
+ *
+ * 改名前的老路径 `/local-pet-skin/*` 与 `/local-pet-gift/*` 仍在（src/lan-routes.js）：
+ * 改名前的邻居（≤0.5.7）不会知道新名字，兼容期内照常能取。它们同样是只读的。
  *
  * **没有素材源时也要能起来**（ticket 25）：不装 dsh-pet 的用户照样需要礼物端口，
  * 所以 `sources` 为空只是「skin 路由一律 404」，不再让整个服务器返回 null。
@@ -24,8 +28,12 @@ import { MAX_GIFT_BYTES, isVisitId } from './protocol.js'
  * 不拼用户输入、只回 webm/octet-stream、单文件有上限、只读、不列目录、v1 不做 Range。
  */
 
-export const SKIN_ROUTE = '/local-pet-skin'
-export const GIFT_ROUTE = '/local-pet-gift'
+export {
+  GIFT_ROUTE,
+  LEGACY_GIFT_ROUTE,
+  LEGACY_SKIN_ROUTE,
+  SKIN_ROUTE
+} from './lan-routes.js'
 export const DEFAULT_SKIN_PORT = 45873
 export const MAX_SKIN_FILE_BYTES = 8 * 1024 * 1024
 export const MAX_SKIN_PORT_TRIES = 10
@@ -153,13 +161,14 @@ export async function startLanServer (options = {}) {
       }
 
       // 礼物路由只有一层（giftId），没有目录、没有 Range、没有任何用户路径。
-      if (pathname.startsWith(GIFT_ROUTE + '/')) {
-        const rawId = pathname.slice(GIFT_ROUTE.length + 1)
-        if (rawId === '' || rawId.includes('/')) return sendText(response, 404, 'not found')
-        return handleGift(request, response, rawId)
+      const gift = matchRoute(pathname, GIFT_ROUTES)
+      if (gift !== null) {
+        if (gift.rest === '' || gift.rest.includes('/')) return sendText(response, 404, 'not found')
+        return handleGift(request, response, gift.rest)
       }
-      if (!pathname.startsWith(SKIN_ROUTE + '/')) return sendText(response, 404, 'not found')
-      return handleSkin(request, response, pathname)
+      const skin = matchRoute(pathname, SKIN_ROUTES)
+      if (skin === null) return sendText(response, 404, 'not found')
+      return handleSkin(request, response, skin.rest)
     } catch (error) {
       log.warn?.('局域网服务请求失败：' + (error instanceof Error ? error.message : String(error)))
       return sendText(response, 500, 'internal error')
@@ -217,8 +226,8 @@ export async function startLanServer (options = {}) {
     stream.pipe(response)
   }
 
-  async function handleSkin (request, response, pathname) {
-    const parts = pathname.slice(SKIN_ROUTE.length + 1).split('/')
+  async function handleSkin (request, response, rest) {
+    const parts = rest === '' ? [] : rest.split('/')
 
     // manifest 路由：默认源，或显式 <源 id>/manifest
     let source = fallbackSource
@@ -433,9 +442,9 @@ function listenOnce (handler, createServerImpl, host, port) {
   })
 }
 
-/** 环境变量覆盖素材源端口；非法值静默回落默认端口（同 LOCAL_PET_PORT 的口径）。 */
+/** 环境变量覆盖素材源端口；非法值静默回落默认端口（同 DSH_ZOO_PORT 的口径）。 */
 export function resolveSkinPort (env = process.env) {
-  const raw = env?.LOCAL_PET_SKIN_PORT
+  const raw = env?.DSH_ZOO_SKIN_PORT
   if (raw === undefined || raw === null || String(raw).trim() === '') return DEFAULT_SKIN_PORT
   const port = Number(String(raw).trim())
   return Number.isInteger(port) && port >= 0 && port <= 65535 ? port : DEFAULT_SKIN_PORT

@@ -4,7 +4,7 @@
 Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与宿主只通过 stdin/stdout 的 JSON 行
 通信，不开端口、不走 HTTP。
 
-- `main.js` — Electron 主进程：窗口、点击穿透裁定、输入租约、`localpet://` 素材协议、stdio、截图
+- `main.js` — Electron 主进程：窗口、点击穿透裁定、输入租约、`dshzoo://` 素材协议、stdio、截图
 - `preload.js` — 渲染端唯一桥：`ready` / `reportHover` / `reportRects` / `reportOverlayRects` /
   `setBusy` / `requestAction` / `onActionResult` / `onScene`
 - `index.html` + `renderer.js` — 透明画布；每只宠物一个 DOM 节点，60fps 本地物理；
@@ -21,45 +21,45 @@ Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与�
 env -u ELECTRON_RUN_AS_NODE \
   /Users/gensean/.dsh/electron/Electron.app/Contents/MacOS/Electron \
   desktop/main.js \
-  --local-pet-shot /tmp/local-pet.png \
-  --local-pet-shot-delay 1200 \
-  --local-pet-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
+  --dsh-zoo-shot /tmp/dsh-zoo.png \
+  --dsh-zoo-shot-delay 1200 \
+  --dsh-zoo-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
 
 # 交互式调试：手动喂 JSON 行
 env -u ELECTRON_RUN_AS_NODE /Users/gensean/.dsh/electron/Electron.app/Contents/MacOS/Electron \
-  desktop/main.js --local-pet-host-pid $$ --local-pet-debug \
-  --local-pet-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
+  desktop/main.js --dsh-zoo-host-pid $$ --dsh-zoo-debug \
+  --dsh-zoo-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
 
 # 不开 argv、只靠环境变量也能进 debug 模式（宿主 spawn helper 时会继承自己的环境）：
-env -u ELECTRON_RUN_AS_NODE LOCAL_PET_DESKTOP_DEBUG=1 \
+env -u ELECTRON_RUN_AS_NODE DSH_ZOO_DESKTOP_DEBUG=1 \
   /Users/gensean/.dsh/electron/Electron.app/Contents/MacOS/Electron \
-  desktop/main.js --local-pet-host-pid $$
+  desktop/main.js --dsh-zoo-host-pid $$
 ```
 
-debug 模式 = `--local-pet-debug` **或** 环境变量 `LOCAL_PET_DESKTOP_DEBUG=1`。
+debug 模式 = `--dsh-zoo-debug` **或** 环境变量 `DSH_ZOO_DESKTOP_DEBUG=1`。
 它打开 devTools，并接受下面那组 `debug-*` / `pointer` 命令；两者效果完全一样，
 后者只是方便在宿主 spawn 出来的 helper 上临时开调试，不用改 argv。
 
-**所有 helper 自己的开关都必须带 `--local-pet-` 前缀**：Electron 会消费 `--debug` 之类的已知
+**所有 helper 自己的开关都必须带 `--dsh-zoo-` 前缀**：Electron 会消费 `--debug` 之类的已知
 开关（实测 `--debug` 直接以 exit 9 退出），前缀保证它们原样落到 `process.argv`。
 
-`--local-pet-assets <dir>` 可以重复，按顺序查找素材；宿主侧由 `src/pet-assets.js` 解析
+`--dsh-zoo-assets <dir>` 可以重复，按顺序查找素材；宿主侧由 `src/pet-assets.js` 解析
 （`$DSH_HOME/dsh-pet/main-animation/webm` → 包内 `assets/webm` → `profiles/*/node_modules/...`），
 **不写死 profile 名**。没有素材时宠物退成内置 SVG 色块，串门不受影响。
 
-`--local-pet-gifts <dir>`（ticket 25）是收到的礼物根目录（宿主传 `<dataDir>/gifts`），
-只用于 `localpet://gifts/...` 的**缩略图**读取；不传时这条读路径不注册（所有 gifts URL 404）。
-它和 `--local-pet-assets` 一样是绝对路径，helper 不自己拼数据目录。
+`--dsh-zoo-gifts <dir>`（ticket 25）是收到的礼物根目录（宿主传 `<dataDir>/gifts`），
+只用于 `dshzoo://gifts/...` 的**缩略图**读取；不传时这条读路径不注册（所有 gifts URL 404）。
+它和 `--dsh-zoo-assets` 一样是绝对路径，helper 不自己拼数据目录。
 
 真机冒烟（不进 `npm test`；没有 Electron 时应该跳过）：
 
 ```bash
 npm run smoke:desktop
-LOCAL_PET_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/local-pet/notes/08-*.png、11-*.png
+DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/dsh-zoo/notes/08-*.png、11-*.png
 ```
 
 它用 `capturePage()` 抓图并用 zlib 自己解/编码 PNG：断言背景透明、每只宠物的媒体区和昵称条
-有像素、`localpet://` 真的加载了 WebM；再跑点击穿透两条通道、输入租约（含超时）、拖拽/投掷、
+有像素、`dshzoo://` 真的加载了 WebM；再跑点击穿透两条通道、输入租约（含超时）、拖拽/投掷、
 场景增删/reset、素材缺失时的 SVG 降级、崩溃重启、dispose、宿主被 SIGKILL 后 helper 自行退出。
 ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给宿主、失败 `notice` 冒泡、
 放行卡接受/拒绝、送客、自己出门时的召回胶囊，以及点击穿透的几条硬线（A2/A3）：
@@ -85,7 +85,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `status` | `id?` | 回 `status` 事件（诊断用） |
 | `quit` | — | 优雅退出 |
 
-只有 debug 模式（`--local-pet-debug` 或 `LOCAL_PET_DESKTOP_DEBUG=1`）下才接受：
+只有 debug 模式（`--dsh-zoo-debug` 或 `DSH_ZOO_DESKTOP_DEBUG=1`）下才接受：
 
 | 命令 | 字段 | 说明 |
 | --- | --- | --- |
@@ -169,7 +169,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
     "visitors": [{ "deviceId": "6f1c…", "label": "阿蟹" }],
     "gifts": [{ "deviceId": "6f1c…", "giftId": "…", "kind": "file", "name": "照片.png",
                 "title": "「阿蟹」捎来一个文件", "status": "received",
-                "thumb": "localpet://gifts/20261103-153245-ab12cd/照片.png" }],
+                "thumb": "dshzoo://gifts/20261103-153245-ab12cd/照片.png" }],
     "prompt": { "deviceId": "9a2b…", "nickname": "泡泡" },
     "notice": { "text": "「阿蟹」没有回应，宠物先留在家里了。", "at": 1762000000000 }
   },
@@ -184,7 +184,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   `nickname` 用来显示“在「阿蟹」家”。
 - `visitors`：当前可送客的访客；`item.id` 是 `visitor:<deviceId>`，两边按 deviceId 对上。
 - `gifts`：贴着访客的礼物卡（ticket 23/25）。状态与标题由宿主算好；`text` 只在
-  `received` 时给，`thumb` 只给图片且只接受 `localpet://gifts/...`。卡片/按钮/桥接矩形
+  `received` 时给，`thumb` 只给图片且只接受 `dshzoo://gifts/...`。卡片/按钮/桥接矩形
   都进 `overlay-rects`，按钮 id 带 `giftId`，两张卡不会撞名。
 - `prompt`：放行 FIFO 队首；渲染端在宠物旁边画 接受 / 拒绝 / 稍后再说，绝不遮挡宠物本体。
 - `notice`：最近一条人话提示。异步失败（超时、对方失联、被送客）不经过 `action-result`，
@@ -212,9 +212,9 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 这是 ticket 08 的关键 seam：
 
-1. 渲染端每次物理步进后用 `local-pet:rects` 上报所有宠物矩形（移动 ~30Hz，静止 300ms 心跳，
+1. 渲染端每次物理步进后用 `dsh-zoo:rects` 上报所有宠物矩形（移动 ~30Hz，静止 300ms 心跳，
    窗口局部 DIP）。矩形带 `id`；主进程按 `id` 把场景里已经删掉的宠物立刻从命中区移除。
-2. 控件（弹层、放行卡、召回胶囊、按钮）用另一条 `local-pet:overlay-rects` 上报，同样带
+2. 控件（弹层、放行卡、召回胶囊、按钮）用另一条 `dsh-zoo:overlay-rects` 上报，同样带
    时间戳、同样 900ms 过期。它们不参与物理，但决定了“光标压在按钮上”时窗口是否接管鼠标；
    **宠物矩形排在控件矩形后面**，重叠时宠物优先（`hit.itemId` 不会变成 `ui:*`）。
    弹层还多报一条 `ui:bridge:popover`：宠物与弹层之间 8px 间隙的并集，光标横穿时不会落空。
@@ -224,7 +224,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
    裁到工作区里（裁完为空就丢掉）、数量上限 `MAX_HIT_RECTS`（256）。
 4. 光标位置仍由主进程用自己的 `screen.getCursorScreenPoint()` 独立复核；渲染端只能申请，
    不能单方面把窗口变成可交互。
-5. **只有拖拽**会让渲染端通过 `local-pet:busy` 持有**输入租约**：宠物是弹簧跟随，快速拖动
+5. **只有拖拽**会让渲染端通过 `dsh-zoo:busy` 持有**输入租约**：宠物是弹簧跟随，快速拖动
    时光标会跑到宠物矩形外，位置判定已经失效，窗口也必须保持可交互，否则
    `pointermove`/`pointerup` 全断（ticket 07 的坑）。为此拖拽期间额外上报一条以光标为
    中心、半径 80px 的 `ui:drag` 矩形（并集上宠物本体），约 30Hz 跟着指针走。
@@ -243,16 +243,16 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 8. 放行卡/召回胶囊是常驻控件，**不持有租约**；它们靠 `overlay-rects` 在光标真正压上去时
    接管鼠标，并用“宠物 + 控件”的桥接矩形盖住间隙。
 
-## 素材协议 `localpet://`
+## 素材协议 `dshzoo://`
 
 页面是 `file://`，拿不到 DSH 的 `/dsh-pet-7340/thumb/...`。主进程在 app ready 前把
-`localpet` 注册成 standard/secure/stream scheme，再从宿主传入的绝对目录里只读地取：
+`dshzoo` 注册成 standard/secure/stream scheme，再从宿主传入的绝对目录里只读地取：
 
-- `localpet://asset/<encodeURIComponent(动画名)>.webm` —— 宠物素材（ticket 07–17）；
-- `localpet://gifts/<礼物目录>/<图片文件名>` —— 礼物缩略图（ticket 25）。只认**两层**路径：
+- `dshzoo://asset/<encodeURIComponent(动画名)>.webm` —— 宠物素材（ticket 07–17）；
+- `dshzoo://gifts/<礼物目录>/<图片文件名>` —— 礼物缩略图（ticket 25）。只认**两层**路径：
   第一层必须是礼物目录名（`^\d{8}-\d{6}-[0-9a-f]{8}(-\d+)?$`），文件名只认
-  `jpg/jpeg/png/gif/webp`，解析后必须仍在 `--local-pet-gifts` 根内；不列目录、不返回
-  非图片文件。`desktop/index.html` 的 CSP 为此在 `img-src` 里加了 `localpet:`。
+  `jpg/jpeg/png/gif/webp`，解析后必须仍在 `--dsh-zoo-gifts` 根内；不列目录、不返回
+  非图片文件。`desktop/index.html` 的 CSP 为此在 `img-src` 里加了 `dshzoo:`。
 
 素材（WebM）一侧的规则：
 
@@ -260,13 +260,13 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - 单文件上限 8 MiB；支持 `Range`（206）让 `<video>` 边下边播/循环。
 - 根目录按优先级查找（用户素材覆盖包内素材），找不到就 404 → 渲染端降级。
 - 礼物缩略图只读不做 Range：图片是完整返回的，且只用于 `<img>`。
-- 页面 CSP 放行 `media-src localpet:` 与 `img-src localpet:`，没有网络、没有新端口。
+- 页面 CSP 放行 `media-src dshzoo:` 与 `img-src dshzoo:`，没有网络、没有新端口。
 
 ## 进程存亡
 
 - 宿主 spawn 时**删除 `ELECTRON_RUN_AS_NODE`**（`src/desktop-launch.js` 的 `helperEnv`）。
   设成空串会让 Electron abort，设成 `'0'` 仍是纯 Node 模式。
-- 宿主注入 `LOCAL_PET_HOST_PID`；helper 每 2s `kill(pid,0)`，ESRCH 就自行退出。
+- 宿主注入 `DSH_ZOO_HOST_PID`；helper 每 2s `kill(pid,0)`，ESRCH 就自行退出。
 - 宿主进程退出时同步 SIGKILL 子进程；`dispose()` 先 `quit`，再 SIGTERM，1s 后 SIGKILL。
 - helper 的 stdin 关闭/EPIPE 也直接退出；stdout/stderr 错误都不会弹 Electron 的默认崩溃框。
 - 崩溃重启由宿主 `src/desktop.js` 负责：300ms 起指数退避（300/600/1200/2400/4800），最多 5 次；
@@ -281,13 +281,13 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 主窗 `focusable: false` 是刻意的（ADR-0005），所以**键盘输入只能单开一扇窗**：
 
-- 悬停自己那只 → 弹层多一项「改名」→ `local-pet:rename-open` → 主进程开一扇
+- 悬停自己那只 → 弹层多一项「改名」→ `dsh-zoo:rename-open` → 主进程开一扇
   `rename.html` 小窗（360×168，无边框、置顶、`focusable: true`，贴在宠物上方，
   放不下就落到下方，再不行夹在工作区里）。
-- 小窗 `ready` 后主进程发 `local-pet:rename-init { name, maxLength }`；提交走
-  `local-pet:rename-submit`，主进程转成一条 `{type:'action', action:'rename', nickname}` 交给宿主。
+- 小窗 `ready` 后主进程发 `dsh-zoo:rename-init { name, maxLength }`；提交走
+  `dsh-zoo:rename-submit`，主进程转成一条 `{type:'action', action:'rename', nickname}` 交给宿主。
 - 宿主回的 `action-result` 按 action id 认领：成功就关窗，失败把 `notice` 发回小窗显示
-  （`local-pet:rename-result`），窗口不关、输入保留。
+  （`dsh-zoo:rename-result`），窗口不关、输入保留。
 - 失焦、Esc、主窗 `hide`、helper 退出都会关掉小窗；10 秒等不到宿主答复就报一句人话。
 - 主窗的穿透/租约状态**完全不受影响**：小窗是另一个 BrowserWindow，关掉它不会改动任何
   `ignoreState` / `busy`。
@@ -296,7 +296,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 背包是宿主的东西（`<dataDir>/backpack.json`），helper 只负责画与收输入；访客捎来的
 礼物卡由场景 `controls.gifts` 下发（宿主管状态与文案），缩略图走
-`localpet://gifts/<礼物目录>/<图片>`，与素材读路径同一套夹取规则。
+`dshzoo://gifts/<礼物目录>/<图片>`，与素材读路径同一套夹取规则。
 
 - 右键自己那只 → 一级工具项「带派」→ 渲染端只发一个**空** `{action:'bring'}`；
   宿主开窗，并用 `bring-window` 把背包内容（id/kind/文案/state，**没有路径**）交给 helper。
@@ -311,7 +311,7 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 - 提交走 `{type:'action', action:'bring', gift}` 或 `{action:'unbring', giftId}`；宿主的
   `action-result` 按 action id 认领：`bring` 成功关窗，失败留在窗里显示 `notice`；
   `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
-- 只有这扇窗自己的 `webContents` 能发 `local-pet:gift-*`（`isGiftSender`），与改名窗同一个模型。
+- 只有这扇窗自己的 `webContents` 能发 `dsh-zoo:gift-*`（`isGiftSender`），与改名窗同一个模型。
 
 ## 多显示器 / 分辨率
 

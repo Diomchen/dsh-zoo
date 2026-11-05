@@ -9,7 +9,7 @@
 //   node scripts/fake-peer.mjs --name 隔壁的小鲸鱼
 //   node scripts/fake-peer.mjs --gift $'给你留了张便条\n第二行'   # 串门时捎一条字条
 //
-// 然后在桌面的放行卡片上点「接受」（或走 /local-pet/action 的 admit），
+// 然后在桌面的放行卡片上点「接受」（或走 /dsh-zoo/action 的 admit），
 // 它的宠物就会出现在你的桌面上。
 // 键盘：v = 让它来串门（你的桌面上出现"来访"）  a <动画名> = 换动作  n <新名字> = 改名  q = 退出
 //
@@ -86,7 +86,7 @@ socket.on('error', (error) => {
 
 socket.bind(port, bindAddress, () => {
   console.log(`[假邻居] 我是「${nickname}」，在 ${bindAddress}:${port} 上听着，去找 ${destHost}:${targetPort} 的插件。`)
-  console.log(`[假邻居] 现在去 /local-pet/state 看 neighbors，用 /local-pet/action 的 admit 放行我；然后按 v 让${nickname}来串门。`)
+  console.log(`[假邻居] 现在去 /dsh-zoo/state 看 neighbors，用 /dsh-zoo/action 的 admit 放行我；然后按 v 让${nickname}来串门。`)
   console.log('[假邻居] 键盘：v=让它来串门  a <动画名>=换动作  s <一句话>=换气泡  n <新名字>=改名  q=退出')
   // 发往广播地址必须先开 SO_BROADCAST，否则 macOS 直接 EACCES，而且错误会被静默吞掉。
   try {
@@ -225,7 +225,7 @@ function outboundVisit () {
     return console.log('[假邻居] 还没看见你的插件——确认 DSH 正在跑、UDP 45871 没被别的进程占。')
   }
   if (!state.admitted) {
-    return console.log('[假邻居] 你还没放行我。先用 /local-pet/action 的 admit 放行，再让我串门。')
+    return console.log('[假邻居] 你还没放行我。先用 /dsh-zoo/action 的 admit 放行，再让我串门。')
   }
   const visitId = randomUUID()
   // 每次串门一件新礼物：gift.id 是 UUID，对端拿它当目录与 action 的键。

@@ -6,7 +6,7 @@ accepted
 
 ## 背景
 
-2026-11-04 Windows 11 现场：装第二个插件触发全树 reconcile，pnpm 判定 `dsh-local-pet` 需要重新导入，
+2026-11-04 Windows 11 现场：装第二个插件触发全树 reconcile，pnpm 判定 `dsh-zoo` 需要重新导入，
 最终 `ERR_PNPM_EPERM`（126 秒），包被删残——51 个文件剩 36 个，`cordis.patch.yml` 和 `desktop/` 下
 14 个文件消失，`package.json` 还是旧版本号。`cordis.patch.yml` 是挂载声明，所以下次启动宠物直接
 不存在，界面上没有任何错误。
@@ -15,7 +15,7 @@ accepted
 
 1. **pnpm 侧（上游）**：vendored 的 `rename-overwrite@7.0.1` 在 `EPERM` 分支先 `rimraf(目标)` 再忙等重试；
    重试仍失败时旧版本已被删、新版本又被 `commitStagedDir` 的 `cleanStageDir(stage)` 清掉，
-   结果新旧都没有。已另写上游报告（`.scratch/local-pet/notes/upstream-rename-overwrite-eperm.md`）。
+   结果新旧都没有。已另写上游报告（`.scratch/dsh-zoo/notes/upstream-rename-overwrite-eperm.md`）。
 2. **本仓侧**：helper 以 `cwd: <pkg>/desktop` 启动。Windows 上**删不掉任何进程的当前工作目录**，
    所以这个包装上去就再也换不掉——pnpm 会先删掉包里的文件，再在删 `desktop/` 时失败。
    `rimraf` 走到一半正好对上现场：文件没了，目录还在。
