@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 
+import { stripBom } from './json-text.js'
 import { MAX_NICKNAME, isSafeAnimationName, sanitizeLabel } from './protocol.js'
 
 /**
@@ -93,7 +94,7 @@ export async function readPetConfig (configPath) {
     return { exists: error?.code !== 'ENOENT', name: null, id: null }
   }
   try {
-    const parsed = JSON.parse(stripJsonComments(text))
+    const parsed = JSON.parse(stripJsonComments(stripBom(text)))
     return { exists: true, ...firstPetConfig(parsed) }
   } catch {
     return { exists: true, name: null, id: null }

@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { parseJsonText } from './json-text.js'
 import { join } from 'node:path'
 
 import { VISIT_RECORD_LIMIT, normalizeVisitRecord } from './visit-record.js'
@@ -68,7 +69,7 @@ class VisitStore {
 
     let raw
     try {
-      raw = JSON.parse(text)
+      raw = parseJsonText(text)
     } catch {
       this.#warnOnce('parse', '串门记录不是合法 JSON，先按空记录运行')
       return

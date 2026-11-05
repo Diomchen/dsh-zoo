@@ -307,6 +307,10 @@ export function createService (ctx, options = {}) {
         // 提示只在启动时打印一行，而宿主 stdout 不落盘（0.4.2 现场就卡在这里）：
         // 把「提示过没有」也放进出口，才能核对「只出现一次」而不必去翻日志。
         dualLayerNoted,
+        // 「外观」菜单的实际内容（票 36）：菜单只有开着才在 helper 那边上报，
+        // 验收时没法远程确认，所以这里给一份宿主侧的事实。
+        menuSkins: Array.isArray(desktopMenu.skins) ? desktopMenu.skins.map((skin) => skin.id) : [],
+        menuActiveSkin: typeof desktopMenu.activeSkin === 'string' ? desktopMenu.activeSkin : null,
         // dualLayer 的判据同样放出来。单机复现不了「关掉 helper」那一态（宿主会立刻拉起），
         // 所以让人一眼看出此刻是哪一层在画、为什么提示是 null。
         dshPet: {
@@ -1055,7 +1059,13 @@ export function createService (ctx, options = {}) {
         log.warn('素材源：' + warning.code + (warning.detail === undefined ? '' : '（' + warning.detail + '）'))
       }
       // 待机池与「对外供源」是两件事：就算关掉对外服务，本机宠物也该有丰富动作。
-      applySkin(loaded.sources, settings === null ? null : settings.activeSource)
+      const wanted = settings === null ? null : settings.activeSource
+      applySkin(loaded.sources, wanted)
+      // 配置指着一条已经不存在的源：回落之后把设置改写成真正在用的那张（票 36）。
+      // 不改的话 settings 说 maodie、state 说 dsh-pet，就是两处真相。
+      if (wanted !== null && activeSkin !== null && activeSkin.id !== wanted) {
+        await settings.setActiveSource(activeSkin.id)
+      }
       // 注册表换了：对外供源跟着换表，邻居下次取到的就是新清单（ticket 34）。
       // 端口还没起（启动早期 / skinServer:false）时是 null，跳过。
       skinServer?.setSources(skinSources)

@@ -16,6 +16,7 @@ import { readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 
 import { stripJsonComments } from './pet-bridge.js'
+import { stripBom } from './json-text.js'
 import { MAX_LABEL, normalizeSkinId } from './protocol.js'
 
 /** 与 dsh-pet `shared/menu.ts` 的 EVENT_LABELS 对齐。 */
@@ -174,7 +175,7 @@ export async function readAnimationsConfig (assetDirs, { readFileImpl = readFile
       continue
     }
     try {
-      const parsed = JSON.parse(stripJsonComments(source))
+      const parsed = JSON.parse(stripJsonComments(stripBom(source)))
       const animations = parsed?.animations
       if (animations !== null && typeof animations === 'object' && !Array.isArray(animations)) {
         return { path, animations }

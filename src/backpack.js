@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { parseJsonText } from './json-text.js'
 import { join } from 'node:path'
 
 import {
@@ -219,7 +220,7 @@ class BackpackStore {
 
     let raw
     try {
-      raw = JSON.parse(text)
+      raw = parseJsonText(text)
     } catch {
       this.#warnOnce('parse', '背包不是合法 JSON，先按空背包运行')
       return

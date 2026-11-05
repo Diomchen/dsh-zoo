@@ -63,8 +63,22 @@ helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约）�
     -d '{"action":"写代码","semantic":"working","say":"在写代码"}'
   ```
   `action` 自由命名（≤64），`semantic` 固定 `working/eating/sleeping/idle/other`，`say` 最多 80 字、
-  默认活 8 秒；推来后 30 秒内优先于 dsh-pet 轮询。想带自己的外观，把素材目录写进
-  `<dataDir>/skin.json` 的 `sources`，local-pet 就会把它作为素材源对外供源。
+  默认活 8 秒；推来后 30 秒内优先于 dsh-pet 轮询。
+- **素材源（`<dataDir>/skin.json`）**：想用别家的外观，把它的动作目录写进来。每条源是
+  `{ id, dirs, size?, idle?, once? }`——`id` 是这张皮的身份证（也是邻居看到的 `skinId`），
+  `size` 是相对 `462` 的比例（缺省 1.0，夹在 0.5–2），`idle` 指定待机动作名，`once` 列
+  一次性动作（不进闲时轮播、清单里标 `loop:false`）：
+
+  ```json
+  { "sources": [
+    { "id": "maodie-pet", "dirs": ["C:\\Users\\me\\.dsh\\dsh-pet\\pet\\maodie-animation"],
+      "size": 693, "idle": "待机", "once": ["喷火"] }
+  ] }
+  ```
+
+  文件一旦存在就**取代**自动注册的 dsh-pet 源（要留鱼就得自己列进去）；两张以上时右键菜单
+  里出现「外观」。改完按「重载配置」生效，不用重启 DSH。文件带 UTF-8 BOM 也认（Windows 的
+  记事本 / PowerShell 会写）。
 - **两个开关**：`{"action":"accept-visits","enabled":false}` 管入站（默认开），
   `{"action":"auto-visits","enabled":true}` 管自发出门（默认关）。状态都存在
   `<dataDir>/settings.json`，重启后保持。关掉入站仍能看见邻居、照常收发心跳，只是

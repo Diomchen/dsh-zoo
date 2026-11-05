@@ -95,3 +95,16 @@ test('镜像：内存立刻生效，落盘是尽力而为，非法名字不生�
   assert.equal(identity.mirror('\u0000\u0007'), null)
   assert.equal(identity.nickname, '新 名字')
 })
+
+test('identity.json 带 BOM 时不能换掉 deviceId', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-local-pet-identity-bom-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const deviceId = '11111111-1111-4111-8111-111111111111'
+  await writeFile(join(dir, IDENTITY_FILE), '\uFEFF' + JSON.stringify({ deviceId, nickname: '鱼姐' }), 'utf8')
+
+  const identity = await createIdentity(dir, { defaultNickname: '兜底' })
+
+  // BOM 解析失败会当场生成新身份 = 邻居把你当新机器，所以这条必须钉住。
+  assert.equal(identity.deviceId, deviceId)
+  assert.equal(identity.nickname, '鱼姐')
+})

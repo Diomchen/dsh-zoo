@@ -4,6 +4,7 @@ import { isAbsolute, join } from 'node:path'
 
 import { resolveDshPetAssetDirs } from './pet-assets.js'
 import { dataDir as defaultDataDir } from './paths.js'
+import { parseJsonText } from './json-text.js'
 import { isSafeAnimationName } from './protocol.js'
 
 /**
@@ -167,7 +168,7 @@ export function parseSkinFile (text) {
   if (typeof text !== 'string' || text.trim() === '') return null
   let parsed
   try {
-    parsed = JSON.parse(text)
+    parsed = parseJsonText(text)
   } catch {
     return null
   }

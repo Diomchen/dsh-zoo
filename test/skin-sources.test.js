@@ -296,3 +296,19 @@ test('一次性动作不进待机池，清单里也不再标 loop', async (t) =>
   const { idlePoolOf } = await import('../src/skin-sources.js')
   assert.deepEqual(idlePoolOf(source), ['东张西望', '待机'])
 })
+
+test('skin.json 带 UTF-8 BOM 也要读得出来（Windows 的 PowerShell / 记事本会写）', async (t) => {
+  const dir = await tempDir(t)
+  const body = JSON.stringify({ sources: [{ id: 'cat', dir: '/skins/cat', idle: '待机' }] })
+  await writeFile(join(dir, SKIN_FILE), '\uFEFF' + body, 'utf8')
+
+  const result = await loadSkinSources({
+    dataDir: dir,
+    resolveDshPetDirs: () => [],
+    readdir: fakeReaddir({ '/skins/cat': ['待机.webm', '踩奶.webm'] })
+  })
+
+  assert.deepEqual(result.warnings, [])
+  assert.equal(result.sources[0].id, 'cat', 'BOM 不能让整份配置被当成坏文件')
+  assert.equal(result.sources[0].idle, '待机')
+})

@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { parseJsonText } from './json-text.js'
 import { join } from 'node:path'
 
 import { isDeviceId, normalizeNickname } from './protocol.js'
@@ -66,7 +67,7 @@ class PeerStore {
 
     let raw
     try {
-      raw = JSON.parse(text)
+      raw = parseJsonText(text)
     } catch {
       this.#warnOnce('parse', '放行名单不是合法 JSON，先按空名单运行')
       return

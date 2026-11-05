@@ -1,6 +1,7 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import { parseJsonText } from './json-text.js'
 import { normalizeSkinId } from './protocol.js'
 
 /**
@@ -72,7 +73,7 @@ class SettingsStore {
 
     let raw
     try {
-      raw = JSON.parse(text)
+      raw = parseJsonText(text)
     } catch {
       this.#warnOnce('parse', '桌面开关不是合法 JSON，先按默认值运行')
       return

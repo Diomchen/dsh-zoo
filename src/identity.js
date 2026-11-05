@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
+import { parseJsonText } from './json-text.js'
 import { isDeviceId, normalizeNickname } from './protocol.js'
 
 /**
@@ -29,7 +30,7 @@ export async function createIdentity (dir, { defaultNickname: fallback, log } = 
 
   try {
     const text = await readFile(file, 'utf8')
-    const parsed = JSON.parse(text)
+    const parsed = parseJsonText(text)
     if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
       saved = parsed
       dirty = false

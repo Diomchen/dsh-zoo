@@ -12,7 +12,7 @@ import { PEERS_FILE } from '../src/peers.js'
 import { SKIN_FILE } from '../src/skin-sources.js'
 import { PEER_LOST_MS, isDeviceId, normalizeNickname } from '../src/protocol.js'
 import { createService } from '../src/service.js'
-import { DEFAULT_ACCEPT_VISITS, DEFAULT_AUTO_VISITS, SETTINGS_FILE, SETTINGS_VERSION } from '../src/settings.js'
+import { DEFAULT_ACCEPT_VISITS, DEFAULT_AUTO_VISITS, SETTINGS_FILE, SETTINGS_VERSION, createSettingsStore } from '../src/settings.js'
 import { VISITS_FILE } from '../src/visits.js'
 
 function fakeCtx () {
@@ -1329,4 +1329,64 @@ test('皮自带尺寸：场景里只有 self 带 size，换皮后跟着变', asy
 
   await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
   assert.equal(widthOfSelf(), 162, '693/462 = 1.5，换皮后场景跟着变')
+})
+
+test('settings.json 带 BOM 也不该被打回默认值', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, SETTINGS_FILE),
+    '\uFEFF' + JSON.stringify({ version: SETTINGS_VERSION, acceptVisits: false, autoVisits: true, desktop: true }),
+    'utf8')
+
+  const store = await createSettingsStore(dir, {})
+  assert.equal(store.acceptVisits, false)
+  assert.equal(store.autoVisits, true)
+})
+
+test('回落时把 activeSource 改写成真正在用的那张（不留两处真相）', async (t) => {
+  const dir = await tempDir(t)
+  const fish = join(dir, 'skin-fish')
+  await mkdir(fish, { recursive: true })
+  await writeFile(join(fish, '待机呼吸休闲.webm'), 'fish')
+  await writeSkins(dir, [{ id: 'fish', dirs: [fish] }])
+
+  const service = makeService(t, { dataDir: dir, skinServer: false, desktop: false })
+  await service.ready
+
+  // 配置指着一个不存在的源：启动回落，并且把设置改写回来。
+  await writeFile(join(dir, SETTINGS_FILE), JSON.stringify({
+    version: SETTINGS_VERSION,
+    acceptVisits: true,
+    autoVisits: false,
+    activeSource: 'ghost'
+  }), 'utf8')
+
+  const reloaded = await call(service, '/local-pet/action', { method: 'POST', body: { action: 'reload' } })
+  assert.equal(reloaded.status, 200)
+
+  const saved = JSON.parse(await readFile(join(dir, SETTINGS_FILE), 'utf8'))
+  assert.equal(saved.activeSource, 'fish', 'settings 不该继续指着 ghost')
+  assert.equal((await call(service, '/local-pet/state')).body.skin.id, 'fish')
+})
+
+test('诊断出口带「外观」菜单的内容，菜单不用打开也能核对', async (t) => {
+  const dir = await tempDir(t)
+  await skinFixture(dir)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+  desktop.emit({ type: 'ready', pid: 4242, workArea: { x: 0, y: 30, width: 1440, height: 900 } })
+
+  const before = await call(service, '/local-pet/desktop')
+  assert.deepEqual(before.body.menuSkins, ['fish', 'cat'])
+  assert.equal(before.body.menuActiveSkin, 'fish')
+
+  await call(service, '/local-pet/action', { method: 'POST', body: { action: 'use-skin', skinId: 'cat' } })
+
+  const after = await call(service, '/local-pet/desktop')
+  assert.deepEqual(after.body.menuSkins, ['fish', 'cat'])
+  assert.equal(after.body.menuActiveSkin, 'cat')
 })
