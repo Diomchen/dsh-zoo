@@ -761,7 +761,7 @@ test('坏 deviceId 仍然明确失败；不带 deviceId 才是“随机挑一个
 async function waitFor (predicate, timeoutMs = 3000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    if (predicate()) return
+    if (await predicate()) return
     await delay(20)
   }
   throw new Error('waitFor timeout')
@@ -850,7 +850,14 @@ test('名字跟着 dsh-pet 走：配置里改名，本机镜像跟着改并落�
   // 用户在 dsh-pet 设置页把名字改了：下一次配置轮询就该跟上
   await writeFile(configPath, '{"pets":[{"id":"main","name":"泡泡"}]}', 'utf8')
   await waitFor(() => service.snapshot().self.nickname === '泡泡')
-  assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '泡泡')
+  // 镜像落盘是异步的：等文件里也真的写成「泡泡」，不跟轮询抢跑。
+  await waitFor(async () => {
+    try {
+      return JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname === '泡泡'
+    } catch {
+      return false
+    }
+  })
 })
 
 test('启动时 dsh-pet 的名字覆盖 identity.json 里的旧昵称', async (t) => {
