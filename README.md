@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="dsh-zoo" width="220">
+</p>
+
 # dsh-zoo
 
 [![CI](https://github.com/Diomchen/dsh-zoo/actions/workflows/ci.yml/badge.svg)](https://github.com/Diomchen/dsh-zoo/actions/workflows/ci.yml)
