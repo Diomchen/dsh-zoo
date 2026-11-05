@@ -1,509 +1,293 @@
 # dsh-zoo
 
-局域网里的 DSH 宠物：自己的宠物活在桌面上，同一网段里邻居的宠物也会来串门，
-留下串门记录。没有客厅，没有第二块屏幕——整个桌面就是它们待的地方。
+把同一局域网里的 DSH 宠物连起来：自己的宠物活在桌面上，邻居的宠物会来串门，你的宠物也会出门。
 
-当前落地的是 **ticket 01–27（0.4.0）**：发现/心跳/放行/串门/记录、v2 桌面层（全屏透明
-helper、真实宠物、物理、拖拽/投掷、点击穿透与输入租约），宠物自发出门、访客常驻
-与「送客」/失联清理的完整状态机，桌面控件：悬停自己弹出「串门 / 召回 / 改名」、点访客
-弹出「送客」、新邻居的放行卡与失败气泡，「一只宠物只有一个名字」（ADR-0007），
-跨插件素材：宠物来串门时自带外观包和状态（ADR-0008 / SPEC v3），
-**桌面右键菜单**：打开软件 / 回到初始位置 / 重载配置 + 「动作」三级树（ADR-0010），
-以及**带派**：出门前给宠物带一件东西（字条或文件），到了邻居家留下；背包、送达回执、
-礼物卡与磁盘限额都已落地（ADR-0011 / SPEC v4）。
-同样的动作也可以通过 `POST /dsh-zoo/action` 完成（见下）。
+dsh-zoo 负责**发现、放行、串门、桌面画布、礼物和记录**；宠物的名字、动作和外观来自 `dsh-pet`。
 
-## 它做什么
+> 桌面层支持 **macOS / Windows**。Linux 或 web profile 没有桌面宠物，但发现、放行、串门照常工作。
 
-- **桌面宠物**：宿主轮询 `dsh-pet` 的 loopback `/state`，把自己的宠物（名字 +
-  被点播过的动作）和所有正在串门的访客画在一个**全屏透明、置顶、默认点击穿透**的窗口里。
-  在线邻居的心跳影子不画——心跳只说明它在，不代表它来了。
-  素材来自 `dsh-pet` 的 WebM；动作取不到就轮播待机片段，仍取不到就画带昵称的 SVG 色块。
-- **跨插件素材（L1/L2）**：本机可以列多个素材源（`<dataDir>/skin.json`，dsh-pet 自动成为
-  其中一个）。邻居的 dsh-zoo 在自己的机器上开一个只读素材源（默认 `45873`，
-  `DSH_ZOO_SKIN_PORT` 可覆盖），广播里带 `skinPort` / `skinId`；本机按需拉当前动作，
-  校验 sha256 后缓存到 `<dataDir>/skin-cache/`，helper 只读缓存、不联网。
-  对方没开素材源、格式不认或校验失败时，退回本机同名素材，再退回带语义标记的通用小人；
-  串门、记录、其他访客都不受影响。**不需要为任何插件打包素材**。
-- **物理**：每只宠物有本地坐标与速度，重力、落地反弹、地面摩擦、撞边、工作区夹取；
-  可以用鼠标拖起来（弹簧跟随），松手按最近轨迹投掷。位置永不过网（ADR-0003）。
-- **右键菜单**：右键自己的宠物弹出菜单——「打开软件」（主进程用系统浏览器打开 DSH 的
-  **登录地址**：`ctx.connection.authenticatedUrl()` 给这次进程的 launch token，换一次 Cookie
-  再 303 到干净地址；直接开裸 origin 会被 401 挡在门外）、
-  「回到初始位置」（这只回到自己的出生点）、「重载配置」（重读 `settings.json` +
-  `skin.json`，重建场景并重启 helper，不占崩溃退避次数）、
-  「扫描外观」（扫 `dsh-pet` 的宠物包目录 `~/.dsh/dsh-pet/pet/`，把没见过的素材追加进
-  `skin.json`；只在你按的时候发生，界面不会自己长出东西来），以及「动作」三级树
-  （分类 → 动画名，分类照 `dsh-pet` 的 `animations` 配置；没装 dsh-pet 时退到本机素材源
-  的平铺清单）。点一项动画名会 `POST dsh-pet /anim` 点播本体（ADR-0009），不可达时
-  只在本机播一次并冒一句人话。`skin.json` 里有两张以上皮时，还会多一个「外观」二级菜单：
-  点一张就换过去（菜单里列的是**源 id**，也就是插件名；当前那张打勾，`POST /dsh-zoo/action {action:"use-skin", skinId}`），
-  只换外观和动作——名字、身份、串门记录和礼物一个字不动（ADR-0013）。菜单只挂自己：访客和空白桌面都不弹。菜单矩形进
-  `overlay-rects`，**点菜单外不关菜单**（那一击要落到桌面），收起靠点中一项 / 移开 / 12 秒超时。
-- **点击穿透**：窗口默认整窗 `setIgnoreMouseEvents(true, { forward: true })`；只有光标
-  真的在**渲染端上报的活的命中矩形**里、且渲染端心跳确认过，才临时接管鼠标。命中矩形
-  只可能来自宠物与控件（弹层/放行卡/召回胶囊），超大或越界的矩形一律拒绝/裁剪。
-  拖拽期间渲染端持有**输入租约**（busy，300ms 续期 / 1.2s 过期）并上报一条跟随光标的
-  `ui:drag` 矩形；租约只在光标确实压在这条矩形上时生效，不会单独把整窗变成可交互。
-- **控件不占桌面**：悬停弹层只靠 overlay 命中矩形接管鼠标（含宠物与弹层之间的桥接矩形），
-  光标离开宠物与弹层后窗口立刻恢复穿透——点桌面别处不会被弹层吃掉。
-- **发现**：每 5 秒 UDP 广播 `{v,type,deviceId,nickname,port}`，收到广播即单播回执。
-  邻居 30 秒没有新报文就从邻居表消失，不需要填任何地址。
-- **放行**：第一次见到某个 `deviceId` 时入队一条 prompt，桌面上出现一张放行卡
-  （接受 / 拒绝 / 稍后再说）；放行/拒绝名单在 `<dataDir>/peers.json`，只按 `deviceId` 认，
-  可手改（改完重启 DSH 生效）。同样的动作也可以走 HTTP：
-  ```sh
-  curl -s http://127.0.0.1:<DSH端口>/dsh-zoo/state | jq '.neighbors, .prompt'
-  curl -s -X POST http://127.0.0.1:<DSH端口>/dsh-zoo/action \
-    -H 'content-type: application/json' \
-    -d '{"action":"admit","deviceId":"<邻居 UUID>"}'
-  ```
-- **本机状态上报（给别的宠物插件）**：任何本机插件都可以把「我现在在干嘛」推给 dsh-zoo：
-  ```sh
-  curl -s -X POST http://127.0.0.1:<DSH端口>/dsh-zoo/self-state \
-    -H 'content-type: application/json' \
-    -d '{"action":"写代码","semantic":"working","say":"在写代码"}'
-  ```
-  `action` 自由命名（≤64），`semantic` 固定 `working/eating/sleeping/idle/other`，`say` 最多 80 字、
-  默认活 8 秒；推来后 30 秒内优先于 dsh-pet 轮询。
-- **素材源（`<dataDir>/skin.json`）**：想用别家的外观，把它的动作目录写进来。每条源是
-  `{ id, dirs, size?, idle?, once? }`——`id` 是这张皮的身份证（也是邻居看到的 `skinId`），
-  `size` 是相对 `462` 的比例（缺省 1.0，夹在 0.5–2），`idle` 指定待机动作名，`once` 列
-  一次性动作（不进闲时轮播、清单里标 `loop:false`）：
+## 快速开始
 
-  ```json
-  { "sources": [
-    { "id": "maodie-pet", "dirs": ["C:\\Users\\me\\.dsh\\dsh-pet\\pet\\maodie-animation"],
-      "size": 693, "idle": "待机", "once": ["喷火"] }
-  ] }
-  ```
+**要求**
 
-  文件一旦存在就**取代**自动注册的 dsh-pet 源（要留鱼就得自己列进去）；两张以上时右键菜单
-  里出现「外观」。改完按「重载配置」生效，不用重启 DSH。文件带 UTF-8 BOM 也认（Windows 的
-  记事本 / PowerShell 会写）。
-- **两个开关**：`{"action":"accept-visits","enabled":false}` 管入站（默认开），
-  `{"action":"auto-visits","enabled":true}` 管自发出门（默认关）。状态都存在
-  `<dataDir>/settings.json`，重启后保持。关掉入站仍能看见邻居、照常收发心跳，只是
-  入站串门请求会被拒绝；关掉自动出门不影响手动「串门」。
-- **心跳**：放行之后每 2 秒向对方单播一条 `{v,type,deviceId,anim}`，只带本机宠物
-  当前动作名；动作变化和刚放行时会立刻补发。收到心跳不仅证明对方在线，也证明
-  **对方放行了我**（心跳只发给发送方的放行名单）。
-- **自动出门**：默认关。打开后（`{"action":"auto-visits","enabled":true}`）还要同时满足
-  四道门：本机最近 10 分钟有活动（`session/event` 优先，桌面指针兜底）、距上次出门
-  ≥15 分钟、随机挑中的邻居在线且**互相放行**。出门后它从自己桌面消失、出现在对方
-  桌面；对方「送客」、自己「召回」、30 分钟上限、或对方 2 分钟失联都会让它回家。
-- **访客常驻**：别人家的宠物来了就待着，直到你点「送客」；没有 TTL，也不设产品上的
-  同屏上限。唯一的自动清场是对方 2 分钟没有心跳（失联），双方各写一条记录。
-  渲染端的单包场景最多画 **256** 只；真到了这一步，宿主会在桌面上说一句
-  “还有 N 位没有画出来”，不会让宠物静默消失。
-- **邻居面板**：桌面上的「串门」不再替你掷骰子，先弹出那条小街——两列小房子，一格一户
-  人家，屋顶和脸色都由 `deviceId` 定，第二行写它此刻在干什么（动作名取自心跳）。点哪户就
-  去哪家；去不了的折叠在「附近还有 N 位，现在去不了」里，理由只有三种：还没放行你、
-  它还没放行你、刚掉线。鼠标停上去那颗头从窗户里探出来晃；谁换了动作，那户自己探一次。
-  自己出门期间整条街压暗，只剩「召回」。掉线的邻居在街上灰着留十分钟才消失。
-  面板是纯本地的派生视图：不新增报文字段，远端写不进来。
-- **串门**：`POST /dsh-zoo/action {"action":"visit"}`（桌面上从邻居面板点某一户会带上
-  它的 `deviceId`；不带 `deviceId` 时随机挑一位在线且互相放行的邻居，一个都没有返回
-  `no-admitted` / `no-online`）。也可以显式带 `deviceId`。请求走现有 UDP socket（`visit-request` / `visit-ack` / `visit-deny` /
-  `visit-recall`），共发三次；未放行、离线、超时、被拒绝、对方关掉了串门、已经在
-  串门都会留一条可读提示。
-- **召回 / 送客**：`{"action":"recall"}` 让自己的宠物立刻回家；
-  `{"action":"end-visit","deviceId":"<访客 UUID>"}` 送走一位访客。两者都立即清场、
-  写记录，并把 `visit-recall` 发三次（收到回执就停）：丢一包不会让对方把出门状态
-  挂到 30 分钟上限，记录也不会变成 30 分钟。
-- **点播 / 重载 / 打开软件**：`{"action":"play-anim","name":"写代码"}` 让 `dsh-pet`
-  本体播一段（失败回 `409` + `anim-unreachable` / `anim-no-pet` / `anim-rejected`）；
-  `{"action":"reload"}` 重读配置并重建桌面；`{"action":"open-site"}` 打开 DSH 的登录地址
-  （宿主现取 `connection.authenticatedUrl()`，拿不到才退回裸 origin）。
-- **带派 / 背包 / 礼物卡**：右键自己 →「带派」打开小窗，放一条 ≤500 字的字条或一个
-  ≤16 MB 的文件；也可以 `{"action":"bring","gift":{"kind":"text","text":"…"}}` 直接放进背包。
-  背包最多两件、先放的先带走；到了邻居家东西留下，访客旁边出现礼物卡（打开 / 在文件夹里
-  显示 / 扔掉，字条另有复制），**收到对方回执才算送到**，否则串门结束时退回背包。
-  细节、落盘位置与限额见下节「带派：串门捎东西」。
-- **串门记录**：每次串门在双方各留一条 `{direction, nickname, startedAt, durationMs}`，
-  `durationMs` 是真实停留时长（封顶 30 分钟），存在 `<dataDir>/visits.json`，
-  滚动上限 200 条；记录文件损坏或不可写时只丢历史。带礼物的串门多一个可选的
-  `gift: { kind, name? }`——**不记字条正文**。
-- **身份**：`deviceId` 是持久化在 `<dataDir>/identity.json` 的随机 UUID；
-  **名字只有一份**（ADR-0007）：它住在 `dsh-pet` 的 `pets[].name` 里，本机的 `nickname`
-  只是它的镜像——配置里改了名，约 30 秒内跟着改并补发一次广播；没装 `dsh-pet` 时它回落到
-  主机名或「我」，并以 `identity.json` 为准。改名用
-  `{"action":"rename","nickname":"…"}`：装了 `dsh-pet` 就写进它的配置（`PUT /config`），
-  写不进去就整个不改，返回 `409`。
+- DSH Desktop（web profile 也可以，只是没有桌面层）
+- `dsh-pet`（提供宠物、动作和素材；不装也能跑，只是显示通用小人）
+- Node.js ≥ 22.12
+- Electron 运行时（装过 `dsh-pet` 后通常已有；没有则不会显示桌面宠物）
 
-## 带派：串门捎东西
-
-一次串门可以带**一件**东西，两种形态：
-
-- **字条**：≤500 字，内联在 `visit-request` 里；保留换行，最多在卡片上显示 8 行，
-  全文用「打开」看 `note.txt`。
-- **文件**：≤16 MB（超了连背包都放不进去）；图片（jpg/png/gif/webp）在卡片上给缩略图，
-  其余给文件名 + 大小。文件本体**不进 UDP**：到了对方家，由接收方在访客抵达时从
-  对方的只读素材端口拉取，校验大小与 sha256 后才落盘。
-
-### 放在哪
-
-| 路径 | 是什么 |
-| --- | --- |
-| `<dataDir>/backpack.json` | 发送端背包：最多 2 件，先放的先带走；文件件只存**本机绝对路径**，不复制 |
-| `<dataDir>/gifts/<dir>/` | 收到的礼物：字条是 `note.txt`，文件是原文件名；每件都有一份 `meta.json`（谁捎的、原名、大小、sha256、到达时间、打开过没有） |
-| `<dataDir>/visits.json` | 串门记录；可选 `gift` 字段只记 `kind` 与文件名，不记字条正文 |
-
-`<dir>` 形如 `20261103-153245-ab12cd`：到达时间的本地时间 + 礼物 id 前 8 位，在 Finder 里
-一眼能看出什么时候收到的。真正的键始终是 UUID，拼路径前一律严格正则，绝不信报文里的字符串。
-
-### 送达、退回与限额
-
-- **送达以回执为准**：接收方真的写进 `gifts/` 之后回一条 `gift-received`（发 3 次、间隔
-  400ms）。发起方收到才把背包那件删掉；串门结束还没收到，就把 `out` 退回 `idle` 并说一句
-  「没送到」。礼物在对方那儿的卡片状态是 `pending / receiving / received / failed / refused`。
-- **限额**：单件 ≤16 MiB；`gifts/` 总量 ≤500 MiB 且 ≤200 件，超了按 `receivedAt` 删最旧
-  （整目录删，每次新礼物写成功之后剪一次）；同一邻居 ≤10 件/小时、≤50 件/天，超了
-  `refused`（原因 `rate`），**不落盘、不回执**。字条和文件共用同一道频率闸。
-- **扔掉**：卡片上的「扔掉」立刻删掉那个目录，并记进本次运行的黑名单——同一件礼物重发
-  也不会再长回来。删除不可恢复。
-- **只在 armed 期间可读**：文件路由只在「这次串门请求发出后 5 分钟内、且串门还没结束」时
-  返回字节；其他时间 404，不列目录。串门一结束（回家 / 送客 / 超时 / 失联 / 被拒绝）立刻失效。
-- **礼物坏了不丢串门**：报文里的礼物字段非法只会少一张卡片，串门照常 ack；坏文件/超时/
-  对方没开端口只让这一张卡 `failed`。
-
-### `/dsh-zoo/action` 的礼物动作
-
-| action | body | 说明 |
-| --- | --- | --- |
-| `bring` | `{ "kind": "text", "text": "…" }` 或 `{ "kind": "file", "path": "/绝对/路径" }` | 放进背包（≤2 件）。不带 gift 的 `bring` 在桌面端表示「打开带派小窗」 |
-| `unbring` | `{ "giftId": "<uuid>" }` | 从背包撤掉；只有 `idle` 件能撤，`out` 中的东西可能已经在对方磁盘上 |
-| `gift-open` | `{ "giftId": "<uuid>" }` | 用系统程序打开（字条 = `note.txt`，文件 = 本体） |
-| `gift-reveal` | `{ "giftId": "<uuid>" }` | 在文件夹里显示 |
-| `gift-discard` | `{ "giftId": "<uuid>" }` | 扔掉：有磁盘记录就整目录删除；没有记录（还没落盘/落盘失败）只拉黑、不碰文件。两种情况都记进当前运行的黑名单 |
-| `gift-copy` | `{ "giftId": "<uuid>" }` | 字条正文进剪贴板；文件没有可复制正文，返回 `409` |
-
-`GET /dsh-zoo/state` 多三项（只对本机页面/回环可用）：
-
-```json
-"skin":     { "id": "maodie-pet", "size": 462, "idle": "待机" },   // 没有素材源时是 null
-"backpack": [ { "id": "…", "kind": "text", "text": "…", "at": 1700000000000, "state": "idle" } ],
-"gifts":    [ { "id": "…", "from": { "deviceId": "…", "nickname": "…" }, "kind": "file",
-                "name": "报价单.pdf", "size": 23194, "at": 1700000000000,
-                "status": "received", "path": "/…/gifts/20261103-153245-ab12cd/报价单.pdf" } ]
-```
-
-`backpack` 按「先放的在前」；`gifts` 只列最近 **20** 件、最新在前，带 `path` 与 `status`。
-这两个字段在任何时候都是数组，不会出现 `undefined`；`skin` 是对象或 `null`，没有素材源时为 `null`。
-
-## 安装
+**安装**
 
 ```sh
-node scripts/install.mjs            # 默认装进 ~/.dsh/profiles/desktop
-node scripts/install.mjs --dry-run  # 先看它会改什么
+git clone https://github.com/Diomchen/dsh-zoo.git
+cd dsh-zoo
+node scripts/install.mjs            # 装进 ~/.dsh/profiles/desktop
+node scripts/install.mjs --dry-run  # 先看会改什么
 node scripts/install.mjs --profile web
 ```
 
-它做三件事：在 profile 的 `node_modules` 里放一个指向本仓库的符号链接（`link:` 依赖），
-把这个包名登记进 `profile.dsh.profile.bundles`，并顺手摘掉改名前的 `dsh-local-pet` 条目。
-改 `package.json` 之前会留一份 `.bak`。
-
-**装完要重启 DSH**：宿主半边是新代码，不会热加载。桌面版 DSH 重启后桌面上应该出现宠物；
-桌面层支持 **macOS 与 Windows**；web profile / Linux / 没找到 Electron 时只打一行日志，
-宠物不显示，网络功能照常。
-
-卸载：
+装完**重启 DSH**。确认接口是否正常：
 
 ```sh
-node scripts/uninstall.mjs          # 摘掉登记与链接；<DSH_HOME>/dsh-zoo/ 的用户数据保留
+curl -s http://127.0.0.1:<DSH端口>/dsh-zoo/state | jq '.neighbors'
 ```
 
-如果 DSH 自己被卡住，把 profile 的 `package.json` 从 `.bak` 还原即可。
+`<DSH端口>` 是 DSH GUI 地址里的那个本地端口。
 
-## 改名：dsh-local-pet → dsh-zoo
+**卸载**
 
-这个包现在叫 `dsh-zoo`。换掉的不只是标题（决策见 [ADR-0014](docs/adr/0014-rename-to-dsh-zoo.md)）：
+```sh
+node scripts/uninstall.mjs
+```
 
-| 旧 | 新 |
+用户数据在 `~/.dsh/dsh-zoo/`，卸载不会删除。
+
+## 它能做什么
+
+| 能力 | 说明 |
 | --- | --- |
-| npm 包名 / 插件 id `dsh-local-pet` | `dsh-zoo` |
-| 数据目录 `~/.dsh/local-pet` | `~/.dsh/dsh-zoo` |
-| 环境变量 `LOCAL_PET_*` | `DSH_ZOO_*` |
-| helper 开关 `--local-pet-*` | `--dsh-zoo-*` |
-| 本机接口 `/local-pet/*` | `/dsh-zoo/*` |
-| 局域网素材/礼物 `/local-pet-skin/*`、`/local-pet-gift/*` | `/dsh-zoo-skin/*`、`/dsh-zoo-gift/*`（旧路径仍接受） |
-| helper 自定义协议 `localpet://` | `dshzoo://` |
+| 桌面宠物 | 全屏透明、置顶、默认点击穿透；有重力，可拖拽，松手按轨迹投掷。 |
+| 邻居发现 | 同一网段 UDP 广播，自动找到邻居；第一次见面先放行。 |
+| 串门 | 手动或自动去邻居家；访客常驻，支持送客、召回和 30 分钟上限。 |
+| 邻居面板 | 点「串门」先看到一条小街：谁在线、在干嘛、能不能去。 |
+| 右键菜单 | 打开软件、回到初始位置、重载配置、扫描外观、动作、外观。 |
+| 带派（捎东西） | 出门前捎一张字条或一个文件；背包、送达回执、礼物卡都已落地。 |
+| 串门记录 | 双方各留一条记录，保留最近 200 条。 |
+| 多外观 | 用 `skin.json` 注册素材源；换皮不动名字、身份和记录。 |
 
-`dsh-pet` 是另一个插件（名字、动作、皮肤的上游），**没有改名，也不需要改**。
+## 桌面上的操作
 
-升级时会发生什么：
+| 操作 | 结果 |
+| --- | --- |
+| 悬停自己 | 弹出「串门 / 召回 / 改名」 |
+| 右键自己 | 打开软件 / 回到初始位置 / 重载配置 / 扫描外观 / 动作 / 外观 |
+| 点「串门」 | 打开邻居小街，点哪户就去哪家；去不了的会说明原因 |
+| 点访客 | 送客 |
+| 拖拽宠物 | 抓起来，松手投掷 |
+| 点礼物卡 | 打开 / 在文件夹里显示 / 复制（字条）/ 扔掉 |
 
-- **数据自动迁移**：新版本第一次启动时把旧目录整体改名成新目录；身份、放行名单、串门记录、
-  背包和礼物都跟着走。改名失败（权限、Windows 上被占用）就继续用旧目录，只打一行警告——
-  不会静默换掉设备身份。
-- **旧版邻居仍能互通**：UDP 报文里没有项目名，串门协议不变；局域网只读服务同时接受旧路径，
-  新客户端拉素材/文件礼物时也会在新路径 404 后回落旧路径。旧版本的换肤与文件礼物照常。
-- **本机旧接口不再提供**：脚本里的 `curl .../local-pet/state` 要改成 `/dsh-zoo/state`。
-- **profile 旧登记会被清掉**：`node scripts/install.mjs` 会删除 `dsh-local-pet` 依赖、
-  bundles 条目和 `node_modules` 链接；先跑一次旧版 uninstall 也可以。
-- **旧 helper**：`scripts/stop-helper.mjs` 同时认 `--dsh-zoo-host-pid` 和旧的
-  `--local-pet-host-pid`。
+右键菜单里的「重载配置」会重读 `settings.json` 和 `skin.json`，并重建桌面，不会占用崩溃退避次数。
+菜单只挂自己的宠物：访客和空白桌面都不会弹。
 
-同一个 profile 里不要同时保留新旧两个包——会画两只桌面宠物。
+## 配置
 
-## 升级
+### 数据目录
 
-**首次从 0.4.0 及更早升到 0.4.1：先停一次 helper，再换包。** 之后就不需要这一步了。
+默认是 `~/.dsh/dsh-zoo/`（跟随 `DSH_HOME`）：
 
-0.4.1 把 helper 的工作目录挪出了包目录（[ADR-0012](docs/adr/0012-helper-cwd-outside-package.md)），
-但**已经在跑的那个旧 helper 改不了自己的 cwd**——它还站在包里的 `desktop/` 上。Windows 删不掉
-任何进程的当前工作目录，于是 `pnpm add` 替换这个包时会 `ERR_PNPM_EPERM`，最坏把包删残
-（51 个文件剩 36 个，`cordis.patch.yml` 与 `desktop/` 消失，下次启动宠物直接不见、界面上没有任何错误）。
+| 路径 | 内容 |
+| --- | --- |
+| `identity.json` | 本机 `deviceId` 和昵称镜像 |
+| `peers.json` | 放行 / 拒绝名单，只按 `deviceId` 认 |
+| `settings.json` | 入站串门、自动出门两个开关 |
+| `visits.json` | 串门记录，最多 200 条 |
+| `backpack.json` | 待捎礼物，最多 2 件 |
+| `gifts/` | 收到的礼物，每件一个目录 |
+| `skin.json` | 本机素材源注册表 |
+| `skin-cache/` | 远端素材缓存，上限 200 MiB |
 
-顺序：**退出 DSH → 停 helper → 换包 → 开 DSH**。宿主还开着的话，helper 被杀掉会被立刻重新拉起，
-包还是被占着。helper 通常会跟着宿主一起退；没退的（或者你先 `SIGSTOP` 了宿主）就用下面这步清掉。
+文件都可以手改。`settings.json` / `skin.json` 改完点「重载配置」生效；`identity.json` /
+`peers.json` 需要重启 DSH。
 
-```sh
-node scripts/stop-helper.mjs --dry-run   # 先看它会停谁
-node scripts/stop-helper.mjs             # 停掉（SIGTERM，2s 不退再 SIGKILL）
-```
+### 两个开关
 
-Windows 上它走 `Get-CimInstance Win32_Process`，macOS/Linux 走 `ps`；认的是宿主拉 helper 时加的
-`--dsh-zoo-host-pid`（改名前的 `--local-pet-host-pid` 也认），不会误伤别的 Electron 进程。
-
-0.4.1 起的 helper cwd 在系统临时目录，**跑着也能整体替换**（现场实测 2.5s 一次，包不掉文件）。
-这条只对「新起的 helper」成立——旧进程的 cwd 是生下来那一刻定死的。
-
-## 打包与分发
-
-```sh
-npm pack          # → dsh-zoo-<version>.tgz
-```
-
-包里只有运行需要的东西：宿主入口、`src/`、`desktop/`（Electron helper）、`scripts/`、
-`cordis.patch.yml`、README。测试和 `.scratch/` 不进去。
-
-装到另一台机器（或另一个 profile）：
-
-```sh
-# 用 DSH 自带的 pnpm（不需要全局装 pnpm）
-node "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs" \
-  --dir ~/.dsh/profiles/desktop add /path/to/dsh-zoo-0.4.0.tgz --save-exact
-
-# 再把 "dsh-zoo" 加进 ~/.dsh/profiles/desktop/package.json 的 dsh.profile.bundles
-```
-
-Windows 上把 pnpm 的路径换成 DSH 安装目录下的同一相对路径
-（`runtime/primary-runtime/dependencies/pnpm/bin/pnpm.mjs`，反斜杠按 PowerShell 习惯写），
-或者在拷过去的仓库里直接跑 `node scripts/install.mjs`——Windows 上它用 junction，
-不需要管理员或开发者模式。
-
-然后重启 DSH。
-
-**前提**：桌面层需要一个 Electron 运行时，直接用 dsh-pet 已经下好的那一份：
-macOS 是 `~/.dsh/electron/Electron.app`，Windows 是 `%USERPROFILE%\.dsh\electron\electron.exe`
-（装过 dsh-pet 就会有）。没有的话宠物不显示，但发现、放行、串门照常工作——日志里
-会有一行说明。
-
-## 端口与防火墙
-
-- 发现/服务端口默认 **45871**（UDP），可用环境变量 `DSH_ZOO_PORT` 覆盖。
-  同一网段的所有机器要用同一个端口。串门复用同一条 UDP socket，不再另开 TCP 端口。
-- 桌面 helper 与宿主只走 **stdio 的 JSON 行**，不开新端口；素材与礼物缩略图走 helper
-  自己注册的 `dshzoo://` 协议（本机文件，仅渲染页可读）。
-- 素材源 / 文件礼物共用 **TCP 45873**（`DSH_ZOO_SKIN_PORT` 可覆盖）。串门只走 UDP 45871；
-  两边 UDP 通、但 45873 被防火墙挡住时，**串门照常成功，文件礼物取不到**：接收方卡片显示
-  「没取到」，发送方等不到回执、串门结束时把东西退回背包并说「没送到」。字条不经过这个端口。
-  改名前的邻居仍用 `/local-pet-*` 路径，服务端照常接受（见「改名」一节）。
-- macOS 首次监听会弹一次“允许传入连接”，允许后才会收到邻居广播。
-- Windows 首次监听会弹 Defender 防火墙询问（通常是 DSH 所在的 `electron.exe` 或
-  `DeepSeek Harness.exe`），要给**专用网络**放行，否则收不到邻居广播。
-- 广播只走 IPv4；不支持跨网段、NAT 穿透或中继。
-
-## 出问题时先关掉它
-
-桌面窗是**置顶全屏**的。如果它在你的机器上行为不对（挡住点击、位置怪），先关掉它：
+`settings.json`：
 
 ```json
-// ~/.dsh/dsh-zoo/settings.json —— 改完重启 DSH
-{ "desktop": false }
+{ "version": 1, "acceptVisits": true, "autoVisits": false }
 ```
 
-或者给 DSH 加上环境变量 `DSH_ZOO_DESKTOP=0`。两种方式都只停掉桌面层：宠物不显示，
-网络、发现、放行、串门状态机照常工作。
+- `acceptVisits`：默认开。关掉后只拒绝入站串门，发现、心跳和手动串门不受影响。
+- `autoVisits`：默认关。打开后还要同时满足：最近 10 分钟有活动、距上次出门 ≥15 分钟、
+  存在在线且互相放行的邻居；满足才随机挑一位出门。
+- 也可以用 HTTP `accept-visits` / `auto-visits` 改，立即生效并落盘。
 
-或者直接杀掉那一个进程（窗口随进程消失，宿主会在 300ms 后重启它，最多 5 次）：
+### 外观（skin.json）
+
+想用其他宠物包的外观，把它的动作目录写进来：
+
+```json
+{
+  "sources": [
+    {
+      "id": "maodie-pet",
+      "dirs": ["C:\\Users\\me\\.dsh\\dsh-pet\\pet\\maodie-animation"],
+      "size": 693,
+      "idle": "待机",
+      "once": ["喷火"]
+    }
+  ]
+}
+```
+
+- `id` 是这张皮的身份证，也是邻居看到的 `skinId`；`dirs` 是动作目录，每个动作一段 WebM。
+- `size` 是相对 462 的比例（默认 1.0，范围 0.5–2）；`idle` 和 `once` 可选。
+- 文件一旦存在，就**取代**自动注册的 `dsh-pet` 源；两张以上皮时右键菜单会出现「外观」。
+- 改完点「重载配置」生效；文件带 UTF-8 BOM 也认。
+
+### 端口与环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DSH_ZOO_PORT` | `45871/udp` | 发现、心跳、串门共用同一条 socket |
+| `DSH_ZOO_SKIN_PORT` | `45873/tcp` | 素材源和文件礼物共用 |
+| `DSH_ZOO_DESKTOP` | 开启 | 设为 `0` / `false` / `off` 关闭桌面层 |
+| `DSH_ZOO_ELECTRON` | 自动查找 | 指定 Electron 可执行文件 |
+
+同一网段的所有机器要用同一个 UDP 端口。macOS 首次监听会问“允许传入连接”；Windows 首次会弹
+Defender 防火墙，需要给**专用网络**放行。文件礼物还要求对方的 TCP 素材端口可达。
+
+## 本机 HTTP API
+
+所有路由都挂在 DSH 自己的本地端口上：
+
+| 方法与路径 | 用途 |
+| --- | --- |
+| `GET /dsh-zoo/state` | 邻居、访客、开关、背包、礼物和桌面诊断 |
+| `POST /dsh-zoo/action` | 放行、串门、改名、换皮、礼物等本机动作 |
+| `POST /dsh-zoo/self-state` | 其他本机插件上报“我现在在干嘛” |
+| `GET /dsh-zoo/desktop` | 桌面 helper 的实时状态 |
+
+常用动作：
+
+| 分组 | action |
+| --- | --- |
+| 放行 | `admit` / `reject` / `dismiss` |
+| 串门 | `visit` / `recall` / `end-visit` |
+| 开关 | `accept-visits` / `auto-visits` |
+| 名字与外观 | `rename` / `use-skin` |
+| 动作与桌面 | `play-anim` / `reload` / `open-site` |
+| 带派 | `bring` / `unbring` / `gift-open` / `gift-reveal` / `gift-discard` / `gift-copy` |
+
+每个 action 的 body、返回值和错误码见 [`docs/protocol.md`](docs/protocol.md)。
+`state` 里最常看的是 `neighbors`、`prompt`、`visitors`、`skin`、`backpack` 和 `gifts`。
 
 ```sh
-pkill -f "dsh-zoo/desktop/main.js"
+# 查看邻居和待放行队列
+curl -s http://127.0.0.1:<DSH端口>/dsh-zoo/state | jq '.neighbors, .prompt'
+
+# 放行一位邻居
+curl -s -X POST http://127.0.0.1:<DSH端口>/dsh-zoo/action \
+  -H 'content-type: application/json' \
+  -d '{"action":"admit","deviceId":"<邻居 UUID>"}'
+
+# 让别的本机插件上报自己的状态
+curl -s -X POST http://127.0.0.1:<DSH端口>/dsh-zoo/self-state \
+  -H 'content-type: application/json' \
+  -d '{"action":"写代码","semantic":"working","say":"在写代码"}'
 ```
 
-如果症状是「宠物看得见，但拖不动」：打开 `/dsh-zoo/desktop`，看 `helperStatus` 里的
-`ignoring` / `trustedInputs` / `busy`。一边在宠物上按左键一边刷新——`trustedInputs` 不动，
-说明真实左键根本没进渲染端（窗口层的问题，右键「重载配置」重启 helper 通常能恢复）；
-`trustedInputs` 涨了而 `busy` 不立，问题就在渲染端。把这三个数连同 `lastTrustedInputAgeMs`
-一起记下来。三个数是**零增长**还是**涨了不立**，决定下一步查窗口层还是渲染端，别混着报。
+`self-state` 的 `action` 自由命名（≤64 字），`semantic` 只能是
+`working` / `eating` / `sleeping` / `idle` / `other`，`say` 最多 80 字。
 
-Windows 上还有一种假失败要先排除：冒烟里的真实左键走 `scripts/win32-sendinput.ps1`
-（`SetCursorPos` + `SendInput`），它自己失败时冒烟现在会直说——`真实光标移动脚本正常退出`
-/ `真实拖拽脚本正常退出` 两条断言里的 `code` 不是 0、或者 `timedOut` 是 `true`，说明问题在
-脚本（锁屏、UAC 安全桌面把输入吞了、PowerShell 卡住），不在产品。
+## 带派：串门捎东西
 
-## 已知限制
+右键自己 →「带派」，放一张字条或一个文件；也可以用 `bring` 动作直接放进背包。
+到了邻居家东西留下，访客旁边出现礼物卡。**收到对方回执才算送到**，否则串门结束时退回背包。
 
-- **同时装 `dsh-pet` 与 `dsh-zoo` 会画两只桌面宠物。** 两个 helper 都是全屏透明、
-  默认点穿的置顶层，命中区只覆盖各自的宠物；两只位置重叠时，看到的是下面那只、拖到的可能
-  是上面那层——症状像「宠物拖不动」，其实是在拖另一只。真遇到时 `/dsh-zoo/desktop` 的
-  `dualLayer` 字段会给提示，启动日志里也有一行。**只留一个桌面层**：关掉 dsh-pet 的桌面窗，
-  或者用 `{"desktop": false}` / `DSH_ZOO_DESKTOP=0` 关掉这一层。
-  同一个出口里还有两项，供没有日志可翻的时候核对：`dualLayerNoted`（那行提示打印过没有，
-  只打一次；`null` 态没提示过，所以是 `false`）和 `dshPet { reachable, reason, name }`
-  （`dualLayer` 的判据：dsh-pet 够不够得着、为什么够不着、它在画谁）。`reachable=false` 时
-  `name` 也是 `null`——桥接会按配置把名字降级回 `self.pet`，但那不是「它在画谁」。
-  要看到 `dualLayer: null` 得让 `/dsh-pet-7340/state` 真的不通
-  （停掉 dsh-pet 插件）；**只关它的 helper 没用**，宿主 300ms 就把它拉回来。
-- `dsh-pet` **不上报随机待机动画**。**本机自己那只**的桌面影子只镜像被 `/anim` 点播过的动作；
-  其余时间从本机素材源的动作池里轮播（dsh-pet 装上后是 106 段，按视频时长 4–12 秒换一段），
-  所以动作种类够了，但仍然是“轮播”，不是和 dsh-pet 本体同一条随机链、不会每一帧同步。
-  跨插件的访客不走这条路：对方插件通过 `POST /dsh-zoo/self-state`
-  （或心跳里的 `action` / `semantic` / `say`）主动上报，动作和气泡通常在一两秒内出现在本机桌面。
-- 访客跟随动作的链路是“本机桥接最多 1 秒轮询 + 立即补发心跳 + 对方场景巡检 500ms”，
-  不是逐帧同步；动作变化通常在一两秒内出现在对面。
-- 自动出门的“活动”里，`session/event` 是主信号；桌面指针兜底只能看到光标进入宠物
-  （helper 只在点击穿透翻转时发 `hit`），不读取全局鼠标/键盘。没有桌面层时，只有
-  `session/event` 能打开活动门。
-- 心跳影子 30 秒没有心跳时 Host 在下一次 tick 移除；入站串门访客没有 TTL，
-  只靠「送客」或对方 2 分钟失联清理。产品上不设同屏上限，但一次场景最多 256 只
-  （超过时宿主给提示）；每个宠物一个 `<video>`，访客很多时解码开销线性增长。
-- 没有装 `dsh-pet`、`/state` 不通、或 dsh-pet 里没有宠物时，自己的宠物显示为带昵称的通用小人；
-  网络发现、放行、串门都不受影响。**访客不需要本机装 `dsh-pet`**：对方有素材源就拉远端素材，
-  没有就退回本机同名素材，再没有就画通用小人（名字 + 颜色 + 语义标记）。
-- 跨机素材只认 WebM：GIF / Spine / Live2D 等格式不认，直接通用小人；这是 SPEC v3 的明确边界。
-  素材缓存上限 200MB，超了按最旧删；对方离线后访客本来就 2 分钟内离场。
-- 放行提示最多同时排 8 位；点“稍后再说”会让队列前进，十分钟内不再问同一位。
-- 心跳影子表最多 8 位（超出挤掉最久没心跳的）；串门访客不设上限（场景单包上限 256）。
-- 串门请求最多发 3 次、约 600ms 一次；约 1.8 秒没有 ack 就明确超时。`visit-recall`
-  也发 3 次（约 500ms 一次），收到 `visit-recall-ack` 或对方不可达就停。出门在外的
-  宠物最多待 30 分钟；接收方没有 TTL，只按对方心跳判断失联。UDP 丢 ack 时接收方可能
-  先看到访客、发起方报超时；重复请求/重复召回都按 id 幂等，不会重复写记录。
-- 串门记录滚动上限 200 条；`visits.json` 损坏或不可写时，本次运行仍能在内存里看到新记录，
-  但磁盘历史会丢失。带礼物的记录只留 `gift.kind` 与文件名，**不留字条正文**。
-- **礼物限制**：单件 ≤16 MB、字条 ≤500 字、一次串门只带一件；没有文件夹、多选、URL/链接卡片、
-  礼物历史界面，也没有单独的「只把东西带过去、人不进门」或「不收礼物」开关。
-- **旧端收不到**：0.3.x 及更早的版本解析 `visit-request` 时会丢弃未知的 `gift` 字段。
-  串门和记录照常，但对方不会落盘、也不会回执；本机看到的是「没送到」，礼物退回背包。
-- **端口被防火墙挡**：文件礼物还需要对方 TCP 素材端口（默认 45873）可达。只放行 UDP 45871
-  时，串门成功但文件取不到；`gifts/` 里不会留下半个文件，卡片显示 `failed`，发送端退回背包。
-- **不自动打开**：礼物永远不会被自动打开或执行；打开 / 在文件夹里显示 / 复制都只在用户点
-  卡片时发生。卡片正文用 `textContent` 渲染，不解析 HTML/Markdown。
-- 礼物卡跟着这一次访客：访客回家 / 被送客 / 失联，卡片就收起；礼物本身留在 `<dataDir>/gifts/`，
-  在 Finder 里能看到。字条全文只存在 `note.txt`，`/state` 与记录都不搬运正文。
-- 桌面 helper 是 `focusable: false`：没有键盘输入；桌面按钮只能是鼠标点击。
-- 多显示器只保证主屏工作区；其它屏不显示。显示器变化后渲染端会把宠物夹回新工作区。
-- 宠物之间没有物理碰撞（SPEC v2 out of scope）。
-- 没有屏幕录制权限，**看窗口只能靠 helper 的 `capturePage()`**：
-  ```sh
-  npm run smoke:desktop
-  DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop   # 写 .scratch/dsh-zoo/notes/ 下的整窗与特写
-  ```
-  最近的整窗截图：`.scratch/dsh-zoo/notes/11-desktop-controls-composited.png`；
-  宠物特写：`.scratch/dsh-zoo/notes/11-desktop-controls-crop-composited.png`；
-  失败气泡：`.scratch/dsh-zoo/notes/11-desktop-controls-notice-composited.png`；
-  「带派」小窗：`.scratch/dsh-zoo/notes/27-bring-window.png`（380×480 真窗口）；
-  礼物卡（字条 / 图片 / 文件）：`.scratch/dsh-zoo/notes/25-gift-card.png`、
-  `25-gift-image.png`、`25-gift-file.png`。
+礼物卡跟着这一次访客走：访客离开卡片收起，礼物本身留在 `gifts/`。卡片正文按纯文本渲染，
+不解析 HTML/Markdown。
 
-## 在本机假装一个邻居
+| 项 | 限制 |
+| --- | --- |
+| 字条 | ≤500 字 |
+| 文件 | ≤16 MiB |
+| 背包 | 最多 2 件，先放的先带走 |
+| 收件箱 | 总量 ≤500 MiB、≤200 件 |
+| 频率 | 同一邻居 ≤10 件/小时、≤50 件/天 |
 
-没有第二台机器也能验完整条链：
+礼物永远不会自动打开或执行；打开、显示、复制、扔掉都只在用户点卡片时发生。
+细节与完整动作见 [`docs/protocol.md`](docs/protocol.md)。
+
+## 与 dsh-pet 的关系
+
+- `dsh-pet` 提供宠物本体：名字、动作、外观和桌宠窗口；`dsh-zoo` 只做联机、串门和画布。
+- 名字只有一份：源头是 `dsh-pet` 的 `pets[].name`，`dsh-zoo` 只是镜像；没装 `dsh-pet` 时
+  回落到主机名或「我」，以 `identity.json` 为准。桌面上的「改名」装了 `dsh-pet` 就写回它
+  （写不进去整体失败，不会只改一半），没装则写 `identity.json`。
+- **两个插件同时开桌面层会画两只宠物**：两个透明窗口重叠时，看到的那只和拖到的那只可能不是同一只。
+  只留一个：关掉 `dsh-pet` 的桌面窗，或用 `{"desktop": false}` / `DSH_ZOO_DESKTOP=0` 关掉这一层。
+- 访客不需要本机装 `dsh-pet`：对方有素材源就拉远端素材，没有就退回本机同名素材或通用小人。
+
+## 升级与改名
+
+项目已从 `dsh-local-pet` 改名为 `dsh-zoo`（[ADR-0014](docs/adr/0014-rename-to-dsh-zoo.md)）：
+
+- 首次启动会把 `~/.dsh/local-pet/` 整体改名为 `~/.dsh/dsh-zoo/`；改名失败就继续用旧目录，数据不丢。
+- 局域网旧路由 `/local-pet-skin/*`、`/local-pet-gift/*` 仍然接受，新旧版本邻居可以混跑。
+- 本机旧接口 `/local-pet/*` 不再提供，脚本要改成 `/dsh-zoo/*`。
+- `node scripts/install.mjs` 会顺手摘掉 profile 里旧的 `dsh-local-pet` 依赖和 bundles 条目。
+
+<details>
+<summary>从 0.4.0 及更早版本升级</summary>
+
+0.4.1 起 helper 的工作目录挪到了系统临时目录（[ADR-0012](docs/adr/0012-helper-cwd-outside-package.md)）。
+已经在跑的旧 helper 改不了自己的 cwd，Windows 上直接替换包可能 `ERR_PNPM_EPERM`。
+先退出 DSH，再：
 
 ```sh
-npm run fake-peer                                  # 默认叫「隔壁的小鲸鱼」
-npm run fake-peer -- --name 楼下的柯基 --auto-visit 5
-npm run fake-peer -- --gift $'给你留了张便条\n第二行'   # 串门时捎一条字条
+node scripts/stop-helper.mjs --dry-run
+node scripts/stop-helper.mjs
 ```
 
-它是一颗真的 UDP socket，说的是真协议（真 beacon、真心跳、真串门请求），只是 bind 在
-45872 而不是 45871——同一台机器上两个进程绑同一个 UDP 端口在 macOS 上会打架。
-报文里的 `port` 字段本来就会告诉对方“回我发这里”，所以它和真机没有区别。
+</details>
 
-流程：启动 → `/dsh-zoo/state` 的 `neighbors` 里出现它 → 放行它（桌面的放行卡，或者
-上面的 `admit`）→ 按 `v` 让它来串门：它的宠物作为访客出现在你的桌面上，待到你点「送客」。
-带上 `--auto-visit N` 会在放行 N 秒后自动来串门一次。
+## 排错
 
-键盘：`v` 让它来串门 · `a <动画名>` 换动作 · `n <新名字>` 改名 · `q` 退出。
-每次启动都是新的 `deviceId`，所以每次都会重新问一遍放行。
+| 症状 | 先做什么 |
+| --- | --- |
+| 桌面窗挡住点击或位置怪 | `settings.json` 里设 `{"desktop": false}`，或 `DSH_ZOO_DESKTOP=0`；只关桌面层，网络照常 |
+| 宠物看得见但拖不动 | 先确认是否同时装了 `dsh-pet`（两个透明层）；再看 `/dsh-zoo/desktop` 的 `helperStatus` |
+| 看不到邻居 | 同一网段？UDP 45871 被占或被防火墙挡？macOS 允许传入连接？跑 `npm run fake-peer` 排除本机问题 |
+| 文件礼物取不到 | 对方 TCP 45873 不可达；串门本身仍成功，礼物会在串门结束时退回背包 |
+| 改名后数据像丢了 | 看日志有没有「旧数据目录改名失败」；数据可能还在 `~/.dsh/local-pet/` |
 
-### 走真的网卡
-
-上面默认只走回环。让它从本机网卡发出去、再被自己的插件收回来，就是第二台机器会走的那条路：
-
-```sh
-# 先看本机网卡：ipconfig getifaddr en1  →  10.10.11.11，广播地址 10.10.11.255
-npm run fake-peer -- --bind 10.10.11.11 --to 10.10.11.255
-```
-
-这一步能证明：插件确实在收**广播**（不是只收单播回执）、报文能出网卡再回来、
-回执能找到广告的服务端口。剩下没被它证明的只有“另一台机器的广播能不能到这”。
-
-## 第二台机器
-
-两边都做同样的事：
-
-1. 把本仓库放到 B 上（clone 或直接拷目录），`node scripts/install.mjs`，重启 B 的 DSH。
-2. 两台机器同一网段，**UDP 45871 都不能被别的进程占**。
-3. macOS 会问一次“允许传入连接”，要允许（这台机器的防火墙当前是关的，所以没弹）。
-4. 两边的 `/dsh-zoo/state` 里出现对方 → 各 `admit` 一次。
-5. 任何一边都可以 `curl http://127.0.0.1:<端口>/dsh-zoo/state` 看 `neighbors` 里有没有对方。
-
-看不到邻居时，先在自己这台上跑上面那条 `--bind/--to` 的命令：
-自己这台都收不到广播，就不用怀疑对面了。
-
-## 看桌面宠物长什么样
-
-没有屏幕录制权限，真机验证和截图都走 helper：
-
-```sh
-npm run smoke:desktop                            # 透明断言 / 点击穿透 / 输入租约 / 控件 / 物理 / 场景
-DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop    # 额外写两张棋盘格合成图
-```
-
-截图模式单独跑：
-
-```sh
-env -u ELECTRON_RUN_AS_NODE \
-  ~/.dsh/electron/Electron.app/Contents/MacOS/Electron \
-  desktop/main.js --dsh-zoo-shot /tmp/pet.png --dsh-zoo-shot-delay 1200 \
-  --dsh-zoo-assets ~/.dsh/profiles/desktop/node_modules/dsh-pet/assets/webm
-```
-
-协议、点击穿透裁定、场景 v3、素材协议的细节见 [`desktop/README.md`](desktop/README.md)。
-
-冒烟里有两类断言值得知道怎么读：
-
-- **等状态，不等事件。** helper 的 `hit` 事件只在点击穿透**真的翻转**时发一条
-  （`desktop/main.js` 的 `setIgnore()` 发现状态没变就直接返回），所以「穿透已经落定、再去
-  挪光标」不会再有新事件。冒烟用 `expectIgnoring()`：事件能到就用事件（带 `reason` 证据），
-  到不了就用 `/dsh-zoo/desktop` 的状态兜底。只等事件会假超时——0.4.2 现场那次
-  「拖拽结束交还穿透」重跑即通过就是这个坑。
-- **Windows 的真实左键走 `scripts/win32-sendinput.ps1`**（`SetCursorPos` + 真 `SendInput`
-  + DPI 感知）。这一段只在 `process.platform === 'win32'` 时跑，`npm test` 用
-  [`test/win32-sendinput.test.js`](test/win32-sendinput.test.js) 守住它的三条最小约定
-  （真 SendInput / 有 DPI 声明 / 按下前挪过光标刷新 hover）。
+`/dsh-zoo/desktop` 里最常看的三项是 `ignoring`、`trustedInputs` 和 `busy`：`trustedInputs` 不增长，
+说明真实左键没进渲染端；涨了但 `busy` 不立，问题在渲染端。
 
 ## 开发
 
 ```sh
 npm test              # node --test，零依赖
-npm run smoke:desktop # 真 Electron 冒烟（不进 npm test）
-
-# 只跑礼物段（本机 Chromium sandbox 起不来时需要两个 NO_SANDBOX）：
-DSH_ZOO_SMOKE_ONLY=gift DSH_ZOO_SMOKE_NO_SANDBOX=1 DSH_ZOO_HELPER_NO_SANDBOX=1 \
-  npm run smoke:desktop
+npm run check         # 语法检查 + 全部测试
+npm run smoke:desktop # 真 Electron 冒烟，不进 npm test
+npm run fake-peer     # 在本机模拟一位邻居
+npm pack              # → dsh-zoo-<version>.tgz
 ```
 
-- 协议与敌意输入边界：`docs/protocol.md`
-- 领域词汇：`CONTEXT.md`；决策：`docs/adr/`
-- 宿主逻辑是“纯状态机 + 薄外壳”：`src/room.js` 不碰 socket/fs，I/O 在
-  `src/identity.js`、`src/peers.js`、`src/settings.js`、`src/visits.js`、`src/discovery.js`、
-  `src/pet-bridge.js`、`src/service.js`；礼物在 `src/gifts.js`（落盘与磁盘限额）、
-  `src/backpack.js`（发送端）、`src/gift-fetch.js`（拉取）、`src/gift-limits.js`（频率限额）、
-  `src/visit-record.js`（记录规范器）；桌面场景是 `src/desktop-pets.js` +
-  `src/pet-assets.js`，物理/命中/场景归一化在 `desktop/shared.js`（纯函数，单测覆盖）。
-- v1 的 GUI 客厅（`client.js`、`shell.overlay`、预览器）已按 ADR-0005 删除，代码留在
-  `v0.1.0` 标签里。
+```sh
+npm run fake-peer -- --name 楼下的柯基 --auto-visit 5
+npm run fake-peer -- --gift $'给你留了张便条\n第二行'
+```
+
+| 路径 | 是什么 |
+| --- | --- |
+| `index.js` | 宿主入口，`cordis.patch.yml` 挂载 |
+| `src/` | 宿主逻辑：纯状态机 + 薄 I/O 外壳 |
+| `desktop/` | Electron helper：全屏透明窗、点击穿透、场景渲染 |
+| `scripts/` | 安装、卸载、冒烟、假邻居 |
+| `test/` | `node:test`，零依赖 |
+| `docs/` | 协议文档和 ADR |
+
+真 Electron 冒烟的截图写在 `.scratch/dsh-zoo/notes/`；`DSH_ZOO_SMOKE_NOTES=1` 会额外保存整窗和特写。
+
+## 已知限制
+
+- 桌面层只支持 macOS / Windows，只保证主屏；没有键盘输入，宠物之间也没有物理碰撞。
+- 外观只认 WebM；GIF、Spine、Live2D 会退回通用小人；素材缓存上限 200 MiB。
+- 礼物：单件 ≤16 MiB、字条 ≤500 字、一次串门只带一件、背包最多 2 件；不自动打开。
+- 0.3.x 及更早版本不认礼物字段：串门照常，但礼物会显示「没送到」并退回背包。
+- 一次场景最多 256 只；访客没有 TTL，靠对方心跳判断失联。放行提示最多同时排 8 位，
+  心跳影子表最多 8 位。
+- 只支持 IPv4 局域网，不支持跨网段、NAT 穿透或中继。
+
+## 文档
+
+- 协议、动作、错误码与敌意输入边界：[`docs/protocol.md`](docs/protocol.md)
+- 桌面 helper、点击穿透、场景 v3、素材协议：[`desktop/README.md`](desktop/README.md)
+- 领域词汇：[`CONTEXT.md`](CONTEXT.md)
+- 决策记录：[`docs/adr/`](docs/adr/)
+- 开发笔记与验收截图：[`.scratch/dsh-zoo/`](.scratch/dsh-zoo/)
+
+## 许可证
+
+MIT
