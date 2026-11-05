@@ -1436,6 +1436,9 @@
       focused: raw.focused === true,
       focusable: raw.focusable === true,
       renameOpen: raw.renameOpen === true,
+      // 开着 ≠ 看得见：冒烟用它区分「窗建出来了」和「窗真的显示在屏幕上」。
+      renameVisible: raw.renameVisible === true,
+      renameFocused: raw.renameFocused === true,
       bringOpen: raw.bringOpen === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,

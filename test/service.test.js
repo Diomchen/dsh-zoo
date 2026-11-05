@@ -933,6 +933,39 @@ test('dsh-pet 装着但不通：改名明确失败，不回退成只改本地', 
   assert.equal(service.snapshot().self.nickname, '蓝毛小女仆')
 })
 
+test('dsh-pet 装了但没挂进这个 DSH（/config 404）：改名直写它的配置文件', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, JSON.stringify({
+    pets: [{ id: 'main', name: '蓝毛小女仆', size: 462, balanceEnabled: true, display: 'desktop' }],
+    notificationsEnabled: true
+  }, null, 2), 'utf8')
+  // 只有 DSH 外壳、没有 dsh-pet 路由：和“profile 里没启用它”一模一样
+  const server = createServer((req, res) => {
+    res.statusCode = 404
+    res.end('not found')
+  })
+  const origin = await listen(server)
+  t.after(() => close(server))
+  const service = await petService(t, { dir, configPath, origin })
+
+  const renamed = await call(service, '/dsh-zoo/action', {
+    method: 'POST',
+    body: { action: 'rename', nickname: '新名字' }
+  })
+  assert.equal(renamed.status, 200)
+  assert.deepEqual(renamed.body, { ok: true, action: 'rename', nickname: '新名字' })
+
+  // 名字的真相（配置文件）、镜像（identity.json）、桌面看到的快照三处一起变
+  const written = JSON.parse(await readFile(configPath, 'utf8'))
+  assert.equal(written.pets[0].name, '新名字')
+  assert.equal(written.pets[0].size, 462)
+  assert.equal(written.notificationsEnabled, true)
+  assert.equal(JSON.parse(await readFile(join(dir, IDENTITY_FILE), 'utf8')).nickname, '新名字')
+  assert.equal(service.snapshot().self.nickname, '新名字')
+  assert.equal(service.snapshot().self.pet.name, '新名字')
+})
+
 test('POST /dsh-zoo/self-state：动作进入快照，非法请求 400，非 POST 405', async (t) => {
   const service = makeService(t)
   await service.ready

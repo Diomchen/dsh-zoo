@@ -1740,11 +1740,16 @@ test('status 白名单放行 bringOpen：冒烟能等到「带派」小窗真的
     id: 'status-1',
     bringOpen: true,
     renameOpen: false,
+    renameVisible: false,
+    renameFocused: false,
     ignored: 'x'
   })
   assert.equal(status.ok, true)
   assert.equal(status.event.status.bringOpen, true)
   assert.equal(status.event.status.renameOpen, false)
+  // 「点了改名没反应」要能分清“窗建出来了”和“窗真的显示/拿到焦点”
+  assert.equal(status.event.status.renameVisible, false)
+  assert.equal(status.event.status.renameFocused, false)
   assert.equal('ignored' in status.event.status, false)
 })
 

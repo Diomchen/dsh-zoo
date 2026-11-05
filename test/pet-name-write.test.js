@@ -1,9 +1,18 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import test from 'node:test'
 
-import { indexOfPet, pickUserEntry, writePetName } from '../src/pet-name-write.js'
+import { indexOfPet, pickUserEntry, writePetName, writePetNameFile } from '../src/pet-name-write.js'
 
 const ORIGIN = 'http://127.0.0.1:61543'
+
+async function tempDir (t) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-name-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  return dir
+}
 
 function pet (id, name, extra = {}) {
   return {
@@ -116,4 +125,123 @@ test('没指定 petId 时改第一只', () => {
   assert.equal(indexOfPet([pet('a', 'A'), pet('b', 'B')], 'b'), 1)
   assert.equal(indexOfPet([], 'a'), -1)
   assert.equal(indexOfPet([pet('a', 'A')], 'ghost'), -1)
+})
+
+// ---------------------------------------------------------------------------
+// /config 路由不存在（dsh-pet 没挂进这个 DSH）：直写它的用户配置
+// ---------------------------------------------------------------------------
+
+/** 一份“用户在磁盘上真会有的”配置：带 BOM、带注释、有全局字段和两只宠物。 */
+const JSONC_CONFIG = '\uFEFF{\n' +
+  '  // 主人手写的备注\n' +
+  '  "pets": [\n' +
+  '    {\n' +
+  '      "id": "main",\n' +
+  '      "name": "蓝毛小女仆",\n' +
+  '      "size": 462,\n' +
+  '      "balanceEnabled": true,\n' +
+  '      "display": "desktop",\n' +
+  '      "position": { "corner": "top-right", "marginX": 24, "marginY": 100 }\n' +
+  '    },\n' +
+  '    { "id": "second", "name": "二号", "size": 300, "balanceEnabled": false, "display": "none" }\n' +
+  '  ],\n' +
+  '  "notificationsEnabled": true,\n' +
+  '  "physics": { "gravity": 1400 }\n' +
+  '}\n'
+
+test('接口 404：退到配置文件，只改目标那只的名字，别的字段一个不丢', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, JSONC_CONFIG, 'utf8')
+
+  const fetchImpl = stubFetch(() => ({ status: 404, json: null }))
+  const result = await writePetName({
+    origin: ORIGIN,
+    petId: 'second',
+    name: '新名字',
+    configPath,
+    fetchImpl
+  })
+
+  assert.deepEqual(result, { ok: true, name: '新名字', id: 'second', via: 'file' })
+  // 只发过那一次 GET：没有 PUT，也没有第二次探测
+  assert.equal(fetchImpl.calls.length, 1)
+
+  const written = JSON.parse(await readFile(configPath, 'utf8'))
+  assert.deepEqual(written.pets.map((entry) => entry.name), ['蓝毛小女仆', '新名字'])
+  assert.equal(written.pets[1].size, 300)
+  assert.equal(written.pets[1].display, 'none')
+  assert.equal(written.pets[0].position.marginY, 100)
+  // 顶层非宠物字段原样留着
+  assert.equal(written.notificationsEnabled, true)
+  assert.deepEqual(written.physics, { gravity: 1400 })
+  // 同目录不留临时文件
+  assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith('.tmp')), [])
+})
+
+test('接口 404 但配置里没有这只宠物：dsh-pet-no-pet，文件不动', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, JSONC_CONFIG, 'utf8')
+
+  const result = await writePetName({
+    origin: ORIGIN,
+    petId: 'ghost',
+    name: '新名字',
+    configPath,
+    fetchImpl: stubFetch(() => ({ status: 404, json: null }))
+  })
+
+  assert.deepEqual(result, { ok: false, error: 'dsh-pet-no-pet' })
+  assert.equal(await readFile(configPath, 'utf8'), JSONC_CONFIG)
+})
+
+test('接口 404 但文件已经没了：dsh-pet-no-pet，不新建文件', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+
+  assert.deepEqual(
+    await writePetNameFile({ configPath, petId: 'main', name: '新名字' }),
+    { ok: false, error: 'dsh-pet-no-pet' }
+  )
+  assert.deepEqual(await readdir(dir), [])
+})
+
+test('只有 404 才直写文件：5xx 与连不上都还当“dsh-pet 在但不可用”', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, JSONC_CONFIG, 'utf8')
+
+  const failed = await writePetName({
+    origin: ORIGIN,
+    petId: 'main',
+    name: '新名字',
+    configPath,
+    fetchImpl: stubFetch(() => ({ status: 500, json: null }))
+  })
+  assert.deepEqual(failed, { ok: false, error: 'dsh-pet-unreachable', status: 500 })
+
+  const offline = await writePetName({
+    origin: ORIGIN,
+    petId: 'main',
+    name: '新名字',
+    configPath,
+    fetchImpl: async () => { throw new Error('ECONNREFUSED') }
+  })
+  assert.deepEqual(offline, { ok: false, error: 'dsh-pet-unreachable' })
+
+  // 两种失败都没碰过那份配置
+  assert.equal(await readFile(configPath, 'utf8'), JSONC_CONFIG)
+})
+
+test('文件坏了：dsh-pet-write-failed，原样留着让用户能修', async (t) => {
+  const dir = await tempDir(t)
+  const configPath = join(dir, 'main-config.jsonc')
+  await writeFile(configPath, '{"pets": [', 'utf8')
+
+  assert.deepEqual(
+    await writePetNameFile({ configPath, petId: 'main', name: '新名字' }),
+    { ok: false, error: 'dsh-pet-write-failed' }
+  )
+  assert.equal(await readFile(configPath, 'utf8'), '{"pets": [')
 })

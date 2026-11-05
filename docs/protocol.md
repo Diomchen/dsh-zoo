@@ -145,9 +145,16 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 只改正在桥接那只的 `name` → `PUT /dsh-pet-7340/config`（body 是**用户层**的扁平
 `{ "pets": [...] }`，不是 GET 那种按条目聚合的形状）。写成功之后才写镜像并广播。
 
+**接口根本没挂载时直写配置文件**：`GET /config` 回 **404**（这个 DSH 里没有 dsh-pet 的路由，
+例如它不在 profile 的 `dsh.profile.bundles` 里）→ 读改写 `<DSH_HOME>/dsh-pet/main-config.jsonc`
+本身，只换目标那只的 `name`，别的顶层与宠物字段一个不动。名字的真相没搬家：用户把 dsh-pet
+启用回来，它读到的就是新名字。代价是这条路径会丢 JSONC 注释（dsh-pet 自己的 `PUT /config`
+同样会丢）。
+
 **写不进去就整个不改**：`dsh-pet` 不可达 `409 dsh-pet-unreachable`、被它拒绝
 `409 dsh-pet-write-failed`（带 `status`），本地昵称、桌面标签、广播内容一个都不动。
-不在错误路径上制造“本地叫 A、`dsh-pet` 叫 B”的分叉。
+不在错误路径上制造“本地叫 A、`dsh-pet` 叫 B”的分叉。超时、连接被拒、5xx 都算不可达，
+不会退化成直写文件——那种时候它可能正自己写这份配置。
 
 名字按 32 码点截断（`MAX_NICKNAME`），与线路上的 `nickname` 同一个上限；空名在
 `dsh-pet` 里是合法状态（回落成宠物 `id`），镜像照抄这个语义。

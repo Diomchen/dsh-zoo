@@ -1023,9 +1023,13 @@ async function verifyControls () {
   const renamePoint = rectCenterScreen(renameButton, workArea)
   client.send({ type: 'debug-dispatch', phase: 'click', x: renamePoint.x, y: renamePoint.y })
   current = await client.waitStatus((status) => status.renameOpen === true, 4000, '改名小窗打开')
+  // 开着 ≠ 看得见：透明窗只建不显（ready-to-show 没到、层级被压住）时，用户看到的就是「点了没反应」。
+  current = await client.waitStatus((status) => status.renameVisible === true, 4000, '改名小窗真的显示出来')
+  assert(current.renameFocused === true, '改名小窗拿到焦点（要能直接打字）')
   assert(current.focusable === false, '改名小窗开着时，主窗仍然不可聚焦')
   client.send({ type: 'debug-rename', close: true })
   current = await client.waitStatus((status) => status.renameOpen === false, 4000, '改名小窗关闭')
+  assert(current.renameVisible === false, '关掉之后小窗不可见')
   assert(current.focusable === false, '关掉小窗后主窗的焦点约定不变')
   client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
   await client.waitStatus((status) => status.busy === false, 3000, '改名后弹层收好、没有残留租约')

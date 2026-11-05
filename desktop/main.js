@@ -1847,6 +1847,12 @@ function statusEvent (id) {
     focused: win !== null && !win.isDestroyed() && win.isFocused(),
     /** 改名小窗是否开着；主窗的 focusable 永远是 false，两者互不影响。 */
     renameOpen: renameWin !== null && !renameWin.isDestroyed(),
+    /**
+     * 开着 ≠ 看得见：透明窗在 `ready-to-show` 之前只是内存里的一个对象。
+     * 「点了改名没反应」现场排查就靠这两个数——open 为真、visible 为假，说明窗建出来了没显示。
+     */
+    renameVisible: renameWin !== null && !renameWin.isDestroyed() && renameWin.isVisible(),
+    renameFocused: renameWin !== null && !renameWin.isDestroyed() && renameWin.isFocused(),
     /** 「带派」小窗是否开着（ticket 24）；冒烟用它等窗口真的出来。 */
     bringOpen: giftWin !== null && !giftWin.isDestroyed(),
     focusable: winFlag((candidate) => candidate.isFocusable()),

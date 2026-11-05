@@ -211,6 +211,9 @@ curl -s -X POST http://127.0.0.1:<DSH端口>/dsh-zoo/self-state \
 - 名字只有一份：源头是 `dsh-pet` 的 `pets[].name`，`dsh-zoo` 只是镜像；没装 `dsh-pet` 时
   回落到主机名或「我」，以 `identity.json` 为准。桌面上的「改名」装了 `dsh-pet` 就写回它
   （写不进去整体失败，不会只改一半），没装则写 `identity.json`。
+- **装了但没启用**（`main-config.jsonc` 还在、profile 的 `dsh.profile.bundles` 里没有 `dsh-pet`）：
+  它的 `/dsh-pet-7340/config` 路由不存在，`dsh-zoo` 会退到直接读写那份配置文件，名字仍然只有一份。
+  代价是 JSONC 注释会丢（`dsh-pet` 自己的 `PUT /config` 同样会丢）。
 - **两个插件同时开桌面层会画两只宠物**：两个透明窗口重叠时，看到的那只和拖到的那只可能不是同一只。
   只留一个：关掉 `dsh-pet` 的桌面窗，或用 `{"desktop": false}` / `DSH_ZOO_DESKTOP=0` 关掉这一层。
 - 访客不需要本机装 `dsh-pet`：对方有素材源就拉远端素材，没有就退回本机同名素材或通用小人。
@@ -246,6 +249,8 @@ node scripts/stop-helper.mjs
 | 宠物看得见但拖不动 | 先确认是否同时装了 `dsh-pet`（两个透明层）；再看 `/dsh-zoo/desktop` 的 `helperStatus` |
 | 看不到邻居 | 同一网段？UDP 45871 被占或被防火墙挡？macOS 允许传入连接？跑 `npm run fake-peer` 排除本机问题 |
 | 文件礼物取不到 | 对方 TCP 45873 不可达；串门本身仍成功，礼物会在串门结束时退回背包 |
+| 点了「改名」没有任何反应 | 桌面层跑的还是旧进程：`ps` 看 helper 的启动时间，比 `desktop/` 里文件的修改时间早就是它；重装 + 重启 DSH |
+| 改名报「dsh-pet 没有响应」 | `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:<端口>/dsh-pet-7340/config`：404 = 这个 profile 没启用 dsh-pet（新版会退到直写配置文件），连不上才是它真的不可用 |
 | 改名后数据像丢了 | 看日志有没有「旧数据目录改名失败」；数据可能还在 `~/.dsh/local-pet/` |
 
 `/dsh-zoo/desktop` 里最常看的三项是 `ignoring`、`trustedInputs` 和 `busy`：`trustedInputs` 不增长，

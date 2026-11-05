@@ -476,11 +476,17 @@ export function createService (ctx, options = {}) {
         const written = await writePetName({
           origin: dshPetOrigin(ctx),
           petId: petConfig.id,
-          name: nickname
+          name: nickname,
+          // 接口缺席（404）时直写这份配置：dsh-pet 的配置文件还在，名字的真相就还在它那儿。
+          configPath
         })
         // 原子：写不进去就什么都不改，绝不留下“本地叫 A、dsh-pet 叫 B”的分叉。
         if (!written.ok) {
           return { ok: false, error: written.error, ...(written.status ? { status: written.status } : {}) }
+        }
+        if (written.via === 'file') {
+          // 正常路径不会走到这里；真走了要能在日志里解释“为什么名字变了、接口却没被调用”。
+          warn(ctx, 'dsh-pet 的 /config 路由不在（404），这次改名直接写它的配置文件')
         }
         // dsh-pet 已经写好了：本机镜像跟上。这里走 identity.rename 是为了**落盘之后**才回 ok；
         // 磁盘写不进去也不回退——配置才是真相，重启会再对一遍（那种情况才用 mirror 兜底）。
