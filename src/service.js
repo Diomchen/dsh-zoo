@@ -10,9 +10,19 @@ import { createDesktop } from './desktop.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
-import { FARM_LOG_VIEW_LIMIT, createFarmStore, initialFarmView } from './farm.js'
-import { CROPS, CROP_IDS, WORKER_GUARD, isMature, plotRemainingMs, plotStage } from './farm-rules.js'
-import { farmErrorText } from './farm-text.js'
+import { FARM_LOG_VIEW_LIMIT, PLOT_IDS, createFarmStore, initialFarmView } from './farm.js'
+import {
+  CROPS,
+  CROP_IDS,
+  WORKER_GUARD,
+  guardValue,
+  isMature,
+  plotRemainingMs,
+  plotStage,
+  stealSucceeds
+} from './farm-rules.js'
+import { createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
+import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
   createMarketStore,
@@ -48,6 +58,8 @@ import {
   MARKET_DIGEST_INTERVAL_MS,
   MAX_GIFT_BYTES,
   createRateLimiter,
+  encodeFarmAction,
+  encodeFarmActionResult,
   encodeMarketDigest,
   normalizeSkinId,
   PEER_LOST_MS,
@@ -112,6 +124,18 @@ export const ARMED_GIFT_MS = 5 * 60 * 1000
 export const STATE_GIFT_LIMIT = 20
 /** 农场 tick（SPEC v5「存储」）：每 60 秒推进生长/露水，保存由 store 节流。 */
 export const FARM_TICK_MS = 60 * 1000
+/**
+ * 访客动作（ticket 43）：首次 + 两次重发（间隔约 500ms），1.8 秒没结果就明确超时。
+ * 重发**复用同一个 requestId 和同一串字节**；主人侧按 requestId 回放缓存，不重复落账。
+ */
+export const FARM_ACTION_ATTEMPTS = 3
+export const FARM_ACTION_RETRY_MS = 500
+export const FARM_ACTION_TIMEOUT_MS = 1800
+/** 邻居广告的 LAN 端口只信 30 秒（与邻居 TTL 同口径）。 */
+export const PEER_LAN_PORT_TTL_MS = 30 * 1000
+/** 主人侧结果幂等缓存：最近 200 条 + 10 分钟。 */
+export const MAX_FARM_RESULTS = 200
+export const FARM_RESULT_TTL_MS = 10 * 60 * 1000
 
 /**
  * 把桌面接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -172,6 +196,16 @@ export function createService (ctx, options = {}) {
   // 农场（ticket 39）：tick 节拍与测试时钟都可注入；生产默认 60 秒 / Date.now。
   const farmTickMs = positiveOption(options.farmTickMs, FARM_TICK_MS, 10)
   const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
+  // 偷菜守卫的随机源（ticket 43）：只给测试注入「必被抓」；生产是 Math.random。
+  const farmRandom = typeof options.farmRandom === 'function' ? options.farmRandom : Math.random
+  // 访客动作的重试/超时（ticket 43）：测试可以调快，生产固定 3×500ms / 1.8s。
+  const farmActionAttempts = integerOption(options.farmActionAttempts, FARM_ACTION_ATTEMPTS, 1, 8)
+  const farmActionRetryMs = positiveOption(options.farmActionRetryMs, FARM_ACTION_RETRY_MS, 10)
+  const farmActionTimeoutMs = positiveOption(
+    options.farmActionTimeoutMs,
+    FARM_ACTION_TIMEOUT_MS,
+    farmActionRetryMs
+  )
   // 交易所也可以单独注入时钟；不传就与农场共用同一个测试时钟。
   const marketNow = typeof options.marketNow === 'function' ? options.marketNow : farmNow
   // 行情 gossip（ticket 42）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值。
@@ -234,6 +268,28 @@ export function createService (ctx, options = {}) {
   const armedGifts = new Map()
   /** 正在拉取的文件礼物：同一 giftId 的迟到重试不重复下载。 */
   const receivingGifts = new Set()
+  /**
+   * 邻居广告的 LAN 服务端口（ticket 43）：deviceId → { port, at }。
+   * 只在 `onPeer` 里从 heartbeat/visit-request/beacon 的 `skinPort` 缓存 30 秒；
+   * 只给访客拉农场快照用，绝不进快照、也不进任何报文。
+   */
+  const peerLanPorts = new Map()
+  /**
+   * 主人侧 farm-action 幂等缓存（ticket 43）：`${deviceId}:${requestId}` → { result, at }。
+   * **应用之后才写**（失败也写：重试要回同一句，不能第二次重新 roll 守卫）。
+   */
+  const farmResults = new Map()
+  /**
+   * 访客侧在飞动作：requestId → { deviceId, visitId, data, attempts, nextAt, deadline, resolve }。
+   * 一次用户点击只有一个 requestId；重发复用同一串字节，结果只 settle 一次。
+   */
+  const farmRequests = new Map()
+  /** 同一 requestId 的并发重发只落账一次：key → Promise<outcome>。 */
+  const farmInflight = new Map()
+  let farmFetcher = null
+  /** 当前农场窗的访客视图（有则串门结束时要推 `ended`，别让窗停在旧快照）。 */
+  let farmWindowVisitId = null
+  let farmWindowVisitView = null
   /**
    * 入站礼物的频率限额（ticket 27）：同一邻居 ≤10 件/小时、≤50 件/天。
    * 只活在本次运行的内存里；字条与文件两条接收路径共用它。
@@ -492,6 +548,12 @@ export function createService (ctx, options = {}) {
     //   - unbring 只删 idle 件（out 中的东西可能已经在对方磁盘上了）。
     if (action === 'bring') return handleBringAction(body)
     if (action === 'unbring') return handleUnbringAction(body)
+
+    // 访客在邻居农场里偷/帮（ticket 43）：不是本地动作，走 UDP farm-action。
+    // 这里会 await 结果（最长 1.8s），所以 handleDesktopAction 只回一次 action-result。
+    if (action === 'farm-steal' || action === 'farm-help') {
+      return handleVisitFarmAction(action, body?.plotId, body?.visitId)
+    }
 
     // 农场（ticket 39）：四个本地动作。规则在 src/farm-rules.js（纯），
     // 落盘/串行化在 src/farm.js；UDP 报文没有入口，访客的偷/帮走 ticket 43。
@@ -805,11 +867,32 @@ export function createService (ctx, options = {}) {
       crops: view.crops,
       dew: view.dew,
       dewEarned: view.dewEarned,
-      guard: 0,
-      worker: null,
+      // ticket 43：守卫和访客视图共用同一个 farmGuard()；不再写死 0。
+      guard: farmGuard().guard,
+      worker: workerOf(),
       hire: view.hire,
       log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
     }
+  }
+
+  /**
+   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 这次没有出门（请求中也不算在家），
+   * 雇工值 worker 先留 false（ticket 44 接合同）。`guard` 与 `guardParts` 都从这里出，
+   * 绝不在三个地方各写一遍 0.3。
+   */
+  function farmGuard () {
+    const ownerHome = room.outboundVisit() === null
+    const worker = workerOf() !== null
+    return {
+      guard: guardValue({ ownerHome, worker }),
+      ownerHome,
+      worker
+    }
+  }
+
+  /** ticket 44 的占位：目前没有雇工合同。 */
+  function workerOf () {
+    return null
   }
 
   /**
@@ -877,36 +960,322 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  /** 菜单「农场」/ 桌面地块的申请：打开或聚焦小窗。没有桌面层就回 `desktop-off`。 */
+  /**
+   * 菜单「农场」/ 桌面地块的申请：打开或聚焦小窗。没有桌面层就回 `desktop-off`。
+   *
+   * ticket 43：正在串门时同一扇窗进入**访客模式**——先立刻推 owner 数据 + `visit.loading`，
+   * 再去拉主人的快照（不阻塞开窗）；拉回来推 `ready`，404 推 `ended`。
+   */
   function handleFarmOpen (rawPlotId) {
     if (desktop === null || typeof desktop.farmWindow !== 'function') {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
     const plotId = typeof rawPlotId === 'string' ? rawPlotId : null
-    const opened = desktop.farmWindow({
+    const out = room.outboundVisit()
+    const visit = out === null ? null : loadingVisitView(out)
+    if (out === null) {
+      farmWindowVisitId = null
+      farmWindowVisitView = null
+    } else {
+      farmWindowVisitId = out.visitId
+      farmWindowVisitView = visit
+    }
+    const opened = desktop.farmWindow(farmWindowPayload({
       open: true,
-      farm: farmWindowView(),
-      // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进 controls.farm。
-      market: marketWindowView(),
-      ...(plotId === null ? {} : { plotId })
-    })
+      plotId,
+      mode: out === null ? 'owner' : 'visitor',
+      visit
+    }))
     if (opened !== true) {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
-    return { ok: true, action: 'farm-open', window: 'opened' }
+    if (out !== null) void loadVisitFarm(out)
+    return { ok: true, action: 'farm-open', window: 'opened', mode: out === null ? 'owner' : 'visitor' }
+  }
+
+  /** `farm-window` 命令的公共载荷：owner 数据 + 交易所 + 可选访客块。 */
+  function farmWindowPayload ({ open, plotId = null, mode = null, visit = null } = {}) {
+    const out = room.outboundVisit()
+    const effectiveMode = mode ?? (out === null ? 'owner' : 'visitor')
+    const effectiveVisit = visit ?? (out !== null && farmWindowVisitId === out.visitId
+      ? farmWindowVisitView
+      : null)
+    return {
+      open: open === true,
+      mode: effectiveMode,
+      farm: farmWindowView(),
+      // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进 controls.farm。
+      market: marketWindowView(),
+      ...(effectiveVisit === null ? {} : { visit: effectiveVisit }),
+      ...(plotId === null ? {} : { plotId })
+    }
   }
 
   /**
-   * 成交后刷新已经开着的交易所页（`open:false` 不会新开窗）。
-   * 窗口不自己算价格：买卖成功后宿主把新的价目/硬币/仓库原样推回去。
+   * 成交/动作后刷新已经开着的窗口（`open:false` 不会新开窗）。
+   * 正在串门时保留访客块，别把窗口打回主人模式。
    */
   function refreshFarmWindow () {
     if (desktop === null || typeof desktop.farmWindow !== 'function') return
     try {
-      desktop.farmWindow({ open: false, farm: farmWindowView(), market: marketWindowView() })
+      desktop.farmWindow(farmWindowPayload({ open: false }))
     } catch {
       // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 访客视图（ticket 43）
+  // -------------------------------------------------------------------------
+
+  /**
+   * 访客拉到的快照只在这里读：授权从 room 的 visitors 派生。
+   * 三个条件缺一不可：visitId 能映射到当前访客、访客仍被放行、农场 store 在。
+   * 任何一条不满足都 404（不区分“没来过”和“刚走”，也不泄露那次串门存在过）。
+   */
+  function lookupFarmView (rawVisitId) {
+    if (typeof rawVisitId !== 'string' || !isVisitId(rawVisitId)) return null
+    let visitor
+    try {
+      visitor = room.visitorByVisitId(rawVisitId)
+    } catch {
+      return null
+    }
+    if (visitor === null) return null
+    if (!room.mayTalkTo(visitor.deviceId)) return null
+    if (farm === null) return null
+    return farmVisitView(visitor)
+  }
+
+  /**
+   * 访客视角的快照。硬约束（每条都有测试）：
+   *   - 4 块地固定 p1..p4；阶段/成熟/remainingMs 由纯规则算；
+   *   - **只给 stolenByMe / helpedByMe 两个布尔**，绝不回传 stolenBy/helpedBy 原数组；
+   *   - 不含任何 path/dir、不含别人的 deviceId；
+   *   - limits 只给这位访客自己的计数 + 本农场总数（不泄露全农场别的访客）。
+   */
+  function farmVisitView (visitor) {
+    const view = farm?.snapshot() ?? initialFarmView()
+    const guard = farmGuard()
+    const byId = new Map(view.plots.map((plot) => [plot.id, plot]))
+    return {
+      v: 1,
+      visitId: visitor.visitId,
+      host: { nickname: room.snapshot().self.nickname ?? identity?.nickname ?? '邻居' },
+      guard: guard.guard,
+      guardParts: { ownerHome: guard.ownerHome, worker: guard.worker },
+      plots: PLOT_IDS.map((id) => {
+        const plot = byId.get(id) ?? { id, crop: null, grownMs: 0, growMs: 0, stolenBy: [], helpedBy: [] }
+        return {
+          id,
+          crop: plot.crop,
+          stage: plotStage(plot),
+          mature: isMature(plot),
+          remainingMs: plotRemainingMs(plot),
+          stolenByMe: Array.isArray(plot.stolenBy) && plot.stolenBy.includes(visitor.deviceId),
+          helpedByMe: Array.isArray(plot.helpedBy) && plot.helpedBy.includes(visitor.deviceId)
+        }
+      }),
+      limits: farm?.visitLimits(visitor.deviceId) ?? null,
+      hire: {
+        enabled: view.hire.enabled === true,
+        wagePerHour: view.hire.wagePerHour,
+        minHours: view.hire.minHours,
+        maxHours: view.hire.maxHours
+      },
+      // 行情摘要（ticket 41/42）：只给窗口画价目与局域网指数，不转发历史。
+      market: marketVisitView(),
+      at: Date.now()
+    }
+  }
+
+  /** 行情摘要：与交易所页同源（含 bid / 新鲜指数），但不带历史。 */
+  function marketVisitView () {
+    if (market === null) return null
+    try {
+      return market.snapshot({ historyLimit: 0, withBid: true })
+    } catch {
+      return null
+    }
+  }
+
+  function loadingVisitView (out) {
+    return {
+      nickname: out.nickname,
+      state: 'loading',
+      guard: 0,
+      guardParts: { ownerHome: false, worker: false },
+      plots: [],
+      limits: null,
+      hire: null,
+      market: null,
+      error: null,
+      at: Date.now()
+    }
+  }
+
+  /** 把访客窗口切到一个新状态（ready/error/ended），并原样推给 helper。 */
+  function pushVisitState (out, patch) {
+    if (desktop === null || typeof desktop.farmWindow !== 'function') return false
+    const previous = farmWindowVisitView
+    const visit = {
+      nickname: out.nickname,
+      state: 'error',
+      guard: 0,
+      guardParts: { ownerHome: false, worker: false },
+      plots: previous?.plots ?? [],
+      limits: previous?.limits ?? null,
+      hire: previous?.hire ?? null,
+      market: previous?.market ?? null,
+      error: null,
+      at: Date.now(),
+      ...patch
+    }
+    farmWindowVisitView = visit
+    farmWindowVisitId = out.visitId
+    try {
+      return desktop.farmWindow(farmWindowPayload({
+        open: false,
+        mode: 'visitor',
+        visit
+      })) === true
+    } catch {
+      return false
+    }
+  }
+
+  /** 串门结束：窗口停在 ended（保留最后一次快照只读，不自动关窗）。 */
+  function pushVisitEnded () {
+    const previous = farmWindowVisitView
+    farmWindowVisitId = null
+    farmWindowVisitView = null
+    if (desktop === null || typeof desktop.farmWindow !== 'function') return false
+    const visit = {
+      nickname: previous?.nickname ?? null,
+      state: 'ended',
+      guard: 0,
+      guardParts: { ownerHome: false, worker: false },
+      plots: previous?.plots ?? [],
+      limits: previous?.limits ?? null,
+      hire: previous?.hire ?? null,
+      market: previous?.market ?? null,
+      error: null,
+      at: Date.now()
+    }
+    try {
+      return desktop.farmWindow(farmWindowPayload({
+        open: false,
+        mode: 'visitor',
+        visit
+      })) === true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 拉主人的快照并推给窗口。路由 404 = 串门结束；没有端口/超时 = error。
+   * 只在开窗/动作成功之后调用，不做 500ms 轮询（快照是网络，场景巡检不该打它）。
+   */
+  async function loadVisitFarm (out) {
+    if (disposed) return null
+    const current = room.outboundVisit()
+    if (current === null || current.visitId !== out.visitId) {
+      pushVisitEnded()
+      return null
+    }
+    if (farmFetcher === null || discovery === null) {
+      pushVisitState(out, { state: 'error', error: 'no-port' })
+      return null
+    }
+    const port = freshPeerLanPort(out.deviceId)
+    const endpoint = discovery.addressOf(out.deviceId)
+    if (port === null || endpoint === null) {
+      pushVisitState(out, { state: 'error', error: 'no-port' })
+      return null
+    }
+    const fetched = await farmFetcher.get({
+      address: endpoint.address,
+      port,
+      visitId: out.visitId
+    })
+    if (disposed) return null
+    const after = room.outboundVisit()
+    if (after === null || after.visitId !== out.visitId) {
+      pushVisitEnded()
+      return null
+    }
+    if (fetched.ok !== true) {
+      if (fetched.error === 'gone') {
+        pushVisitEnded()
+        return null
+      }
+      pushVisitState(out, { state: 'error', error: fetched.error })
+      return null
+    }
+    const view = normalizeVisitView(fetched.view)
+    if (view === null || view.visitId !== out.visitId) {
+      pushVisitState(out, { state: 'error', error: 'bad-shape' })
+      return null
+    }
+    // 跨农场的日上限只有访客本机算得清：把本机计数补进 limits。
+    if (view.limits !== null && typeof view.limits === 'object' && farm !== null) {
+      for (const kind of ['steal', 'help']) {
+        const entry = view.limits[kind]
+        if (entry === null || typeof entry !== 'object') continue
+        entry.perDay = kind === 'steal' ? 10 : 5
+        entry.usedToday = farm.visitActionUsed(kind)
+      }
+    }
+    const visit = { ...view, state: 'ready', error: null }
+    farmWindowVisitId = out.visitId
+    farmWindowVisitView = visit
+    if (desktop === null || typeof desktop.farmWindow !== 'function') return visit
+    try {
+      desktop.farmWindow(farmWindowPayload({ open: false, mode: 'visitor', visit }))
+    } catch {
+      // 窗口刚关：下一次开窗会再拉一份。
+    }
+    return visit
+  }
+
+  /** 每拍巡检：串门结束（召回/送客/失联/30 分钟）时把窗口切到 ended。 */
+  function noteFarmWindowVisitEnded () {
+    if (farmWindowVisitId === null) return false
+    const out = room.outboundVisit()
+    if (out !== null && out.visitId === farmWindowVisitId) return false
+    return pushVisitEnded()
+  }
+
+  /** 邻居的 LAN 端口只从报文里记 30 秒；只给农场快照用，不进快照/报文。 */
+  function notePeerLanPort (packet) {
+    if (!isPort(packet?.skinPort) || !isDeviceId(packet?.deviceId)) return false
+    const now = Date.now()
+    peerLanPorts.set(packet.deviceId, { port: packet.skinPort, at: now })
+    // 内存有界：邻居表本身有上限，这里只防被大量伪造 deviceId 灌满。
+    if (peerLanPorts.size > 256) {
+      let oldestKey = null
+      let oldestAt = Infinity
+      for (const [deviceId, entry] of peerLanPorts) {
+        if (entry.at < oldestAt) {
+          oldestAt = entry.at
+          oldestKey = deviceId
+        }
+      }
+      if (oldestKey !== null) peerLanPorts.delete(oldestKey)
+    }
+    return true
+  }
+
+  /** 端口必须新鲜（30 秒）；过期就当没有，窗口降级为“偷不了”。 */
+  function freshPeerLanPort (deviceId) {
+    const entry = peerLanPorts.get(deviceId)
+    if (entry === undefined) return null
+    if (Date.now() - entry.at > PEER_LAN_PORT_TTL_MS) {
+      peerLanPorts.delete(deviceId)
+      return null
+    }
+    return entry.port
   }
 
   /** 最近 20 件已落盘的礼物，最新在前；形状按 SPEC v4「记录与状态出口」。 */
@@ -1207,6 +1576,13 @@ export function createService (ctx, options = {}) {
           totalTimeoutMs: options.giftTimeoutMs,
           cooldownMs: options.giftCooldownMs
         })
+        // 农场快照（ticket 43）：≤64 KiB 的小 JSON、2 秒超时、只私网、失败冷却 60 秒。
+        farmFetcher = createFarmFetcher({
+          log,
+          ...(typeof options.farmFetchImpl === 'function' ? { fetchImpl: options.farmFetchImpl } : {}),
+          ...(options.farmFetchTimeoutMs === undefined ? {} : { timeoutMs: options.farmFetchTimeoutMs }),
+          ...(options.farmFetchCooldownMs === undefined ? {} : { cooldownMs: options.farmFetchCooldownMs })
+        })
         // 先起素材源，再起发现：beacon 的第一拍就能带上 skinPort。
         await serveSkin()
         if (disposed) return
@@ -1230,6 +1606,9 @@ export function createService (ctx, options = {}) {
           mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
           onPeer (packet) {
             if (disposed) return
+            // ticket 43：任何一条带 skinPort 的报文都顺手记下邻居的 LAN 端口。
+            // 不能只靠 noteVisitorSkin：那一条要求 skinId，没装素材源的邻居端口会被漏掉。
+            notePeerLanPort(packet)
             // 远端字段到这里只剩三种效果：更新邻居/访客/串门表，让客户端画出来，
             // 以及一次串门完成时写一条有界记录。这里不读本机文件、不回传本机状态。
             if (packet.type === 'heartbeat') {
@@ -1268,6 +1647,11 @@ export function createService (ctx, options = {}) {
               // 行情 gossip（ticket 42）。**不能落到 else**：那会当成 beacon 刷新邻居灯，
               // 看起来没坏，但价格永远进不了 index。
               handleMarketDigest(packet)
+            } else if (packet.type === 'farm-action') {
+              // ticket 43：主人侧的落账要等磁盘/随机/日志，不能冒到 socket 循环。
+              void handleFarmActionPacket(packet)
+            } else if (packet.type === 'farm-action-result') {
+              handleFarmActionResult(packet)
             } else {
               room.observeBeacon(packet)
             }
@@ -1482,7 +1866,9 @@ export function createService (ctx, options = {}) {
         host: '0.0.0.0',
         log,
         // 串门模块与服务器之间只通过这张表耦合：路由拿不到任何报文里的路径。
-        lookupGift: lookupArmedGift
+        lookupGift: lookupArmedGift,
+        // 农场快照（ticket 43）：每次现查 room 的活跃访客 + 本地农场，没有第二张 armed 表。
+        lookupFarm: lookupFarmView
       })
       if (skinServer === null) {
         log.warn('素材源端口没起来：访客先用本机素材，没有就画通用小人；礼物也发不出去')
@@ -1824,9 +2210,11 @@ export function createService (ctx, options = {}) {
         // 礼物四动作只带 giftId（UUID）；路径由宿主查 store，渲染端从来不知道。
         giftId: event.giftId ?? undefined,
         // 农场（ticket 40）：开窗可带 plotId，四个地块动作必须带；种地再带 cropId。
+        // 访客动作（ticket 43）可带 visitId，但宿主只拿它做校验（以 self.out 为准）。
         // 少拷一处，到 39 的 store 就只剩 bad-plot，而错误信息不会告诉你是哪一跳丢的。
         plotId: event.plotId ?? undefined,
         cropId: event.cropId ?? undefined,
+        visitId: event.visitId ?? undefined,
         // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
         qty: event.qty ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
@@ -1854,6 +2242,331 @@ export function createService (ctx, options = {}) {
     }
     // 动作可能改变访客/出门状态；flushRoomEffects 已经同步一次，这里再补一次确保及时。
     syncDesktop()
+  }
+
+  // -------------------------------------------------------------------------
+  // 访客动作（ticket 43）：访客宿主 → UDP farm-action → 主人落账 → 结果回放
+  // -------------------------------------------------------------------------
+
+  /**
+   * 访客点「偷」/「帮」的唯一入口。**在调用栈里等 UDP 结果**（最多 1.8 秒），
+   * 这样 handleDesktopAction 只回一次 action-result（单次回执契约）。
+   *
+   * 三条本地纪律：
+   *   - 一次点击只生成一个 requestId；重发复用同一串字节；
+   *   - 帮忙的 1 露水在**发出前**扣，失败/超时退回，且只退一次（settle 只发生一次）；
+   *   - 跨农场的日上限（偷 10 / 帮 5）只有本机知道，在发出前按本机账本检查。
+   */
+  async function handleVisitFarmAction (rawAction, rawPlotId, rawVisitId) {
+    const kind = rawAction === 'farm-help' ? 'help' : 'steal'
+    if (farm === null) return { ok: false, error: 'starting', notice: farmErrorText('starting') }
+    const out = room.outboundVisit()
+    if (out === null || out.phase !== 'active') return visitFarmError(kind, 'no-visit')
+    if (rawVisitId !== undefined && rawVisitId !== null) {
+      const expected = typeof rawVisitId === 'string' ? rawVisitId.trim().toLowerCase() : ''
+      if (expected !== out.visitId) return visitFarmError(kind, 'no-visit')
+    }
+    const plotId = typeof rawPlotId === 'string' && PLOT_IDS.includes(rawPlotId) ? rawPlotId : null
+    if (plotId === null) return visitFarmError(kind, 'bad-plot')
+    if (identity === null || discovery === null) return visitFarmError(kind, 'no-port')
+
+    const limit = kind === 'steal' ? 10 : 5
+    if (farm.visitActionUsed(kind) >= limit) return visitFarmError(kind, 'cap')
+
+    // 帮忙先扣露水：否则并发两次 help 都能过“露水够不够”的检查。
+    if (kind === 'help') {
+      if ((farm.snapshot().dew ?? 0) < 1) return visitFarmError(kind, 'no-dew')
+      const spent = await farm.spendDew(1)
+      if (spent.ok !== true) return visitFarmError(kind, 'no-dew')
+    }
+
+    const requestId = randomUUID()
+    let data
+    try {
+      data = encodeFarmAction({
+        deviceId: identity.deviceId,
+        visitId: out.visitId,
+        requestId,
+        action: kind,
+        plotId
+      })
+    } catch {
+      if (kind === 'help') await farm.refundDew(1)
+      return visitFarmError(kind, 'starting')
+    }
+
+    const settled = await sendFarmActionAndWait(out.deviceId, {
+      visitId: out.visitId,
+      requestId,
+      data
+    })
+    if (disposed) return { ok: false, error: 'disposed' }
+
+    if (settled.ok === true) {
+      await farm.noteVisitAction(kind)
+      if (kind === 'steal') {
+        const qty = Number.isInteger(settled.qty) && settled.qty > 0 ? settled.qty : 1
+        await farm.addCrop(settled.crop, qty)
+      } else {
+        await farm.addCoins(1)
+      }
+      // 成功：拉一份新快照推给窗口（不 await，结果先回给 helper）。
+      void loadVisitFarm(out)
+    } else if (kind === 'help') {
+      // 失败/超时/上限：露水退回。settle 只发生一次，所以最多退一次。
+      await farm.refundDew(1)
+    }
+    if (settled.error === 'no-visit') pushVisitEnded()
+
+    const result = {
+      ok: settled.ok === true,
+      action: rawAction,
+      plotId,
+      ...settled,
+      notice: farmActionResultText({
+        action: kind,
+        ok: settled.ok === true,
+        error: settled.error ?? null,
+        crop: settled.crop ?? null
+      })
+    }
+    return result
+  }
+
+  function visitFarmError (kind, error) {
+    return {
+      ok: false,
+      error,
+      notice: farmActionResultText({ action: kind, ok: false, error, crop: null })
+    }
+  }
+
+  /**
+   * 发出一次 farm-action 并等结果。首次发送失败（没地址/不再放行）立即 `no-port`；
+   * 之后由 `runFarmRetries` 重发同一串字节，到 deadline settle `timeout` 并删条目。
+   * 结果只 settle 一次：条目先从表里摘掉，迟到/重复的 result 找不到条目就丢弃。
+   */
+  function sendFarmActionAndWait (deviceId, { visitId, requestId, data }) {
+    if (disposed || discovery === null) return Promise.resolve({ ok: false, error: 'no-port' })
+    return new Promise((resolve) => {
+      const now = Date.now()
+      const entry = {
+        deviceId,
+        visitId,
+        data,
+        attempts: 1,
+        nextAt: now + farmActionRetryMs,
+        deadline: now + farmActionTimeoutMs,
+        resolve,
+        timer: null
+      }
+      farmRequests.set(requestId, entry)
+      if (!sendFarmActionPacket(deviceId, data)) {
+        settleFarmRequest(requestId, { ok: false, error: 'no-port' })
+        return
+      }
+      // 兜底：即使 visitTimer 没跑（极少见），到点也要把等待方放出来。
+      entry.timer = setTimeout(() => {
+        settleFarmRequest(requestId, { ok: false, error: 'timeout' })
+      }, farmActionTimeoutMs + 50)
+      entry.timer.unref?.()
+    })
+  }
+
+  function settleFarmRequest (requestId, result) {
+    const entry = farmRequests.get(requestId)
+    if (entry === undefined) return false
+    farmRequests.delete(requestId)
+    if (entry.timer !== null) clearTimeout(entry.timer)
+    entry.resolve(result)
+    return true
+  }
+
+  function sendFarmActionPacket (deviceId, data) {
+    if (disposed || discovery === null) return false
+    try {
+      return discovery.sendTo(deviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 访客侧的重试/超时（由 visitTimer 每 200ms 驱动）：重发同一串字节，
+   * 到 deadline 还没结果就明确 timeout。
+   */
+  function runFarmRetries () {
+    if (farmRequests.size === 0) return
+    const now = Date.now()
+    for (const [requestId, entry] of farmRequests) {
+      if (now >= entry.deadline) {
+        settleFarmRequest(requestId, { ok: false, error: 'timeout' })
+        continue
+      }
+      if (entry.attempts >= farmActionAttempts || now < entry.nextAt) continue
+      // 重发失败（对方离线/不再放行）也留着等 deadline：结果可能已经在路上。
+      sendFarmActionPacket(entry.deviceId, entry.data)
+      entry.attempts += 1
+      entry.nextAt += farmActionRetryMs
+    }
+  }
+
+  /** 收到结果：按 requestId 找到唯一等待方并 settle；未知/迟到/重复一律丢弃。 */
+  function handleFarmActionResult (packet) {
+    const entry = farmRequests.get(packet.requestId)
+    if (entry === undefined) return false
+    if (entry.deviceId !== packet.deviceId) return false
+    const out = room.outboundVisit()
+    if (out === null || out.visitId !== entry.visitId) {
+      settleFarmRequest(packet.requestId, { ok: false, error: 'no-visit' })
+      return false
+    }
+    settleFarmRequest(packet.requestId, {
+      ok: packet.ok === true,
+      ...(packet.ok === true
+        ? { crop: packet.crop, qty: packet.qty }
+        : { error: packet.error }),
+      ...(packet.caught === true ? { caught: true } : {})
+    })
+    return true
+  }
+
+  // -------------------------------------------------------------------------
+  // 主人侧：授权、幂等、落账、回结果
+  // -------------------------------------------------------------------------
+
+  function farmResultKey (deviceId, requestId) {
+    return deviceId + ':' + requestId
+  }
+
+  /** 已落账的结果只能按 requestId 回放；过期条目先清掉。 */
+  function cachedFarmResult (deviceId, requestId) {
+    const key = farmResultKey(deviceId, requestId)
+    const entry = farmResults.get(key)
+    if (entry === undefined) return null
+    if (Date.now() - entry.at > FARM_RESULT_TTL_MS) {
+      farmResults.delete(key)
+      return null
+    }
+    return entry.result
+  }
+
+  function cacheFarmResult (deviceId, requestId, result) {
+    const key = farmResultKey(deviceId, requestId)
+    farmResults.delete(key)
+    farmResults.set(key, { result, at: Date.now() })
+    while (farmResults.size > MAX_FARM_RESULTS) {
+      const oldest = farmResults.keys().next().value
+      if (oldest === undefined) break
+      farmResults.delete(oldest)
+    }
+  }
+
+  function sendFarmActionResult (deviceId, payload) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendTo(deviceId, encodeFarmActionResult({
+        deviceId: identity.deviceId,
+        ...payload
+      }))
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * 主人收到 farm-action（ticket 43）。四道门按顺序：
+   *   1. visitId 必须对应**当前**入站访客，且 packet.deviceId 与访客本人一致；
+   *   2. 同一 `${deviceId}:${requestId}` 命中缓存 → 原样回放（不重新 roll 守卫）；
+   *   3. 校验/落账在 farm store 里（成熟/生长中、每块地一次、日限额）；
+   *   4. 应用之后（失败也算）才写缓存，然后回结果。
+   *
+   * 未授权的包**静默丢弃**：不回错误，避免把“这个 visitId 存在过”变成 oracle。
+   */
+  async function handleFarmActionPacket (packet) {
+    if (disposed || farm === null || identity === null) return false
+    const visitor = room.visitorByVisitId(packet.visitId)
+    if (visitor === null || visitor.deviceId !== packet.deviceId) return false
+    if (!room.mayTalkTo(visitor.deviceId)) return false
+
+    const key = farmResultKey(packet.deviceId, packet.requestId)
+    const cached = cachedFarmResult(packet.deviceId, packet.requestId)
+    if (cached !== null) {
+      sendFarmActionResult(packet.deviceId, { requestId: packet.requestId, ...cached })
+      return true
+    }
+    // 两包重发间只隔几十 ms 时，第一次的磁盘写可能还没完成：等同一个 Promise，
+    // 绝不让第二次再进 store 重新 roll 守卫（那会得到两份不同的结果）。
+    const inflight = farmInflight.get(key)
+    if (inflight !== undefined) {
+      const shared = await inflight.catch(() => null)
+      if (shared !== null && !disposed) {
+        sendFarmActionResult(packet.deviceId, { requestId: packet.requestId, ...shared })
+      }
+      return true
+    }
+    const task = applyFarmAction(packet, visitor)
+    farmInflight.set(key, task)
+    let outcome
+    try {
+      outcome = await task
+    } finally {
+      farmInflight.delete(key)
+    }
+    if (disposed || outcome === null) return false
+    cacheFarmResult(packet.deviceId, packet.requestId, outcome)
+    sendFarmActionResult(packet.deviceId, { requestId: packet.requestId, ...outcome })
+
+    // 主人侧的日志/通知：成功偷/帮与被抓各一句；其它失败（上限/没熟）不刷屏。
+    if (outcome.ok === true && packet.action === 'steal') {
+      room.noteFarmEvent('「' + visitor.nickname + '」偷了 1 个' + cropName(outcome.crop) + '。')
+    } else if (outcome.ok === true && packet.action === 'help') {
+      room.noteFarmEvent('「' + visitor.nickname + '」来帮忙浇水了。')
+    } else if (outcome.caught === true) {
+      room.noteFarmEvent('「' + visitor.nickname + '」被抓住了。')
+    }
+    // onPeer 的 flush 在 await 之前就跑了：这次必须自己同步桌面/窗口。
+    refreshFarmWindow()
+    flushRoomEffects()
+    return true
+  }
+
+  /** 真正改农场的那一段（被 in-flight 去重包住）；返回要回放的 wire 结果。 */
+  async function applyFarmAction (packet, visitor) {
+    let result
+    try {
+      if (packet.action === 'steal') {
+        const guard = farmGuard()
+        const caught = !stealSucceeds(guard.guard, farmRandom)
+        result = await farm.markStolen(packet.plotId, visitor.deviceId, {
+          who: visitor.nickname,
+          caught
+        })
+      } else if (packet.action === 'help') {
+        result = await farm.markHelped(packet.plotId, visitor.deviceId, { who: visitor.nickname })
+      } else {
+        return null
+      }
+    } catch (error) {
+      warn(ctx, '农场动作落账失败：' + message(error))
+      result = { ok: false, error: 'starting', persisted: false }
+    }
+    return result.ok === true
+      ? {
+          ok: true,
+          crop: result.crop,
+          qty: Number.isInteger(result.qty) ? result.qty : 1,
+          ...(result.caught === true ? { caught: true } : {})
+        }
+      : {
+          ok: false,
+          error: typeof result.error === 'string' ? result.error : 'starting',
+          ...(result.caught === true ? { caught: true } : {})
+        }
+  }
+
+  function cropName (cropId) {
+    return CROPS[cropId]?.name ?? '作物'
   }
 
   /** 失败动作的兜底人话：room 通常已经给了 notice，这里只处理协议层的坏请求。 */
@@ -2305,6 +3018,7 @@ export function createService (ctx, options = {}) {
    */
   function runVisitTimers () {
     if (disposed) return
+    runFarmRetries()
     if (request !== null) {
       const out = room.outboundVisit()
       if (out === null || out.visitId !== request.visitId || out.phase !== 'requesting') {
@@ -2724,6 +3438,8 @@ export function createService (ctx, options = {}) {
     runReceiptRetries()
     reconcileOutboundGifts()
     noteEndedInboundGifts()
+    // ticket 43：串门结束（召回/送客/失联/30 分钟）时，打开的访客农场窗切到 ended。
+    noteFarmWindowVisitEnded()
     // 谁在/谁走/动作变了都可能从这里经过：让桌面场景跟上（没变就不发）。
     syncDesktop()
     return records.length
@@ -2993,6 +3709,17 @@ export function createService (ctx, options = {}) {
       receivingGifts.clear()
       giftFetcher = null
       giftRate.clear()
+      // 农场访客（ticket 43）：端口缓存、主人幂等缓存、访客在飞请求全部作废。
+      peerLanPorts.clear()
+      farmResults.clear()
+      farmInflight.clear()
+      for (const requestId of [...farmRequests.keys()]) {
+        settleFarmRequest(requestId, { ok: false, error: 'disposed' })
+      }
+      farmRequests.clear()
+      farmFetcher = null
+      farmWindowVisitId = null
+      farmWindowVisitView = null
       // 回执不再发了；还没回执的礼物先写回 idle，再放开背包引用。
       receipts.clear()
       releaseOutboundGiftsOnDispose()

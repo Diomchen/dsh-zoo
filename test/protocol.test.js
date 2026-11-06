@@ -241,6 +241,32 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'farm-action') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        visitId: randomUUID(),
+        requestId: randomUUID(),
+        action: 'steal',
+        plotId: 'p1',
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type === 'farm-action-result') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        requestId: randomUUID(),
+        ok: true,
+        crop: 'tomato',
+        qty: 1,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
     } else if (type.startsWith('visit-')) {
       raw = {
         v: PROTOCOL_VERSION,
@@ -277,9 +303,13 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
               ? ['v', 'type', 'deviceId', 'visitId', 'giftId']
               : type === 'market-digest'
                 ? ['v', 'type', 'deviceId', 'at', 'prices', 'hire']
-                : type.startsWith('visit-')
-                ? ['v', 'type', 'deviceId', 'visitId']
-                : ['v', 'type', 'deviceId', 'nickname', 'port']
+                : type === 'farm-action'
+                  ? ['v', 'type', 'deviceId', 'visitId', 'requestId', 'action', 'plotId']
+                  : type === 'farm-action-result'
+                    ? ['v', 'type', 'deviceId', 'requestId', 'ok', 'crop', 'qty']
+                    : type.startsWith('visit-')
+                      ? ['v', 'type', 'deviceId', 'visitId']
+                      : ['v', 'type', 'deviceId', 'nickname', 'port']
     )
   }
 })
@@ -569,7 +599,9 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'visit-recall',
     'visit-recall-ack',
     'gift-received',
-    'market-digest'
+    'market-digest',
+    'farm-action',
+    'farm-action-result'
   ])
 })
 

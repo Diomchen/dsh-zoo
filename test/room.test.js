@@ -847,3 +847,97 @@ test('文件礼物：访客身上只留 name/size，走 pending → receiving �
   assert.equal(room.markGiftStatus(id, giftId, 'received'), true)
   assert.equal('reason' in room.snapshot().visitors[0].gift, false)
 })
+
+// ---------------------------------------------------------------------------
+// ticket 43：按 visitId 查活跃访客（农场路由 / farm-action 的唯一授权）
+// ---------------------------------------------------------------------------
+
+/** trust 的 allowed 记录是 `{ nickname }`（不是字符串）；这里单独建一个正确的房间。 */
+function farmVisitorRoom (deviceId, nickname = '阿蟹') {
+  const room = roomAt()
+  room.setIdentity({ deviceId: randomUUID(), nickname: '我' })
+  room.setTrust({ allowed: { [deviceId]: { nickname } } })
+  return room
+}
+
+test('visitorByVisitId：命中/大小写/非法 id；返回拷贝；五个结束点后为 null', () => {
+  const visitorDevice = randomUUID()
+  const room = farmVisitorRoom(visitorDevice, '阿蟹')
+  const visitId = randomUUID()
+  assert.equal(room.observeVisitRequest({
+    deviceId: visitorDevice,
+    visitId,
+    nickname: '阿蟹',
+    anim: null
+  }, T0).reply, 'ack')
+
+  const visitor = room.visitorByVisitId(visitId)
+  assert.equal(visitor.deviceId, visitorDevice)
+  assert.equal(visitor.visitId, visitId)
+  assert.equal(visitor.nickname, '阿蟹')
+  // 大写也命中（协议层统一小写）。
+  assert.equal(room.visitorByVisitId(visitId.toUpperCase())?.visitId, visitId)
+  assert.equal(room.visitorByVisitId('nope'), null)
+  assert.equal(room.visitorByVisitId(null), null)
+
+  // 返回的是拷贝：改它不影响下一次查询。
+  visitor.nickname = '篡改'
+  assert.equal(room.visitorByVisitId(visitId).nickname, '阿蟹')
+
+  // 送客：立刻查不到。
+  assert.equal(room.endInboundVisit(visitorDevice, T0 + 1000).ok, true)
+  assert.equal(room.visitorByVisitId(visitId), null)
+})
+
+test('visitorByVisitId：对方召回、失联、信任收紧（reject）都让查询归 null', () => {
+  const visitorA = randomUUID()
+  const visitorB = randomUUID()
+  const visitorC = randomUUID()
+
+  // 对方召回。
+  const recalled = farmVisitorRoom(visitorA)
+  const visitA = randomUUID()
+  recalled.observeVisitRequest({ deviceId: visitorA, visitId: visitA, nickname: '甲', anim: null }, T0)
+  recalled.observeVisitRecall({ deviceId: visitorA, visitId: visitA }, T0 + 1000)
+  assert.equal(recalled.visitorByVisitId(visitA), null)
+
+  // 失联：2 分钟没有心跳，room.tick 清掉。
+  const lost = farmVisitorRoom(visitorB)
+  const visitB = randomUUID()
+  lost.observeVisitRequest({ deviceId: visitorB, visitId: visitB, nickname: '乙', anim: null }, T0)
+  lost.tick(T0 + 2 * 60 * 1000)
+  assert.equal(lost.visitorByVisitId(visitB), null)
+
+  // 信任收紧：reject 立刻清场。
+  const denied = farmVisitorRoom(visitorC)
+  const visitC = randomUUID()
+  denied.observeVisitRequest({ deviceId: visitorC, visitId: visitC, nickname: '丙', anim: null }, T0)
+  denied.reject(visitorC)
+  assert.equal(denied.visitorByVisitId(visitC), null)
+})
+
+test('isVisitorVisit：deviceId + visitId 双证，交叉组合为 false', () => {
+  const a = randomUUID()
+  const b = randomUUID()
+  const room = roomAt()
+  room.setIdentity({ deviceId: randomUUID(), nickname: '我' })
+  room.setTrust({ allowed: { [a]: { nickname: '甲' }, [b]: { nickname: '乙' } } })
+  const visitA = randomUUID()
+  const visitB = randomUUID()
+  room.observeVisitRequest({ deviceId: a, visitId: visitA, nickname: '甲', anim: null }, T0)
+  room.observeVisitRequest({ deviceId: b, visitId: visitB, nickname: '乙', anim: null }, T0)
+
+  assert.equal(room.isVisitorVisit(a, visitA), true)
+  assert.equal(room.isVisitorVisit(a.toUpperCase(), visitA.toUpperCase()), true)
+  assert.equal(room.isVisitorVisit(a, visitB), false)
+  assert.equal(room.isVisitorVisit(b, visitA), false)
+  assert.equal(room.isVisitorVisit('nope', visitA), false)
+})
+
+test('noteFarmEvent：进 noticed 快照；空文本/null 不产生一条', () => {
+  const room = roomAt()
+  assert.equal(room.noteFarmEvent('「阿蟹」偷了 1 个番茄。', T0).text, '「阿蟹」偷了 1 个番茄。')
+  assert.equal(room.noteFarmEvent('   ', T0), null)
+  assert.equal(room.noteFarmEvent(null, T0), null)
+  assert.equal(room.snapshot().notices[0].text, '「阿蟹」偷了 1 个番茄。')
+})

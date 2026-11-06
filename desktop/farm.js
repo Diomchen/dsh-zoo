@@ -9,6 +9,7 @@
 
 const api = window.dshZooFarm
 const plotsEl = document.getElementById('plots')
+const visitorBannerEl = document.getElementById('visitor-banner')
 const inventoryEl = document.getElementById('inventory')
 const logEl = document.getElementById('log')
 const marketRowsEl = document.getElementById('market-rows')
@@ -63,9 +64,22 @@ const LOG_TEXT = {
   settle: '结算'
 }
 const MARKET_SIDE_TEXT = { buy: '买种', sell: '卖出' }
+/** 访客模式的固定错误码 → 窗口兜底文案（宿主 notice 优先，这里是拿不到 notice 时）。 */
+const VISIT_ERROR_TEXT = {
+  'no-port': '对方没开局域网端口，看不到他家的农场。',
+  timeout: '主人家的宠物没回应，稍后再试。',
+  gone: '这次串门已经结束了。',
+  'bad-shape': '对方发来的农场数据不对。',
+  'bad-json': '对方发来的农场数据坏了。',
+  'too-large': '对方的农场数据太大了。',
+  refused: '对方没有回应。'
+}
 
 let farm = null
 let market = null
+/** 访客模式（ticket 43）：宿主决定模式；窗口只画 visit 块，不自己联网。 */
+let mode = 'owner'
+let visit = null
 let selectedPlot = null
 let busy = false
 let toastTimer = null
@@ -137,9 +151,157 @@ function button (label, options = {}) {
   return el
 }
 
+function visitLimit (kind) {
+  const entry = visit?.limits?.[kind]
+  return entry !== null && typeof entry === 'object' ? entry : null
+}
+
+function visitCapReached (kind) {
+  const limit = visitLimit(kind)
+  if (limit === null) return false
+  const used = Number(limit.usedInVisit) || 0
+  const perVisit = Number(limit.perVisit) || 0
+  const total = Number(limit.usedOnFarm) || 0
+  const perFarm = Number(limit.perFarm) || 0
+  const today = Number(limit.usedToday) || 0
+  const perDay = Number(limit.perDay) || 0
+  return (perVisit > 0 && used >= perVisit) ||
+    (perFarm > 0 && total >= perFarm) ||
+    (perDay > 0 && today >= perDay)
+}
+
+/** 访客模式的顶部说明：谁家、守卫、今天还能偷/帮几次、loading/error/ended 的原因。 */
+function renderVisitorBanner () {
+  if (visitorBannerEl === null) return
+  if (mode !== 'visitor' || visit === null) {
+    visitorBannerEl.hidden = true
+    visitorBannerEl.textContent = ''
+    return
+  }
+  const state = typeof visit.state === 'string' ? visit.state : 'error'
+  const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
+  visitorBannerEl.hidden = false
+  visitorBannerEl.dataset.state = state
+  if (state === 'loading') {
+    visitorBannerEl.textContent = '正在看「' + nickname + '」家的农场…'
+    return
+  }
+  if (state === 'ended') {
+    visitorBannerEl.textContent = '这次串门已经结束了；下面留的是最后一次快照，不能再偷/帮。'
+    return
+  }
+  if (state === 'error') {
+    const reason = VISIT_ERROR_TEXT[visit.error] ?? '暂时看不到他家的农场。'
+    visitorBannerEl.textContent = '看不到「' + nickname + '」家的农场：' + reason
+    return
+  }
+  const guard = Math.round((Number(visit.guard) || 0) * 100)
+  const steal = visitLimit('steal')
+  const help = visitLimit('help')
+  const stealText = steal === null
+    ? ''
+    : ' · 偷 ' + (Number(steal.usedInVisit) || 0) + '/' + (Number(steal.perVisit) || 0)
+  const helpText = help === null
+    ? ''
+    : ' · 帮 ' + (Number(help.usedInVisit) || 0) + '/' + (Number(help.perVisit) || 0)
+  visitorBannerEl.textContent = '在「' + nickname + '」家 · 守卫 ' + guard + '%' + stealText + helpText
+}
+
+function renderVisitPlots () {
+  const plots = visit !== null && Array.isArray(visit.plots) ? visit.plots : []
+  if (plots.length === 0) {
+    const message = document.createElement('p')
+    message.className = 'empty'
+    message.textContent = visit?.state === 'loading'
+      ? '正在等主人家的农场快照…'
+      : '这次串门没有可看的地块。'
+    plotsEl.appendChild(message)
+    return
+  }
+  const ready = visit?.state === 'ready'
+  for (const plot of plots) {
+    const meta = cropMeta(plot.crop)
+    const card = document.createElement('article')
+    card.className = 'plot'
+    card.dataset.stage = plot.stage
+    card.dataset.plot = plot.id
+    if (plot.id === selectedPlot) card.dataset.selected = 'true'
+
+    const head = document.createElement('div')
+    head.className = 'plot-head'
+    const name = document.createElement('span')
+    name.textContent = plotName(plot)
+    head.appendChild(name)
+    const badge = document.createElement('span')
+    badge.className = 'badge' + (plot.stage === 'mature' ? ' mature' : '')
+    badge.textContent = plot.stage === 'mature' ? '熟了' : plot.stage === 'growing' ? '生长中' : '空地'
+    head.appendChild(badge)
+    card.appendChild(head)
+
+    const body = document.createElement('div')
+    body.className = 'plot-body'
+    const icon = document.createElement('span')
+    icon.className = 'crop-icon' + (plot.stage === 'empty' ? ' empty' : ' growing')
+    icon.setAttribute('aria-hidden', 'true')
+    icon.textContent = meta === null ? '🟫' : meta.emoji
+    body.appendChild(icon)
+
+    const info = document.createElement('div')
+    info.className = 'plot-info'
+    const headline = document.createElement('strong')
+    headline.textContent = meta === null ? '空地' : meta.name
+    info.appendChild(headline)
+    const detail = document.createElement('span')
+    if (plot.stolenByMe === true) detail.textContent = '这一轮已经偷过了'
+    else if (plot.helpedByMe === true) detail.textContent = '这一轮已经帮过了'
+    else if (plot.stage === 'mature') detail.textContent = '成熟了，可以偷 1 个'
+    else if (plot.stage === 'growing') {
+      detail.textContent = '还要 '
+      const countdown = document.createElement('span')
+      countdown.className = 'countdown'
+      countdown.textContent = formatRemaining(plot.remainingMs)
+      detail.appendChild(countdown)
+      countdowns.set(plot.id, countdown)
+    } else detail.textContent = '还空着'
+    info.appendChild(detail)
+    body.appendChild(info)
+    card.appendChild(body)
+
+    const actions = document.createElement('div')
+    actions.className = 'plot-actions'
+    if (plot.stage === 'mature' && plot.stolenByMe !== true) {
+      actions.appendChild(button('偷 1 个', {
+        plotId: plot.id,
+        action: 'steal',
+        className: 'harvest',
+        disabled: busy || !ready || visitCapReached('steal'),
+        reason: !ready ? '这次串门已经结束' : '今天的次数用完了'
+      }))
+    }
+    if (plot.stage === 'growing' && plot.helpedByMe !== true) {
+      actions.appendChild(button('帮忙 +10%', {
+        plotId: plot.id,
+        action: 'help',
+        className: 'primary',
+        disabled: busy || !ready || visitCapReached('help') || (Number(farm?.dew) || 0) < 1,
+        reason: !ready ? '这次串门已经结束' : '露水不够或次数用完了'
+      }))
+    }
+    if (plot.stolenByMe === true) actions.appendChild(button('已偷过', { plotId: plot.id, disabled: true }))
+    else if (plot.helpedByMe === true) actions.appendChild(button('已帮过', { plotId: plot.id, disabled: true }))
+    card.appendChild(actions)
+    plotsEl.appendChild(card)
+  }
+}
+
 function renderPlots () {
   plotsEl.textContent = ''
   countdowns.clear()
+  renderVisitorBanner()
+  if (mode === 'visitor' && visit !== null) {
+    renderVisitPlots()
+    return
+  }
   if (farm === null) {
     const message = document.createElement('p')
     message.className = 'empty'
@@ -254,6 +416,35 @@ function renderPlots () {
 
 function renderInventory () {
   inventoryEl.textContent = ''
+  if (mode === 'visitor' && visit !== null) {
+    const row = (label, values) => {
+      const rowEl = document.createElement('div')
+      rowEl.className = 'row'
+      const labelEl = document.createElement('span')
+      labelEl.className = 'label'
+      labelEl.textContent = label
+      rowEl.appendChild(labelEl)
+      for (const [name, count] of values) {
+        const valueEl = document.createElement('span')
+        valueEl.className = 'value'
+        valueEl.textContent = count === '' ? name : name + ' ' + count
+        rowEl.appendChild(valueEl)
+      }
+      inventoryEl.appendChild(rowEl)
+    }
+    const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
+    row('访客', [['在「' + nickname + '」家', '']])
+    row('钱包', [['🪙 硬币', Number(farm?.coins) || 0], ['💧 露水', Number(farm?.dew) || 0]])
+    const steal = visitLimit('steal')
+    const help = visitLimit('help')
+    if (steal !== null || help !== null) {
+      row('次数', [
+        ['偷', steal === null ? '—' : (Number(steal.usedInVisit) || 0) + '/' + (Number(steal.perVisit) || 0)],
+        ['帮', help === null ? '—' : (Number(help.usedInVisit) || 0) + '/' + (Number(help.perVisit) || 0)]
+      ])
+    }
+    return
+  }
   if (farm === null) return
   const row = (label, value) => {
     const rowEl = document.createElement('div')
@@ -293,8 +484,16 @@ function renderLog () {
     const text = document.createElement('span')
     const crop = cropMeta(entry.crop)
     const kind = LOG_TEXT[entry.kind] ?? '动作'
-    text.textContent = kind + (crop === null ? '' : ' ' + crop.name) +
-      (Number(entry.qty) > 0 && entry.kind !== 'plant' ? ' ×' + entry.qty : '')
+    const who = typeof entry.who === 'string' && entry.who !== '' ? '「' + entry.who + '」' : ''
+    if (entry.kind === 'steal' && Number(entry.qty) === 0) {
+      text.textContent = who === '' ? '被抓住了' : who + '被抓住了'
+    } else if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
+      text.textContent = who + (entry.kind === 'steal' ? '偷了 ' : '帮了 ') +
+        (crop === null ? '1 个作物' : '1 个' + crop.name)
+    } else {
+      text.textContent = kind + (crop === null ? '' : ' ' + crop.name) +
+        (Number(entry.qty) > 0 && entry.kind !== 'plant' ? ' ×' + entry.qty : '')
+    }
     const when = document.createElement('span')
     when.className = 'when'
     when.textContent = formatTime(entry.at)
@@ -502,6 +701,13 @@ function renderMarket () {
 }
 
 function renderSubtitle () {
+  if (mode === 'visitor' && visit !== null) {
+    const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
+    const guard = Math.round((Number(visit.guard) || 0) * 100)
+    subtitleEl.textContent = '「' + nickname + '」家 · 守卫 ' + guard + '% · 🪙 ' +
+      (Number(farm?.coins) || 0) + ' · 💧 ' + (Number(farm?.dew) || 0)
+    return
+  }
   if (farm === null) {
     subtitleEl.textContent = '正在等宿主把地块送过来…'
     return
@@ -523,8 +729,24 @@ function render () {
 }
 
 function tick () {
-  if (farm === null) return
   let needsRender = false
+  if (mode === 'visitor' && visit !== null && Array.isArray(visit.plots)) {
+    for (const plot of visit.plots) {
+      if (plot.stage !== 'growing') continue
+      plot.remainingMs = Math.max(0, Number(plot.remainingMs) - 1000)
+      if (plot.remainingMs === 0) {
+        plot.stage = 'mature'
+        plot.mature = true
+        needsRender = true
+        continue
+      }
+      const node = countdowns.get(plot.id)
+      if (node !== undefined) node.textContent = formatRemaining(plot.remainingMs)
+    }
+    if (needsRender) render()
+    return
+  }
+  if (farm === null) return
   for (const plot of farm.plots) {
     if (plot.stage !== 'growing') continue
     plot.remainingMs = Math.max(0, Number(plot.remainingMs) - 1000)
@@ -541,7 +763,8 @@ function tick () {
 }
 
 function submit (payload) {
-  if (busy || farm === null || api === null || typeof api?.submit !== 'function') return
+  const ready = farm !== null || (mode === 'visitor' && visit !== null && visit.state === 'ready')
+  if (busy || !ready || api === null || typeof api?.submit !== 'function') return
   busy = true
   hideToast()
   render()
@@ -567,6 +790,11 @@ plotsEl.addEventListener('click', (event) => {
     return
   }
   if (action === 'harvest' || action === 'water' || action === 'fertilize') {
+    submit({ action: 'farm-' + action, plotId })
+    return
+  }
+  // 访客模式（ticket 43）：只发 plotId；visitId/requestId 由宿主生成并复用。
+  if (action === 'steal' || action === 'help') {
     submit({ action: 'farm-' + action, plotId })
   }
 })
@@ -629,6 +857,10 @@ api?.onState((payload) => {
   if (payload === null || typeof payload !== 'object') return
   farm = payload.farm !== null && typeof payload.farm === 'object' ? payload.farm : null
   market = payload.market !== null && typeof payload.market === 'object' ? payload.market : null
+  mode = payload.mode === 'visitor' ? 'visitor' : 'owner'
+  visit = mode === 'visitor' && payload.visit !== null && typeof payload.visit === 'object'
+    ? payload.visit
+    : null
   selectedPlot = typeof payload.plotId === 'string' && payload.plotId !== '' ? payload.plotId : null
   busy = false
   // 不在这里 hideToast：动作成功后宿主紧接着会推新状态，toast 不能被这次刷新抹掉。

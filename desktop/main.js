@@ -151,6 +151,9 @@ let farmWin = null
 let farmState = null
 /** 交易所页 / `farm-window` 里随农场一起下发的 market view（价目/历史/index）。 */
 let farmMarket = null
+/** 访客模式（ticket 43）：`owner` / `visitor` 与主人家的快照块（state/guard/plots/limits）。 */
+let farmMode = 'owner'
+let farmVisit = null
 /** 点某块地开窗时带上的 plotId；窗口用它高亮那一块。 */
 let farmPlotId = null
 /** 正在等宿主答复的那次农场动作（action id）与它的计时器。 */
@@ -1593,6 +1596,8 @@ function sendFarmState () {
     farmWin.webContents.send('dsh-zoo:farm-state', {
       farm: farmState,
       market: farmMarket,
+      mode: farmMode,
+      visit: farmVisit,
       plotId: farmPlotId
     })
   } catch {
@@ -1818,10 +1823,12 @@ function applyCommand (command) {
       return
     }
     case 'farm-window': {
-      // 宿主交下来的完整农场 + 交易所（ticket 40/41）：不落盘、不拼路径，只转发给窗口。
+      // 宿主交下来的完整农场 + 交易所 + 访客块（ticket 40/41/43）：不落盘、不拼路径。
       // `open:true` 打开/聚焦（已开则只刷新）；`open:false` 刷新已开着的窗。
       farmState = command.farm
       farmMarket = command.market
+      farmMode = command.mode === 'visitor' ? 'visitor' : 'owner'
+      farmVisit = command.visit ?? null
       farmPlotId = typeof command.plotId === 'string' ? command.plotId : null
       if (command.open === true) {
         if (!openFarmWindow()) {

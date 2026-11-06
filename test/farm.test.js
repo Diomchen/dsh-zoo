@@ -39,7 +39,7 @@ const TODAY = localDayKey(NOON)
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-farm-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 
@@ -528,4 +528,141 @@ test('形状不对：坏字段/坏地块/坏日志只修不崩，且只告警一
   assert.deepEqual(store.snapshot().seeds, {}, '坏计数丢掉，不白送种子')
   assert.deepEqual(store.snapshot().plots.map((plot) => plot.id), ['p1', 'p2', 'p3', 'p4'])
   assert.deepEqual(store.snapshot().log, [])
+})
+
+// ---------------------------------------------------------------------------
+// ticket 43：访客相关的仓库动作、偷/帮落账、每日计数
+// ---------------------------------------------------------------------------
+
+const VISITOR_A = '11111111-1111-4111-8111-111111111111'
+const VISITOR_B = '22222222-2222-4222-8222-222222222222'
+
+test('访客仓库：addCrop / addCoins / spendDew / refundDew 都落盘并夹上限', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createFarmStore(dir, { now: makeClock().now })
+
+  assert.deepEqual(await store.addCrop('tomato', 2), {
+    ok: true, action: 'add-crop', crop: 'tomato', qty: 2,
+    crops: { tomato: 2 }, persisted: true
+  })
+  assert.deepEqual((await store.addCrop('tomato', 999)).crops, { tomato: MAX_STACK })
+  assert.equal((await store.addCrop('alien', 1)).error, 'bad-crop')
+
+  const coins = await store.addCoins(5)
+  assert.equal(coins.ok, true)
+  assert.equal(coins.coins, START_COINS + 5)
+  assert.equal((await readFarm(dir)).coins, START_COINS + 5)
+
+  // 露水不够不扣；够则扣；退款封顶 48。
+  assert.equal((await store.spendDew(1)).error, 'no-dew')
+  await store.addCoins(1)
+  await store.refundDew(3)
+  assert.equal(store.snapshot().dew, 3)
+  assert.equal((await store.spendDew(2)).dew, 1)
+  await store.refundDew(99)
+  assert.equal(store.snapshot().dew, MAX_DEW)
+})
+
+test('markStolen：成熟才可偷、同一访客同一块只一次、日志带 who、stolenBy 让收获 −1', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const mature = plantedPlot('p1', 'tomato', { grownMs: CROPS.tomato.growMs })
+  await writeFarm(dir, farmFile({ plots: [mature, ...PLOT_IDS.slice(1).map(emptyPlot)] }))
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  // 未成熟 / 空地 → not-mature / bad-plot。
+  assert.equal((await store.markStolen('p2', VISITOR_A)).error, 'bad-plot')
+  // 成功。
+  const stolen = await store.markStolen('p1', VISITOR_A, { who: '  楼上的 柯基 ' })
+  assert.equal(stolen.ok, true)
+  assert.equal(stolen.crop, 'tomato')
+  assert.equal(stolen.qty, 1)
+  assert.equal(stolen.yield, CROPS.tomato.yield - 1)
+  assert.deepEqual(stolen.plot.stolenBy, [VISITOR_A])
+  assert.equal(store.snapshot().log[0].kind, 'steal')
+  assert.equal(store.snapshot().log[0].who, '楼上的 柯基')
+  assert.equal((await readFarm(dir)).plots[0].stolenBy[0], VISITOR_A)
+
+  // 同一访客同一块地：already-stolen；换个访客可以继续偷。
+  assert.equal((await store.markStolen('p1', VISITOR_A)).error, 'already-stolen')
+  const second = await store.markStolen('p1', VISITOR_B)
+  assert.equal(second.ok, true)
+  assert.equal(second.yield, CROPS.tomato.yield - 2)
+  // 同一访客在不同地块：仍可偷（本块地判定与日限额是两件事）。
+})
+
+test('markStolen 日限额：3/访客/农场、5/农场；被抓只写日志不占次数', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const plots = PLOT_IDS.map((id) => plantedPlot(id, 'tomato', { grownMs: CROPS.tomato.growMs }))
+  await writeFarm(dir, farmFile({ plots }))
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  // 被抓：不标 stolenBy、不占次数，但日志有 qty 0 + who。
+  const caught = await store.markStolen('p1', VISITOR_A, { who: '阿蟹', caught: true })
+  assert.deepEqual(caught, { ok: false, error: 'guard', caught: true, crop: 'tomato', qty: 0, persisted: true })
+  assert.deepEqual(store.snapshot().plots[0].stolenBy, [])
+  assert.equal(store.snapshot().log[0].qty, 0)
+  assert.equal(store.snapshot().log[0].who, '阿蟹')
+
+  // 3 次成功（p1/p2/p3）后这位访客在第 4 块地被 cap。
+  assert.equal((await store.markStolen('p1', VISITOR_A)).ok, true)
+  assert.equal((await store.markStolen('p2', VISITOR_A)).ok, true)
+  assert.equal((await store.markStolen('p3', VISITOR_A)).ok, true)
+  assert.equal((await store.markStolen('p4', VISITOR_A)).error, 'cap')
+
+  // 农场总上限 5：B 偷两块后到 5，C 也被 cap。
+  assert.equal((await store.markStolen('p4', VISITOR_B)).ok, true)
+  assert.equal((await store.markStolen('p3', VISITOR_B)).ok, true)
+  assert.equal((await store.markStolen('p2', '33333333-3333-4333-8333-333333333333')).error, 'cap')
+
+  const limits = store.visitLimits(VISITOR_A)
+  assert.equal(limits.steal.perVisit, 3)
+  assert.equal(limits.steal.usedInVisit, 3)
+  assert.equal(limits.steal.usedOnFarm, 5)
+})
+
+test('markHelped：生长中才可帮、+10% 不改 waterings、每块地一次、日志带 who', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const growing = plantedPlot('p1', 'tomato', { grownMs: 1000 })
+  const mature = plantedPlot('p2', 'tomato', { grownMs: CROPS.tomato.growMs })
+  const empty = emptyPlot('p3')
+  await writeFarm(dir, farmFile({ plots: [growing, mature, empty, emptyPlot('p4')] }))
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  const helped = await store.markHelped('p1', VISITOR_A, { who: '阿蟹' })
+  assert.equal(helped.ok, true)
+  const plot = store.snapshot().plots[0]
+  assert.equal(plot.grownMs, 1000 + Math.floor(CROPS.tomato.growMs * 0.1))
+  assert.equal(plot.waterings, 0)
+  assert.deepEqual(plot.helpedBy, [VISITOR_A])
+  assert.equal(store.snapshot().log[0].kind, 'help')
+  assert.equal(store.snapshot().log[0].who, '阿蟹')
+
+  assert.equal((await store.markHelped('p1', VISITOR_A)).error, 'already-helped')
+  assert.equal((await store.markHelped('p2', VISITOR_A)).error, 'bad-plot')
+  assert.equal((await store.markHelped('p3', VISITOR_A)).error, 'bad-plot')
+})
+
+test('访客本机日计数：偷 10 / 帮 5 封顶，跨本地日重置', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  for (let i = 1; i <= 10; i += 1) {
+    assert.equal((await store.noteVisitAction('steal')).ok, true, String(i))
+  }
+  assert.equal((await store.noteVisitAction('steal')).error, 'cap')
+  for (let i = 1; i <= 5; i += 1) {
+    assert.equal((await store.noteVisitAction('help')).ok, true, String(i))
+  }
+  assert.equal((await store.noteVisitAction('help')).error, 'cap')
+  assert.equal(store.visitActionUsed('steal'), 10)
+  assert.equal(store.visitActionUsed('help'), 5)
+
+  // 跨本地日：计数归零（写动作会先 #advance 到新的一天）。
+  clock.advance(24 * HOUR_MS)
+  assert.equal(store.visitActionUsed('steal'), 0)
+  assert.equal((await store.noteVisitAction('steal')).ok, true)
 })

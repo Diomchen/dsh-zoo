@@ -46,12 +46,18 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 { "v": 1, "type": "visit-recall", "deviceId": "<uuid>", "visitId": "<uuid>" }
 { "v": 1, "type": "visit-recall-ack", "deviceId": "<uuid>", "visitId": "<uuid>" }
 { "v": 1, "type": "gift-received", "deviceId": "<uuid>", "visitId": "<uuid>", "giftId": "<uuid>" }
+{ "v": 1, "type": "farm-action", "deviceId": "<uuid>", "visitId": "<uuid>", "requestId": "<uuid>",
+  "action": "steal", "plotId": "p1" }
+{ "v": 1, "type": "farm-action-result", "deviceId": "<uuid>", "requestId": "<uuid>",
+  "ok": true, "crop": "tomato", "qty": 1 }
+{ "v": 1, "type": "farm-action-result", "deviceId": "<uuid>", "requestId": "<uuid>",
+  "ok": false, "error": "guard", "caught": true }
 ```
 
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `farm-action` / `farm-action-result` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -64,6 +70,11 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `visitId` | `visit-*` | 一次串门的随机 UUID；与 `deviceId` 同一种形状，但只用于关联这一次串门 |
 | `gift` | `visit-request` | 可选，一次串门最多一件；`kind:'text'` 或 `kind:'file'`，字段规则见「礼物字段」 |
 | `giftId` | `gift-received` | 礼物的 UUID（与报文里的 `gift.id` 同一个键）；只用于确认「哪一件到了」 |
+| `requestId` | `farm-action`、`farm-action-result` | 一次访客动作的 UUID 幂等键；重发复用同一个，主人按它回放缓存 |
+| `plotId` | `farm-action` | 地块 id，固定 `p1`–`p4`；不能是路径或自由文本 |
+| `ok` / `error` | `farm-action-result` | `ok` 布尔；失败时 `error` 是固定枚举（`no-visit` / `bad-plot` / `bad-action` / `not-mature` / `already-stolen` / `already-helped` / `cap` / `guard` / `starting`） |
+| `crop` / `qty` | `farm-action-result` | 成功时作物 id（`tomato`/`carrot`/`pumpkin`）与 0..1 的数量；失败不带 |
+| `caught` | `farm-action-result` | 只能与 `error:'guard'` 一起出现；表示被守卫抓住（没有罚款） |
 | `reason` | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。旧端解析时会丢弃未知字段，行为不变；
@@ -451,6 +462,39 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 - 串门结束（回家 / 送客 / 超时 / 失联 / 被拒绝）立即 unarm；5 分钟到点也自然失效。
 - 没装素材源的用户也会监听这个端口——它必须保持**只读、只按 id 白名单、不列目录**。
 
+## 农场快照与动作（ticket 43）
+
+访客打开主人的农场时，由**访客的宿主服务**（不是 helper）向主人拉一份只读 JSON：
+
+```
+GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
+```
+
+- **只在这次串门活跃期间可读**：授权直接从 room 的 `visitors` 派生（`visitorByVisitId`），
+  送客 / 对方召回 / 失联 / 信任收紧 / 宿主 dispose 五条结束路径都会让下一次请求自然
+  `404`。没有第二张 armed 表，也没有“曾经来过”的 410/403。
+- 形状：`{ v, visitId, host:{nickname}, guard, guardParts:{ownerHome,worker}, plots[], limits, hire, market, at }`。
+  `plots` 固定 `p1..p4`，每块只给 `stage/mature/remainingMs` 与 **`stolenByMe`/`helpedByMe` 两个布尔**；
+  绝不回传 `stolenBy`/`helpedBy` 原数组（那里是别的访客 deviceId），也不含任何路径。
+- `200` + `application/json; charset=utf-8` + `cache-control: no-store`；
+  坏 `visitId`、未知/已结束、多一段路径一律 `404`；非 GET/HEAD → `405`；HEAD 只回头。
+- 访客侧只连私网/回环：2 秒超时、响应 ≤64 KiB、失败按 `address:port` 冷却 60 秒；
+  `404` 等同于“这次串门结束了”，窗口切到 `ended`，不再重试。
+
+偷/帮走 UDP（不是 HTTP）：访客 helper → 访客宿主（`farm-steal`/`farm-help`）→
+`farm-action` → 主人校验 `visitId`/`deviceId`/成熟或生长中/每块地每轮一次/日限额/守卫 →
+落账 → `farm-action-result` → 访客宿主更新自己的仓库（偷来的作物、帮忙的硬币）→ helper 刷新。
+
+- 主人按 `${deviceId}:${requestId}` 缓存最近 200 条结果（10 分钟 TTL）；**落账之后**才写缓存
+  （失败也写），重发原样回放，不重新 roll 守卫、不重复扣。
+- 未授权的 `farm-action`（visitId 不匹配当前访客 / deviceId 冒用）**静默丢弃**，不回错误，
+  避免把“这个 visitId 存在过”变成 oracle。
+- 限额：偷 3/访客/农场、5/农场/天、10/访客/天（最后一条由访客本机账本算）；
+  帮 3/访客/农场、5/访客/天；每块地每轮每访客各一次。帮忙的 1 露水在**发出前**扣，
+  失败/超时退回。
+- 守卫 = 主人在家 0.3（v1 没有雇工；ticket 44 再加 0.5，封顶 0.8）；成功率 `1 − 守卫`。
+  被抓住 = 这次白跑，没有罚款、不改地块。
+
 ### 改名前后的路径（ADR-0014）
 
 项目从 `dsh-local-pet` 改名为 `dsh-zoo`，路由随之改成 `/dsh-zoo-skin/*` 与
@@ -496,6 +540,11 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
   `visits.json` 只能由本机完成的串门触发写入，且写入有界。
 - 礼物路由只读、不列目录、不接受任何用户路径；只返回 `armedGifts` 里按 `giftId` 查到的那一个
   本机绝对路径，且在 armed 窗口外一律 `404`。这一层是 ADR-0011 唯一新增的局域网攻击面。
+- 农场快照同样是局域网只读面：没有路径、没有别人的 deviceId、只在串门活跃期可读，
+  响应 ≤64 KiB；`farm-action` 的 `visitId`/`requestId` 必须是 UUID、`plotId` 必须 `p1..p4`、
+  `action`/`error` 是固定枚举，`caught` 只能跟 `guard` 一起出现。
+  `farm-action-result` 只按 `requestId` 回放已落账的结果；未授权动作静默丢弃。
+  动作的日限额与每块地每轮一次把刷屏限制在有界范围内，不另叠滑动窗口。
 - 协议里永远没有坐标、朝向、拖拽状态、项目名、文件路径或会话内容（ADR-0003）。
   礼物报文只有 `id`/`kind`/`name`/`size`/`sha256`/`text`；本机路径只留在发送端的背包与
   接收端的 `gifts/` 里，连 `/dsh-zoo/state` 的礼物 `path` 也只是本机回环页面能读到。
