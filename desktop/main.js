@@ -2050,6 +2050,24 @@ function applyCommand (command) {
       void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
       return
     }
+    case 'debug-farm-tab': {
+      // 冒烟用：切到农场小窗的某个页签，好分别截农场/交易所/雇工三页。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const tab = command.tab === 'market' || command.tab === 'hire' ? command.tab : 'farm'
+      const selector = '.tab[data-tab="' + tab + '"]'
+      const script = '(() => {' +
+        'const tab = document.querySelector(' + JSON.stringify(selector) + ');' +
+        'if (!tab) return false;' +
+        'tab.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
     case 'debug-freeze-hover':
       if (!debugEnabled) return
       hover.frozen = command.frozen === true

@@ -2172,6 +2172,11 @@
         if (farmAction === null) return { ok: false, error: 'bad-farm-action' }
         return { ok: true, command: { type, id, ...farmAction } }
       }
+      case 'debug-farm-tab': {
+        // 冒烟用：切到农场小窗的某个页签（农场 / 交易所 / 雇工）。
+        const tab = raw.tab === 'market' || raw.tab === 'hire' ? raw.tab : 'farm'
+        return { ok: true, command: { type, id, tab } }
+      }
       case 'debug-gift-submit':
         // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
         if (typeof raw.text !== 'string') return { ok: false, error: 'bad-text' }

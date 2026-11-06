@@ -2345,6 +2345,23 @@ async function verifyFarmWindow () {
     guard: 0.8,
     log: [{ at: Date.now(), kind: 'plant', crop: 'tomato', qty: 1 }]
   }
+  // 交易所页（票 41/45）：价格、bid、局域网指数和最近成交都要有值，截图才不是空表。
+  const marketAt = Date.now()
+  const fullMarket = {
+    prices: {
+      tomato: { base: 5, price: 5, volume24h: 6, at: marketAt, bid: 5 },
+      carrot: { base: 6, price: 6.4, volume24h: 2, at: marketAt, bid: 6 },
+      pumpkin: { base: 30, price: 28, volume24h: 1, at: marketAt, bid: 25 }
+    },
+    index: {
+      tomato: { price: 5.2, at: marketAt, samples: 2, stale: false },
+      carrot: { price: 6.1, at: marketAt, samples: 2, stale: false }
+    },
+    history: [
+      { crop: 'tomato', side: 'sell', qty: 3, price: 5, at: marketAt },
+      { crop: 'carrot', side: 'buy', qty: 2, price: 6, at: marketAt - 60000 }
+    ]
+  }
   // 票 44：雇工页的数据也随 farm-window 一起下发（窗口读不到 /state）。
   const fullContracts = {
     outgoing: [{
@@ -2460,9 +2477,13 @@ async function verifyFarmWindow () {
   assert(workerPet !== undefined, '渲染端画出 role:worker 的雇工')
   assert(workerPet.badge === 'work', '雇工带 work 角标')
   assert(workerState.controls.farm.worker.nickname === '阿蟹', '摘要里带雇工昵称')
+  const workerStripPath = join(OUT_DIR, 'farm-worker-strip.png')
+  client.send({ type: 'shot', id: 'smoke-farm-worker-strip', path: workerStripPath })
+  await client.waitFrom(client.mark(), (event) => event.type === 'shot', 6000, '雇工地块条截图')
+  assert(existsSync(workerStripPath), '雇工地块条截图落盘：' + workerStripPath)
 
   // 2) 宿主开窗：完整农场（种子/作物/日志/remainingMs）+ contracts（雇工页）随命令下发。
-  client.send({ type: 'farm-window', open: true, farm: fullFarm, contracts: fullContracts, plotId: 'p1' })
+  client.send({ type: 'farm-window', open: true, farm: fullFarm, market: fullMarket, contracts: fullContracts, plotId: 'p1' })
   await client.waitStatus((status) => status.farmOpen === true, 5000, '农场小窗打开')
   await client.waitStatus((status) => status.farmVisible === true, 5000, '农场小窗可见')
   await sleep(900)
@@ -2492,6 +2513,43 @@ async function verifyFarmWindow () {
   }
   assert(visible > image.width * image.height * 0.2,
     '小窗里画出了可见内容（' + visible + '/' + (image.width * image.height) + ' px）')
+
+  // 票 45：交易所页 / 雇工页分别切页截图；页签由 debug-farm-tab 真点一次。
+  const marketPath = join(OUT_DIR, 'farm-market.png')
+  client.send({ type: 'debug-farm-tab', tab: 'market', id: 'smoke-farm-market-tab' })
+  await sleep(600)
+  client.send({ type: 'shot', id: 'smoke-farm-market-shot', path: marketPath, window: 'farm' })
+  const marketShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-market-shot',
+    8000,
+    '交易所页截图'
+  )
+  assert(marketShot.width > 0 && existsSync(marketPath), '交易所页截图落盘：' + marketPath)
+  const marketImage = decodePng(readFileSync(marketPath))
+  let marketVisible = 0
+  for (let index = 3; index < marketImage.data.length; index += 4) {
+    if (marketImage.data[index] > 16) marketVisible += 1
+  }
+  assert(marketVisible > marketImage.width * marketImage.height * 0.2, '交易所页画出了可见内容')
+
+  const hirePath = join(OUT_DIR, 'farm-hire.png')
+  client.send({ type: 'debug-farm-tab', tab: 'hire', id: 'smoke-farm-hire-tab' })
+  await sleep(600)
+  client.send({ type: 'shot', id: 'smoke-farm-hire-shot', path: hirePath, window: 'farm' })
+  const hireShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-hire-shot',
+    8000,
+    '雇工页截图'
+  )
+  assert(hireShot.width > 0 && existsSync(hirePath), '雇工页截图落盘：' + hirePath)
+  const hireImage = decodePng(readFileSync(hirePath))
+  let hireVisible = 0
+  for (let index = 3; index < hireImage.data.length; index += 4) {
+    if (hireImage.data[index] > 16) hireVisible += 1
+  }
+  assert(hireVisible > hireImage.width * hireImage.height * 0.2, '雇工页画出了可见内容')
 
   // 4) 窗口 → 主进程 → 宿主：真渲染进程里提交一次种地，helper 必须报一条窄申请。
   const actionMark = client.mark()
@@ -2537,6 +2595,9 @@ async function verifyFarmWindow () {
   )
   assert(hireAction.enabled === true && hireAction.wagePerHour === 10, '挂牌字段过窄口')
   assert((await client.status()).farmOpen === true, '挂牌成功不关农场小窗')
+  // 回复这次挂牌，否则 main.js 的 farmPending 会挡住下一次农场申请。
+  client.send({ type: 'action-result', id: hireAction.id, ok: true })
+  await sleep(250)
 
   // 6) 失败也留在窗里，notice 说人话；之后 hide 才关。
   const failMark = client.mark()
@@ -2550,22 +2611,110 @@ async function verifyFarmWindow () {
   client.send({ type: 'action-result', id: failed.id, ok: false, error: 'bad-plot', notice: '这块地不在了，刷新后再试。' })
   await sleep(450)
   assert((await client.status()).farmOpen === true, '动作失败也不关农场小窗')
+  // 失败 toast 会活 4.2 秒；等它消失再截访客视图，别把上一段的错误画进验收图。
+  await sleep(4300)
+
+  // 票 43/45：访客视图（偷/帮按钮、守卫、上限）单独截一张；数据全由宿主 push。
+  const visitorVisit = {
+    state: 'ready',
+    nickname: '阿蟹',
+    guard: 0.8,
+    guardParts: { ownerHome: true, worker: true },
+    plots: [
+      { id: 'p1', crop: 'tomato', stage: 'mature', mature: true, remainingMs: 0, stolenByMe: false, helpedByMe: false },
+      { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 45 * 60 * 1000, stolenByMe: false, helpedByMe: false },
+      { id: 'p3', crop: null, stage: 'empty', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: false },
+      { id: 'p4', crop: 'pumpkin', stage: 'growing', mature: false, remainingMs: 2 * 60 * 60 * 1000, stolenByMe: true, helpedByMe: false }
+    ],
+    limits: {
+      steal: { perVisit: 3, usedInVisit: 1, perFarm: 5, usedOnFarm: 2, perDay: 10, usedToday: 3 },
+      help: { perVisit: 3, usedInVisit: 0, perFarm: 5, usedOnFarm: 1, perDay: 5, usedToday: 1 }
+    },
+    error: null,
+    at: Date.now()
+  }
+  client.send({
+    type: 'farm-window',
+    open: true,
+    mode: 'visitor',
+    farm: fullFarm,
+    market: fullMarket,
+    contracts: fullContracts,
+    visit: visitorVisit
+  })
+  client.send({ type: 'debug-farm-tab', tab: 'farm', id: 'smoke-farm-visitor-tab' })
+  await sleep(700)
+  const stealPath = join(OUT_DIR, 'farm-steal.png')
+  client.send({ type: 'shot', id: 'smoke-farm-steal-shot', path: stealPath, window: 'farm' })
+  const stealShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-steal-shot',
+    8000,
+    '访客偷/帮截图'
+  )
+  assert(stealShot.width > 0 && existsSync(stealPath), '访客偷/帮截图落盘：' + stealPath)
+
   client.send({ type: 'hide' })
   await client.waitStatus((status) => status.farmOpen === false, 4000, 'hide 关掉农场小窗')
 
-  let notePath = null
+  const notePaths = []
   if (WRITE_NOTES) {
     mkdirSync(NOTES_DIR, { recursive: true })
-    const composite = compositeOverCheckerboard(image)
-    notePath = join(NOTES_DIR, '40-farm-window-composited.png')
-    writeFileSync(notePath, encodePng(composite))
-    info('农场小窗截图笔记：' + notePath)
+    const noteComposite = (src, name) => {
+      const srcImage = decodePng(readFileSync(src))
+      const dest = join(NOTES_DIR, name)
+      writeFileSync(dest, encodePng(compositeOverCheckerboard(srcImage)))
+      notePaths.push(dest)
+      info('农场截图笔记：' + dest)
+      return dest
+    }
+    noteComposite(pngPath, '45-farm-window-composited.png')
+    noteComposite(marketPath, '45-farm-market-composited.png')
+    noteComposite(hirePath, '45-farm-hire-composited.png')
+    noteComposite(stealPath, '45-farm-steal-composited.png')
+    // 地块条截图是整张透明桌面；按命中矩形裁到地块条附近再合成，笔记里才看得清。
+    const noteStrip = (src, state, name) => {
+      const srcImage = decodePng(readFileSync(src))
+      const rect = state.uiRects.find((candidate) => candidate.id === 'ui:farm-strip')
+      if (rect === undefined) return null
+      const scale = srcImage.width / ready.workArea.width
+      const pad = 24 * scale
+      const left = Math.max(0, Math.floor(rect.x * scale - pad))
+      const top = Math.max(0, Math.floor(rect.y * scale - pad))
+      const width = Math.min(srcImage.width - left, Math.floor(rect.width * scale + pad * 2))
+      const height = Math.min(srcImage.height - top, Math.floor(rect.height * scale + pad * 2))
+      if (width <= 0 || height <= 0) return null
+      const dest = join(NOTES_DIR, name)
+      writeFileSync(dest, encodePng(compositeOverCheckerboard(cropImage(srcImage, left, top, width, height))))
+      notePaths.push(dest)
+      info('农场地块条截图笔记：' + dest)
+      return dest
+    }
+    noteStrip(stripPath, stripState, '45-farm-strip.png')
+    noteStrip(workerStripPath, workerState, '45-farm-worker-strip.png')
+    // 雇工角标特写：地块条里看不到宠物本体，单独裁一张 worker pet 的图。
+    const workerPetState = workerState.pets.find((pet) => pet.role === 'worker')
+    if (workerPetState !== undefined) {
+      const srcImage = decodePng(readFileSync(workerStripPath))
+      const scale = srcImage.width / ready.workArea.width
+      const pad = 18 * scale
+      const left = Math.max(0, Math.floor((workerPetState.x - 18) * scale))
+      const top = Math.max(0, Math.floor((workerPetState.y - 18) * scale))
+      const width = Math.min(srcImage.width - left, Math.floor((workerPetState.width + 36) * scale))
+      const height = Math.min(srcImage.height - top, Math.floor((workerPetState.height + 36) * scale))
+      if (width > 0 && height > 0) {
+        const dest = join(NOTES_DIR, '45-farm-worker.png')
+        writeFileSync(dest, encodePng(compositeOverCheckerboard(cropImage(srcImage, left, top, width, height))))
+        notePaths.push(dest)
+        info('雇工角标特写：' + dest)
+      }
+    }
   }
 
   client.send({ type: 'quit' })
   const exit = await Promise.race([client.exited, sleep(10000).then(() => null)])
   assert(exit !== null, '农场用例结束后 helper 自己退出')
-  return { pngPath, stripPath, notePath }
+  return { pngPath, stripPath, marketPath, hirePath, stealPath, workerStripPath, notePaths }
 }
 
 async function verifyManager () {
@@ -2763,7 +2912,10 @@ try {
   if (farmWindow !== null) {
     console.log('桌面地块条截图：' + farmWindow.stripPath)
     console.log('农场小窗截图：' + farmWindow.pngPath)
-    if (farmWindow.notePath !== null) console.log('  农场小窗（棋盘格合成）: ' + farmWindow.notePath)
+    console.log('交易所页截图：' + farmWindow.marketPath)
+    console.log('雇工页截图：' + farmWindow.hirePath)
+    console.log('访客偷/帮截图：' + farmWindow.stealPath)
+    for (const note of farmWindow.notePaths) console.log('  农场截图笔记: ' + note)
   }
   if (standalone !== null) console.log('截图模式输出：' + standalone.pngPath)
 } catch (error) {

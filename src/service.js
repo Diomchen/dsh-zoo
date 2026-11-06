@@ -155,6 +155,8 @@ export const PEER_LAN_PORT_TTL_MS = 30 * 1000
 /** 主人侧结果幂等缓存：最近 200 条 + 10 分钟。 */
 export const MAX_FARM_RESULTS = 200
 export const FARM_RESULT_TTL_MS = 10 * 60 * 1000
+/** 合同 ack 重放缓存（work-ack / work-settle-ack）：同样 200 条 + 10 分钟。 */
+export const MAX_WORK_RESULTS = 200
 
 /**
  * 把桌面接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -1268,7 +1270,7 @@ export function createService (ctx, options = {}) {
     const key = deviceId + ':' + requestId
     workResults.delete(key)
     workResults.set(key, { data, at: contractClock() })
-    while (workResults.size > 100) {
+    while (workResults.size > MAX_WORK_RESULTS) {
       const oldest = workResults.keys().next().value
       if (oldest === undefined) break
       workResults.delete(oldest)

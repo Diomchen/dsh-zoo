@@ -171,3 +171,23 @@ test('ticket 44：/state.contracts 始终是完整空形状；farm.guard/worker 
   assert.deepEqual(service.snapshot().contracts, state.body.contracts)
   assert.deepEqual(Object.keys(state.body.contracts).sort(), ['incoming', 'outgoing'])
 })
+
+test('ticket 45：/state 的 farm / market / contracts 形状与 docs/protocol.md 一致', async (t) => {
+  const dir = await tempDir(t)
+  const service = makeService(t, dir)
+  await service.ready
+
+  const state = await call(service, '/dsh-zoo/state')
+  assert.equal(state.status, 200)
+  assert.deepEqual(Object.keys(state.body.farm).sort(), [
+    'coins', 'crops', 'dew', 'dewEarned', 'guard', 'hire', 'log', 'plots', 'seeds', 'worker'
+  ])
+  assert.deepEqual(Object.keys(state.body.farm.plots[0]).sort(), [
+    'crop', 'fertilized', 'growMs', 'grownMs', 'helpedBy', 'id', 'plantedAt', 'stolenBy', 'waterings'
+  ])
+  assert.deepEqual(Object.keys(state.body.farm.hire).sort(), ['enabled', 'maxHours', 'minHours', 'wagePerHour'])
+  assert.deepEqual(Object.keys(state.body.market).sort(), ['history', 'index', 'prices'])
+  assert.deepEqual(Object.keys(state.body.market.prices.tomato).sort(), ['at', 'base', 'price', 'volume24h'])
+  assert.deepEqual(state.body.market.history, [])
+  assert.deepEqual(state.body.contracts, { outgoing: [], incoming: [] })
+})
