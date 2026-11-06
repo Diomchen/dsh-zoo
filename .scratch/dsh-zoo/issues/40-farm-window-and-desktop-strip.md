@@ -21,7 +21,8 @@
       （macOS 中文输入法会打断，和 gift/rename 的 IME 取舍一致）、显式关闭 + 10s 超时；
       桥只暴露 `ready / submit / close / onState / onResult`
 - [ ] 窗口数据与场景分开：宿主用 `farm-window` 命令推**完整** farm view
-      （`plots` 带 `remainingMs`、`seeds` / `crops` / `coins` / `dew` / `log`）；
+      （`plots` 带 `remainingMs`（从 `grownMs`/`growMs` 用 `src/farm-rules.js` 的
+      `plotStage`/`plotRemainingMs` 推）、`seeds` / `crops` / `coins` / `dew` / `log`）；
       `controls.farm` 只拿摘要 `{ plots: [{id,crop,stage,mature}], coins, dew, worker,
       contractCount }`——不要把 `/state.farm` 直接塞进场景
 - [ ] `src/desktop-pets.js` 的 `controls.farm` 从 service 的 `desktopSnapshot()` 来
