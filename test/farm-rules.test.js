@@ -162,7 +162,15 @@ test('离线补算：min(now − lastTickAt, 12h)；时钟倒退/缺时间戳按
 test('露水：10 分钟 +1、零头保留、余额封顶 48、跨本地午夜归零', () => {
   const start = { dew: 0, dewAt: T0, dewDay: TODAY }
   const nine = advanceDew(start, T0 + 9 * MINUTE_MS)
-  assert.deepEqual(nine, { dew: 0, dewAt: T0, dewDay: TODAY, gained: 0, reset: false })
+  assert.deepEqual(nine, {
+    dew: 0,
+    dewEarned: 0,
+    dewAt: T0,
+    dewDay: TODAY,
+    dewDayEarned: TODAY,
+    gained: 0,
+    reset: false
+  })
 
   const ten = advanceDew(start, T0 + 10 * MINUTE_MS)
   assert.equal(ten.dew, 1)
@@ -197,6 +205,39 @@ test('露水：10 分钟 +1、零头保留、余额封顶 48、跨本地午夜�
   assert.equal(afterMidnight.dewDay, localDayKey(late + 20 * MINUTE_MS))
   const nextPoint = advanceDew(afterMidnight, late + 30 * MINUTE_MS)
   assert.equal(nextPoint.dew, 1)
+})
+
+test('露水每日上限按「已挣」算：挣满 48、花光后再等 10 分钟也不再涨；跨日恢复', () => {
+  const spentAll = {
+    dew: 0,
+    dewEarned: MAX_DEW,
+    dewAt: T0 + 10 * MINUTE_MS,
+    dewDay: TODAY,
+    dewDayEarned: TODAY
+  }
+  const noRefill = advanceDew(spentAll, T0 + 20 * MINUTE_MS)
+  assert.equal(noRefill.dew, 0)
+  assert.equal(noRefill.dewEarned, MAX_DEW)
+  assert.equal(noRefill.gained, 0, '花掉的余额不释放当天的额度')
+
+  // 还剩 1 点没花也一样：只要「今天已挣」到 48，就不再产生新的露水。
+  const partlySpent = advanceDew({ ...spentAll, dew: 1 }, T0 + 20 * MINUTE_MS)
+  assert.equal(partlySpent.dew, 1)
+  assert.equal(partlySpent.dewEarned, MAX_DEW)
+  assert.equal(partlySpent.gained, 0)
+
+  // 次日：先跨日归零（这一拍只重置），再等 10 分钟恢复 +1。
+  const nextNoon = new Date(2026, 4, 7, 12, 0, 0).getTime()
+  const nextDay = advanceDew(noRefill, nextNoon)
+  assert.equal(nextDay.dew, 0)
+  assert.equal(nextDay.dewEarned, 0)
+  assert.equal(nextDay.reset, true)
+  assert.equal(nextDay.dewDayEarned, localDayKey(nextNoon))
+
+  const resumed = advanceDew(nextDay, nextNoon + 10 * MINUTE_MS)
+  assert.equal(resumed.dew, 1)
+  assert.equal(resumed.dewEarned, 1)
+  assert.equal(resumed.gained, 1)
 })
 
 test('露水：时钟倒退/锚点缺失不产生负增长或瞬间满额', () => {

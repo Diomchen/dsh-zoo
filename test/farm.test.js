@@ -79,8 +79,10 @@ function farmFile (overrides = {}) {
     seeds: { ...START_SEEDS },
     crops: {},
     dew: 0,
+    dewEarned: 0,
     dewAt: NOON,
     dewDay: TODAY,
+    dewDayEarned: TODAY,
     lastTickAt: NOON,
     plots: PLOT_IDS.map(emptyPlot),
     hire: { ...DEFAULT_HIRE },
@@ -119,6 +121,7 @@ test('初始农场：4 空地、30 硬币、2 番茄种子；缺文件不告警�
   assert.deepEqual(view.seeds, { tomato: 2 })
   assert.deepEqual(view.crops, {})
   assert.equal(view.dew, 0)
+  assert.equal(view.dewEarned, 0)
   assert.deepEqual(view.hire, DEFAULT_HIRE)
   assert.deepEqual(view.log, [])
   assert.deepEqual(warnings, [])
@@ -152,8 +155,10 @@ test('normalizeFarmFile：损坏整份 → 初始农场；字段/地块/日志�
     seeds: { tomato: 5000, carrot: -2, pumpkin: 'x', alien: 3 },
     crops: { tomato: 1200, carrot: 0 },
     dew: 99,
+    dewEarned: 99,
     dewAt: 0,
     dewDay: '2026/05/06',
+    dewDayEarned: '2026/05/06',
     lastTickAt: 'nope',
     plots: [
       null,
@@ -182,8 +187,10 @@ test('normalizeFarmFile：损坏整份 → 初始农场；字段/地块/日志�
   assert.deepEqual(normalized.farm.seeds, { tomato: MAX_STACK })
   assert.deepEqual(normalized.farm.crops, { tomato: MAX_STACK })
   assert.equal(normalized.farm.dew, MAX_DEW)
+  assert.equal(normalized.farm.dewEarned, MAX_DEW)
   assert.equal(normalized.farm.dewAt, null)
   assert.equal(normalized.farm.dewDay, null)
+  assert.equal(normalized.farm.dewDayEarned, null)
   assert.equal(normalized.farm.lastTickAt, null)
   assert.deepEqual(normalized.farm.plots.map((plot) => plot.id), ['p1', 'p2', 'p3', 'p4'])
   assert.equal(normalized.farm.plots[0].crop, null, '坏作物整块回空地')
@@ -198,6 +205,13 @@ test('normalizeFarmFile：损坏整份 → 初始农场；字段/地块/日志�
   assert.equal(normalized.farm.hire.maxHours, 8, 'max 不能小于 min')
   assert.equal(normalized.farm.log.length, MAX_FARM_LOG)
   assert.equal(normalized.farm.log[0].at, NOON + MAX_FARM_LOG + 9, '日志最新在前')
+})
+
+test('normalizeFarmFile：旧文件没有 dewEarned 时，当前余额计进今天已挣', () => {
+  const normalized = normalizeFarmFile({ version: FARM_VERSION, dew: 10 })
+  assert.equal(normalized.corrupt, false)
+  assert.equal(normalized.farm.dew, 10)
+  assert.equal(normalized.farm.dewEarned, 10)
 })
 
 // ---------------------------------------------------------------------------
@@ -349,10 +363,12 @@ test('tick：每 10 分钟 +1 露水，8 小时到 48 封顶；跨本地午夜�
   clock.advance(10 * MINUTE_MS)
   await store.tick()
   assert.equal(store.snapshot().dew, 1)
+  assert.equal(store.snapshot().dewEarned, 1)
 
   clock.advance(8 * HOUR_MS)
   await store.tick()
   assert.equal(store.snapshot().dew, MAX_DEW)
+  assert.equal(store.snapshot().dewEarned, MAX_DEW)
 
   clock.advance(2 * HOUR_MS)
   await store.tick()
@@ -369,6 +385,39 @@ test('tick：每 10 分钟 +1 露水，8 小时到 48 封顶；跨本地午夜�
   lateClock.advance(10 * MINUTE_MS)
   await lateStore.tick()
   assert.equal(lateStore.snapshot().dew, 1)
+})
+
+test('露水日上限按已挣算：余额花光也不补；跨本地日才恢复', async (t) => {
+  const dir = await tempDir(t)
+  await writeFarm(dir, farmFile({
+    dew: 0,
+    dewEarned: MAX_DEW,
+    dewAt: NOON,
+    dewDay: TODAY,
+    dewDayEarned: TODAY,
+    lastTickAt: NOON
+  }))
+  const clock = makeClock(NOON)
+  const store = await createFarmStore(dir, { log: logSink().log, now: clock.now })
+
+  clock.advance(10 * MINUTE_MS)
+  await store.tick()
+  assert.equal(store.snapshot().dew, 0, '今天已挣满 48，花光也刷不出新的')
+  assert.equal(store.snapshot().dewEarned, MAX_DEW)
+  const raw = await readFarm(dir)
+  assert.equal(raw.dewEarned, MAX_DEW, 'dewEarned 跟 farm.json 一起落盘')
+  assert.equal(raw.dewDayEarned, TODAY)
+
+  const nextNoon = new Date(2026, 4, 7, 12, 0, 0).getTime()
+  clock.set(nextNoon)
+  await store.tick()
+  assert.equal(store.snapshot().dew, 0, '跨日这一拍只重置')
+  assert.equal(store.snapshot().dewEarned, 0)
+
+  clock.advance(10 * MINUTE_MS)
+  await store.tick()
+  assert.equal(store.snapshot().dew, 1)
+  assert.equal(store.snapshot().dewEarned, 1)
 })
 
 test('离线生长：补 min(now − lastTickAt, 12h)，成熟即停，不枯萎；离线不攒露水', async (t) => {

@@ -133,6 +133,7 @@ test('HTTP：初始农场 → 种 → 等 → 收 → 再种；硬币/种子/作
   assert.deepEqual(initial.body.farm.seeds, { tomato: 2 })
   assert.deepEqual(initial.body.farm.crops, {})
   assert.equal(initial.body.farm.dew, 0)
+  assert.equal(initial.body.farm.dewEarned, 0)
   assert.deepEqual(initial.body.farm.hire, DEFAULT_HIRE)
   assert.deepEqual(initial.body.farm.plots.map((plot) => plot.crop), [null, null, null, null])
   assert.equal(initial.body.farm.guard, 0)
@@ -177,6 +178,8 @@ test('HTTP：初始农场 → 种 → 等 → 收 → 再种；硬币/种子/作
   assert.equal(final.body.farm.coins, 30, '这一票没有买卖，硬币不动')
   assert.deepEqual(final.body.farm.seeds, {})
   assert.deepEqual(final.body.farm.crops, { tomato: 6 })
+  assert.equal(final.body.farm.dew, 6)
+  assert.equal(final.body.farm.dewEarned, 6, '今天已挣的露水跟着累计')
   assert.deepEqual(final.body.farm.plots.map((plot) => plot.crop), [null, null, null, null])
   assert.deepEqual(
     final.body.farm.log.map((entry) => entry.kind),
@@ -254,8 +257,10 @@ test('HTTP：浇水/施肥花露水、每株一次；成熟后施肥，收获按
     seeds: { tomato: 1 },
     crops: {},
     dew: 10,
+    dewEarned: 10,
     dewAt: NOON,
     dewDay: TODAY,
+    dewDayEarned: TODAY,
     lastTickAt: NOON,
     plots: [plot, emptyPlot('p2'), emptyPlot('p3'), emptyPlot('p4')],
     hire: { ...DEFAULT_HIRE },
@@ -304,8 +309,10 @@ test('HTTP：farm.log 最多 50 条，状态出口只给最近 20 条', async (t
     seeds: { tomato: 2 },
     crops: {},
     dew: 0,
+    dewEarned: 0,
     dewAt: NOON,
     dewDay: TODAY,
+    dewDayEarned: TODAY,
     lastTickAt: NOON,
     plots: [emptyPlot('p1'), emptyPlot('p2'), emptyPlot('p3'), emptyPlot('p4')],
     hire: { ...DEFAULT_HIRE },
@@ -356,6 +363,7 @@ test('HTTP：60 秒 tick 的接线（测试用 15ms 节拍）会推进生长与�
 
   const farm = service.snapshot().farm
   assert.equal(farm.dew, 1)
+  assert.equal(farm.dewEarned, 1)
   assert.equal(farm.plots[0].grownMs, 10 * MINUTE_MS)
 
   // 让最后几拍 tick 的异步写盘落完，避免和 tmp 目录清理抢。

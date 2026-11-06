@@ -709,7 +709,8 @@ export function createService (ctx, options = {}) {
 
   /**
    * `/state` 的农场出口（SPEC v5「状态出口与动作」）：
-   * `{ plots, coins, seeds, crops, dew, guard, worker, hire, log }`，log 最近 20 条。
+   * `{ plots, coins, seeds, crops, dew, dewEarned, guard, worker, hire, log }`，log 最近 20 条。
+   * `dewEarned` 是今天已经挣到的露水（花掉余额不会回退），UI 用它显示当天剩余额度。
    *
    * `guard` / `worker` 是 43/44 的口子：偷菜和雇工还没实现，先给固定空值，
    * 形状先按 SPEC 固定下来，后面只填值、不再改结构。
@@ -722,6 +723,7 @@ export function createService (ctx, options = {}) {
       seeds: view.seeds,
       crops: view.crops,
       dew: view.dew,
+      dewEarned: view.dewEarned,
       guard: 0,
       worker: null,
       hire: view.hire,

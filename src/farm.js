@@ -30,8 +30,10 @@ import { parseJsonText } from './json-text.js'
  *     "seeds": { "tomato": 2 },
  *     "crops": {},
  *     "dew": 0,
+ *     "dewEarned": 0,
  *     "dewAt": 1700000000000,
  *     "dewDay": "2026-11-06",
+ *     "dewDayEarned": "2026-11-06",
  *     "lastTickAt": 1700000000000,
  *     "plots": [
  *       { "id": "p1", "crop": "tomato", "plantedAt": 1700000000000,
@@ -44,8 +46,8 @@ import { parseJsonText } from './json-text.js'
  *
  * 三条产品规则决定这里的形状：
  *   - **离线也长，但一次最多补 12 小时**；成熟就停，不枯萎、不生病；
- *   - **露水只奖励「DSH 开着但没在玩」**：每 10 分钟 +1，每天余额上限 48；
- *     关掉 DSH 的时间不算，加载时把计时锚点重置到 now；
+ *   - **露水只奖励「DSH 开着但没在玩」**：每 10 分钟 +1，每天最多挣 48
+ *     （余额也封顶 48）；关掉 DSH 的时间不算，加载时把计时锚点重置到 now；
  *   - **任何一次成功的农场动作都会重置待机计时**（种/收/浇/施肥）。
  *
  * 容错与 `src/backpack.js` 同一套路：
@@ -115,9 +117,12 @@ export function initialFarmState () {
     seeds: { ...START_SEEDS },
     crops: {},
     dew: 0,
-    // 这两个时间由 store 在加载时按 now 补；null 表示「文件里没有/坏了」。
+    // 今天已经挣到的露水：花掉余额不会让这个数变小，第二天才归零。
+    dewEarned: 0,
+    // 这三个时间由 store 在加载时按 now 补；null 表示「文件里没有/坏了」。
     dewAt: null,
     dewDay: null,
+    dewDayEarned: null,
     lastTickAt: null,
     plots: PLOT_IDS.map(emptyPlot),
     hire: { ...DEFAULT_HIRE },
@@ -133,6 +138,7 @@ export function farmView (state) {
     seeds: { ...state.seeds },
     crops: { ...state.crops },
     dew: state.dew,
+    dewEarned: state.dewEarned,
     hire: { ...state.hire },
     // 完整日志（≤50）；`/state` 只取最近 20，农场小窗的记录页要的是完整的一份。
     log: state.log.map(copyLogEntry)
@@ -209,6 +215,13 @@ function normalizeDew (value) {
   const num = finiteNumber(value)
   if (num === null) return { dew: 0, repaired: 1 }
   return { dew: Math.min(MAX_DEW, Math.max(0, Math.floor(num))), repaired: 0 }
+}
+
+function normalizeDewEarned (value) {
+  if (value === undefined) return { dewEarned: 0, repaired: 0 }
+  const num = finiteNumber(value)
+  if (num === null) return { dewEarned: 0, repaired: 1 }
+  return { dewEarned: Math.min(MAX_DEW, Math.max(0, Math.floor(num))), repaired: 0 }
 }
 
 /**
@@ -444,12 +457,15 @@ export function normalizeFarmFile (value) {
   const seeds = normalizeStacks(value.seeds, START_SEEDS)
   const crops = normalizeStacks(value.crops, null)
   const dew = normalizeDew(value.dew)
+  const dewEarned = normalizeDewEarned(value.dewEarned)
   const plots = normalizePlots(value.plots)
   const hire = normalizeHire(value.hire)
   const log = normalizeLog(value.log)
   repaired += coins.repaired + seeds.repaired + crops.repaired +
-    dew.repaired + plots.repaired + hire.repaired + log.repaired
+    dew.repaired + dewEarned.repaired + plots.repaired + hire.repaired + log.repaired
 
+  const dewDay = normalizeDayKey(value.dewDay)
+  const dewDayEarned = normalizeDayKey(value.dewDayEarned) ?? dewDay
   return {
     farm: {
       version: FARM_VERSION,
@@ -457,8 +473,11 @@ export function normalizeFarmFile (value) {
       seeds: seeds.stacks,
       crops: crops.stacks,
       dew: dew.dew,
+      // 余额一定计进「今天已挣」：旧文件/手改文件不能靠删除计数多出额度。
+      dewEarned: Math.max(dewEarned.dewEarned, dew.dew),
       dewAt: normalizeTimestamp(value.dewAt),
-      dewDay: normalizeDayKey(value.dewDay),
+      dewDay,
+      dewDayEarned,
       lastTickAt: normalizeTimestamp(value.lastTickAt),
       plots: plots.plots,
       hire: hire.hire,
@@ -495,8 +514,10 @@ function toFileState (state) {
     seeds: { ...state.seeds },
     crops: { ...state.crops },
     dew: state.dew,
+    dewEarned: state.dewEarned,
     dewAt: state.dewAt,
     dewDay: state.dewDay,
+    dewDayEarned: state.dewDayEarned,
     lastTickAt: state.lastTickAt,
     plots: state.plots.map(copyPlot),
     hire: { ...state.hire },
@@ -596,8 +617,19 @@ class FarmStore {
       this.#state.dew = 0
       changed = true
     }
+    if (this.#state.dewDayEarned !== null && day !== null && this.#state.dewDayEarned !== day) {
+      // 「今天已挣」独立按日归零；余额被花掉不会让它回退。
+      if (this.#state.dewEarned !== 0) changed = true
+      this.#state.dewEarned = 0
+      changed = true
+    }
+    // 余额一定算进「今天已挣」；旧文件没有计数时从当前余额起算，不白送额度。
+    this.#state.dewEarned = Math.max(this.#state.dewEarned, this.#state.dew)
     this.#state.dewAt = now
-    if (day !== null) this.#state.dewDay = day
+    if (day !== null) {
+      this.#state.dewDay = day
+      this.#state.dewDayEarned = day
+    }
     this.#state.lastTickAt = now
     return changed
   }
@@ -655,15 +687,21 @@ class FarmStore {
 
     const dew = advanceDew({
       dew: state.dew,
+      dewEarned: state.dewEarned,
       dewAt: state.dewAt,
-      dewDay: state.dewDay
+      dewDay: state.dewDay,
+      dewDayEarned: state.dewDayEarned
     }, now)
-    if (dew.dew !== state.dew || dew.dewAt !== state.dewAt || dew.dewDay !== state.dewDay) {
+    if (dew.dew !== state.dew || dew.dewEarned !== state.dewEarned ||
+      dew.dewAt !== state.dewAt || dew.dewDay !== state.dewDay ||
+      dew.dewDayEarned !== state.dewDayEarned) {
       changed = true
     }
     state.dew = dew.dew
+    state.dewEarned = dew.dewEarned
     state.dewAt = dew.dewAt
     state.dewDay = dew.dewDay
+    state.dewDayEarned = dew.dewDayEarned
 
     if (state.lastTickAt !== now) changed = true
     state.lastTickAt = now
@@ -677,7 +715,10 @@ class FarmStore {
   #resetIdle (now) {
     this.#state.dewAt = now
     const day = localDayKey(now)
-    if (day !== null) this.#state.dewDay = day
+    if (day !== null) {
+      this.#state.dewDay = day
+      this.#state.dewDayEarned = day
+    }
   }
 
   #appendLog (entry) {
@@ -730,6 +771,7 @@ class FarmStore {
       seeds: { ...this.#state.seeds },
       crops: { ...this.#state.crops },
       dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
       persisted
     }
   }
@@ -766,6 +808,7 @@ class FarmStore {
       seeds: { ...this.#state.seeds },
       crops: { ...this.#state.crops },
       dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
       persisted
     }
   }
@@ -800,6 +843,7 @@ class FarmStore {
       seeds: { ...this.#state.seeds },
       crops: { ...this.#state.crops },
       dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
       persisted
     }
   }
@@ -833,6 +877,7 @@ class FarmStore {
       seeds: { ...this.#state.seeds },
       crops: { ...this.#state.crops },
       dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
       persisted
     }
   }
