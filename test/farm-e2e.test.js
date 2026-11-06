@@ -136,7 +136,7 @@ test('HTTP：初始农场 → 种 → 等 → 收 → 再种；硬币/种子/作
   assert.equal(initial.body.farm.dewEarned, 0)
   assert.deepEqual(initial.body.farm.hire, DEFAULT_HIRE)
   assert.deepEqual(initial.body.farm.plots.map((plot) => plot.crop), [null, null, null, null])
-  assert.equal(initial.body.farm.guard, 0)
+  assert.equal(initial.body.farm.guard, 0.3)
   assert.equal(initial.body.farm.worker, null)
 
   const planted = await action(service, { action: 'plant', plotId: 'p1', cropId: 'tomato' })

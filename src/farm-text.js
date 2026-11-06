@@ -31,7 +31,13 @@ const FARM_ERROR_TEXT = Object.freeze({
   'market-busy': '交易所这会儿太忙了（每分钟最多 10 笔），等一下再试。',
   'no-dew': '露水不够，先让宠物待机攒一会儿。',
   'already-watered': '这株已经浇过水了。',
-  'already-fertilized': '这株已经施过肥了。'
+  'already-fertilized': '这株已经施过肥了。',
+  // 访客动作（ticket 43）
+  'no-visit': '这次串门已经结束了。',
+  'no-port': '对方没开局域网端口，看不到他家的农场。',
+  'already-stolen': '这块地这一轮已经被你偷过了。',
+  'already-helped': '这块地这一轮已经帮过了。',
+  guard: '被抓住了，这次白跑（没有罚款）。'
 })
 
 export const FARM_ERROR_CODES = Object.freeze(Object.keys(FARM_ERROR_TEXT))
@@ -41,4 +47,40 @@ export function farmErrorText (error) {
   return typeof error === 'string' && Object.prototype.hasOwnProperty.call(FARM_ERROR_TEXT, error)
     ? FARM_ERROR_TEXT[error]
     : null
+}
+
+/**
+ * 访客动作（偷/帮）的结果文案。成功两句要说出“拿到了什么”，失败按固定枚举翻人话；
+ * `cap` 在访客语境里不是“仓库满”，而是“今天的次数用完了”。
+ */
+const VISIT_ERROR_TEXT = Object.freeze({
+  'no-visit': '这次串门已经结束了，偷不了啦。',
+  'no-port': '对方没开局域网端口，偷不了啦。',
+  timeout: '主人家的宠物没回应，这次可能白跑。',
+  'not-mature': '这块地还没熟。',
+  'already-stolen': '这块地这一轮已经被你偷过了。',
+  'already-helped': '这块地这一轮已经帮过了。',
+  cap: '今天的次数用完了，明天再来。',
+  guard: '被抓住了，这次白跑（没有罚款）。',
+  'no-dew': '露水不够，帮不了忙。',
+  'bad-plot': '这块地不能这么做。',
+  starting: '农场还在准备中，稍等一下再试。',
+  'bad-shape': '对方发来的农场数据不对，这次没偷成。',
+  'bad-json': '对方发来的农场数据坏了，这次没偷成。',
+  'too-large': '对方的农场数据太大了，这次没偷成。',
+  refused: '对方没有回应，这次可能白跑。',
+  gone: '这次串门已经结束了。'
+})
+
+const CROP_NAMES = Object.freeze({ tomato: '小番茄', carrot: '胡萝卜', pumpkin: '南瓜' })
+
+export function farmActionResultText ({ action, ok, error, crop } = {}) {
+  if (ok === true) {
+    const name = CROP_NAMES[crop] ?? '作物'
+    if (action === 'help') return '帮上了忙：这块地长得快了一点，+1 硬币。'
+    return '偷到了 1 个' + name + '！'
+  }
+  return typeof error === 'string' && Object.prototype.hasOwnProperty.call(VISIT_ERROR_TEXT, error)
+    ? VISIT_ERROR_TEXT[error]
+    : '这次没有完成，稍后再试。'
 }

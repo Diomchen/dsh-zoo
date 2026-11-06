@@ -66,6 +66,28 @@ export const HIRE_HOURS_MIN = 2
 export const HIRE_HOURS_MAX = 8
 export const HIRE_GUARD_MAX = 0.8
 /**
+ * 农场访客动作（ticket 43）：偷/帮只由这两条线走，别的动作名整包丢弃。
+ * `requestId` 是幂等键（重发复用同一个），`visitId` 只用来核对“这次串门还在不在”。
+ */
+export const FARM_ACTION_KINDS = Object.freeze(['steal', 'help'])
+/** 主人侧结果的固定错误枚举（不转发自由文本；面向用户的话在 farm-text.js）。 */
+export const FARM_ACTION_ERRORS = Object.freeze([
+  'no-visit',
+  'bad-plot',
+  'bad-action',
+  'not-mature',
+  'already-stolen',
+  'already-helped',
+  'cap',
+  'guard',
+  'starting'
+])
+export const PLOT_ID_RE = /^p[1-4]$/
+/** 一次偷只拿 1 个；结果里的 qty 只能是 0..1。 */
+export const MAX_FARM_QTY = 1
+const FARM_ACTION_KIND_SET = new Set(FARM_ACTION_KINDS)
+const FARM_ACTION_ERROR_SET = new Set(FARM_ACTION_ERRORS)
+/**
  * 一次**出门**的硬上限：30 分钟到点主动回家并写记录（ticket 09）。
  * 入站串门没有时间上限——访客待到主人点「送客」（ticket 10）。
  * 这个值同时是单条串门记录的时长上限（见 src/visit-record.js）。
@@ -92,7 +114,9 @@ export const PACKET_TYPES = Object.freeze([
   'visit-recall',
   'visit-recall-ack',
   'gift-received',
-  'market-digest'
+  'market-digest',
+  'farm-action',
+  'farm-action-result'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -397,6 +421,13 @@ function buildPacket ({
   at,
   prices,
   hire,
+  requestId,
+  plotId,
+  ok,
+  error,
+  crop,
+  qty,
+  caught,
   now = Date.now()
 } = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
@@ -444,6 +475,50 @@ function buildPacket ({
     const safeHire = normalizeDigestHire(hire)
     if (safeHire === null) throw new Error('protocol: invalid digest hire')
     packet = { ...base, at: stamp, prices: safePrices, hire: safeHire }
+  } else if (type === 'farm-action') {
+    // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，requestId/action/plotId 会消失。
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (!FARM_ACTION_KIND_SET.has(action)) throw new Error('protocol: invalid farm action')
+    if (typeof plotId !== 'string' || !PLOT_ID_RE.test(plotId)) {
+      throw new Error('protocol: invalid plotId')
+    }
+    packet = {
+      ...base,
+      visitId: visitId.toLowerCase(),
+      requestId: requestId.toLowerCase(),
+      action,
+      plotId
+    }
+  } else if (type === 'farm-action-result') {
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (typeof ok !== 'boolean') throw new Error('protocol: invalid result ok')
+    if (ok === true) {
+      if (caught === true) throw new Error('protocol: caught requires guard')
+      if (!isCropId(crop)) throw new Error('protocol: invalid crop')
+      if (!Number.isInteger(qty) || qty < 0 || qty > MAX_FARM_QTY) {
+        throw new Error('protocol: invalid qty')
+      }
+      packet = {
+        ...base,
+        requestId: requestId.toLowerCase(),
+        ok: true,
+        crop,
+        qty,
+        ...(caught === true ? { caught: true } : {})
+      }
+    } else {
+      if (!FARM_ACTION_ERROR_SET.has(error)) throw new Error('protocol: invalid farm error')
+      // `caught` 只有一个意思：被守卫抓住；不能拿它给别的错误加戏。
+      if (caught === true && error !== 'guard') throw new Error('protocol: caught without guard')
+      packet = {
+        ...base,
+        requestId: requestId.toLowerCase(),
+        ok: false,
+        error,
+        ...(caught === true ? { caught: true } : {})
+      }
+    }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -552,6 +627,22 @@ export function encodeGiftReceived ({ deviceId, visitId, giftId } = {}) {
  */
 export function encodeMarketDigest ({ deviceId, at, prices, hire, now } = {}) {
   return encodePacket({ type: 'market-digest', deviceId, at, prices, hire, now })
+}
+
+/**
+ * 农场动作（ticket 43）：访客 → 主人。
+ * 只带这次动作的全部输入；没有昵称、端口、坐标、路径或自由文本。
+ */
+export function encodeFarmAction ({ deviceId, visitId, requestId, action, plotId } = {}) {
+  return encodePacket({ type: 'farm-action', deviceId, visitId, requestId, action, plotId })
+}
+
+/**
+ * 农场动作结果：主人 → 访客。`requestId` 原样回传，访客按它 settle 一次。
+ * 成功带 crop/qty；失败带固定枚举 error；`caught` 只跟 steal 的 guard 一起出现。
+ */
+export function encodeFarmActionResult ({ deviceId, requestId, ok, error, crop, qty, caught } = {}) {
+  return encodePacket({ type: 'farm-action-result', deviceId, requestId, ok, error, crop, qty, caught })
 }
 
 function fail (reason) {
@@ -686,6 +777,69 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         at,
         prices,
         hire
+      }
+    }
+  }
+
+  // 农场动作（ticket 43）：**不**落进 VISIT_TYPES（那里只重建四个字段）。
+  // 字段就是这次动作的全部输入：任何一项坏都整包丢；昵称/端口等一律不读。
+  if (raw.type === 'farm-action') {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.action !== 'string' || !FARM_ACTION_KIND_SET.has(raw.action)) return fail('action')
+    if (typeof raw.plotId !== 'string' || !PLOT_ID_RE.test(raw.plotId)) return fail('plot-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        action: raw.action,
+        plotId: raw.plotId
+      }
+    }
+  }
+
+  // 农场动作结果（ticket 43）：成功必须有合法作物与 0..1 的数量；
+  // 失败必须有固定枚举；`caught` 可选，但出现就必须是布尔（不转发文本）。
+  if (raw.type === 'farm-action-result') {
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.ok !== 'boolean') return fail('ok')
+    if (raw.caught !== undefined && typeof raw.caught !== 'boolean') return fail('caught')
+    if (raw.ok === true) {
+      if (raw.caught === true) return fail('caught')
+      if (!isCropId(raw.crop)) return fail('crop')
+      const qty = Number(raw.qty)
+      if (!Number.isInteger(qty) || qty < 0 || qty > MAX_FARM_QTY) return fail('qty')
+      return {
+        ok: true,
+        packet: {
+          v: PROTOCOL_VERSION,
+          type: raw.type,
+          deviceId: raw.deviceId.toLowerCase(),
+          requestId: raw.requestId.toLowerCase(),
+          ok: true,
+          crop: raw.crop,
+          qty,
+          ...(raw.caught === true ? { caught: true } : {})
+        }
+      }
+    }
+    if (typeof raw.error !== 'string' || !FARM_ACTION_ERROR_SET.has(raw.error)) return fail('error')
+    // caught 只能跟 guard 一起出现；`ok:true + caught` 或 `cap + caught` 都整包丢。
+    if (raw.caught === true && raw.error !== 'guard') return fail('caught')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        ok: false,
+        error: raw.error,
+        ...(raw.caught === true ? { caught: true } : {})
       }
     }
   }

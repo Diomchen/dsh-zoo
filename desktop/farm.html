@@ -164,6 +164,24 @@
         grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 8px;
       }
+      /* 访客模式（ticket 43）：顶部一条说明，地块/按钮与主人页共用同一套样式。 */
+      .visitor-banner {
+        padding: 7px 9px;
+        border-radius: 10px;
+        background: rgba(224, 163, 60, 0.16);
+        box-shadow: inset 0 0 0 1px rgba(224, 163, 60, 0.38);
+        color: var(--ink-soft);
+        font-size: 10.5px;
+        line-height: 1.45;
+      }
+      .visitor-banner[data-state='ended'],
+      .visitor-banner[data-state='error'] {
+        background: rgba(217, 124, 110, 0.14);
+        box-shadow: inset 0 0 0 1px rgba(217, 124, 110, 0.4);
+      }
+      .visitor-banner strong {
+        color: var(--ink);
+      }
       .plot {
         display: flex;
         flex-direction: column;
@@ -540,6 +558,8 @@
       </nav>
 
       <section class="page" id="page-farm" role="tabpanel" aria-label="农场">
+        <section class="visitor-banner" id="visitor-banner" data-state="loading" hidden></section>
+
         <section class="plots" id="plots" aria-label="四块地"></section>
 
         <section class="inventory" id="inventory" aria-label="库存"></section>

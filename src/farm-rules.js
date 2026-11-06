@@ -123,6 +123,20 @@ export function waterPlot (plot) {
   return { ...plot, waterings: Number(plot.waterings) + 1, grownMs }
 }
 
+/**
+ * 访客帮忙（ticket 43）：和主人的浇水走同一条 +10% 生长，但**不算** waterings。
+ *
+ * 主人的浇水和访客的帮忙是两件独立的事：同一位访客每块地只能帮一次（`helpedBy` 判），
+ * 主人自己也仍能浇一次（`waterings` 判）。把帮忙记进 waterings 会让两者互相吃掉。
+ * 空地/成熟地没有可帮的生长，返回 null。
+ */
+export function helpPlot (plot) {
+  if (!isCropId(plot?.crop) || isMature(plot)) return null
+  const bonus = Math.max(1, Math.floor(Number(plot.growMs) * 0.1))
+  const grownMs = Math.min(Number(plot.growMs), Number(plot.grownMs) + bonus)
+  return { ...plot, grownMs }
+}
+
 /** 还能施肥吗：有作物、这一株还没施过。成熟后仍可施（收获前最后一个加成）。 */
 export function canFertilize (plot) {
   return isCropId(plot?.crop) && plot.fertilized !== true

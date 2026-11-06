@@ -8,6 +8,7 @@ import test from 'node:test'
 
 import {
   DEFAULT_SKIN_PORT,
+  FARM_ROUTE,
   GIFT_ROUTE,
   LEGACY_GIFT_ROUTE,
   LEGACY_SKIN_ROUTE,
@@ -344,4 +345,88 @@ test('setSources：同一个源对象不必重算 sha256（按对象缓存）', 
   server.setSources([source])
   const second = await (await fetch(url(server, '/dsh-zoo-skin/same/manifest'))).json()
   assert.deepEqual(second, first)
+})
+
+// ---------------------------------------------------------------------------
+// 农场路由（ticket 43）：只读、只在活跃 visitId 期间可读、404 不泄露“曾经来过”
+// ---------------------------------------------------------------------------
+
+function farmViewFixture (visitId) {
+  return {
+    v: 1,
+    visitId,
+    host: { nickname: '楼上的柯基' },
+    guard: 0.3,
+    guardParts: { ownerHome: true, worker: false },
+    plots: [
+      {
+        id: 'p1',
+        crop: 'tomato',
+        stage: 'mature',
+        mature: true,
+        remainingMs: 0,
+        stolenByMe: false,
+        helpedByMe: false
+      },
+      { id: 'p2', crop: null, stage: 'empty', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: false }
+    ],
+    limits: {
+      steal: { perVisit: 3, usedInVisit: 0, perFarm: 5, usedOnFarm: 0 },
+      help: { perVisit: 3, usedInVisit: 0, perFarm: 5, usedOnFarm: 0 }
+    },
+    hire: { enabled: false, wagePerHour: 10, minHours: 2, maxHours: 8 },
+    market: null,
+    at: 1700000000000
+  }
+}
+
+test('农场路由：活跃 visitId 可读；坏 id/多段/未知/过期 → 404；POST → 405；HEAD 只回头', async (t) => {
+  const visitId = '44444444-4444-4444-8444-444444444444'
+  const table = new Map([[visitId, farmViewFixture(visitId)]])
+  const server = await start(t, { sources: [], lookupFarm: (id) => table.get(id) ?? null })
+
+  const response = await fetch(url(server, FARM_ROUTE + '/' + visitId))
+  assert.equal(response.status, 200)
+  assert.match(response.headers.get('content-type'), /application\/json/)
+  assert.equal(response.headers.get('cache-control'), 'no-store')
+  assert.ok(Number(response.headers.get('content-length')) < 8192)
+  const body = await response.json()
+  assert.equal(body.visitId, visitId)
+  assert.equal(body.plots.length, 2)
+  assert.equal(body.guard, 0.3)
+  assert.equal('path' in body, false)
+  assert.equal('dir' in body, false)
+  assert.doesNotMatch(JSON.stringify(body), /\/Users\/|[A-Za-z]:\\\\|"path"|"dir"/)
+  // 只允许回显自己的 visitId：不能带出别的访客 / 邻居的 deviceId。
+  const uuids = JSON.stringify(body).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? []
+  assert.deepEqual(uuids.map((id) => id.toLowerCase()), [visitId])
+  assert.doesNotMatch(JSON.stringify(body), /stolenBy"|helpedBy"/)
+
+  const head = await fetch(url(server, FARM_ROUTE + '/' + visitId), { method: 'HEAD' })
+  assert.equal(head.status, 200)
+  assert.equal(head.headers.get('cache-control'), 'no-store')
+  assert.equal(await head.text(), '')
+
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/'))).status, 404)
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/nope'))).status, 404)
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/' + encodeURIComponent('../' + visitId)))).status, 404)
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/' + visitId + '/extra'))).status, 404)
+  assert.equal(
+    (await fetch(url(server, FARM_ROUTE + '/55555555-5555-4555-8555-555555555555'))).status,
+    404
+  )
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/' + visitId), { method: 'POST' })).status, 405)
+
+  // 串门结束（room 删掉访客）之后同一个 URL 立刻 404。
+  table.clear()
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/' + visitId))).status, 404)
+})
+
+test('农场路由：lookupFarm 抛异常也只回 404，不变成 500', async (t) => {
+  const visitId = '66666666-6666-4666-8666-666666666666'
+  const server = await start(t, {
+    sources: [],
+    lookupFarm: () => { throw new Error('boom') }
+  })
+  assert.equal((await fetch(url(server, FARM_ROUTE + '/' + visitId))).status, 404)
 })

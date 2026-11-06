@@ -601,7 +601,10 @@ export function createDesktop (options = {}) {
     return sendHostCommand({
       type: 'farm-window',
       open: payload?.open === true,
+      mode: payload?.mode === 'visitor' ? 'visitor' : 'owner',
       farm: payload?.farm ?? null,
+      market: payload?.market ?? null,
+      visit: payload?.visit ?? null,
       ...(typeof payload?.plotId === 'string' ? { plotId: payload.plotId } : {})
     })
   }

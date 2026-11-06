@@ -12,6 +12,7 @@ import {
   advanceGrowth,
   fertilizePlot,
   harvestYield,
+  helpPlot,
   isCropId,
   isMature,
   localDayKey,
@@ -91,9 +92,35 @@ export const MAX_HIRE_HOURS = 8
 export const MAX_GROW_MS = 30 * 24 * 60 * 60 * 1000
 /** 单块地的偷/帮名单上限；正常一轮只可能有一两个 deviceId。 */
 export const MAX_PLOT_VISITORS = 50
+/**
+ * 访客每日限额（SPEC v5「偷菜与帮忙」，ticket 43）。
+ *
+ * 主人侧能算的只有「这位访客在我家」和「我家今天一共」；「这位访客在所有农场」
+ * 只有访客自己知道，所以 `mine` 是访客本机账本，`byVisitor`/`total` 是主人侧账本。
+ * 两本账永远不可能强一致（ADR-0016 明确接受），这里只防误操作与刷屏。
+ */
+export const STEAL_PER_VISITOR_PER_FARM = 3
+export const STEAL_PER_FARM_PER_DAY = 5
+export const STEAL_PER_VISITOR_PER_DAY = 10
+export const HELP_PER_VISITOR_PER_FARM = 3
+export const HELP_PER_VISITOR_PER_DAY = 5
+/** 每日访客计数最多记多少位访客；超出的按最旧丢（内存/文件都有界）。 */
+export const MAX_VISIT_STATS_VISITORS = 64
 
 const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle'])
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
+const WHO_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
+
+/** 每天一份访客计数；跨本地日整份换新（不把昨天的次数带进今天）。 */
+function emptyVisitStats (day = null) {
+  return {
+    day,
+    steal: { total: 0, byVisitor: {} },
+    help: { total: 0, byVisitor: {} },
+    // 访客本机账本：今天「我」在别人家偷/帮了几次（跨农场，只有自己算得清）。
+    mine: { steal: 0, help: 0 }
+  }
+}
 
 /** 一块空地（数组每次新建，避免多块地共享同一个 stolenBy）。 */
 export function emptyPlot (id) {
@@ -127,6 +154,7 @@ export function initialFarmState () {
     lastTickAt: null,
     plots: PLOT_IDS.map(emptyPlot),
     hire: { ...DEFAULT_HIRE },
+    visitStats: emptyVisitStats(),
     log: []
   }
 }
@@ -161,6 +189,35 @@ function copyPlot (plot) {
 
 function copyLogEntry (entry) {
   return { ...entry }
+}
+
+function copyVisitStats (stats) {
+  const copy = emptyVisitStats(stats?.day ?? null)
+  for (const kind of ['steal', 'help']) {
+    const source = stats?.[kind] ?? {}
+    copy[kind].total = Number(source.total) || 0
+    for (const [deviceId, count] of Object.entries(source.byVisitor ?? {})) {
+      copy[kind].byVisitor[deviceId] = count
+    }
+  }
+  copy.mine.steal = Number(stats?.mine?.steal) || 0
+  copy.mine.help = Number(stats?.mine?.help) || 0
+  return copy
+}
+
+/**
+ * 日志里的「谁」：昵称来自网络，只留可显示的字，最多 32 码点。
+ * 与 protocol 的 `normalizeNickname` 同一口径，但 farm.js 不 import 协议层（避免反向依赖）。
+ */
+function sanitizeWho (value) {
+  if (typeof value !== 'string') return null
+  const clean = value
+    .replace(WHO_CONTROL_RE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (clean === '') return null
+  const chars = Array.from(clean)
+  return chars.length > 32 ? chars.slice(0, 32).join('') : clean
 }
 
 function errorName (error) {
@@ -292,6 +349,63 @@ function hireInt (value, min, max, fallback) {
   return { value: Math.min(max, Math.max(min, Math.floor(num))), repaired: 0 }
 }
 
+/**
+ * 每日访客计数（ticket 43）。旧文件没有这一项不算损坏：按空账本补；
+ * 坏 deviceId 键/坏计数只丢自己，绝不让脏值进内存。
+ */
+function normalizeVisitStats (value) {
+  if (value === undefined) return { stats: emptyVisitStats(), repaired: 0 }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { stats: emptyVisitStats(), repaired: 1 }
+  }
+
+  const stats = emptyVisitStats(normalizeDayKey(value.day))
+  let repaired = 0
+  for (const kind of ['steal', 'help']) {
+    const source = value[kind]
+    if (source === undefined) continue
+    if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+      repaired += 1
+      continue
+    }
+    const total = nonNegativeInt(source.total, 999)
+    if (source.total !== undefined && total === null) repaired += 1
+    stats[kind].total = total ?? 0
+    const byVisitor = source.byVisitor
+    if (byVisitor === undefined) continue
+    if (byVisitor === null || typeof byVisitor !== 'object' || Array.isArray(byVisitor)) {
+      repaired += 1
+      continue
+    }
+    for (const [rawId, rawCount] of Object.entries(byVisitor)) {
+      const deviceId = typeof rawId === 'string' ? rawId.trim() : ''
+      const count = nonNegativeInt(rawCount, 999)
+      if (deviceId === '' || deviceId.length > 64 || count === null || count <= 0) {
+        repaired += 1
+        continue
+      }
+      if (Object.keys(stats[kind].byVisitor).length >= MAX_VISIT_STATS_VISITORS) {
+        repaired += 1
+        continue
+      }
+      stats[kind].byVisitor[deviceId] = count
+    }
+  }
+  const mine = value.mine
+  if (mine !== undefined) {
+    if (mine === null || typeof mine !== 'object' || Array.isArray(mine)) {
+      repaired += 1
+    } else {
+      for (const kind of ['steal', 'help']) {
+        const count = nonNegativeInt(mine[kind], 999)
+        if (mine[kind] !== undefined && count === null) repaired += 1
+        stats.mine[kind] = count ?? 0
+      }
+    }
+  }
+  return { stats, repaired }
+}
+
 function normalizeIdList (value) {
   if (value === undefined) return { ids: [], repaired: 0 }
   if (!Array.isArray(value)) return { ids: [], repaired: 1 }
@@ -414,7 +528,8 @@ function normalizeLogEntry (value) {
   }
   const rawQty = finiteNumber(value.qty)
   const qty = rawQty === null ? 0 : Math.min(MAX_STACK, Math.max(0, Math.floor(rawQty)))
-  return { at, kind: value.kind, ...(crop === null ? {} : { crop }), qty }
+  const who = sanitizeWho(value.who)
+  return { at, kind: value.kind, ...(crop === null ? {} : { crop }), qty, ...(who === null ? {} : { who }) }
 }
 
 function normalizeLog (value) {
@@ -461,9 +576,11 @@ export function normalizeFarmFile (value) {
   const dewEarned = normalizeDewEarned(value.dewEarned)
   const plots = normalizePlots(value.plots)
   const hire = normalizeHire(value.hire)
+  const visitStats = normalizeVisitStats(value.visitStats)
   const log = normalizeLog(value.log)
   repaired += coins.repaired + seeds.repaired + crops.repaired +
-    dew.repaired + dewEarned.repaired + plots.repaired + hire.repaired + log.repaired
+    dew.repaired + dewEarned.repaired + plots.repaired + hire.repaired +
+    visitStats.repaired + log.repaired
 
   const dewDay = normalizeDayKey(value.dewDay)
   const dewDayEarned = normalizeDayKey(value.dewDayEarned) ?? dewDay
@@ -482,6 +599,7 @@ export function normalizeFarmFile (value) {
       lastTickAt: normalizeTimestamp(value.lastTickAt),
       plots: plots.plots,
       hire: hire.hire,
+      visitStats: visitStats.stats,
       log: log.log
     },
     corrupt: false,
@@ -493,6 +611,14 @@ function normalizePlotId (value) {
   if (typeof value !== 'string') return null
   const id = value.trim().toLowerCase()
   return PLOT_IDS.includes(id) ? id : null
+}
+
+/** 访客 deviceId 只用于名单/计数：短标识符即可，形状校验由协议层负责。 */
+function normalizeDeviceId (value) {
+  if (typeof value !== 'string') return null
+  const id = value.trim()
+  if (id === '' || id.length > 64) return null
+  return id
 }
 
 function normalizeCropId (value) {
@@ -522,6 +648,7 @@ function toFileState (state) {
     lastTickAt: state.lastTickAt,
     plots: state.plots.map(copyPlot),
     hire: { ...state.hire },
+    visitStats: copyVisitStats(state.visitStats),
     log: state.log.map(copyLogEntry)
   }
 }
@@ -637,6 +764,12 @@ class FarmStore {
       this.#state.dewDay = day
       this.#state.dewDayEarned = day
     }
+    // 访客日限额同样按本地日重置：昨天用掉的次数不能带到今天。
+    // 这是派生字段：**不**因为加载就立刻落盘（升级旧文件不该白写一次 farm.json）；
+    // 下一次动作/tick 自然会把新的一天写入。
+    if (day !== null && this.#state.visitStats.day !== day) {
+      this.#state.visitStats = emptyVisitStats(day)
+    }
     this.#state.lastTickAt = now
     return changed
   }
@@ -684,6 +817,60 @@ class FarmStore {
     return this.#enqueue(() => this.#trade('sell-crop', cropId, qty))
   }
 
+  // -------------------------------------------------------------------------
+  // 访客相关的仓库动作（ticket 43）：偷到的作物、帮忙的硬币、先扣后退的露水。
+  // 全部走同一条串行队列，绝不绕开 #persist。
+  // -------------------------------------------------------------------------
+
+  /** 访客仓库 +n 作物（偷菜成功）；上限 999。 */
+  addCrop (cropId, qty = 1) {
+    return this.#enqueue(() => this.#addCrop(cropId, qty))
+  }
+
+  /** 访客硬币 +n（帮忙成功）；上限 1,000,000。 */
+  addCoins (qty = 1) {
+    return this.#enqueue(() => this.#addCoins(qty))
+  }
+
+  /** 帮人之前先扣 1 露水；不够就明确 no-dew（不进入发送）。 */
+  spendDew (qty = 1) {
+    return this.#enqueue(() => this.#spendDew(qty))
+  }
+
+  /** 帮忙失败/超时退回露水；余额封顶 48。 */
+  refundDew (qty = 1) {
+    return this.#enqueue(() => this.#refundDew(qty))
+  }
+
+  /**
+   * 主人侧的「偷」落账：校验成熟/未偷过/日限额 → 标记 stolenBy → 写日志。
+   * `caught:true` 时只写一条「被抓住」的日志（qty 0），不改地块、不占次数——
+   * 守卫判定在 service（随机源可注入），这里只负责落账。
+   */
+  markStolen (plotId, deviceId, options = {}) {
+    return this.#enqueue(() => this.#markStolen(plotId, deviceId, options))
+  }
+
+  /** 主人侧的「帮」落账：校验生长中/未帮过/日限额 → +10% 生长 → 写日志。 */
+  markHelped (plotId, deviceId, options = {}) {
+    return this.#enqueue(() => this.#markHelped(plotId, deviceId, options))
+  }
+
+  /** 给访客视图用的当日计数（只读；跨日按零算，不改内存）。 */
+  visitLimits (deviceId) {
+    return this.#visitLimits(deviceId)
+  }
+
+  /** 访客本机今天已经偷/帮了几次（跨所有农场）。 */
+  visitActionUsed (kind) {
+    return this.#visitActionUsed(kind)
+  }
+
+  /** 访客本机成功一次偷/帮：先查上限，再计数（跨农场 10/5）。 */
+  noteVisitAction (kind) {
+    return this.#enqueue(() => this.#noteVisitAction(kind))
+  }
+
   /**
    * 运行中的时间推进：生长按真实时间走（不设上限），露水按 10 分钟/点攒。
    * 所有 action 进来也先走一遍，这样「到点了但 tick 还没跑」也不会少长一秒。
@@ -719,6 +906,13 @@ class FarmStore {
     state.dewAt = dew.dewAt
     state.dewDay = dew.dewDay
     state.dewDayEarned = dew.dewDayEarned
+
+    // 访客日限额：跨日整份换新，不把昨天的次数带进今天。
+    const day = localDayKey(now)
+    if (day !== null && state.visitStats.day !== day) {
+      state.visitStats = emptyVisitStats(day)
+      changed = true
+    }
 
     if (state.lastTickAt !== now) changed = true
     state.lastTickAt = now
@@ -983,6 +1177,222 @@ class FarmStore {
       dewEarned: this.#state.dewEarned,
       notice,
       persisted: farmPersisted === true && marketPersisted !== false
+    }
+  }
+
+  async #addCrop (rawCropId, rawQty) {
+    const cropId = normalizeCropId(rawCropId)
+    if (cropId === null) return farmError('bad-crop')
+    const qty = positiveInt(rawQty, MAX_STACK)
+    if (qty === null) return farmError('bad-qty')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+    const before = this.#state.crops[cropId] ?? 0
+    const after = addStack(this.#state.crops, cropId, qty)
+    const added = Math.max(0, after - before)
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'add-crop',
+      crop: cropId,
+      qty: added,
+      crops: { ...this.#state.crops },
+      persisted
+    }
+  }
+
+  async #addCoins (rawQty) {
+    const qty = positiveInt(rawQty, MAX_COINS)
+    if (qty === null) return farmError('bad-qty')
+    const now = this.#nowMs()
+    this.#advance(now)
+    const before = this.#state.coins
+    this.#state.coins = Math.min(MAX_COINS, before + qty)
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'add-coins',
+      qty: this.#state.coins - before,
+      coins: this.#state.coins,
+      persisted
+    }
+  }
+
+  async #spendDew (rawQty) {
+    const qty = positiveInt(rawQty, MAX_DEW)
+    if (qty === null) return farmError('bad-qty')
+    const now = this.#nowMs()
+    this.#advance(now)
+    if (this.#state.dew < qty) return farmError('no-dew')
+    this.#state.dew -= qty
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'spend-dew',
+      qty,
+      dew: this.#state.dew,
+      persisted
+    }
+  }
+
+  async #refundDew (rawQty) {
+    const qty = positiveInt(rawQty, MAX_DEW)
+    if (qty === null) return farmError('bad-qty')
+    const now = this.#nowMs()
+    this.#advance(now)
+    const before = this.#state.dew
+    this.#state.dew = Math.min(MAX_DEW, before + qty)
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'refund-dew',
+      qty: this.#state.dew - before,
+      dew: this.#state.dew,
+      persisted
+    }
+  }
+
+  /** 只读统计：跨日按零算，但不改内存（等下一次 tick/动作再重置）。 */
+  #visitStatsAt (now) {
+    const day = localDayKey(now)
+    const stats = this.#state.visitStats
+    if (day !== null && stats.day !== day) return emptyVisitStats(day)
+    return stats
+  }
+
+  #visitLimits (rawDeviceId) {
+    const deviceId = normalizeDeviceId(rawDeviceId)
+    const stats = this.#visitStatsAt(this.#nowMs())
+    const stealUsed = deviceId === null ? 0 : Number(stats.steal.byVisitor[deviceId]) || 0
+    const helpUsed = deviceId === null ? 0 : Number(stats.help.byVisitor[deviceId]) || 0
+    return {
+      steal: {
+        perVisit: STEAL_PER_VISITOR_PER_FARM,
+        usedInVisit: stealUsed,
+        perFarm: STEAL_PER_FARM_PER_DAY,
+        usedOnFarm: Number(stats.steal.total) || 0,
+        perDay: STEAL_PER_VISITOR_PER_DAY,
+        usedToday: Number(stats.mine.steal) || 0
+      },
+      help: {
+        perVisit: HELP_PER_VISITOR_PER_FARM,
+        usedInVisit: helpUsed,
+        perFarm: HELP_PER_VISITOR_PER_DAY,
+        usedOnFarm: Number(stats.help.total) || 0,
+        perDay: HELP_PER_VISITOR_PER_DAY,
+        usedToday: Number(stats.mine.help) || 0
+      }
+    }
+  }
+
+  #visitActionUsed (kind) {
+    if (kind !== 'steal' && kind !== 'help') return 0
+    const stats = this.#visitStatsAt(this.#nowMs())
+    return Number(stats.mine[kind]) || 0
+  }
+
+  async #noteVisitAction (kind) {
+    if (kind !== 'steal' && kind !== 'help') return farmError('bad-action')
+    const now = this.#nowMs()
+    this.#advance(now)
+    const limit = kind === 'steal' ? STEAL_PER_VISITOR_PER_DAY : HELP_PER_VISITOR_PER_DAY
+    const used = Number(this.#state.visitStats.mine[kind]) || 0
+    if (used >= limit) return { ok: false, error: 'cap', used, limit, persisted: false }
+    this.#state.visitStats.mine[kind] = used + 1
+    const persisted = await this.#persist(true)
+    return { ok: true, kind, used: used + 1, limit, persisted }
+  }
+
+  async #markStolen (rawPlotId, rawDeviceId, options) {
+    const plotId = normalizePlotId(rawPlotId)
+    if (plotId === null) return farmError('bad-plot')
+    const deviceId = normalizeDeviceId(rawDeviceId)
+    if (deviceId === null) return farmError('bad-plot')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+    const index = PLOT_IDS.indexOf(plotId)
+    const plot = this.#state.plots[index]
+    if (plot === undefined || !isCropId(plot.crop)) return farmError('bad-plot')
+    if (!isMature(plot)) return farmError('not-mature')
+    if (plot.stolenBy.includes(deviceId)) return farmError('already-stolen')
+
+    const stats = this.#state.visitStats
+    const usedInVisit = Number(stats.steal.byVisitor[deviceId]) || 0
+    if (usedInVisit >= STEAL_PER_VISITOR_PER_FARM || stats.steal.total >= STEAL_PER_FARM_PER_DAY) {
+      return farmError('cap')
+    }
+
+    const crop = plot.crop
+    const who = sanitizeWho(options?.who)
+    if (options?.caught === true) {
+      // 被抓住也是一次“有人来过”：写一条 qty 0 的日志，但地块与次数都不动。
+      this.#appendLog({ at: now, kind: 'steal', crop, qty: 0, ...(who === null ? {} : { who }) })
+      const persisted = await this.#persist(true)
+      return { ok: false, error: 'guard', caught: true, crop, qty: 0, persisted }
+    }
+
+    const next = { ...plot, stolenBy: [...plot.stolenBy, deviceId] }
+    this.#state.plots[index] = next
+    stats.steal.total += 1
+    stats.steal.byVisitor[deviceId] = usedInVisit + 1
+    this.#appendLog({ at: now, kind: 'steal', crop, qty: 1, ...(who === null ? {} : { who }) })
+
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'steal',
+      plotId,
+      crop,
+      qty: 1,
+      plot: copyPlot(next),
+      // 收获时结算的产量：stolenBy 每多一位访客就少 1（harvestYield 是唯一算法）。
+      yield: harvestYield(next),
+      persisted
+    }
+  }
+
+  async #markHelped (rawPlotId, rawDeviceId, options) {
+    const plotId = normalizePlotId(rawPlotId)
+    if (plotId === null) return farmError('bad-plot')
+    const deviceId = normalizeDeviceId(rawDeviceId)
+    if (deviceId === null) return farmError('bad-plot')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+    const index = PLOT_IDS.indexOf(plotId)
+    const plot = this.#state.plots[index]
+    if (plot === undefined || !isCropId(plot.crop) || isMature(plot)) return farmError('bad-plot')
+    if (plot.helpedBy.includes(deviceId)) return farmError('already-helped')
+
+    const stats = this.#state.visitStats
+    const usedInVisit = Number(stats.help.byVisitor[deviceId]) || 0
+    if (usedInVisit >= HELP_PER_VISITOR_PER_FARM) return farmError('cap')
+
+    const helped = helpPlot(plot)
+    if (helped === null) return farmError('bad-plot')
+    this.#state.plots[index] = { ...helped, helpedBy: [...helped.helpedBy, deviceId] }
+    stats.help.total += 1
+    stats.help.byVisitor[deviceId] = usedInVisit + 1
+    const who = sanitizeWho(options?.who)
+    this.#appendLog({
+      at: now,
+      kind: 'help',
+      crop: plot.crop,
+      qty: 1,
+      ...(who === null ? {} : { who })
+    })
+
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'help',
+      plotId,
+      crop: plot.crop,
+      qty: 1,
+      plot: copyPlot(this.#state.plots[index]),
+      persisted
     }
   }
 

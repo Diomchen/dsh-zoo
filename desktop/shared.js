@@ -134,7 +134,15 @@
    * 交易所两条（ticket 41）只带 cropId + qty。数量/价格全由宿主算。
    * 声明必须在 CONTROL_ACTIONS 之前（后者会展开它）。
    */
-  const FARM_PLOT_ACTIONS = ['farm-plant', 'farm-harvest', 'farm-water', 'farm-fertilize']
+  const FARM_VISIT_ACTIONS = ['farm-steal', 'farm-help']
+  const FARM_PLOT_ACTIONS = [
+    'farm-plant',
+    'farm-harvest',
+    'farm-water',
+    'farm-fertilize',
+    // ticket 43：访客偷/帮也是地块动作；只带 plotId，visitId/requestId 由宿主生成。
+    ...FARM_VISIT_ACTIONS
+  ]
   const FARM_MARKET_ACTIONS = ['farm-buy-seed', 'farm-sell-crop']
   const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS)
   /**
@@ -584,7 +592,17 @@
     if (raw.crop !== undefined && raw.crop !== null && crop === null) return null
     const qtyValue = Number(raw.qty)
     const qty = Number.isFinite(qtyValue) ? Math.min(MAX_FARM_STACK, Math.max(0, Math.floor(qtyValue))) : 0
-    return { at: Math.floor(at), kind: raw.kind, ...(crop === null ? {} : { crop }), qty }
+    // ticket 43：偷/帮日志带「谁」（昵称，≤32 码点）；没有就不是一条访客日志。
+    // 先按 UTF-16 上限取一段，再按码点夹取，避免在 emoji 代理对中间切断。
+    const whoText = raw.who === undefined || raw.who === null ? null : normalizeText(raw.who, null, 128)
+    const who = whoText === null ? null : Array.from(whoText).slice(0, 32).join('')
+    return {
+      at: Math.floor(at),
+      kind: raw.kind,
+      ...(crop === null ? {} : { crop }),
+      qty,
+      ...(who === null ? {} : { who })
+    }
   }
 
   /**
@@ -737,13 +755,93 @@
     return { prices, index, history }
   }
 
-  /** 宿主 → helper 的 `farm-window` 命令体：打开/刷新 + 完整农场视图 + 可选地块。 */
+  /**
+   * 访客模式（ticket 43）：宿主推来的主人家快照。窗口不联网，只画这一份。
+   * 只重建白名单字段：`stolenByMe` / `helpedByMe` 是布尔；绝不接受 stolenBy/helpedBy 数组
+   * （那会把别的访客 deviceId 带进 helper）。坏地块只丢那一块。
+   */
+  const FARM_VISIT_STATES = ['loading', 'ready', 'error', 'ended']
+  const MAX_VISIT_LIMIT = 99
+  const MAX_VISIT_GUARD = 0.8
+
+  function normalizeFarmVisitPlot (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizePlotId(raw.id)
+    if (id === null || !/^p[1-4]$/.test(id)) return null
+    const crop = raw.crop === null || raw.crop === undefined ? null : normalizeCropId(raw.crop)
+    if (raw.crop !== null && raw.crop !== undefined && crop === null) return null
+    const stage = crop === null ? 'empty' : (raw.stage === 'mature' || raw.mature === true ? 'mature' : 'growing')
+    const remaining = Number(raw.remainingMs)
+    return {
+      id,
+      crop,
+      stage,
+      mature: stage === 'mature',
+      remainingMs: stage === 'mature' || !Number.isFinite(remaining)
+        ? 0
+        : Math.min(MAX_FARM_REMAINING_MS, Math.max(0, Math.floor(remaining))),
+      stolenByMe: raw.stolenByMe === true,
+      helpedByMe: raw.helpedByMe === true
+    }
+  }
+
+  function normalizeVisitLimit (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const value = (key) => {
+      const num = Number(raw[key])
+      return Number.isFinite(num) ? Math.min(MAX_VISIT_LIMIT, Math.max(0, Math.floor(num))) : 0
+    }
+    return {
+      perVisit: value('perVisit'),
+      usedInVisit: value('usedInVisit'),
+      perFarm: value('perFarm'),
+      usedOnFarm: value('usedOnFarm'),
+      perDay: value('perDay'),
+      usedToday: value('usedToday')
+    }
+  }
+
+  function normalizeFarmVisit (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const state = FARM_VISIT_STATES.includes(raw.state) ? raw.state : 'error'
+    const guardValue = Number(raw.guard)
+    const plots = []
+    const seen = new Set()
+    if (Array.isArray(raw.plots)) {
+      for (const candidate of raw.plots) {
+        if (plots.length >= MAX_FARM_PLOTS) break
+        const plot = normalizeFarmVisitPlot(candidate)
+        if (plot === null || seen.has(plot.id)) continue
+        seen.add(plot.id)
+        plots.push(plot)
+      }
+    }
+    const at = Number(raw.at)
+    const error = typeof raw.error === 'string' && /^[a-z0-9-]{1,32}$/.test(raw.error) ? raw.error : null
+    return {
+      state,
+      nickname: normalizeText(raw.nickname, null, 32),
+      guard: Number.isFinite(guardValue) ? Math.min(MAX_VISIT_GUARD, Math.max(0, guardValue)) : 0,
+      plots,
+      limits: {
+        steal: normalizeVisitLimit(raw.limits?.steal),
+        help: normalizeVisitLimit(raw.limits?.help)
+      },
+      error,
+      at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0
+    }
+  }
+
+  /** 宿主 → helper 的 `farm-window` 命令体：打开/刷新 + 完整农场视图 + 可选地块/访客块。 */
   function normalizeFarmWindow (raw) {
     const plotId = normalizePlotId(raw.plotId)
+    const visit = normalizeFarmVisit(raw.visit)
     return {
       open: raw.open === true,
+      mode: raw.mode === 'visitor' ? 'visitor' : 'owner',
       farm: normalizeFarm(raw.farm, { full: true }),
       market: normalizeMarket(raw.market),
+      ...(visit === null ? {} : { visit }),
       ...(plotId === null ? {} : { plotId })
     }
   }
@@ -761,10 +859,13 @@
     }
     const plotId = normalizePlotId(raw.plotId)
     if (plotId === null) return null
+    // 偷/帮只可能是 p1..p4（访客没有别的可点）；在主进程那一层就挡住 p9。
+    if (FARM_VISIT_ACTIONS.includes(action) && !/^p[1-4]$/.test(plotId)) return null
     if (action === 'farm-plant') {
       const cropId = normalizeCropId(raw.cropId)
       return cropId === null ? null : { action, plotId, cropId }
     }
+    // 偷/帮与主人四条一样只带 plotId；visitId 与 requestId 由宿主生成，渲染端不传。
     return { action, plotId }
   }
 
@@ -2553,6 +2654,7 @@
     FARM_ACTIONS,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
+    FARM_VISIT_ACTIONS,
     GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,

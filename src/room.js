@@ -418,6 +418,22 @@ export function createRoom ({
   }
 
   /**
+   * 按 visitId 找当前入站访客（ticket 43）。返回拷贝，调用方改不到内部状态。
+   *
+   * `visitors` 按 deviceId 索引，visitId 只是值里的字段；这里直接遍历值（访客通常 0–2 位）。
+   * 五个结束点（送客/对方召回/失联/信任收紧/dispose）都会删条目，所以路由的 404
+   * 不需要第二张 armed 表——查询不到就是“这次串门结束了”。
+   */
+  function findVisitorByVisitId (rawVisitId) {
+    const visitId = normalizeVisitId(rawVisitId)
+    if (visitId === null) return null
+    for (const visitor of state.visitors.values()) {
+      if (visitor.visitId === visitId) return copyVisitor(visitor)
+    }
+    return null
+  }
+
+  /**
    * 入站礼物：协议层已经清洗过一遍，这里再过一遍白名单（room 也会被单测直接喂）。
    * 返回的状态永远是 pending——真正收下要等 service 把 note.txt/文件写成功。
    * 文件礼物只带 name/size（渲染端要画文件名与大小）；sha256 与路径都不进快照。
@@ -1232,6 +1248,24 @@ export function createRoom ({
     },
 
     /**
+     * 只读查询（ticket 43）：visitId → 当前入站访客（拷贝）。
+     * 非法/没找到都返回 null；路由与 farm-action 授权据此 404 / 静默丢弃。
+     */
+    visitorByVisitId (rawVisitId) {
+      return findVisitorByVisitId(rawVisitId)
+    },
+
+    /** 这次 farm-action 是否来自当前访客本人（deviceId + visitId 双证）。 */
+    isVisitorVisit (rawDeviceId, rawVisitId) {
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      if (deviceId === null) return false
+      const visitor = findVisitorByVisitId(rawVisitId)
+      if (visitor === null) return false
+      // 协议层已把 deviceId 归一成小写；这里再兜一次大小写，避免直接调用方传大写时误拒。
+      return visitor.deviceId.toLowerCase() === deviceId.toLowerCase()
+    },
+
+    /**
      * 主人点「送客」：立刻结束一位入站访客（ticket 10）。
      * 写 in 记录并排一条 visit-recall 让对方也回家；对方收不到也没关系，
      * 它会靠自己的 2 分钟失联检测或 30 分钟出门上限回来。
@@ -1327,6 +1361,15 @@ export function createRoom ({
      * 文案由 service 从 `gift-text.js` 取，room 只负责排进快照。
      */
     noteGiftMissed (text, at = clock()) {
+      if (typeof text !== 'string' || text.trim() === '') return null
+      return pushNotice(text.trim(), at)
+    },
+
+    /**
+     * 农场事件（ticket 43）：偷/帮/被抓都由 service 拼好一句人话，room 只负责排进快照。
+     * 和 `noteGiftMissed` 同一条出口：文案清洗与长度上限都在 `pushNotice` 里。
+     */
+    noteFarmEvent (text, at = clock()) {
       if (typeof text !== 'string' || text.trim() === '') return null
       return pushNotice(text.trim(), at)
     },

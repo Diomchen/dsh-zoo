@@ -160,7 +160,7 @@ test('farm-open：窗口拿完整农场（含 remainingMs/种子/日志），场
   assert.equal(state.body.farm.plots[0].id, 'p1')
   assert.equal('remainingMs' in state.body.farm.plots[0], false)
   assert.equal('stage' in state.body.farm.plots[0], false)
-  assert.equal(state.body.farm.guard, 0)
+  assert.equal(state.body.farm.guard, 0.3)
 
   // 菜单/地块点击 → 宿主发 farm-window，窗口拿到完整视图 + 预选地块。
   const opened = await callAction(service, { action: 'farm-open', plotId: 'p2' })
@@ -431,4 +431,132 @@ test('交易所页的局域网指数：新鲜时混进 bid，过期后标 stale 
   const stale = desktop.calls.windows.at(-1).market
   assert.equal(stale.index.tomato.stale, true)
   assert.equal(stale.prices.tomato.bid, 9, '本机 10 → bid 9')
+})
+
+// ---------------------------------------------------------------------------
+// ticket 43：访客模式的窗口载荷与动作窄口
+// ---------------------------------------------------------------------------
+
+test('访客动作：shared 只放行 farm-steal/farm-help + plotId；helper 事件同样带 plotId', () => {
+  assert.equal(shared.FARM_ACTIONS.includes('farm-steal'), true)
+  assert.equal(shared.FARM_ACTIONS.includes('farm-help'), true)
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-steal', plotId: 'p2', visitId: 'ignored' }),
+    { action: 'farm-steal', plotId: 'p2' }
+  )
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-help', plotId: 'P4' }),
+    { action: 'farm-help', plotId: 'p4' }
+  )
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-steal' }), null)
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-steal', plotId: 'p9' }), null)
+
+  const steal = shared.normalizeHelperEvent({
+    type: 'action', id: 'f1', action: 'farm-steal', plotId: 'p1'
+  })
+  assert.equal(steal.ok, true)
+  assert.equal(steal.event.action, 'farm-steal')
+  assert.equal(steal.event.plotId, 'p1')
+  const help = shared.normalizeHelperEvent({
+    type: 'action', id: 'f2', action: 'farm-help', plotId: 'p3'
+  })
+  assert.equal(help.ok, true)
+  assert.equal(help.event.plotId, 'p3')
+  // 缺 plotId 整条丢，不猜一块地。
+  assert.equal(shared.normalizeHelperEvent({
+    type: 'action', id: 'f3', action: 'farm-steal'
+  }).ok, false)
+})
+
+test('farm-window：mode/visit 白名单只留布尔与四块地；坏地块/坏状态退化', () => {
+  const other = '99999999-9999-4999-8999-999999999999'
+  const command = shared.normalizeHostCommand({
+    type: 'farm-window',
+    id: 'w1',
+    open: true,
+    mode: 'visitor',
+    farm: { plots: [], coins: 30, seeds: {}, crops: {}, dew: 1 },
+    visit: {
+      state: 'ready',
+      nickname: '  楼上的 柯基 ',
+      guard: 9,
+      plots: [
+        { id: 'p1', crop: 'tomato', stage: 'mature', mature: true, stolenByMe: true, stolenBy: [other] },
+        { id: 'p2', crop: 'carrot', stage: 'growing', remainingMs: -1, helpedByMe: true, helpedBy: [other] },
+        { id: 'p9', crop: 'tomato' },
+        { id: 'p3', crop: 'alien' }
+      ],
+      limits: {
+        steal: { perVisit: 3, usedInVisit: 1, perFarm: 5, usedOnFarm: 2, perDay: 10, usedToday: 1 },
+        help: { perVisit: 3, usedInVisit: 0, perFarm: 5, usedOnFarm: 0, perDay: 5, usedToday: 0 }
+      },
+      at: 1700000000000
+    }
+  })
+  assert.equal(command.ok, true)
+  assert.equal(command.command.mode, 'visitor')
+  assert.equal(command.command.visit.state, 'ready')
+  assert.equal(command.command.visit.guard, 0.8)
+  assert.equal(command.command.visit.nickname, '楼上的 柯基')
+  assert.deepEqual(command.command.visit.plots, [
+    { id: 'p1', crop: 'tomato', stage: 'mature', mature: true, remainingMs: 0, stolenByMe: true, helpedByMe: false },
+    { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: true }
+  ])
+  const text = JSON.stringify(command.command)
+  assert.equal(text.includes(other), false, '别的访客 deviceId 不进 helper')
+  assert.equal(text.includes('"stolenBy"'), false)
+  assert.equal(text.includes('"helpedBy"'), false)
+  assert.deepEqual(command.command.visit.limits.steal, {
+    perVisit: 3, usedInVisit: 1, perFarm: 5, usedOnFarm: 2, perDay: 10, usedToday: 1
+  })
+
+  // 没有 visit 时就是 owner 模式（老宿主/老窗口照常）。
+  const owner = shared.normalizeHostCommand({
+    type: 'farm-window', id: 'w2', open: false, farm: { plots: [], coins: 0 }
+  })
+  assert.equal(owner.command.mode, 'owner')
+  assert.equal('visit' in owner.command, false)
+
+  // 坏状态退化成 error；坏 error 码丢掉；loading 时地块为空。
+  const broken = shared.normalizeFarmWindow({
+    mode: 'visitor',
+    visit: { state: 'nope', error: '../secret', plots: 'nope' }
+  })
+  assert.equal(broken.visit.state, 'error')
+  assert.equal(broken.visit.error, null)
+  assert.deepEqual(broken.visit.plots, [])
+})
+
+test('主人日志的「谁」：full 视图保留 who（≤32 码点），场景摘要仍不带日志', () => {
+  const normalized = shared.normalizeFarm({
+    plots: [],
+    coins: 30,
+    dew: 1,
+    log: [
+      { at: NOON, kind: 'steal', crop: 'tomato', qty: 1, who: '  阿蟹  ' },
+      { at: NOON, kind: 'steal', crop: 'tomato', qty: 0, who: '喵'.repeat(40) },
+      { at: NOON, kind: 'help', crop: 'carrot', qty: 1 }
+    ]
+  }, { full: true })
+  assert.equal(normalized.log[0].who, '阿蟹')
+  assert.equal(Array.from(normalized.log[1].who).length, 32)
+  assert.equal('who' in normalized.log[2], false)
+  assert.equal('log' in shared.normalizeFarmSummary({
+    plots: [], coins: 30, dew: 1, log: [{ at: NOON, kind: 'steal', qty: 1, who: '阿蟹' }]
+  }), false)
+})
+
+test('访客窗口的渲染端/预加载/主进程都走同一条动作线（静态窄口检查）', async () => {
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  assert.match(renderer, /action === 'steal' \|\| action === 'help'/)
+  assert.match(renderer, /action: 'farm-' \+ action/)
+  assert.match(renderer, /visitor-banner/)
+  assert.match(renderer, /stolenByMe/)
+  assert.match(renderer, /helpedByMe/)
+  const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
+  assert.match(preload, /plotId: action\.plotId/)
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  assert.match(main, /farmVisit/)
+  assert.match(main, /command\.mode === 'visitor'/)
+  assert.match(main, /farmPending/)
 })
