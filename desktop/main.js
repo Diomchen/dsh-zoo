@@ -151,6 +151,8 @@ let farmWin = null
 let farmState = null
 /** 交易所页 / `farm-window` 里随农场一起下发的 market view（价目/历史/index）。 */
 let farmMarket = null
+/** 雇工页（ticket 44）：合同/邻居挂牌/在飞状态，和 farm 一起下发、一起缓存。 */
+let farmContracts = null
 /** 访客模式（ticket 43）：`owner` / `visitor` 与主人家的快照块（state/guard/plots/limits）。 */
 let farmMode = 'owner'
 let farmVisit = null
@@ -935,6 +937,17 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '数量要在 1–99 之间。', error: 'bad-qty' })
     return
   }
+  // 雇佣（ticket 44）：四个动作共用 normalizeFarmAction，窗口与主窗走同一道白名单。
+  if (shared.FARM_HIRE_ACTIONS.includes(action)) {
+    const normalized = shared.normalizeFarmAction({ ...payload, action })
+    if (normalized === null) {
+      sendActionResult({ id, ok: false, notice: '这个雇佣操作缺少字段，再试一次。', error: 'bad-farm-action' })
+      return
+    }
+    const hireWritten = writeEvent({ type: 'action', id, ...normalized })
+    if (!hireWritten) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接。', error: 'host-unavailable' })
+    return
+  }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
   const written = writeEvent({
     type: 'action',
@@ -1596,6 +1609,7 @@ function sendFarmState () {
     farmWin.webContents.send('dsh-zoo:farm-state', {
       farm: farmState,
       market: farmMarket,
+      contracts: farmContracts,
       mode: farmMode,
       visit: farmVisit,
       plotId: farmPlotId
@@ -1827,6 +1841,7 @@ function applyCommand (command) {
       // `open:true` 打开/聚焦（已开则只刷新）；`open:false` 刷新已开着的窗。
       farmState = command.farm
       farmMarket = command.market
+      farmContracts = command.contracts ?? null
       farmMode = command.mode === 'visitor' ? 'visitor' : 'owner'
       farmVisit = command.visit ?? null
       farmPlotId = typeof command.plotId === 'string' ? command.plotId : null
@@ -2018,7 +2033,14 @@ function applyCommand (command) {
         action: command.action,
         plotId: command.plotId,
         cropId: command.cropId,
-        qty: command.qty
+        qty: command.qty,
+        deviceId: command.deviceId,
+        hours: command.hours,
+        contractId: command.contractId,
+        wagePerHour: command.wagePerHour,
+        minHours: command.minHours,
+        maxHours: command.maxHours,
+        enabled: command.enabled
       })
       const script = '(() => {' +
         'if (!window.dshZooFarm) return false;' +

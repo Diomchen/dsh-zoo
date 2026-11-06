@@ -32,6 +32,18 @@ const FARM_ERROR_TEXT = Object.freeze({
   'no-dew': '露水不够，先让宠物待机攒一会儿。',
   'already-watered': '这株已经浇过水了。',
   'already-fertilized': '这株已经施过肥了。',
+  // 雇佣合同（ticket 44）
+  'own-pet': '不能雇自己的宠物。',
+  'worker-unavailable': '这只宠物现在不能来打工：可能不在家、在串门，或者已经接了别的活。',
+  'already-working': '宠物正在打工，合同结束前不能再接别的活。',
+  'already-hired': '家里已经有一位雇工了，先结束现有合同。',
+  'bad-wage': '时薪要在 1–100 硬币之间。',
+  'bad-hours': '合同时长要在 2–8 小时之间（最短不能超过最长）。',
+  'bad-enabled': '挂牌开关的取值不对。',
+  'contract-not-found': '找不到这份合同，可能已经结束了。',
+  'contract-ended': '这份合同已经结束了。',
+  'contract-busy': '这份合同正在结算，等一下再看。',
+  busy: '上一笔雇佣还在联系中，等一下再试。',
   // 访客动作（ticket 43）
   'no-visit': '这次串门已经结束了。',
   'no-port': '对方没开局域网端口，看不到他家的农场。',

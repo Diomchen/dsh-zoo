@@ -31,7 +31,7 @@ const PEER_B = '22222222-2222-4222-8222-222222222222'
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-market-index-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 

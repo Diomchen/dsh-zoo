@@ -181,6 +181,39 @@ test('心跳同样接受版本、deviceId、4 KiB 的校验', () => {
   assert.equal(parsePacket(Buffer.alloc(MAX_PACKET_BYTES + 1, 0x61)).reason, 'too-large')
 })
 
+function workPayload (type, deviceId) {
+  const contractId = randomUUID()
+  const requestId = randomUUID()
+  const base = { v: PROTOCOL_VERSION, type, deviceId }
+  if (type === 'work-request') {
+    return { ...base, requestId, hours: 2, wagePerHour: 5, fee: 1 }
+  }
+  if (type === 'work-ack') {
+    return { ...base, requestId, ok: true, contractId, startedAt: 1700000000000, endsAt: 1700007200000, guard: 0.5 }
+  }
+  if (type === 'work-recall') return { ...base, contractId }
+  if (type === 'work-recall-ack') return { ...base, contractId, ok: true }
+  if (type === 'work-end') return { ...base, contractId, reason: 'employer-end' }
+  if (type === 'work-end-ack') return { ...base, contractId, requestId, ok: true }
+  if (type === 'work-settle') {
+    return { ...base, contractId, requestId, servedMs: 3600000, earned: 5, reason: 'completed' }
+  }
+  return { ...base, contractId, requestId, ok: true, earned: 5 }
+}
+
+function workKeys (type) {
+  return {
+    'work-request': ['v', 'type', 'deviceId', 'requestId', 'hours', 'wagePerHour', 'fee'],
+    'work-ack': ['v', 'type', 'deviceId', 'requestId', 'ok', 'contractId', 'startedAt', 'endsAt', 'guard'],
+    'work-recall': ['v', 'type', 'deviceId', 'contractId'],
+    'work-recall-ack': ['v', 'type', 'deviceId', 'contractId', 'ok'],
+    'work-end': ['v', 'type', 'deviceId', 'contractId', 'reason'],
+    'work-end-ack': ['v', 'type', 'deviceId', 'contractId', 'requestId', 'ok'],
+    'work-settle': ['v', 'type', 'deviceId', 'contractId', 'requestId', 'servedMs', 'earned', 'reason'],
+    'work-settle-ack': ['v', 'type', 'deviceId', 'contractId', 'requestId', 'ok', 'earned']
+  }[type]
+}
+
 test('任何报文都不含坐标字段（包括串门报文）', () => {
   const deviceId = randomUUID()
   const visitId = randomUUID()
@@ -267,6 +300,8 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type.startsWith('work-')) {
+      raw = { ...workPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('visit-')) {
       raw = {
         v: PROTOCOL_VERSION,
@@ -307,9 +342,11 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
                   ? ['v', 'type', 'deviceId', 'visitId', 'requestId', 'action', 'plotId']
                   : type === 'farm-action-result'
                     ? ['v', 'type', 'deviceId', 'requestId', 'ok', 'crop', 'qty']
-                    : type.startsWith('visit-')
-                      ? ['v', 'type', 'deviceId', 'visitId']
-                      : ['v', 'type', 'deviceId', 'nickname', 'port']
+                    : type.startsWith('work-')
+                      ? workKeys(type)
+                      : type.startsWith('visit-')
+                        ? ['v', 'type', 'deviceId', 'visitId']
+                        : ['v', 'type', 'deviceId', 'nickname', 'port']
     )
   }
 })
@@ -601,7 +638,15 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'gift-received',
     'market-digest',
     'farm-action',
-    'farm-action-result'
+    'farm-action-result',
+    'work-request',
+    'work-ack',
+    'work-recall',
+    'work-recall-ack',
+    'work-end',
+    'work-end-ack',
+    'work-settle',
+    'work-settle-ack'
   ])
 })
 

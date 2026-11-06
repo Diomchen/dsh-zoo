@@ -122,7 +122,7 @@ test('buildMenu：本地动作清单为空时才退到待机池，不出现空�
 
 test('读动画配置：素材目录旁边的 config.jsonc，剥注释；坏文件跳过看下一个源', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-menu-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
 
   const broken = join(dir, 'broken', 'assets')
   const good = join(dir, 'good', 'assets')

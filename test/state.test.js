@@ -33,7 +33,7 @@ function fakeCtx () {
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-state-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 
@@ -149,4 +149,25 @@ test('/state：bring 之后 backpack 出现 FIFO 顺序的条目；service.snaps
   }
   assert.deepEqual(service.snapshot().backpack, state.body.backpack)
   assert.deepEqual(service.snapshot().gifts, state.body.gifts)
+})
+
+test('ticket 44：/state.contracts 始终是完整空形状；farm.guard/worker 来自唯一守卫计算点', async (t) => {
+  const dir = await tempDir(t)
+  const service = makeService(t, dir)
+  // store 还没起来也不能是 undefined。
+  const early = await call(service, '/dsh-zoo/state')
+  assert.deepEqual(early.body.contracts, { outgoing: [], incoming: [] })
+  assert.equal(early.body.farm.guard, 0.3)
+  assert.equal(early.body.farm.worker, null)
+  assert.equal(early.body.self.work, null)
+  assert.equal(early.body.worker, null)
+
+  await service.ready
+  const state = await call(service, '/dsh-zoo/state')
+  assert.deepEqual(state.body.contracts, { outgoing: [], incoming: [] })
+  assert.equal(state.body.farm.guard, 0.3)
+  assert.equal(state.body.farm.worker, null)
+  assert.equal(state.body.farm.hire.enabled, false)
+  assert.deepEqual(service.snapshot().contracts, state.body.contracts)
+  assert.deepEqual(Object.keys(state.body.contracts).sort(), ['incoming', 'outgoing'])
 })

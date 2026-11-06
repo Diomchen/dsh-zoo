@@ -480,8 +480,14 @@
     mediaBox.className = 'lp-pet-media'
     const nameEl = document.createElement('span')
     nameEl.className = 'lp-pet-name'
+    // ticket 44：雇工角标固定「打工」，不是自由文本（host 只发枚举 badge:'work'）。
+    const badgeEl = document.createElement('span')
+    badgeEl.className = 'lp-pet-badge'
+    badgeEl.textContent = '打工'
+    badgeEl.hidden = true
     el.appendChild(mediaBox)
     el.appendChild(nameEl)
+    el.appendChild(badgeEl)
     el.addEventListener('pointerdown', onPetPointerDown)
     el.addEventListener('mousedown', onPetMouseDown)
     el.addEventListener('contextmenu', onPetContextMenu)
@@ -497,6 +503,7 @@
       el,
       mediaBox,
       nameEl,
+      badgeEl,
       video: null,
       svg: null,
       badge: null,
@@ -526,8 +533,13 @@
 
   function updateNode (pet) {
     const item = pet.item
-    const role = item.role === 'self' || item.role === 'visitor' ? item.role : 'guest'
+    const role = item.role === 'self' || item.role === 'visitor' || item.role === 'worker'
+      ? item.role
+      : 'guest'
     if (pet.el.dataset.role !== role) pet.el.dataset.role = role
+    // 角标是固定枚举：只有 work 才画（渲染端不猜也不接受任意字符串）。
+    const showBadge = item.badge === 'work'
+    if (pet.badgeEl.hidden !== !showBadge) pet.badgeEl.hidden = !showBadge
     if (pet.el.getAttribute('aria-label') !== item.label) {
       pet.el.setAttribute('aria-label', item.label)
       pet.el.setAttribute('role', 'img')
@@ -1891,10 +1903,8 @@
     if (ui.farm === null) buildFarmStrip()
     const signature = JSON.stringify(farm)
     if (ui.farm.signature === signature) {
-      // 地块没变，但自己出门/回家了：状态角标要跟着变。
-      const away = pets.get('self') === undefined
-      ui.farm.statusEl.hidden = !away
-      ui.farm.statusEl.textContent = away ? '看家中' : ''
+      // 地块没变，但主人出门/打工/回家了：状态角标要跟着变（ticket 44 修正反向文案）。
+      syncFarmStatus(farm)
       return
     }
     ui.farm.signature = signature
@@ -1914,10 +1924,26 @@
       if (entry !== undefined) updateFarmPlot(entry, plot)
     }
     // 自己出门/打工时，桌面没有 self；地块条上要有一句状态（SPEC v5「桌面地块条」）。
-    const away = pets.get('self') === undefined
-    ui.farm.statusEl.hidden = !away
-    ui.farm.statusEl.textContent = away ? '看家中' : ''
+    syncFarmStatus(farm)
     layoutUi(true)
+  }
+
+  /**
+   * 地块条的状态角标（ticket 44）。以宿主的 `farm.owner.presence` 为准：
+   * home = 看家中 / visiting = 串门中 / working = 在外打工。
+   * 老宿主没有 owner 时退回「桌面有没有 self」——注意旧文案写反了，这里顺手修正。
+   */
+  function syncFarmStatus (farm) {
+    if (ui.farm === null) return
+    const presence = farm?.owner?.presence
+    let text = ''
+    if (presence === 'working') text = '在外打工'
+    else if (presence === 'visiting') text = '串门中'
+    else if (presence === 'home') text = '看家中'
+    // 老宿主没有 owner：不知道是串门还是打工，就不写（不再沿用 40 的反向「看家中」）。
+    else text = ''
+    ui.farm.statusEl.hidden = text === ''
+    if (ui.farm.statusEl.textContent !== text) ui.farm.statusEl.textContent = text
   }
 
   // -------------------------------------------------------------------------
@@ -3189,6 +3215,7 @@
         pets: [...pets.values()].map((pet) => ({
           id: pet.id,
           role: pet.item.role,
+          badge: pet.item.badge ?? null,
           label: pet.item.label,
           anim: pet.item.anim,
           x: round(pet.body.x),

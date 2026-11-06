@@ -30,7 +30,7 @@ const TODAY = localDayKey(NOON)
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-farm-market-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 

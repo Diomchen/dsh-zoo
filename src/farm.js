@@ -349,6 +349,13 @@ function hireInt (value, min, max, fallback) {
   return { value: Math.min(max, Math.max(min, Math.floor(num))), repaired: 0 }
 }
 
+/** 挂牌动作的严格版：必须落在区间里，不夹取；坏值返回 null。 */
+function strictHireInt (value, min, max) {
+  const num = finiteNumber(value)
+  if (num === null || !Number.isInteger(num) || num < min || num > max) return null
+  return num
+}
+
 /**
  * 每日访客计数（ticket 43）。旧文件没有这一项不算损坏：按空账本补；
  * 坏 deviceId 键/坏计数只丢自己，绝不让脏值进内存。
@@ -832,6 +839,19 @@ class FarmStore {
     return this.#enqueue(() => this.#addCoins(qty))
   }
 
+  /** 合同结算的扣款/退款也走这一条（ticket 44）：铸币只发生在本地。 */
+  spendCoins (qty = 1) {
+    return this.#enqueue(() => this.#spendCoins(qty))
+  }
+
+  /**
+   * 改挂牌（ticket 44）：显式拒绝坏值，绝不静默夹取——窗口填了 0 时薪却看到
+   * 「已保存」，用户会以为下一位邻居只花 0 硬币。
+   */
+  setHire (raw) {
+    return this.#enqueue(() => this.#setHire(raw))
+  }
+
   /** 帮人之前先扣 1 露水；不够就明确 no-dew（不进入发送）。 */
   spendDew (qty = 1) {
     return this.#enqueue(() => this.#spendDew(qty))
@@ -1215,6 +1235,51 @@ class FarmStore {
       action: 'add-coins',
       qty: this.#state.coins - before,
       coins: this.#state.coins,
+      persisted
+    }
+  }
+
+  async #spendCoins (rawQty) {
+    const qty = positiveInt(rawQty, MAX_COINS)
+    if (qty === null) return farmError('bad-qty')
+    const now = this.#nowMs()
+    this.#advance(now)
+    if (this.#state.coins < qty) return farmError('no-coin')
+    this.#state.coins -= qty
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'spend-coins',
+      qty,
+      coins: this.#state.coins,
+      persisted
+    }
+  }
+
+  async #setHire (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return farmError('bad-enabled')
+    const current = this.#state.hire
+    const enabled = raw.enabled === undefined ? current.enabled : raw.enabled
+    if (typeof enabled !== 'boolean') return farmError('bad-enabled')
+    const wage = raw.wagePerHour === undefined
+      ? current.wagePerHour
+      : strictHireInt(raw.wagePerHour, MIN_WAGE, MAX_WAGE)
+    if (wage === null) return farmError('bad-wage')
+    const minHours = raw.minHours === undefined
+      ? current.minHours
+      : strictHireInt(raw.minHours, MIN_HIRE_HOURS, MAX_HIRE_HOURS)
+    if (minHours === null) return farmError('bad-hours')
+    const maxHours = raw.maxHours === undefined
+      ? current.maxHours
+      : strictHireInt(raw.maxHours, MIN_HIRE_HOURS, MAX_HIRE_HOURS)
+    if (maxHours === null) return farmError('bad-hours')
+    if (minHours > maxHours) return farmError('bad-hours')
+    this.#state.hire = { enabled, wagePerHour: wage, minHours, maxHours }
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'hire-listing',
+      hire: { ...this.#state.hire },
       persisted
     }
   }

@@ -2330,7 +2330,8 @@ async function verifyFarmWindow () {
     coins: 30,
     dew: 5,
     worker: null,
-    contractCount: 0
+    contractCount: 0,
+    owner: { presence: 'home' }
   }
   const fullFarm = {
     plots: farmPlots.map((plot) => ({ ...plot, waterings: 0, fertilized: false })),
@@ -2339,8 +2340,39 @@ async function verifyFarmWindow () {
     coins: 30,
     dew: 5,
     worker: null,
-    contractCount: 0,
+    contractCount: 1,
+    hire: { enabled: true, wagePerHour: 10, minHours: 2, maxHours: 8 },
+    guard: 0.8,
     log: [{ at: Date.now(), kind: 'plant', crop: 'tomato', qty: 1 }]
+  }
+  // 票 44：雇工页的数据也随 farm-window 一起下发（窗口读不到 /state）。
+  const fullContracts = {
+    outgoing: [{
+      id: '11111111-1111-4111-8111-111111111111',
+      workerNickname: '阿蟹',
+      hours: 2,
+      wagePerHour: 10,
+      wage: 20,
+      fee: 1,
+      status: 'active',
+      earned: 0,
+      remainingMs: 30 * 60 * 1000,
+      settled: false
+    }],
+    incoming: [],
+    listings: [{
+      deviceId: '22222222-2222-4222-8222-222222222222',
+      nickname: '泡泡',
+      enabled: true,
+      available: true,
+      reason: 'ready',
+      wagePerHour: 10,
+      minHours: 2,
+      maxHours: 8,
+      guard: 0.5,
+      stale: false
+    }],
+    pendingHire: false
   }
 
   // 1) 主窗的桌面地块条：4 块地 + 成熟角标 + 「农场」按钮都在命中矩形里。
@@ -2395,8 +2427,42 @@ async function verifyFarmWindow () {
   assert(clickAction.plotId === 'p2', '点第 2 块地带的就是 plotId=p2（' + clickAction.plotId + '）')
   client.send({ type: 'action-result', id: clickAction.id, ok: true })
 
-  // 2) 宿主开窗：完整农场（种子/作物/日志/remainingMs）随命令下发。
-  client.send({ type: 'farm-window', open: true, farm: fullFarm, plotId: 'p1' })
+  // 票 44：雇工宠物带 role:'worker' + badge:'work'；self 在 out/work 时消失由宿主决定，
+  // 这里直接喂场景验渲染端四层白名单。
+  client.send({
+    type: 'update',
+    scene: shared.petScene([
+      { id: 'self', role: 'self', label: '小蓝', anim: '东张西望', color: shared.PET_COLORS[0] },
+      {
+        id: 'worker:33333333-3333-4333-8333-333333333333',
+        role: 'worker',
+        badge: 'work',
+        label: '阿蟹',
+        anim: null,
+        color: shared.PET_COLORS[4]
+      }
+    ], ready.workArea, {
+      controls: {
+        visit: { enabled: false, reason: '宠物在外打工，合同结束前不能去串门。' },
+        recall: { enabled: false, nickname: null },
+        visitors: [],
+        street: [],
+        gifts: [],
+        farm: { ...summary, worker: { nickname: '阿蟹' }, contractCount: 1 },
+        prompt: null,
+        notice: null
+      }
+    })
+  })
+  await sleep(900)
+  const workerState = await client.rendererState()
+  const workerPet = workerState.pets.find((pet) => pet.role === 'worker')
+  assert(workerPet !== undefined, '渲染端画出 role:worker 的雇工')
+  assert(workerPet.badge === 'work', '雇工带 work 角标')
+  assert(workerState.controls.farm.worker.nickname === '阿蟹', '摘要里带雇工昵称')
+
+  // 2) 宿主开窗：完整农场（种子/作物/日志/remainingMs）+ contracts（雇工页）随命令下发。
+  client.send({ type: 'farm-window', open: true, farm: fullFarm, contracts: fullContracts, plotId: 'p1' })
   await client.waitStatus((status) => status.farmOpen === true, 5000, '农场小窗打开')
   await client.waitStatus((status) => status.farmVisible === true, 5000, '农场小窗可见')
   await sleep(900)
@@ -2451,6 +2517,26 @@ async function verifyFarmWindow () {
   client.send({ type: 'action-result', id: action.id, ok: true, notice: '种下了小番茄。' })
   await sleep(500)
   assert((await client.status()).farmOpen === true, '动作成功不关农场小窗（继续种）')
+
+  // 票 44：雇工页的「保存挂牌」也走同一个 preload → IPC → 宿主窄口。
+  const hireMark = client.mark()
+  client.send({
+    type: 'debug-farm-submit',
+    id: 'smoke-farm-hire-listing',
+    action: 'hire-listing',
+    enabled: true,
+    wagePerHour: 10,
+    minHours: 2,
+    maxHours: 8
+  })
+  const hireAction = await client.waitFrom(
+    hireMark,
+    (event) => event.type === 'action' && event.action === 'hire-listing',
+    6000,
+    '雇工页保存挂牌'
+  )
+  assert(hireAction.enabled === true && hireAction.wagePerHour === 10, '挂牌字段过窄口')
+  assert((await client.status()).farmOpen === true, '挂牌成功不关农场小窗')
 
   // 6) 失败也留在窗里，notice 说人话；之后 hide 才关。
   const failMark = client.mark()

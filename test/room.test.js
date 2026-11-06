@@ -20,7 +20,9 @@ test('初始快照保持 v1 形状，并带上降级状态', () => {
     nickname: '我',
     pet: null,
     bridge: { ok: false, reason: 'starting' },
-    out: null
+    out: null,
+    // ticket 44：在外打工与出门互斥，初始都是 null。
+    work: null
   })
   assert.deepEqual(snap.neighbors, [])
   assert.deepEqual(snap.guests, [])

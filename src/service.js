@@ -5,6 +5,17 @@ import { join, resolve } from 'node:path'
 
 import shared from '../desktop/shared.js'
 import { createBackpackStore } from './backpack.js'
+import { createContractStore } from './contracts.js'
+import {
+  MAX_CONTRACTS_PER_SIDE,
+  contractMsOf,
+  earnedFor,
+  feeFor,
+  normalizeHours,
+  refundFor,
+  servedMsOf,
+  WORK_FEE_RATE
+} from './contracts-rules.js'
 import { dualLayerAdvisory } from './desktop-advisory.js'
 import { createDesktop } from './desktop.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
@@ -71,6 +82,14 @@ import {
   encodeVisitRecall,
   encodeVisitRecallAck,
   encodeVisitRequestDetailed,
+  encodeWorkAck,
+  encodeWorkEnd,
+  encodeWorkEndAck,
+  encodeWorkRecall,
+  encodeWorkRecallAck,
+  encodeWorkRequest,
+  encodeWorkSettle,
+  encodeWorkSettleAck,
   isDeviceId,
   isPort,
   isVisitId,
@@ -167,12 +186,13 @@ export function createService (ctx, options = {}) {
     log.warn('旧数据目录改名失败（' + reason + '），继续使用 ' + dir)
   }
   const configPath = options.petConfigPath ?? dshPetConfigPath(env)
+  // 2 分钟失联窗口：room 的镜像与合同的离线结算共用同一个值。
+  const peerLostMs = positiveOption(options.peerLostMs, PEER_LOST_MS, 100)
   const room = createRoom({
     dir,
     log,
     visitMaxMs: positiveOption(options.visitMaxMs, VISIT_MAX_MS, 100),
-    // 测试注入：2 分钟失联窗口可以缩短，但生产默认不动。
-    peerLostMs: positiveOption(options.peerLostMs, PEER_LOST_MS, 100)
+    peerLostMs
   })
   const disposers = []
   const visitRetryMs = positiveOption(options.visitRetryMs, VISIT_REQUEST_RETRY_MS, 10)
@@ -206,6 +226,26 @@ export function createService (ctx, options = {}) {
     FARM_ACTION_TIMEOUT_MS,
     farmActionRetryMs
   )
+  // 雇佣合同（ticket 44）：时钟默认跟随农场测试时钟；生产就是 Date.now。
+  const contractNow = typeof options.contractNow === 'function'
+    ? options.contractNow
+    : (farmNow ?? (() => Date.now()))
+  const contractClock = () => {
+    const value = contractNow()
+    const stamp = Number(value)
+    return Number.isFinite(stamp) ? stamp : Date.now()
+  }
+  // 雇佣请求：首次 + 两次重发；1.8 秒没有 ack 就明确超时并退款。
+  const workAttempts = integerOption(options.workAttempts, 3, 1, 8)
+  const workRetryMs = positiveOption(options.workRetryMs, 500, 10)
+  const workTimeoutMs = positiveOption(options.workTimeoutMs, 1800, workRetryMs)
+  /** 合同巡检（到期/失联/重发 settle/召回）节拍；生产 1 秒。 */
+  const contractTickMs = positiveOption(options.contractTickMs, 1000, 10)
+  /** 启动宽限：雇工刚重启时先等第一拍心跳，避免把「刚回来」误判成离线。 */
+  const contractStartupGraceMs = positiveOption(options.contractStartupGraceMs, 5000, 1)
+  /** 结算/召回重发：1s 起步指数退避，封顶 30s。 */
+  const contractRetryMs = positiveOption(options.contractRetryMs, 1000, 20)
+  const contractRetryMaxMs = positiveOption(options.contractRetryMaxMs, 30 * 1000, 50)
   // 交易所也可以单独注入时钟；不传就与农场共用同一个测试时钟。
   const marketNow = typeof options.marketNow === 'function' ? options.marketNow : farmNow
   // 行情 gossip（ticket 42）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值。
@@ -228,6 +268,25 @@ export function createService (ctx, options = {}) {
   let farm = null
   // 本机交易所（ticket 41）：读不出来 = 本次运行按初始价交易，串门照常。
   let market = null
+  // 雇佣合同账本（ticket 44）：读不出来 = 本次运行不能雇/被雇，串门与农场照常。
+  let contracts = null
+  let contractsReadyAt = 0
+  /** 在飞雇佣：requestId → { deviceId, data, attempts, deadline, resolve, timer, done }。 */
+  const workRequests = new Map()
+  /** 幂等 ack 缓存：`deviceId:requestId` → { data, at }；命中原样重发同一串字节。 */
+  const workResults = new Map()
+  /** 同一 requestId 的并发重发只落账一次。 */
+  const workInFlight = new Set()
+  /** 一次只允许一笔在飞雇佣（UI 的「正在联系…」）。 */
+  let pendingHire = null
+  /** 合同重试的下一次时间：id → at（只活在内存；重启后立刻试一次）。 */
+  const contractRetryAt = new Map()
+  /** 同一份合同的重试次数（指数退避，1s→2s→…→30s）。 */
+  const contractAttempts = new Map()
+  /** 结算/退款各自只允许一笔在飞；重复报文看到标记就等下一拍。 */
+  const settleInFlight = new Set()
+  const refundInFlight = new Set()
+  const settleSending = new Set()
   /**
    * 放行邻居最近一条行情（ticket 42，供 44 的雇工板直接读）：
    * deviceId → { prices, hire, at, nickname }。store 只留价格算指数；
@@ -289,6 +348,8 @@ export function createService (ctx, options = {}) {
   let farmFetcher = null
   /** 当前农场窗的访客视图（有则串门结束时要推 `ended`，别让窗停在旧快照）。 */
   let farmWindowVisitId = null
+  /** 农场窗是否被打开过：没开过就不必为合同/digest 变化推 `open:false`。 */
+  let farmWindowOpened = false
   let farmWindowVisitView = null
   /**
    * 入站礼物的频率限额（ticket 27）：同一邻居 ≤10 件/小时、≤50 件/天。
@@ -329,6 +390,7 @@ export function createService (ctx, options = {}) {
   let visitTimer = null
   let autoVisitTimer = null
   let farmTimer = null
+  let contractTimer = null
   // 当前出门请求的重试状态；只活在 service，room 只记“在请求中/已抵达”。
   let request = null
   // 已发出、等回执的 visit-recall：visitId → { deviceId, attempts, nextAt, deadline }。
@@ -587,6 +649,13 @@ export function createService (ctx, options = {}) {
       return result
     }
 
+    // 雇佣（ticket 44）：窗口只能「申请」，钱/时长/总价全由宿主算。
+    // 四个动作共用一套错误码（contracts-rules 的 WORK_ERRORS）。
+    if (action === 'hire') return hireNeighbor(body?.deviceId, body?.hours)
+    if (action === 'recall-worker') return recallWorker(body?.contractId)
+    if (action === 'end-contract') return endContract(body?.contractId)
+    if (action === 'hire-listing') return setHireListing(body)
+
     // 农场小窗（ticket 40）：菜单「农场」或桌面地块把一次开窗申请交给宿主。
     // 数据由宿主算好（窗口是 file:// 页面，读不到 /state），失败必须回人话。
     if (action === 'farm-open') return handleFarmOpen(body?.plotId)
@@ -833,7 +902,9 @@ export function createService (ctx, options = {}) {
       backpack: backpack?.items() ?? [],
       gifts: recentGifts(),
       // 本机交易所（ticket 41）：prices/index/history；history 最近 50 笔。
-      market: marketStateView()
+      market: marketStateView(),
+      // 雇佣合同（ticket 44）：store 没起来也给完整空形状，绝不 undefined。
+      contracts: contractsView()
     }
   }
 
@@ -876,23 +947,89 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 这次没有出门（请求中也不算在家），
-   * 雇工值 worker 先留 false（ticket 44 接合同）。`guard` 与 `guardParts` 都从这里出，
-   * 绝不在三个地方各写一遍 0.3。
+   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 既没有出门串门，也没有在外打工。
+   * 雇工镜像存在 = 有人在我家打工。`/state.farm.guard`、访客快照的 `guardParts`、
+   * 桌面摘要全部从这里出，绝不三个地方各写一遍 0.3。
    */
   function farmGuard () {
-    const ownerHome = room.outboundVisit() === null
-    const worker = workerOf() !== null
+    const out = room.outboundVisit()
+    const work = room.outboundWork()
+    const worker = room.inboundWorker()
+    const ownerHome = out === null && work === null
+    const hasWorker = worker !== null
     return {
-      guard: guardValue({ ownerHome, worker }),
+      guard: guardValue({ ownerHome, worker: hasWorker }),
       ownerHome,
-      worker
+      worker: hasWorker,
+      working: work !== null
     }
   }
 
-  /** ticket 44 的占位：目前没有雇工合同。 */
+  /**
+   * `/state.farm.worker`：只给昵称/合同号/结束时间/守卫，**不给 deviceId**（少一个泄露面）。
+   * 雇工离线时 room.tick 会清镜像，这里自然回到 null。
+   */
   function workerOf () {
-    return null
+    const worker = room.inboundWorker()
+    if (worker === null) return null
+    return {
+      nickname: worker.workerNickname,
+      contractId: worker.contractId,
+      endsAt: worker.endsAt,
+      guard: WORKER_GUARD
+    }
+  }
+
+  /** `/state.contracts` 与窗口共用的公开视图；store 没起来时是完整空形状。 */
+  function contractsView () {
+    const now = contractClock()
+    if (contracts === null) return { outgoing: [], incoming: [] }
+    try {
+      return contracts.windowView(now)
+    } catch {
+      return { outgoing: [], incoming: [] }
+    }
+  }
+
+  /**
+   * 雇工页（ticket 44）的数据全部由宿主 push：自己的合同 + 邻居挂牌 + 在飞状态。
+   * 窗口是 file:// 页面，读不到 `/state`，所以这些必须随 `farm-window` 一起下发。
+   */
+  function contractWindowView () {
+    const now = contractClock()
+    const view = contractsView()
+    const listings = []
+    for (const [deviceId, digest] of peerDigests) {
+      const hire = digest?.hire
+      if (hire === null || typeof hire !== 'object') continue
+      const at = Number(digest.at)
+      const fresh = Number.isFinite(at) && now - at <= 120 * 1000
+      const active = digest.nickname !== null && digest.nickname !== undefined
+        ? digest.nickname
+        : neighborNickname(deviceId)
+      listings.push({
+        deviceId,
+        nickname: active ?? '邻居',
+        enabled: hire.enabled === true,
+        available: hire.available === true && fresh,
+        reason: hire.reason ?? null,
+        wagePerHour: hire.wagePerHour,
+        minHours: hire.minHours,
+        maxHours: hire.maxHours,
+        guard: hire.guard,
+        feeRate: WORK_FEE_RATE,
+        stale: !fresh,
+        at: Number.isFinite(at) ? at : 0
+      })
+    }
+    return {
+      outgoing: view.outgoing,
+      incoming: view.incoming,
+      listings,
+      pendingHire: pendingHire !== null,
+      now,
+      feeRate: WORK_FEE_RATE
+    }
   }
 
   /**
@@ -954,8 +1091,13 @@ export function createService (ctx, options = {}) {
       crops: stacks(view.crops),
       coins: view.coins,
       dew: view.dew,
-      worker: null,
-      contractCount: 0,
+      // ticket 44：雇工与挂牌都是真实值；contractCount 只用于窗口画「有几份合同」。
+      worker: workerOf(),
+      contractCount: contracts === null
+        ? 0
+        : Math.min(MAX_CONTRACTS_PER_SIDE, contracts.outgoing().length + contracts.incoming().length),
+      hire: { ...view.hire },
+      guard: farmGuard().guard,
       log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
     }
   }
@@ -989,6 +1131,7 @@ export function createService (ctx, options = {}) {
     if (opened !== true) {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
+    farmWindowOpened = true
     if (out !== null) void loadVisitFarm(out)
     return { ok: true, action: 'farm-open', window: 'opened', mode: out === null ? 'owner' : 'visitor' }
   }
@@ -1006,6 +1149,8 @@ export function createService (ctx, options = {}) {
       farm: farmWindowView(),
       // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进 controls.farm。
       market: marketWindowView(),
+      // ticket 44：雇工页的数据也由宿主 push（窗口读不到 /state）。
+      contracts: contractWindowView(),
       ...(effectiveVisit === null ? {} : { visit: effectiveVisit }),
       ...(plotId === null ? {} : { plotId })
     }
@@ -1016,12 +1161,1036 @@ export function createService (ctx, options = {}) {
    * 正在串门时保留访客块，别把窗口打回主人模式。
    */
   function refreshFarmWindow () {
+    if (farmWindowOpened !== true) return
     if (desktop === null || typeof desktop.farmWindow !== 'function') return
     try {
       desktop.farmWindow(farmWindowPayload({ open: false }))
     } catch {
       // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
     }
+  }
+
+
+  // -------------------------------------------------------------------------
+  // 雇佣合同（ticket 44）：挂牌 → 雇佣 → 打工 → 结束 → 结算
+  // -------------------------------------------------------------------------
+
+  /** 合同相关的错误：统一形状，桌面气泡经 farmErrorText 变人话。 */
+  function workFailure (error) {
+    return { ok: false, error }
+  }
+
+  function contractFound (id) {
+    if (contracts === null) return null
+    try {
+      return contracts.byId(id)
+    } catch {
+      return null
+    }
+  }
+
+  function contractByRequest (requestId) {
+    if (contracts === null) return null
+    try {
+      return contracts.byRequestId(requestId)
+    } catch {
+      return null
+    }
+  }
+
+  /** 把 `endReason` 映射成协议里允许的结算 reason。 */
+  function settleReasonOf (endReason) {
+    if (endReason === 'recall') return 'recall'
+    if (endReason === 'employer-end') return 'employer-end'
+    if (endReason === 'offline') return 'offline'
+    if (endReason === 'expired') return 'expired'
+    return 'completed'
+  }
+
+  /**
+   * 结算数学（§8.3）：合同时长只取 ack 里的差值；服务时长只取**雇主本地**
+   * ackedAt → endedAt。到期按整段算（时钟差在这里没有意义）。
+   */
+  function settleNumbers (record) {
+    const contractMs = contractMsOf(record.startedAt, record.endsAt)
+    if (contractMs <= 0) return { contractMs: 0, servedMs: 0, earned: 0, reason: 'completed' }
+    const full = record.endReason === 'expired' || record.endReason === 'completed'
+    const anchor = record.ackedAt ?? record.startedAt
+    const endedAt = record.endedAt ?? contractClock()
+    const servedMs = full ? contractMs : servedMsOf(anchor, endedAt, contractMs)
+    return {
+      contractMs,
+      servedMs,
+      earned: earnedFor(record.wage, servedMs, contractMs),
+      reason: settleReasonOf(record.endReason)
+    }
+  }
+
+  function contractRetryDelay (id) {
+    const attempts = contractAttempts.get(id) ?? 0
+    contractAttempts.set(id, attempts + 1)
+    return Math.min(contractRetryMaxMs, contractRetryMs * 2 ** attempts)
+  }
+
+  function sendWorkEndPacket (deviceId, { contractId, requestId, reason }) {
+    if (discovery === null || identity === null) return false
+    try {
+      const data = encodeWorkEnd({
+        deviceId: identity.deviceId,
+        contractId: contractId ?? undefined,
+        requestId: contractId === undefined || contractId === null ? requestId : undefined,
+        reason
+      })
+      return discovery.sendTo(deviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  function sendWorkEndAckPacket (deviceId, { contractId, requestId, ok, error }) {
+    if (discovery === null || identity === null) return false
+    try {
+      const data = encodeWorkEndAck({
+        deviceId: identity.deviceId,
+        contractId,
+        requestId,
+        ok,
+        error
+      })
+      return discovery.sendTo(deviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  /** 缓存一条 ack 字节（请求/结算都按 deviceId+requestId 原样重放）。 */
+  function cacheWorkResult (deviceId, requestId, data) {
+    const key = deviceId + ':' + requestId
+    workResults.delete(key)
+    workResults.set(key, { data, at: contractClock() })
+    while (workResults.size > 100) {
+      const oldest = workResults.keys().next().value
+      if (oldest === undefined) break
+      workResults.delete(oldest)
+    }
+    // 10 分钟前的 ack 不再重放：合同最多 8 小时，但重试风暴只会发生在几分钟内。
+    const cutoff = contractClock() - 10 * 60 * 1000
+    for (const [candidate, entry] of workResults) {
+      if (entry.at < cutoff) workResults.delete(candidate)
+    }
+  }
+
+  function replayedWorkResult (deviceId, requestId) {
+    const entry = workResults.get(deviceId + ':' + requestId)
+    if (entry === undefined) return null
+    if (contractClock() - entry.at > 10 * 60 * 1000) {
+      workResults.delete(deviceId + ':' + requestId)
+      return null
+    }
+    return entry.data
+  }
+
+  function sendWorkAckPacket (deviceId, requestId, payload) {
+    if (discovery === null || identity === null) return false
+    let data
+    try {
+      data = encodeWorkAck({
+        deviceId: identity.deviceId,
+        requestId,
+        ok: payload.ok,
+        contractId: payload.contractId,
+        startedAt: payload.startedAt,
+        endsAt: payload.endsAt,
+        guard: payload.guard,
+        error: payload.error
+      })
+    } catch (error) {
+      warn(ctx, '雇佣回执编码失败：' + message(error))
+      return false
+    }
+    cacheWorkResult(deviceId, requestId, data)
+    return discovery.sendTo(deviceId, data)
+  }
+
+  function sendWorkSettleAckPacket (deviceId, { contractId, requestId, ok, earned, error }) {
+    if (discovery === null || identity === null) return false
+    try {
+      const data = encodeWorkSettleAck({
+        deviceId: identity.deviceId,
+        contractId,
+        requestId,
+        ok,
+        earned,
+        error
+      })
+      cacheWorkResult(deviceId, requestId, data)
+      return discovery.sendTo(deviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  /** 把合同镜像/窗口/挂牌一起刷新：合同状态变化会影响 available/reason。 */
+  function refreshContractViews () {
+    refreshFarmWindow()
+    syncDesktop()
+  }
+
+  /** 一条心跳/合同报文同时是「对方还在」的证据（离线结算按它算最后心跳）。 */
+  function noteContractSeen (deviceId, at = contractClock()) {
+    if (contracts === null) return
+    for (const record of contracts.activeOutgoing()) {
+      if (record.workerDeviceId === deviceId) {
+        contracts.noteSeen(record.id, at).catch(() => {})
+      }
+    }
+    for (const record of contracts.activeIncoming()) {
+      if (record.employerDeviceId === deviceId) {
+        contracts.noteSeen(record.id, at).catch(() => {})
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 主动作：hire / recall-worker / end-contract / hire-listing
+  // -------------------------------------------------------------------------
+
+  /** 邻居挂牌（ticket 44 D1）：只读 digest，不逐个问邻居。 */
+  function neighborListing (deviceId, hours) {
+    const digest = peerDigests.get(deviceId)
+    if (digest === undefined) return null
+    const hire = digest.hire
+    if (hire === null || typeof hire !== 'object') return null
+    const now = contractClock()
+    const at = Number(digest.at)
+    if (!Number.isFinite(at) || now - at > 2 * 60 * 1000) return null
+    if (hire.enabled !== true || hire.available !== true) return null
+    if (!Number.isInteger(hours) || hours < hire.minHours || hours > hire.maxHours) return null
+    return hire
+  }
+
+  /**
+   * 点「雇佣」：先落 pending 合同、再扣 `wage + fee`，然后发 work-request。
+   * 任何一步失败都回滚；`work-ack` 成功才算 active（钱已经在本地扣掉了）。
+   */
+  async function hireNeighbor (rawDeviceId, rawHours) {
+    if (disposed) return workFailure('disposed')
+    if (contracts === null || farm === null) return workFailure('starting')
+    const deviceId = actionDeviceId(rawDeviceId)
+    if (deviceId === null) return workFailure('bad-device-id')
+    const hours = normalizeHours(rawHours)
+    if (hours === null) return workFailure('bad-hours')
+    const selfId = identity?.deviceId ?? null
+    if (selfId !== null && deviceId === selfId) return workFailure('own-pet')
+    if (!room.mayTalkTo(deviceId)) return workFailure('worker-unavailable')
+    const neighbor = room.snapshot().neighbors.find((candidate) => candidate.deviceId === deviceId)
+    if (neighbor === undefined || !(neighbor.heartbeatAt > 0)) return workFailure('worker-unavailable')
+    if (contractClock() - neighbor.heartbeatAt > peerLostMs) return workFailure('worker-unavailable')
+    if (room.inboundWorker() !== null) return workFailure('already-hired')
+    if (contracts.activeOutgoing().length > 0) return workFailure('already-hired')
+    if (pendingHire !== null) return workFailure('busy')
+    const listing = neighborListing(deviceId, hours)
+    if (listing === null) return workFailure('worker-unavailable')
+
+    const wage = listing.wagePerHour * hours
+    const fee = feeFor(wage)
+    const total = wage + fee
+    if ((farm.snapshot().coins ?? 0) < total) return workFailure('no-coin')
+
+    const requestId = randomUUID()
+    const created = await contracts.beginOutgoing({
+      requestId,
+      workerDeviceId: deviceId,
+      workerNickname: neighbor.nickname,
+      hours,
+      wagePerHour: listing.wagePerHour
+    })
+    if (created === null) return workFailure('busy')
+
+    const spent = await farm.spendCoins(total)
+    if (spent.ok !== true) {
+      await contracts.cancelOutgoing(requestId, 'cancelled')
+      return workFailure(spent.error === 'no-coin' ? 'no-coin' : 'busy')
+    }
+    await contracts.markCharged(requestId)
+
+    pendingHire = requestId
+    refreshContractViews()
+    const encoded = (() => {
+      try {
+        return encodeWorkRequest({
+          deviceId: identity.deviceId,
+          requestId,
+          hours,
+          wagePerHour: listing.wagePerHour,
+          fee
+        })
+      } catch (error) {
+        warn(ctx, '雇佣请求编码失败：' + message(error))
+        return null
+      }
+    })()
+    if (encoded === null) {
+      await failWorkRequest(requestId, 'busy')
+      return workFailure('busy')
+    }
+
+    const outcome = await startWorkRequest({ requestId, deviceId, data: encoded })
+    refreshContractViews()
+    sendMarketDigest()
+    return outcome
+  }
+
+  /** 发一次请求、按间隔重发；ack 由 handleWorkAck 兑现，超时就退款取消。 */
+  function startWorkRequest ({ requestId, deviceId, data }) {
+    return new Promise((resolve) => {
+      const entry = {
+        requestId,
+        deviceId,
+        data,
+        attempts: 0,
+        deadline: contractClock() + workTimeoutMs,
+        timer: null,
+        done: false,
+        resolve
+      }
+      const send = () => {
+        if (entry.done) return
+        entry.attempts += 1
+        try {
+          discovery?.sendTo(deviceId, data)
+        } catch {
+          // 一包发不出去就等下一拍；最后统一超时退款。
+        }
+        if (contractClock() >= entry.deadline || entry.attempts >= workAttempts) {
+          void failWorkRequest(requestId, 'timeout')
+          return
+        }
+        // 不 unref：一笔雇佣最多等 1.8 秒，但等待期间的计时器必须把事件循环留住，
+        // 否则 Node 会在 ack 到达前退出（测试里表现为 Promise still pending）。
+        entry.timer = setTimeout(send, workRetryMs)
+      }
+      workRequests.set(requestId, entry)
+      send()
+    })
+  }
+
+  /**
+   * 一笔在飞雇佣失败：退款一次、取消 pending、告诉对端别等了，然后回结果。
+   * 所有入口（ack 失败/超时/房间拒绝）都走这里，保证钱只退一次。
+   */
+  async function failWorkRequest (requestId, error) {
+    const entry = workRequests.get(requestId)
+    if (entry === undefined) return
+    workRequests.delete(requestId)
+    if (entry.timer !== null) clearTimeout(entry.timer)
+    if (!entry.done) {
+      entry.done = true
+      const found = contractByRequest(requestId)
+      if (found !== null && found.side === 'outgoing') {
+        const record = found.record
+        if (record.charged && !record.refunded) {
+          // 还没 ack 的雇佣等于没发生：工资和手续费一起退（手续费只在成交后烧）。
+          await refundOutgoingOnce(record, record.wage + record.fee)
+        }
+        await contracts.cancelOutgoing(requestId, 'cancelled')
+        sendWorkEndPacket(record.workerDeviceId, { requestId, reason: 'cancelled' })
+      }
+      if (pendingHire === requestId) pendingHire = null
+      entry.resolve(workFailure(error))
+      refreshContractViews()
+      sendMarketDigest()
+    }
+  }
+
+  /** 退款一次（WAL：先写 refunding，再入账，再写 refunded；重复调用返回 0）。 */
+  async function refundOutgoingOnce (record, amount) {
+    if (contracts === null || farm === null) return 0
+    if (refundInFlight.has(record.id)) return 0
+    refundInFlight.add(record.id)
+    try {
+      const fresh = contractFound(record.id)
+      if (fresh === null || fresh.side !== 'outgoing') return 0
+      if (fresh.record.refunded) return 0
+      if (fresh.record.refundStartedAt !== null) {
+        // 上一次已经写过 refunding 就崩了：钱可能已经到账，fail-closed 不再退。
+        await contracts.markRefunded(fresh.record.id, {
+          amount: fresh.record.refundAmount,
+          at: contractClock()
+        })
+        return 0
+      }
+      const cap = fresh.record.wage + fresh.record.fee
+      const value = Math.min(cap, Math.max(0, Math.floor(Number(amount) || 0)))
+      await contracts.markRefundStarted(fresh.record.id, value)
+      const added = await farm.addCoins(value)
+      if (added.ok !== true) {
+        warn(ctx, '合同退款没入账（' + (added.error ?? 'unknown') + '），等下一次重试')
+        return 0
+      }
+      await contracts.markRefunded(fresh.record.id, { amount: value, at: contractClock() })
+      if (value > 0) room.noteFarmEvent('合同结束，退回 ' + value + ' 硬币。')
+      return value
+    } finally {
+      refundInFlight.delete(record.id)
+    }
+  }
+
+  /** 改挂牌：显式校验，不静默夹取；保存后立刻广播一轮 digest。 */
+  async function setHireListing (body) {
+    if (farm === null) return workFailure('starting')
+    if (typeof body?.enabled !== 'boolean') return workFailure('bad-enabled')
+    const wagePerHour = Number(body?.wagePerHour)
+    if (!Number.isInteger(wagePerHour) || wagePerHour < 1 || wagePerHour > 100) {
+      return workFailure('bad-wage')
+    }
+    const minHours = Number(body?.minHours)
+    const maxHours = Number(body?.maxHours)
+    if (!Number.isInteger(minHours) || !Number.isInteger(maxHours) ||
+      minHours < 2 || maxHours > 8 || minHours > maxHours) {
+      return workFailure('bad-hours')
+    }
+    const result = await farm.setHire({ enabled: body.enabled, wagePerHour, minHours, maxHours })
+    if (result?.ok !== true) return workFailure(result?.error === 'bad-wage' ? 'bad-wage' : 'bad-hours')
+    refreshFarmWindow()
+    sendMarketDigest({ force: true })
+    return { ok: true, action: 'hire-listing', hire: result.hire }
+  }
+
+  /** 主人召回自己的雇工（我是雇工侧）。 */
+  async function recallWorker (rawContractId) {
+    if (contracts === null) return workFailure('starting')
+    const contractId = actionDeviceId(rawContractId)
+    if (contractId === null) return workFailure('bad-device-id')
+    const found = contractFound(contractId)
+    if (found === null || found.side !== 'incoming') return workFailure('contract-not-found')
+    const record = found.record
+    if (record.status === 'ended') {
+      refreshContractViews()
+      return { ok: true, action: 'recall-worker', contractId, alreadyEnded: true }
+    }
+    if (record.status !== 'active') return workFailure('contract-ended')
+    await contracts.setRecallRequested(record.id, contractClock())
+    sendRecall(record)
+    room.noteFarmEvent('已经通知雇主召回，等对方确认。')
+    refreshContractViews()
+    return { ok: true, action: 'recall-worker', contractId }
+  }
+
+  function sendRecall (record) {
+    if (discovery === null || identity === null) return false
+    try {
+      const data = encodeWorkRecall({ deviceId: identity.deviceId, contractId: record.id })
+      return discovery.sendTo(record.employerDeviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  /** 雇主提前结束（我是雇主侧）：立即结束并启动结算。 */
+  async function endContract (rawContractId) {
+    if (contracts === null) return workFailure('starting')
+    const contractId = actionDeviceId(rawContractId)
+    if (contractId === null) return workFailure('bad-device-id')
+    const found = contractFound(contractId)
+    if (found === null || found.side !== 'outgoing') return workFailure('contract-not-found')
+    const record = found.record
+    if (record.status === 'active') {
+      await endOutgoingContract(record, 'employer-end', contractClock())
+      sendWorkEndPacket(record.workerDeviceId, { contractId: record.id, reason: 'employer-end' })
+    } else if (record.status === 'pending') {
+      await failWorkRequest(record.requestId, 'contract-ended')
+      return { ok: true, action: 'end-contract', contractId, cancelled: true }
+    }
+    refreshContractViews()
+    return { ok: true, action: 'end-contract', contractId }
+  }
+
+  // -------------------------------------------------------------------------
+  // 对方发来的八个 work-* 分支
+  // -------------------------------------------------------------------------
+
+  /** 收到 work-request（我是被雇的一方）。先幂等、后校验、落盘之后才 ack。 */
+  async function handleWorkRequest (packet) {
+    if (disposed || contracts === null || farm === null) return
+    if (identity === null || packet.deviceId === identity.deviceId) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    noteContractSeen(packet.deviceId)
+    const requestId = packet.requestId
+    const replayed = replayedWorkResult(packet.deviceId, requestId)
+    if (replayed !== null) {
+      try {
+        discovery?.sendTo(packet.deviceId, replayed)
+      } catch {
+        // 重放失败也没关系：对方会再重试。
+      }
+      return
+    }
+    const key = packet.deviceId + ':' + requestId
+    if (workInFlight.has(key)) return
+    workInFlight.add(key)
+    try {
+      const rejection = validateIncomingWork(packet)
+      if (rejection !== null) {
+        sendWorkAckPacket(packet.deviceId, requestId, { ok: false, error: rejection })
+        return
+      }
+      const now = contractClock()
+      const hours = packet.hours
+      const wage = packet.wagePerHour * hours
+      const contractId = randomUUID()
+      const startedAt = now
+      const endsAt = now + hours * 60 * 60 * 1000
+      const employerNickname = room.peerNickname(packet.deviceId) ?? '邻居'
+      const record = await contracts.beginIncoming({
+        contractId,
+        requestId,
+        employerDeviceId: packet.deviceId,
+        employerNickname,
+        hours,
+        wagePerHour: packet.wagePerHour,
+        startedAt,
+        endsAt,
+        guard: WORKER_GUARD
+      })
+      if (record === null) {
+        sendWorkAckPacket(packet.deviceId, requestId, { ok: false, error: 'worker-unavailable' })
+        return
+      }
+      const begun = room.beginWorking({
+        contractId,
+        employerDeviceId: packet.deviceId,
+        employerNickname,
+        startedAt,
+        endsAt,
+        guard: WORKER_GUARD,
+        lastSeen: now
+      })
+      if (begun.ok !== true) {
+        await contracts.end(contractId, { endedAt: now, reason: 'cancelled' })
+        sendWorkAckPacket(packet.deviceId, requestId, { ok: false, error: begun.error ?? 'already-working' })
+        return
+      }
+      sendWorkAckPacket(packet.deviceId, requestId, {
+        ok: true,
+        contractId,
+        startedAt,
+        endsAt,
+        guard: WORKER_GUARD
+      })
+      room.noteFarmEvent('「' + employerNickname + '」雇了你 ' + hours + ' 小时，去打工啦。')
+      refreshContractViews()
+      sendMarketDigest({ force: true })
+    } finally {
+      workInFlight.delete(key)
+    }
+  }
+
+  /**
+   * work-request 的业务校验（协议层已经验过形状/范围）。返回错误码或 null。
+   * 顺序有讲究：先看「我在不在家/在不在打工」，再看挂牌，最后核钱。
+   */
+  function validateIncomingWork (packet) {
+    if (room.outboundVisit() !== null) return 'worker-unavailable'
+    if (room.outboundWork() !== null) return 'already-working'
+    if (contracts.activeIncoming().length > 0) return 'already-working'
+    const view = farm?.snapshot() ?? initialFarmView()
+    const hire = view.hire
+    if (hire.enabled !== true) return 'worker-unavailable'
+    if (packet.hours < hire.minHours || packet.hours > hire.maxHours) return 'bad-hours'
+    if (packet.wagePerHour < hire.wagePerHour) return 'bad-wage'
+    const wage = packet.wagePerHour * packet.hours
+    if (feeFor(wage) !== packet.fee) return 'bad-wage'
+    return null
+  }
+
+  /** 收到 work-ack（我是雇主）：确认合同 + 雇工进镜像，或者退款取消。 */
+  async function handleWorkAck (packet) {
+    const entry = workRequests.get(packet.requestId)
+    if (entry === undefined) {
+      // 迟到/重复的 ack：合同还活着就什么都不做；完全找不到才补一条 work-end 收尾。
+      const existing = contractByRequest(packet.requestId)
+      if (existing === null && packet.ok === true) {
+        sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
+      }
+      return
+    }
+    if (entry.deviceId !== packet.deviceId) return
+    if (packet.ok !== true) {
+      await failWorkRequest(packet.requestId, packet.error)
+      return
+    }
+    workRequests.delete(packet.requestId)
+    if (entry.timer !== null) clearTimeout(entry.timer)
+    entry.done = true
+    const now = contractClock()
+    const confirmed = await contracts.confirmOutgoing(packet.requestId, {
+      contractId: packet.contractId,
+      startedAt: packet.startedAt,
+      endsAt: packet.endsAt,
+      guard: packet.guard,
+      ackedAt: now
+    })
+    if (confirmed !== true) {
+      // 超时已经退款取消：这条 ack 来晚了，让对端立刻结束那份合同。
+      sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
+      entry.resolve(workFailure('timeout'))
+      return
+    }
+    const workerNickname = room.peerNickname(packet.deviceId) ?? '邻居'
+    const begun = room.beginWorker({
+      contractId: packet.contractId,
+      workerDeviceId: packet.deviceId,
+      workerNickname,
+      startedAt: packet.startedAt,
+      endsAt: packet.endsAt,
+      guard: packet.guard,
+      lastSeen: now
+    })
+    if (begun.ok !== true) {
+      // 本地已经有雇工（例如两笔并发 ack）：结束这份新合同并全额退款。
+      const fresh = contractFound(packet.contractId)
+      if (fresh !== null && fresh.side === 'outgoing') {
+        await endOutgoingContract(fresh.record, 'cancelled', now)
+        await refundOutgoingOnce(fresh.record, fresh.record.wage + fresh.record.fee)
+      }
+      sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
+      entry.resolve(workFailure(begun.error ?? 'already-hired'))
+      return
+    }
+    if (pendingHire === packet.requestId) pendingHire = null
+    entry.resolve({ ok: true, action: 'hire', contractId: packet.contractId })
+    room.noteFarmEvent('「' + workerNickname + '」来打工了。')
+    refreshContractViews()
+    sendMarketDigest({ force: true })
+  }
+
+  /** 收到 work-recall（我是雇主）：结束合同、启动结算、回一条 recall-ack。 */
+  async function handleWorkRecall (packet) {
+    if (contracts === null) return
+    const found = contractFound(packet.contractId)
+    if (found === null || found.side !== 'outgoing') {
+      sendRecallAck(packet.deviceId, packet.contractId, false, 'contract-not-found')
+      return
+    }
+    const record = found.record
+    if (record.status === 'active') {
+      await endOutgoingContract(record, 'recall', contractClock())
+    }
+    await contracts.markRecallAcked(record.id)
+    sendRecallAck(packet.deviceId, record.id, true, null)
+    refreshContractViews()
+  }
+
+  function sendRecallAck (deviceId, contractId, ok, error) {
+    if (discovery === null || identity === null) return false
+    try {
+      const data = encodeWorkRecallAck({
+        deviceId: identity.deviceId,
+        contractId,
+        ok,
+        error: ok === true ? undefined : error
+      })
+      return discovery.sendTo(deviceId, data)
+    } catch {
+      return false
+    }
+  }
+
+  /** 收到 work-recall-ack（我是雇工侧）：对方已结束，本地镜像也该回家。 */
+  async function handleWorkRecallAck (packet) {
+    if (contracts === null) return
+    const found = contractFound(packet.contractId)
+    if (found === null || found.side !== 'incoming') return
+    const record = found.record
+    await contracts.markRecallAcked(record.id)
+    contractRetryAt.delete('recall:' + record.id)
+    if (packet.ok === true && record.status === 'active') {
+      await endIncomingContract(record, 'recall', contractClock())
+    }
+    refreshContractViews()
+  }
+
+  /** 收到 work-end（我是雇工侧）：幂等结束；找不到也回 ok，避免重试风暴。 */
+  async function handleWorkEnd (packet) {
+    if (contracts === null) return
+    const found = packet.contractId !== undefined
+      ? contractFound(packet.contractId)
+      : contractByRequest(packet.requestId)
+    if (found === null) {
+      sendWorkEndAckPacket(packet.deviceId, {
+        contractId: packet.contractId,
+        requestId: packet.requestId,
+        ok: true
+      })
+      return
+    }
+    const record = found.record
+    if (found.side === 'incoming' && record.status === 'active') {
+      await endIncomingContract(record, packet.reason === 'cancelled' ? 'cancelled' : packet.reason, contractClock())
+    }
+    if (found.side === 'outgoing' && record.status === 'active') {
+      await endOutgoingContract(record, packet.reason, contractClock())
+    }
+    sendWorkEndAckPacket(packet.deviceId, {
+      contractId: record.id,
+      requestId: record.requestId,
+      ok: true
+    })
+    refreshContractViews()
+  }
+
+  /** 收到 work-end-ack（我是发起方）：只清重试标记。 */
+  function handleWorkEndAck (packet) {
+    if (packet.contractId !== undefined) contractRetryAt.delete('end:' + packet.contractId)
+    else if (packet.requestId !== undefined) contractRetryAt.delete('end:' + packet.requestId)
+  }
+
+  /**
+   * 收到 work-settle（我是雇工侧）：用**自己算的** earned 入账一次，回 ack。
+   * 已结算/崩溃窗口（settleStartedAt 存在）都按「已经入过账」处理（fail-closed）。
+   */
+  async function handleWorkSettle (packet) {
+    if (contracts === null || farm === null) return
+    const found = contractFound(packet.contractId)
+    if (found === null || found.side !== 'incoming') {
+      sendWorkSettleAckPacket(packet.deviceId, {
+        contractId: packet.contractId,
+        requestId: packet.requestId,
+        ok: false,
+        error: 'contract-not-found'
+      })
+      return
+    }
+    const record = found.record
+    noteContractSeen(record.employerDeviceId)
+    if (record.settledAt !== null) {
+      sendWorkSettleAckPacket(packet.deviceId, {
+        contractId: record.id,
+        requestId: packet.requestId,
+        ok: true,
+        earned: record.earned
+      })
+      return
+    }
+    const key = record.id
+    if (settleInFlight.has(key)) return
+    settleInFlight.add(key)
+    try {
+      const contractMs = contractMsOf(record.startedAt, record.endsAt)
+      if (contractMs <= 0) {
+        sendWorkSettleAckPacket(packet.deviceId, {
+          contractId: record.id,
+          requestId: packet.requestId,
+          ok: false,
+          error: 'contract-ended'
+        })
+        return
+      }
+      const servedMs = servedMsOf(0, Math.min(contractMs, Math.max(0, packet.servedMs)), contractMs)
+      const earned = earnedFor(record.wage, servedMs, contractMs)
+      if (record.settleStartedAt !== null) {
+        // 上次写完 settling 意图就崩了：按已入账处理，绝不重复铸币。
+        await contracts.finishSettle(record.id, {
+          earned: record.earned,
+          servedMs: record.settleServedMs,
+          settledAt: contractClock(),
+          reason: settleReasonOf(record.endReason)
+        })
+      } else {
+        await contracts.beginSettle(record.id, {
+          requestId: packet.requestId,
+          servedMs,
+          earned,
+          reason: settleReasonOf(record.endReason)
+        })
+        const credited = await farm.addCoins(earned)
+        if (credited.ok !== true) {
+          warn(ctx, '结算入账失败（' + (credited.error ?? 'unknown') + '），保持 settling 等重试')
+          sendWorkSettleAckPacket(packet.deviceId, {
+            contractId: record.id,
+            requestId: packet.requestId,
+            ok: false,
+            error: 'contract-busy'
+          })
+          return
+        }
+        await contracts.finishSettle(record.id, {
+          earned,
+          servedMs,
+          settledAt: contractClock(),
+          reason: settleReasonOf(record.endReason)
+        })
+      }
+      const settled = contractFound(record.id)?.record ?? record
+      if (room.outboundWork() !== null && room.outboundWork().contractId === record.id) {
+        room.endWorking(record.id, { at: contractClock(), reason: 'completed' })
+      }
+      room.noteFarmEvent('结算完成：拿到 ' + settled.earned + ' 硬币。')
+      sendWorkSettleAckPacket(packet.deviceId, {
+        contractId: record.id,
+        requestId: packet.requestId,
+        ok: true,
+        earned: settled.earned
+      })
+      refreshContractViews()
+      sendMarketDigest({ force: true })
+    } finally {
+      settleInFlight.delete(key)
+    }
+  }
+
+  /** 收到 work-settle-ack（我是雇主）：按雇工主人算出的 earned 退款一次。 */
+  async function handleWorkSettleAck (packet) {
+    if (contracts === null || farm === null) return
+    const found = contractFound(packet.contractId)
+    if (found === null || found.side !== 'outgoing') return
+    const record = found.record
+    if (record.settleRequestId !== null && record.settleRequestId !== packet.requestId) return
+    if (packet.ok !== true) {
+      contractRetryAt.delete(record.id)
+      return
+    }
+    if (record.settledAt !== null) {
+      contractRetryAt.delete(record.id)
+      return
+    }
+    const earned = Math.min(record.wage, Math.max(0, Math.floor(Number(packet.earned) || 0)))
+    if (record.refunded) {
+      // 退款已经写进 WAL（崩溃在写 settledAt 之前）：只补 settled 标记，不再退款。
+      await contracts.finishSettle(record.id, {
+        earned,
+        servedMs: record.settleServedMs,
+        settledAt: contractClock(),
+        reason: settleReasonOf(record.endReason)
+      })
+      contractRetryAt.delete(record.id)
+      refreshContractViews()
+      return
+    }
+    await refundOutgoingOnce(record, refundFor(record.wage, earned))
+    await contracts.finishSettle(record.id, {
+      earned,
+      servedMs: record.settleServedMs,
+      settledAt: contractClock(),
+      reason: settleReasonOf(record.endReason)
+    })
+    contractRetryAt.delete(record.id)
+    refreshContractViews()
+    sendMarketDigest({ force: true })
+  }
+
+  // -------------------------------------------------------------------------
+  // 合同的结束/结算/巡检/重启对账
+  // -------------------------------------------------------------------------
+
+  async function endOutgoingContract (record, reason, endedAt) {
+    if (contracts === null) return
+    const id = record.id
+    const ended = await contracts.end(id, { endedAt, reason })
+    if (ended) {
+      room.endWorker(id, { at: endedAt, reason })
+      contractRetryAt.delete(id)
+      refreshContractViews()
+      // 挂牌的 available/reason 变了：不等 30 秒节拍，立刻广播一轮。
+      sendMarketDigest({ force: true })
+    }
+  }
+
+  async function endIncomingContract (record, reason, endedAt) {
+    if (contracts === null) return
+    const id = record.id
+    const ended = await contracts.end(id, { endedAt, reason })
+    if (ended) {
+      room.endWorking(id, { at: endedAt, reason })
+      contractRetryAt.delete(id)
+      contractRetryAt.delete('recall:' + id)
+      refreshContractViews()
+      sendMarketDigest({ force: true })
+    }
+  }
+
+  /** 把 room 在 tick 里清掉的合同落到 store（幂等：只有 active 会动）。 */
+  async function applyEndedContract (event) {
+    if (contracts === null) return
+    const found = contractFound(event.contractId)
+    if (found === null) return
+    if (found.record.status !== 'active') return
+    await contracts.end(event.contractId, { endedAt: event.endedAt, reason: event.reason })
+    refreshContractViews()
+  }
+
+  /** 发一次 work-settle（同一个 settleRequestId 重发；重连后立刻补发）。 */
+  async function sendSettle (id) {
+    if (contracts === null || discovery === null || identity === null) return false
+    if (settleSending.has(id)) return false
+    const found = contractFound(id)
+    if (found === null || found.side !== 'outgoing') return false
+    const record = found.record
+    if (record.status !== 'ended' || record.settledAt !== null) return false
+    settleSending.add(id)
+    try {
+      const numbers = settleNumbers(record)
+      let settleRequestId = record.settleRequestId
+      if (settleRequestId === null) {
+        settleRequestId = randomUUID()
+        await contracts.beginSettle(id, {
+          requestId: settleRequestId,
+          servedMs: numbers.servedMs,
+          earned: numbers.earned,
+          reason: numbers.reason
+        })
+      }
+      try {
+        const data = encodeWorkSettle({
+          deviceId: identity.deviceId,
+          contractId: id,
+          requestId: settleRequestId,
+          servedMs: numbers.servedMs,
+          earned: numbers.earned,
+          reason: numbers.reason
+        })
+        discovery.sendTo(record.workerDeviceId, data)
+      } catch (error) {
+        warn(ctx, '结算报文编码失败：' + message(error))
+      }
+      contractRetryAt.set(id, contractClock() + contractRetryDelay(id))
+      return true
+    } finally {
+      settleSending.delete(id)
+    }
+  }
+
+  /**
+   * 每秒（或注入的 contractTickMs）跑一次：
+   *   1. pending 超时（只在本地有在飞请求时；重启对账另有入口）；
+   *   2. active 到期 / 失联；
+   *   3. ended 未结算 → 退避重发 settle；
+   *   4. 召回未确认 → 退避重发 recall。
+   */
+  function runContractTimers () {
+    if (disposed || contracts === null) return
+    const now = contractClock()
+    const grace = now - contractsReadyAt >= contractStartupGraceMs
+    for (const record of contracts.pendingOutgoing()) {
+      if (workRequests.has(record.requestId) && now - record.startedAt >= workTimeoutMs) {
+        void failWorkRequest(record.requestId, 'timeout')
+      }
+    }
+    for (const record of contracts.activeOutgoing()) {
+      if (now >= record.endsAt) {
+        void endOutgoingContract(record, 'expired', record.endsAt)
+      } else if (grace && now - record.lastSeenAt >= peerLostMs) {
+        void endOutgoingContract(record, 'offline', record.lastSeenAt)
+        const nickname = record.workerNickname
+        room.noteFarmEvent('「' + nickname + '」失联了，合同已结束。')
+      }
+    }
+    for (const record of contracts.activeIncoming()) {
+      if (now >= record.endsAt) {
+        void endIncomingContract(record, 'expired', record.endsAt)
+      } else if (grace && now - record.lastSeenAt >= peerLostMs) {
+        void endIncomingContract(record, 'offline', record.lastSeenAt)
+        room.noteFarmEvent('雇主失联了，合同已结束，宠物回来了。')
+      }
+      if (record.recallRequested && !record.recallAcked &&
+        (contractRetryAt.get('recall:' + record.id) ?? 0) <= now) {
+        const sent = sendRecall(record)
+        contractRetryAt.set('recall:' + record.id, now + contractRetryDelay('recall:' + record.id))
+        if (!sent) contractAttempts.set('recall:' + record.id, 0)
+      }
+    }
+    for (const record of contracts.unsettledOutgoing()) {
+      if ((contractRetryAt.get(record.id) ?? 0) <= now) void sendSettle(record.id)
+    }
+  }
+
+  /**
+   * 启动对账（§8.2/8.4）：pending 退款取消；active rehydrate 房间镜像；
+   * settling/refunding 的崩溃窗口按「已经动过」处理（fail-closed）。
+   */
+  async function reconcileContractsOnStart () {
+    if (contracts === null) return
+    const now = contractClock()
+    contractsReadyAt = now
+    for (const record of contracts.pendingOutgoing()) {
+      if (record.charged && !record.refunded) {
+        await refundOutgoingOnce(record, record.wage + record.fee)
+      } else if (!record.charged) {
+        warn(ctx, '有一笔雇佣在扣钱前崩溃：按 fail-closed 不退款，合同已取消')
+      }
+      await contracts.cancelOutgoing(record.requestId, 'restart')
+    }
+    for (const record of contracts.outgoing()) {
+      if (record.refundStartedAt !== null && record.refunded !== true) {
+        // 写了 refunding 就崩：钱可能已经到账，绝不再退一次；结算标记也补齐，
+        // 否则 ended 合同会被巡检当成「还没结算」重发到天荒地老。
+        await contracts.markRefunded(record.id, { amount: record.refundAmount, at: now })
+        if (record.status === 'ended' && record.settledAt === null) {
+          await contracts.finishSettle(record.id, {
+            earned: record.earned,
+            servedMs: record.settleServedMs,
+            settledAt: now,
+            reason: settleReasonOf(record.endReason)
+          })
+        }
+      }
+    }
+    for (const record of contracts.activeOutgoing()) {
+      if (now >= record.endsAt) {
+        await endOutgoingContract(record, 'expired', record.endsAt)
+        continue
+      }
+      const begun = room.beginWorker({
+        contractId: record.id,
+        workerDeviceId: record.workerDeviceId,
+        workerNickname: record.workerNickname,
+        startedAt: record.startedAt,
+        endsAt: record.endsAt,
+        guard: record.guard,
+        lastSeen: record.lastSeenAt
+      })
+      if (begun.ok !== true) {
+        warn(ctx, '重启后恢复雇工失败（' + begun.error + '），合同按离线结束')
+        await endOutgoingContract(record, 'offline', record.lastSeenAt)
+      }
+    }
+    for (const record of contracts.activeIncoming()) {
+      if (now >= record.endsAt) {
+        await endIncomingContract(record, 'expired', record.endsAt)
+        continue
+      }
+      const begun = room.beginWorking({
+        contractId: record.id,
+        employerDeviceId: record.employerDeviceId,
+        employerNickname: record.employerNickname,
+        startedAt: record.startedAt,
+        endsAt: record.endsAt,
+        guard: record.guard,
+        lastSeen: record.lastSeenAt
+      })
+      if (begun.ok !== true) {
+        warn(ctx, '重启后恢复打工状态失败（' + begun.error + '），合同按离线结束')
+        await endIncomingContract(record, 'offline', record.lastSeenAt)
+      }
+    }
+    for (const record of contracts.incoming()) {
+      if (record.settleStartedAt !== null && record.settledAt === null && record.status === 'ended') {
+        // 崩溃在「写完 settling 意图、还没入账/没写 settledAt」之间：按已入账处理。
+        await contracts.finishSettle(record.id, {
+          earned: record.earned,
+          servedMs: record.settleServedMs,
+          settledAt: now,
+          reason: settleReasonOf(record.endReason)
+        })
+      }
+    }
+  }
+
+  function startContractTimer () {
+    if (contractTimer !== null || disposed) return
+    contractTimer = setInterval(runContractTimers, contractTickMs)
+    contractTimer.unref?.()
   }
 
   // -------------------------------------------------------------------------
@@ -1548,12 +2717,27 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 雇佣合同（ticket 44）：坏文件只降级成空账本，不挡启动；`contractNow` 只给测试注入。
+      try {
+        contracts = await createContractStore(dir, {
+          log,
+          ...(typeof options.contractNow === 'function' ? { now: options.contractNow } : {})
+        })
+      } catch (error) {
+        contracts = null
+        warn(ctx, '合同账本初始化失败，本次不能雇/被雇：' + message(error))
+      }
+      if (disposed) return
+
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
       identity = await createIdentity(dir, { defaultNickname: fallback, log })
       if (disposed) return
       room.setIdentity(identity)
+      // ticket 44：第一拍桌面之前必须把 active 合同恢复成镜像；pending 在这里退款取消。
+      await reconcileContractsOnStart()
+      if (disposed) return
 
       // 皮是本地资源，跟联不联网无关：先读注册表，桌面层才知道该画谁的素材（ticket 33）。
       await loadSkin()
@@ -1609,11 +2793,17 @@ export function createService (ctx, options = {}) {
             // ticket 43：任何一条带 skinPort 的报文都顺手记下邻居的 LAN 端口。
             // 不能只靠 noteVisitorSkin：那一条要求 skinId，没装素材源的邻居端口会被漏掉。
             notePeerLanPort(packet)
+            // 任意 work-* 报文都证明「对方还在」：离线结算用最后心跳/最后报文。
+            if (typeof packet.type === 'string' && packet.type.startsWith('work-')) {
+              noteContractSeen(packet.deviceId)
+            }
             // 远端字段到这里只剩三种效果：更新邻居/访客/串门表，让客户端画出来，
             // 以及一次串门完成时写一条有界记录。这里不读本机文件、不回传本机状态。
             if (packet.type === 'heartbeat') {
               room.observeHeartbeat(packet)
               noteVisitorSkin(packet)
+              // ticket 44：心跳也是合同「对方还在」的证据（离线结算按最后心跳算）。
+              noteContractSeen(packet.deviceId)
             } else if (packet.type === 'visit-request') {
               handleVisitRequest(packet)
               noteVisitorSkin(packet)
@@ -1652,6 +2842,23 @@ export function createService (ctx, options = {}) {
               void handleFarmActionPacket(packet)
             } else if (packet.type === 'farm-action-result') {
               handleFarmActionResult(packet)
+            } else if (packet.type === 'work-request') {
+              // ticket 44：要落盘 + 回 ack，不能冒到 socket 循环。
+              void handleWorkRequest(packet)
+            } else if (packet.type === 'work-ack') {
+              void handleWorkAck(packet)
+            } else if (packet.type === 'work-recall') {
+              void handleWorkRecall(packet)
+            } else if (packet.type === 'work-recall-ack') {
+              void handleWorkRecallAck(packet)
+            } else if (packet.type === 'work-end') {
+              void handleWorkEnd(packet)
+            } else if (packet.type === 'work-end-ack') {
+              handleWorkEndAck(packet)
+            } else if (packet.type === 'work-settle') {
+              void handleWorkSettle(packet)
+            } else if (packet.type === 'work-settle-ack') {
+              void handleWorkSettleAck(packet)
             } else {
               room.observeBeacon(packet)
             }
@@ -1698,6 +2905,8 @@ export function createService (ctx, options = {}) {
 
       // 农场是本机玩法，跟联不联网无关：没有桌面层、没有网络也照样长。
       if (!disposed) startFarmTick()
+      // 合同的到期/失联/重试也不依赖网络；没有 discovery 时 sendTo 自然是 no-op。
+      if (!disposed) startContractTimer()
 
       if (!disposed && options.network !== false) {
         startNeighborTick()
@@ -2148,8 +3357,10 @@ export function createService (ctx, options = {}) {
           : { ...pet, size: activeSkin.size }
         return skinPool.length === 0 ? sized : { ...sized, idlePool: skinPool }
       }
-      if (pet.role !== 'visitor') return pet
-      const key = pet.id.startsWith('visitor:') ? pet.id.slice('visitor:'.length) : null
+      if (pet.role !== 'visitor' && pet.role !== 'worker') return pet
+      // 雇工复用访客素材缓存，但用 `worker:` 前缀，避免与同名 deviceId 的访客串皮。
+      const prefix = pet.role === 'worker' ? 'worker:' : 'visitor:'
+      const key = pet.id.startsWith(prefix) ? pet.id.slice(prefix.length) : null
       const skin = key === null ? undefined : visitorSkins.get(key)
       if (skin === undefined) return pet
       return {
@@ -2217,6 +3428,13 @@ export function createService (ctx, options = {}) {
         visitId: event.visitId ?? undefined,
         // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
         qty: event.qty ?? undefined,
+        // 雇佣（ticket 44）：只接这些窄字段；硬币/总价/服务时长窗口一概不传。
+        hours: event.hours ?? undefined,
+        contractId: event.contractId ?? undefined,
+        wagePerHour: event.wagePerHour ?? undefined,
+        minHours: event.minHours ?? undefined,
+        maxHours: event.maxHours ?? undefined,
+        enabled: event.enabled ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
         gift: event.gift ?? undefined
       })
@@ -2794,6 +4012,9 @@ export function createService (ctx, options = {}) {
           at: packet.at,
           nickname: neighborNickname(packet.deviceId)
         })
+        // 雇工板直接读 digest（D1）：新挂牌/可用性变化要推给开着的农场窗，
+        // 否则窗口会停在「没有邻居挂牌」直到用户手动重开。
+        refreshFarmWindow()
       }
     } catch (error) {
       // 一条坏行情不能把邻居循环/交易所拖垮；下一包照常走。
@@ -3440,6 +4661,13 @@ export function createService (ctx, options = {}) {
     noteEndedInboundGifts()
     // ticket 43：串门结束（召回/送客/失联/30 分钟）时，打开的访客农场窗切到 ended。
     noteFarmWindowVisitEnded()
+    // ticket 44：room 在 tick 里清掉的合同镜像落进 store（幂等），并跑一次合同巡检。
+    for (const ended of room.drainEndedContracts()) {
+      applyEndedContract(ended).catch((error) => {
+        warn(ctx, '合同落账失败：' + message(error))
+      })
+    }
+    runContractTimers()
     // 谁在/谁走/动作变了都可能从这里经过：让桌面场景跟上（没变就不发）。
     syncDesktop()
     return records.length
@@ -3665,6 +4893,11 @@ export function createService (ctx, options = {}) {
     sendHeartbeats,
     /** 手动补发一轮行情（测试用；正常由 1 秒巡检按 30 秒/变化触发）。 */
     sendMarketDigest,
+    /** ticket 44 的测试/诊断缝：雇工页数据与唯一守卫计算点。 */
+    contractWindow: () => contractWindowView(),
+    farmGuard: () => farmGuard(),
+    /** 本机 UDP 实际绑定端口（`port:0` 的测试用它拿到临时端口）。 */
+    localPort: () => discovery?.address()?.port ?? null,
     dispose () {
       if (disposed) return
       // 卸载前把已经完成的记录尽量落盘；recall 发不出去也无妨，对方会自己到期。
@@ -3690,6 +4923,31 @@ export function createService (ctx, options = {}) {
         clearInterval(farmTimer)
         farmTimer = null
       }
+      if (contractTimer !== null) {
+        clearInterval(contractTimer)
+        contractTimer = null
+      }
+      // ticket 44：先把 active 合同落成 ended（尽力而为；写盘失败也只告警一次），
+      // 再放开 store。钱的标记保持不变，下一次启动按对账规则收尾。
+      if (contracts !== null) {
+        contracts.endAllActive(contractClock(), 'shutdown').catch((error) => {
+          warn(ctx, '卸载时结束合同失败：' + message(error))
+        })
+      }
+      for (const requestId of [...workRequests.keys()]) {
+        const entry = workRequests.get(requestId)
+        if (entry !== undefined && entry.timer !== null) clearTimeout(entry.timer)
+        workRequests.delete(requestId)
+      }
+      workResults.clear()
+      workInFlight.clear()
+      settleInFlight.clear()
+      refundInFlight.clear()
+      settleSending.clear()
+      pendingHire = null
+      contractRetryAt.clear()
+      contractAttempts.clear()
+      contracts = null
       farm = null
       market = null
       digestLimiter.clear()
@@ -3720,6 +4978,7 @@ export function createService (ctx, options = {}) {
       farmFetcher = null
       farmWindowVisitId = null
       farmWindowVisitView = null
+      farmWindowOpened = false
       // 回执不再发了；还没回执的礼物先写回 idle，再放开背包引用。
       receipts.clear()
       releaseOutboundGiftsOnDispose()

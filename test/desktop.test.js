@@ -1002,13 +1002,13 @@ function fakeCtx () {
 async function assetEnv (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-assets-'))
   await writeFile(join(dir, 'idle.webm'), Buffer.from('webm'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return { ...process.env, DSH_ZOO_DSH_PET_ASSETS: dir }
 }
 
 test('service：桌面层启动、ready 时下发占位场景、dispose 收掉；desktop:false 完全不碰', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
 
   const calls = { start: 0, dispose: 0, updates: [], resync: 0 }
   let captured = null
@@ -1070,7 +1070,7 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
 
 test('service：桌面工厂抛错只降级成一行告警，服务照常 ready', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const { ctx, warnings } = fakeCtx()
   const service = createService(ctx, {
     network: false,
@@ -1087,7 +1087,7 @@ test('service：桌面工厂抛错只降级成一行告警，服务照常 ready'
 
 test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作无需逐帧 update）', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-sync-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const updates = []
   let captured = null
   const factory = (options) => {
@@ -1147,7 +1147,7 @@ test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作�
 
 test('service：桌面控件申请走同一套 action 并回 action-result；失败一定带人话 notice', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-actions-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const updates = []
   const results = []
   let captured = null
@@ -1230,7 +1230,7 @@ async function waitFor (predicate, timeoutMs) {
 test('DSH_ZOO_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常', async (t) => {
   for (const value of ['0', 'false', 'off', 'NO']) {
     const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
-    t.after(() => rm(dir, { recursive: true, force: true }))
+    t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
     let spawned = 0
     const { ctx } = fakeCtx()
     const service = createService(ctx, {
@@ -1250,7 +1250,7 @@ test('DSH_ZOO_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常
 test('DSH_ZOO_DESKTOP 为空或其它值时仍然启动桌面层', async (t) => {
   for (const value of [undefined, '1', 'on']) {
     const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
-    t.after(() => rm(dir, { recursive: true, force: true }))
+    t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
     let spawned = 0
     const { ctx } = fakeCtx()
     const service = createService(ctx, {
@@ -1376,7 +1376,7 @@ test('manager：pong 看门狗——超过 15s 没回 pong 杀掉并按现有退
 
 test('service：访客超出场景上限时不静默丢宠物，宿主给一条人话提示（A5）', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-overflow-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const updates = []
   let captured = null
   const factory = (options) => {

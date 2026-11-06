@@ -17,6 +17,16 @@ const tradesEl = document.getElementById('trades')
 const marketWalletEl = document.getElementById('market-wallet')
 const farmPageEl = document.getElementById('page-farm')
 const marketPageEl = document.getElementById('page-market')
+const hirePageEl = document.getElementById('page-hire')
+const contractsEl = document.getElementById('contracts')
+const listingsEl = document.getElementById('listings')
+const hireFormEl = document.getElementById('hire-form')
+const hireEnabledEl = document.getElementById('hire-enabled')
+const hireWageEl = document.getElementById('hire-wage')
+const hireMinEl = document.getElementById('hire-min')
+const hireMaxEl = document.getElementById('hire-max')
+const hireSaveEl = document.getElementById('hire-save')
+const hireHintEl = document.getElementById('hire-hint')
 const tabs = Array.from(document.querySelectorAll('.tab[data-tab]'))
 const subtitleEl = document.getElementById('subtitle')
 const toastEl = document.getElementById('toast')
@@ -33,6 +43,12 @@ const WATER_COST = 1
 const FERTILIZE_COST = 5
 const MIN_TRADE_QTY = 1
 const MAX_TRADE_QTY = 99
+/** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
+const HIRE_WAGE_MIN = 1
+const HIRE_WAGE_MAX = 100
+const HIRE_HOURS_MIN = 2
+const HIRE_HOURS_MAX = 8
+const HIRE_FEE_RATE = 0.05
 
 /**
  * 主进程只会用错误码回传传输层失败（超时/管道断/坏形状）；宿主给的 notice 已经是人话，
@@ -53,7 +69,19 @@ const RESULT_CODE_TEXT = {
   'market-busy': '交易所这会儿太忙了，等一下再试。',
   'no-dew': '露水不够，先让宠物待机攒一会儿。',
   'already-watered': '这株已经浇过水了。',
-  'already-fertilized': '这株已经施过肥了。'
+  'already-fertilized': '这株已经施过肥了。',
+  // 雇佣（ticket 44）
+  'own-pet': '不能雇自己的宠物。',
+  'worker-unavailable': '这只宠物现在不能来打工。',
+  'already-working': '宠物正在打工，合同结束前不能再接活。',
+  'already-hired': '家里已经有一位雇工了。',
+  'bad-wage': '时薪要在 1–100 之间。',
+  'bad-hours': '时段要在 2–8 小时之间（最短不能超过最长）。',
+  'bad-enabled': '挂牌开关的取值不对。',
+  'contract-not-found': '找不到这份合同。',
+  'contract-ended': '这份合同已经结束了。',
+  'contract-busy': '这份合同正在结算。',
+  busy: '上一笔雇佣还在联系中。'
 }
 const LOG_TEXT = {
   plant: '种下',
@@ -77,6 +105,10 @@ const VISIT_ERROR_TEXT = {
 
 let farm = null
 let market = null
+/** 雇工页（ticket 44）：合同/邻居挂牌/在飞状态，全部由宿主 push。 */
+let contracts = null
+/** 用户在挂牌表单里改过、还没保存：宿主刷新时不覆盖他刚填的数字。 */
+let hireDirty = false
 /** 访客模式（ticket 43）：宿主决定模式；窗口只画 visit 块，不自己联网。 */
 let mode = 'owner'
 let visit = null
@@ -88,6 +120,8 @@ let activeTab = 'farm'
 const marketQty = { tomato: 1, carrot: 1, pumpkin: 1 }
 /** plotId → 倒计时节点；tick 只改文本，不重建按钮（重建会打断用户点击）。 */
 const countdowns = new Map()
+/** contractId → { node, remaining, text }；合同倒计时同理。 */
+const contractCountdowns = new Map()
 
 function cropMeta (cropId) {
   return CROP_META[cropId] ?? null
@@ -700,6 +734,221 @@ function renderMarket () {
   }
 }
 
+
+/** 合同剩余时间：窗口本地每秒递减（宿主只给那一刻的 remainingMs）。 */
+function contractRemainingText (contract) {
+  const remaining = Math.max(0, Number(contract.remainingMs) || 0)
+  if (contract.status === 'pending') return '正在联系雇主…'
+  if (contract.status !== 'active') {
+    return contract.settled === true ? '已结算' : contract.status === 'cancelled' ? '已取消' : '已结束'
+  }
+  return '还剩 ' + formatRemaining(remaining)
+}
+
+function hireFee (total) {
+  return Math.max(1, Math.ceil(Number(total) * HIRE_FEE_RATE))
+}
+
+/** 总价 = 时薪 × 时长 + ceil(5%)；窗口只显示，真正扣钱仍由宿主算。 */
+function hireQuote (listing, hours) {
+  const count = Number(hours)
+  if (!Number.isInteger(count) || count < HIRE_HOURS_MIN || count > HIRE_HOURS_MAX) return null
+  const wage = Math.max(0, Math.round(Number(listing.wagePerHour) || 0)) * count
+  const fee = hireFee(wage)
+  return { wage, fee, total: wage + fee }
+}
+
+function updateHireQuote (input) {
+  const row = input.closest('.hire-row')
+  const quoteEl = row?.querySelector('[data-hire-quote]')
+  if (quoteEl === null || quoteEl === undefined) return
+  const listing = (contracts?.listings ?? []).find((entry) => entry.deviceId === row.dataset.deviceId)
+  if (listing === undefined) return
+  const quote = hireQuote(listing, input.value)
+  quoteEl.textContent = quote === null ? '时长 2–8 小时' : '总价 ' + quote.total + '（含手续费 ' + quote.fee + '）'
+}
+
+function hireDraftOf () {
+  return {
+    enabled: hireEnabledEl.checked === true,
+    wagePerHour: Number(hireWageEl.value),
+    minHours: Number(hireMinEl.value),
+    maxHours: Number(hireMaxEl.value)
+  }
+}
+
+function hireFormValid (draft) {
+  return Number.isInteger(draft.wagePerHour) && draft.wagePerHour >= HIRE_WAGE_MIN && draft.wagePerHour <= HIRE_WAGE_MAX &&
+    Number.isInteger(draft.minHours) && Number.isInteger(draft.maxHours) &&
+    draft.minHours >= HIRE_HOURS_MIN && draft.maxHours <= HIRE_HOURS_MAX && draft.minHours <= draft.maxHours
+}
+
+/** 宿主刷新时填挂牌表单；用户正在编辑就不覆盖。 */
+function syncHireForm () {
+  if (hireFormEl.contains(document.activeElement) || hireDirty) return
+  const hire = farm?.hire
+  if (hire === null || typeof hire !== 'object') return
+  hireEnabledEl.checked = hire.enabled === true
+  hireWageEl.value = String(hire.wagePerHour)
+  hireMinEl.value = String(hire.minHours)
+  hireMaxEl.value = String(hire.maxHours)
+}
+
+function contractRow (contract, side) {
+  const row = document.createElement('div')
+  row.className = 'hire-row'
+  row.dataset.contractId = contract.id
+  row.dataset.side = side
+  const name = document.createElement('span')
+  name.className = 'name'
+  name.textContent = side === 'outgoing'
+    ? '雇工：' + (contract.workerNickname ?? '邻居')
+    : '雇主：' + (contract.employerNickname ?? '邻居')
+  const meta = document.createElement('span')
+  meta.className = 'meta'
+  meta.dataset.contractMeta = contract.id
+  const money = side === 'outgoing'
+    ? '托管 ' + contract.wage + ' · 手续费 ' + contract.fee
+    : '预计 ' + (contract.earned || 0) + '/' + contract.wage
+  meta.textContent = contractRemainingText(contract) + ' · ' + money
+  row.appendChild(name)
+  row.appendChild(meta)
+  if (contract.status === 'active') {
+    const action = side === 'outgoing' ? 'end-contract' : 'recall-worker'
+    const btn = document.createElement('button')
+    btn.type = 'button'
+    btn.className = 'btn'
+    btn.dataset.hireAction = action
+    btn.dataset.contractId = contract.id
+    btn.textContent = side === 'outgoing' ? '结束' : '召回'
+    btn.disabled = busy
+    row.appendChild(btn)
+    contractCountdowns.set(contract.id, {
+      node: meta,
+      remaining: Math.max(0, Number(contract.remainingMs) || 0),
+      text: money
+    })
+  } else {
+    contractCountdowns.delete(contract.id)
+  }
+  return row
+}
+
+function renderHire () {
+  if (hirePageEl === null) return
+  syncHireForm()
+  contractCountdowns.clear()
+
+  contractsEl.textContent = ''
+  const outgoing = Array.isArray(contracts?.outgoing) ? contracts.outgoing : []
+  const incoming = Array.isArray(contracts?.incoming) ? contracts.incoming : []
+  const rows = [...outgoing.map((contract) => contractRow(contract, 'outgoing')),
+    ...incoming.map((contract) => contractRow(contract, 'incoming'))]
+  if (rows.length === 0) {
+    const empty = document.createElement('p')
+    empty.className = 'hire-empty'
+    empty.textContent = '还没有合同。'
+    contractsEl.appendChild(empty)
+  } else {
+    for (const row of rows) contractsEl.appendChild(row)
+  }
+
+  listingsEl.textContent = ''
+  const listings = Array.isArray(contracts?.listings) ? contracts.listings : []
+  if (listings.length === 0) {
+    const empty = document.createElement('p')
+    empty.className = 'hire-empty'
+    empty.textContent = '还没收到邻居的挂牌（每 30 秒随行情广播一次）。'
+    listingsEl.appendChild(empty)
+  }
+  const pending = contracts?.pendingHire === true
+  for (const listing of listings) {
+    const row = document.createElement('div')
+    row.className = 'hire-row'
+    row.dataset.deviceId = listing.deviceId
+    row.dataset.stale = listing.stale === true || listing.available !== true ? 'true' : 'false'
+    const name = document.createElement('span')
+    name.className = 'name'
+    name.textContent = listing.nickname ?? '邻居'
+    const meta = document.createElement('span')
+    meta.className = 'meta'
+    const reasonText = listing.stale === true
+      ? '行情过期'
+      : listing.available !== true
+        ? (listing.reason === 'working' ? '在打工' : listing.reason === 'visiting' ? '在串门' : listing.reason === 'off' ? '没挂牌' : '现在不能雇')
+        : listing.wagePerHour + ' 硬币/时 · ' + listing.minHours + '–' + listing.maxHours + ' 小时'
+    meta.textContent = reasonText
+    row.appendChild(name)
+    row.appendChild(meta)
+    if (listing.available === true && listing.stale !== true) {
+      const hours = document.createElement('input')
+      hours.type = 'number'
+      hours.min = String(listing.minHours)
+      hours.max = String(listing.maxHours)
+      hours.step = '1'
+      hours.value = String(listing.minHours)
+      hours.inputMode = 'numeric'
+      hours.dataset.hireHours = listing.deviceId
+      hours.setAttribute('aria-label', '雇佣时长')
+      const quote = document.createElement('span')
+      quote.className = 'meta'
+      quote.dataset.hireQuote = listing.deviceId
+      const initialQuote = hireQuote(listing, hours.value)
+      quote.textContent = initialQuote === null
+        ? '时长 2–8 小时'
+        : '总价 ' + initialQuote.total + '（含手续费 ' + initialQuote.fee + '）'
+      const btn = document.createElement('button')
+      btn.type = 'button'
+      btn.className = 'btn primary'
+      btn.dataset.hireAction = 'hire'
+      btn.dataset.deviceId = listing.deviceId
+      btn.textContent = pending ? '联系中…' : '雇佣'
+      btn.disabled = busy || pending
+      row.appendChild(hours)
+      row.appendChild(quote)
+      row.appendChild(btn)
+    }
+    listingsEl.appendChild(row)
+  }
+
+  const guard = Number(farm?.guard)
+  hireHintEl.textContent = '时薪 1–100，时段 2–8 小时；手续费 5%（最低 1 硬币，烧掉）。' +
+    (Number.isFinite(guard) ? ' 自家守卫 ' + Math.round(guard * 100) + '%。' : '') +
+    (pending ? ' 正在联系雇主…' : '')
+}
+
+function submitHireListing () {
+  const draft = hireDraftOf()
+  if (hireFormValid(draft) !== true) {
+    showToast('时薪 1–100，时段 2–8 小时（最短不能超过最长）。', 'error')
+    return
+  }
+  hireDirty = false
+  submit({
+    action: 'hire-listing',
+    enabled: draft.enabled,
+    wagePerHour: draft.wagePerHour,
+    minHours: draft.minHours,
+    maxHours: draft.maxHours
+  })
+}
+
+/** 雇工页的倒计时只改文本：每 1 秒一次，合同归零时重画一次。 */
+function tickContracts () {
+  if (activeTab !== 'hire' || contracts === null) return false
+  let needsRender = false
+  for (const [id, entry] of contractCountdowns) {
+    entry.remaining = Math.max(0, entry.remaining - 1000)
+    if (entry.remaining === 0) {
+      needsRender = true
+      continue
+    }
+    entry.node.textContent = '还剩 ' + formatRemaining(entry.remaining) + ' · ' + entry.text
+  }
+  if (needsRender) renderHire()
+  return needsRender
+}
+
 function renderSubtitle () {
   if (mode === 'visitor' && visit !== null) {
     const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
@@ -726,9 +975,14 @@ function render () {
   renderInventory()
   renderLog()
   renderMarket()
+  if (activeTab === 'hire') renderHire()
 }
 
 function tick () {
+  if (activeTab === 'hire') {
+    tickContracts()
+    return
+  }
   let needsRender = false
   if (mode === 'visitor' && visit !== null && Array.isArray(visit.plots)) {
     for (const plot of visit.plots) {
@@ -800,7 +1054,7 @@ plotsEl.addEventListener('click', (event) => {
 })
 
 function selectTab (name) {
-  activeTab = name === 'market' ? 'market' : 'farm'
+  activeTab = name === 'market' ? 'market' : name === 'hire' ? 'hire' : 'farm'
   for (const tab of tabs) {
     const active = tab.dataset.tab === activeTab
     tab.classList.toggle('active', active)
@@ -808,6 +1062,8 @@ function selectTab (name) {
   }
   farmPageEl.hidden = activeTab !== 'farm'
   marketPageEl.hidden = activeTab !== 'market'
+  if (hirePageEl !== null) hirePageEl.hidden = activeTab !== 'hire'
+  if (activeTab === 'hire') renderHire()
 }
 
 for (const tab of tabs) {
@@ -845,6 +1101,48 @@ marketRowsEl.addEventListener('click', (event) => {
   })
 })
 
+// 雇工页（ticket 44）：保存挂牌 / 雇佣 / 召回 / 结束。只发窄字段，总价由宿主算。
+hireSaveEl?.addEventListener('click', () => submitHireListing())
+hireFormEl?.addEventListener('input', () => {
+  hireDirty = true
+  const draft = hireDraftOf()
+  const valid = hireFormValid(draft)
+  hireWageEl.setAttribute('aria-invalid', valid ? 'false' : 'true')
+  hireMinEl.setAttribute('aria-invalid', valid ? 'false' : 'true')
+  hireMaxEl.setAttribute('aria-invalid', valid ? 'false' : 'true')
+})
+
+hirePageEl?.addEventListener('input', (event) => {
+  const target = event.target
+  if (!(target instanceof Element) || !target.matches('input[data-hire-hours]')) return
+  updateHireQuote(target)
+})
+
+hirePageEl?.addEventListener('click', (event) => {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const buttonEl = target.closest('button[data-hire-action]')
+  if (buttonEl === null || buttonEl.disabled) return
+  const action = buttonEl.dataset.hireAction
+  if (action === 'hire') {
+    const deviceId = buttonEl.dataset.deviceId
+    const row = buttonEl.closest('.hire-row')
+    const hoursInput = row?.querySelector('input[data-hire-hours]')
+    const hours = Number(hoursInput?.value)
+    if (typeof deviceId !== 'string' || !Number.isInteger(hours) || hours < HIRE_HOURS_MIN || hours > HIRE_HOURS_MAX) {
+      showToast('雇佣时长要在 2–8 小时之间。', 'error')
+      return
+    }
+    submit({ action: 'hire', deviceId, hours })
+    return
+  }
+  const contractId = buttonEl.dataset.contractId
+  if (typeof contractId !== 'string' || contractId === '') return
+  if (action === 'recall-worker' || action === 'end-contract') {
+    submit({ action, contractId })
+  }
+})
+
 closeButton.addEventListener('click', () => api?.close())
 
 document.addEventListener('keydown', (event) => {
@@ -857,6 +1155,7 @@ api?.onState((payload) => {
   if (payload === null || typeof payload !== 'object') return
   farm = payload.farm !== null && typeof payload.farm === 'object' ? payload.farm : null
   market = payload.market !== null && typeof payload.market === 'object' ? payload.market : null
+  contracts = payload.contracts !== null && typeof payload.contracts === 'object' ? payload.contracts : null
   mode = payload.mode === 'visitor' ? 'visitor' : 'owner'
   visit = mode === 'visitor' && payload.visit !== null && typeof payload.visit === 'object'
     ? payload.visit
