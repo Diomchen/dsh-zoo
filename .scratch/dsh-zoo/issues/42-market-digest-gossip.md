@@ -9,7 +9,9 @@
 决策依据：[ADR-0016](../../../docs/adr/0016-farm-economy-federated.md)、[SPEC v5](../SPEC-v5.md)。
 
 - [ ] `src/protocol.js`：新报文 `market-digest`（`prices` 每作物一个数 + `hire` 挂牌 +
-      `at`）；编解码、4 KiB、UUID/枚举/字段白名单；未知字段丢弃；旧 peer 静默丢类型不崩
+      `at`）；`hire` 带 `enabled / wagePerHour / minHours / maxHours / guard /
+      available / reason`（44 的雇工板直接读，不再逐个问邻居）；编解码、4 KiB、UUID/
+      枚举/字段白名单；未知字段丢弃；旧 peer 静默丢类型不崩
 - [ ] 发送：每 30 秒或价格变化时，向放行邻居单播；只在 `mayTalkTo` 之后；失败不重试
       （下一轮自然补）
 - [ ] 接收：只认已知作物、`at` 在 2 分钟内、价格在 `[base×0.5, base×2]`；按 deviceId
