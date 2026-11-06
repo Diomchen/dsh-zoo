@@ -13,7 +13,7 @@ const EBML = Buffer.from([0x1a, 0x45, 0xdf, 0xa3])
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-fetch-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 

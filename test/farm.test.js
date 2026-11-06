@@ -666,3 +666,47 @@ test('访客本机日计数：偷 10 / 帮 5 封顶，跨本地日重置', async
   assert.equal(store.visitActionUsed('steal'), 0)
   assert.equal((await store.noteVisitAction('steal')).ok, true)
 })
+
+test('ticket 44：spendCoins 扣钱/不足明确 no-coin/上限夹取', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createFarmStore(dir, { now: () => NOON })
+  const spent = await store.spendCoins(10)
+  assert.equal(spent.ok, true)
+  assert.equal(spent.coins, 20)
+  assert.equal(store.snapshot().coins, 20)
+
+  const tooMuch = await store.spendCoins(21)
+  assert.equal(tooMuch.ok, false)
+  assert.equal(tooMuch.error, 'no-coin')
+  assert.equal(store.snapshot().coins, 20)
+
+  assert.equal((await store.spendCoins(0)).error, 'bad-qty')
+  assert.equal((await store.spendCoins(-5)).error, 'bad-qty')
+  assert.equal((await store.spendCoins('x')).error, 'bad-qty')
+
+  // 退款/结算入账走 addCoins，封顶 1,000,000。
+  const added = await store.addCoins(40)
+  assert.equal(added.ok, true)
+  assert.equal(added.coins, 60)
+})
+
+test('ticket 44：setHire 显式校验（不静默夹取）并落盘', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createFarmStore(dir, { now: () => NOON })
+  assert.deepEqual(store.snapshot().hire, { ...DEFAULT_HIRE })
+
+  assert.equal((await store.setHire({ enabled: 'yes' })).error, 'bad-enabled')
+  assert.equal((await store.setHire({ enabled: true, wagePerHour: 0 })).error, 'bad-wage')
+  assert.equal((await store.setHire({ enabled: true, wagePerHour: 101 })).error, 'bad-wage')
+  assert.equal((await store.setHire({ enabled: true, wagePerHour: 10.5 })).error, 'bad-wage')
+  assert.equal((await store.setHire({ enabled: true, minHours: 1 })).error, 'bad-hours')
+  assert.equal((await store.setHire({ enabled: true, minHours: 6, maxHours: 4 })).error, 'bad-hours')
+
+  const saved = await store.setHire({ enabled: true, wagePerHour: 25, minHours: 3, maxHours: 6 })
+  assert.equal(saved.ok, true)
+  assert.deepEqual(saved.hire, { enabled: true, wagePerHour: 25, minHours: 3, maxHours: 6 })
+  assert.deepEqual(store.snapshot().hire, saved.hire)
+
+  const reopened = await createFarmStore(dir, { now: () => NOON })
+  assert.deepEqual(reopened.snapshot().hire, saved.hire)
+})

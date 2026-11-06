@@ -24,11 +24,21 @@ contextBridge.exposeInMainWorld('dshZooFarm', {
   submit (action) {
     if (action === null || typeof action !== 'object' || Array.isArray(action)) return
     // 字段由主进程按 shared.normalizeFarmAction 再白名单一遍；这里只挡明显不是对象的东西。
+    // 字段按动作族显式拷贝：地块（plotId/cropId）、交易所（cropId/qty）、
+    // 雇佣（deviceId/hours/contractId/wagePerHour/minHours/maxHours/enabled）。
+    // 硬币、总价、服务时长一概不传——全部由宿主算。
     ipcRenderer.send('dsh-zoo:farm-submit', {
       action: action.action,
       plotId: action.plotId,
       cropId: action.cropId,
-      qty: action.qty
+      qty: action.qty,
+      deviceId: action.deviceId,
+      hours: action.hours,
+      contractId: action.contractId,
+      wagePerHour: action.wagePerHour,
+      minHours: action.minHours,
+      maxHours: action.maxHours,
+      enabled: action.enabled
     })
   },
   close () {

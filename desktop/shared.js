@@ -127,7 +127,10 @@
 
   const DEFAULT_COLOR = '#3b74d8'
   const ITEM_KINDS = ['pet', 'card']
-  const PET_ROLES = ['self', 'guest', 'visitor']
+  // ticket 44：worker 是「别人家的宠物在我家打工」，与 guest/visitor 都不是一回事。
+  const PET_ROLES = ['self', 'guest', 'visitor', 'worker']
+  /** 宠物角标的固定枚举（跨进程传输，不能用自由文本）。 */
+  const PET_BADGES = ['work']
   const SCENE_VERSION = 3
   /**
    * 农场小窗能提交的动作。地块四条（ticket 40）只带 plotId（种地再带 cropId）；
@@ -144,7 +147,16 @@
     ...FARM_VISIT_ACTIONS
   ]
   const FARM_MARKET_ACTIONS = ['farm-buy-seed', 'farm-sell-crop']
-  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS)
+  /**
+   * 雇佣页的四条动作（ticket 44）。字段同样窄：
+   *   hire          { deviceId, hours }                    （2–8 小时）
+   *   recall-worker { contractId }
+   *   end-contract  { contractId }
+   *   hire-listing  { enabled, wagePerHour, minHours, maxHours }
+   * 总价/手续费/硬币全由宿主算，窗口一概不传。
+   */
+  const FARM_HIRE_ACTIONS = ['hire', 'recall-worker', 'end-contract', 'hire-listing']
+  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS, FARM_HIRE_ACTIONS)
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
@@ -247,6 +259,16 @@
   const MARKET_INDEX_WEIGHT = 0.15
   /** `remainingMs` 只用来画倒计时；一行 JSON 推到几百年后没有意义。 */
   const MAX_FARM_REMAINING_MS = 30 * 24 * 60 * 60 * 1000
+  /** 雇佣（ticket 44）：与 src/contracts-rules.js 同源，改的时候两边一起改。 */
+  const HIRE_WAGE_MIN = 1
+  const HIRE_WAGE_MAX = 100
+  const HIRE_HOURS_MIN = 2
+  const HIRE_HOURS_MAX = 8
+  const HIRE_FEE_RATE = 0.05
+  const MAX_CONTRACT_EARNED = HIRE_HOURS_MAX * HIRE_WAGE_MAX
+  const CONTRACT_STATUSES = ['pending', 'active', 'ended', 'cancelled']
+  const HIRE_REASONS = ['ready', 'off', 'visiting', 'working']
+  const OWNER_PRESENCES = ['home', 'visiting', 'working']
   /** 地块 id 的形状：宿主只发 p1–p4，这里允许短标识符，大小写统一成小写。 */
   const PLOT_ID_RE = /^[a-z0-9_-]{1,16}$/
 
@@ -346,6 +368,15 @@
    * 礼物 id 是 wire 上的 UUID（与 visitId/deviceId 同一种形状）。这里不复用 `normalizeId`：
    * 那个入口还给动画名/诊断 id 用，宽松得多；礼物 id 会被拼进宿主侧的目录查找，必须严格。
    */
+  /** 合同/device id：与宿主协议层同一种 UUID 形状，统一小写。 */
+  function normalizeUuid (value) {
+    if (typeof value !== 'string') return null
+    const id = value.trim()
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+      ? id.toLowerCase()
+      : null
+  }
+
   function normalizeGiftId (value) {
     if (typeof value !== 'string') return null
     const id = value.trim()
@@ -638,7 +669,8 @@
         ? Math.min(MAX_FARM_CONTRACTS, Math.max(0, Math.floor(contracts)))
         : 0
     }
-    if (full !== true) return farm
+    // ticket 44：只有地块条摘要需要「主人在哪」；完整视图没有这个字段。
+    if (full !== true) return { ...farm, owner: normalizeFarmOwner(raw.owner) }
 
     const log = []
     if (Array.isArray(raw.log)) {
@@ -648,7 +680,129 @@
         if (entry !== null) log.push(entry)
       }
     }
-    return { ...farm, seeds: normalizeFarmStacks(raw.seeds), crops: normalizeFarmStacks(raw.crops), log }
+    const hire = normalizeFarmHire(raw.hire)
+    const guard = Number(raw.guard)
+    return {
+      ...farm,
+      seeds: normalizeFarmStacks(raw.seeds),
+      crops: normalizeFarmStacks(raw.crops),
+      ...(hire === null ? {} : { hire }),
+      ...(Number.isFinite(guard) ? { guard: Math.min(0.8, Math.max(0, guard)) } : {}),
+      log
+    }
+  }
+
+  /** 地块条的主人状态：`home` / `visiting` / `working`；认不出按 home。 */
+  function normalizeFarmOwner (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { presence: 'home' }
+    return { presence: OWNER_PRESENCES.includes(raw.presence) ? raw.presence : 'home' }
+  }
+
+  /** 小窗的挂牌（只有完整视图才有；摘要里刻意不带 hire）。 */
+  function normalizeFarmHire (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const wage = Number(raw.wagePerHour)
+    const minHours = Number(raw.minHours)
+    const maxHours = Number(raw.maxHours)
+    if (!Number.isFinite(wage) || !Number.isFinite(minHours) || !Number.isFinite(maxHours)) return null
+    return {
+      enabled: raw.enabled === true,
+      wagePerHour: Math.min(HIRE_WAGE_MAX, Math.max(HIRE_WAGE_MIN, Math.floor(wage))),
+      minHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(minHours))),
+      maxHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(maxHours)))
+    }
+  }
+
+  /**
+   * 合同（ticket 44）：窗口只画宿主给的公开字段；坏条目只丢自己。
+   * WAL/charged/refunded 这些内部字段永远不过 IPC。
+   */
+  function normalizeContracts (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { outgoing: [], incoming: [], listings: [], pendingHire: false, now: 0, feeRate: HIRE_FEE_RATE }
+    }
+    const record = (candidate, side) => {
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) return null
+      const id = normalizeUuid(candidate.id)
+      if (id === null) return null
+      const status = CONTRACT_STATUSES.includes(candidate.status) ? candidate.status : null
+      if (status === null) return null
+      const hours = Number(candidate.hours)
+      const wagePerHour = Number(candidate.wagePerHour)
+      const wage = Number(candidate.wage)
+      const fee = Number(candidate.fee)
+      if (![hours, wagePerHour, wage, fee].every(Number.isFinite)) return null
+      const name = side === 'outgoing'
+        ? normalizeLabel(candidate.workerNickname, '邻居')
+        : normalizeLabel(candidate.employerNickname, '邻居')
+      const remaining = Number(candidate.remainingMs)
+      const earned = Number(candidate.earned)
+      return {
+        id,
+        ...(side === 'outgoing'
+          ? { workerNickname: name }
+          : { employerNickname: name }),
+        hours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(hours))),
+        wagePerHour: Math.min(HIRE_WAGE_MAX, Math.max(HIRE_WAGE_MIN, Math.floor(wagePerHour))),
+        wage: Math.max(0, Math.floor(wage)),
+        fee: Math.max(0, Math.floor(fee)),
+        status,
+        earned: Number.isFinite(earned) ? Math.max(0, Math.floor(earned)) : 0,
+        remainingMs: Number.isFinite(remaining) ? Math.max(0, Math.floor(remaining)) : 0,
+        endedAt: Number.isFinite(Number(candidate.endedAt)) ? Math.floor(Number(candidate.endedAt)) : null,
+        settled: candidate.settled === true
+      }
+    }
+    const outgoing = []
+    const incoming = []
+    if (Array.isArray(raw.outgoing)) {
+      for (const candidate of raw.outgoing) {
+        if (outgoing.length >= MAX_FARM_CONTRACTS) break
+        const entry = record(candidate, 'outgoing')
+        if (entry !== null) outgoing.push(entry)
+      }
+    }
+    if (Array.isArray(raw.incoming)) {
+      for (const candidate of raw.incoming) {
+        if (incoming.length >= MAX_FARM_CONTRACTS) break
+        const entry = record(candidate, 'incoming')
+        if (entry !== null) incoming.push(entry)
+      }
+    }
+    const listings = []
+    if (Array.isArray(raw.listings)) {
+      for (const candidate of raw.listings) {
+        if (listings.length >= MAX_FARM_CONTRACTS) break
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+        const deviceId = normalizeUuid(candidate.deviceId)
+        if (deviceId === null || listings.some((entry) => entry.deviceId === deviceId)) continue
+        const wage = Number(candidate.wagePerHour)
+        const minHours = Number(candidate.minHours)
+        const maxHours = Number(candidate.maxHours)
+        if (![wage, minHours, maxHours].every(Number.isFinite)) continue
+        listings.push({
+          deviceId,
+          nickname: normalizeLabel(candidate.nickname, '邻居'),
+          enabled: candidate.enabled === true,
+          available: candidate.available === true,
+          reason: HIRE_REASONS.includes(candidate.reason) ? candidate.reason : null,
+          wagePerHour: Math.min(HIRE_WAGE_MAX, Math.max(HIRE_WAGE_MIN, Math.floor(wage))),
+          minHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(minHours))),
+          maxHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(maxHours))),
+          guard: Number.isFinite(Number(candidate.guard)) ? Math.min(0.8, Math.max(0, Number(candidate.guard))) : 0,
+          stale: candidate.stale === true
+        })
+      }
+    }
+    const now = Number(raw.now)
+    return {
+      outgoing,
+      incoming,
+      listings,
+      pendingHire: raw.pendingHire === true,
+      now: Number.isFinite(now) ? Math.floor(now) : 0,
+      feeRate: HIRE_FEE_RATE
+    }
   }
 
   /** 地块条只吃的摘要；完整农场进来也只留下摘要。null = 没有桌面层/没有农场。 */
@@ -841,6 +995,8 @@
       mode: raw.mode === 'visitor' ? 'visitor' : 'owner',
       farm: normalizeFarm(raw.farm, { full: true }),
       market: normalizeMarket(raw.market),
+      // ticket 44：雇工页的合同/挂牌由宿主 push，窗口永远不自己发请求。
+      contracts: normalizeContracts(raw.contracts),
       ...(visit === null ? {} : { visit }),
       ...(plotId === null ? {} : { plotId })
     }
@@ -856,6 +1012,27 @@
       const qty = normalizeTradeQty(raw.qty)
       if (cropId === null || qty === null) return null
       return { action, cropId, qty }
+    }
+    if (action === 'hire') {
+      const deviceId = normalizeUuid(raw.deviceId)
+      const hours = Number(raw.hours)
+      if (deviceId === null) return null
+      if (!Number.isInteger(hours) || hours < HIRE_HOURS_MIN || hours > HIRE_HOURS_MAX) return null
+      return { action, deviceId, hours }
+    }
+    if (action === 'recall-worker' || action === 'end-contract') {
+      const contractId = normalizeUuid(raw.contractId)
+      return contractId === null ? null : { action, contractId }
+    }
+    if (action === 'hire-listing') {
+      const wagePerHour = Number(raw.wagePerHour)
+      const minHours = Number(raw.minHours)
+      const maxHours = Number(raw.maxHours)
+      if (typeof raw.enabled !== 'boolean') return null
+      if (!Number.isInteger(wagePerHour) || wagePerHour < HIRE_WAGE_MIN || wagePerHour > HIRE_WAGE_MAX) return null
+      if (!Number.isInteger(minHours) || !Number.isInteger(maxHours)) return null
+      if (minHours < HIRE_HOURS_MIN || maxHours > HIRE_HOURS_MAX || minHours > maxHours) return null
+      return { action, enabled: raw.enabled, wagePerHour, minHours, maxHours }
     }
     const plotId = normalizePlotId(raw.plotId)
     if (plotId === null) return null
@@ -881,6 +1058,11 @@
 
   function normalizeRole (value) {
     return PET_ROLES.includes(value) ? value : null
+  }
+
+  /** 角标只认固定枚举；认不出就不画（绝不把任意字符串送进场景）。 */
+  function normalizeBadge (value) {
+    return PET_BADGES.includes(value) ? value : null
   }
 
   function normalizeSemantic (value) {
@@ -1000,11 +1182,13 @@
     const src = isPet ? normalizeAssetUrl(raw.src) : null
     const fallback = isPet ? normalizeSemantic(raw.fallback) : null
     const idlePool = isPet ? normalizeIdlePool(raw.idlePool) : null
+    const badge = isPet ? normalizeBadge(raw.badge) : null
     return {
       id,
       kind: raw.kind,
       role: isPet ? normalizeRole(raw.role) : null,
       anim: isPet ? normalizeAnim(raw.anim) : null,
+      ...(badge === null ? {} : { badge }),
       // 只有真的用得上时才带这两个字段：旧场景形状保持不变，测试/日志不无故多两个 null。
       ...(src === null ? {} : { src }),
       ...(fallback === null ? {} : { fallback }),
@@ -1419,6 +1603,7 @@
         if (id === null || seen.has(id)) continue
         seen.add(id)
         const role = normalizeRole(raw.role) ?? 'guest'
+        const badge = normalizeBadge(raw.badge)
         const idlePool = normalizeIdlePool(raw.idlePool)
         // 访客自己的素材（ticket 17）：宿主把拉到的 cache URL 放在 pets 里，
         // 这里必须原样带下去，否则渲染端看不到 src，只能拿本机同名动作顶替。
@@ -1430,6 +1615,7 @@
           role,
           label: normalizeLabel(raw.label, role === 'self' ? '我' : '邻居'),
           anim: normalizeAnim(raw.anim),
+          ...(badge === null ? {} : { badge }),
           ...(idlePool === null ? {} : { idlePool }),
           ...(src === null ? {} : { src }),
           ...(fallback === null ? {} : { fallback }),
@@ -1479,6 +1665,7 @@
         kind: 'pet',
         role: pet.role,
         anim: pet.anim,
+        ...(pet.badge === undefined ? {} : { badge: pet.badge }),
         ...(pet.idlePool === undefined ? {} : { idlePool: pet.idlePool }),
         ...(pet.src === undefined ? {} : { src: pet.src }),
         ...(pet.fallback === undefined ? {} : { fallback: pet.fallback }),
@@ -2193,6 +2380,21 @@
         // 换皮只带素材源 id（ticket 32）：注册表在宿主那边，这里只守形状。
         const skinId = action === 'use-skin' ? normalizeSkinId(raw.skinId) : null
         if (action === 'use-skin' && skinId === null) return { ok: false, error: 'bad-skin-id' }
+        // 雇佣（ticket 44）：四个动作的字段与窗口提交共用同一条白名单。
+        if (FARM_HIRE_ACTIONS.includes(action)) {
+          const normalized = normalizeFarmAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-farm-action' }
+          return {
+            ok: true,
+            event: {
+              type,
+              id,
+              ...normalized,
+              deviceId: normalized.deviceId ?? null,
+              nickname
+            }
+          }
+        }
         // 农场（ticket 40）：`farm-open` 可带 plotId（点某块地开窗），四个地块动作必须带；
         // 种地还必须有 cropId。这里少一条，到了 store 就只剩一句 bad-plot，没有线索。
         // 交易所（ticket 41）：不碰地块，只带 cropId + qty（1–99）。
@@ -2648,6 +2850,7 @@
     DEFAULT_COLOR,
     ITEM_KINDS,
     PET_ROLES,
+    PET_BADGES,
     SCENE_VERSION,
     CONTROL_ACTIONS,
     GIFT_ACTIONS,
@@ -2655,6 +2858,16 @@
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
     FARM_VISIT_ACTIONS,
+    FARM_HIRE_ACTIONS,
+    HIRE_WAGE_MIN,
+    HIRE_WAGE_MAX,
+    HIRE_HOURS_MIN,
+    HIRE_HOURS_MAX,
+    HIRE_FEE_RATE,
+    MAX_CONTRACT_EARNED,
+    CONTRACT_STATUSES,
+    HIRE_REASONS,
+    OWNER_PRESENCES,
     GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
@@ -2674,6 +2887,10 @@
     normalizeFarmSummary,
     normalizeFarmWindow,
     normalizeFarmAction,
+    normalizeFarmHire,
+    normalizeFarmOwner,
+    normalizeContracts,
+    normalizeBadge,
     normalizeMarket,
     normalizeTradeQty,
     normalizePlotId,

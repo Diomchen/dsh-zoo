@@ -16,7 +16,7 @@ const T0 = 1_700_000_000_000
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-visits-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 
@@ -180,7 +180,7 @@ test('文件写不进去：内存里仍有记录，只告警一次，后续追�
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-visits-ro-'))
   t.after(async () => {
     await chmod(dir, 0o700)
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
   await chmod(dir, 0o500)
 
