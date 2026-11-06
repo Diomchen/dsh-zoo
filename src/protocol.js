@@ -7,11 +7,14 @@
  * - 版本、类型、deviceId、visitId、port 逐项校验，昵称清洗 + 截断，动画名只允许安全文件名；
  * - 每种报文只写自己那几个字段：beacon/beacon-ack 是身份，heartbeat 是动作意图，
  *   visit-request/ack/deny/recall 是一次串门的生命周期，gift-received 是礼物的送达回执；
+ *   market-digest 是本机行情与雇工挂牌的定期广播；
  * - 任何校验失败都只返回 `{ ok: false }`，不抛异常、不写盘、不读本机状态。
  *
  * 协议本身不传素材本体、不传坐标、不传项目或会话信息（ADR-0003）。素材只传引用：
  * `skinPort` / `skinId` 告诉对方去哪儿取，视频本身走 HTTP（ticket 15 起）。
  */
+import { CROPS, CROP_IDS, isCropId, MINUTE_MS } from './farm-rules.js'
+
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
 export const MAX_PACKET_BYTES = 4 * 1024
@@ -47,6 +50,22 @@ export const HEARTBEAT_INTERVAL_MS = 2000
 /** 30 秒没有心跳，心跳影子从快照里消失；与邻居灯共用同一条 tick 时间线。 */
 export const GUEST_TTL_MS = 30000
 /**
+ * 行情 gossip（ticket 42）：每 30 秒一条 `market-digest`；接收端只认 2 分钟内的样本。
+ * 这两个数字既是发送节拍/接收新鲜度，也是「1 个 peer 30 秒最多 1 条」的限速窗口。
+ */
+export const MARKET_DIGEST_INTERVAL_MS = 30 * 1000
+export const MARKET_DIGEST_FRESH_MS = 2 * MINUTE_MS
+/**
+ * 雇工挂牌的固定原因枚举（ticket 44 才填真实值；42 自己只发 null）。
+ * 形状先固定，44 的雇工板直接读 digest，不再逐个问邻居。
+ */
+export const HIRE_REASONS = Object.freeze(['ready', 'off', 'visiting', 'working'])
+export const HIRE_WAGE_MIN = 1
+export const HIRE_WAGE_MAX = 100
+export const HIRE_HOURS_MIN = 2
+export const HIRE_HOURS_MAX = 8
+export const HIRE_GUARD_MAX = 0.8
+/**
  * 一次**出门**的硬上限：30 分钟到点主动回家并写记录（ticket 09）。
  * 入站串门没有时间上限——访客待到主人点「送客」（ticket 10）。
  * 这个值同时是单条串门记录的时长上限（见 src/visit-record.js）。
@@ -72,7 +91,8 @@ export const PACKET_TYPES = Object.freeze([
   'visit-deny',
   'visit-recall',
   'visit-recall-ack',
-  'gift-received'
+  'gift-received',
+  'market-digest'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -91,6 +111,8 @@ const VISIT_TYPES = new Set([
  */
 export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off'])
 const DENY_REASON_SET = new Set(VISIT_DENY_REASONS)
+/** 雇工挂牌原因同样是固定枚举（ticket 44）；42 只发 null。 */
+const HIRE_REASON_SET = new Set(HIRE_REASONS)
 
 const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -253,6 +275,67 @@ export function normalizeGift (value) {
   return null
 }
 
+/**
+ * 行情 digest 的单个价格：只认已知作物 + 有限数字 + `[base×0.5, base×2]`。
+ * 价格是**条目**而不是整包：一个坏价只丢这一种作物（见 `normalizeDigestPrices`）。
+ */
+export function isDigestPrice (cropId, value) {
+  if (!isCropId(cropId)) return false
+  if (typeof value !== 'number' || !Number.isFinite(value)) return false
+  const base = CROPS[cropId].base
+  return value >= base * 0.5 && value <= base * 2
+}
+
+/**
+ * 把 `prices` 收成白名单新对象：未知作物、坏价格、超范围价格都丢掉，
+ * 但**不**因为一个坏条目丢掉整条 digest（SPEC：「坏条目丢掉、不整包丢」）。
+ * 形状不是对象时返回 null，由调用方把整包判坏。
+ */
+export function normalizeDigestPrices (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const prices = {}
+  for (const cropId of CROP_IDS) {
+    if (!Object.prototype.hasOwnProperty.call(value, cropId)) continue
+    if (!isDigestPrice(cropId, value[cropId])) continue
+    prices[cropId] = value[cropId]
+  }
+  return prices
+}
+
+/**
+ * 雇工挂牌：字段固定 `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`。
+ * 开工前拍板（ticket 44 D1）：42 的 digest 就带 `available/reason/guard`，44 的雇工板直接读。
+ * `reason` 允许 `null`（42 本机挂牌还没有真实可用性）或固定枚举（44 填）。
+ */
+export function normalizeDigestHire (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (typeof value.enabled !== 'boolean') return null
+  if (typeof value.available !== 'boolean') return null
+  if (!Number.isInteger(value.wagePerHour) ||
+    value.wagePerHour < HIRE_WAGE_MIN || value.wagePerHour > HIRE_WAGE_MAX) return null
+  if (!Number.isInteger(value.minHours) || !Number.isInteger(value.maxHours)) return null
+  if (value.minHours < HIRE_HOURS_MIN || value.maxHours > HIRE_HOURS_MAX) return null
+  if (value.minHours > value.maxHours) return null
+  if (typeof value.guard !== 'number' || !Number.isFinite(value.guard)) return null
+  if (value.guard < 0 || value.guard > HIRE_GUARD_MAX) return null
+  const reason = value.reason
+  if (reason !== null && !(typeof reason === 'string' && HIRE_REASON_SET.has(reason))) return null
+  return {
+    enabled: value.enabled,
+    wagePerHour: value.wagePerHour,
+    minHours: value.minHours,
+    maxHours: value.maxHours,
+    guard: value.guard,
+    available: value.available,
+    reason
+  }
+}
+
+/** digest 时间戳：正整数毫秒；**新鲜度**在接收端按本地时钟判（见 src/market.js）。 */
+export function normalizeDigestAt (value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.DSH_ZOO_PORT
@@ -269,6 +352,7 @@ export function resolvePort (env = process.env) {
  *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
  *   gift-received           → { v, type, deviceId, visitId, giftId }
+ *   market-digest           → { v, type, deviceId, at, prices, hire }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
@@ -310,6 +394,9 @@ function buildPacket ({
   skinPort,
   skinId,
   gift,
+  at,
+  prices,
+  hire,
   now = Date.now()
 } = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
@@ -348,6 +435,15 @@ function buildPacket ({
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
     packet = { ...base, visitId: visitId.toLowerCase(), giftId: giftId.toLowerCase() }
+  } else if (type === 'market-digest') {
+    // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，prices/hire 会在这里消失。
+    const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
+    if (stamp === null) throw new Error('protocol: invalid digest time')
+    const safePrices = normalizeDigestPrices(prices)
+    if (safePrices === null) throw new Error('protocol: invalid digest prices')
+    const safeHire = normalizeDigestHire(hire)
+    if (safeHire === null) throw new Error('protocol: invalid digest hire')
+    packet = { ...base, at: stamp, prices: safePrices, hire: safeHire }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -448,6 +544,14 @@ export function encodeVisitRecallAck ({ deviceId, visitId } = {}) {
  */
 export function encodeGiftReceived ({ deviceId, visitId, giftId } = {}) {
   return encodePacket({ type: 'gift-received', deviceId, visitId, giftId })
+}
+
+/**
+ * 行情 gossip（ticket 42）：本机每种作物的 price + 自己的雇工挂牌。
+ * `at` 缺省用本地时钟；价格/挂牌由调用方从 store 取，坏条目在这里被丢弃。
+ */
+export function encodeMarketDigest ({ deviceId, at, prices, hire, now } = {}) {
+  return encodePacket({ type: 'market-digest', deviceId, at, prices, hire, now })
 }
 
 function fail (reason) {
@@ -560,6 +664,28 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         deviceId: raw.deviceId.toLowerCase(),
         visitId: raw.visitId.toLowerCase(),
         giftId: raw.giftId.toLowerCase()
+      }
+    }
+  }
+
+  // 行情 digest（ticket 42）：**不**落进 VISIT_TYPES（那里只重建四个字段）。
+  // 坏价格只丢那一个作物；形状/时间/挂牌坏了才整包丢。昵称、端口等一律不读。
+  if (raw.type === 'market-digest') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    const prices = normalizeDigestPrices(raw.prices)
+    if (prices === null) return fail('prices')
+    const hire = normalizeDigestHire(raw.hire)
+    if (hire === null) return fail('hire')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        prices,
+        hire
       }
     }
   }

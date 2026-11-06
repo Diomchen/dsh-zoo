@@ -404,6 +404,15 @@
         color: var(--ink);
         font-variant-numeric: tabular-nums;
       }
+      /* 局域网指数（ticket 42）：本机行情退成次要色；过期样本整项灰掉。 */
+      .market-stats .index-local {
+        color: var(--muted);
+      }
+      .market-stats .index-stale,
+      .market-stats .index-stale b {
+        color: var(--muted);
+        opacity: 0.55;
+      }
       .market-trade {
         display: flex;
         align-items: center;
