@@ -1,6 +1,6 @@
 {
   "name": "dsh-zoo",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "局域网 DSH 宠物：互相看得见、互相串门，还能捎一张字条或一个文件。 · LAN pets for DeepSeek Harness.",
   "type": "module",
   "main": "index.js",
