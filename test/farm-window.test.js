@@ -8,11 +8,12 @@
  *   3. 失败码（bad-plot）回一句人话；没有桌面层时 `farm-open` 是 `desktop-off`。
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import shared from '../desktop/shared.js'
 import { PLOT_IDS } from '../src/farm.js'
 import { MINUTE_MS } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
@@ -259,4 +260,129 @@ test('窗口动作：farm-plant → 39 的 store → action-result；下一帧 c
 
   // 窗口连点两次：第二次在第一次结果回来前不会串 id（main 会挡，宿主这边只验 id 对得上）。
   assert.equal(desktop.calls.results.length, 3)
+})
+
+test('交易所页：farm-window 带 market；买种/卖作物走同一 store 并自动刷新窗口', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: NOON }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  // 小窗页签与动作白名单：交易所页必须真的存在，窗口只能发 cropId + qty。
+  const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
+  assert.match(html, /data-tab="market"/)
+  assert.match(html, /id="market-rows"/)
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  assert.match(renderer, /farm-buy-seed/)
+  assert.match(renderer, /farm-sell-crop/)
+  const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
+  assert.match(preload, /qty: action\.qty/)
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-buy-seed', cropId: 'tomato', qty: 2 }),
+    { action: 'farm-buy-seed', cropId: 'tomato', qty: 2 }
+  )
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-sell-crop', cropId: 'tomato', qty: 0 }), null)
+  const event = shared.normalizeHelperEvent({
+    type: 'action', id: 'm0', action: 'farm-sell-crop', cropId: 'carrot', qty: 3
+  })
+  assert.equal(event.ok, true)
+  assert.equal(event.event.qty, 3)
+  assert.equal(event.event.cropId, 'carrot')
+  assert.equal(shared.FARM_ACTIONS.includes('farm-buy-seed'), true)
+  // helper 侧同样夹价格/重算 bid：宿主多给一个字段也不会让窗口画错价。
+  const normalizedWindow = shared.normalizeFarmWindow({
+    open: true,
+    market: {
+      prices: {
+        tomato: { base: 999, price: 999, volume24h: 'x', at: 0, bid: 1 },
+        carrot: null
+      },
+      history: [{ crop: 'tomato', side: 'sell', qty: 2, price: 5, at: NOON }],
+      index: { tomato: { price: 999, at: NOON, samples: 2 }, alien: { price: 1 } }
+    }
+  })
+  assert.equal(normalizedWindow.market.prices.tomato.base, 5)
+  assert.equal(normalizedWindow.market.prices.tomato.price, 10)
+  assert.equal(normalizedWindow.market.prices.tomato.bid, 9)
+  assert.equal(normalizedWindow.market.prices.carrot.price, 6)
+  assert.deepEqual(normalizedWindow.market.history, [
+    { crop: 'tomato', side: 'sell', qty: 2, price: 5, at: NOON }
+  ])
+  assert.equal(normalizedWindow.market.index.tomato.price, 10)
+  assert.equal('alien' in normalizedWindow.market.index, false)
+
+  // 开窗：完整视图里带交易所，且交易所不混进场景的 controls.farm。
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.body.ok, true)
+  const window = desktop.calls.windows.at(-1)
+  assert.deepEqual(window.market.prices.tomato, {
+    base: 5,
+    price: 5,
+    volume24h: 0,
+    at: NOON,
+    bid: 5
+  })
+  assert.deepEqual(window.market.history, [])
+  assert.deepEqual(window.market.index, {})
+  assert.equal('market' in desktop.calls.scenes.at(-1).controls.farm, false)
+
+  // 窗口提交买 2 颗番茄种子：宿主回人话，并推一份新的完整窗口状态（open:false）。
+  desktop.emit({ type: 'action', id: 'market-1', action: 'farm-buy-seed', cropId: 'tomato', qty: 2 })
+  await waitFor(() => desktop.calls.results.length === 1)
+  assert.deepEqual(desktop.calls.results[0], {
+    id: 'market-1',
+    result: { ok: true, notice: '买了 2 颗小番茄种子，花了 12 硬币。', error: null }
+  })
+  await waitFor(() => desktop.calls.windows.at(-1).open === false)
+  const refreshed = desktop.calls.windows.at(-1)
+  assert.equal(refreshed.farm.coins, 18)
+  assert.deepEqual(refreshed.farm.seeds, { tomato: 4, carrot: 0, pumpkin: 0 })
+  assert.equal(refreshed.market.prices.tomato.volume24h, 2)
+  assert.equal(refreshed.market.history[0].side, 'buy')
+
+  // 种下并等 30 分钟：收 3 个番茄，再卖给交易所。
+  desktop.emit({ type: 'action', id: 'farm-1', action: 'farm-plant', plotId: 'p1', cropId: 'tomato' })
+  await waitFor(() => desktop.calls.results.length === 2)
+  assert.equal(desktop.calls.results[1].result.ok, true)
+  clock.value += 30 * MINUTE_MS
+  desktop.emit({ type: 'action', id: 'farm-2', action: 'farm-harvest', plotId: 'p1' })
+  await waitFor(() => desktop.calls.results.length === 3)
+  assert.equal(desktop.calls.results[2].result.ok, true)
+
+  const beforeSell = desktop.calls.windows.length
+  desktop.emit({ type: 'action', id: 'market-2', action: 'farm-sell-crop', cropId: 'tomato', qty: 3 })
+  await waitFor(() => desktop.calls.results.length === 4)
+  assert.deepEqual(desktop.calls.results[3], {
+    id: 'market-2',
+    result: { ok: true, notice: '卖了 3 个小番茄，得到 15 硬币。', error: null }
+  })
+  await waitFor(() => desktop.calls.windows.length > beforeSell)
+  const soldWindow = desktop.calls.windows.at(-1)
+  assert.equal(soldWindow.farm.coins, 33)
+  assert.deepEqual(soldWindow.farm.crops, { tomato: 0, carrot: 0, pumpkin: 0 })
+  assert.equal(soldWindow.market.history[0].side, 'sell')
+  assert.equal(soldWindow.market.history[0].price, 5)
+  assert.ok(soldWindow.market.prices.tomato.price < 5)
+
+  const state = await call(service, '/dsh-zoo/state')
+  assert.equal(state.body.farm.coins, 33)
+  assert.equal(state.body.market.history.length, 2)
+  assert.deepEqual(state.body.market.history.map((entry) => entry.side), ['sell', 'buy'])
+  assert.equal('bid' in state.body.market.prices.tomato, false, '/state 保持 SPEC 的 prices 形状')
+
+  // 数量非法时窗口那层会先挡（shared），服务端也会再挡一次。
+  desktop.emit({ type: 'action', id: 'market-3', action: 'farm-sell-crop', cropId: 'tomato', qty: 0 })
+  await waitFor(() => desktop.calls.results.length === 5)
+  assert.equal(desktop.calls.results[4].result.ok, false)
+  assert.equal(desktop.calls.results[4].result.error, 'bad-qty')
+  assert.match(desktop.calls.results[4].result.notice, /1–99/)
 })

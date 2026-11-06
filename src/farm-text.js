@@ -1,5 +1,5 @@
 /**
- * 农场失败的「错误码 → 人话」唯一文案表（ticket 40）。
+ * 农场/交易所失败的「错误码 → 人话」唯一文案表（ticket 40 / 41）。
  *
  * 三条路共用这一份：
  *   - `POST /dsh-zoo/action` 的失败（HTTP 客户端自己决定怎么显示，但文案同源）；
@@ -26,6 +26,9 @@ const FARM_ERROR_TEXT = Object.freeze({
   'not-mature': '还没熟呢，再等一会儿。',
   'no-seed': '没有这种种子了，先去交易所买。',
   'no-coin': '硬币不够，先去卖点作物。',
+  'bad-qty': '数量要在 1–99 之间。',
+  cap: '仓库装不下了，先卖掉一点再来。',
+  'market-busy': '交易所这会儿太忙了（每分钟最多 10 笔），等一下再试。',
   'no-dew': '露水不够，先让宠物待机攒一会儿。',
   'already-watered': '这株已经浇过水了。',
   'already-fertilized': '这株已经施过肥了。'

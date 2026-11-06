@@ -130,10 +130,13 @@
   const PET_ROLES = ['self', 'guest', 'visitor']
   const SCENE_VERSION = 3
   /**
-   * 农场小窗能提交的四条动作（ticket 40）；窗口只带 plotId（种地再带 cropId），
-   * 数量/价格全由宿主算。声明必须在 CONTROL_ACTIONS 之前（后者会展开它）。
+   * 农场小窗能提交的动作。地块四条（ticket 40）只带 plotId（种地再带 cropId）；
+   * 交易所两条（ticket 41）只带 cropId + qty。数量/价格全由宿主算。
+   * 声明必须在 CONTROL_ACTIONS 之前（后者会展开它）。
    */
-  const FARM_ACTIONS = ['farm-plant', 'farm-harvest', 'farm-water', 'farm-fertilize']
+  const FARM_PLOT_ACTIONS = ['farm-plant', 'farm-harvest', 'farm-water', 'farm-fertilize']
+  const FARM_MARKET_ACTIONS = ['farm-buy-seed', 'farm-sell-crop']
+  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS)
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
@@ -155,7 +158,7 @@
     // ticket 24：右键「带派」只发一个空动作，由宿主开小窗；unbring 才带 giftId。
     'bring',
     'unbring',
-    // ticket 40：农场小窗的四条动作。只带 plotId（种地再带 cropId），一切计算在宿主。
+    // ticket 40/41：农场七条动作。地块只带 plotId（种地再带 cropId），交易所只带 cropId + qty。
     ...FARM_ACTIONS
   ]
   /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
@@ -220,6 +223,17 @@
   const MAX_FARM_DEW = 48
   const MAX_FARM_CONTRACTS = 20
   const MAX_FARM_LOG = 50
+  /**
+   * 交易所（ticket 41）的窄口：底价表与 `src/farm-rules.js` 同源；
+   * 价格夹在 [base×0.5, base×2]，成交历史最多 50 条进窗口。
+   */
+  const CROP_BASE_PRICE = { tomato: 5, carrot: 6, pumpkin: 30 }
+  const MAX_FARM_MARKET_HISTORY = 50
+  const MARKET_SIDES = ['buy', 'sell']
+  const MARKET_MIN_QTY = 1
+  const MARKET_MAX_QTY = 99
+  const MARKET_FLOOR_RATIO = 0.5
+  const MARKET_CEIL_RATIO = 2
   /** `remainingMs` 只用来画倒计时；一行 JSON 推到几百年后没有意义。 */
   const MAX_FARM_REMAINING_MS = 30 * 24 * 60 * 60 * 1000
   /** 地块 id 的形状：宿主只发 p1–p4，这里允许短标识符，大小写统一成小写。 */
@@ -621,12 +635,94 @@
     return normalizeFarm(raw, { full: false })
   }
 
+  /** 交易所数量：1–99 的整数；字符串数字也认（input.value 常见）。 */
+  function normalizeTradeQty (value) {
+    const num = Number(value)
+    if (!Number.isFinite(num) || !Number.isInteger(num)) return null
+    return num >= MARKET_MIN_QTY && num <= MARKET_MAX_QTY ? num : null
+  }
+
+  function normalizeMarketPrice (raw, cropId) {
+    const base = CROP_BASE_PRICE[cropId]
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { base, price: base, bid: Math.round(base * 0.9), volume24h: 0, at: 0 }
+    }
+    const rawPrice = Number(raw.price)
+    const price = Number.isFinite(rawPrice)
+      ? Math.min(base * MARKET_CEIL_RATIO, Math.max(base * MARKET_FLOOR_RATIO, rawPrice))
+      : base
+    const volume = Number(raw.volume24h)
+    const at = Number(raw.at)
+    return {
+      base,
+      price,
+      bid: Math.round(price * 0.9),
+      volume24h: Number.isFinite(volume) ? Math.min(MAX_FARM_STACK * 1000, Math.max(0, Math.floor(volume))) : 0,
+      at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0
+    }
+  }
+
+  function normalizeMarketHistoryEntry (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const cropId = normalizeCropId(raw.crop)
+    if (cropId === null || !MARKET_SIDES.includes(raw.side)) return null
+    const qty = normalizeTradeQty(raw.qty)
+    if (qty === null) return null
+    const price = Number(raw.price)
+    const at = Number(raw.at)
+    if (!Number.isFinite(price) || price < 0) return null
+    if (!Number.isFinite(at) || at <= 0) return null
+    return { crop: cropId, side: raw.side, qty, price, at: Math.floor(at) }
+  }
+
+  /**
+   * 交易所页视图（ticket 41）。只信价格/成交量/历史这三类字段：
+   *   - 未知作物、坏成交、超长历史一律丢掉，不整份失败；
+   *   - `bid` 在这里按价格重算，宿主多传一个字段也不会让窗口画错价；
+   *   - index 只是形状，ticket 42 才填样本。
+   */
+  function normalizeMarket (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const prices = {}
+    for (const cropId of CROP_IDS) {
+      prices[cropId] = normalizeMarketPrice(raw.prices?.[cropId], cropId)
+    }
+    const history = []
+    if (Array.isArray(raw.history)) {
+      for (const candidate of raw.history) {
+        if (history.length >= MAX_FARM_MARKET_HISTORY) break
+        const entry = normalizeMarketHistoryEntry(candidate)
+        if (entry !== null) history.push(entry)
+      }
+    }
+    const index = {}
+    if (raw.index !== null && typeof raw.index === 'object' && !Array.isArray(raw.index)) {
+      for (const cropId of CROP_IDS) {
+        const entry = raw.index[cropId]
+        if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+        const price = Number(entry.price)
+        const at = Number(entry.at)
+        const samples = Number(entry.samples)
+        if (!Number.isFinite(price) || price < 0) continue
+        if (!Number.isFinite(at) || at <= 0) continue
+        const base = CROP_BASE_PRICE[cropId]
+        index[cropId] = {
+          price: Math.min(base * MARKET_CEIL_RATIO, Math.max(base * MARKET_FLOOR_RATIO, price)),
+          at: Math.floor(at),
+          samples: Number.isFinite(samples) ? Math.max(0, Math.floor(samples)) : 0
+        }
+      }
+    }
+    return { prices, index, history }
+  }
+
   /** 宿主 → helper 的 `farm-window` 命令体：打开/刷新 + 完整农场视图 + 可选地块。 */
   function normalizeFarmWindow (raw) {
     const plotId = normalizePlotId(raw.plotId)
     return {
       open: raw.open === true,
       farm: normalizeFarm(raw.farm, { full: true }),
+      market: normalizeMarket(raw.market),
       ...(plotId === null ? {} : { plotId })
     }
   }
@@ -636,6 +732,12 @@
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
     if (!FARM_ACTIONS.includes(action)) return null
+    if (FARM_MARKET_ACTIONS.includes(action)) {
+      const cropId = normalizeCropId(raw.cropId)
+      const qty = normalizeTradeQty(raw.qty)
+      if (cropId === null || qty === null) return null
+      return { action, cropId, qty }
+    }
     const plotId = normalizePlotId(raw.plotId)
     if (plotId === null) return null
     if (action === 'farm-plant') {
@@ -1971,11 +2073,17 @@
         if (action === 'use-skin' && skinId === null) return { ok: false, error: 'bad-skin-id' }
         // 农场（ticket 40）：`farm-open` 可带 plotId（点某块地开窗），四个地块动作必须带；
         // 种地还必须有 cropId。这里少一条，到了 store 就只剩一句 bad-plot，没有线索。
-        const needsPlot = FARM_ACTIONS.includes(action)
+        // 交易所（ticket 41）：不碰地块，只带 cropId + qty（1–99）。
+        const needsPlot = FARM_PLOT_ACTIONS.includes(action)
+        const isMarketAction = FARM_MARKET_ACTIONS.includes(action)
         const plotId = needsPlot || action === 'farm-open' ? normalizePlotId(raw.plotId) : null
         if (needsPlot && plotId === null) return { ok: false, error: 'bad-plot' }
-        const cropId = action === 'farm-plant' ? normalizeCropId(raw.cropId) : null
-        if (action === 'farm-plant' && cropId === null) return { ok: false, error: 'bad-crop' }
+        const cropId = action === 'farm-plant' || isMarketAction ? normalizeCropId(raw.cropId) : null
+        if ((action === 'farm-plant' || isMarketAction) && cropId === null) {
+          return { ok: false, error: 'bad-crop' }
+        }
+        const qty = isMarketAction ? normalizeTradeQty(raw.qty) : null
+        if (isMarketAction && qty === null) return { ok: false, error: 'bad-qty' }
         return {
           ok: true,
           event: {
@@ -1989,7 +2097,8 @@
             ...(giftId === null ? {} : { giftId }),
             ...(gift === null ? {} : { gift }),
             ...(plotId === null ? {} : { plotId }),
-            ...(cropId === null ? {} : { cropId })
+            ...(cropId === null ? {} : { cropId }),
+            ...(qty === null ? {} : { qty })
           }
         }
       }
@@ -2421,21 +2530,29 @@
     CONTROL_ACTIONS,
     GIFT_ACTIONS,
     FARM_ACTIONS,
+    FARM_PLOT_ACTIONS,
+    FARM_MARKET_ACTIONS,
     GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
     MAX_FARM_PLOTS,
     CROP_IDS,
+    CROP_BASE_PRICE,
     MAX_FARM_COINS,
     MAX_FARM_STACK,
     MAX_FARM_DEW,
     MAX_FARM_CONTRACTS,
     MAX_FARM_LOG,
+    MAX_FARM_MARKET_HISTORY,
+    MARKET_MIN_QTY,
+    MARKET_MAX_QTY,
     normalizeFarm,
     normalizeFarmSummary,
     normalizeFarmWindow,
     normalizeFarmAction,
+    normalizeMarket,
+    normalizeTradeQty,
     normalizePlotId,
     normalizeCropId,
     MAX_ACTION_TEXT,

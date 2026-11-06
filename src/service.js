@@ -13,6 +13,13 @@ import { createDiscovery } from './discovery.js'
 import { FARM_LOG_VIEW_LIMIT, createFarmStore, initialFarmView } from './farm.js'
 import { CROPS, isMature, plotRemainingMs, plotStage } from './farm-rules.js'
 import { farmErrorText } from './farm-text.js'
+import {
+  MARKET_VIEW_HISTORY,
+  bidPrice,
+  createMarketStore,
+  initialMarketView,
+  marketView
+} from './market.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
@@ -162,6 +169,8 @@ export function createService (ctx, options = {}) {
   // 农场（ticket 39）：tick 节拍与测试时钟都可注入；生产默认 60 秒 / Date.now。
   const farmTickMs = positiveOption(options.farmTickMs, FARM_TICK_MS, 10)
   const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
+  // 交易所也可以单独注入时钟；不传就与农场共用同一个测试时钟。
+  const marketNow = typeof options.marketNow === 'function' ? options.marketNow : farmNow
 
   let identity = null
   let discovery = null
@@ -173,6 +182,8 @@ export function createService (ctx, options = {}) {
   let backpack = null
   // 农场（ticket 39）：读不出来 = 本次运行按初始农场玩，串门照常。
   let farm = null
+  // 本机交易所（ticket 41）：读不出来 = 本次运行按初始价交易，串门照常。
+  let market = null
   let settings = null
   let bridge = null
   let desktop = null
@@ -462,8 +473,25 @@ export function createService (ctx, options = {}) {
       if (farm === null) return { ok: false, error: 'starting' }
       // 桌面小窗发的是 farm-* 前缀（和菜单/客户端动作族一致）；HTTP 仍是 SPEC 里的四种。
       const kind = action.startsWith('farm-') ? action.slice('farm-'.length) : action
-      if (kind === 'plant') return farm.plant(body?.plotId, body?.cropId)
-      return farm[kind](body?.plotId)
+      const result = kind === 'plant'
+        ? await farm.plant(body?.plotId, body?.cropId)
+        : await farm[kind](body?.plotId)
+      // 开着的窗口不能停在旧地块：种/收/浇/施肥成功后都推一份新的完整视图。
+      if (result?.ok === true) refreshFarmWindow()
+      return result
+    }
+
+    // 交易所（ticket 41）：HTTP 用 SPEC 的 `buy-seed` / `sell-crop`，小窗用带前缀的同名动作。
+    // 数量与价格由宿主算；窗口只发 cropId + qty，永远不传单价。
+    if (action === 'buy-seed' || action === 'sell-crop' ||
+      action === 'farm-buy-seed' || action === 'farm-sell-crop') {
+      if (farm === null || market === null) return { ok: false, error: 'starting' }
+      const result = action === 'buy-seed' || action === 'farm-buy-seed'
+        ? await farm.buySeed(body?.cropId, body?.qty)
+        : await farm.sellCrop(body?.cropId, body?.qty)
+      // 成交后价目/硬币/仓库都变了：开着的交易所页要立刻看到新一份。
+      if (result?.ok === true) refreshFarmWindow()
+      return result
     }
 
     // 农场小窗（ticket 40）：菜单「农场」或桌面地块把一次开窗申请交给宿主。
@@ -710,7 +738,9 @@ export function createService (ctx, options = {}) {
         ? null
         : { id: activeSkin.id, size: activeSkin.size, idle: activeSkin.idle },
       backpack: backpack?.items() ?? [],
-      gifts: recentGifts()
+      gifts: recentGifts(),
+      // 本机交易所（ticket 41）：prices/index/history；history 最近 50 笔。
+      market: marketStateView()
     }
   }
 
@@ -752,6 +782,25 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * `/state` 的交易所出口（SPEC v5「状态出口与动作」）：
+   * `{ prices, index, history }`，history 最近 50 笔、最新在前。
+   * `prices` 保持 market.json 的形状；`bid` 只给小窗，不混进状态出口。
+   */
+  function marketStateView () {
+    return marketView(market?.snapshot() ?? initialMarketView(), {
+      historyLimit: MARKET_VIEW_HISTORY
+    })
+  }
+
+  /** 交易所页的视图：多一个算好的 `bid`，省得渲染端自己猜成交价。 */
+  function marketWindowView () {
+    return marketView(market?.snapshot() ?? initialMarketView(), {
+      historyLimit: MARKET_VIEW_HISTORY,
+      withBid: true
+    })
+  }
+
+  /**
    * 农场小窗的完整视图（ticket 40）。
    *
    * 和 `/state.farm` 是两个形状，别混：
@@ -759,6 +808,9 @@ export function createService (ctx, options = {}) {
    *     阶段与倒计时用 39 的纯规则（`plotStage` / `plotRemainingMs`）在**下发那一刻**算；
    *   - `seeds/crops` 补全三种作物（0 也要有键），窗口不用猜缺键；
    *   - `log` 只给最近 20 条：窗口记录页在 41 之后才接，先给能显示的一份。
+   *
+   * 交易所（41）是 `farm-window` 命令里与 `farm` 并列的另一份视图（见 `handleFarmOpen`），
+   * 不塞进农场视图，更不塞进场景。
    *
    * 窗口是 file:// 页面，没有 Node、没有网络、读不到 `/state`，所以这份必须随
    * `farm-window` 命令一起下发；**绝不**把它塞进场景（controls 每帧比较，日志/仓库会污染签名）。
@@ -797,12 +849,27 @@ export function createService (ctx, options = {}) {
     const opened = desktop.farmWindow({
       open: true,
       farm: farmWindowView(),
+      // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进 controls.farm。
+      market: marketWindowView(),
       ...(plotId === null ? {} : { plotId })
     })
     if (opened !== true) {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
     return { ok: true, action: 'farm-open', window: 'opened' }
+  }
+
+  /**
+   * 成交后刷新已经开着的交易所页（`open:false` 不会新开窗）。
+   * 窗口不自己算价格：买卖成功后宿主把新的价目/硬币/仓库原样推回去。
+   */
+  function refreshFarmWindow () {
+    if (desktop === null || typeof desktop.farmWindow !== 'function') return
+    try {
+      desktop.farmWindow({ open: false, farm: farmWindowView(), market: marketWindowView() })
+    } catch {
+      // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
+    }
   }
 
   /** 最近 20 件已落盘的礼物，最新在前；形状按 SPEC v4「记录与状态出口」。 */
@@ -1050,9 +1117,25 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 交易所（ticket 41）先于农场读：农场 store 需要它在同一个串行段里完成买卖。
+      // 坏文件只降级成初始价格，不挡启动；`marketNow`/`farmNow` 只给测试注入。
+      try {
+        market = await createMarketStore(
+          dir,
+          marketNow === undefined ? { log } : { log, now: marketNow }
+        )
+      } catch (error) {
+        market = null
+        warn(ctx, '交易所初始化失败，本次按初始行情运行：' + message(error))
+      }
+      if (disposed) return
+
       // 农场（ticket 39）：坏文件只降级成初始农场，不挡启动；`farmNow` 只给测试注入。
       try {
-        farm = await createFarmStore(dir, farmNow === undefined ? { log } : { log, now: farmNow })
+        farm = await createFarmStore(
+          dir,
+          farmNow === undefined ? { log, market } : { log, now: farmNow, market }
+        )
       } catch (error) {
         farm = null
         warn(ctx, '农场初始化失败，本次按初始农场运行：' + message(error))
@@ -1703,6 +1786,8 @@ export function createService (ctx, options = {}) {
         // 少拷一处，到 39 的 store 就只剩 bad-plot，而错误信息不会告诉你是哪一跳丢的。
         plotId: event.plotId ?? undefined,
         cropId: event.cropId ?? undefined,
+        // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
+        qty: event.qty ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
         gift: event.gift ?? undefined
       })
@@ -1882,22 +1967,26 @@ export function createService (ctx, options = {}) {
 
   /**
    * 农场 tick（ticket 39）：每 60 秒推进生长、露水与 lastTickAt；
-   * 落盘节流在 store 里（有变化且距上次写 ≥30 秒）。失败只影响这一拍。
+   * 交易所 tick（ticket 41）也搭这班车：到 10 分钟就把价格往 base 拉一次。
+   * 落盘节流在 store 里（农场有变化且距上次写 ≥30 秒）。失败只影响这一拍。
    */
   function startFarmTick () {
     if (farmTimer !== null || disposed || farm === null) return
     farmTimer = setInterval(() => {
-      let ticking
+      const ticks = []
       try {
-        ticking = farm?.tick()
+        ticks.push(['农场', farm?.tick()])
+        if (market !== null) ticks.push(['交易所', market.tick()])
       } catch (error) {
         warn(ctx, '农场 tick 失败：' + message(error))
         return
       }
-      if (ticking !== undefined && typeof ticking?.catch === 'function') {
-        ticking.catch((error) => {
-          warn(ctx, '农场 tick 失败：' + message(error))
-        })
+      for (const [label, ticking] of ticks) {
+        if (ticking !== undefined && typeof ticking?.catch === 'function') {
+          ticking.catch((error) => {
+            warn(ctx, label + ' tick 失败：' + message(error))
+          })
+        }
       }
     }, farmTickMs)
     farmTimer.unref?.()
@@ -2706,6 +2795,7 @@ export function createService (ctx, options = {}) {
         farmTimer = null
       }
       farm = null
+      market = null
       stopDesktopSync()
       unsubscribeSessionEvents()
       try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }

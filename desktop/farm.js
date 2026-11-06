@@ -1,9 +1,9 @@
 /**
- * 农场小窗的渲染端（ticket 40）。
+ * 农场小窗的渲染端（ticket 40 / 41）。
  *
  * 它只做三件事：把宿主推来的完整 farm view 画成 4 块地；每秒本地递减倒计时；
- * 把「种 / 收 / 浇 / 施肥」当**申请**交给主进程。仓库、硬币、成熟与否全部由宿主算，
- * 成功与否也等宿主回执——窗口不自己改状态。
+ * 把「种 / 收 / 浇 / 施肥 / 买种 / 卖作物」当**申请**交给主进程。仓库、硬币、成熟与否、
+ * 单价与总价全部由宿主算，成功与否也等宿主回执——窗口不自己改状态。
  */
 'use strict'
 
@@ -11,19 +11,27 @@ const api = window.dshZooFarm
 const plotsEl = document.getElementById('plots')
 const inventoryEl = document.getElementById('inventory')
 const logEl = document.getElementById('log')
+const marketRowsEl = document.getElementById('market-rows')
+const tradesEl = document.getElementById('trades')
+const marketWalletEl = document.getElementById('market-wallet')
+const farmPageEl = document.getElementById('page-farm')
+const marketPageEl = document.getElementById('page-market')
+const tabs = Array.from(document.querySelectorAll('.tab[data-tab]'))
 const subtitleEl = document.getElementById('subtitle')
 const toastEl = document.getElementById('toast')
 const closeButton = document.getElementById('close')
 
 const CROP_META = {
-  tomato: { name: '小番茄', emoji: '🍅' },
-  carrot: { name: '胡萝卜', emoji: '🥕' },
-  pumpkin: { name: '南瓜', emoji: '🎃' }
+  tomato: { name: '小番茄', emoji: '🍅', seedPrice: 6, base: 5 },
+  carrot: { name: '胡萝卜', emoji: '🥕', seedPrice: 14, base: 6 },
+  pumpkin: { name: '南瓜', emoji: '🎃', seedPrice: 36, base: 30 }
 }
 const CROP_IDS = Object.keys(CROP_META)
 const PLOT_LABEL = { 1: '地块 1', 2: '地块 2', 3: '地块 3', 4: '地块 4' }
 const WATER_COST = 1
 const FERTILIZE_COST = 5
+const MIN_TRADE_QTY = 1
+const MAX_TRADE_QTY = 99
 
 /**
  * 主进程只会用错误码回传传输层失败（超时/管道断/坏形状）；宿主给的 notice 已经是人话，
@@ -35,9 +43,13 @@ const RESULT_CODE_TEXT = {
   'bad-farm-action': '这个操作缺少地块或作物，再试一次。',
   'bad-plot': '这块地不在了，刷新后再试。',
   'bad-crop': '这种作物种不了，换一种吧。',
+  'bad-qty': '数量要在 1–99 之间。',
   'plot-occupied': '这块地已经种上了，先收掉再种。',
   'not-mature': '还没熟呢，再等一会儿。',
-  'no-seed': '没有这种种子了，先去交易所买。',
+  'no-seed': '没有这种种子或作物了。',
+  'no-coin': '硬币不够，先去卖点作物。',
+  cap: '仓库装不下了，先卖掉一点再来。',
+  'market-busy': '交易所这会儿太忙了，等一下再试。',
   'no-dew': '露水不够，先让宠物待机攒一会儿。',
   'already-watered': '这株已经浇过水了。',
   'already-fertilized': '这株已经施过肥了。'
@@ -50,11 +62,16 @@ const LOG_TEXT = {
   hire: '雇工',
   settle: '结算'
 }
+const MARKET_SIDE_TEXT = { buy: '买种', sell: '卖出' }
 
 let farm = null
+let market = null
 let selectedPlot = null
 let busy = false
 let toastTimer = null
+let activeTab = 'farm'
+/** 每种作物上一次输入的数量；宿主刷新价目时不把用户刚填的数字吞掉。 */
+const marketQty = { tomato: 1, carrot: 1, pumpkin: 1 }
 /** plotId → 倒计时节点；tick 只改文本，不重建按钮（重建会打断用户点击）。 */
 const countdowns = new Map()
 
@@ -79,9 +96,11 @@ function formatRemaining (ms) {
 }
 
 function formatTime (at) {
-  const date = new Date(Number(at))
+  const value = Number(at)
+  if (!Number.isFinite(value) || value <= 0) return ''
+  const date = new Date(value)
   if (Number.isNaN(date.getTime())) return ''
-  const pad = (value) => String(value).padStart(2, '0')
+  const pad = (number) => String(number).padStart(2, '0')
   return pad(date.getHours()) + ':' + pad(date.getMinutes())
 }
 
@@ -285,6 +304,176 @@ function renderLog () {
   }
 }
 
+function readMarketQty (cropId) {
+  const value = Number(marketQty[cropId])
+  if (!Number.isInteger(value) || value < MIN_TRADE_QTY || value > MAX_TRADE_QTY) return null
+  return value
+}
+
+function marketEntry (cropId) {
+  const entry = market?.prices?.[cropId]
+  return entry !== null && typeof entry === 'object' ? entry : null
+}
+
+function bidOf (entry) {
+  const bid = Number(entry?.bid)
+  if (Number.isFinite(bid) && bid >= 0) return Math.round(bid)
+  const price = Number(entry?.price)
+  return Number.isFinite(price) ? Math.round(price * 0.9) : 0
+}
+
+function latestTrade (cropId) {
+  if (!Array.isArray(market?.history)) return null
+  return market.history.find((entry) => entry.crop === cropId) ?? null
+}
+
+function updateMarketTotals (row, cropId) {
+  if (row === null) return
+  const input = row.querySelector('input[data-crop-qty]')
+  const totalEl = row.querySelector('[data-total]')
+  const buyButton = row.querySelector('button[data-market-action="buy"]')
+  const sellButton = row.querySelector('button[data-market-action="sell"]')
+  const qty = Number(input?.value)
+  const valid = Number.isInteger(qty) && qty >= MIN_TRADE_QTY && qty <= MAX_TRADE_QTY
+  const meta = CROP_META[cropId]
+  const entry = marketEntry(cropId)
+  const bid = bidOf(entry)
+  if (!valid) {
+    if (totalEl !== null) totalEl.textContent = '数量 1–99'
+    if (buyButton !== null) buyButton.disabled = true
+    if (sellButton !== null) sellButton.disabled = true
+    return
+  }
+  const seedTotal = meta.seedPrice * qty
+  if (totalEl !== null) {
+    totalEl.textContent = '买 ' + seedTotal + ' · 卖 ' + (bid * qty)
+  }
+  const coins = Number(farm?.coins) || 0
+  const seeds = Number(farm?.seeds?.[cropId]) || 0
+  const crops = Number(farm?.crops?.[cropId]) || 0
+  // 服务端仍会再验一遍；这里只把明显不可能的按钮灰掉，少一次失败 toast。
+  if (buyButton !== null) buyButton.disabled = busy || coins < seedTotal || seeds + qty > 999
+  if (sellButton !== null) sellButton.disabled = busy || crops < qty
+}
+
+function renderMarket () {
+  marketRowsEl.textContent = ''
+  tradesEl.textContent = ''
+  marketWalletEl.textContent = '🪙 ' + (Number(farm?.coins) || 0) + ' · 永远有流动性'
+  if (market === null) {
+    const empty = document.createElement('p')
+    empty.className = 'empty'
+    empty.textContent = '交易所数据还没到，等宿主推过来…'
+    marketRowsEl.appendChild(empty)
+    return
+  }
+
+  for (const cropId of CROP_IDS) {
+    const meta = CROP_META[cropId]
+    const entry = marketEntry(cropId) ?? { base: meta.base, price: meta.base }
+    const last = latestTrade(cropId)
+    const row = document.createElement('article')
+    row.className = 'market-row'
+    row.dataset.cropId = cropId
+
+    const head = document.createElement('div')
+    head.className = 'market-row-head'
+    const emoji = document.createElement('span')
+    emoji.className = 'emoji'
+    emoji.setAttribute('aria-hidden', 'true')
+    emoji.textContent = meta.emoji
+    const name = document.createElement('span')
+    name.className = 'name'
+    name.textContent = meta.name
+    const lastEl = document.createElement('span')
+    lastEl.className = 'last'
+    lastEl.textContent = last === null
+      ? '还没成交'
+      : MARKET_SIDE_TEXT[last.side] + ' ×' + last.qty + ' · ' + formatTime(last.at)
+    head.appendChild(emoji)
+    head.appendChild(name)
+    head.appendChild(lastEl)
+    row.appendChild(head)
+
+    const stats = document.createElement('div')
+    stats.className = 'market-stats'
+    const stat = (label, value) => {
+      const span = document.createElement('span')
+      span.textContent = label + ' '
+      const strong = document.createElement('b')
+      strong.textContent = String(value)
+      span.appendChild(strong)
+      stats.appendChild(span)
+    }
+    stat('底价', entry.base ?? '—')
+    stat('本机卖价', bidOf(entry))
+    stat('种子价', meta.seedPrice)
+    stat('成交量', entry.volume24h ?? 0)
+    row.appendChild(stats)
+
+    const trade = document.createElement('div')
+    trade.className = 'market-trade'
+    const label = document.createElement('span')
+    label.className = 'qty-label'
+    label.textContent = '数量'
+    const input = document.createElement('input')
+    input.type = 'number'
+    input.min = String(MIN_TRADE_QTY)
+    input.max = String(MAX_TRADE_QTY)
+    input.step = '1'
+    input.inputMode = 'numeric'
+    input.dataset.cropQty = cropId
+    input.value = String(marketQty[cropId] ?? 1)
+    input.setAttribute('aria-label', meta.name + '数量')
+    const total = document.createElement('span')
+    total.className = 'total'
+    total.dataset.total = cropId
+    const buy = document.createElement('button')
+    buy.type = 'button'
+    buy.className = 'btn buy'
+    buy.dataset.marketAction = 'buy'
+    buy.dataset.cropId = cropId
+    buy.textContent = '买种'
+    const sell = document.createElement('button')
+    sell.type = 'button'
+    sell.className = 'btn sell'
+    sell.dataset.marketAction = 'sell'
+    sell.dataset.cropId = cropId
+    sell.textContent = '卖出'
+    trade.appendChild(label)
+    trade.appendChild(input)
+    trade.appendChild(buy)
+    trade.appendChild(sell)
+    trade.appendChild(total)
+    row.appendChild(trade)
+    marketRowsEl.appendChild(row)
+    updateMarketTotals(row, cropId)
+  }
+
+  const history = Array.isArray(market.history) ? market.history.slice(0, 8) : []
+  if (history.length === 0) {
+    const empty = document.createElement('li')
+    empty.className = 'empty'
+    empty.textContent = '还没有成交。'
+    tradesEl.appendChild(empty)
+    return
+  }
+  for (const entry of history) {
+    const meta = cropMeta(entry.crop)
+    const item = document.createElement('li')
+    const text = document.createElement('span')
+    text.textContent = (meta === null ? '作物' : meta.name) + ' ' +
+      (MARKET_SIDE_TEXT[entry.side] ?? '成交') + ' ×' + entry.qty +
+      (Number.isFinite(Number(entry.price)) ? ' @' + entry.price : '')
+    const when = document.createElement('span')
+    when.className = 'when'
+    when.textContent = formatTime(entry.at)
+    item.appendChild(text)
+    item.appendChild(when)
+    tradesEl.appendChild(item)
+  }
+}
+
 function renderSubtitle () {
   if (farm === null) {
     subtitleEl.textContent = '正在等宿主把地块送过来…'
@@ -303,6 +492,7 @@ function render () {
   renderPlots()
   renderInventory()
   renderLog()
+  renderMarket()
 }
 
 function tick () {
@@ -354,6 +544,52 @@ plotsEl.addEventListener('click', (event) => {
   }
 })
 
+function selectTab (name) {
+  activeTab = name === 'market' ? 'market' : 'farm'
+  for (const tab of tabs) {
+    const active = tab.dataset.tab === activeTab
+    tab.classList.toggle('active', active)
+    tab.setAttribute('aria-selected', active ? 'true' : 'false')
+  }
+  farmPageEl.hidden = activeTab !== 'farm'
+  marketPageEl.hidden = activeTab !== 'market'
+}
+
+for (const tab of tabs) {
+  tab.addEventListener('click', () => selectTab(tab.dataset.tab))
+}
+
+marketRowsEl.addEventListener('input', (event) => {
+  const target = event.target
+  if (!(target instanceof Element) || !target.matches('input[data-crop-qty]')) return
+  const cropId = target.dataset.cropQty
+  if (!Object.prototype.hasOwnProperty.call(CROP_META, cropId)) return
+  marketQty[cropId] = target.value
+  updateMarketTotals(target.closest('.market-row'), cropId)
+})
+
+marketRowsEl.addEventListener('click', (event) => {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const buttonEl = target.closest('button[data-market-action]')
+  if (buttonEl === null || buttonEl.disabled) return
+  const cropId = buttonEl.dataset.cropId
+  const row = buttonEl.closest('.market-row')
+  const input = row?.querySelector('input[data-crop-qty]')
+  if (input !== null && input !== undefined) marketQty[cropId] = input.value
+  const qty = readMarketQty(cropId)
+  if (qty === null) {
+    showToast('数量要在 1–99 之间。', 'error')
+    return
+  }
+  const side = buttonEl.dataset.marketAction
+  submit({
+    action: side === 'buy' ? 'farm-buy-seed' : 'farm-sell-crop',
+    cropId,
+    qty
+  })
+})
+
 closeButton.addEventListener('click', () => api?.close())
 
 document.addEventListener('keydown', (event) => {
@@ -365,6 +601,7 @@ document.addEventListener('keydown', (event) => {
 api?.onState((payload) => {
   if (payload === null || typeof payload !== 'object') return
   farm = payload.farm !== null && typeof payload.farm === 'object' ? payload.farm : null
+  market = payload.market !== null && typeof payload.market === 'object' ? payload.market : null
   selectedPlot = typeof payload.plotId === 'string' && payload.plotId !== '' ? payload.plotId : null
   busy = false
   // 不在这里 hideToast：动作成功后宿主紧接着会推新状态，toast 不能被这次刷新抹掉。
@@ -390,6 +627,7 @@ api?.onResult((result) => {
   showToast(notice, 'error')
 })
 
+selectTab('farm')
 render()
 setInterval(tick, 1000)
 api?.ready()

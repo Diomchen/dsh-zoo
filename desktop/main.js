@@ -149,6 +149,8 @@ let giftSeq = 0
 let farmWin = null
 /** 宿主交下来的完整 farm view（地块/种子/作物/硬币/露水/日志），窗口打开或刷新时原样转发。 */
 let farmState = null
+/** 交易所页 / `farm-window` 里随农场一起下发的 market view（价目/历史/index）。 */
+let farmMarket = null
 /** 点某块地开窗时带上的 plotId；窗口用它高亮那一块。 */
 let farmPlotId = null
 /** 正在等宿主答复的那次农场动作（action id）与它的计时器。 */
@@ -909,16 +911,25 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     return
   }
   // 农场（ticket 40）：点地块开窗可带 plotId，四个地块动作必须带；种地再要 cropId。
+  // 交易所（ticket 41）：不碰地块，只带 cropId + qty（1–99）。
   // 这一层是渲染端 → 宿主的窄口，漏掉一个字段，到 store 就只剩一句 bad-plot。
-  const needsPlot = shared.FARM_ACTIONS.includes(action)
+  const isMarketAction = shared.FARM_MARKET_ACTIONS.includes(action)
+  const needsPlot = shared.FARM_PLOT_ACTIONS.includes(action)
   const plotId = needsPlot || action === 'farm-open' ? shared.normalizePlotId(payload?.plotId) : null
   if (needsPlot && plotId === null) {
     sendActionResult({ id, ok: false, notice: '这块地不在桌面上，刷新后再试。', error: 'bad-plot' })
     return
   }
-  const cropId = action === 'farm-plant' ? shared.normalizeCropId(payload?.cropId) : null
-  if (action === 'farm-plant' && cropId === null) {
+  const cropId = action === 'farm-plant' || isMarketAction
+    ? shared.normalizeCropId(payload?.cropId)
+    : null
+  if ((action === 'farm-plant' || isMarketAction) && cropId === null) {
     sendActionResult({ id, ok: false, notice: '这种作物种不了，换一种吧。', error: 'bad-crop' })
+    return
+  }
+  const qty = isMarketAction ? shared.normalizeTradeQty(payload?.qty) : null
+  if (isMarketAction && qty === null) {
+    sendActionResult({ id, ok: false, notice: '数量要在 1–99 之间。', error: 'bad-qty' })
     return
   }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
@@ -931,7 +942,8 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     ...(skinId === null ? {} : { skinId }),
     ...(giftId === null ? {} : { giftId }),
     ...(plotId === null ? {} : { plotId }),
-    ...(cropId === null ? {} : { cropId })
+    ...(cropId === null ? {} : { cropId }),
+    ...(qty === null ? {} : { qty })
   })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
@@ -1574,12 +1586,13 @@ function clearFarmTimer () {
   farmTimer = null
 }
 
-/** 窗口的完整农场数据（地块带 remainingMs，另有种子/作物/硬币/露水/日志）。 */
+/** 窗口的完整农场数据（地块带 remainingMs，另有种子/作物/硬币/露水/日志/交易所）。 */
 function sendFarmState () {
   if (farmWin === null || farmWin.isDestroyed()) return
   try {
     farmWin.webContents.send('dsh-zoo:farm-state', {
       farm: farmState,
+      market: farmMarket,
       plotId: farmPlotId
     })
   } catch {
@@ -1805,9 +1818,10 @@ function applyCommand (command) {
       return
     }
     case 'farm-window': {
-      // 宿主交下来的完整农场（ticket 40）：不落盘、不拼路径，只转发给窗口。
+      // 宿主交下来的完整农场 + 交易所（ticket 40/41）：不落盘、不拼路径，只转发给窗口。
       // `open:true` 打开/聚焦（已开则只刷新）；`open:false` 刷新已开着的窗。
       farmState = command.farm
+      farmMarket = command.market
       farmPlotId = typeof command.plotId === 'string' ? command.plotId : null
       if (command.open === true) {
         if (!openFarmWindow()) {
@@ -1996,7 +2010,8 @@ function applyCommand (command) {
       const payload = JSON.stringify({
         action: command.action,
         plotId: command.plotId,
-        cropId: command.cropId
+        cropId: command.cropId,
+        qty: command.qty
       })
       const script = '(() => {' +
         'if (!window.dshZooFarm) return false;' +
