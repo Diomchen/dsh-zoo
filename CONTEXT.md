@@ -10,7 +10,12 @@
 
 「皮」与「身份」的切分见 [ADR-0013](docs/adr/0013-skin-switch-keeps-identity.md)：换皮只换外观和动作。
 
+「农场 / 偷菜 / 雇佣 / 交易所」的决策见 [ADR-0016](docs/adr/0016-farm-economy-federated.md)，
+规格见 [SPEC v5](.scratch/dsh-zoo/SPEC-v5.md)；票 39–45 在
+[`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
+农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 待机 / 露水”同义。
 
 ## Language
 
@@ -20,7 +25,7 @@
 _Avoid_: 桌宠, 头像, avatar, companion, 吉祥物
 
 **身份 (Identity)**：
-这台机器留在局域网里的持续部分：不随外观变化的设备标识、名字、放行过的邻居、串门记录、背包和收到的礼物。
+这台机器留在局域网里的持续部分：不随外观变化的设备标识、名字、放行过的邻居、串门记录、背包、收到的礼物和农场。
 换皮不动它。
 _Avoid_: 账号, 用户, profile, 用户资料
 
@@ -122,3 +127,73 @@ _Avoid_: 色块, 占位, placeholder, 兜底形象
 一台机器上能对外提供外观包的那一小块只读服务；端口随 beacon 广播，只在局域网内可达。
 一台机器可以有多个源，只有一个是当前那张**皮**。
 _Avoid_: 服务器, 仓库, CDN, 素材库
+
+## 农场与经济
+
+**农场 (Farm)**：
+一只宠物名下的那块地：地块、仓库、硬币、工具和雇工合同。属于身份，不随皮变。
+_Avoid_: 菜地, 庄园, garden, homestead
+
+**地块 (Plot)**：
+农场里种一株作物的格子；一块地一次只长一株。
+_Avoid_: 土地, 田, slot, tile
+
+**作物 (Crop)**：
+种在地块里、按真实时间生长、成熟后可以收的东西。每种作物有自己的生长时长、产量和底价。
+_Avoid_: 植物, 农产品, plant, produce
+
+**仓库 (Store)**：
+农场里存种子、作物和硬币的地方；不是带派背包。
+_Avoid_: 背包, 库存, inventory, 储物箱
+
+**硬币 (Coin)**：
+农场的货币；买种子、工具、土地，付雇工工资都用它。它可以被宠物装在驮包里带走。
+_Avoid_: 金币, 钱, 积分, currency, token
+
+**驮包 (Saddlebag)**：
+宠物出门时身上背的那一小包东西：偷来的作物、打工的工资。它不是带派背包——背包是待送的礼物，驮包是已经带在身上的货。
+_Avoid_: 背包, 行李, 货舱, cargo, inventory
+
+**交易所 (Exchange)**：
+农场买卖作物和种子的地方；价格随供需变，每个农场有自己的交易所。
+_Avoid_: 商店, 市场, shop, market
+
+**行情 (Market Price)**：
+交易所此刻的买卖价；各家的行情会汇总成一个局域网指数，但成交仍在各家自己的交易所。
+_Avoid_: 价格表, 报价, price, quote
+
+**偷菜 (Steal)**：
+访客从邻居成熟的地块里拿走一小部分作物的动作。永远允许，只受每日上限和守卫影响；主人知道是谁。
+_Avoid_: 抢, 偷窃, raid, loot
+
+**帮忙 (Help)**：
+访客给邻居的地块浇水/施肥，让主人长得快、自己拿一点回报的动作；和偷菜是访客的两种互动。
+_Avoid_: 协助, 打工, assist
+
+**雇工 (Hireling)**：
+被主人雇到别人农场打工的宠物；合同期内它不在自己家，自家农场因此没人看。
+_Avoid_: 员工, 保姆, employee
+
+**工资 (Wage)**：
+雇主付给雇工主人的硬币；由宠物背着，合同结束时带回家。
+_Avoid_: 薪水, 报酬, salary, pay
+
+**合同 (Contract)**：
+一次雇佣的期限和价钱；固定期限、预付，可以提前召回，按实际时长结算。
+_Avoid_: 订单, 协议, order, deal
+
+**看家 (Guard)**：
+宠物在家时对农场的保护；它出门串门或在外打工时失效。
+_Avoid_: 防守, 保安, defend, protect
+
+**待机 (Idle)**：
+DSH 开着、主人没在操作的状态；它攒“露水”，给农场加成。
+_Avoid_: 挂机, 闲置, AFK
+
+**露水 (Dew)**：
+待机攒出来的资源，用来浇水/施肥；有每日上限。
+_Avoid_: 能量, 体力, energy, water
+
+**离线生长 (Offline Growth)**：
+关掉 DSH 后作物仍按真实时间生长，但有累计上限；回来不会少收，只是不会无限长。
+_Avoid_: 离线收益, 挂机收益, offline earnings
