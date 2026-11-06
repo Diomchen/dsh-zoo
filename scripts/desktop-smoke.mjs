@@ -1027,6 +1027,12 @@ async function verifyControls () {
   current = await client.waitStatus((status) => status.renameVisible === true, 4000, '改名小窗真的显示出来')
   assert(current.renameFocused === true, '改名小窗拿到焦点（要能直接打字）')
   assert(current.focusable === false, '改名小窗开着时，主窗仍然不可聚焦')
+  // 现场回归：macOS 上打中文时输入法候选窗会抢走键盘焦点，改名小窗跟着消失。
+  // 失焦不能成为关窗条件；Esc / 取消 / 保存才是。
+  client.send({ type: 'debug-blur', window: 'rename' })
+  await sleep(450)
+  current = await client.status()
+  assert(current.renameOpen === true, '失焦不关改名小窗（输入法候选窗会触发 blur）')
   client.send({ type: 'debug-rename', close: true })
   current = await client.waitStatus((status) => status.renameOpen === false, 4000, '改名小窗关闭')
   assert(current.renameVisible === false, '关掉之后小窗不可见')
@@ -2219,6 +2225,12 @@ async function verifyBringWindow () {
   })
   await client.waitStatus((status) => status.bringOpen === true, 5000, '「带派」小窗打开')
   await sleep(900)
+
+  // 和改名窗同一条：字条要能打中文，输入法候选窗触发的 blur 不能关窗。
+  client.send({ type: 'debug-blur', window: 'bring' })
+  await sleep(450)
+  const afterBlur = await client.status()
+  assert(afterBlur.bringOpen === true, '失焦不关「带派」小窗（输入法候选窗会触发 blur）')
 
   const pngPath = join(OUT_DIR, 'bring.png')
   const start = client.mark()

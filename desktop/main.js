@@ -135,8 +135,6 @@ let giftWin = null
 let giftState = { items: [], count: 0, maxItems: 2, maxTextLength: 500, maxFileBytes: 0 }
 /** 用户在主进程的文件选择器里刚选中的文件；只有这个路径能被提交，渲染端不能自己编。 */
 let giftPicked = null
-/** 系统文件对话框开着时窗口会失焦：这期间绝不按 blur 关窗。 */
-let giftPicking = false
 /** 正在等宿主答复的那次 bring/unbring（action id）与它的计时器。 */
 let giftPending = null
 let giftTimer = null
@@ -365,6 +363,20 @@ function showWindow () {
     win.showInactive()
   } catch {
     // showInactive 失败不能拖垮 helper
+  }
+}
+
+/**
+ * dock.hide() 的附属应用里，`show()/focus()` 只保证窗口在 app 内是 key；
+ * macOS 的输入法（候选窗、输入源切换）跟随**前台应用**，所以用户点「改名/带派」
+ * 要打字时显式抢一次前台。只在用户主动打开输入窗时调用，不影响主窗的“不抢焦点”。
+ */
+function focusAppForDialog () {
+  if (process.platform !== 'darwin') return
+  try {
+    app.focus({ steal: true })
+  } catch {
+    // 旧版 Electron 没有 steal：窗口自己的 show/focus 已是尽力而为
   }
 }
 
@@ -1108,13 +1120,8 @@ function openRenameWindow () {
     // 置顶已由构造参数保证
   }
   created.webContents.on('context-menu', (event) => event.preventDefault())
-  // 只在「拿到过焦点」之后才按失焦关闭：小窗刚建出来时的一次 blur 不该把它直接关掉
-  // （后台拉起、Dock 隐藏等情况下都可能先来一个 blur）。
-  let hadFocus = false
-  created.on('focus', () => { hadFocus = true })
-  created.on('blur', () => {
-    if (hadFocus) closeRenameWindow('blur')
-  })
+  // **不要**在 blur 时关窗：macOS 上打中文时，输入法候选窗会抢走键盘焦点，这扇窗
+  // 也跟着 blur —— 现场就是「打中文时改名小窗消失」。关窗只由 Esc / 取消 / 保存驱动。
   created.on('closed', () => {
     if (renameWin === created) renameWin = null
     clearRenameTimer()
@@ -1122,6 +1129,7 @@ function openRenameWindow () {
   created.once('ready-to-show', () => {
     if (renameWin !== created || created.isDestroyed()) return
     created.show()
+    focusAppForDialog()
     created.focus()
   })
   created.loadFile(path.join(__dirname, 'rename.html')).catch(() => closeRenameWindow('load-failed'))
@@ -1237,7 +1245,6 @@ function openGiftWindow () {
   })
   giftWin = created
   giftPicked = null
-  giftPicking = false
   giftPending = null
   clearGiftTimer()
   try {
@@ -1246,13 +1253,8 @@ function openGiftWindow () {
     // 置顶已由构造参数保证
   }
   created.webContents.on('context-menu', (event) => event.preventDefault())
-  // 和改名窗同一条原因：小窗刚建出来时的一次 blur 不该把它直接关掉。
-  let hadFocus = false
-  created.on('focus', () => { hadFocus = true })
-  created.on('blur', () => {
-    // 选文件时系统对话框会让窗口短暂失焦：那不是“用户点了别处”。
-    if (hadFocus && !giftPicking) closeGiftWindow('blur')
-  })
+  // 和改名窗同一条：字条要能打中文，输入法候选窗触发的 blur 不能关窗。
+  // 选文件时系统对话框也会让窗口失焦；关窗只由取消 / 提交 / Esc 驱动，不再需要例外。
   created.on('closed', () => {
     if (giftWin === created) giftWin = null
     clearGiftTimer()
@@ -1260,6 +1262,7 @@ function openGiftWindow () {
   created.once('ready-to-show', () => {
     if (giftWin !== created || created.isDestroyed()) return
     created.show()
+    focusAppForDialog()
     created.focus()
   })
   created.loadFile(path.join(__dirname, 'gift.html')).catch(() => closeGiftWindow('load-failed'))
@@ -1337,15 +1340,11 @@ function startGiftPending (action, event) {
 async function pickGiftFile () {
   if (giftWin === null || giftWin.isDestroyed()) return
   let result
-  giftPicking = true
   try {
     result = await dialog.showOpenDialog(giftWin, { properties: ['openFile'] })
   } catch {
-    giftPicking = false
     sendGiftResult({ ok: false, code: 'pick-failed' })
     return
-  } finally {
-    giftPicking = false
   }
   if (giftWin === null || giftWin.isDestroyed()) return
   giftWin.focus()
@@ -1642,6 +1641,14 @@ function applyCommand (command) {
       if (!debugEnabled) return
       if (command.close === true) closeRenameWindow('debug')
       else openRenameWindow()
+      return
+    }
+    case 'debug-blur': {
+      // 冒烟用：模拟“输入法候选窗/别的窗口抢走键盘焦点”。小窗不该因此关掉
+      // （现场：打中文时改名小窗消失）。
+      if (!debugEnabled) return
+      const target = command.window === 'bring' ? giftWin : renameWin
+      if (target !== null && !target.isDestroyed()) target.blur()
       return
     }
     case 'debug-dispatch':

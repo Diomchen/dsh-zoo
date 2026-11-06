@@ -227,6 +227,10 @@ test('宿主命令：update/show/hide/quit/ping/shot/pointer 白名单，未知�
   assert.equal(shared.normalizeHostCommand({ type: 'debug-busy-max', ms: -1 }).ok, false)
   assert.equal(shared.normalizeHostCommand({ type: 'debug-busy-max', ms: 60001 }).ok, false)
   assert.equal(shared.normalizeHostCommand({ type: 'debug-renderer' }).command.type, 'debug-renderer')
+  // 冒烟用：模拟输入法候选窗抢焦点；window 缺省/乱写都落到改名窗，只有 bring 认带派窗。
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur' }).command.window, 'rename')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur', window: 'nope' }).command.window, 'rename')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur', window: 'bring' }).command.window, 'bring')
   assert.equal(
     shared.normalizeHostCommand({ type: 'debug-dispatch', phase: 'down', x: 5, y: 6 }).command.phase,
     'down'

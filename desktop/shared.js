@@ -1374,6 +1374,11 @@
       case 'debug-rename':
         // 冒烟用：开/关改名小窗（它没有渲染端可点击的关闭按钮，测试只能从这里关）。
         return { ok: true, command: { type, id, close: raw.close === true } }
+      case 'debug-blur': {
+        // 冒烟用：模拟输入法候选窗/别的窗口抢走小窗焦点。
+        const window = raw.window === 'bring' ? 'bring' : 'rename'
+        return { ok: true, command: { type, id, window } }
+      }
       case 'debug-gift-submit':
         // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
         if (typeof raw.text !== 'string') return { ok: false, error: 'bad-text' }
