@@ -73,25 +73,26 @@ test('降级清单：本机素材源平铺成一组；空池不出菜单', () =>
 })
 
 test('工具项：拿得到 DSH 地址才有「打开软件」；顺序固定', () => {
-  assert.deepEqual(menuTools({ hasOrigin: true }).map((tool) => tool.id), ['open-site', 'bring', 'home', 'reload', 'scan-skins'])
-  assert.deepEqual(menuTools({ hasOrigin: false }).map((tool) => tool.id), ['bring', 'home', 'reload', 'scan-skins'])
+  assert.deepEqual(menuTools({ hasOrigin: true }).map((tool) => tool.id), ['open-site', 'bring', 'farm', 'home', 'reload', 'scan-skins'])
+  assert.deepEqual(menuTools({ hasOrigin: false }).map((tool) => tool.id), ['bring', 'farm', 'home', 'reload', 'scan-skins'])
   assert.equal(MENU_TOOL_LABELS.reload, '重载配置')
   assert.equal(MENU_TOOL_LABELS.bring, '带派')
+  assert.equal(MENU_TOOL_LABELS.farm, '农场')
   assert.equal(MENU_TOOL_LABELS['scan-skins'], '扫描外观')
 })
 
 test('buildMenu：dsh-pet 在就用它的分类；不在就退平铺；两条都空只剩工具', () => {
   const withPet = buildMenu({ animations: ANIMATIONS, pool: ['甲'], hasOrigin: true })
   assert.equal(withPet.groups[0].label, '待机')
-  assert.deepEqual(withPet.tools.map((tool) => tool.id), ['open-site', 'bring', 'home', 'reload', 'scan-skins'])
+  assert.deepEqual(withPet.tools.map((tool) => tool.id), ['open-site', 'bring', 'farm', 'home', 'reload', 'scan-skins'])
 
   const fallback = buildMenu({ animations: null, pool: ['甲', '乙'] })
   assert.deepEqual(fallback.groups, [{ label: '动作', actions: ['甲', '乙'] }])
-  assert.deepEqual(fallback.tools.map((tool) => tool.id), ['bring', 'home', 'reload', 'scan-skins'])
+  assert.deepEqual(fallback.tools.map((tool) => tool.id), ['bring', 'farm', 'home', 'reload', 'scan-skins'])
 
   const bare = buildMenu({})
   assert.deepEqual(bare.groups, [])
-  assert.deepEqual(bare.tools.map((tool) => tool.id), ['bring', 'home', 'reload', 'scan-skins'])
+  assert.deepEqual(bare.tools.map((tool) => tool.id), ['bring', 'farm', 'home', 'reload', 'scan-skins'])
   assert.equal(withPet.actionsLocal, undefined, 'dsh-pet 那张皮不带本地播放标记')
 })
 

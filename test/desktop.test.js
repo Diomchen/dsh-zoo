@@ -1984,3 +1984,226 @@ test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: 'relative/gifts' }), ['/h'])
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: '' }), ['/h'])
 })
+
+// ---------------------------------------------------------------------------
+// ticket 40：农场摘要 / farm-window / 地块动作的窄口
+// ---------------------------------------------------------------------------
+
+test('场景 controls.farm：只留地块摘要；完整视图（种子/作物/日志）不进场景', () => {
+  const scene = shared.normalizeScene({
+    items: [],
+    controls: {
+      farm: {
+        plots: [
+          { id: 'p1', crop: 'tomato', grownMs: 100, growMs: 1000 },
+          { id: 'p2', crop: 'carrot', grownMs: 2000, growMs: 1000 },
+          { id: 'p1', crop: 'pumpkin', grownMs: 0, growMs: 1 },
+          { id: 'bad id', crop: 'tomato' },
+          { id: 'p3', crop: 'unknown' }
+        ],
+        seeds: { tomato: 2 },
+        crops: { carrot: 5 },
+        coins: 30.7,
+        dew: 999,
+        worker: { nickname: '  阿蟹  ', endsAt: 123 },
+        contractCount: 99,
+        log: [{ at: 1, kind: 'plant', crop: 'tomato', qty: 1 }],
+        hire: { enabled: true }
+      }
+    }
+  })
+  const farm = scene.controls.farm
+  assert.deepEqual(farm.plots, [
+    { id: 'p1', crop: 'tomato', stage: 'growing', mature: false },
+    { id: 'p2', crop: 'carrot', stage: 'mature', mature: true },
+    { id: 'p3', crop: null, stage: 'empty', mature: false }
+  ])
+  assert.equal(farm.coins, 30)
+  assert.equal(farm.dew, shared.MAX_FARM_DEW)
+  assert.deepEqual(farm.worker, { nickname: '阿蟹' })
+  assert.equal(farm.contractCount, shared.MAX_FARM_CONTRACTS)
+  // 完整农场才有的字段不许漏进场景（否则 controls 每帧签名被日志/仓库带着狂变）。
+  for (const key of ['seeds', 'crops', 'log', 'hire']) assert.equal(key in farm, false, key)
+  // 没有农场 = null（老宿主/没有桌面层），不是“4 块空地”。
+  assert.equal(shared.normalizeControls({}).farm, null)
+  assert.equal(shared.normalizeControls({ farm: null }).farm, null)
+  assert.equal(shared.normalizeControls({ farm: 'nope' }).farm, null)
+  const capped = shared.normalizeFarmSummary({
+    plots: ['p1', 'p2', 'p3', 'p4', 'p5'].map((id) => ({ id, crop: null }))
+  })
+  assert.equal(capped.plots.length, shared.MAX_FARM_PLOTS)
+})
+
+test('farm-window：完整视图带上 remainingMs/waterings/fertilized/种子/日志，坏值夹取', () => {
+  const command = shared.normalizeHostCommand({
+    type: 'farm-window',
+    open: true,
+    plotId: 'P1',
+    farm: {
+      plots: [
+        { id: 'p1', crop: 'tomato', stage: 'growing', remainingMs: 123456, waterings: 1, fertilized: true },
+        { id: 'p2', crop: 'carrot', stage: 'mature', mature: true, remainingMs: 999999999999 },
+        { id: 'p3', crop: null, remainingMs: 5, waterings: 9 },
+        { id: 'p4', crop: 'pumpkin', growMs: 0 }
+      ],
+      seeds: { tomato: 2, carrot: 99999, weed: 4 },
+      crops: { pumpkin: 1 },
+      coins: 30,
+      dew: 3,
+      worker: null,
+      contractCount: 0,
+      log: [
+        { at: 1700000000000, kind: 'plant', crop: 'tomato', qty: 1 },
+        { at: 1700000000001, kind: 'nope' },
+        { at: -1, kind: 'harvest' }
+      ]
+    }
+  })
+  assert.equal(command.ok, true)
+  assert.equal(command.command.type, 'farm-window')
+  assert.equal(command.command.open, true)
+  assert.equal(command.command.plotId, 'p1')
+  const farm = command.command.farm
+  assert.equal(farm.plots.length, 4)
+  assert.deepEqual(farm.plots[0], {
+    id: 'p1',
+    crop: 'tomato',
+    stage: 'growing',
+    mature: false,
+    remainingMs: 123456,
+    waterings: 1,
+    fertilized: true
+  })
+  assert.equal(farm.plots[1].mature, true)
+  assert.equal(farm.plots[1].remainingMs, 0, '成熟地不倒数')
+  assert.equal(farm.plots[2].remainingMs, 0, '空地不倒数')
+  assert.equal(farm.plots[2].waterings, 0)
+  assert.equal(farm.seeds.tomato, 2)
+  assert.equal(farm.seeds.carrot, shared.MAX_FARM_STACK)
+  assert.equal('weed' in farm.seeds, false)
+  assert.equal(farm.crops.pumpkin, 1)
+  assert.equal(farm.log.length, 1)
+  // open 缺省 false；没有 farm 时是 null（窗口仍可打开，只是显示“等数据”）。
+  const refresh = shared.normalizeHostCommand({ type: 'farm-window' })
+  assert.equal(refresh.command.open, false)
+  assert.equal(refresh.command.farm, null)
+  assert.equal('plotId' in refresh.command, false)
+})
+
+test('helper 动作：农场四条必须带 plotId，种地还要 cropId；farm-open 可省 plotId', () => {
+  const plot = shared.normalizeHelperEvent({ type: 'action', id: 'a1', action: 'farm-plant', plotId: 'p1', cropId: 'tomato' })
+  assert.equal(plot.ok, true)
+  assert.equal(plot.event.plotId, 'p1')
+  assert.equal(plot.event.cropId, 'tomato')
+
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a2', action: 'farm-harvest' }),
+    { ok: false, error: 'bad-plot' }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a3', action: 'farm-water', plotId: '../p1' }),
+    { ok: false, error: 'bad-plot' }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a4', action: 'farm-plant', plotId: 'p1' }),
+    { ok: false, error: 'bad-crop' }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a5', action: 'farm-fertilize', plotId: 'p2', cropId: 'tomato' }),
+    { ok: true, event: { type: 'action', id: 'a5', action: 'farm-fertilize', deviceId: null, nickname: null, plotId: 'p2' } }
+  )
+
+  const open = shared.normalizeHelperEvent({ type: 'action', id: 'a6', action: 'farm-open' })
+  assert.equal(open.ok, true)
+  assert.equal('plotId' in open.event, false)
+  assert.equal(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a7', action: 'farm-open', plotId: 'p3' }).event.plotId,
+    'p3'
+  )
+  // 四个动作和开窗都进了帮助侧白名单，渲染端才发得出来；菜单工具 id 也要认。
+  for (const action of shared.FARM_ACTIONS) {
+    assert.equal(shared.CONTROL_ACTIONS.includes(action), true, action)
+    assert.equal(shared.DESKTOP_ACTIONS.includes(action), true, action)
+  }
+  assert.equal(shared.MENU_ACTION_IDS.includes('farm-open'), true)
+  assert.equal(shared.MENU_TOOL_IDS.includes('farm'), true)
+})
+
+test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status 放行三个字段', () => {
+  assert.equal(shared.normalizeHostCommand({ type: 'shot', path: '/tmp/a.png', window: 'farm' }).command.window, 'farm')
+  assert.equal(shared.normalizeHostCommand({ type: 'shot', path: '/tmp/a.png', window: 'nope' }).command.window, undefined)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur', window: 'farm' }).command.window, 'farm')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur', window: 'nope' }).command.window, 'rename')
+
+  const status = shared.normalizeHelperEvent({
+    type: 'status',
+    id: 's1',
+    farmOpen: true,
+    farmVisible: true,
+    farmFocused: false
+  })
+  assert.equal(status.event.status.farmOpen, true)
+  assert.equal(status.event.status.farmVisible, true)
+  assert.equal(status.event.status.farmFocused, false)
+
+  const debugFarm = shared.normalizeHostCommand({
+    type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1', cropId: 'tomato'
+  }).command
+  assert.equal(debugFarm.type, 'debug-farm-submit')
+  assert.equal(debugFarm.action, 'farm-plant')
+  assert.equal(debugFarm.plotId, 'p1')
+  assert.equal(debugFarm.cropId, 'tomato')
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-farm-submit', action: 'farm-harvest', plotId: 'p1' }).ok,
+    true
+  )
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1' }).ok,
+    false
+  )
+})
+
+test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4500 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4500, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+
+  const farm = {
+    plots: [{ id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 1000, waterings: 0, fertilized: false }],
+    seeds: { tomato: 2, carrot: 0, pumpkin: 0 },
+    crops: { tomato: 0, carrot: 0, pumpkin: 0 },
+    coins: 30,
+    dew: 1,
+    worker: null,
+    contractCount: 0,
+    log: []
+  }
+  assert.equal(manager.farmWindow({ open: true, farm, plotId: 'p1' }), true)
+  const command = children[0].parsedLines().at(-1)
+  assert.equal(command.type, 'farm-window')
+  assert.equal(command.open, true)
+  assert.equal(command.plotId, 'p1')
+  assert.deepEqual(command.farm, farm)
+
+  assert.equal(manager.farmWindow({ open: false, farm }), true)
+  assert.equal(children[0].parsedLines().at(-1).open, false)
+  assert.equal('plotId' in children[0].parsedLines().at(-1), false)
+})
