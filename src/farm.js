@@ -18,6 +18,7 @@ import {
   offlineElapsed,
   waterPlot
 } from './farm-rules.js'
+import { normalizeTradeQty } from './market.js'
 import { parseJsonText } from './json-text.js'
 
 /**
@@ -528,10 +529,14 @@ function toFileState (state) {
 /**
  * 打开（或创建）农场 store。读盘失败不抛：调用方拿到的是一份能玩的初始农场，
  * 只在日志里留一条警告。`now` 只为测试注入，生产不传就是 Date.now。
+ *
+ * `market`（ticket 41）是 `src/market.js` 的交易所 store；给了它才能买卖。
+ * 交易会同时改两本账（硬币/种子/作物 + 价格/历史），所以放在农场自己的串行队列里，
+ * 让一笔买卖的库存变化与价格变化在同一段里完成。
  */
-export async function createFarmStore (dir, { log, now = Date.now } = {}) {
+export async function createFarmStore (dir, { log, now = Date.now, market = null } = {}) {
   if (typeof dir !== 'string' || dir === '') throw new Error('farm: missing data directory')
-  const store = new FarmStore({ dir, log, now })
+  const store = new FarmStore({ dir, log, now, market })
   await store.load()
   return store
 }
@@ -540,15 +545,17 @@ class FarmStore {
   #dir
   #log
   #now
+  #market
   #state = initialFarmState()
   #warned = new Set()
   /** 串行化写盘：同一毫秒里的两个动作不能互相写掉对方的地块/仓库。 */
   #chain = Promise.resolve()
   #lastWriteAt = Number.NEGATIVE_INFINITY
 
-  constructor ({ dir, log, now }) {
+  constructor ({ dir, log, now, market }) {
     this.#dir = dir
     this.#log = log
+    this.#market = market
     const clock = typeof now === 'function' ? now : () => now
     this.#now = () => {
       const stamp = Number(clock())
@@ -665,6 +672,16 @@ class FarmStore {
 
   fertilize (plotId) {
     return this.#enqueue(() => this.#fertilize(plotId))
+  }
+
+  /** 从交易所买种子：扣硬币、加种子；价格是作物表里的固定种子价（ticket 41）。 */
+  buySeed (cropId, qty) {
+    return this.#enqueue(() => this.#trade('buy-seed', cropId, qty))
+  }
+
+  /** 把作物卖给交易所：按本机 bid 成交、加硬币；成交后价格按数量冲击下跌。 */
+  sellCrop (cropId, qty) {
+    return this.#enqueue(() => this.#trade('sell-crop', cropId, qty))
   }
 
   /**
@@ -882,6 +899,93 @@ class FarmStore {
     }
   }
 
+  /**
+   * 买卖的唯一入口（ticket 41）。同步段里完成「交易所记账 + 农场仓库变化」：
+   *   1. 先 `#advance`（到点了的生长/露水不能因为买卖被跳过）；
+   *   2. 检查作物、数量、库存与上限；失败不消耗交易所的每分钟限额；
+   *   3. 调交易所同步记账（价格/历史/限速），紧接着改硬币/种子/作物；
+   *   4. 两本账各自串行落盘；农场写盘完成后再返回。
+   */
+  async #trade (kind, rawCropId, rawQty) {
+    const cropId = normalizeCropId(rawCropId)
+    if (cropId === null) return farmError('bad-crop')
+    const qty = normalizeTradeQty(rawQty)
+    if (qty === null) return farmError('bad-qty', '数量要在 1–99 之间。')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    if (this.#market === null || typeof this.#market.applyTrade !== 'function') {
+      return farmError('market-busy', '交易所还没准备好，稍等一下再试。')
+    }
+
+    const crop = CROPS[cropId]
+    if (kind === 'buy-seed') {
+      const total = crop.seedPrice * qty
+      if (this.#state.coins < total) return farmError('no-coin')
+      const held = this.#state.seeds[cropId] ?? 0
+      if (held + qty > MAX_STACK) return farmError('cap')
+    } else {
+      const held = this.#state.crops[cropId] ?? 0
+      // 错误码表里只有 no-seed 这一种「仓库没有」；卖作物时也用同一个码，
+      // 但 notice 说的是作物，窗口/HTTP 拿到的是人话而不是种子文案。
+      if (held < qty) return farmError('no-seed', '没有这种作物了，先种一点再来卖。')
+    }
+
+    let trade
+    try {
+      trade = this.#market.applyTrade({
+        side: kind === 'buy-seed' ? 'buy' : 'sell',
+        cropId,
+        qty,
+        now
+      })
+    } catch {
+      return farmError('market-busy')
+    }
+    if (trade.ok !== true) return farmError(trade.error ?? 'market-busy')
+
+    const total = trade.total
+    if (kind === 'buy-seed') {
+      this.#state.coins = Math.max(0, this.#state.coins - total)
+      // 上限上面已经检查过；这里仍用 addStack 保证不会写出 1000 颗。
+      addStack(this.#state.seeds, cropId, qty)
+    } else {
+      const held = this.#state.crops[cropId] ?? 0
+      const left = held - qty
+      if (left <= 0) delete this.#state.crops[cropId]
+      else this.#state.crops[cropId] = left
+      this.#state.coins = Math.min(MAX_COINS, this.#state.coins + total)
+    }
+    this.#resetIdle(now)
+
+    const farmPersisted = await this.#persist(true)
+    let marketPersisted = true
+    if (trade.persisted !== undefined && typeof trade.persisted.then === 'function') {
+      marketPersisted = await trade.persisted.catch(() => false)
+    }
+
+    const notice = kind === 'buy-seed'
+      ? '买了 ' + qty + ' 颗' + crop.name + '种子，花了 ' + total + ' 硬币。'
+      : '卖了 ' + qty + ' 个' + crop.name + '，得到 ' + total + ' 硬币。'
+    return {
+      ok: true,
+      action: kind,
+      cropId,
+      qty,
+      unitPrice: trade.unitPrice,
+      total,
+      price: trade.priceAfter,
+      coins: this.#state.coins,
+      seeds: { ...this.#state.seeds },
+      crops: { ...this.#state.crops },
+      dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
+      notice,
+      persisted: farmPersisted === true && marketPersisted !== false
+    }
+  }
+
   #enqueue (task) {
     const run = this.#chain.then(task, task)
     this.#chain = run.then(() => {}, () => {})
@@ -928,6 +1032,11 @@ class FarmStore {
   }
 }
 
-function farmError (error) {
-  return { ok: false, error, persisted: false }
+function farmError (error, notice = null) {
+  return {
+    ok: false,
+    error,
+    persisted: false,
+    ...(notice === null ? {} : { notice })
+  }
 }

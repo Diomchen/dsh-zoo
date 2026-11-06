@@ -3,11 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <!--
-      农场小窗（ticket 40）：不联网、不加载远程资源。
-      窗口是 file:// 页面，读不到宿主 /state；地块/种子/作物/硬币/露水/日志全部由
-      宿主随 `farm-window` 命令推过来，这里只画、只把「申请」交回主进程。
+      农场小窗（ticket 40 / 41）：不联网、不加载远程资源。
+      窗口是 file:// 页面，读不到宿主 /state；地块/种子/作物/硬币/露水/日志/交易所
+      全部由宿主随 `farm-window` 命令推过来，这里只画、只把「申请」交回主进程。
 
       视觉：奶油纸底 + 泥土色地块 + 贴纸投影；作物用 emoji，成熟角标在右上角。
+      交易所页只画宿主算好的 bid/base/最近成交与总价，不在窗口里算价格。
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -147,6 +148,16 @@
       .tab:disabled {
         color: var(--muted);
         cursor: default;
+      }
+      .page {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        flex: 1 1 auto;
+        min-height: 0;
+      }
+      .page[hidden] {
+        display: none !important;
       }
       .plots {
         display: grid;
@@ -334,6 +345,141 @@
       .log .empty {
         color: var(--muted);
       }
+      .market-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 10.5px;
+        color: var(--ink-soft);
+      }
+      .market-head strong {
+        color: var(--soil-deep);
+        font-size: 11px;
+      }
+      .market-rows {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        min-height: 0;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: rgba(122, 106, 92, 0.3) transparent;
+      }
+      .market-row {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 7px 9px;
+        border-radius: 11px;
+        background: rgba(255, 253, 248, 0.72);
+        box-shadow: inset 0 0 0 1px var(--line);
+      }
+      .market-row-head {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .market-row-head .emoji {
+        font-size: 17px;
+      }
+      .market-row-head .name {
+        flex: 1 1 auto;
+        font-size: 11.5px;
+        font-weight: 700;
+      }
+      .market-row-head .last {
+        font-size: 9.5px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .market-stats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px 10px;
+        font-size: 10px;
+        color: var(--ink-soft);
+      }
+      .market-stats b {
+        color: var(--ink);
+        font-variant-numeric: tabular-nums;
+      }
+      .market-trade {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+      .market-trade .qty-label {
+        font-size: 9.5px;
+        color: var(--muted);
+      }
+      .market-trade input {
+        width: 48px;
+        padding: 3px 5px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--cream);
+        color: var(--ink);
+        font: inherit;
+        font-size: 10.5px;
+        font-variant-numeric: tabular-nums;
+      }
+      .market-trade .total {
+        margin-left: auto;
+        font-size: 10px;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+      .market-trade .btn.buy {
+        background: var(--green);
+        border-color: var(--green);
+        color: #fff;
+      }
+      .market-trade .btn.sell {
+        background: var(--gold);
+        border-color: var(--gold);
+        color: #fff;
+      }
+      .trades {
+        flex: 1 1 auto;
+        min-height: 56px;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+      .trades h2 {
+        margin: 0;
+        font-size: 10.5px;
+        font-weight: 700;
+        color: var(--soil-deep);
+        letter-spacing: 0.04em;
+      }
+      .trades ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        overflow-y: auto;
+        font-size: 10.5px;
+        line-height: 1.5;
+        color: var(--ink-soft);
+        scrollbar-width: thin;
+        scrollbar-color: rgba(122, 106, 92, 0.3) transparent;
+      }
+      .trades li {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 1px 0;
+      }
+      .trades .when {
+        flex: none;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .trades .empty {
+        color: var(--muted);
+      }
       .toast {
         position: absolute;
         left: 16px;
@@ -378,19 +524,33 @@
       </header>
 
       <nav class="tabs" role="tablist" aria-label="农场页">
-        <button class="tab active" type="button" role="tab" aria-selected="true">农场</button>
-        <button class="tab" type="button" role="tab" disabled title="ticket 41">交易所</button>
-        <button class="tab" type="button" role="tab" disabled title="ticket 44">雇工</button>
-        <button class="tab" type="button" role="tab" disabled title="ticket 41">记录</button>
+        <button class="tab active" type="button" role="tab" data-tab="farm" aria-selected="true">农场</button>
+        <button class="tab" type="button" role="tab" data-tab="market" aria-selected="false">交易所</button>
+        <button class="tab" type="button" role="tab" disabled title="雇工还没开放">雇工</button>
+        <button class="tab" type="button" role="tab" disabled title="记录还没开放">记录</button>
       </nav>
 
-      <section class="plots" id="plots" aria-label="四块地"></section>
+      <section class="page" id="page-farm" role="tabpanel" aria-label="农场">
+        <section class="plots" id="plots" aria-label="四块地"></section>
 
-      <section class="inventory" id="inventory" aria-label="库存"></section>
+        <section class="inventory" id="inventory" aria-label="库存"></section>
 
-      <section class="log">
-        <h2>最近</h2>
-        <ul id="log"></ul>
+        <section class="log">
+          <h2>最近</h2>
+          <ul id="log"></ul>
+        </section>
+      </section>
+
+      <section class="page" id="page-market" role="tabpanel" aria-label="交易所" hidden>
+        <div class="market-head">
+          <strong>本机交易所</strong>
+          <span id="market-wallet">🪙 0 · 永远有流动性</span>
+        </div>
+        <div class="market-rows" id="market-rows"></div>
+        <section class="trades">
+          <h2>最近成交</h2>
+          <ul id="trades"></ul>
+        </section>
       </section>
 
       <footer>数据由桌面宿主提供 · Esc 关闭</footer>
