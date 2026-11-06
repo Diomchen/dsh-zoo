@@ -10,6 +10,7 @@ import { createDesktop } from './desktop.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
+import { FARM_LOG_VIEW_LIMIT, createFarmStore, initialFarmView } from './farm.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
@@ -97,6 +98,8 @@ export const AUTO_VISIT_LOG_INTERVAL_MS = 5 * 60 * 1000
 export const ARMED_GIFT_MS = 5 * 60 * 1000
 /** `/dsh-zoo/state` 只列最近 20 件收到的礼物（SPEC v4「记录与状态出口」）。 */
 export const STATE_GIFT_LIMIT = 20
+/** 农场 tick（SPEC v5「存储」）：每 60 秒推进生长/露水，保存由 store 节流。 */
+export const FARM_TICK_MS = 60 * 1000
 
 /**
  * 把桌面接到 DSH 的同一个源上：本地浏览器照旧带着自己的 cookie 来读，
@@ -108,6 +111,7 @@ export const STATE_GIFT_LIMIT = 20
  * - 放行/拒绝名单落盘（src/peers.js）
  * - 桌面开关（入站串门 / 自发出门）落盘（src/settings.js）
  * - 串门记录落盘（src/visits.js）
+ * - 农场落盘（src/farm.js；规则在 src/farm-rules.js）
  * - dsh-pet 轮询（src/pet-bridge.js）
  * - UDP 发现（src/discovery.js）
  * 它们只把结果翻译成 room 的方法调用；room 保持纯。
@@ -153,6 +157,9 @@ export function createService (ctx, options = {}) {
   const autoVisitIntervalMs = positiveOption(options.autoVisitIntervalMs, AUTO_VISIT_INTERVAL_MS, 10)
   /** 测试可以缩短 armed 窗口；生产固定 5 分钟。 */
   const armedGiftMs = positiveOption(options.armedGiftMs, ARMED_GIFT_MS, 10)
+  // 农场（ticket 39）：tick 节拍与测试时钟都可注入；生产默认 60 秒 / Date.now。
+  const farmTickMs = positiveOption(options.farmTickMs, FARM_TICK_MS, 10)
+  const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
 
   let identity = null
   let discovery = null
@@ -162,6 +169,8 @@ export function createService (ctx, options = {}) {
   let gifts = null
   // 发送端的背包（ticket 24）；起不来 = 这次运行不带东西，串门照常。
   let backpack = null
+  // 农场（ticket 39）：读不出来 = 本次运行按初始农场玩，串门照常。
+  let farm = null
   let settings = null
   let bridge = null
   let desktop = null
@@ -225,6 +234,7 @@ export function createService (ctx, options = {}) {
   let heartbeatTimer = null
   let visitTimer = null
   let autoVisitTimer = null
+  let farmTimer = null
   // 当前出门请求的重试状态；只活在 service，room 只记“在请求中/已抵达”。
   let request = null
   // 已发出、等回执的 visit-recall：visitId → { deviceId, attempts, nextAt, deadline }。
@@ -442,6 +452,14 @@ export function createService (ctx, options = {}) {
     //   - unbring 只删 idle 件（out 中的东西可能已经在对方磁盘上了）。
     if (action === 'bring') return handleBringAction(body)
     if (action === 'unbring') return handleUnbringAction(body)
+
+    // 农场（ticket 39）：四个本地动作。规则在 src/farm-rules.js（纯），
+    // 落盘/串行化在 src/farm.js；UDP 报文没有入口，访客的偷/帮走 ticket 43。
+    if (action === 'plant' || action === 'harvest' || action === 'water' || action === 'fertilize') {
+      if (farm === null) return { ok: false, error: 'starting' }
+      if (action === 'plant') return farm.plant(body?.plotId, body?.cropId)
+      return farm[action](body?.plotId)
+    }
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') {
@@ -670,10 +688,10 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * `/dsh-zoo/state` 的唯一形状（ticket 27）：room 的纯快照 + 两份磁盘视图。
+   * `/dsh-zoo/state` 的唯一形状（ticket 27 / 39）：room 的纯快照 + 磁盘视图。
    *
-   * 磁盘只在这里读，room 永远不碰 fs。两个字段在任何时候都是数组：
-   * store 还没起来/初始化为 null 时就是空数组，绝不出现 `undefined`。
+   * 磁盘只在这里读，room 永远不碰 fs。数组/对象在任何时候都有完整形状：
+   * store 还没起来/初始化为 null 时就是空数组或初始农场，绝不出现 `undefined`。
    */
   function stateView () {
     return {
@@ -683,7 +701,31 @@ export function createService (ctx, options = {}) {
         ? null
         : { id: activeSkin.id, size: activeSkin.size, idle: activeSkin.idle },
       backpack: backpack?.items() ?? [],
-      gifts: recentGifts()
+      gifts: recentGifts(),
+      // 农场（ticket 39）。store 没起来时也给完整初始形状，字段永远不会是 undefined。
+      farm: farmStateView()
+    }
+  }
+
+  /**
+   * `/state` 的农场出口（SPEC v5「状态出口与动作」）：
+   * `{ plots, coins, seeds, crops, dew, guard, worker, hire, log }`，log 最近 20 条。
+   *
+   * `guard` / `worker` 是 43/44 的口子：偷菜和雇工还没实现，先给固定空值，
+   * 形状先按 SPEC 固定下来，后面只填值、不再改结构。
+   */
+  function farmStateView () {
+    const view = farm?.snapshot() ?? initialFarmView()
+    return {
+      plots: view.plots,
+      coins: view.coins,
+      seeds: view.seeds,
+      crops: view.crops,
+      dew: view.dew,
+      guard: 0,
+      worker: null,
+      hire: view.hire,
+      log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
     }
   }
 
@@ -932,6 +974,15 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 农场（ticket 39）：坏文件只降级成初始农场，不挡启动；`farmNow` 只给测试注入。
+      try {
+        farm = await createFarmStore(dir, farmNow === undefined ? { log } : { log, now: farmNow })
+      } catch (error) {
+        farm = null
+        warn(ctx, '农场初始化失败，本次按初始农场运行：' + message(error))
+      }
+      if (disposed) return
+
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
@@ -1061,6 +1112,9 @@ export function createService (ctx, options = {}) {
         await bridge.start()
       }
 
+      // 农场是本机玩法，跟联不联网无关：没有桌面层、没有网络也照样长。
+      if (!disposed) startFarmTick()
+
       if (!disposed && options.network !== false) {
         startNeighborTick()
         startVisitTimer()
@@ -1070,6 +1124,8 @@ export function createService (ctx, options = {}) {
       if (disposed) return
       warn(ctx, '启动失败，桌面会降级：' + message(error))
       room.setBridge({ ok: false, reason: 'error' })
+      // 农场已经读出来的话，tick 不陪网络一起降级。
+      if (!disposed) startFarmTick()
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
       if (options.network !== false) {
         startNeighborTick()
@@ -1737,6 +1793,29 @@ export function createService (ctx, options = {}) {
     if (visitTimer !== null || disposed || discovery === null) return
     visitTimer = setInterval(runVisitTimers, visitTickMs)
     visitTimer.unref?.()
+  }
+
+  /**
+   * 农场 tick（ticket 39）：每 60 秒推进生长、露水与 lastTickAt；
+   * 落盘节流在 store 里（有变化且距上次写 ≥30 秒）。失败只影响这一拍。
+   */
+  function startFarmTick () {
+    if (farmTimer !== null || disposed || farm === null) return
+    farmTimer = setInterval(() => {
+      let ticking
+      try {
+        ticking = farm?.tick()
+      } catch (error) {
+        warn(ctx, '农场 tick 失败：' + message(error))
+        return
+      }
+      if (ticking !== undefined && typeof ticking?.catch === 'function') {
+        ticking.catch((error) => {
+          warn(ctx, '农场 tick 失败：' + message(error))
+        })
+      }
+    }, farmTickMs)
+    farmTimer.unref?.()
   }
 
   function startAutoVisitTimer () {
@@ -2537,6 +2616,11 @@ export function createService (ctx, options = {}) {
         clearInterval(autoVisitTimer)
         autoVisitTimer = null
       }
+      if (farmTimer !== null) {
+        clearInterval(farmTimer)
+        farmTimer = null
+      }
+      farm = null
       stopDesktopSync()
       unsubscribeSessionEvents()
       try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }
