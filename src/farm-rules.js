@@ -41,7 +41,7 @@ export const CROPS = Object.freeze({
 
 export const CROP_IDS = Object.freeze(Object.keys(CROPS))
 
-/** 露水：每 10 分钟待机 +1，每天余额上限 48（SPEC v5「待机、露水与离线生长」）。 */
+/** 露水：每 10 分钟待机 +1，每天最多挣 48、余额也封顶 48（SPEC v5）。 */
 export const DEW_INTERVAL_MS = 10 * MINUTE_MS
 export const MAX_DEW = 48
 /** 浇水 / 施肥的露水价（各一次）。 */
@@ -175,51 +175,101 @@ export function localDayKey (at) {
 /**
  * 待机露水推进（纯函数）。
  *
- * - 同一本地日：每满 10 分钟 +1，余额封顶 48；不足 10 分钟的零头留在 `dewAt` 里。
- * - 跨本地日：`dew` 归零、`dewAt` 从 `now` 重新计时（午夜正好重置，不补前一天）。
+ * - 同一本地日：每满 10 分钟 +1；**每天挣到的总量**封顶 48，余额也封顶 48。
+ *   只有余额会被花掉，`dewEarned` 记账不随花费回退——花光不能再刷当天的额度。
+ * - 跨本地日：`dew` / `dewEarned` 都归零、`dewAt` 从 `now` 重新计时
+ *   （午夜正好重置，不补前一天）。
  * - `dewAt` 缺失/倒退：从 `now` 重新计时，不产生负增长或瞬间满额。
+ * - 旧文件没有 `dewEarned` 时按 0 起算，但当前余额一定算进「今天已挣」，
+ *   避免手改/旧版本凭空多出额度。
  *
  * 关掉 DSH 的离线时间**不**在这里补：那是离线生长的事，露水只奖励「开着但没在玩」。
  * 调用方在加载时把 `dewAt` 设成 now 即可把这条规则写死。
  */
 export function advanceDew (state, now) {
   const current = Number(now)
-  const balance = clampDew(state?.dew)
-  const oldDay = typeof state?.dewDay === 'string' && state.dewDay !== '' ? state.dewDay : null
+  let balance = clampDew(state?.dew)
+  let earned = clampDew(state?.dewEarned)
+  const oldDay = dayOrNull(state?.dewDay)
+  const oldEarnedDay = dayOrNull(state?.dewDayEarned) ?? oldDay
   const oldAt = Number(state?.dewAt)
 
   if (!Number.isFinite(current)) {
     return {
       dew: balance,
+      dewEarned: Math.max(earned, balance),
       dewAt: Number.isFinite(oldAt) && oldAt > 0 ? oldAt : null,
       dewDay: oldDay,
+      dewDayEarned: oldEarnedDay,
       gained: 0,
       reset: false
     }
   }
 
   const day = localDayKey(current)
+  let reset = false
   if (oldDay !== null && day !== null && oldDay !== day) {
-    return { dew: 0, dewAt: current, dewDay: day, gained: 0, reset: true }
+    balance = 0
+    reset = true
+  }
+  if (oldEarnedDay !== null && day !== null && oldEarnedDay !== day) {
+    earned = 0
+    reset = true
+  }
+  // 余额里的每一滴都算今天已经挣到的：手改文件/旧版本不能凭空多出额度。
+  earned = Math.max(earned, balance)
+
+  if (reset) {
+    // 跨日这一拍只做重置，不补午夜前后的零头；下一拍重新从 10 分钟起算。
+    return {
+      dew: balance,
+      dewEarned: earned,
+      dewAt: current,
+      dewDay: day,
+      dewDayEarned: day,
+      gained: 0,
+      reset: true
+    }
   }
 
   const anchor = Number.isFinite(oldAt) && oldAt > 0 && oldAt <= current ? oldAt : current
-  if (balance >= MAX_DEW) {
-    return { dew: balance, dewAt: current, dewDay: day, gained: 0, reset: false }
+  if (balance >= MAX_DEW || earned >= MAX_DEW) {
+    return {
+      dew: balance,
+      dewEarned: earned,
+      dewAt: current,
+      dewDay: day,
+      dewDayEarned: day,
+      gained: 0,
+      reset: false
+    }
   }
 
   const intervals = Math.floor((current - anchor) / DEW_INTERVAL_MS)
   if (intervals <= 0) {
-    return { dew: balance, dewAt: anchor, dewDay: day, gained: 0, reset: false }
+    return {
+      dew: balance,
+      dewEarned: earned,
+      dewAt: anchor,
+      dewDay: day,
+      dewDayEarned: day,
+      gained: 0,
+      reset: false
+    }
   }
 
-  const gained = Math.min(intervals, MAX_DEW - balance)
+  const gained = Math.min(intervals, MAX_DEW - balance, MAX_DEW - earned)
   const nextDew = balance + gained
+  const nextEarned = earned + gained
   return {
     dew: nextDew,
-    // 到顶就把锚点推到 now：满额期间不再攒「下次可兑现」的整数间隔。
-    dewAt: nextDew >= MAX_DEW ? current : anchor + intervals * DEW_INTERVAL_MS,
+    dewEarned: nextEarned,
+    // 被日上限或余额上限截住时把锚点推到 now：攒不下的间隔不能留到以后兑现。
+    dewAt: gained < intervals || nextDew >= MAX_DEW || nextEarned >= MAX_DEW
+      ? current
+      : anchor + intervals * DEW_INTERVAL_MS,
     dewDay: day,
+    dewDayEarned: day,
     gained,
     reset: false
   }
@@ -229,6 +279,10 @@ function clampDew (value) {
   const num = Number(value)
   if (!Number.isFinite(num)) return 0
   return Math.min(MAX_DEW, Math.max(0, Math.floor(num)))
+}
+
+function dayOrNull (value) {
+  return typeof value === 'string' && value !== '' ? value : null
 }
 
 /**
