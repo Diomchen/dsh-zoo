@@ -252,34 +252,33 @@ test('两个 service：双向放行后指数收敛到同一中位数；成交后
   assert.equal(a.room.admit(bId).ok, true)
   assert.equal(b.room.admit(aId).ok, true)
 
-  // A 的 tomato 10、B 的 5；中位数 7.5，两边样本都是 2（含本机）。
-  await waitFor(() => a.snapshot().market.index.tomato?.samples === 2 &&
-    b.snapshot().market.index.tomato?.samples === 2)
-  assert.deepEqual(a.snapshot().market.index.tomato.price, 7.5)
-  assert.deepEqual(b.snapshot().market.index.tomato.price, 7.5)
+  // A 的 tomato 10、B 的 5；指数只取 peer 价，所以 A 看到 5、B 看到 10（样本都只有 1 个）。
+  await waitFor(() => a.snapshot().market.index.tomato?.samples === 1 &&
+    b.snapshot().market.index.tomato?.samples === 1)
+  assert.equal(a.snapshot().market.index.tomato.price, 5)
+  assert.equal(b.snapshot().market.index.tomato.price, 10)
   assert.ok(a.snapshot().market.index.tomato.at > NOON, '指数 at 是 digest 的本地时钟')
   assert.ok(b.snapshot().market.index.tomato.at > NOON)
 
   // `GET /state` 的 market.index 就是 `{price, at, samples}`，不带窗口用的 stale。
   const state = await call(b, '/dsh-zoo/state')
   const stateIndex = state.body.market.index.tomato
-  assert.equal(stateIndex.price, 7.5)
-  assert.equal(stateIndex.samples, 2)
+  assert.equal(stateIndex.price, 10)
+  assert.equal(stateIndex.samples, 1)
   assert.deepEqual(Object.keys(stateIndex).sort(), ['at', 'price', 'samples'])
 
-  // A 卖 3 个：本机价 10 → 9.82，digest 立刻补发；B 的指数从 7.5 → (5+9.82)/2 = 7.41。
+  // A 卖 3 个：本机价 10 → 9.82，digest 立刻补发；B 的指数从 10 → 9.82（peer 价就是 A 的本机价）。
   const sold = await action(a, { action: 'sell-crop', cropId: 'tomato', qty: 3 })
   assert.equal(sold.body.ok, true)
   assert.ok(Math.abs(sold.body.price - 9.82) < 1e-9)
   await waitFor(() => {
     const index = b.snapshot().market.index.tomato
-    return index !== undefined && Math.abs(index.price - 7.41) < 1e-9
+    return index !== undefined && Math.abs(index.price - 9.82) < 1e-9
   })
-  assert.equal(b.snapshot().market.index.tomato.samples, 2)
-  await waitFor(() => {
-    const index = a.snapshot().market.index.tomato
-    return index !== undefined && Math.abs(index.price - 7.41) < 1e-9
-  })
+  assert.equal(b.snapshot().market.index.tomato.samples, 1)
+  // A 仍看 B 的 5；成交不会把本机价混进自己的指数。
+  assert.equal(a.snapshot().market.index.tomato.price, 5)
+  assert.equal(a.snapshot().market.index.tomato.samples, 1)
 })
 
 test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；坏包不崩', async (t) => {
@@ -332,7 +331,8 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
     }
   }), servicePort)
   await delay(60)
-  assert.equal(service.snapshot().market.index.tomato, undefined, '未放行邻居的行情不进指数')
+  assert.deepEqual(service.snapshot().market.index.tomato, { price: 5, at: NOON, samples: 0 },
+    '未放行邻居的行情不进指数；没有 peer 时指数 = 本机、samples 0')
 
   assert.equal((await action(service, { action: 'admit', deviceId })).status, 200)
   await waitFor(() => digests(peer).length >= 1)
@@ -340,7 +340,7 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
   assert.deepEqual(Object.keys(first), ['v', 'type', 'deviceId', 'at', 'prices', 'hire'])
   assert.equal(first.deviceId, service.snapshot().self.deviceId)
   assert.deepEqual(Object.keys(first.prices).sort(), ['carrot', 'pumpkin', 'tomato'])
-  // 42 的挂牌只发 farm.json 的值 + 固定守卫；available 暂时等于 enabled，reason 为 null。
+  // 挂牌发 farm.json 的值 + 雇工贡献的 0.5；available/reason 来自真实在家状态。
   assert.deepEqual(first.hire, {
     enabled: true,
     wagePerHour: 20,
@@ -348,18 +348,56 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
     maxHours: 6,
     guard: 0.5,
     available: true,
-    reason: null
+    reason: 'ready'
   })
 
-  // 第一条合法 digest：本机 5 + peer 8 → 6.5。
+  // 真实可用性：串门中 → visiting；打工中 → working；关掉挂牌 → off。
+  const hireMark = digests(peer).length
+  const visitId = randomUUID()
+  assert.equal(service.room.beginVisit(deviceId, { visitId, at: Date.now() }).ok, true)
+  service.sendMarketDigest({ force: true })
+  await waitFor(() => digests(peer).length > hireMark)
+  assert.deepEqual(digests(peer).at(-1).parsed.packet.hire, { ...first.hire, available: false, reason: 'visiting' })
+  service.room.recallOutbound(Date.now())
+
+  const workStart = Date.now()
+  const contractId = randomUUID()
+  const begun = service.room.beginWorking({
+    contractId,
+    employerDeviceId: deviceId,
+    employerNickname: '行情邻居',
+    startedAt: workStart,
+    endsAt: workStart + 2 * 60 * 60 * 1000,
+    guard: 0.5
+  }, workStart)
+  assert.equal(begun.ok, true)
+  service.sendMarketDigest({ force: true })
+  await waitFor(() => digests(peer).length > hireMark + 1)
+  assert.deepEqual(digests(peer).at(-1).parsed.packet.hire, { ...first.hire, available: false, reason: 'working' })
+  service.room.endWorking(contractId, { at: workStart + 1000, reason: 'recall' })
+
+  const off = await action(service, {
+    action: 'hire-listing',
+    enabled: false,
+    wagePerHour: 20,
+    minHours: 3,
+    maxHours: 6
+  })
+  assert.equal(off.status, 200)
+  await waitFor(() => {
+    const last = digests(peer).at(-1)?.parsed.packet
+    return last?.hire?.reason === 'off' && last.hire.available === false
+  })
+
+  // 第一条合法 digest：本机 5 + peer 8 → 指数 8（不含本机）。
   send(peer, digestPayload({
     deviceId,
     at: clock.now(),
     prices: { tomato: 8, carrot: 6, pumpkin: 30 },
     hire: first.hire
   }), servicePort)
-  await waitFor(() => Math.abs((service.snapshot().market.index.tomato?.price ?? 0) - 6.5) < 1e-9)
-  assert.equal(service.snapshot().market.index.tomato.samples, 2)
+  await waitFor(() => Math.abs((service.snapshot().market.index.tomato?.price ?? 0) - 8) < 1e-9)
+  assert.equal(service.snapshot().market.index.tomato.samples, 1)
 
   // 同一窗口里的第二条被限速丢掉：仍是 6.5。
   send(peer, digestPayload({
@@ -369,7 +407,7 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
     hire: first.hire
   }), servicePort)
   await delay(80)
-  assert.equal(service.snapshot().market.index.tomato.price, 6.5, '1 peer / 窗口最多 1 条')
+  assert.equal(service.snapshot().market.index.tomato.price, 8, '1 peer / 窗口最多 1 条')
 
   // 坏包（未知类型 / 坏挂牌 / 越界价格）既不更新指数，也不把服务弄崩。
   const before = JSON.stringify(service.snapshot().market.index)
@@ -395,7 +433,7 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
   assert.equal(JSON.stringify(service.snapshot().market.index), before, '坏 digest 不影响已有指数')
   assert.equal((await call(service, '/dsh-zoo/state')).status, 200, '服务还活着')
 
-  // 过了窗口，新的合法 digest 才进来：本机 5 + peer 9 → 7。
+  // 过了窗口，新的合法 digest 才进来：指数 = peer 9。
   clock.advance(250)
   send(peer, digestPayload({
     deviceId,
@@ -403,12 +441,12 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
     prices: { tomato: 9, carrot: 6, pumpkin: 30 },
     hire: first.hire
   }), servicePort)
-  await waitFor(() => Math.abs((service.snapshot().market.index.tomato?.price ?? 0) - 7) < 1e-9)
-  assert.equal(service.snapshot().market.index.tomato.samples, 2)
+  await waitFor(() => Math.abs((service.snapshot().market.index.tomato?.price ?? 0) - 9) < 1e-9)
+  assert.equal(service.snapshot().market.index.tomato.samples, 1)
 
-  // 拒绝这位邻居：它已经送来的价格也不再影响本机指数。
+  // 拒绝这位邻居：它已经送来的价格也不再影响本机指数，退回本机价 / samples 0。
   assert.equal((await action(service, { action: 'reject', deviceId })).status, 200)
-  assert.equal(service.snapshot().market.index.tomato, undefined)
+  assert.deepEqual(service.snapshot().market.index.tomato, { price: 5, at: clock.now(), samples: 0 })
 })
 
 test('行情不重试：一条 digest 没有回执，窗口内不会连发', async (t) => {

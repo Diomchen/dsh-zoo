@@ -14,7 +14,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { PLOT_IDS } from '../src/farm.js'
+import { FARM_FILE, FARM_VERSION, PLOT_IDS, initialFarmState } from '../src/farm.js'
 import { MINUTE_MS } from '../src/farm-rules.js'
 import { MARKET_FILE, MARKET_VERSION } from '../src/market.js'
 import { createService } from '../src/service.js'
@@ -337,7 +337,12 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
     bid: 5
   })
   assert.deepEqual(window.market.history, [])
-  assert.deepEqual(window.market.index, {})
+  // 没有 peer：指数仍是完整形状，但每条都是「本机价 / samples 0」。
+  assert.deepEqual(window.market.index, {
+    tomato: { price: 5, at: NOON, samples: 0, stale: false },
+    carrot: { price: 6, at: NOON, samples: 0, stale: false },
+    pumpkin: { price: 30, at: NOON, samples: 0, stale: false }
+  })
   assert.equal('market' in desktop.calls.scenes.at(-1).controls.farm, false)
 
   // 窗口提交买 2 颗番茄种子：宿主回人话，并推一份新的完整窗口状态（open:false）。
@@ -535,15 +540,30 @@ test('主人日志的「谁」：full 视图保留 who（≤32 码点），场�
     log: [
       { at: NOON, kind: 'steal', crop: 'tomato', qty: 1, who: '  阿蟹  ' },
       { at: NOON, kind: 'steal', crop: 'tomato', qty: 0, who: '喵'.repeat(40) },
-      { at: NOON, kind: 'help', crop: 'carrot', qty: 1 }
+      { at: NOON, kind: 'help', crop: 'carrot', qty: 1 },
+      { at: NOON, kind: 'hire', who: '阿蟹', hours: 4, wage: 40 },
+      { at: NOON, kind: 'settle', who: '阿蟹', wage: 40, earned: 18 }
+    ],
+    carried: [
+      { kind: 'crop', crop: 'tomato', qty: 2, at: NOON, until: NOON + 1000 },
+      { kind: 'wage', amount: 12, contractId: '11111111-1111-4111-8111-111111111111', at: NOON },
+      { kind: 'crop', crop: 'alien', qty: 1 },
+      { kind: 'wage', amount: -1 }
     ]
   }, { full: true })
   assert.equal(normalized.log[0].who, '阿蟹')
   assert.equal(Array.from(normalized.log[1].who).length, 32)
   assert.equal('who' in normalized.log[2], false)
+  assert.deepEqual(normalized.log[3], { at: NOON, kind: 'hire', qty: 0, who: '阿蟹', hours: 4, wage: 40 })
+  assert.deepEqual(normalized.log[4], { at: NOON, kind: 'settle', qty: 0, who: '阿蟹', wage: 40, earned: 18 })
+  assert.deepEqual(normalized.carried, [
+    { kind: 'crop', crop: 'tomato', qty: 2, at: NOON, until: NOON + 1000 },
+    { kind: 'wage', amount: 12, contractId: '11111111-1111-4111-8111-111111111111', at: NOON }
+  ], '坏驮包条目只丢自己')
   assert.equal('log' in shared.normalizeFarmSummary({
     plots: [], coins: 30, dew: 1, log: [{ at: NOON, kind: 'steal', qty: 1, who: '阿蟹' }]
   }), false)
+  assert.equal('carried' in shared.normalizeFarmSummary({ plots: [], coins: 30, carried: [] }), false)
 })
 
 test('访客窗口的渲染端/预加载/主进程都走同一条动作线（静态窄口检查）', async () => {
@@ -559,4 +579,55 @@ test('访客窗口的渲染端/预加载/主进程都走同一条动作线（静
   assert.match(main, /farmVisit/)
   assert.match(main, /command\.mode === 'visitor'/)
   assert.match(main, /farmPending/)
+})
+
+test('记录页：窗口拿 50 条、/state 只给 20 条；hire/settle 日志字段齐全', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: NOON }
+  const entries = Array.from({ length: 55 }, (_, index) => {
+    if (index === 0) return { at: NOON, kind: 'hire', who: '阿蟹', hours: 2, wage: 20 }
+    if (index === 1) return { at: NOON - 1, kind: 'settle', who: '阿蟹', wage: 20, earned: 5 }
+    return { at: NOON - 2 - index, kind: index % 2 === 0 ? 'plant' : 'harvest', crop: 'tomato', qty: 1 }
+  })
+  const farmState = {
+    ...initialFarmState(),
+    version: FARM_VERSION,
+    lastTickAt: NOON,
+    log: entries
+  }
+  await writeFile(join(dir, FARM_FILE), JSON.stringify(farmState), 'utf8')
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.body.ok, true)
+  const window = desktop.calls.windows.at(-1)
+  assert.equal(window.farm.log.length, 50, '窗口记录页给最近 50 条')
+  assert.equal(window.farm.log[0].kind, 'hire')
+  assert.equal(window.farm.log[0].wage, 20)
+  assert.equal(window.farm.log[1].kind, 'settle')
+  assert.equal(window.farm.log[1].earned, 5)
+
+  const state = await call(service, '/dsh-zoo/state')
+  assert.equal(state.body.farm.log.length, 20, '/state.farm.log 仍按 SPEC 只给 20 条')
+  assert.equal('carried' in state.body.farm, false, '驮包只进窗口，不混进 /state')
+
+  // 记录页签是真页签（可点击），日志有自己的滚动容器。
+  const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
+  assert.match(html, /data-tab="log"/)
+  assert.match(html, /id="page-log"/)
+  assert.equal(html.includes('记录还没开放'), false)
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  assert.match(renderer, /slice\(0, 50\)/)
+  assert.match(renderer, /page-log/)
+  assert.match(renderer, /carried/)
 })

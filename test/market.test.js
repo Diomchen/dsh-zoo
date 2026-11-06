@@ -90,7 +90,12 @@ test('初始交易所：缺文件按作物表建价，不告警、不落盘', as
     assert.equal(view.prices[cropId].bid, undefined, '状态视图不额外发明 bid')
   }
   assert.deepEqual(view.history, [])
-  assert.deepEqual(view.index, {})
+  // 没有邻居：指数条目存在，但价格 = 本机、samples 0（UI 画成「本机行情」）。
+  assert.deepEqual(view.index, Object.fromEntries(Object.keys(CROPS).map((cropId) => [cropId, {
+    price: CROPS[cropId].base,
+    at: NOON,
+    samples: 0
+  }])))
   assert.deepEqual(warnings, [])
   await assert.rejects(readFile(join(dir, MARKET_FILE), 'utf8'), /ENOENT/)
 })
@@ -340,7 +345,11 @@ test('形状不对：坏价格/坏历史/坏指数只修不崩，且只告警一
   assert.equal(store.snapshot().prices.carrot.price, 12, '999 夹到 base×2')
   assert.equal(store.snapshot().prices.pumpkin.price, 15, '-1 夹到 base×0.5')
   assert.equal(store.snapshot().history.length, 1)
-  assert.deepEqual(store.snapshot().index, { tomato: { price: 5, at: NOON, samples: 1 } })
+  assert.deepEqual(store.snapshot().index, {
+    tomato: { price: 5, at: NOON, samples: 1 },
+    carrot: { price: 12, at: NOON, samples: 0 },
+    pumpkin: { price: 15, at: NOON, samples: 0 }
+  })
 })
 
 test('重启：价格与成交历史都还在，均值回归锚点从重启这一刻重新计时', async (t) => {

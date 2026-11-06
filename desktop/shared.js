@@ -265,6 +265,8 @@
   const HIRE_HOURS_MIN = 2
   const HIRE_HOURS_MAX = 8
   const HIRE_FEE_RATE = 0.05
+  /** 守卫上限 0.8：与宿主 src/farm-rules.js 的 MAX_GUARD 同源（drift 测试会读）。 */
+  const MAX_FARM_GUARD = 0.8
   const MAX_CONTRACT_EARNED = HIRE_HOURS_MAX * HIRE_WAGE_MAX
   const CONTRACT_STATUSES = ['pending', 'active', 'ended', 'cancelled']
   const HIRE_REASONS = ['ready', 'off', 'visiting', 'working']
@@ -627,13 +629,61 @@
     // 先按 UTF-16 上限取一段，再按码点夹取，避免在 emoji 代理对中间切断。
     const whoText = raw.who === undefined || raw.who === null ? null : normalizeText(raw.who, null, 128)
     const who = whoText === null ? null : Array.from(whoText).slice(0, 32).join('')
+    // ticket 44/45：hire/settle 日志带工资与结算数（显示用，不参与任何计算）。
+    const wage = Number(raw.wage)
+    const earned = Number(raw.earned)
+    const hours = Number(raw.hours)
     return {
       at: Math.floor(at),
       kind: raw.kind,
       ...(crop === null ? {} : { crop }),
       qty,
-      ...(who === null ? {} : { who })
+      ...(who === null ? {} : { who }),
+      ...(Number.isFinite(wage) ? { wage: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(wage))) } : {}),
+      ...(Number.isFinite(earned) ? { earned: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(earned))) } : {}),
+      ...(Number.isFinite(hours) ? { hours: Math.min(HIRE_HOURS_MAX, Math.max(0, Math.floor(hours))) } : {})
     }
+  }
+
+  /**
+   * 驮包（ticket 43/44，只显示）：作物「在驮包里」到串门结束，工资在合同结算前显示。
+   * 只重建白名单字段；坏条目只丢自己。**不**参与任何记账（宿主已经算过仓库/硬币）。
+   */
+  function normalizeFarmCarried (raw) {
+    if (!Array.isArray(raw)) return []
+    const out = []
+    for (const candidate of raw) {
+      if (out.length >= 8) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const kind = candidate.kind === 'crop' ? 'crop' : candidate.kind === 'wage' ? 'wage' : null
+      if (kind === null) continue
+      const at = Number(candidate.at)
+      const until = Number(candidate.until)
+      const amount = Number(candidate.amount)
+      if (kind === 'crop') {
+        const crop = normalizeCropId(candidate.crop)
+        const qty = Number(candidate.qty)
+        if (crop === null || !Number.isFinite(qty) || qty <= 0) continue
+        out.push({
+          kind,
+          crop,
+          qty: Math.min(MAX_FARM_STACK, Math.floor(qty)),
+          ...(Number.isFinite(at) && at > 0 ? { at: Math.floor(at) } : {}),
+          ...(Number.isFinite(until) && until > 0 ? { until: Math.floor(until) } : {})
+        })
+        continue
+      }
+      if (!Number.isFinite(amount) || amount < 0) continue
+      const contractId = normalizeUuid(candidate.contractId)
+      out.push({
+        kind,
+        amount: Math.min(MAX_FARM_COINS, Math.floor(amount)),
+        ...(contractId === null ? {} : { contractId }),
+        ...(Number.isFinite(at) && at > 0 ? { at: Math.floor(at) } : {}),
+        ...(Number.isFinite(until) && until > 0 ? { until: Math.floor(until) } : {})
+      })
+    }
+    return out
   }
 
   /**
@@ -687,8 +737,9 @@
       seeds: normalizeFarmStacks(raw.seeds),
       crops: normalizeFarmStacks(raw.crops),
       ...(hire === null ? {} : { hire }),
-      ...(Number.isFinite(guard) ? { guard: Math.min(0.8, Math.max(0, guard)) } : {}),
-      log
+      ...(Number.isFinite(guard) ? { guard: Math.min(MAX_FARM_GUARD, Math.max(0, guard)) } : {}),
+      log,
+      carried: normalizeFarmCarried(raw.carried)
     }
   }
 
@@ -789,7 +840,7 @@
           wagePerHour: Math.min(HIRE_WAGE_MAX, Math.max(HIRE_WAGE_MIN, Math.floor(wage))),
           minHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(minHours))),
           maxHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(maxHours))),
-          guard: Number.isFinite(Number(candidate.guard)) ? Math.min(0.8, Math.max(0, Number(candidate.guard))) : 0,
+          guard: Number.isFinite(Number(candidate.guard)) ? Math.min(MAX_FARM_GUARD, Math.max(0, Number(candidate.guard))) : 0,
           stale: candidate.stale === true
         })
       }
@@ -916,7 +967,7 @@
    */
   const FARM_VISIT_STATES = ['loading', 'ready', 'error', 'ended']
   const MAX_VISIT_LIMIT = 99
-  const MAX_VISIT_GUARD = 0.8
+  const MAX_VISIT_GUARD = MAX_FARM_GUARD
 
   function normalizeFarmVisitPlot (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -2064,12 +2115,17 @@
   }
 
   /** 宿主 → helper 的命令白名单。未知 type / 缺字段一律 not-ok，helper 只记调试信息。 */
-  function normalizeHostCommand (raw) {
+  function normalizeHostCommand (raw, { debug = true } = {}) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
       return { ok: false, error: 'not-object' }
     }
     const type = typeof raw.type === 'string' ? raw.type.trim().toLowerCase() : ''
     const id = normalizeToken(raw.id)
+    // 调试/冒烟命令只在显式 debug 模式可解析；普通运行的 helper 连白名单都进不来。
+    // 默认 true 只给既有单测用；helper 的 main 会显式传 `{debug: debugEnabled}`。
+    if (debug !== true && type.startsWith('debug-')) {
+      return { ok: false, error: 'debug-disabled' }
+    }
     switch (type) {
       case 'show':
       case 'hide':
@@ -2173,8 +2229,10 @@
         return { ok: true, command: { type, id, ...farmAction } }
       }
       case 'debug-farm-tab': {
-        // 冒烟用：切到农场小窗的某个页签（农场 / 交易所 / 雇工）。
-        const tab = raw.tab === 'market' || raw.tab === 'hire' ? raw.tab : 'farm'
+        // 冒烟用：切到农场小窗的某个页签（农场 / 交易所 / 雇工 / 记录）。
+        const tab = raw.tab === 'market' || raw.tab === 'hire' || raw.tab === 'log'
+          ? raw.tab
+          : 'farm'
         return { ok: true, command: { type, id, tab } }
       }
       case 'debug-gift-submit':
@@ -2884,6 +2942,7 @@
     MAX_FARM_STACK,
     MAX_FARM_DEW,
     MAX_FARM_CONTRACTS,
+    MAX_FARM_GUARD,
     MAX_FARM_LOG,
     MAX_FARM_MARKET_HISTORY,
     MARKET_MIN_QTY,

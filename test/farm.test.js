@@ -591,27 +591,28 @@ test('markStolen：成熟才可偷、同一访客同一块只一次、日志带 
   // 同一访客在不同地块：仍可偷（本块地判定与日限额是两件事）。
 })
 
-test('markStolen 日限额：3/访客/农场、5/农场；被抓只写日志不占次数', async (t) => {
+test('markStolen 日限额：3/访客/农场、5/农场；被抓也占次数（不能重试到成功）', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock()
   const plots = PLOT_IDS.map((id) => plantedPlot(id, 'tomato', { grownMs: CROPS.tomato.growMs }))
   await writeFarm(dir, farmFile({ plots }))
   const store = await createFarmStore(dir, { now: clock.now })
 
-  // 被抓：不标 stolenBy、不占次数，但日志有 qty 0 + who。
+  // 被抓住：不标 stolenBy，但这次尝试照样计入访客/农场当日次数。
   const caught = await store.markStolen('p1', VISITOR_A, { who: '阿蟹', caught: true })
   assert.deepEqual(caught, { ok: false, error: 'guard', caught: true, crop: 'tomato', qty: 0, persisted: true })
   assert.deepEqual(store.snapshot().plots[0].stolenBy, [])
   assert.equal(store.snapshot().log[0].qty, 0)
   assert.equal(store.snapshot().log[0].who, '阿蟹')
+  assert.equal(store.visitLimits(VISITOR_A).steal.usedInVisit, 1)
 
-  // 3 次成功（p1/p2/p3）后这位访客在第 4 块地被 cap。
-  assert.equal((await store.markStolen('p1', VISITOR_A)).ok, true)
-  assert.equal((await store.markStolen('p2', VISITOR_A)).ok, true)
-  assert.equal((await store.markStolen('p3', VISITOR_A)).ok, true)
-  assert.equal((await store.markStolen('p4', VISITOR_A)).error, 'cap')
+  // 同一块地再被抓两次：次数耗尽，第 4 次是 cap，不是又一次 guard。
+  assert.equal((await store.markStolen('p1', VISITOR_A, { caught: true })).error, 'guard')
+  assert.equal((await store.markStolen('p1', VISITOR_A, { caught: true })).error, 'guard')
+  assert.equal((await store.markStolen('p1', VISITOR_A, { caught: true })).error, 'cap')
+  assert.equal(store.visitLimits(VISITOR_A).steal.usedInVisit, 3)
 
-  // 农场总上限 5：B 偷两块后到 5，C 也被 cap。
+  // 农场总上限 5：B 再偷两块到 5，C 也被 cap（A 的三次尝试已占掉 3）。
   assert.equal((await store.markStolen('p4', VISITOR_B)).ok, true)
   assert.equal((await store.markStolen('p3', VISITOR_B)).ok, true)
   assert.equal((await store.markStolen('p2', '33333333-3333-4333-8333-333333333333')).error, 'cap')
@@ -620,6 +621,51 @@ test('markStolen 日限额：3/访客/农场、5/农场；被抓只写日志不�
   assert.equal(limits.steal.perVisit, 3)
   assert.equal(limits.steal.usedInVisit, 3)
   assert.equal(limits.steal.usedOnFarm, 5)
+})
+
+test('touch：雇佣等农场动作重置待机计时；不影响露水余额', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  await writeFarm(dir, farmFile({ dew: 4, dewEarned: 4 }))
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  clock.advance(9 * MINUTE_MS)
+  const touched = await store.touch()
+  assert.equal(touched.ok, true)
+  assert.equal(touched.dewAt, clock.now())
+  const file = await readFarm(dir)
+  assert.equal(file.dewAt, clock.now(), '待机锚点被推到点击那一刻')
+  assert.equal(file.dew, 4, '重置待机不是奖励/扣除露水')
+
+  // 重置后 10 分钟才重新攒到 1 滴（部分间隔不跨过这次点击）。
+  clock.advance(10 * MINUTE_MS)
+  await store.tick()
+  const after = await readFarm(dir)
+  assert.equal(after.dew, 5)
+})
+
+test('noteHire / noteSettle：日志带 who/wage/hours/earned，仍然只保留最近 50 条', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  await store.noteHire({ who: '  楼上的 柯基 ', hours: 4, wage: 40 })
+  await store.noteSettle({ who: '阿蟹', wage: 40, earned: 18 })
+  const log = store.snapshot().log
+  assert.equal(log[0].kind, 'settle')
+  assert.equal(log[0].who, '阿蟹')
+  assert.equal(log[0].wage, 40)
+  assert.equal(log[0].earned, 18)
+  assert.equal(log[1].kind, 'hire')
+  assert.equal(log[1].who, '楼上的 柯基')
+  assert.equal(log[1].hours, 4)
+  assert.equal(log[1].wage, 40)
+  assert.equal((await readFarm(dir)).log[0].kind, 'settle', '日志落盘')
+
+  for (let index = 0; index < MAX_FARM_LOG + 5; index += 1) {
+    await store.noteHire({ who: '邻居', hours: 2, wage: 1 })
+  }
+  assert.equal(store.snapshot().log.length, MAX_FARM_LOG)
 })
 
 test('markHelped：生长中才可帮、+10% 不改 waterings、每块地一次、日志带 who', async (t) => {

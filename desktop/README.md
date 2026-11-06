@@ -37,8 +37,10 @@ env -u ELECTRON_RUN_AS_NODE DSH_ZOO_DESKTOP_DEBUG=1 \
 ```
 
 debug 模式 = `--dsh-zoo-debug` **或** 环境变量 `DSH_ZOO_DESKTOP_DEBUG=1`。
-它打开 devTools，并接受下面那组 `debug-*` / `pointer` 命令；两者效果完全一样，
+它打开 devTools，并接受下面那组 `debug-*` / `pointer` 命令；两者效果完全一样。
 后者只是方便在宿主 spawn 出来的 helper 上临时开调试，不用改 argv。
+普通运行（没有 `--dsh-zoo-debug`）的 helper 在 `normalizeHostCommand` 就拒绝全部 `debug-*`，
+不会执行、也不会静默通过。
 
 **所有 helper 自己的开关都必须带 `--dsh-zoo-` 前缀**：Electron 会消费 `--debug` 之类的已知
 开关（实测 `--debug` 直接以 exit 9 退出），前缀保证它们原样落到 `process.argv`。
@@ -102,7 +104,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-gift-submit` | `text` | 调试/冒烟：在「带派」小窗里填一段字条并按提交（走真实 form submit 处理器），验窗口 → 主进程 → 宿主的申请链路 |
 | `debug-gift-remove` | — | 调试/冒烟：点「带派」小窗背包列表里第一个可撤的「撤掉」 |
 | `debug-farm-submit` | `action`, `plotId?`, `cropId?`, `qty?`, `deviceId?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 调试/冒烟：在农场小窗里提交一次动作，走和用户点击相同的 preload → IPC 窄口 |
-| `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
+| `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'\|'log'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
 
 ## 右键菜单（ticket 22）
 
@@ -339,8 +341,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   宿主发 `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
   正出门串门时同一扇窗进入访客模式，先推 `visit.state:'loading'`，拿到主人快照后变
   `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。
-- 页签：农场 / 交易所 / 雇工。记录页签暂未开放；最近 8 条日志画在农场页底部。
-  「记录」按钮是 `disabled`，不会发请求。
+- 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 50 条；窗口顶部有一条
+  「驮包」只显示偷来的作物与在途工资（宿主算好下发，窗口不记账）。
 - 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
   （只带 `plotId`，种地再带 `cropId`）；交易所 `farm-buy-seed` / `farm-sell-crop`
   （只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
@@ -354,7 +356,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 - 失焦、Esc、主窗 `hide`、helper 退出都会关窗；失焦不关（macOS 中文输入法候选窗会触发
   blur，和改名/带派同一条取舍）。
 - 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会分别
-  截桌面地块条、农场页、交易所页、雇工页和访客偷/帮视图；`debug-farm-tab` 只用于这一步。
+  截桌面地块条、农场页、交易所页、雇工页、记录页和访客偷/帮视图；`debug-farm-tab` 只用于这一步。
 
 ## 多显示器 / 分辨率
 

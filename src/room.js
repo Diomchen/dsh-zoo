@@ -605,16 +605,16 @@ export function createRoom ({
   }
 
   /**
-   * 结束「我在外打工」的镜像（ticket 44）。只清匹配的那一份；重复调用返回 false。
-   * 结束事件排队给 service（role:'worker' 指我的宠物是雇工）。
+   * 结束一份「打工」镜像（ticket 44）：working/worker 只差状态键、role 与昵称来源，
+   * 结束事件都排队给 service。只清匹配的那一份；重复调用返回 false。
    */
-  function finishWorking (contractId, { at = nowMs(), reason = 'recall', notice = null } = {}) {
-    const work = state.work
-    if (work === null || work.contractId !== contractId) return false
-    state.work = null
+  function finishContractMirror (key, role, contractId, { at = nowMs(), reason = 'recall', notice = null } = {}) {
+    const mirror = state[key]
+    if (mirror === null || mirror.contractId !== contractId) return false
+    state[key] = null
     state.completedContracts.push({
-      role: 'worker',
-      contractId: work.contractId,
+      role,
+      contractId: mirror.contractId,
       endedAt: Number.isFinite(at) ? at : nowMs(),
       reason
     })
@@ -623,20 +623,16 @@ export function createRoom ({
     return true
   }
 
+  /**
+   * 结束「我在外打工」的镜像（ticket 44）。role:'worker' 指我的宠物是雇工。
+   */
+  function finishWorking (contractId, options = {}) {
+    return finishContractMirror('work', 'worker', contractId, options)
+  }
+
   /** 结束「别人在我家打工」的镜像（ticket 44）。role:'employer'。 */
-  function finishWorker (contractId, { at = nowMs(), reason = 'recall', notice = null } = {}) {
-    const worker = state.worker
-    if (worker === null || worker.contractId !== contractId) return false
-    state.worker = null
-    state.completedContracts.push({
-      role: 'employer',
-      contractId: worker.contractId,
-      endedAt: Number.isFinite(at) ? at : nowMs(),
-      reason
-    })
-    while (state.completedContracts.length > 40) state.completedContracts.shift()
-    if (notice !== null) pushNotice(notice, at)
-    return true
+  function finishWorker (contractId, options = {}) {
+    return finishContractMirror('worker', 'employer', contractId, options)
   }
 
   /** 清掉一位入站访客并写记录；被拒绝/名单收紧时用。 */

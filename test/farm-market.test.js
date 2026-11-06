@@ -137,7 +137,7 @@ test('错误码：bad-crop / bad-qty / no-coin / no-seed；失败不动任何一
   const noCoin = await farm.buySeed('pumpkin', 1)
   assert.equal(noCoin.error, 'no-coin', '初始 30 硬币买不起 36 的南瓜种子')
   const noCrop = await farm.sellCrop('tomato', 1)
-  assert.equal(noCrop.error, 'no-seed')
+  assert.equal(noCrop.error, 'no-crop')
   assert.match(noCrop.notice, /没有这种作物/)
   assert.equal((await farm.buySeed('tomato', 0)).error, 'bad-qty')
   assert.equal((await farm.buySeed('tomato', 2.5)).error, 'bad-qty', '只认整数')

@@ -144,8 +144,11 @@ export function refundFor (wage, earned) {
  * 只给 UI 显示用的「大概能拿多少」：合同还在跑时按 now 估，结算时以雇主报文里的
  * `servedMs` 为准。**绝不**用这个值动钱。
  */
-export function provisionalEarned (record, now = Date.now()) {
+export function provisionalEarned (record, now) {
   if (record === null || typeof record !== 'object') return 0
+  // 纯函数：时钟必须由调用方给（窗口/测试各用各的 now），绝不回落到 Date.now()。
+  const current = Number(now)
+  if (!Number.isFinite(current) || current <= 0) return 0
   const wage = Number(record.wage)
   const contractMs = contractMsOf(record.startedAt, record.endsAt)
   if (contractMs <= 0) return 0
@@ -153,8 +156,27 @@ export function provisionalEarned (record, now = Date.now()) {
   const anchor = Number.isFinite(ackedAt) && ackedAt > 0 ? ackedAt : Number(record.startedAt)
   if (!Number.isFinite(anchor)) return 0
   const ended = Number(record.endedAt)
-  const endAt = Number.isFinite(ended) && ended > 0 ? Math.min(ended, now) : now
+  const endAt = Number.isFinite(ended) && ended > 0 ? Math.min(ended, current) : current
   return earnedFor(wage, servedMsOf(anchor, endAt, contractMs), contractMs)
+}
+
+/**
+ * 挂牌能不能被雇（ticket 44 D1 / SPEC v5「雇佣」）：只由「开没开」与
+ * 「宠物在不在家」决定，不看行情新鲜度（那是接收端的门）。
+ *
+ * - `off`：主人没开挂牌；
+ * - `visiting`：宠物正在串门/去串门的路上；
+ * - `working`：宠物在外打工；
+ * - `ready`：在家、空闲，可以被雇。
+ *
+ * `guard` 不在这个函数里：挂牌里的 `guard` 是**雇工贡献的 0.5**，
+ * 不是 `farmGuard()` 合成后的 0.3/0.5/0.8。
+ */
+export function hireAvailability ({ enabled = false, visiting = false, working = false } = {}) {
+  if (enabled !== true) return { available: false, reason: 'off' }
+  if (visiting === true) return { available: false, reason: 'visiting' }
+  if (working === true) return { available: false, reason: 'working' }
+  return { available: true, reason: 'ready' }
 }
 
 export function isContractStatus (value) {

@@ -323,6 +323,41 @@
         font-variant-numeric: tabular-nums;
         color: var(--ink);
       }
+      /* 驮包（ticket 43/44）：一块跨页签的窄条，空时整块隐藏。 */
+      .carried {
+        display: flex;
+        align-items: baseline;
+        gap: 7px;
+        padding: 6px 9px;
+        border-radius: 10px;
+        background: rgba(224, 163, 60, 0.14);
+        box-shadow: inset 0 0 0 1px rgba(224, 163, 60, 0.34);
+        font-size: 10.5px;
+        line-height: 1.45;
+        color: var(--ink-soft);
+      }
+      .carried[hidden] {
+        display: none !important;
+      }
+      .carried h2 {
+        margin: 0;
+        flex: none;
+        font-size: 10.5px;
+        font-weight: 700;
+        color: var(--soil-deep);
+      }
+      .carried ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px 10px;
+        min-width: 0;
+      }
+      .carried .when {
+        color: var(--muted);
+      }
       .log {
         flex: 1 1 auto;
         min-height: 48px;
@@ -647,8 +682,14 @@
         <button class="tab active" type="button" role="tab" data-tab="farm" aria-selected="true">农场</button>
         <button class="tab" type="button" role="tab" data-tab="market" aria-selected="false">交易所</button>
         <button class="tab" type="button" role="tab" data-tab="hire" aria-selected="false">雇工</button>
-        <button class="tab" type="button" role="tab" disabled title="记录还没开放">记录</button>
+        <button class="tab" type="button" role="tab" data-tab="log" aria-selected="false">记录</button>
       </nav>
+
+      <!-- 驮包（ticket 43/44）：跨页签的「在路上的东西」，只显示，不参与记账。 -->
+      <section class="carried" id="carried" aria-label="驮包" hidden>
+        <h2>驮包</h2>
+        <ul id="carried-items"></ul>
+      </section>
 
       <section class="page" id="page-farm" role="tabpanel" aria-label="农场">
         <section class="visitor-banner" id="visitor-banner" data-state="loading" hidden></section>
@@ -656,9 +697,11 @@
         <section class="plots" id="plots" aria-label="四块地"></section>
 
         <section class="inventory" id="inventory" aria-label="库存"></section>
+      </section>
 
+      <section class="page" id="page-log" role="tabpanel" aria-label="记录" hidden>
         <section class="log">
-          <h2>最近</h2>
+          <h2>最近 50 条</h2>
           <ul id="log"></ul>
         </section>
       </section>

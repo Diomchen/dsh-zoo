@@ -2343,7 +2343,14 @@ async function verifyFarmWindow () {
     contractCount: 1,
     hire: { enabled: true, wagePerHour: 10, minHours: 2, maxHours: 8 },
     guard: 0.8,
-    log: [{ at: Date.now(), kind: 'plant', crop: 'tomato', qty: 1 }]
+    log: [
+      { at: Date.now(), kind: 'settle', who: '阿蟹', wage: 40, earned: 18 },
+      { at: Date.now() - 60000, kind: 'hire', who: '阿蟹', hours: 4, wage: 40 },
+      { at: Date.now() - 120000, kind: 'plant', crop: 'tomato', qty: 1 }
+    ],
+    carried: [
+      { kind: 'crop', crop: 'tomato', qty: 1, at: Date.now(), until: Date.now() + 1800000 }
+    ]
   }
   // 交易所页（票 41/45）：价格、bid、局域网指数和最近成交都要有值，截图才不是空表。
   const marketAt = Date.now()
@@ -2551,6 +2558,25 @@ async function verifyFarmWindow () {
   }
   assert(hireVisible > hireImage.width * hireImage.height * 0.2, '雇工页画出了可见内容')
 
+  // 票 45：记录页是第四页签，50 条日志自己滚动；驮包条也在这页可见。
+  const logPath = join(OUT_DIR, 'farm-log.png')
+  client.send({ type: 'debug-farm-tab', tab: 'log', id: 'smoke-farm-log-tab' })
+  await sleep(600)
+  client.send({ type: 'shot', id: 'smoke-farm-log-shot', path: logPath, window: 'farm' })
+  const logShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-log-shot',
+    8000,
+    '记录页截图'
+  )
+  assert(logShot.width > 0 && existsSync(logPath), '记录页截图落盘：' + logPath)
+  const logImage = decodePng(readFileSync(logPath))
+  let logVisible = 0
+  for (let index = 3; index < logImage.data.length; index += 4) {
+    if (logImage.data[index] > 16) logVisible += 1
+  }
+  assert(logVisible > logImage.width * logImage.height * 0.2, '记录页画出了可见内容')
+
   // 4) 窗口 → 主进程 → 宿主：真渲染进程里提交一次种地，helper 必须报一条窄申请。
   const actionMark = client.mark()
   client.send({
@@ -2671,6 +2697,7 @@ async function verifyFarmWindow () {
     noteComposite(pngPath, '45-farm-window-composited.png')
     noteComposite(marketPath, '45-farm-market-composited.png')
     noteComposite(hirePath, '45-farm-hire-composited.png')
+    noteComposite(logPath, '45-farm-log-composited.png')
     noteComposite(stealPath, '45-farm-steal-composited.png')
     // 地块条截图是整张透明桌面；按命中矩形裁到地块条附近再合成，笔记里才看得清。
     const noteStrip = (src, state, name) => {

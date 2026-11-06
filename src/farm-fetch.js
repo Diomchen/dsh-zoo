@@ -1,4 +1,10 @@
-import { CROP_IDS, isCropId } from './farm-rules.js'
+import {
+  MAX_CONTRACT_HOURS,
+  MAX_CONTRACT_WAGE,
+  MIN_CONTRACT_HOURS,
+  MIN_CONTRACT_WAGE
+} from './contracts-rules.js'
+import { CROP_IDS, MAX_GUARD, isCropId } from './farm-rules.js'
 import { isPrivateAddress } from './skin-fetch.js'
 import { isVisitId, normalizeNickname } from './protocol.js'
 
@@ -23,7 +29,6 @@ export const FARM_FETCH_COOLDOWN_MS = 60 * 1000
 const MAX_PLOTS = 4
 const STAGES = new Set(['empty', 'growing', 'mature'])
 const MAX_LIMIT = 99
-const MAX_GUARD = 0.8
 
 export function createFarmFetcher (options = {}) {
   const fetchImpl = typeof options.fetchImpl === 'function' ? options.fetchImpl : globalThis.fetch
@@ -253,9 +258,15 @@ function normalizeHire (raw) {
   const maxHours = Number(raw.maxHours)
   return {
     enabled: raw.enabled === true,
-    wagePerHour: Number.isFinite(wage) ? Math.min(100, Math.max(1, Math.floor(wage))) : 10,
-    minHours: Number.isFinite(minHours) ? Math.min(8, Math.max(2, Math.floor(minHours))) : 2,
-    maxHours: Number.isFinite(maxHours) ? Math.min(8, Math.max(2, Math.floor(maxHours))) : 8
+    wagePerHour: Number.isFinite(wage)
+      ? Math.min(MAX_CONTRACT_WAGE, Math.max(MIN_CONTRACT_WAGE, Math.floor(wage)))
+      : 10,
+    minHours: Number.isFinite(minHours)
+      ? Math.min(MAX_CONTRACT_HOURS, Math.max(MIN_CONTRACT_HOURS, Math.floor(minHours)))
+      : MIN_CONTRACT_HOURS,
+    maxHours: Number.isFinite(maxHours)
+      ? Math.min(MAX_CONTRACT_HOURS, Math.max(MIN_CONTRACT_HOURS, Math.floor(maxHours)))
+      : MAX_CONTRACT_HOURS
   }
 }
 

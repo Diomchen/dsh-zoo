@@ -18,6 +18,9 @@ const marketWalletEl = document.getElementById('market-wallet')
 const farmPageEl = document.getElementById('page-farm')
 const marketPageEl = document.getElementById('page-market')
 const hirePageEl = document.getElementById('page-hire')
+const logPageEl = document.getElementById('page-log')
+const carriedEl = document.getElementById('carried')
+const carriedItemsEl = document.getElementById('carried-items')
 const contractsEl = document.getElementById('contracts')
 const listingsEl = document.getElementById('listings')
 const hireFormEl = document.getElementById('hire-form')
@@ -63,7 +66,8 @@ const RESULT_CODE_TEXT = {
   'bad-qty': '数量要在 1–99 之间。',
   'plot-occupied': '这块地已经种上了，先收掉再种。',
   'not-mature': '还没熟呢，再等一会儿。',
-  'no-seed': '没有这种种子或作物了。',
+  'no-seed': '没有这种种子了，先去交易所买。',
+  'no-crop': '没有这种作物了，先种一点再来卖。',
   'no-coin': '硬币不够，先去卖点作物。',
   cap: '仓库装不下了，先卖掉一点再来。',
   'market-busy': '交易所这会儿太忙了，等一下再试。',
@@ -505,7 +509,8 @@ function renderInventory () {
 
 function renderLog () {
   logEl.textContent = ''
-  const entries = farm === null || !Array.isArray(farm.log) ? [] : farm.log.slice(0, 8)
+  // 记录页（ticket 45）：宿主给最近 50 条；列表自己滚动，不把窗口撑高。
+  const entries = farm === null || !Array.isArray(farm.log) ? [] : farm.log.slice(0, 50)
   if (entries.length === 0) {
     const empty = document.createElement('li')
     empty.className = 'empty'
@@ -519,7 +524,17 @@ function renderLog () {
     const crop = cropMeta(entry.crop)
     const kind = LOG_TEXT[entry.kind] ?? '动作'
     const who = typeof entry.who === 'string' && entry.who !== '' ? '「' + entry.who + '」' : ''
-    if (entry.kind === 'steal' && Number(entry.qty) === 0) {
+    if (entry.kind === 'hire') {
+      const hours = Number(entry.hours)
+      const wage = Number(entry.wage)
+      text.textContent = (who === '' ? '' : who + ' ') + '雇工' +
+        (Number.isFinite(hours) && hours > 0 ? ' ' + hours + ' 小时' : '') +
+        (Number.isFinite(wage) && wage > 0 ? ' · ' + wage + ' 硬币' : '')
+    } else if (entry.kind === 'settle') {
+      const earned = Number(entry.earned)
+      text.textContent = (who === '' ? '' : who + ' ') + '结算' +
+        (Number.isFinite(earned) ? ' · ' + earned + ' 硬币' : '')
+    } else if (entry.kind === 'steal' && Number(entry.qty) === 0) {
       text.textContent = who === '' ? '被抓住了' : who + '被抓住了'
     } else if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
       text.textContent = who + (entry.kind === 'steal' ? '偷了 ' : '帮了 ') +
@@ -535,6 +550,38 @@ function renderLog () {
     item.appendChild(when)
     logEl.appendChild(item)
   }
+}
+
+/**
+ * 驮包（ticket 43/44）：只画宿主给的 carried 列表；
+ * 偷来的作物「在驮包里」到串门结束，工资在合同结算前显示。没有条目就整块隐藏。
+ */
+function renderCarried () {
+  if (carriedEl === null || carriedItemsEl === null) return
+  const items = farm === null || !Array.isArray(farm.carried) ? [] : farm.carried
+  carriedItemsEl.textContent = ''
+  if (items.length === 0) {
+    carriedEl.hidden = true
+    return
+  }
+  carriedEl.hidden = false
+  for (const entry of items) {
+    const item = document.createElement('li')
+    if (entry !== null && typeof entry === 'object' && entry.kind === 'wage') {
+      const amount = Number(entry.amount)
+      item.textContent = '🪙 约 ' + (Number.isFinite(amount) ? Math.floor(amount) : 0) +
+        ' 硬币 · 工资在驮包里'
+    } else if (entry !== null && typeof entry === 'object' && entry.kind === 'crop') {
+      const crop = cropMeta(entry.crop)
+      const qty = Number(entry.qty)
+      item.textContent = (crop === null ? '作物' : crop.emoji + ' ' + crop.name) +
+        ' ×' + (Number.isFinite(qty) && qty > 0 ? Math.floor(qty) : 1) + ' · 在驮包里'
+    } else {
+      continue
+    }
+    carriedItemsEl.appendChild(item)
+  }
+  carriedEl.hidden = carriedItemsEl.childElementCount === 0
 }
 
 function readMarketQty (cropId) {
@@ -656,14 +703,14 @@ function renderMarket () {
     // 交易所页的「局域网指数」列：没有邻居样本时明确写「本机行情」；
     // 有样本但超过 2 分钟没更新时灰掉（值仍是最后一次算出的中位数）。
     const indexEntry = marketIndexEntry(cropId)
-    if (indexEntry === null) {
+    const samples = Number(indexEntry?.samples)
+    if (indexEntry === null || !Number.isFinite(samples) || samples <= 0) {
+      // samples 0 = 没有 peer 报价，指数就是本机价；不能画成「有邻居的指数」。
       stat('局域网指数', '本机行情', 'index-local')
     } else {
-      const samples = Number(indexEntry.samples)
-      const suffix = Number.isFinite(samples) && samples > 0 ? ' · ' + Math.floor(samples) + ' 份' : ''
       stat(
         '局域网指数',
-        formatMarketPrice(indexEntry.price) + suffix,
+        formatMarketPrice(indexEntry.price) + ' · ' + Math.floor(samples) + ' 份',
         indexEntry.stale === true ? 'index-stale' : 'index-live'
       )
     }
@@ -974,6 +1021,7 @@ function render () {
   renderPlots()
   renderInventory()
   renderLog()
+  renderCarried()
   renderMarket()
   if (activeTab === 'hire') renderHire()
 }
@@ -1054,7 +1102,7 @@ plotsEl.addEventListener('click', (event) => {
 })
 
 function selectTab (name) {
-  activeTab = name === 'market' ? 'market' : name === 'hire' ? 'hire' : 'farm'
+  activeTab = name === 'market' ? 'market' : name === 'hire' ? 'hire' : name === 'log' ? 'log' : 'farm'
   for (const tab of tabs) {
     const active = tab.dataset.tab === activeTab
     tab.classList.toggle('active', active)
@@ -1063,6 +1111,7 @@ function selectTab (name) {
   farmPageEl.hidden = activeTab !== 'farm'
   marketPageEl.hidden = activeTab !== 'market'
   if (hirePageEl !== null) hirePageEl.hidden = activeTab !== 'hire'
+  if (logPageEl !== null) logPageEl.hidden = activeTab !== 'log'
   if (activeTab === 'hire') renderHire()
 }
 

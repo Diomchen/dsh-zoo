@@ -317,6 +317,7 @@ export function stealSucceeds (guard, random = Math.random) {
   const value = Number(guard)
   const safeGuard = Number.isFinite(value) ? Math.min(MAX_GUARD, Math.max(0, value)) : 0
   const roll = typeof random === 'function' ? Number(random()) : Number.NaN
-  const dice = Number.isFinite(roll) ? Math.min(1, Math.max(0, roll)) : Math.random()
+  // 随机源坏了也不能回落到全局 Math.random()（那不是注入的判定）：按 0 处理＝必被抓住。
+  const dice = Number.isFinite(roll) ? Math.min(1, Math.max(0, roll)) : 0
   return dice >= safeGuard
 }

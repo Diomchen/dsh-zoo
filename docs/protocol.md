@@ -101,11 +101,11 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `reason`（结算） | `work-settle` | 固定枚举 `completed` / `recall` / `employer-end` / `offline` / `expired` |
 | `at` | `market-digest` | 发起方时钟的正整数毫秒；接收方只认与本机时钟相差 ≤2 分钟的样本 |
 | `prices` | `market-digest` | `{ <cropId>: number }`；只认三种作物、有限数、夹在 `[base×0.5, base×2]`；坏条目只丢那一种 |
-| `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working` 或 `null`；坏形状整包丢 |
+| `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working`（旧版本可能给 `null`）；`available` 只在这只宠物真的能被雇时为 true；坏形状整包丢 |
 | `contractId` | `work-ack`、`work-recall`、`work-end`、`work-settle` | 合同 UUID；`work-end` 在取消一笔还没 ack 的请求时可改用 `requestId` |
 | `hours` / `wagePerHour` / `fee` | `work-request` | 时长 2–8 小时、时薪 1–100 的整数；`fee` 是 1..40 的整数，必须等于 `ceil(时薪 × 时长 × 5%)`（最低 1） |
 | `startedAt` / `endsAt` | `work-ack` | 正整数毫秒；`endsAt > startedAt` 且差值 ≤8 小时 |
-| `guard` | `work-ack`、`market-digest.hire` | 0..0.8 的有限数；v1 只有 0.3（主人在家）/0.5（雇工）/0.8（两者） |
+| `guard` | `work-ack`、`market-digest.hire` | 0..0.8 的有限数；`work-ack` 是雇工贡献的 0.5，`market-digest.hire` 同样是**雇工贡献的 0.5**，不是 `farmGuard()` 的合成值（0.3/0.5/0.8） |
 | `servedMs` / `earned` | `work-settle` | 服务毫秒 0..8 小时；工钱 0..800 的整数；`work-settle-ack` 回的 `earned` 同一范围 |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
@@ -542,12 +542,15 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
   两者都 ≤48；跨本地日归零。`dewEarned` 是对 SPEC v5 字段表的一个 additive 字段。
 - `farm.guard` 是 0..0.8 的守卫值；`farm.worker` 是 `null` 或
   `{ nickname, contractId, endsAt, guard: 0.5 }`——**不带 deviceId**。
-- `farm.hire` 就是本机挂牌；`farm.log` 最新在前，最多 20 条，条目字段
-  `{ at, kind, crop?, qty, who? }`。`kind` 目前是 `plant` / `harvest` / `steal` / `help`；
-  `who` 只出现在偷/帮日志里（昵称，≤32 码点），被抓住是 `qty: 0`。
+- `farm.hire` 就是本机挂牌；`farm.log` 最新在前，**文件/农场小窗最多 50 条**，
+  `/state.farm.log` 只给最近 **20** 条。条目字段 `{ at, kind, crop?, qty, who?, hours?, wage?, earned? }`。
+  `kind` 是 `plant` / `harvest` / `steal` / `help` / `hire` / `settle`；`who` 出现在
+  偷/帮/雇/结算日志里（昵称，≤32 码点），被抓住是 `qty: 0`。`hire` 带 `hours`/`wage`，
+  `settle` 带 `wage`/`earned`，都只用于显示。
 - `market.prices` 保持 `market.json` 的形状（`base/price/volume24h/at`），**不带 `bid`**；
   `bid` 只出现在农场小窗的交易所页。`market.history` 最新在前，最多 50 笔；
-  `market.index` 只在至少有一个新鲜 peer 样本时出现，`samples` 含本机。
+  `market.index` 在 store 起来后每种作物都有一条：有新鲜 peer 时是 peer 价格的中位数
+  （`samples` = peer 数），没有 peer 时是本机价、`samples: 0`（窗口画成「本机行情」）。
 - `contracts` 的每一项是公开视图：
   `{ id, requestId, workerDeviceId, workerNickname, hours, wagePerHour, wage, fee,
      startedAt, endsAt, ackedAt, status, earned, endedAt, endReason, settled,
@@ -569,7 +572,7 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 | `water` / `farm-water` | `{ plotId }` | `{ ok, action, plotId, plot, coins, seeds, crops, dew, dewEarned, persisted }` | `bad-plot` `already-watered` `no-dew` `starting` |
 | `fertilize` / `farm-fertilize` | `{ plotId }` | 同上 | `bad-plot` `already-fertilized` `no-dew` `starting` |
 | `buy-seed` / `farm-buy-seed` | `{ cropId, qty }` | `{ ok, action, cropId, qty, unitPrice, total, price, coins, seeds, crops, dew, dewEarned, notice, persisted }` | `bad-crop` `bad-qty` `no-coin` `cap` `market-busy` `starting` |
-| `sell-crop` / `farm-sell-crop` | `{ cropId, qty }` | 同上，`action` 是 `sell-crop`，`price` 是成交后的本机价 | `bad-crop` `bad-qty` `no-seed` `market-busy` `starting` |
+| `sell-crop` / `farm-sell-crop` | `{ cropId, qty }` | 同上，`action` 是 `sell-crop`，`price` 是成交后的本机价 | `bad-crop` `bad-qty` `no-crop` `market-busy` `starting` |
 | `hire` | `{ deviceId, hours }` | `{ ok, action: "hire", contractId }`（收到 `work-ack` 才算成功） | `bad-device-id` `bad-hours` `own-pet` `worker-unavailable` `already-hired` `busy` `no-coin` `starting` `disposed` |
 | `recall-worker` | `{ contractId }` | `{ ok, action, contractId }`；合同已结束时带 `alreadyEnded: true` | `bad-device-id` `contract-not-found` `contract-ended` `starting` |
 | `end-contract` | `{ contractId }` | `{ ok, action, contractId }`；还在 pending 时带 `cancelled: true` | `bad-device-id` `contract-not-found` `starting` |
@@ -579,7 +582,7 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 
 `plant` / `harvest` / `water` / `fertilize` 的 `plot` 是修改后的完整地块；
 `buy-seed` / `sell-crop` 的 `qty` 必须是 1–99，每分钟最多 10 笔（买 + 卖共享），
-超了是 `market-busy`。卖作物时仓库不够的 `no-seed` 文案会说“没有这种作物”，
+超了是 `market-busy`。卖作物时仓库不够是 `no-crop`（和买种子的 `no-seed` 分开），
 与买种子时的“没有种子”区分。`hire-listing` 的 `minHours <= maxHours`，范围 2–8；
 `hire` 的 `hours` 也必须在 2–8 之间，且落在对方挂牌的 `minHours..maxHours` 内。
 
@@ -596,7 +599,8 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 | `plot-occupied` | 这块地已经种了 |
 | `not-mature` | 收获时还没熟 |
 | `already-watered` / `already-fertilized` | 这一株已经浇过 / 施过 |
-| `no-seed` | 仓库没有这种种子（买种子的语境）；卖作物时表示没有这种作物 |
+| `no-seed` | 仓库没有这种种子（买种子的语境） |
+| `no-crop` | 卖作物时仓库没有这种作物 |
 | `no-coin` / `no-dew` | 硬币 / 露水不够 |
 | `bad-qty` | 数量不是 1–99 的整数 |
 | `cap` | 仓库/次数到上限：种子或作物 999、偷菜/帮忙日限额、访客本机跨农场限额 |
@@ -654,13 +658,16 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
   重发复用同一个 `requestId` 和同一串字节。
 - 偷：目标成熟；一次 1 个；这块地这一轮还没被这位访客偷过。成功 → 访客仓库 +1、
   主人 `stolenBy` + 访客、收获时少 1、主人日志一条；失败 → 这次白跑，没有罚款。
+  **被抓也消耗一次当日次数**（访客本机跨农场 10、这家的访客 3、这家农场 5），
+  `stolenBy` 只在成功时标记；换新 `requestId` 重试不能绕过上限。
 - 帮：目标还在生长；这位访客这一轮没帮过这块地。访客花 **1 露水**（**发出前**扣，
   失败/超时退回），地块 +10% 生长，访客得 **1 硬币**。成熟地/空地帮忙是 `bad-plot`。
 - 上限：偷 3/访客/农场/天、5/农场/天、10/访客/天；帮 3/访客/农场/天、5/访客/天；
   每块地每轮每访客各一次。“10/访客/天”和“5/访客/天”是访客本机跨农场账本，
   主人只回自己农场的计数。
 - 守卫 = 主人在家 0.3（主人在串门/打工时为 0）+ 雇工 0.5，封顶 **0.8**；
-  成功率 `1 − 守卫`。守卫判定在主人侧，随机源可注入；被抓住只写一条 `qty:0` 的日志。
+  成功率 `1 − 守卫`。守卫判定在主人侧，随机源可注入；被抓住只写一条 `qty:0` 的日志，
+  同一访客每天的桌面提示只发一次（日志仍每次一条、有界 50）。
 
 ### 行情 gossip（`market-digest`）
 
@@ -678,8 +685,9 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 - 接收端四道门：只认已放行邻居；`at` 与本机时钟相差 ≤**2 分钟**；同一 peer
   **30 秒最多 1 条**；价格只认三种作物、有限数、`[base×0.5, base×2]`。坏价格只丢那一种，
   坏 `hire`/形状/时间才整包丢。未知字段在解析时丢掉。
-- 每家按 `deviceId` 只留最近一条 digest；指数取本机价格 + 所有新鲜 peer 样本的**中位数**，
-  至少一个 peer 样本才产出条目（`samples` 含本机，所以一个 peer 时是 2）。
+- 每家按 `deviceId` 只留最近一条 digest；指数只取**新鲜 peer 价格的中位数**（不含本机），
+  `samples` 是 peer 样本数（一个 peer 时是 1）。没有 peer 样本时指数退化为本机价、
+  `samples: 0`，交易所页显示「本机行情」。
 - 成交价：`effective = 0.85 × 本机 price + 0.15 × 新鲜指数`；没有新鲜指数时只用本机价。
   `bid = round(effective × 0.9)`。价格夹在 `[base×0.5, base×2]`；每 10 分钟向 base
   回归 3%。卖 `q` 个：`price = clamp(price × (1 − 0.12 × q / 20), base×0.5, base×2)`；
@@ -705,7 +713,9 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 流程与规则：
 
 1. **挂牌**：主人在 `farm.json` 的 `hire` 里写 `enabled/wagePerHour/minHours/maxHours`，
-   随 `market-digest.hire` 广播。只有在线、在家、没在串门/打工的宠物能被雇。
+   随 `market-digest.hire` 广播；`available`/`reason` 是真实可用性（ready/off/visiting/
+   working），`guard` 是雇工贡献的 0.5（不是合成后的农场守卫）。只有在线、在家、
+   没在串门/打工的宠物能被雇。
 2. **请求**：雇主选 `deviceId` + `hours`，宿主算 `wage = 时薪 × 时长`、
    `fee = ceil(wage × 5%)`（最低 1，烧掉），先落 pending 合同并扣 `wage + fee`，再发
    `work-request`。首次 + 两次重发（约 500ms），1.8 秒没 ack 就取消并全额退款。
