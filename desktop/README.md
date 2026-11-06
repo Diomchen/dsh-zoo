@@ -80,7 +80,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
 | `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行。地址可能带 DSH 的 launch token：helper 只转交，不写日志、也不回传给渲染端 |
 | `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
-| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` 抓的是「带派」小窗 |
+| `farm-window` | `open`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'`, `visit?`, `plotId?` | 打开或刷新农场小窗（ticket 40/41/43/44）。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
+| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'\|'farm'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` / `window:'farm'` 抓对应小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
 | `quit` | — | 优雅退出 |
@@ -100,6 +101,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-lock-input` | `locked` | 调试/冒烟：锁住真实鼠标/焦点事件，只接受 `debug-dispatch` 的合成输入（同时清掉悬停与租约） |
 | `debug-gift-submit` | `text` | 调试/冒烟：在「带派」小窗里填一段字条并按提交（走真实 form submit 处理器），验窗口 → 主进程 → 宿主的申请链路 |
 | `debug-gift-remove` | — | 调试/冒烟：点「带派」小窗背包列表里第一个可撤的「撤掉」 |
+| `debug-farm-submit` | `action`, `plotId?`, `cropId?`, `qty?`, `deviceId?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 调试/冒烟：在农场小窗里提交一次动作，走和用户点击相同的 preload → IPC 窄口 |
+| `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
 
 ## 右键菜单（ticket 22）
 
@@ -123,12 +126,12 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
-| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），helper 只校验形状，清洗交给宿主 |
+| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?`, `plotId?`, `cropId?`, `qty?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`/`farm-*`/`hire`/`recall-worker`/`end-contract`/`hire-listing`/`farm-open`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），农场动作只带 `plotId`/`cropId`/`qty`，雇佣只带 `deviceId`/`hours`/`contractId`/挂牌四字段；helper 只校验形状，清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
 | `pong` | `id?` | 对 `ping` |
-| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` 等 |
+| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` / `farmOpen` / `farmVisible` / `farmFocused` 等 |
 
 `ready` 里的 `workArea` 是**整张虚拟桌面**：所有显示器工作区的并集（DIP），也就是窗口实际
 覆盖的那块矩形；`displays` 里带每块屏的 `bounds` / `workArea` / `scaleFactor` / `primary`。
@@ -326,6 +329,33 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
 - 只有这扇窗自己的 `webContents` 能发 `dsh-zoo:gift-*`（`isGiftSender`），与改名窗同一个模型。
 
+## 农场小窗（ticket 40 / 43 / 44）
+
+农场小窗和改名/带派同一种模型：**宿主算数据，helper 只画和收输入**。窗口是 `file://`
+页面，没有 Node、没有网络、读不到 `/state`；地块、种子、作物、交易所、合同和访客快照
+全部随 `farm-window` 命令下发，成功/失败走 `action-result`，窗口不自动关。
+
+- 打开：右键菜单「农场」、桌面地块条或点某块地 → 渲染端发 `farm-open`（可带 `plotId`）；
+  宿主发 `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
+  正出门串门时同一扇窗进入访客模式，先推 `visit.state:'loading'`，拿到主人快照后变
+  `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。
+- 页签：农场 / 交易所 / 雇工。记录页签暂未开放；最近 8 条日志画在农场页底部。
+  「记录」按钮是 `disabled`，不会发请求。
+- 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
+  （只带 `plotId`，种地再带 `cropId`）；交易所 `farm-buy-seed` / `farm-sell-crop`
+  （只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
+  `recall-worker` / `end-contract` / `hire-listing`；访客偷/帮 `farm-steal` / `farm-help`。
+  `shared.normalizeFarmAction` 与 `main.js` 的 `farmPending` 双重防串 id；一次只能有
+  一个在飞动作，宿主回 `action-result` 后窗口才解锁。
+- 成功不关窗：种/收/买卖/挂牌/雇佣都只 toast 并刷新数据；失败留在窗里显示 `notice`。
+  偷/帮由宿主等 UDP 结果（最多约 1.8 秒），窗口只发一次申请。
+- 每块地、每份合同、每条日志都有二次校验：`shared.normalizeFarm` 只重建白名单字段，
+  未知作物/坏阶段/坏价格/坏合同只丢自己，不把错误数据画进窗口。
+- 失焦、Esc、主窗 `hide`、helper 退出都会关窗；失焦不关（macOS 中文输入法候选窗会触发
+  blur，和改名/带派同一条取舍）。
+- 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会分别
+  截桌面地块条、农场页、交易所页、雇工页和访客偷/帮视图；`debug-farm-tab` 只用于这一步。
+
 ## 多显示器 / 分辨率
 
 **一扇窗铺满所有显示器工作区的并集**，宠物可以在任意一块屏上被看见、被拖动、被点击。
@@ -353,7 +383,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 ## 已知限制
 
 - `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/改名/放行卡）都是鼠标点击，没有
-  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是**改名小窗**与**带派小窗**（见下）。
+  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是 **改名小窗**、
+  **带派小窗**与**农场小窗**（见上）。
 - 悬停弹层依赖渲染端收到 `pointermove`；macOS 上 `forward: true` 失效时，主进程仍能靠 300ms
   兜底让弹层打开后的按钮可点，但“悬停即出现”本身可能延迟到兜底接管。
 - 控件位置每 100ms 跟一次宠物；宠物被快速拖动时弹层会有一点跟手延迟（不影响点击）。

@@ -3161,6 +3161,9 @@
                     : control.plots.filter((plot) => plot.mature === true).length,
                   coins: control === null ? 0 : control.coins,
                   dew: control === null ? 0 : control.dew,
+                  // ticket 44/45：冒烟要断言摘要里的雇工昵称与合同数，别只断言角标。
+                  worker: control === null ? null : control.worker,
+                  contractCount: control === null ? 0 : control.contractCount,
                   status: ui.farm.statusEl.hidden ? null : ui.farm.statusEl.textContent,
                   x: round(box.left),
                   y: round(box.top),

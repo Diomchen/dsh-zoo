@@ -2161,6 +2161,10 @@ test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status �
     shared.normalizeHostCommand({ type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1' }).ok,
     false
   )
+  // ticket 45：冒烟切页签的调试命令也走同一条白名单；坏值回到农场页。
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'market' }).command.tab, 'market')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'hire' }).command.tab, 'hire')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'nope' }).command.tab, 'farm')
 })
 
 test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (t) => {

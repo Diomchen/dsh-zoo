@@ -4,6 +4,9 @@
 
 accepted
 
+规格：[SPEC v5](../../.scratch/dsh-zoo/SPEC-v5.md)；票 39–45 在
+[`.scratch/dsh-zoo/issues/`](../../.scratch/dsh-zoo/issues/)。
+
 ## 背景
 
 用户要「农场模式」：种地、待机生长、去邻居家偷菜、有交易所、还能雇佣别人的宠物看家。
