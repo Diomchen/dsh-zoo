@@ -64,7 +64,10 @@ contextBridge.exposeInMainWorld('dshZooDesktop', {
       skinId: payload.skinId,
       nickname: payload.nickname,
       // 礼物四动作只带 giftId（UUID）；路径与磁盘操作全在宿主/主进程那边。
-      giftId: payload.giftId
+      giftId: payload.giftId,
+      // 农场（ticket 40）：开窗可带 plotId，四个地块动作必须带；形状由 shared 归一化。
+      plotId: payload.plotId,
+      cropId: payload.cropId
     })
   },
   /**

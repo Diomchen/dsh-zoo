@@ -29,6 +29,7 @@ import {
   isGiftReason,
   isGiftStatus
 } from './gift-text.js'
+import { MAX_CONTRACT_MS } from './contracts-rules.js'
 import { visitReasonText } from './visit-copy.js'
 import { STALE_KEEP_MS, streetFrom } from './street.js'
 import {
@@ -56,6 +57,9 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *       bridge: { ok, reason },       // reason: starting|not-installed|unreachable|no-pet|error|null
  *       out: { deviceId, nickname, visitId, phase: 'requesting'|'active',
  *              startedAt, endsAt } | null   // 本地宠物出门了；active 的 endsAt = 30 分钟上限
+ *       work: { contractId, employerDeviceId, employerNickname,
+ *               startedAt, endsAt, guard, lastSeen } | null
+ *                                            // 我的宠物在外打工（ticket 44）；与 out 互斥
  *     },
  *     neighbors: [ { deviceId, nickname, status: 'pending'|'allowed'|'denied', lastSeen, port,
  *                    heartbeatAt } ],
@@ -63,6 +67,10 @@ export { MAX_VISIT_RECORD_MS, VISIT_RECORD_LIMIT } from './visit-record.js'
  *     guests:    [ { deviceId, nickname, anim, since, expiresAt } ], // 30 秒心跳影子，v2 不渲染
  *     visitors:  [ { deviceId, nickname, anim, visitId, since, lastSeen, endsAt: null } ],
  *                 // 入站串门访客：没有时间上限，只靠心跳存活与「送客」结束
+ *     worker:    { contractId, workerDeviceId, workerNickname,
+ *                  startedAt, endsAt, guard, anim, lastSeen } | null,
+ *                 // 别人家的宠物在我家打工（ticket 44）；与 visitors 正交
+ *                 // （雇工不是访客：不能送客，只能结束合同并结算）
  *     visits:    [ { direction: 'out'|'in', nickname, startedAt, durationMs,
  *                    gift?: { kind: 'text'|'file', name? } } ],
  *     prompt:    { deviceId, nickname } | null,   // 放行 FIFO 的队首；其余排队等待
@@ -170,8 +178,14 @@ export function createRoom ({
     recentSeen: new Map(),
     visitors: new Map(),
     out: null,
+    // ticket 44：两个镜像。真相在 contracts.json，room 只回答「谁在哪、还有多久、守卫多少」。
+    work: null,
+    worker: null,
     visits: [],
     completedVisits: [],
+    // ticket 44：房间自己结束掉的合同（到期/失联/被拒绝/信任收紧），service 在
+    // flushRoomEffects 里 drain 后落 store + 结算；room 仍然不碰磁盘。
+    completedContracts: [],
     pendingRecalls: [],
     // ticket 26：结束的入站串门身上那件礼物（送客 / 对方召回 / 失联）。
     // 只有 service 知道磁盘上的 meta.opened，所以这里只负责“交给它”。
@@ -402,6 +416,46 @@ export function createRoom ({
     }
   }
 
+  /** ticket 44：`self.work` 的只读拷贝。钱不在 room，只有身份/时间/守卫。 */
+  function copyWork (work) {
+    if (work === null) return null
+    return {
+      contractId: work.contractId,
+      employerDeviceId: work.employerDeviceId,
+      employerNickname: work.employerNickname,
+      startedAt: work.startedAt,
+      endsAt: work.endsAt,
+      guard: work.guard,
+      lastSeen: work.lastSeen
+    }
+  }
+
+  /** ticket 44：顶层 `worker` 的只读拷贝（别人在我家打工的那只）。 */
+  function copyWorker (worker) {
+    if (worker === null) return null
+    return {
+      contractId: worker.contractId,
+      workerDeviceId: worker.workerDeviceId,
+      workerNickname: worker.workerNickname,
+      startedAt: worker.startedAt,
+      endsAt: worker.endsAt,
+      guard: worker.guard,
+      anim: worker.anim,
+      lastSeen: worker.lastSeen
+    }
+  }
+
+  /** 合同时间/守卫的形状校验；坏合同不能进入镜像（否则守卫会永远算错）。 */
+  function normalizeContractTiming (startedAt, endsAt, guard, at) {
+    const start = Number.isFinite(startedAt) ? startedAt : at
+    const end = Number.isFinite(endsAt) ? endsAt : null
+    if (end === null || end <= start) return null
+    if (end - start > MAX_CONTRACT_MS) return null
+    const value = Number(guard)
+    const safeGuard = Number.isFinite(value) ? Math.min(0.8, Math.max(0, value)) : 0
+    return { startedAt: start, endsAt: end, guard: safeGuard }
+  }
+
   function copyVisitor (visitor) {
     return {
       deviceId: visitor.deviceId,
@@ -415,6 +469,22 @@ export function createRoom ({
       // 只加字段、不改名：没有礼物的访客，快照形状与 ticket 10 完全一致。
       ...(visitor.gift === undefined ? {} : { gift: { ...visitor.gift } })
     }
+  }
+
+  /**
+   * 按 visitId 找当前入站访客（ticket 43）。返回拷贝，调用方改不到内部状态。
+   *
+   * `visitors` 按 deviceId 索引，visitId 只是值里的字段；这里直接遍历值（访客通常 0–2 位）。
+   * 五个结束点（送客/对方召回/失联/信任收紧/dispose）都会删条目，所以路由的 404
+   * 不需要第二张 armed 表——查询不到就是“这次串门结束了”。
+   */
+  function findVisitorByVisitId (rawVisitId) {
+    const visitId = normalizeVisitId(rawVisitId)
+    if (visitId === null) return null
+    for (const visitor of state.visitors.values()) {
+      if (visitor.visitId === visitId) return copyVisitor(visitor)
+    }
+    return null
   }
 
   /**
@@ -534,6 +604,41 @@ export function createRoom ({
     return { visit: copyOutbound(out), record }
   }
 
+  /**
+   * 结束「我在外打工」的镜像（ticket 44）。只清匹配的那一份；重复调用返回 false。
+   * 结束事件排队给 service（role:'worker' 指我的宠物是雇工）。
+   */
+  function finishWorking (contractId, { at = nowMs(), reason = 'recall', notice = null } = {}) {
+    const work = state.work
+    if (work === null || work.contractId !== contractId) return false
+    state.work = null
+    state.completedContracts.push({
+      role: 'worker',
+      contractId: work.contractId,
+      endedAt: Number.isFinite(at) ? at : nowMs(),
+      reason
+    })
+    while (state.completedContracts.length > 40) state.completedContracts.shift()
+    if (notice !== null) pushNotice(notice, at)
+    return true
+  }
+
+  /** 结束「别人在我家打工」的镜像（ticket 44）。role:'employer'。 */
+  function finishWorker (contractId, { at = nowMs(), reason = 'recall', notice = null } = {}) {
+    const worker = state.worker
+    if (worker === null || worker.contractId !== contractId) return false
+    state.worker = null
+    state.completedContracts.push({
+      role: 'employer',
+      contractId: worker.contractId,
+      endedAt: Number.isFinite(at) ? at : nowMs(),
+      reason
+    })
+    while (state.completedContracts.length > 40) state.completedContracts.shift()
+    if (notice !== null) pushNotice(notice, at)
+    return true
+  }
+
   /** 清掉一位入站访客并写记录；被拒绝/名单收紧时用。 */
   function dropInboundVisitor (deviceId, at) {
     const visitor = state.visitors.get(deviceId)
@@ -599,6 +704,23 @@ export function createRoom ({
     if (status === 'denied') {
       state.guests.delete(deviceId)
       dropInboundVisitor(deviceId, nowMs())
+      // ticket 44 / D7：信任收紧时合同立即结束（钱等重新放行后结算），
+      // 绝不让一个已经不被放行的雇工继续提供 0.5 守卫。
+      const now = nowMs()
+      if (state.worker !== null && state.worker.workerDeviceId === deviceId) {
+        finishWorker(state.worker.contractId, {
+          at: now,
+          reason: 'denied',
+          notice: `「${state.worker.workerNickname}」不再被放行，雇工已经离开。`
+        })
+      }
+      if (state.work !== null && state.work.employerDeviceId === deviceId) {
+        finishWorking(state.work.contractId, {
+          at: now,
+          reason: 'denied',
+          notice: `「${state.work.employerNickname}」不再被放行，宠物回来了。`
+        })
+      }
     }
 
     return {
@@ -621,7 +743,9 @@ export function createRoom ({
           nickname: state.self.nickname,
           pet: selfPetView(),
           bridge: { ...state.self.bridge },
-          out: copyOutbound(state.out)
+          out: copyOutbound(state.out),
+          // ticket 44：在外打工时 out 一定是 null，两者互斥。
+          work: copyWork(state.work)
         },
         neighbors: [...state.neighbors.values()].map((neighbor) => ({ ...neighbor })),
         guests: [...state.guests.values()].map((guest) => ({
@@ -633,6 +757,8 @@ export function createRoom ({
           expiresAt: guest.lastSeen + GUEST_TTL_MS
         })),
         visitors: [...state.visitors.values()].map(copyVisitor),
+        // ticket 44：雇工画在访客之前（场景顺序 = DOM 顺序，访客在上层）。
+        worker: copyWorker(state.worker),
         visits: state.visits.slice(0, 5).map(copyRecord),
         prompt: currentPrompt(),
         notices: state.notices.slice(0, 3).map((notice) => ({ ...notice })),
@@ -759,7 +885,8 @@ export function createRoom ({
         lastActivityAt: activity.at,
         lastDepartureAt: state.lastDepartureAt,
         neighbors: [...state.neighbors.values()],
-        alreadyOut: state.out !== null,
+        // ticket 44：在外打工和出门串门一样，都不能再自发/手动出门。
+        alreadyOut: state.out !== null || state.work !== null,
         random
       })
       return { ...plan, activitySource: activity.source }
@@ -848,6 +975,13 @@ export function createRoom ({
       }
       for (const deviceId of [...state.visitors.keys()]) {
         if (!allowed.has(deviceId) || denied.has(deviceId)) dropInboundVisitor(deviceId, nowMs())
+      }
+      // ticket 44：手改名单收紧同样立即结束合同（D7）。
+      if (state.worker !== null && !allowed.has(state.worker.workerDeviceId)) {
+        finishWorker(state.worker.contractId, { at: nowMs(), reason: 'denied' })
+      }
+      if (state.work !== null && !allowed.has(state.work.employerDeviceId)) {
+        finishWorking(state.work.contractId, { at: nowMs(), reason: 'denied' })
       }
       purgePrompts()
     },
@@ -942,6 +1076,16 @@ export function createRoom ({
         state.out.lastSeen = lastSeen
       }
 
+      // ticket 44：合同期内的心跳同样只证明「它还在」——雇主/雇工失联按最后心跳结算。
+      if (state.work !== null && state.work.employerDeviceId === deviceId) {
+        state.work.lastSeen = lastSeen
+      }
+      if (state.worker !== null && state.worker.workerDeviceId === deviceId) {
+        state.worker.lastSeen = lastSeen
+        state.worker.anim = anim
+        state.worker.nickname = nickname
+      }
+
       // 心跳证明这位邻居还在线，也证明它放行了我：邻居灯不用等下一次 5 秒广播，
       // 串门目标表也不用猜“对方到底放没放行我”。
       markPeerHeartbeat(deviceId, nickname, lastSeen)
@@ -1004,6 +1148,12 @@ export function createRoom ({
           : `宠物已经在「${name}」家了，先召回来再说。`
         const notice = pushNotice(text, now)
         return { ok: false, error: 'already-out', notice: notice === null ? null : notice.text }
+      }
+
+      if (state.work !== null) {
+        // ticket 44：合同期内不能串门（与 beginWorking 的 already-out 对称）。
+        const notice = pushNotice('宠物在外打工，合同结束前不能去串门。', now)
+        return { ok: false, error: 'already-working', notice: notice === null ? null : notice.text }
       }
 
       const deviceId = normalizeDeviceId(rawDeviceId)
@@ -1232,6 +1382,24 @@ export function createRoom ({
     },
 
     /**
+     * 只读查询（ticket 43）：visitId → 当前入站访客（拷贝）。
+     * 非法/没找到都返回 null；路由与 farm-action 授权据此 404 / 静默丢弃。
+     */
+    visitorByVisitId (rawVisitId) {
+      return findVisitorByVisitId(rawVisitId)
+    },
+
+    /** 这次 farm-action 是否来自当前访客本人（deviceId + visitId 双证）。 */
+    isVisitorVisit (rawDeviceId, rawVisitId) {
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      if (deviceId === null) return false
+      const visitor = findVisitorByVisitId(rawVisitId)
+      if (visitor === null) return false
+      // 协议层已把 deviceId 归一成小写；这里再兜一次大小写，避免直接调用方传大写时误拒。
+      return visitor.deviceId.toLowerCase() === deviceId.toLowerCase()
+    },
+
+    /**
      * 主人点「送客」：立刻结束一位入站访客（ticket 10）。
      * 写 in 记录并排一条 visit-recall 让对方也回家；对方收不到也没关系，
      * 它会靠自己的 2 分钟失联检测或 30 分钟出门上限回来。
@@ -1331,6 +1499,15 @@ export function createRoom ({
       return pushNotice(text.trim(), at)
     },
 
+    /**
+     * 农场事件（ticket 43）：偷/帮/被抓都由 service 拼好一句人话，room 只负责排进快照。
+     * 和 `noteGiftMissed` 同一条出口：文案清洗与长度上限都在 `pushNotice` 里。
+     */
+    noteFarmEvent (text, at = clock()) {
+      if (typeof text !== 'string' || text.trim() === '') return null
+      return pushNotice(text.trim(), at)
+    },
+
     /** 对方回执到了（ticket 26）：发起方把「收下了」说一句。 */
     noteGiftReceived (nickname, at = clock()) {
       return pushNotice(giftReceivedText(nickname), at)
@@ -1360,6 +1537,126 @@ export function createRoom ({
       const clean = normalizeVisitGift(gift)
       state.out.gift = clean
       return true
+    },
+
+    // -------------------------------------------------------------------------
+    // 雇佣合同（ticket 44）：两个纯镜像。钱的真相在 contracts.json；这一层只回答
+    // 「谁在哪、还有多久、守卫多少」，结束事件排队给 service。
+    // -------------------------------------------------------------------------
+
+    /** 我的宠物开始在外打工。与出门串门互斥（already-out / already-working）。 */
+    beginWorking (contract = {}, at = clock()) {
+      const now = stampOf(at)
+      if (state.self.deviceId === null) return { ok: false, error: 'starting' }
+      if (state.out !== null) {
+        const notice = pushNotice('宠物正在串门，等它回来再接这份工作。', now)
+        return { ok: false, error: 'already-out', notice: notice === null ? null : notice.text }
+      }
+      if (state.work !== null) return { ok: false, error: 'already-working' }
+      const contractId = normalizeVisitId(contract.contractId)
+      const employerDeviceId = normalizeDeviceId(contract.employerDeviceId)
+      if (contractId === null || employerDeviceId === null) return { ok: false, error: 'bad-contract' }
+      const timing = normalizeContractTiming(
+        Number(contract.startedAt),
+        Number(contract.endsAt),
+        contract.guard,
+        now
+      )
+      if (timing === null) return { ok: false, error: 'bad-contract' }
+      state.work = {
+        contractId,
+        employerDeviceId,
+        employerNickname: normalizeNickname(contract.employerNickname) ?? FALLBACK_NICKNAME,
+        startedAt: timing.startedAt,
+        endsAt: timing.endsAt,
+        guard: timing.guard,
+        lastSeen: Number.isFinite(contract.lastSeen) ? contract.lastSeen : now
+      }
+      return { ok: true, work: copyWork(state.work) }
+    },
+
+    /** 本地结束「在外打工」：主人召回、收到 work-end/到期/失联。 */
+    endWorking (rawContractId, options = {}) {
+      // 兼容 `endWorking(id, at)` 与 `endWorking(id, { at, reason })` 两种调用。
+      const { at = clock(), reason = 'recall' } = typeof options === 'number' ? { at: options } : options
+      const contractId = normalizeVisitId(rawContractId)
+      if (contractId === null) return false
+      return finishWorking(contractId, { at: stampOf(at), reason })
+    },
+
+    /** 别人家的宠物进我家打工（雇主侧镜像）。一个农场只允许一位雇工。 */
+    beginWorker (contract = {}, at = clock()) {
+      const now = stampOf(at)
+      if (state.self.deviceId === null) return { ok: false, error: 'starting' }
+      if (state.worker !== null) return { ok: false, error: 'already-hired' }
+      const contractId = normalizeVisitId(contract.contractId)
+      const workerDeviceId = normalizeDeviceId(contract.workerDeviceId)
+      if (contractId === null || workerDeviceId === null) return { ok: false, error: 'bad-contract' }
+      if (state.self.deviceId !== null && workerDeviceId === state.self.deviceId) {
+        return { ok: false, error: 'own-pet' }
+      }
+      const timing = normalizeContractTiming(
+        Number(contract.startedAt),
+        Number(contract.endsAt),
+        contract.guard,
+        now
+      )
+      if (timing === null) return { ok: false, error: 'bad-contract' }
+      state.worker = {
+        contractId,
+        workerDeviceId,
+        workerNickname: normalizeNickname(contract.workerNickname) ?? FALLBACK_NICKNAME,
+        startedAt: timing.startedAt,
+        endsAt: timing.endsAt,
+        guard: timing.guard,
+        anim: normalizeAnimation(contract.anim),
+        lastSeen: Number.isFinite(contract.lastSeen) ? contract.lastSeen : now
+      }
+      return { ok: true, worker: copyWorker(state.worker) }
+    },
+
+    /** 本地结束「雇工在我家」：雇主提前结束、收到 work-recall/到期/失联。 */
+    endWorker (rawContractId, options = {}) {
+      const { at = clock(), reason = 'employer-end' } = typeof options === 'number' ? { at: options } : options
+      const contractId = normalizeVisitId(rawContractId)
+      if (contractId === null) return false
+      return finishWorker(contractId, { at: stampOf(at), reason })
+    },
+
+    /** 当前「我在外打工」的镜像（拷贝）。 */
+    outboundWork () {
+      return copyWork(state.work)
+    },
+
+    /** `outboundWork` 的短别名（两种命名都有人用，保留一个实现）。 */
+    working () {
+      return copyWork(state.work)
+    },
+
+    /** 当前「别人在我家打工」的镜像（拷贝）。 */
+    inboundWorker () {
+      return copyWorker(state.worker)
+    },
+
+    /** `inboundWorker` 的短别名。 */
+    worker () {
+      return copyWorker(state.worker)
+    },
+
+    /** 房间已经清掉的合同事件；service 每次 flush 取走落盘 + 结算。 */
+    drainEndedContracts () {
+      const ended = state.completedContracts
+      state.completedContracts = []
+      return ended
+    },
+
+    /** 邻居表 → 放行名单 → null：合同记录/日志里的「谁」用。 */
+    peerNickname (rawDeviceId) {
+      const deviceId = normalizeDeviceId(rawDeviceId)
+      if (deviceId === null) return null
+      const neighbor = state.neighbors.get(deviceId)
+      if (neighbor !== undefined) return neighbor.nickname
+      return state.trust.allowed.get(deviceId) ?? null
     },
 
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */
@@ -1443,6 +1740,33 @@ export function createRoom ({
         }
       }
 
+      // ticket 44：合同镜像的两条结束线——到期，或对方 2 分钟没有心跳。
+      // 与访客不同：雇工不是访客，没有「送客」，只能结束合同并结算。
+      if (state.worker !== null) {
+        if (now >= state.worker.endsAt) {
+          finishWorker(state.worker.contractId, { at: state.worker.endsAt, reason: 'expired' })
+        } else if (now - state.worker.lastSeen >= lostMs) {
+          const nickname = state.worker.workerNickname
+          finishWorker(state.worker.contractId, {
+            at: Math.min(state.worker.lastSeen, state.worker.endsAt),
+            reason: 'offline',
+            notice: `「${nickname}」失联了，雇工已经离开。`
+          })
+        }
+      }
+      if (state.work !== null) {
+        if (now >= state.work.endsAt) {
+          finishWorking(state.work.contractId, { at: state.work.endsAt, reason: 'expired' })
+        } else if (now - state.work.lastSeen >= lostMs) {
+          const nickname = state.work.employerNickname
+          finishWorking(state.work.contractId, {
+            at: Math.min(state.work.lastSeen, state.work.endsAt),
+            reason: 'offline',
+            notice: `「${nickname}」失联了，宠物回来了。`
+          })
+        }
+      }
+
       for (const [deviceId, guest] of state.guests) {
         if (now - guest.lastSeen >= GUEST_TTL_MS) state.guests.delete(deviceId)
       }
@@ -1471,6 +1795,9 @@ export function createRoom ({
       state.recentSeen.clear()
       state.visitors.clear()
       state.out = null
+      state.work = null
+      state.worker = null
+      state.completedContracts.length = 0
       state.visits.length = 0
       state.completedVisits.length = 0
       state.pendingRecalls.length = 0

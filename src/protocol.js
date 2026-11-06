@@ -7,11 +7,25 @@
  * - 版本、类型、deviceId、visitId、port 逐项校验，昵称清洗 + 截断，动画名只允许安全文件名；
  * - 每种报文只写自己那几个字段：beacon/beacon-ack 是身份，heartbeat 是动作意图，
  *   visit-request/ack/deny/recall 是一次串门的生命周期，gift-received 是礼物的送达回执；
+ *   market-digest 是本机行情与雇工挂牌的定期广播；work-*（ticket 44）是一份
+ *   雇佣合同的生命周期（请求/确认/召回/结束/结算）；
  * - 任何校验失败都只返回 `{ ok: false }`，不抛异常、不写盘、不读本机状态。
  *
  * 协议本身不传素材本体、不传坐标、不传项目或会话信息（ADR-0003）。素材只传引用：
  * `skinPort` / `skinId` 告诉对方去哪儿取，视频本身走 HTTP（ticket 15 起）。
  */
+import {
+  CONTRACT_END_REASONS as CONTRACT_END_REASON_LIST,
+  MAX_CONTRACT_HOURS,
+  MAX_CONTRACT_MS,
+  MAX_CONTRACT_WAGE,
+  MIN_CONTRACT_HOURS,
+  MIN_CONTRACT_WAGE,
+  WORK_ERRORS as CONTRACT_WORK_ERROR_LIST,
+  WORK_SETTLE_REASONS as CONTRACT_SETTLE_REASON_LIST
+} from './contracts-rules.js'
+import { CROPS, CROP_IDS, isCropId, MINUTE_MS } from './farm-rules.js'
+
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
 export const MAX_PACKET_BYTES = 4 * 1024
@@ -47,6 +61,61 @@ export const HEARTBEAT_INTERVAL_MS = 2000
 /** 30 秒没有心跳，心跳影子从快照里消失；与邻居灯共用同一条 tick 时间线。 */
 export const GUEST_TTL_MS = 30000
 /**
+ * 行情 gossip（ticket 42）：每 30 秒一条 `market-digest`；接收端只认 2 分钟内的样本。
+ * 这两个数字既是发送节拍/接收新鲜度，也是「1 个 peer 30 秒最多 1 条」的限速窗口。
+ */
+export const MARKET_DIGEST_INTERVAL_MS = 30 * 1000
+export const MARKET_DIGEST_FRESH_MS = 2 * MINUTE_MS
+/**
+ * 雇工挂牌的固定原因枚举（ticket 44 才填真实值；42 自己只发 null）。
+ * 形状先固定，44 的雇工板直接读 digest，不再逐个问邻居。
+ */
+export const HIRE_REASONS = Object.freeze(['ready', 'off', 'visiting', 'working'])
+export const HIRE_WAGE_MIN = 1
+export const HIRE_WAGE_MAX = 100
+export const HIRE_HOURS_MIN = 2
+export const HIRE_HOURS_MAX = 8
+export const HIRE_GUARD_MAX = 0.8
+/**
+ * 雇佣合同（ticket 44）的线上常量。与 `src/contracts-rules.js` 同源（那边是钱的真相，
+ * 这里是报文的边界）；`test/contracts-rules.test.js` 有防漂移断言。
+ */
+export const WORK_MIN_HOURS = MIN_CONTRACT_HOURS
+export const WORK_MAX_HOURS = MAX_CONTRACT_HOURS
+export const WORK_MIN_WAGE = MIN_CONTRACT_WAGE
+export const WORK_MAX_WAGE = MAX_CONTRACT_WAGE
+/** 8 小时 × 100 硬币 = 800；手续费最多 40。 */
+export const MAX_WORK_EARNED = MAX_CONTRACT_HOURS * MAX_CONTRACT_WAGE
+export const MAX_WORK_SERVED_MS = MAX_CONTRACT_MS
+export const MAX_WORK_FEE = Math.ceil(MAX_WORK_EARNED * 0.05)
+export const WORK_ERRORS = CONTRACT_WORK_ERROR_LIST
+export const WORK_END_REASONS = CONTRACT_END_REASON_LIST
+export const WORK_SETTLE_REASONS = CONTRACT_SETTLE_REASON_LIST
+/** 合同 id / requestId 与 visitId 同一种 UUID 形状。 */
+export const isContractId = isVisitId
+/**
+ * 农场访客动作（ticket 43）：偷/帮只由这两条线走，别的动作名整包丢弃。
+ * `requestId` 是幂等键（重发复用同一个），`visitId` 只用来核对“这次串门还在不在”。
+ */
+export const FARM_ACTION_KINDS = Object.freeze(['steal', 'help'])
+/** 主人侧结果的固定错误枚举（不转发自由文本；面向用户的话在 farm-text.js）。 */
+export const FARM_ACTION_ERRORS = Object.freeze([
+  'no-visit',
+  'bad-plot',
+  'bad-action',
+  'not-mature',
+  'already-stolen',
+  'already-helped',
+  'cap',
+  'guard',
+  'starting'
+])
+export const PLOT_ID_RE = /^p[1-4]$/
+/** 一次偷只拿 1 个；结果里的 qty 只能是 0..1。 */
+export const MAX_FARM_QTY = 1
+const FARM_ACTION_KIND_SET = new Set(FARM_ACTION_KINDS)
+const FARM_ACTION_ERROR_SET = new Set(FARM_ACTION_ERRORS)
+/**
  * 一次**出门**的硬上限：30 分钟到点主动回家并写记录（ticket 09）。
  * 入站串门没有时间上限——访客待到主人点「送客」（ticket 10）。
  * 这个值同时是单条串门记录的时长上限（见 src/visit-record.js）。
@@ -72,7 +141,20 @@ export const PACKET_TYPES = Object.freeze([
   'visit-deny',
   'visit-recall',
   'visit-recall-ack',
-  'gift-received'
+  'gift-received',
+  'market-digest',
+  'farm-action',
+  'farm-action-result',
+  // ticket 44：雇佣合同。**故意不放进 VISIT_TYPES**——那条分支只重建四个字段，
+  // hours/wage/contractId/earned 会被吃掉。
+  'work-request',
+  'work-ack',
+  'work-recall',
+  'work-recall-ack',
+  'work-end',
+  'work-end-ack',
+  'work-settle',
+  'work-settle-ack'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -91,6 +173,11 @@ const VISIT_TYPES = new Set([
  */
 export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off'])
 const DENY_REASON_SET = new Set(VISIT_DENY_REASONS)
+/** 雇工挂牌原因同样是固定枚举（ticket 44）；42 只发 null。 */
+const HIRE_REASON_SET = new Set(HIRE_REASONS)
+const WORK_ERROR_SET = new Set(WORK_ERRORS)
+const WORK_END_REASON_SET = new Set(WORK_END_REASONS)
+const WORK_SETTLE_REASON_SET = new Set(WORK_SETTLE_REASONS)
 
 const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -136,6 +223,39 @@ export function isVisitId (value) {
 /** visit-deny 的 reason 只能是固定枚举；其余值整包丢弃，不做自由文本转发。 */
 export function isVisitDenyReason (value) {
   return typeof value === 'string' && DENY_REASON_SET.has(value)
+}
+
+/** 合同里的整数枚举：时薪、时长、手续费、服务毫秒、工钱。 */
+function safeInt (value, min, max) {
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : null
+}
+
+export function isWorkHours (value) {
+  return safeInt(value, WORK_MIN_HOURS, WORK_MAX_HOURS) !== null
+}
+
+export function isWorkWage (value) {
+  return safeInt(value, WORK_MIN_WAGE, WORK_MAX_WAGE) !== null
+}
+
+export function isWorkFee (value) {
+  return safeInt(value, 1, MAX_WORK_FEE) !== null
+}
+
+export function isWorkGuard (value) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= HIRE_GUARD_MAX
+}
+
+export function isWorkError (value) {
+  return typeof value === 'string' && WORK_ERROR_SET.has(value)
+}
+
+export function isWorkEndReason (value) {
+  return typeof value === 'string' && WORK_END_REASON_SET.has(value)
+}
+
+export function isWorkSettleReason (value) {
+  return typeof value === 'string' && WORK_SETTLE_REASON_SET.has(value)
 }
 
 export function isPort (value) {
@@ -253,6 +373,67 @@ export function normalizeGift (value) {
   return null
 }
 
+/**
+ * 行情 digest 的单个价格：只认已知作物 + 有限数字 + `[base×0.5, base×2]`。
+ * 价格是**条目**而不是整包：一个坏价只丢这一种作物（见 `normalizeDigestPrices`）。
+ */
+export function isDigestPrice (cropId, value) {
+  if (!isCropId(cropId)) return false
+  if (typeof value !== 'number' || !Number.isFinite(value)) return false
+  const base = CROPS[cropId].base
+  return value >= base * 0.5 && value <= base * 2
+}
+
+/**
+ * 把 `prices` 收成白名单新对象：未知作物、坏价格、超范围价格都丢掉，
+ * 但**不**因为一个坏条目丢掉整条 digest（SPEC：「坏条目丢掉、不整包丢」）。
+ * 形状不是对象时返回 null，由调用方把整包判坏。
+ */
+export function normalizeDigestPrices (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const prices = {}
+  for (const cropId of CROP_IDS) {
+    if (!Object.prototype.hasOwnProperty.call(value, cropId)) continue
+    if (!isDigestPrice(cropId, value[cropId])) continue
+    prices[cropId] = value[cropId]
+  }
+  return prices
+}
+
+/**
+ * 雇工挂牌：字段固定 `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`。
+ * 开工前拍板（ticket 44 D1）：42 的 digest 就带 `available/reason/guard`，44 的雇工板直接读。
+ * `reason` 允许 `null`（42 本机挂牌还没有真实可用性）或固定枚举（44 填）。
+ */
+export function normalizeDigestHire (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (typeof value.enabled !== 'boolean') return null
+  if (typeof value.available !== 'boolean') return null
+  if (!Number.isInteger(value.wagePerHour) ||
+    value.wagePerHour < HIRE_WAGE_MIN || value.wagePerHour > HIRE_WAGE_MAX) return null
+  if (!Number.isInteger(value.minHours) || !Number.isInteger(value.maxHours)) return null
+  if (value.minHours < HIRE_HOURS_MIN || value.maxHours > HIRE_HOURS_MAX) return null
+  if (value.minHours > value.maxHours) return null
+  if (typeof value.guard !== 'number' || !Number.isFinite(value.guard)) return null
+  if (value.guard < 0 || value.guard > HIRE_GUARD_MAX) return null
+  const reason = value.reason
+  if (reason !== null && !(typeof reason === 'string' && HIRE_REASON_SET.has(reason))) return null
+  return {
+    enabled: value.enabled,
+    wagePerHour: value.wagePerHour,
+    minHours: value.minHours,
+    maxHours: value.maxHours,
+    guard: value.guard,
+    available: value.available,
+    reason
+  }
+}
+
+/** digest 时间戳：正整数毫秒；**新鲜度**在接收端按本地时钟判（见 src/market.js）。 */
+export function normalizeDigestAt (value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.DSH_ZOO_PORT
@@ -269,6 +450,7 @@ export function resolvePort (env = process.env) {
  *   visit-ack / visit-recall / visit-recall-ack → { v, type, deviceId, visitId }
  *   visit-deny              → { v, type, deviceId, visitId, reason }
  *   gift-received           → { v, type, deviceId, visitId, giftId }
+ *   market-digest           → { v, type, deviceId, at, prices, hire }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
@@ -310,6 +492,26 @@ function buildPacket ({
   skinPort,
   skinId,
   gift,
+  at,
+  prices,
+  hire,
+  requestId,
+  plotId,
+  ok,
+  error,
+  crop,
+  qty,
+  caught,
+  // ticket 44：合同的全部线上字段
+  contractId,
+  hours,
+  wagePerHour,
+  fee,
+  startedAt,
+  endsAt,
+  guard,
+  servedMs,
+  earned,
   now = Date.now()
 } = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
@@ -348,6 +550,182 @@ function buildPacket ({
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
     packet = { ...base, visitId: visitId.toLowerCase(), giftId: giftId.toLowerCase() }
+  } else if (type === 'market-digest') {
+    // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，prices/hire 会在这里消失。
+    const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
+    if (stamp === null) throw new Error('protocol: invalid digest time')
+    const safePrices = normalizeDigestPrices(prices)
+    if (safePrices === null) throw new Error('protocol: invalid digest prices')
+    const safeHire = normalizeDigestHire(hire)
+    if (safeHire === null) throw new Error('protocol: invalid digest hire')
+    packet = { ...base, at: stamp, prices: safePrices, hire: safeHire }
+  } else if (type === 'farm-action') {
+    // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，requestId/action/plotId 会消失。
+    if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (!FARM_ACTION_KIND_SET.has(action)) throw new Error('protocol: invalid farm action')
+    if (typeof plotId !== 'string' || !PLOT_ID_RE.test(plotId)) {
+      throw new Error('protocol: invalid plotId')
+    }
+    packet = {
+      ...base,
+      visitId: visitId.toLowerCase(),
+      requestId: requestId.toLowerCase(),
+      action,
+      plotId
+    }
+  } else if (type === 'farm-action-result') {
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (typeof ok !== 'boolean') throw new Error('protocol: invalid result ok')
+    if (ok === true) {
+      if (caught === true) throw new Error('protocol: caught requires guard')
+      if (!isCropId(crop)) throw new Error('protocol: invalid crop')
+      if (!Number.isInteger(qty) || qty < 0 || qty > MAX_FARM_QTY) {
+        throw new Error('protocol: invalid qty')
+      }
+      packet = {
+        ...base,
+        requestId: requestId.toLowerCase(),
+        ok: true,
+        crop,
+        qty,
+        ...(caught === true ? { caught: true } : {})
+      }
+    } else {
+      if (!FARM_ACTION_ERROR_SET.has(error)) throw new Error('protocol: invalid farm error')
+      // `caught` 只有一个意思：被守卫抓住；不能拿它给别的错误加戏。
+      if (caught === true && error !== 'guard') throw new Error('protocol: caught without guard')
+      packet = {
+        ...base,
+        requestId: requestId.toLowerCase(),
+        ok: false,
+        error,
+        ...(caught === true ? { caught: true } : {})
+      }
+    }
+  } else if (type === 'work-request') {
+    // 自己的一条分支，绝不并进 VISIT_TYPES。
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (!isWorkHours(hours)) throw new Error('protocol: invalid work hours')
+    if (!isWorkWage(wagePerHour)) throw new Error('protocol: invalid work wage')
+    if (!isWorkFee(fee)) throw new Error('protocol: invalid work fee')
+    packet = {
+      ...base,
+      requestId: requestId.toLowerCase(),
+      hours,
+      wagePerHour,
+      fee
+    }
+  } else if (type === 'work-ack') {
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (typeof ok !== 'boolean') throw new Error('protocol: invalid work ack ok')
+    if (ok === true) {
+      if (!isVisitId(contractId)) throw new Error('protocol: invalid contractId')
+      if (!Number.isSafeInteger(startedAt) || startedAt <= 0) throw new Error('protocol: invalid startedAt')
+      if (!Number.isSafeInteger(endsAt)) throw new Error('protocol: invalid endsAt')
+      if (endsAt <= startedAt || endsAt - startedAt > MAX_WORK_SERVED_MS) {
+        throw new Error('protocol: invalid contract time')
+      }
+      if (!isWorkGuard(guard)) throw new Error('protocol: invalid guard')
+      packet = {
+        ...base,
+        requestId: requestId.toLowerCase(),
+        ok: true,
+        contractId: contractId.toLowerCase(),
+        startedAt,
+        endsAt,
+        guard
+      }
+    } else {
+      if (!isWorkError(error)) throw new Error('protocol: invalid work error')
+      packet = { ...base, requestId: requestId.toLowerCase(), ok: false, error }
+    }
+  } else if (type === 'work-recall' || type === 'work-recall-ack') {
+    if (!isVisitId(contractId)) throw new Error('protocol: invalid contractId')
+    if (type === 'work-recall') {
+      packet = { ...base, contractId: contractId.toLowerCase() }
+    } else {
+      if (typeof ok !== 'boolean') throw new Error('protocol: invalid work ack ok')
+      if (ok !== true && !isWorkError(error)) throw new Error('protocol: invalid work error')
+      packet = {
+        ...base,
+        contractId: contractId.toLowerCase(),
+        ok,
+        ...(ok === true ? {} : { error })
+      }
+    }
+  } else if (type === 'work-end') {
+    // contractId 优先；取消一笔还没 ack 的请求时用 requestId。
+    const hasContract = contractId !== undefined && contractId !== null
+    const hasRequest = requestId !== undefined && requestId !== null
+    if (!hasContract && !hasRequest) throw new Error('protocol: invalid work end target')
+    if (hasContract && !isVisitId(contractId)) throw new Error('protocol: invalid contractId')
+    if (hasRequest && !isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (!isWorkEndReason(reason)) throw new Error('protocol: invalid work end reason')
+    packet = {
+      ...base,
+      ...(hasContract ? { contractId: contractId.toLowerCase() } : {}),
+      ...(hasContract || !hasRequest ? {} : { requestId: requestId.toLowerCase() }),
+      reason
+    }
+  } else if (type === 'work-end-ack') {
+    if (typeof ok !== 'boolean') throw new Error('protocol: invalid work ack ok')
+    const hasContract = contractId !== undefined && contractId !== null
+    const hasRequest = requestId !== undefined && requestId !== null
+    if (!hasContract && !hasRequest) throw new Error('protocol: invalid work end target')
+    if (hasContract && !isVisitId(contractId)) throw new Error('protocol: invalid contractId')
+    if (hasRequest && !isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (ok !== true && !isWorkError(error)) throw new Error('protocol: invalid work error')
+    packet = {
+      ...base,
+      ...(hasContract ? { contractId: contractId.toLowerCase() } : {}),
+      ...(hasRequest ? { requestId: requestId.toLowerCase() } : {}),
+      ok,
+      ...(ok === true ? {} : { error })
+    }
+  } else if (type === 'work-settle') {
+    if (!isVisitId(contractId)) throw new Error('protocol: invalid contractId')
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (!Number.isSafeInteger(servedMs) || servedMs < 0 || servedMs > MAX_WORK_SERVED_MS) {
+      throw new Error('protocol: invalid servedMs')
+    }
+    if (!Number.isSafeInteger(earned) || earned < 0 || earned > MAX_WORK_EARNED) {
+      throw new Error('protocol: invalid earned')
+    }
+    if (!isWorkSettleReason(reason)) throw new Error('protocol: invalid settle reason')
+    packet = {
+      ...base,
+      contractId: contractId.toLowerCase(),
+      requestId: requestId.toLowerCase(),
+      servedMs,
+      earned,
+      reason
+    }
+  } else if (type === 'work-settle-ack') {
+    if (!isVisitId(contractId)) throw new Error('protocol: invalid contractId')
+    if (!isVisitId(requestId)) throw new Error('protocol: invalid requestId')
+    if (typeof ok !== 'boolean') throw new Error('protocol: invalid work ack ok')
+    if (ok === true) {
+      if (!Number.isSafeInteger(earned) || earned < 0 || earned > MAX_WORK_EARNED) {
+        throw new Error('protocol: invalid earned')
+      }
+      packet = {
+        ...base,
+        contractId: contractId.toLowerCase(),
+        requestId: requestId.toLowerCase(),
+        ok: true,
+        earned
+      }
+    } else {
+      if (!isWorkError(error)) throw new Error('protocol: invalid work error')
+      packet = {
+        ...base,
+        contractId: contractId.toLowerCase(),
+        requestId: requestId.toLowerCase(),
+        ok: false,
+        error
+      }
+    }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -448,6 +826,84 @@ export function encodeVisitRecallAck ({ deviceId, visitId } = {}) {
  */
 export function encodeGiftReceived ({ deviceId, visitId, giftId } = {}) {
   return encodePacket({ type: 'gift-received', deviceId, visitId, giftId })
+}
+
+/**
+ * 行情 gossip（ticket 42）：本机每种作物的 price + 自己的雇工挂牌。
+ * `at` 缺省用本地时钟；价格/挂牌由调用方从 store 取，坏条目在这里被丢弃。
+ */
+export function encodeMarketDigest ({ deviceId, at, prices, hire, now } = {}) {
+  return encodePacket({ type: 'market-digest', deviceId, at, prices, hire, now })
+}
+
+/**
+ * 农场动作（ticket 43）：访客 → 主人。
+ * 只带这次动作的全部输入；没有昵称、端口、坐标、路径或自由文本。
+ */
+export function encodeFarmAction ({ deviceId, visitId, requestId, action, plotId } = {}) {
+  return encodePacket({ type: 'farm-action', deviceId, visitId, requestId, action, plotId })
+}
+
+/**
+ * 农场动作结果：主人 → 访客。`requestId` 原样回传，访客按它 settle 一次。
+ * 成功带 crop/qty；失败带固定枚举 error；`caught` 只跟 steal 的 guard 一起出现。
+ */
+export function encodeFarmActionResult ({ deviceId, requestId, ok, error, crop, qty, caught } = {}) {
+  return encodePacket({ type: 'farm-action-result', deviceId, requestId, ok, error, crop, qty, caught })
+}
+
+/**
+ * 八个 work-* 的窄入口（ticket 44）。全部只带合同字段：没有昵称、端口、路径、自由文本。
+ * 编码失败抛异常（本机程序错误）；解析失败返回 `{ok:false, reason}`（网络输入）。
+ */
+export function encodeWorkRequest ({ deviceId, requestId, hours, wagePerHour, fee } = {}) {
+  return encodePacket({ type: 'work-request', deviceId, requestId, hours, wagePerHour, fee })
+}
+
+export function encodeWorkAck ({ deviceId, requestId, ok, contractId, startedAt, endsAt, guard, error } = {}) {
+  return encodePacket({
+    type: 'work-ack',
+    deviceId,
+    requestId,
+    ok,
+    contractId,
+    startedAt,
+    endsAt,
+    guard,
+    error
+  })
+}
+
+export function encodeWorkRecall ({ deviceId, contractId } = {}) {
+  return encodePacket({ type: 'work-recall', deviceId, contractId })
+}
+
+export function encodeWorkRecallAck ({ deviceId, contractId, ok = true, error } = {}) {
+  return encodePacket({ type: 'work-recall-ack', deviceId, contractId, ok, error })
+}
+
+export function encodeWorkEnd ({ deviceId, contractId, requestId, reason } = {}) {
+  return encodePacket({ type: 'work-end', deviceId, contractId, requestId, reason })
+}
+
+export function encodeWorkEndAck ({ deviceId, contractId, requestId, ok = true, error } = {}) {
+  return encodePacket({ type: 'work-end-ack', deviceId, contractId, requestId, ok, error })
+}
+
+export function encodeWorkSettle ({ deviceId, contractId, requestId, servedMs, earned, reason } = {}) {
+  return encodePacket({ type: 'work-settle', deviceId, contractId, requestId, servedMs, earned, reason })
+}
+
+export function encodeWorkSettleAck ({ deviceId, contractId, requestId, ok = true, earned, error } = {}) {
+  return encodePacket({
+    type: 'work-settle-ack',
+    deviceId,
+    contractId,
+    requestId,
+    ok,
+    earned,
+    error
+  })
 }
 
 function fail (reason) {
@@ -560,6 +1016,282 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         deviceId: raw.deviceId.toLowerCase(),
         visitId: raw.visitId.toLowerCase(),
         giftId: raw.giftId.toLowerCase()
+      }
+    }
+  }
+
+  // 行情 digest（ticket 42）：**不**落进 VISIT_TYPES（那里只重建四个字段）。
+  // 坏价格只丢那一个作物；形状/时间/挂牌坏了才整包丢。昵称、端口等一律不读。
+  if (raw.type === 'market-digest') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    const prices = normalizeDigestPrices(raw.prices)
+    if (prices === null) return fail('prices')
+    const hire = normalizeDigestHire(raw.hire)
+    if (hire === null) return fail('hire')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        prices,
+        hire
+      }
+    }
+  }
+
+  // 农场动作（ticket 43）：**不**落进 VISIT_TYPES（那里只重建四个字段）。
+  // 字段就是这次动作的全部输入：任何一项坏都整包丢；昵称/端口等一律不读。
+  if (raw.type === 'farm-action') {
+    if (!isVisitId(raw.visitId)) return fail('visit-id')
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.action !== 'string' || !FARM_ACTION_KIND_SET.has(raw.action)) return fail('action')
+    if (typeof raw.plotId !== 'string' || !PLOT_ID_RE.test(raw.plotId)) return fail('plot-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        visitId: raw.visitId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        action: raw.action,
+        plotId: raw.plotId
+      }
+    }
+  }
+
+  // 农场动作结果（ticket 43）：成功必须有合法作物与 0..1 的数量；
+  // 失败必须有固定枚举；`caught` 可选，但出现就必须是布尔（不转发文本）。
+  if (raw.type === 'farm-action-result') {
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.ok !== 'boolean') return fail('ok')
+    if (raw.caught !== undefined && typeof raw.caught !== 'boolean') return fail('caught')
+    if (raw.ok === true) {
+      if (raw.caught === true) return fail('caught')
+      if (!isCropId(raw.crop)) return fail('crop')
+      const qty = Number(raw.qty)
+      if (!Number.isInteger(qty) || qty < 0 || qty > MAX_FARM_QTY) return fail('qty')
+      return {
+        ok: true,
+        packet: {
+          v: PROTOCOL_VERSION,
+          type: raw.type,
+          deviceId: raw.deviceId.toLowerCase(),
+          requestId: raw.requestId.toLowerCase(),
+          ok: true,
+          crop: raw.crop,
+          qty,
+          ...(raw.caught === true ? { caught: true } : {})
+        }
+      }
+    }
+    if (typeof raw.error !== 'string' || !FARM_ACTION_ERROR_SET.has(raw.error)) return fail('error')
+    // caught 只能跟 guard 一起出现；`ok:true + caught` 或 `cap + caught` 都整包丢。
+    if (raw.caught === true && raw.error !== 'guard') return fail('caught')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        ok: false,
+        error: raw.error,
+        ...(raw.caught === true ? { caught: true } : {})
+      }
+    }
+  }
+
+  // 雇佣合同（ticket 44）：八个独立分支，**不落进 VISIT_TYPES**。
+  if (raw.type === 'work-request') {
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (!isWorkHours(raw.hours)) return fail('hours')
+    if (!isWorkWage(raw.wagePerHour)) return fail('wage')
+    if (!isWorkFee(raw.fee)) return fail('fee')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        hours: raw.hours,
+        wagePerHour: raw.wagePerHour,
+        fee: raw.fee
+      }
+    }
+  }
+
+  if (raw.type === 'work-ack') {
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.ok !== 'boolean') return fail('ok')
+    if (raw.ok === true) {
+      if (!isVisitId(raw.contractId)) return fail('contract-id')
+      if (!Number.isSafeInteger(raw.startedAt) || raw.startedAt <= 0) return fail('started-at')
+      if (!Number.isSafeInteger(raw.endsAt)) return fail('ends-at')
+      if (raw.endsAt <= raw.startedAt || raw.endsAt - raw.startedAt > MAX_WORK_SERVED_MS) {
+        return fail('contract-time')
+      }
+      if (!isWorkGuard(raw.guard)) return fail('guard')
+      return {
+        ok: true,
+        packet: {
+          v: PROTOCOL_VERSION,
+          type: raw.type,
+          deviceId: raw.deviceId.toLowerCase(),
+          requestId: raw.requestId.toLowerCase(),
+          ok: true,
+          contractId: raw.contractId.toLowerCase(),
+          startedAt: raw.startedAt,
+          endsAt: raw.endsAt,
+          guard: raw.guard
+        }
+      }
+    }
+    if (!isWorkError(raw.error)) return fail('error')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        ok: false,
+        error: raw.error
+      }
+    }
+  }
+
+  if (raw.type === 'work-recall' || raw.type === 'work-recall-ack') {
+    if (!isVisitId(raw.contractId)) return fail('contract-id')
+    if (raw.type === 'work-recall') {
+      return {
+        ok: true,
+        packet: {
+          v: PROTOCOL_VERSION,
+          type: raw.type,
+          deviceId: raw.deviceId.toLowerCase(),
+          contractId: raw.contractId.toLowerCase()
+        }
+      }
+    }
+    if (typeof raw.ok !== 'boolean') return fail('ok')
+    if (raw.ok !== true && !isWorkError(raw.error)) return fail('error')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        contractId: raw.contractId.toLowerCase(),
+        ok: raw.ok,
+        ...(raw.ok === true ? {} : { error: raw.error })
+      }
+    }
+  }
+
+  if (raw.type === 'work-end') {
+    const hasContract = raw.contractId !== undefined && raw.contractId !== null
+    const hasRequest = raw.requestId !== undefined && raw.requestId !== null
+    if (!hasContract && !hasRequest) return fail('target')
+    if (hasContract && !isVisitId(raw.contractId)) return fail('contract-id')
+    if (hasRequest && !isVisitId(raw.requestId)) return fail('request-id')
+    if (!isWorkEndReason(raw.reason)) return fail('reason')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        ...(hasContract ? { contractId: raw.contractId.toLowerCase() } : {}),
+        ...(hasContract || !hasRequest ? {} : { requestId: raw.requestId.toLowerCase() }),
+        reason: raw.reason
+      }
+    }
+  }
+
+  if (raw.type === 'work-end-ack') {
+    const hasContract = raw.contractId !== undefined && raw.contractId !== null
+    const hasRequest = raw.requestId !== undefined && raw.requestId !== null
+    if (!hasContract && !hasRequest) return fail('target')
+    if (hasContract && !isVisitId(raw.contractId)) return fail('contract-id')
+    if (hasRequest && !isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.ok !== 'boolean') return fail('ok')
+    if (raw.ok !== true && !isWorkError(raw.error)) return fail('error')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        ...(hasContract ? { contractId: raw.contractId.toLowerCase() } : {}),
+        ...(hasRequest ? { requestId: raw.requestId.toLowerCase() } : {}),
+        ok: raw.ok,
+        ...(raw.ok === true ? {} : { error: raw.error })
+      }
+    }
+  }
+
+  if (raw.type === 'work-settle') {
+    if (!isVisitId(raw.contractId)) return fail('contract-id')
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (!Number.isSafeInteger(raw.servedMs) || raw.servedMs < 0 || raw.servedMs > MAX_WORK_SERVED_MS) {
+      return fail('served-ms')
+    }
+    if (!Number.isSafeInteger(raw.earned) || raw.earned < 0 || raw.earned > MAX_WORK_EARNED) {
+      return fail('earned')
+    }
+    if (!isWorkSettleReason(raw.reason)) return fail('reason')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        contractId: raw.contractId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        servedMs: raw.servedMs,
+        earned: raw.earned,
+        reason: raw.reason
+      }
+    }
+  }
+
+  if (raw.type === 'work-settle-ack') {
+    if (!isVisitId(raw.contractId)) return fail('contract-id')
+    if (!isVisitId(raw.requestId)) return fail('request-id')
+    if (typeof raw.ok !== 'boolean') return fail('ok')
+    if (raw.ok === true) {
+      if (!Number.isSafeInteger(raw.earned) || raw.earned < 0 || raw.earned > MAX_WORK_EARNED) {
+        return fail('earned')
+      }
+      return {
+        ok: true,
+        packet: {
+          v: PROTOCOL_VERSION,
+          type: raw.type,
+          deviceId: raw.deviceId.toLowerCase(),
+          contractId: raw.contractId.toLowerCase(),
+          requestId: raw.requestId.toLowerCase(),
+          ok: true,
+          earned: raw.earned
+        }
+      }
+    }
+    if (!isWorkError(raw.error)) return fail('error')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        contractId: raw.contractId.toLowerCase(),
+        requestId: raw.requestId.toLowerCase(),
+        ok: false,
+        error: raw.error
       }
     }
   }

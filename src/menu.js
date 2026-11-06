@@ -36,6 +36,8 @@ export const MAX_MENU_SKINS = 16
 export const MENU_TOOL_LABELS = Object.freeze({
   'open-site': '打开软件',
   bring: '带派',
+  // ticket 40：打开农场小窗。数据由宿主随 `farm-window` 命令下发。
+  farm: '农场',
   home: '回到初始位置',
   reload: '重载配置',
   // ticket 37：扫 dsh-pet 的宠物包目录，把没见过的素材加进 skin.json。
@@ -121,6 +123,8 @@ export function menuTools ({ hasOrigin = false } = {}) {
   if (hasOrigin) tools.push({ id: 'open-site', label: MENU_TOOL_LABELS['open-site'] })
   // 「带派」（ticket 24）：永远可用——背包是本地东西，不依赖邻居在线。
   tools.push({ id: 'bring', label: MENU_TOOL_LABELS.bring })
+  // 「农场」（ticket 40）：和带派一样是本机能力，没有邻居也能种。
+  tools.push({ id: 'farm', label: MENU_TOOL_LABELS.farm })
   tools.push({ id: 'home', label: MENU_TOOL_LABELS.home })
   tools.push({ id: 'reload', label: MENU_TOOL_LABELS.reload })
   tools.push({ id: 'scan-skins', label: MENU_TOOL_LABELS['scan-skins'] })

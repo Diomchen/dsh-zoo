@@ -1,7 +1,8 @@
 # dsh-zoo 协议 v1
 
-本文记录 **ticket 01–27 已落地** 的发现、放行、心跳、串门（含自发出门与访客常驻）、
-串门记录，以及「带派」礼物（wire 字段、拉取路由、送达回执、限额）协议。
+本文记录 **ticket 01–45 已落地** 的发现、放行、心跳、串门（含自发出门与访客常驻）、
+串门记录、「带派」礼物（wire 字段、拉取路由、送达回执、限额），以及农场 v1.1 的
+农场快照、行情 gossip、偷/帮和雇佣合同。
 v1 的 GUI 客户端行为（灯条、卡片、同屏 4 位、`expiresAt` 淡出）已随 ADR-0005 删除，
 这里只留线路上的事实。
 实现修正：串门走现有 UDP socket，而不是原计划的 TCP（原因见文末）；礼物本体走
@@ -46,27 +47,70 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 { "v": 1, "type": "visit-recall", "deviceId": "<uuid>", "visitId": "<uuid>" }
 { "v": 1, "type": "visit-recall-ack", "deviceId": "<uuid>", "visitId": "<uuid>" }
 { "v": 1, "type": "gift-received", "deviceId": "<uuid>", "visitId": "<uuid>", "giftId": "<uuid>" }
+{ "v": 1, "type": "farm-action", "deviceId": "<uuid>", "visitId": "<uuid>", "requestId": "<uuid>",
+  "action": "steal", "plotId": "p1" }
+{ "v": 1, "type": "farm-action-result", "deviceId": "<uuid>", "requestId": "<uuid>",
+  "ok": true, "crop": "tomato", "qty": 1 }
+{ "v": 1, "type": "farm-action-result", "deviceId": "<uuid>", "requestId": "<uuid>",
+  "ok": false, "error": "guard", "caught": true }
+
+{ "v": 1, "type": "market-digest", "deviceId": "<uuid>", "at": 1700000000000,
+  "prices": { "tomato": 5.2, "carrot": 6.1, "pumpkin": 31 },
+  "hire": { "enabled": true, "wagePerHour": 10, "minHours": 2, "maxHours": 8,
+            "guard": 0.5, "available": true, "reason": "ready" } }
+
+{ "v": 1, "type": "work-request", "deviceId": "<uuid>", "requestId": "<uuid>",
+  "hours": 4, "wagePerHour": 10, "fee": 2 }
+{ "v": 1, "type": "work-ack", "deviceId": "<uuid>", "requestId": "<uuid>", "ok": true,
+  "contractId": "<uuid>", "startedAt": 1700000000000, "endsAt": 1700000014400, "guard": 0.5 }
+{ "v": 1, "type": "work-recall", "deviceId": "<uuid>", "contractId": "<uuid>" }
+{ "v": 1, "type": "work-recall-ack", "deviceId": "<uuid>", "contractId": "<uuid>", "ok": true }
+{ "v": 1, "type": "work-end", "deviceId": "<uuid>", "contractId": "<uuid>", "reason": "employer-end" }
+{ "v": 1, "type": "work-end-ack", "deviceId": "<uuid>", "contractId": "<uuid>", "ok": true }
+{ "v": 1, "type": "work-settle", "deviceId": "<uuid>", "contractId": "<uuid>",
+  "requestId": "<uuid>", "servedMs": 7200000, "earned": 20, "reason": "recall" }
+{ "v": 1, "type": "work-settle-ack", "deviceId": "<uuid>", "contractId": "<uuid>",
+  "requestId": "<uuid>", "ok": true, "earned": 20 }
 ```
 
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
 | `anim` | `heartbeat`、`visit-request` | 本机宠物当前动作名，或 `null`；必须是安全文件名（无路径分隔符/控制字符，≤64）。旧端只读它 |
-| `action` | `heartbeat`、`visit-request` | 本机宠物当前动作的**语义名**（自由字符串，≤64）；缺省时消费端回退到 `anim`。和 `anim` 相同时不必重复发 |
+| `action`（宠物动作） | `heartbeat`、`visit-request` | 本机宠物当前动作的**语义名**（自由字符串，≤64）；缺省时消费端回退到 `anim`。和 `anim` 相同时不必重复发 |
+| `action`（访客动作） | `farm-action` | 只能是 `steal` 或 `help`；别的值整包丢 |
 | `semantic` | `heartbeat`、`visit-request` | 动作的固定语义标签：`working` / `eating` / `sleeping` / `idle` / `other`；不认识的动作靠它画通用表情 |
 | `say` | `heartbeat`、`visit-request` | `{ text, until }`：气泡文本（清洗、≤80 码点）与过期时刻；`until` 最多 `now + 30s`，过期不显示 |
 | `skinPort` | `beacon`、`beacon-ack`、`heartbeat`、`visit-request` | 本机素材源端口（1..65535）；没有素材源就不带 |
 | `skinId` | 同上 | 素材源 id（`[A-Za-z0-9_-]{1,32}`）；缺省用 `deviceId` |
-| `visitId` | `visit-*` | 一次串门的随机 UUID；与 `deviceId` 同一种形状，但只用于关联这一次串门 |
+| `visitId` | `visit-*`、`farm-action` | 一次串门的随机 UUID；与 `deviceId` 同一种形状，但只用于关联这一次串门 |
 | `gift` | `visit-request` | 可选，一次串门最多一件；`kind:'text'` 或 `kind:'file'`，字段规则见「礼物字段」 |
 | `giftId` | `gift-received` | 礼物的 UUID（与报文里的 `gift.id` 同一个键）；只用于确认「哪一件到了」 |
-| `reason` | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
+| `requestId` | `farm-action`、`farm-action-result`、`work-request`、`work-ack`、`work-end`、`work-settle`、`work-settle-ack` | UUID 幂等键；重发复用同一个。访客动作按 `${deviceId}:${requestId}` 回放；`work-*` 的 ack 也按同一键回放 |
+| `plotId` | `farm-action` | 地块 id，固定 `p1`–`p4`；不能是路径或自由文本 |
+| `ok` / `error`（访客动作） | `farm-action-result` | `ok` 布尔；失败时 `error` 是固定枚举（`no-visit` / `bad-plot` / `bad-action` / `not-mature` / `already-stolen` / `already-helped` / `cap` / `guard` / `starting`） |
+| `ok` / `error`（合同） | `work-ack`、`work-recall-ack`、`work-end-ack`、`work-settle-ack` | `ok` 布尔；失败时 `error` 是固定枚举（`own-pet` / `worker-unavailable` / `already-working` / `already-hired` / `bad-wage` / `bad-hours` / `no-coin` / `contract-not-found` / `contract-ended` / `contract-busy` / `busy` / `starting`）。`timeout` / `bad-device-id` / `disposed` 只在本机 HTTP/桌面结果里出现，不上线 |
+| `crop` / `qty` | `farm-action-result` | 成功时作物 id（`tomato`/`carrot`/`pumpkin`）与 0..1 的数量；失败不带 |
+| `caught` | `farm-action-result` | 只能与 `error:'guard'` 一起出现；表示被守卫抓住（没有罚款） |
+| `reason`（访客） | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
+| `reason`（合同结束） | `work-end` | 固定枚举 `expired` / `offline` / `recall` / `employer-end` / `denied` / `cancelled` / `shutdown` / `restart` / `completed` |
+| `reason`（结算） | `work-settle` | 固定枚举 `completed` / `recall` / `employer-end` / `offline` / `expired` |
+| `at` | `market-digest` | 发起方时钟的正整数毫秒；接收方只认与本机时钟相差 ≤2 分钟的样本 |
+| `prices` | `market-digest` | `{ <cropId>: number }`；只认三种作物、有限数、夹在 `[base×0.5, base×2]`；坏条目只丢那一种 |
+| `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working` 或 `null`；坏形状整包丢 |
+| `contractId` | `work-ack`、`work-recall`、`work-end`、`work-settle` | 合同 UUID；`work-end` 在取消一笔还没 ack 的请求时可改用 `requestId` |
+| `hours` / `wagePerHour` / `fee` | `work-request` | 时长 2–8 小时、时薪 1–100 的整数；`fee` 是 1..40 的整数，必须等于 `ceil(时薪 × 时长 × 5%)`（最低 1） |
+| `startedAt` / `endsAt` | `work-ack` | 正整数毫秒；`endsAt > startedAt` 且差值 ≤8 小时 |
+| `guard` | `work-ack`、`market-digest.hire` | 0..0.8 的有限数；v1 只有 0.3（主人在家）/0.5（雇工）/0.8（两者） |
+| `servedMs` / `earned` | `work-settle` | 服务毫秒 0..8 小时；工钱 0..800 的整数；`work-settle-ack` 回的 `earned` 同一范围 |
 
-**兼容口径（v 仍为 1）**：以上新字段全部可选。旧端解析时会丢弃未知字段，行为不变；
+**兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
+`farm-action` / `farm-action-result` / 8 种 `work-*`）旧端不认识时整包静默丢弃，既不回复
+也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
 那一个字段，不整包失败——`anim` 仍然必发，所以新旧两端始终能至少对上动作名。
@@ -134,6 +178,10 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `gift-discard` | `{ "giftId": "<uuid>" }` | 扔掉：有磁盘记录就立刻整目录删除；没有记录（`pending` / `receiving` / `failed` / `refused`）只拉黑、不碰文件。两种情况都记进本次运行的黑名单 |
 | `gift-copy` | `{ "giftId": "<uuid>" }` | 字条正文进剪贴板；文件没有可复制正文，明确拒绝 |
 | `use-skin` | `{ "skinId": "<源 id>" }` | 换成本机素材注册表里的另一张皮（ticket 32 / ADR-0013）：只换外观、动作和对外 `skinId`；名字、身份、串门记录、礼物不动。未知 id `409 unknown-skin` |
+| 农场 / 交易所 | `plant` / `harvest` / `water` / `fertilize` / `buy-seed` / `sell-crop`，小窗用同义 `farm-*` | 见「农场、交易所与雇佣 · 本机动作」。成功 `200`，失败 `409 { ok:false, error }` |
+| 雇佣 | `hire` / `hire-listing` / `recall-worker` / `end-contract` | 见「农场、交易所与雇佣 · 雇佣」。雇佣请求最多等 1.8 秒（3 次发送） |
+| 访客农场 | `farm-steal` / `farm-help` | 只在串门期间；`{ plotId, visitId? }`。宿主等 UDP 结果（~1.8 秒）后回一次 `action-result` |
+| 农场小窗 | `farm-open` | `{ plotId? }`；没有桌面层回 `409 desktop-off` |
 
 ### 名字只有一份（ADR-0007）
 
@@ -451,6 +499,267 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 - 串门结束（回家 / 送客 / 超时 / 失联 / 被拒绝）立即 unarm；5 分钟到点也自然失效。
 - 没装素材源的用户也会监听这个端口——它必须保持**只读、只按 id 白名单、不列目录**。
 
+## 农场、交易所与雇佣（ticket 39–45）
+
+农场是本机账本（`farm.json` / `market.json` / `contracts.json`）；成交永远在本机交易所，
+只有偷/帮/雇和行情 gossip 跨机。所有新报文都遵守文末的 4 KiB、白名单和旧邻居规则。
+
+### 状态出口 `GET /dsh-zoo/state`
+
+在原有 room 快照之外多三项（只加字段）：
+
+```json
+{
+  "farm": {
+    "plots": [
+      { "id": "p1", "crop": "tomato", "plantedAt": 1700000000000,
+        "grownMs": 0, "growMs": 1800000, "waterings": 0,
+        "fertilized": false, "stolenBy": ["<uuid>"], "helpedBy": [] }
+    ],
+    "coins": 30,
+    "seeds": { "tomato": 2 },
+    "crops": {},
+    "dew": 0,
+    "dewEarned": 0,
+    "guard": 0.3,
+    "worker": null,
+    "hire": { "enabled": false, "wagePerHour": 10, "minHours": 2, "maxHours": 8 },
+    "log": [ { "at": 1700000000000, "kind": "harvest", "crop": "tomato", "qty": 3 } ]
+  },
+  "market": {
+    "prices": { "tomato": { "base": 5, "price": 5.2, "volume24h": 12, "at": 1700000000000 } },
+    "index": { "tomato": { "price": 5.1, "at": 1700000000000, "samples": 2 } },
+    "history": [ { "crop": "tomato", "side": "sell", "qty": 3, "price": 4, "at": 1700000000000 } ]
+  },
+  "contracts": { "outgoing": [], "incoming": [] }
+}
+```
+
+- `farm.plots` 固定 `p1`–`p4`。空地是 `crop: null`、`plantedAt: null`、`growMs: 0`；
+  成熟看 `grownMs >= growMs`，日志里不另给阶段。
+- `farm.seeds` / `farm.crops` 是**稀疏计数**：缺键就是 0；每种上限 999。`coins` 上限 1,000,000。
+- `farm.dew` 是当前余额，`farm.dewEarned` 是「今天已经挣到」的露水（花掉不会回退）。
+  两者都 ≤48；跨本地日归零。`dewEarned` 是对 SPEC v5 字段表的一个 additive 字段。
+- `farm.guard` 是 0..0.8 的守卫值；`farm.worker` 是 `null` 或
+  `{ nickname, contractId, endsAt, guard: 0.5 }`——**不带 deviceId**。
+- `farm.hire` 就是本机挂牌；`farm.log` 最新在前，最多 20 条，条目字段
+  `{ at, kind, crop?, qty, who? }`。`kind` 目前是 `plant` / `harvest` / `steal` / `help`；
+  `who` 只出现在偷/帮日志里（昵称，≤32 码点），被抓住是 `qty: 0`。
+- `market.prices` 保持 `market.json` 的形状（`base/price/volume24h/at`），**不带 `bid`**；
+  `bid` 只出现在农场小窗的交易所页。`market.history` 最新在前，最多 50 笔；
+  `market.index` 只在至少有一个新鲜 peer 样本时出现，`samples` 含本机。
+- `contracts` 的每一项是公开视图：
+  `{ id, requestId, workerDeviceId, workerNickname, hours, wagePerHour, wage, fee,
+     startedAt, endsAt, ackedAt, status, earned, endedAt, endReason, settled,
+     settledAt, recallRequested, remainingMs, provisionalEarned }`（`outgoing`），
+  `incoming` 把前两项换成 `employerDeviceId` / `employerNickname`。每侧最多 20 条；
+  `status` 是 `pending` / `active` / `ended` / `cancelled`；`provisionalEarned` 只给 UI，
+  绝不用于结算。`contracts` 是**本机**出口，才允许出现 deviceId；访客快照不含。
+
+### 本机动作（`POST /dsh-zoo/action`）
+
+成功 `200`，失败 `409 { ok: false, error, ... }`。桌面小窗的地块/交易动作使用带
+`farm-` 前缀的同义写法，两种走同一个分支；雇佣动作同名。所有数量、价格、总价都由宿主算，
+请求体只给 id / 枚举。
+
+| action | body | 成功返回 | 主要错误 |
+| --- | --- | --- | --- |
+| `plant` / `farm-plant` | `{ plotId, cropId }` | `{ ok, action, plotId, crop, plot, coins, seeds, crops, dew, dewEarned, persisted }` | `bad-plot` `bad-crop` `plot-occupied` `no-seed` `starting` |
+| `harvest` / `farm-harvest` | `{ plotId }` | 同上，另带 `qty`，`plot` 是空地 | `bad-plot` `not-mature` `starting` |
+| `water` / `farm-water` | `{ plotId }` | `{ ok, action, plotId, plot, coins, seeds, crops, dew, dewEarned, persisted }` | `bad-plot` `already-watered` `no-dew` `starting` |
+| `fertilize` / `farm-fertilize` | `{ plotId }` | 同上 | `bad-plot` `already-fertilized` `no-dew` `starting` |
+| `buy-seed` / `farm-buy-seed` | `{ cropId, qty }` | `{ ok, action, cropId, qty, unitPrice, total, price, coins, seeds, crops, dew, dewEarned, notice, persisted }` | `bad-crop` `bad-qty` `no-coin` `cap` `market-busy` `starting` |
+| `sell-crop` / `farm-sell-crop` | `{ cropId, qty }` | 同上，`action` 是 `sell-crop`，`price` 是成交后的本机价 | `bad-crop` `bad-qty` `no-seed` `market-busy` `starting` |
+| `hire` | `{ deviceId, hours }` | `{ ok, action: "hire", contractId }`（收到 `work-ack` 才算成功） | `bad-device-id` `bad-hours` `own-pet` `worker-unavailable` `already-hired` `busy` `no-coin` `starting` `disposed` |
+| `recall-worker` | `{ contractId }` | `{ ok, action, contractId }`；合同已结束时带 `alreadyEnded: true` | `bad-device-id` `contract-not-found` `contract-ended` `starting` |
+| `end-contract` | `{ contractId }` | `{ ok, action, contractId }`；还在 pending 时带 `cancelled: true` | `bad-device-id` `contract-not-found` `starting` |
+| `hire-listing` | `{ enabled, wagePerHour, minHours, maxHours }` | `{ ok, action, hire }` | `bad-enabled` `bad-wage` `bad-hours` `starting` |
+| `farm-steal` / `farm-help` | `{ plotId, visitId? }` | `{ ok, action, plotId, crop?, qty?, caught?, notice }` | 见「偷菜与帮忙」 |
+| `farm-open` | `{ plotId? }` | `{ ok, action, window: "opened", mode: "owner"\|"visitor" }` | `desktop-off` |
+
+`plant` / `harvest` / `water` / `fertilize` 的 `plot` 是修改后的完整地块；
+`buy-seed` / `sell-crop` 的 `qty` 必须是 1–99，每分钟最多 10 笔（买 + 卖共享），
+超了是 `market-busy`。卖作物时仓库不够的 `no-seed` 文案会说“没有这种作物”，
+与买种子时的“没有种子”区分。`hire-listing` 的 `minHours <= maxHours`，范围 2–8；
+`hire` 的 `hours` 也必须在 2–8 之间，且落在对方挂牌的 `minHours..maxHours` 内。
+
+`farm-steal` / `farm-help` 不是本机农场动作：它们只在串门期间有效，宿主把它转成 UDP
+`farm-action`，等结果后再更新本机仓库。`visitId` 可省略（宿主用当前出门的 `visitId`）；
+给了但和当前串门不一致时是 `no-visit`。
+
+主要错误码（人话在 `src/farm-text.js`，HTTP 不返回路径/堆栈）：
+
+| 错误码 | 含义 |
+| --- | --- |
+| `bad-plot` | 地块不是 `p1`–`p4`，或这块地不能做这个动作（空地浇水、成熟地帮忙等） |
+| `bad-crop` | 作物不是三种之一 |
+| `plot-occupied` | 这块地已经种了 |
+| `not-mature` | 收获时还没熟 |
+| `already-watered` / `already-fertilized` | 这一株已经浇过 / 施过 |
+| `no-seed` | 仓库没有这种种子（买种子的语境）；卖作物时表示没有这种作物 |
+| `no-coin` / `no-dew` | 硬币 / 露水不够 |
+| `bad-qty` | 数量不是 1–99 的整数 |
+| `cap` | 仓库/次数到上限：种子或作物 999、偷菜/帮忙日限额、访客本机跨农场限额 |
+| `market-busy` | 一分钟内已经成交 10 笔，或交易所还没准备好 |
+| `no-visit` | 这次串门已经结束，或 `visitId` 与当前串门不一致 |
+| `no-port` | 对方没有开局域网端口，拿不到农场快照 / 发不出访客动作 |
+| `already-stolen` / `already-helped` | 这一轮已经偷过 / 帮过这块地 |
+| `guard` | 被守卫抓住；同时带 `caught: true`，没有罚款 |
+| `worker-unavailable` | 对方不在家 / 在串门 / 在打工 / 没挂牌 / 挂牌时段不含这次时长 |
+| `own-pet` | 不能雇自己 |
+| `already-working` / `already-hired` | 对方宠物已在打工 / 我家已有一位雇工 |
+| `bad-wage` / `bad-hours` / `bad-enabled` | 挂牌或雇佣参数不合法 |
+| `contract-not-found` / `contract-ended` / `contract-busy` | 合同不存在 / 已结束 / 正在结算 |
+| `busy` / `starting` / `disposed` | 上一笔还在联系中 / 宿主还没起来 / 正在关闭 |
+| `timeout` | 1.8 秒内没收到对方结果；访客动作可能白跑，雇佣请求会退款 |
+
+### 农场快照（HTTP，ticket 43）
+
+访客打开主人的农场时，由**访客的宿主服务**（不是 helper）向主人拉一份只读 JSON：
+
+```
+GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
+```
+
+- **只在这次串门活跃期间可读**：授权直接从 room 的 `visitors` 派生（`visitorByVisitId`），
+  送客 / 对方召回 / 失联 / 信任收紧 / 宿主 dispose 五条结束路径都会让下一次请求自然
+  `404`。没有第二张 armed 表，也没有“曾经来过”的 410/403。
+- 形状：
+  `{ v, visitId, host:{nickname}, guard, guardParts:{ownerHome,worker}, plots[], limits, hire, market, at }`。
+  `plots` 固定 `p1..p4`，每块只给 `id/crop/stage/mature/remainingMs` 与
+  **`stolenByMe`/`helpedByMe` 两个布尔**；绝不回传 `stolenBy`/`helpedBy` 原数组
+  （那里是别的访客 deviceId），也不含任何路径。`market` 是交易所页的摘要
+  （含 `bid` / 新鲜指数），不带历史。
+- `limits` 是主人侧给这位访客的计数：
+  `{ steal: { perVisit, usedInVisit, perFarm, usedOnFarm, perDay, usedToday },
+     help: { perVisit, usedInVisit, perFarm, usedOnFarm, perDay, usedToday } }`。
+  `usedToday` 是访客本机账本（跨农场），只有访客自己算得清；主人侧只保证
+  `usedInVisit` / `usedOnFarm` 是这家农场的账。
+- `200` + `application/json; charset=utf-8` + `cache-control: no-store`；
+  坏 `visitId`、未知/已结束、多一段路径一律 `404`；非 GET/HEAD → `405`；HEAD 只回头。
+- 访客侧只连私网/回环：2 秒超时、响应 ≤64 KiB、失败按 `address:port` 冷却 60 秒；
+  `404` 等同于“这次串门结束了”，窗口切到 `ended`，不再重试。
+
+### 偷菜与帮忙（`farm-action` / `farm-action-result`）
+
+访客 helper → 访客宿主（`farm-steal` / `farm-help`）→ UDP `farm-action` →
+主人校验 → 落账 → UDP `farm-action-result` → 访客宿主更新仓库（偷来的作物、帮忙的硬币）
+→ helper 刷新。
+
+- 主人按 `${deviceId}:${requestId}` 缓存最近 **200** 条结果（10 分钟 TTL）；
+  **落账之后**才写缓存（失败也写），重发原样回放，不重新 roll 守卫、不重复扣。
+- 未授权的 `farm-action`（`visitId` 不匹配当前访客 / `deviceId` 冒用）**静默丢弃**，
+  不回错误，避免把“这个 visitId 存在过”变成 oracle。
+- 访客侧首次 + 两次重发（间隔约 500ms），**1.8 秒**没结果就 settle `timeout`；
+  重发复用同一个 `requestId` 和同一串字节。
+- 偷：目标成熟；一次 1 个；这块地这一轮还没被这位访客偷过。成功 → 访客仓库 +1、
+  主人 `stolenBy` + 访客、收获时少 1、主人日志一条；失败 → 这次白跑，没有罚款。
+- 帮：目标还在生长；这位访客这一轮没帮过这块地。访客花 **1 露水**（**发出前**扣，
+  失败/超时退回），地块 +10% 生长，访客得 **1 硬币**。成熟地/空地帮忙是 `bad-plot`。
+- 上限：偷 3/访客/农场/天、5/农场/天、10/访客/天；帮 3/访客/农场/天、5/访客/天；
+  每块地每轮每访客各一次。“10/访客/天”和“5/访客/天”是访客本机跨农场账本，
+  主人只回自己农场的计数。
+- 守卫 = 主人在家 0.3（主人在串门/打工时为 0）+ 雇工 0.5，封顶 **0.8**；
+  成功率 `1 − 守卫`。守卫判定在主人侧，随机源可注入；被抓住只写一条 `qty:0` 的日志。
+
+### 行情 gossip（`market-digest`）
+
+每 **30 秒**（或本机价格/挂牌签名变化时）向所有放行邻居单播一条：
+
+```json
+{ "v": 1, "type": "market-digest", "deviceId": "<uuid>", "at": 1700000000000,
+  "prices": { "tomato": 5.2, "carrot": 6.1, "pumpkin": 31 },
+  "hire": { "enabled": true, "wagePerHour": 10, "minHours": 2, "maxHours": 8,
+            "guard": 0.5, "available": true, "reason": "ready" } }
+```
+
+- 发送走 `discovery.sendTo`（内部再查 `mayTalkTo`），失败不重试，下一拍自然补；
+  没有放行邻居时不算“发过”。
+- 接收端四道门：只认已放行邻居；`at` 与本机时钟相差 ≤**2 分钟**；同一 peer
+  **30 秒最多 1 条**；价格只认三种作物、有限数、`[base×0.5, base×2]`。坏价格只丢那一种，
+  坏 `hire`/形状/时间才整包丢。未知字段在解析时丢掉。
+- 每家按 `deviceId` 只留最近一条 digest；指数取本机价格 + 所有新鲜 peer 样本的**中位数**，
+  至少一个 peer 样本才产出条目（`samples` 含本机，所以一个 peer 时是 2）。
+- 成交价：`effective = 0.85 × 本机 price + 0.15 × 新鲜指数`；没有新鲜指数时只用本机价。
+  `bid = round(effective × 0.9)`。价格夹在 `[base×0.5, base×2]`；每 10 分钟向 base
+  回归 3%。卖 `q` 个：`price = clamp(price × (1 − 0.12 × q / 20), base×0.5, base×2)`；
+  种子按表里的固定价卖，买种子不影响作物价。
+- 指数过期后保留最后一次值（交易所页画灰），但不再参与定价；邻居被拒绝/移除时
+  它的 digest 和指数贡献一起清掉。
+
+### 雇佣合同（8 种 `work-*`，ticket 44）
+
+合同是**预付 + 按实际时长结算**；没有托管账户，钱只在双方本机账本和报文里走。
+
+| 类型 | 方向 | 字段 | 幂等键 |
+| --- | --- | --- | --- |
+| `work-request` | 雇主 → 雇工主人 | `requestId` / `hours` / `wagePerHour` / `fee` | `requestId` |
+| `work-ack` | 雇工主人 → 雇主 | 同上 + `ok`；成功带 `contractId` / `startedAt` / `endsAt` / `guard` | `deviceId:requestId` |
+| `work-recall` | 雇工主人 → 雇主 | `contractId` | `contractId` |
+| `work-recall-ack` | 雇主 → 雇工主人 | `contractId` / `ok` | `contractId` |
+| `work-end` | 雇主 → 雇工主人 | `contractId` 或 `requestId` / `reason` | 目标 id |
+| `work-end-ack` | 对方 → 发起方 | `contractId` / `requestId` / `ok` | 目标 id |
+| `work-settle` | 雇主 → 雇工主人 | `contractId` / `requestId` / `servedMs` / `earned` / `reason` | `requestId` |
+| `work-settle-ack` | 雇工主人 → 雇主 | `contractId` / `requestId` / `ok` / `earned` | `contractId` |
+
+流程与规则：
+
+1. **挂牌**：主人在 `farm.json` 的 `hire` 里写 `enabled/wagePerHour/minHours/maxHours`，
+   随 `market-digest.hire` 广播。只有在线、在家、没在串门/打工的宠物能被雇。
+2. **请求**：雇主选 `deviceId` + `hours`，宿主算 `wage = 时薪 × 时长`、
+   `fee = ceil(wage × 5%)`（最低 1，烧掉），先落 pending 合同并扣 `wage + fee`，再发
+   `work-request`。首次 + 两次重发（约 500ms），1.8 秒没 ack 就取消并全额退款。
+3. **确认**：雇工主人再校验一遍在线/在家/挂牌/时段/时薪/手续费；落 `incoming` 合同、
+   进 `working`、创建 `contractId` 后回 `work-ack`。雇主收到 ack 才把合同置 active，
+   `ackedAt` 用雇主本地时钟。
+4. **`working`**：雇工不出现在自己家（`self.work`），出现在雇主农场（`worker` 镜像 +
+   `role:'worker'`/`badge:'work'`），雇主守卫 +0.5。合同期内它不能再串门、不能再被雇；
+   v1 一个农场最多一位雇工，不能雇自己（D2 允许同一位宠物既当雇主又当雇工）。
+5. **结束**：主人 `work-recall`；雇主 `work-end`（`reason` 为 `employer-end`）；
+   到期 `expired`；任一方离线按最后心跳 `offline`。结束写 `ended` / `endReason`，
+   然后双方走 `work-settle` / `work-settle-ack`。
+6. **结算**：`earned = floor(wage × servedMs / contractMs)`；`servedMs` 只取**雇主本地时钟**
+   从收到 ack 到结束的差值，跨机只用 `endsAt − startedAt` 这个差值。雇工主人用自己的
+   合同重算并夹在 0..wage，给 `earned` 入账一次并回 ack；雇主拿回 `wage − earned`，
+   手续费不退。`requestId`/`contractId` 重发只回放、不重复加钱。
+7. **离线/重启**：合同的一方在最后心跳后判离线，按最后心跳结算；重连后按 `contractId`
+   幂等补发。`work-*` ack 缓存最近 **200** 条 / 10 分钟；结算/召回重试 1 秒起步、
+   指数退避封顶 30 秒。
+8. **枚举**：合同 `status` 是 `pending` / `active` / `ended` / `cancelled`；
+   结束原因见字段表；结算原因只允许 `completed` / `recall` / `employer-end` / `offline` /
+   `expired`。`contractId` / `requestId` 都是 UUID 形状。
+
+### 限额与边界
+
+| 项 | 值 |
+| --- | --- |
+| 地块 / 作物 / 初始 | 4 块 / 3 种 / 30 硬币 + 2 番茄种子 + 0 露水 |
+| 硬币 / 每种种子或作物 | 1,000,000 / 999 |
+| 露水 | 每 10 分钟待机 +1，每天最多挣 48、余额 48；本地午夜重置 |
+| 离线生长 | 一次最多补 12 小时；运行中按真实时间 |
+| 农场日志 / 行情历史 | 50 / 200（`/state` 分别 20 / 50） |
+| 合同 | 每侧 20 条，未结算的不淘汰；2–8 小时；时薪 1–100；手续费 5%（向上取整、最低 1） |
+| 偷菜 / 帮忙 | 3/5/10 与 3/5/1（每地每轮）；帮忙每次 1 露水 / +1 硬币 |
+| 行情 | 1 条/30 秒/peer；样本 2 分钟内；价格夹在 `[base×0.5, base×2]` |
+| 买卖 | 1–99 个/次；10 笔/分钟；价格夹取；`bid = round(effective × 0.9)` |
+| 幂等缓存 | `farm-action` 200 条/10 分钟；`work-*` ack 200 条/10 分钟 |
+| 守卫 | 0.3（主人在家）/ 0.5（雇工）/ 0.8（两者），宠物出门/打工时自家 0 |
+| 快照 | HTTP ≤64 KiB；访客宿主 2 秒超时、60 秒冷却 |
+
+### 4 KiB、白名单与旧邻居
+
+- **4 KiB**：所有 UDP 报文都是单个 JSON，超过 4 KiB 在解析前丢弃；不回复、不报错。
+  `market-digest` 和 8 种 `work-*` 都很小（价格 3 个数、合同 6 个字段），正常触不到上限。
+  农场快照走 HTTP，不受 UDP 4 KiB 限制，但访客客户端仍只收 ≤64 KiB。
+- **字段白名单**：每种类型只重建自己的字段；未知字段、未知作物、未知枚举、越界数字
+  一律丢弃或整包拒绝。所有 id 只从校验过的字段拼，不拼路径。
+- **旧邻居**：旧版本只认识自己的报文类型，`market-digest` / `farm-action(-result)` /
+  `work-*` 会被当成未知类型静默丢掉，不报错、不崩。新端收到旧端：缺 `action`/`skin*`/
+  `gift` 都按本文的兼容口径降级；没有农场报文时，本地农场照常运行，只是不能跨机偷/帮/雇。
+- **降级**：旧邻居 → 串门/礼物/记录照常，没有农场入口；对方没开局域网端口 → 串门照常、
+  快照取不到、偷/帮/雇不可用；对方离线 → 不能偷/帮/雇，行情过期，合同按最后心跳结束；
+  没有桌面层 → HTTP 动作与 `state` 可用，没有地块条/农场窗。
+
 ### 改名前后的路径（ADR-0014）
 
 项目从 `dsh-local-pet` 改名为 `dsh-zoo`，路由随之改成 `/dsh-zoo-skin/*` 与
@@ -496,6 +805,20 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
   `visits.json` 只能由本机完成的串门触发写入，且写入有界。
 - 礼物路由只读、不列目录、不接受任何用户路径；只返回 `armedGifts` 里按 `giftId` 查到的那一个
   本机绝对路径，且在 armed 窗口外一律 `404`。这一层是 ADR-0011 唯一新增的局域网攻击面。
+- 农场快照同样是局域网只读面：没有路径、没有别人的 deviceId、只在串门活跃期可读，
+  响应 ≤64 KiB；`farm-action` 的 `visitId`/`requestId` 必须是 UUID、`plotId` 必须 `p1..p4`、
+  `action`/`error` 是固定枚举，`caught` 只能跟 `guard` 一起出现。
+  `farm-action-result` 只按 `requestId` 回放已落账的结果；未授权动作静默丢弃。
+  动作的日限额与每块地每轮一次把刷屏限制在有界范围内，不另叠滑动窗口。
+- `market-digest` 只读三种作物、有限数、`[base×0.5, base×2]` 的价格与固定形状的 `hire`；
+  只认放行邻居、2 分钟内、每 peer 30 秒 1 条。坏价格只丢那一种，坏形状整包丢。
+- 8 种 `work-*` 各自校验 UUID/整数范围/固定枚举；`work-*` 不落进 `VISIT_TYPES` 的
+  四字段分支。合同只能由本机 action（`hire` / `hire-listing` / `recall-worker` /
+  `end-contract`）或已放行邻居的合法报文创建/推进；`work-*` ack 按
+  `${deviceId}:${requestId}` 回放最近 200 条 / 10 分钟。
+- `farm.json` / `market.json` / `contracts.json` 只由本机 store 写，写入串行 + tmp/rename、
+  每份有界（日志 50、历史 200、合同每侧 20）；远端报文不能直接写文件或指定路径。
+  访客动作的落账同样只经 `farm.store`，并受日限额/每地每轮/`requestId` 幂等约束。
 - 协议里永远没有坐标、朝向、拖拽状态、项目名、文件路径或会话内容（ADR-0003）。
   礼物报文只有 `id`/`kind`/`name`/`size`/`sha256`/`text`；本机路径只留在发送端的背包与
   接收端的 `gifts/` 里，连 `/dsh-zoo/state` 的礼物 `path` 也只是本机回环页面能读到。

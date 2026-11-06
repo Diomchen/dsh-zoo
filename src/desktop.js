@@ -592,6 +592,23 @@ export function createDesktop (options = {}) {
     })
   }
 
+  /**
+   * 农场小窗（ticket 40）：把宿主算好的完整 farm view 交给 helper。
+   * `open:true` 打开/聚焦；`open:false` 只刷新已经开着的那扇（种/收之后）。
+   * 窗口拿不到 `/state`，所以种子/作物/日志/剩余毫秒必须随这条命令一起走。
+   */
+  function farmWindow (payload = {}) {
+    return sendHostCommand({
+      type: 'farm-window',
+      open: payload?.open === true,
+      mode: payload?.mode === 'visitor' ? 'visitor' : 'owner',
+      farm: payload?.farm ?? null,
+      market: payload?.market ?? null,
+      visit: payload?.visit ?? null,
+      ...(typeof payload?.plotId === 'string' ? { plotId: payload.plotId } : {})
+    })
+  }
+
   function show () {
     try {
       return send({ type: 'show' })
@@ -775,6 +792,7 @@ export function createDesktop (options = {}) {
     giftCopy,
     giftDiscard,
     bringWindow,
+    farmWindow,
     actionResult,
     shot,
     requestStatus,

@@ -41,7 +41,9 @@ function fakeCtx () {
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-visit-e2e-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  // 串门结束后仍可能有 visits.json 的写入在飞：删除目录时重试几次，别让测试
+  // 偶尔以 ENOTEMPTY 失败（这是测试清理的竞态，不是产品行为）。
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return dir
 }
 
