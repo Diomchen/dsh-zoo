@@ -203,6 +203,19 @@ function isThumbName (name) {
 }
 
 /**
+ * 农场摘要（ticket 40）：桌面地块条只画「哪块地、什么阶段、熟没熟」，完整视图
+ * （种子/作物/日志/剩余毫秒）由宿主在 `farm-window` 命令里给窗口，**不进场景**。
+ *
+ * `snapshot.farm` 是 39 的 `/state.farm` 形状（`src/farm.js` 的 `farmView`）；摘要的裁剪
+ * 与上限跟 helper 共用 `shared.normalizeFarmSummary`，避免两处各写一套。没有农场
+ * （老宿主 / 39 没起来 / 没有桌面层）时返回 null，渲染端据此不画地块条。
+ */
+function farmFromSnapshot (snapshot) {
+  if (snapshot === null || typeof snapshot !== 'object') return null
+  return shared.normalizeFarmSummary(snapshot.farm)
+}
+
+/**
  * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
  * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
  *
@@ -252,6 +265,7 @@ export function controlsFromSnapshot (snapshot, options = {}) {
 
   controls.street = streetFromSnapshot(snapshot)
   controls.gifts = giftsFromSnapshot(snapshot, options)
+  controls.farm = farmFromSnapshot(snapshot)
 
   const prompt = snapshot.prompt !== null && typeof snapshot.prompt === 'object' ? snapshot.prompt : null
   if (prompt !== null) {

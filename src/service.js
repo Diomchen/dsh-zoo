@@ -11,6 +11,8 @@ import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { FARM_LOG_VIEW_LIMIT, createFarmStore, initialFarmView } from './farm.js'
+import { CROPS, isMature, plotRemainingMs, plotStage } from './farm-rules.js'
+import { farmErrorText } from './farm-text.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
@@ -455,11 +457,18 @@ export function createService (ctx, options = {}) {
 
     // 农场（ticket 39）：四个本地动作。规则在 src/farm-rules.js（纯），
     // 落盘/串行化在 src/farm.js；UDP 报文没有入口，访客的偷/帮走 ticket 43。
-    if (action === 'plant' || action === 'harvest' || action === 'water' || action === 'fertilize') {
+    if (action === 'plant' || action === 'harvest' || action === 'water' || action === 'fertilize' ||
+      action === 'farm-plant' || action === 'farm-harvest' || action === 'farm-water' || action === 'farm-fertilize') {
       if (farm === null) return { ok: false, error: 'starting' }
-      if (action === 'plant') return farm.plant(body?.plotId, body?.cropId)
-      return farm[action](body?.plotId)
+      // 桌面小窗发的是 farm-* 前缀（和菜单/客户端动作族一致）；HTTP 仍是 SPEC 里的四种。
+      const kind = action.startsWith('farm-') ? action.slice('farm-'.length) : action
+      if (kind === 'plant') return farm.plant(body?.plotId, body?.cropId)
+      return farm[kind](body?.plotId)
     }
+
+    // 农场小窗（ticket 40）：菜单「农场」或桌面地块把一次开窗申请交给宿主。
+    // 数据由宿主算好（窗口是 file:// 页面，读不到 /state），失败必须回人话。
+    if (action === 'farm-open') return handleFarmOpen(body?.plotId)
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') {
@@ -695,14 +704,25 @@ export function createService (ctx, options = {}) {
    */
   function stateView () {
     return {
-      ...room.snapshot(),
+      ...desktopSnapshot(),
       // 当前那张皮（ticket 32）：换皮只看这一项，别的状态都不该动。
       skin: activeSkin === null
         ? null
         : { id: activeSkin.id, size: activeSkin.size, idle: activeSkin.idle },
       backpack: backpack?.items() ?? [],
-      gifts: recentGifts(),
-      // 农场（ticket 39）。store 没起来时也给完整初始形状，字段永远不会是 undefined。
+      gifts: recentGifts()
+    }
+  }
+
+  /**
+   * 桌面层拿到的快照（ticket 40）：room 的纯快照 + 39 的农场全量视图。
+   *
+   * **room 一行不改**：农场和 backpack/gifts 一样是「room 快照 + 磁盘视图」，由这里合成。
+   * `controlsFromSnapshot` 只把它裁成地块条要的摘要；窗口那份完整视图走 `farm-window`。
+   */
+  function desktopSnapshot () {
+    return {
+      ...room.snapshot(),
       farm: farmStateView()
     }
   }
@@ -729,6 +749,60 @@ export function createService (ctx, options = {}) {
       hire: view.hire,
       log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
     }
+  }
+
+  /**
+   * 农场小窗的完整视图（ticket 40）。
+   *
+   * 和 `/state.farm` 是两个形状，别混：
+   *   - 这里每块地多 `stage / mature / remainingMs / waterings / fertilized`，
+   *     阶段与倒计时用 39 的纯规则（`plotStage` / `plotRemainingMs`）在**下发那一刻**算；
+   *   - `seeds/crops` 补全三种作物（0 也要有键），窗口不用猜缺键；
+   *   - `log` 只给最近 20 条：窗口记录页在 41 之后才接，先给能显示的一份。
+   *
+   * 窗口是 file:// 页面，没有 Node、没有网络、读不到 `/state`，所以这份必须随
+   * `farm-window` 命令一起下发；**绝不**把它塞进场景（controls 每帧比较，日志/仓库会污染签名）。
+   */
+  function farmWindowView () {
+    const view = farm?.snapshot() ?? initialFarmView()
+    const stacks = (source) => Object.fromEntries(
+      Object.keys(CROPS).map((cropId) => [cropId, source[cropId] ?? 0])
+    )
+    return {
+      plots: view.plots.map((plot) => ({
+        id: plot.id,
+        crop: plot.crop,
+        stage: plotStage(plot),
+        mature: isMature(plot),
+        remainingMs: plotRemainingMs(plot),
+        waterings: Number(plot.waterings) >= 1 ? 1 : 0,
+        fertilized: plot.fertilized === true
+      })),
+      seeds: stacks(view.seeds),
+      crops: stacks(view.crops),
+      coins: view.coins,
+      dew: view.dew,
+      worker: null,
+      contractCount: 0,
+      log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
+    }
+  }
+
+  /** 菜单「农场」/ 桌面地块的申请：打开或聚焦小窗。没有桌面层就回 `desktop-off`。 */
+  function handleFarmOpen (rawPlotId) {
+    if (desktop === null || typeof desktop.farmWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+    }
+    const plotId = typeof rawPlotId === 'string' ? rawPlotId : null
+    const opened = desktop.farmWindow({
+      open: true,
+      farm: farmWindowView(),
+      ...(plotId === null ? {} : { plotId })
+    })
+    if (opened !== true) {
+      return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+    }
+    return { ok: true, action: 'farm-open', window: 'opened' }
   }
 
   /** 最近 20 件已落盘的礼物，最新在前；形状按 SPEC v4「记录与状态出口」。 */
@@ -1554,7 +1628,8 @@ export function createService (ctx, options = {}) {
    */
   function syncDesktop ({ reset = false } = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
-    const snapshot = room.snapshot()
+    // 40：农场和背包/礼物一样是「room 快照 + 磁盘视图」；room 自己不碰农场。
+    const snapshot = desktopSnapshot()
     const pets = petsFromSnapshot(snapshot).map((pet) => {
       // 本机宠物：把当前这张皮的动作名交给渲染端轮播，并带上它的尺寸（票 32 / 35）。
       if (pet.role === 'self') {
@@ -1578,7 +1653,8 @@ export function createService (ctx, options = {}) {
     const dropped = droppedVisitors(snapshot)
     if (dropped > 0) room.noteSceneOverflow(dropped)
     // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 dshzoo:// URL。
-    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
+    // 40：这里也必须用 desktopSnapshot —— 用 room.snapshot 会把农场从控件里漏掉。
+    const controls = controlsFromSnapshot(dropped > 0 ? desktopSnapshot() : snapshot, { thumbOf: giftThumb })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const assetRoots = assetRootsFor(activeSkin)
     // 目录也进签名：两张皮的素材同名但不同目录时，换皮必须让渲染端跟着换根（ticket 33）。
@@ -1623,6 +1699,10 @@ export function createService (ctx, options = {}) {
         skinId: event.skinId ?? undefined,
         // 礼物四动作只带 giftId（UUID）；路径由宿主查 store，渲染端从来不知道。
         giftId: event.giftId ?? undefined,
+        // 农场（ticket 40）：开窗可带 plotId，四个地块动作必须带；种地再带 cropId。
+        // 少拷一处，到 39 的 store 就只剩 bad-plot，而错误信息不会告诉你是哪一跳丢的。
+        plotId: event.plotId ?? undefined,
+        cropId: event.cropId ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
         gift: event.gift ?? undefined
       })
@@ -1678,6 +1758,9 @@ export function createService (ctx, options = {}) {
     if (error === 'open-failed') return '系统没有接受这个打开请求。'
     if (error === 'gift-not-found') return '这件东西已经不在了。'
     if (error === 'bad-gift') return '这张礼物卡已经不在了。'
+    // 农场（ticket 40）：39 的错误码各有下一步，文案在 src/farm-text.js（HTTP/桌面/小窗同源）。
+    const farmNotice = farmErrorText(error)
+    if (farmNotice !== null) return farmNotice
     // 背包（ticket 24）：小窗/HTTP 的失败一律说人话，五个错误码各有各的下一步。
     if (error === 'backpack-full' || error === 'too-large' || error === 'no-such-file' ||
       error === 'gift-out') {

@@ -88,7 +88,7 @@
   const MAX_MENU_TOOLS = 8
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'home', 'reload', 'scan-skins']
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'home', 'reload', 'scan-skins']
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -130,6 +130,11 @@
   const PET_ROLES = ['self', 'guest', 'visitor']
   const SCENE_VERSION = 3
   /**
+   * 农场小窗能提交的四条动作（ticket 40）；窗口只带 plotId（种地再带 cropId），
+   * 数量/价格全由宿主算。声明必须在 CONTROL_ACTIONS 之前（后者会展开它）。
+   */
+  const FARM_ACTIONS = ['farm-plant', 'farm-harvest', 'farm-water', 'farm-fertilize']
+  /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
    * （装了 dsh-pet 就写它的配置，见 ADR-0007）。
@@ -149,12 +154,14 @@
     'gift-discard',
     // ticket 24：右键「带派」只发一个空动作，由宿主开小窗；unbring 才带 giftId。
     'bring',
-    'unbring'
+    'unbring',
+    // ticket 40：农场小窗的四条动作。只带 plotId（种地再带 cropId），一切计算在宿主。
+    ...FARM_ACTIONS
   ]
   /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
   const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
-  /** 菜单项的动作（ticket 22 / 24 / 32）：点播 / 重载配置 / 打开软件 / 带派 / 换皮。同样只是一次「申请」。 */
-  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins']
+  /** 菜单项的动作（ticket 22 / 24 / 32 / 40）：点播 / 重载 / 打开软件 / 带派 / 换皮 / 农场。同样只是一次「申请」。 */
+  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins', 'farm-open']
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
   const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
@@ -195,6 +202,28 @@
   const MAX_GIFT_ITEMS = 64
   /** 礼物的状态词表，与 `src/gift-text.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
   const GIFT_STATUSES = ['pending', 'receiving', 'received', 'failed', 'refused']
+
+  /**
+   * 农场（ticket 40）。下面的数字与 `src/farm-rules.js` / `src/farm.js` 同源，但这一层是
+   * **普通 script**（渲染页 `<script>` 加载、主进程 require），不能 import 宿主的 ESM；
+   * 所以按 `desktop/shared.js` 的老规矩再守一次边界，改的时候两边一起改：
+   *   - 4 块地，id 由宿主生成（p1–p4，与 `src/farm.js` 的 PLOT_IDS 一致）；
+   *   - 三种作物，与 SPEC v5 的作物表一致；
+   *   - 硬币/种子/作物/露水/合同/日志的硬上限与 SPEC v5「货币、仓库与限额」一致。
+   */
+  const MAX_FARM_PLOTS = 4
+  const CROP_IDS = ['tomato', 'carrot', 'pumpkin']
+  const FARM_STAGES = ['empty', 'growing', 'mature']
+  const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle']
+  const MAX_FARM_COINS = 1000000
+  const MAX_FARM_STACK = 999
+  const MAX_FARM_DEW = 48
+  const MAX_FARM_CONTRACTS = 20
+  const MAX_FARM_LOG = 50
+  /** `remainingMs` 只用来画倒计时；一行 JSON 推到几百年后没有意义。 */
+  const MAX_FARM_REMAINING_MS = 30 * 24 * 60 * 60 * 1000
+  /** 地块 id 的形状：宿主只发 p1–p4，这里允许短标识符，大小写统一成小写。 */
+  const PLOT_ID_RE = /^[a-z0-9_-]{1,16}$/
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
   const PET_COLORS = ['#3b74d8', '#2f8f5b', '#a8542f', '#7a4fd8', '#c2913b', '#2f8fa8', '#b04a86', '#5b7f2f']
@@ -449,6 +478,173 @@
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 农场（ticket 40）：桌面地块条只拿摘要，小窗拿完整视图。
+  // -------------------------------------------------------------------------
+
+  function normalizePlotId (value) {
+    if (typeof value !== 'string') return null
+    const id = value.trim().toLowerCase()
+    return PLOT_ID_RE.test(id) ? id : null
+  }
+
+  function normalizeCropId (value) {
+    if (typeof value !== 'string') return null
+    const id = value.trim().toLowerCase()
+    return CROP_IDS.includes(id) ? id : null
+  }
+
+  /** 种子/作物仓库：三种作物永远都有键，坏值按 0；上限 999。 */
+  function normalizeFarmStacks (value) {
+    const source = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+    const stacks = {}
+    for (const id of CROP_IDS) {
+      const count = Number(source[id])
+      stacks[id] = Number.isFinite(count)
+        ? Math.min(MAX_FARM_STACK, Math.max(0, Math.floor(count)))
+        : 0
+    }
+    return stacks
+  }
+
+  function normalizeFarmWorker (value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+    const nickname = normalizeLabel(value.nickname, null)
+    return nickname === null ? null : { nickname }
+  }
+
+  /**
+   * 一块地。
+   *
+   * 两种输入共用这一个函数：
+   *   - 场景摘要来自 `/state.farm` 的完整地块（crop/grownMs/growMs），阶段要推；
+   *   - 小窗视图来自宿主算好的 `stage/mature/remainingMs`（`src/farm-rules.js` 推的），
+   *     这里只做二次校验。
+   * 不一致时以 `crop === null` 优先判空、其余以 `mature` 为准（`stage` 只是显示用的派生值）。
+   */
+  function normalizeFarmPlot (raw, full) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizePlotId(raw.id)
+    if (id === null) return null
+    const crop = normalizeCropId(raw.crop)
+    if (crop === null) {
+      return full
+        ? { id, crop: null, stage: 'empty', mature: false, remainingMs: 0, waterings: 0, fertilized: false }
+        : { id, crop: null, stage: 'empty', mature: false }
+    }
+
+    const growMs = Number(raw.growMs)
+    const grownMs = Number(raw.grownMs)
+    const stage = FARM_STAGES.includes(raw.stage) && raw.stage !== 'empty' ? raw.stage : null
+    let mature = raw.mature === true
+    if (mature !== true) {
+      if (stage === 'mature') mature = true
+      else if (Number.isFinite(growMs) && growMs > 0 && Number.isFinite(grownMs)) mature = grownMs >= growMs
+    }
+    const summary = { id, crop, stage: mature ? 'mature' : 'growing', mature }
+    if (full !== true) return summary
+
+    // 宿主给 remainingMs 就信它（窗口倒计时以那一份为准）；没给就从生长进度推。
+    let remaining = Number(raw.remainingMs)
+    if (!Number.isFinite(remaining) || remaining < 0) {
+      remaining = Number.isFinite(growMs) && Number.isFinite(grownMs) ? growMs - grownMs : 0
+    }
+    const waterings = Number(raw.waterings)
+    return {
+      ...summary,
+      remainingMs: mature ? 0 : Math.min(MAX_FARM_REMAINING_MS, Math.max(0, Math.floor(remaining))),
+      waterings: Number.isFinite(waterings) && waterings >= 1 ? 1 : 0,
+      fertilized: raw.fertilized === true
+    }
+  }
+
+  function normalizeFarmLogEntry (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const at = Number(raw.at)
+    if (!Number.isFinite(at) || at <= 0) return null
+    if (typeof raw.kind !== 'string' || !FARM_LOG_KINDS.includes(raw.kind)) return null
+    const crop = raw.crop === undefined || raw.crop === null ? null : normalizeCropId(raw.crop)
+    if (raw.crop !== undefined && raw.crop !== null && crop === null) return null
+    const qtyValue = Number(raw.qty)
+    const qty = Number.isFinite(qtyValue) ? Math.min(MAX_FARM_STACK, Math.max(0, Math.floor(qtyValue))) : 0
+    return { at: Math.floor(at), kind: raw.kind, ...(crop === null ? {} : { crop }), qty }
+  }
+
+  /**
+   * 农场视图归一化。
+   *
+   * `full:false`（桌面地块条）= 摘要：`{ plots:[{id,crop,stage,mature}], coins, dew, worker, contractCount }`。
+   * `full:true`（farm-window 命令）= 小窗要的完整一份：多 `seeds/crops/log` 与每块地的
+   * `remainingMs/waterings/fertilized`。**不要把完整视图塞进场景**：`controls` 是每帧比较的
+   * 契约，日志/仓库只会让签名狂变；窗口数据走 `farm-window`。
+   */
+  function normalizeFarm (raw, { full = false } = {}) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const plots = []
+    const seen = new Set()
+    if (Array.isArray(raw.plots)) {
+      for (const candidate of raw.plots) {
+        if (plots.length >= MAX_FARM_PLOTS) break
+        const plot = normalizeFarmPlot(candidate, full === true)
+        if (plot === null || seen.has(plot.id)) continue
+        seen.add(plot.id)
+        plots.push(plot)
+      }
+    }
+    const coins = Number(raw.coins)
+    const dew = Number(raw.dew)
+    const contracts = Number(raw.contractCount)
+    const farm = {
+      plots,
+      coins: Number.isFinite(coins) ? Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(coins))) : 0,
+      dew: Number.isFinite(dew) ? Math.min(MAX_FARM_DEW, Math.max(0, Math.floor(dew))) : 0,
+      worker: normalizeFarmWorker(raw.worker),
+      contractCount: Number.isFinite(contracts)
+        ? Math.min(MAX_FARM_CONTRACTS, Math.max(0, Math.floor(contracts)))
+        : 0
+    }
+    if (full !== true) return farm
+
+    const log = []
+    if (Array.isArray(raw.log)) {
+      for (const candidate of raw.log) {
+        if (log.length >= MAX_FARM_LOG) break
+        const entry = normalizeFarmLogEntry(candidate)
+        if (entry !== null) log.push(entry)
+      }
+    }
+    return { ...farm, seeds: normalizeFarmStacks(raw.seeds), crops: normalizeFarmStacks(raw.crops), log }
+  }
+
+  /** 地块条只吃的摘要；完整农场进来也只留下摘要。null = 没有桌面层/没有农场。 */
+  function normalizeFarmSummary (raw) {
+    return normalizeFarm(raw, { full: false })
+  }
+
+  /** 宿主 → helper 的 `farm-window` 命令体：打开/刷新 + 完整农场视图 + 可选地块。 */
+  function normalizeFarmWindow (raw) {
+    const plotId = normalizePlotId(raw.plotId)
+    return {
+      open: raw.open === true,
+      farm: normalizeFarm(raw.farm, { full: true }),
+      ...(plotId === null ? {} : { plotId })
+    }
+  }
+
+  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
+  function normalizeFarmAction (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+    if (!FARM_ACTIONS.includes(action)) return null
+    const plotId = normalizePlotId(raw.plotId)
+    if (plotId === null) return null
+    if (action === 'farm-plant') {
+      const cropId = normalizeCropId(raw.cropId)
+      return cropId === null ? null : { action, plotId, cropId }
+    }
+    return { action, plotId }
+  }
+
   /** 动画名会拼进 `dshzoo://asset/<name>.webm`：和宿主协议层同一套字符约束。 */
   function normalizeAnim (value) {
     if (typeof value !== 'string') return null
@@ -625,6 +821,8 @@
       visitors: [],
       street: [],
       gifts: [],
+      // ticket 40：桌面地块条的摘要；null = 没有农场（老宿主/没有桌面层），不是「4 块空地」。
+      farm: null,
       prompt: null,
       notice: null
     }
@@ -737,6 +935,10 @@
         })
       }
     }
+
+    // 农场（ticket 40）：场景里只放摘要，完整视图走 farm-window 命令。
+    // 缺省/坏形状 = null（老宿主/没有桌面层），渲染端据此不画地块条。
+    controls.farm = normalizeFarmSummary(raw.farm)
 
     const prompt = raw.prompt
     if (prompt !== null && typeof prompt === 'object' && !Array.isArray(prompt)) {
@@ -1511,10 +1713,17 @@
        */
       case 'bring-window':
         return { ok: true, command: { type, id, ...normalizeBringWindow(raw) } }
+      /**
+       * 农场小窗（ticket 40）：`open:true` 打开/聚焦，`open:false` 只刷新已经开着的那扇。
+       * 内容和「带派」一样由宿主算好：窗口不读盘、不联网，连 `/state` 都拿不到。
+       */
+      case 'farm-window':
+        return { ok: true, command: { type, id, ...normalizeFarmWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
-        const window = raw.window === 'bring' ? 'bring' : null
+        // 冒烟可以点名抓小窗；主窗仍是默认目标。
+        const window = raw.window === 'bring' ? 'bring' : raw.window === 'farm' ? 'farm' : null
         return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
@@ -1541,9 +1750,16 @@
         // 冒烟用：开/关改名小窗（它没有渲染端可点击的关闭按钮，测试只能从这里关）。
         return { ok: true, command: { type, id, close: raw.close === true } }
       case 'debug-blur': {
-        // 冒烟用：模拟输入法候选窗/别的窗口抢走小窗焦点。
-        const window = raw.window === 'bring' ? 'bring' : 'rename'
+        // 冒烟用：模拟输入法候选窗/别的窗口抢走小窗焦点。小窗都**不**该因此关掉
+        // （现场：打中文时小窗消失；农场窗也一样）。
+        const window = raw.window === 'bring' ? 'bring' : raw.window === 'farm' ? 'farm' : 'rename'
         return { ok: true, command: { type, id, window } }
+      }
+      case 'debug-farm-submit': {
+        // 冒烟用：在农场小窗里提交一次动作，走和用户点击一模一样的 preload → IPC。
+        const farmAction = normalizeFarmAction(raw)
+        if (farmAction === null) return { ok: false, error: 'bad-farm-action' }
+        return { ok: true, command: { type, id, ...farmAction } }
       }
       case 'debug-gift-submit':
         // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
@@ -1626,6 +1842,10 @@
       renameVisible: raw.renameVisible === true,
       renameFocused: raw.renameFocused === true,
       bringOpen: raw.bringOpen === true,
+      // ticket 40：农场小窗的打开/可见/焦点；冒烟靠这三个数等窗口真的出来。
+      farmOpen: raw.farmOpen === true,
+      farmVisible: raw.farmVisible === true,
+      farmFocused: raw.farmFocused === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -1749,6 +1969,13 @@
         // 换皮只带素材源 id（ticket 32）：注册表在宿主那边，这里只守形状。
         const skinId = action === 'use-skin' ? normalizeSkinId(raw.skinId) : null
         if (action === 'use-skin' && skinId === null) return { ok: false, error: 'bad-skin-id' }
+        // 农场（ticket 40）：`farm-open` 可带 plotId（点某块地开窗），四个地块动作必须带；
+        // 种地还必须有 cropId。这里少一条，到了 store 就只剩一句 bad-plot，没有线索。
+        const needsPlot = FARM_ACTIONS.includes(action)
+        const plotId = needsPlot || action === 'farm-open' ? normalizePlotId(raw.plotId) : null
+        if (needsPlot && plotId === null) return { ok: false, error: 'bad-plot' }
+        const cropId = action === 'farm-plant' ? normalizeCropId(raw.cropId) : null
+        if (action === 'farm-plant' && cropId === null) return { ok: false, error: 'bad-crop' }
         return {
           ok: true,
           event: {
@@ -1760,7 +1987,9 @@
             ...(name === null ? {} : { name }),
             ...(skinId === null ? {} : { skinId }),
             ...(giftId === null ? {} : { giftId }),
-            ...(gift === null ? {} : { gift })
+            ...(gift === null ? {} : { gift }),
+            ...(plotId === null ? {} : { plotId }),
+            ...(cropId === null ? {} : { cropId })
           }
         }
       }
@@ -2191,10 +2420,24 @@
     SCENE_VERSION,
     CONTROL_ACTIONS,
     GIFT_ACTIONS,
+    FARM_ACTIONS,
     GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
+    MAX_FARM_PLOTS,
+    CROP_IDS,
+    MAX_FARM_COINS,
+    MAX_FARM_STACK,
+    MAX_FARM_DEW,
+    MAX_FARM_CONTRACTS,
+    MAX_FARM_LOG,
+    normalizeFarm,
+    normalizeFarmSummary,
+    normalizeFarmWindow,
+    normalizeFarmAction,
+    normalizePlotId,
+    normalizeCropId,
     MAX_ACTION_TEXT,
     MAX_NAME_LENGTH,
     MAX_GIFT_TEXT_LENGTH,
