@@ -11,13 +11,13 @@ import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
 import { FARM_LOG_VIEW_LIMIT, createFarmStore, initialFarmView } from './farm.js'
-import { CROPS, isMature, plotRemainingMs, plotStage } from './farm-rules.js'
+import { CROPS, CROP_IDS, WORKER_GUARD, isMature, plotRemainingMs, plotStage } from './farm-rules.js'
 import { farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
-  bidPrice,
   createMarketStore,
   initialMarketView,
+  isFreshMarketSample,
   marketView
 } from './market.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
@@ -45,7 +45,10 @@ import { DEFAULT_SKIN_ID, appendSkinSources, idlePoolOf, loadSkinSources, readSk
 import { createSkinFetcher } from './skin-fetch.js'
 import {
   HEARTBEAT_INTERVAL_MS,
+  MARKET_DIGEST_INTERVAL_MS,
   MAX_GIFT_BYTES,
+  createRateLimiter,
+  encodeMarketDigest,
   normalizeSkinId,
   PEER_LOST_MS,
   VISIT_MAX_MS,
@@ -171,6 +174,13 @@ export function createService (ctx, options = {}) {
   const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
   // 交易所也可以单独注入时钟；不传就与农场共用同一个测试时钟。
   const marketNow = typeof options.marketNow === 'function' ? options.marketNow : farmNow
+  // 行情 gossip（ticket 42）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值。
+  const marketDigestMs = positiveOption(options.marketDigestMs, MARKET_DIGEST_INTERVAL_MS, 10)
+  const marketClock = () => {
+    const value = marketNow === undefined ? Date.now() : marketNow()
+    const stamp = Number(value)
+    return Number.isFinite(stamp) ? stamp : Date.now()
+  }
 
   let identity = null
   let discovery = null
@@ -184,6 +194,12 @@ export function createService (ctx, options = {}) {
   let farm = null
   // 本机交易所（ticket 41）：读不出来 = 本次运行按初始价交易，串门照常。
   let market = null
+  /**
+   * 放行邻居最近一条行情（ticket 42，供 44 的雇工板直接读）：
+   * deviceId → { prices, hire, at, nickname }。store 只留价格算指数；
+   * 挂牌与昵称留在这里，44 不再逐个问邻居。过期判断用 `at`。
+   */
+  const peerDigests = new Map()
   let settings = null
   let bridge = null
   let desktop = null
@@ -245,6 +261,15 @@ export function createService (ctx, options = {}) {
   let desktopMenu = { tools: [], groups: [] }
   let tickTimer = null
   let heartbeatTimer = null
+  /** 上一次成功发出 digest 的时间与签名（价格 + 挂牌）；变化时不等 30 秒。 */
+  let marketDigestAt = Number.NEGATIVE_INFINITY
+  let marketDigestSignature = null
+  const digestLimiter = createRateLimiter({
+    windowMs: marketDigestMs,
+    max: 1,
+    maxSources: 128,
+    now: marketClock
+  })
   let visitTimer = null
   let autoVisitTimer = null
   let farmTimer = null
@@ -395,6 +420,8 @@ export function createService (ctx, options = {}) {
         : await peers.reject({ deviceId, nickname: decision.nickname, at: decision.at })
       // 放行后立刻补一发心跳：对方不用等满 2 秒才第一次看见我。
       if (action === 'admit') sendHeartbeats()
+      // 拒绝/移除一位邻居：它的行情也不该继续影响本机指数。
+      if (action === 'reject') forgetPeerDigest(deviceId)
       return {
         ok: true,
         action,
@@ -489,8 +516,12 @@ export function createService (ctx, options = {}) {
       const result = action === 'buy-seed' || action === 'farm-buy-seed'
         ? await farm.buySeed(body?.cropId, body?.qty)
         : await farm.sellCrop(body?.cropId, body?.qty)
-      // 成交后价目/硬币/仓库都变了：开着的交易所页要立刻看到新一份。
-      if (result?.ok === true) refreshFarmWindow()
+      // 成交后价目/硬币/仓库都变了：开着的交易所页要立刻看到新一份；
+      // 价格也是邻居的指数样本，不等下一拍 tick 就补发一轮 digest。
+      if (result?.ok === true) {
+        refreshFarmWindow()
+        sendMarketDigest()
+      }
       return result
     }
 
@@ -787,17 +818,23 @@ export function createService (ctx, options = {}) {
    * `prices` 保持 market.json 的形状；`bid` 只给小窗，不混进状态出口。
    */
   function marketStateView () {
-    return marketView(market?.snapshot() ?? initialMarketView(), {
-      historyLimit: MARKET_VIEW_HISTORY
-    })
+    if (market === null) return marketView(initialMarketView(), { historyLimit: MARKET_VIEW_HISTORY })
+    return market.snapshot({ historyLimit: MARKET_VIEW_HISTORY })
   }
 
-  /** 交易所页的视图：多一个算好的 `bid`，省得渲染端自己猜成交价。 */
+  /**
+   * 交易所页的视图：多一个算好的 `bid`（已混入新鲜局域网指数），
+   * index 条目多一个 `stale`，窗口据此把过期行情画灰。
+   */
   function marketWindowView () {
-    return marketView(market?.snapshot() ?? initialMarketView(), {
-      historyLimit: MARKET_VIEW_HISTORY,
-      withBid: true
-    })
+    if (market === null) {
+      return marketView(initialMarketView(), {
+        historyLimit: MARKET_VIEW_HISTORY,
+        withBid: true,
+        now: marketClock()
+      })
+    }
+    return market.snapshot({ historyLimit: MARKET_VIEW_HISTORY, withBid: true })
   }
 
   /**
@@ -1227,6 +1264,10 @@ export function createService (ctx, options = {}) {
               // 礼物的送达回执（ticket 26）。**必须有这个分支**：落到下面的 else 会被
               // 当成 beacon 静默吞掉——不报错，只是礼物永远删不掉。
               handleGiftReceived(packet)
+            } else if (packet.type === 'market-digest') {
+              // 行情 gossip（ticket 42）。**不能落到 else**：那会当成 beacon 刷新邻居灯，
+              // 看起来没坏，但价格永远进不了 index。
+              handleMarketDigest(packet)
             } else {
               room.observeBeacon(packet)
             }
@@ -1934,6 +1975,141 @@ export function createService (ctx, options = {}) {
     return sent
   }
 
+  /**
+   * 本机挂牌（ticket 42/44 D1）：42 只发 farm.json 里的挂牌 + 固定守卫 0.5；
+   * `available` 暂时等于 `enabled`，`reason` 为 null。44 会在这里填真实的
+   * 「在家 / 在串门 / 在打工」与原因，但报文形状不再改。
+   */
+  function hireDigestView () {
+    const view = farm?.snapshot() ?? initialFarmView()
+    const hire = view.hire
+    return {
+      enabled: hire.enabled === true,
+      wagePerHour: hire.wagePerHour,
+      minHours: hire.minHours,
+      maxHours: hire.maxHours,
+      guard: WORKER_GUARD,
+      available: hire.enabled === true,
+      reason: null
+    }
+  }
+
+  /** 发出去的那一份行情：本机三种作物的 price + 挂牌 + 本机时钟。 */
+  function marketDigestView (now) {
+    if (identity === null || market === null) return null
+    const view = market.snapshot()
+    const prices = {}
+    for (const cropId of CROP_IDS) {
+      const price = Number(view.prices?.[cropId]?.price)
+      if (Number.isFinite(price)) prices[cropId] = price
+    }
+    return { at: now, prices, hire: hireDigestView() }
+  }
+
+  /**
+   * 向所有已放行邻居发一轮行情。触发条件（ticket 42）：
+   *   - 距离上次成功发送满 30 秒；
+   *   - 或本机价格/挂牌签名变了（成交、均值回归、改挂牌）。
+   * 走 `discovery.sendTo`：内部再查 mayTalkTo 与地址表；**失败不重试**，下一拍自然补。
+   * 没有任何放行邻居时不算「发过」，邻居一出现就能收到第一条。
+   */
+  function sendMarketDigest ({ force = false } = {}) {
+    if (disposed || discovery === null || identity === null || market === null) return 0
+    const now = marketClock()
+    const digest = marketDigestView(now)
+    if (digest === null) return 0
+    let data
+    try {
+      data = encodeMarketDigest({
+        deviceId: identity.deviceId,
+        at: digest.at,
+        prices: digest.prices,
+        hire: digest.hire
+      })
+    } catch {
+      // 本机行情坏了只停这一轮广播，不影响交易所本身。
+      return 0
+    }
+    const signature = JSON.stringify({ prices: digest.prices, hire: digest.hire })
+    const due = now - marketDigestAt >= marketDigestMs
+    const changed = marketDigestSignature !== null && signature !== marketDigestSignature
+    if (!force && !due && !changed) return 0
+
+    const targets = room.heartbeatTargets()
+    // 一个放行邻居都没有：这不算「发过」，邻居一出现就能收到第一条。
+    if (targets.length === 0) return 0
+    let sent = 0
+    for (const deviceId of targets) {
+      try {
+        if (discovery.sendTo(deviceId, data)) sent += 1
+      } catch {
+        // 一个坏地址不能挡住其他邻居的行情
+      }
+    }
+    // **失败不重试**：这一轮已经尝试过，下一轮（30 秒后）自然带最新价补上。
+    marketDigestAt = now
+    marketDigestSignature = signature
+    return sent
+  }
+
+  /**
+   * 收到一条行情（ticket 42）。四道门：
+   *   1. 只认已放行邻居（未放行的来源连价格都不该影响本机）；
+   *   2. `at` 必须在本机时钟 2 分钟内；
+   *   3. 同一 peer 一个窗口最多 1 条；
+   *   4. 协议层已把未知作物/越界价格/坏挂牌丢掉或整包拒绝。
+   * 通过后交给交易所 store：按 deviceId 留最近一条，重算中位数并落盘。
+   */
+  function handleMarketDigest (packet) {
+    if (disposed || market === null) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    const now = marketClock()
+    if (!isFreshMarketSample(packet.at, now)) return
+    if (!digestLimiter.allow(packet.deviceId, now)) return
+    try {
+      const result = market.observeDigest(packet.deviceId, {
+        prices: packet.prices,
+        at: packet.at
+      })
+      result?.persisted?.catch?.((error) => {
+        warn(ctx, '行情写盘失败：' + message(error))
+      })
+      if (result?.ok === true) {
+        peerDigests.set(packet.deviceId, {
+          prices: { ...packet.prices },
+          hire: { ...packet.hire },
+          at: packet.at,
+          nickname: neighborNickname(packet.deviceId)
+        })
+      }
+    } catch (error) {
+      // 一条坏行情不能把邻居循环/交易所拖垮；下一包照常走。
+      warn(ctx, '行情处理失败，已丢弃：' + message(error))
+    }
+  }
+
+  /** 只给 44 的雇工板：昵称来自本机邻居表，不来自报文（digest 里没有昵称）。 */
+  function neighborNickname (deviceId) {
+    for (const neighbor of room.snapshot().neighbors) {
+      if (neighbor.deviceId === deviceId) return neighbor.nickname
+    }
+    return null
+  }
+
+  /** 邻居被拒绝/移除：摘掉行情并重算指数（store 没有这条记录时是 no-op）。 */
+  function forgetPeerDigest (deviceId) {
+    peerDigests.delete(deviceId)
+    if (market === null) return
+    try {
+      const result = market.removeDigest(deviceId)
+      result?.persisted?.catch?.((error) => {
+        warn(ctx, '行情写盘失败：' + message(error))
+      })
+    } catch (error) {
+      warn(ctx, '行情清理失败：' + message(error))
+    }
+  }
+
   function startHeartbeat () {
     if (heartbeatTimer !== null || disposed || discovery === null) return
     const configured = options.heartbeatIntervalMs
@@ -1955,6 +2131,8 @@ export function createService (ctx, options = {}) {
       // 礼物表按“当前出门的 visitId”对账，任何已结束的条目立刻失效。
       unarmEndedGifts()
       flushRoomEffects()
+      // 行情每 30 秒一轮；价格/挂牌变了则下一拍立刻发（不等节拍）。
+      sendMarketDigest()
     }, interval)
     tickTimer.unref?.()
   }
@@ -2769,6 +2947,8 @@ export function createService (ctx, options = {}) {
     replyTo: (deviceId, data) => discovery?.sendReply(deviceId, data) ?? false,
     /** 手动补发一轮心跳（测试与 ticket 05 的“立刻让对方看见我”可复用）。 */
     sendHeartbeats,
+    /** 手动补发一轮行情（测试用；正常由 1 秒巡检按 30 秒/变化触发）。 */
+    sendMarketDigest,
     dispose () {
       if (disposed) return
       // 卸载前把已经完成的记录尽量落盘；recall 发不出去也无妨，对方会自己到期。
@@ -2796,6 +2976,10 @@ export function createService (ctx, options = {}) {
       }
       farm = null
       market = null
+      digestLimiter.clear()
+      peerDigests.clear()
+      marketDigestAt = Number.NEGATIVE_INFINITY
+      marketDigestSignature = null
       stopDesktopSync()
       unsubscribeSessionEvents()
       try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }

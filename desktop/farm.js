@@ -327,6 +327,18 @@ function latestTrade (cropId) {
   return market.history.find((entry) => entry.crop === cropId) ?? null
 }
 
+/** 局域网指数（ticket 42）：宿主已经按自己的时钟判好 stale，窗口只画。 */
+function marketIndexEntry (cropId) {
+  const entry = market?.index?.[cropId]
+  return entry !== null && typeof entry === 'object' ? entry : null
+}
+
+function formatMarketPrice (value) {
+  const price = Number(value)
+  if (!Number.isFinite(price)) return '—'
+  return String(Math.round(price * 10) / 10)
+}
+
 function updateMarketTotals (row, cropId) {
   if (row === null) return
   const input = row.querySelector('input[data-crop-qty]')
@@ -397,8 +409,9 @@ function renderMarket () {
 
     const stats = document.createElement('div')
     stats.className = 'market-stats'
-    const stat = (label, value) => {
+    const stat = (label, value, className = '') => {
       const span = document.createElement('span')
+      if (className !== '') span.className = className
       span.textContent = label + ' '
       const strong = document.createElement('b')
       strong.textContent = String(value)
@@ -407,6 +420,20 @@ function renderMarket () {
     }
     stat('底价', entry.base ?? '—')
     stat('本机卖价', bidOf(entry))
+    // 交易所页的「局域网指数」列：没有邻居样本时明确写「本机行情」；
+    // 有样本但超过 2 分钟没更新时灰掉（值仍是最后一次算出的中位数）。
+    const indexEntry = marketIndexEntry(cropId)
+    if (indexEntry === null) {
+      stat('局域网指数', '本机行情', 'index-local')
+    } else {
+      const samples = Number(indexEntry.samples)
+      const suffix = Number.isFinite(samples) && samples > 0 ? ' · ' + Math.floor(samples) + ' 份' : ''
+      stat(
+        '局域网指数',
+        formatMarketPrice(indexEntry.price) + suffix,
+        indexEntry.stale === true ? 'index-stale' : 'index-live'
+      )
+    }
     stat('种子价', meta.seedPrice)
     stat('成交量', entry.volume24h ?? 0)
     row.appendChild(stats)

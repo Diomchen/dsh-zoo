@@ -234,6 +234,9 @@
   const MARKET_MAX_QTY = 99
   const MARKET_FLOOR_RATIO = 0.5
   const MARKET_CEIL_RATIO = 2
+  /** 局域网指数混价（ticket 42）：与宿主 src/market.js 同一组权重。 */
+  const MARKET_LOCAL_WEIGHT = 0.85
+  const MARKET_INDEX_WEIGHT = 0.15
   /** `remainingMs` 只用来画倒计时；一行 JSON 推到几百年后没有意义。 */
   const MAX_FARM_REMAINING_MS = 30 * 24 * 60 * 60 * 1000
   /** 地块 id 的形状：宿主只发 p1–p4，这里允许短标识符，大小写统一成小写。 */
@@ -642,21 +645,33 @@
     return num >= MARKET_MIN_QTY && num <= MARKET_MAX_QTY ? num : null
   }
 
-  function normalizeMarketPrice (raw, cropId) {
+  /**
+   * 交易所的一行价目。`indexPrice` 只在指数新鲜时传进来：
+   * bid 与宿主同一条公式 `round((0.85×price + 0.15×index) × 0.9)`，窗口画的就是成交价。
+   * 宿主多传的 `bid` 一律不信——helper 自己按白名单字段算。
+   */
+  function normalizeMarketPrice (raw, cropId, indexPrice = null) {
     const base = CROP_BASE_PRICE[cropId]
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
-      return { base, price: base, bid: Math.round(base * 0.9), volume24h: 0, at: 0 }
-    }
-    const rawPrice = Number(raw.price)
+    const rawPrice = raw === null || typeof raw !== 'object' || Array.isArray(raw)
+      ? Number.NaN
+      : Number(raw.price)
     const price = Number.isFinite(rawPrice)
       ? Math.min(base * MARKET_CEIL_RATIO, Math.max(base * MARKET_FLOOR_RATIO, rawPrice))
       : base
-    const volume = Number(raw.volume24h)
-    const at = Number(raw.at)
+    const volume = raw === null || typeof raw !== 'object' || Array.isArray(raw)
+      ? Number.NaN
+      : Number(raw.volume24h)
+    const at = raw === null || typeof raw !== 'object' || Array.isArray(raw)
+      ? Number.NaN
+      : Number(raw.at)
+    const remote = Number(indexPrice)
+    const effective = Number.isFinite(remote) && remote > 0
+      ? MARKET_LOCAL_WEIGHT * price + MARKET_INDEX_WEIGHT * remote
+      : price
     return {
       base,
       price,
-      bid: Math.round(price * 0.9),
+      bid: Math.round(effective * 0.9),
       volume24h: Number.isFinite(volume) ? Math.min(MAX_FARM_STACK * 1000, Math.max(0, Math.floor(volume))) : 0,
       at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0
     }
@@ -676,25 +691,13 @@
   }
 
   /**
-   * 交易所页视图（ticket 41）。只信价格/成交量/历史这三类字段：
-   *   - 未知作物、坏成交、超长历史一律丢掉，不整份失败；
-   *   - `bid` 在这里按价格重算，宿主多传一个字段也不会让窗口画错价；
-   *   - index 只是形状，ticket 42 才填样本。
+   * 交易所页视图（ticket 41/42）。只信价格/成交量/历史/指数这几类字段：
+   *   - 未知作物、坏成交、超长历史、坏指数一律丢掉，不整份失败；
+   *   - `bid` 在这里按 `price + 新鲜 index` 重算，宿主多传一个 `bid` 也不会让窗口画错价；
+   *   - index 条目多一个 `stale`：宿主按自己的时钟判过期，窗口只负责画灰。
    */
   function normalizeMarket (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const prices = {}
-    for (const cropId of CROP_IDS) {
-      prices[cropId] = normalizeMarketPrice(raw.prices?.[cropId], cropId)
-    }
-    const history = []
-    if (Array.isArray(raw.history)) {
-      for (const candidate of raw.history) {
-        if (history.length >= MAX_FARM_MARKET_HISTORY) break
-        const entry = normalizeMarketHistoryEntry(candidate)
-        if (entry !== null) history.push(entry)
-      }
-    }
     const index = {}
     if (raw.index !== null && typeof raw.index === 'object' && !Array.isArray(raw.index)) {
       for (const cropId of CROP_IDS) {
@@ -709,8 +712,26 @@
         index[cropId] = {
           price: Math.min(base * MARKET_CEIL_RATIO, Math.max(base * MARKET_FLOOR_RATIO, price)),
           at: Math.floor(at),
-          samples: Number.isFinite(samples) ? Math.max(0, Math.floor(samples)) : 0
+          samples: Number.isFinite(samples) ? Math.max(0, Math.floor(samples)) : 0,
+          stale: entry.stale === true
         }
+      }
+    }
+    const prices = {}
+    for (const cropId of CROP_IDS) {
+      const indexEntry = index[cropId]
+      prices[cropId] = normalizeMarketPrice(
+        raw.prices?.[cropId],
+        cropId,
+        indexEntry !== undefined && indexEntry.stale !== true ? indexEntry.price : null
+      )
+    }
+    const history = []
+    if (Array.isArray(raw.history)) {
+      for (const candidate of raw.history) {
+        if (history.length >= MAX_FARM_MARKET_HISTORY) break
+        const entry = normalizeMarketHistoryEntry(candidate)
+        if (entry !== null) history.push(entry)
       }
     }
     return { prices, index, history }

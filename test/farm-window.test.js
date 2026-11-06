@@ -8,7 +8,7 @@
  *   3. 失败码（bad-plot）回一句人话；没有桌面层时 `farm-open` 是 `desktop-off`。
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -16,6 +16,7 @@ import test from 'node:test'
 import shared from '../desktop/shared.js'
 import { PLOT_IDS } from '../src/farm.js'
 import { MINUTE_MS } from '../src/farm-rules.js'
+import { MARKET_FILE, MARKET_VERSION } from '../src/market.js'
 import { createService } from '../src/service.js'
 
 const NOON = new Date(2026, 4, 6, 12, 0, 0).getTime()
@@ -284,6 +285,10 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
   assert.match(renderer, /farm-buy-seed/)
   assert.match(renderer, /farm-sell-crop/)
+  // 交易所页必须真的画出「局域网指数 / 样本」与「本机行情」。
+  assert.match(renderer, /局域网指数/)
+  assert.match(renderer, /本机行情/)
+  assert.match(renderer, /index-stale/)
   const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
   assert.match(preload, /qty: action\.qty/)
   assert.deepEqual(
@@ -385,4 +390,45 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   assert.equal(desktop.calls.results[4].result.ok, false)
   assert.equal(desktop.calls.results[4].result.error, 'bad-qty')
   assert.match(desktop.calls.results[4].result.notice, /1–99/)
+})
+
+
+test('交易所页的局域网指数：新鲜时混进 bid，过期后标 stale 并退回本机价', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, MARKET_FILE), JSON.stringify({
+    version: MARKET_VERSION,
+    prices: {
+      tomato: { base: 5, price: 10, volume24h: 0, at: NOON },
+      carrot: { base: 6, price: 6, volume24h: 0, at: NOON },
+      pumpkin: { base: 30, price: 30, volume24h: 0, at: NOON }
+    },
+    history: [],
+    index: { tomato: { price: 5, at: NOON, samples: 3 } }
+  }), 'utf8')
+  const clock = { value: NOON }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value,
+    marketNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  assert.equal((await callAction(service, { action: 'farm-open' })).body.ok, true)
+  const fresh = desktop.calls.windows.at(-1).market
+  assert.deepEqual(fresh.index.tomato, { price: 5, at: NOON, samples: 3, stale: false })
+  // (0.85×10 + 0.15×5) × 0.9 = 7.7625 → 8
+  assert.equal(fresh.prices.tomato.bid, 8)
+
+  // 2 分钟后：指数不再参与 bid，窗口拿到 stale:true 画灰。
+  clock.value += 2 * MINUTE_MS + 1
+  assert.equal((await callAction(service, { action: 'farm-open' })).body.ok, true)
+  const stale = desktop.calls.windows.at(-1).market
+  assert.equal(stale.index.tomato.stale, true)
+  assert.equal(stale.prices.tomato.bid, 9, '本机 10 → bid 9')
 })

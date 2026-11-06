@@ -4,6 +4,7 @@ import { join } from 'node:path'
 
 import { CROPS, CROP_IDS, isCropId, MINUTE_MS } from './farm-rules.js'
 import { parseJsonText } from './json-text.js'
+import { MARKET_DIGEST_FRESH_MS } from './protocol.js'
 
 /**
  * 本机交易所（ticket 41）：`<dataDir>/market.json`。
@@ -21,7 +22,9 @@ import { parseJsonText } from './json-text.js'
  *   - **卖多了价跌**：每卖一次按数量冲击价格，每 10 分钟向 base 均值回归 3%；
  *   - **价格夹在 [base×0.5, base×2]**：手改文件也不能把交易所推到离谱的价位。
  *
- * v1 的 `effective = price`；`index` 只是先把文件形状固定下来，ticket 42 才填局域网行情。
+ * 局域网指数（ticket 42）：收方按 deviceId 保留最近一条 digest，取新鲜样本（含本机）
+ * 的中位数；`effective = 0.85 × 本机 price + 0.15 × 指数`。指数过期后保留最后一次的值
+ * （交易所页灰掉），但不再参与定价（见 `freshIndexPrice`）。
  *
  * 容错与 `src/farm.js` / `src/backpack.js` 同一套路：
  *   - 文件不存在：按作物表建初始价，不告警、不落盘；
@@ -52,6 +55,9 @@ export const MEAN_REVERSION_RATE = 0.03
 export const PRICE_FLOOR_RATIO = 0.5
 export const PRICE_CEIL_RATIO = 2
 export const BID_RATIO = 0.9
+/** 局域网指数（ticket 42）：本机价与样本中位数的权重。 */
+export const MARKET_LOCAL_WEIGHT = 0.85
+export const MARKET_INDEX_WEIGHT = 0.15
 
 const SIDES = Object.freeze(['buy', 'sell'])
 const MAX_HISTORY_PRICE = 1_000_000_000
@@ -106,18 +112,93 @@ export function clampPrice (price, base) {
 }
 
 /**
- * 成交价（v1 的 `effective` = price）。ticket 42 会把局域网指数混进来；
- * 成交那一刻仍按本机价格，指数只影响展示与背货套利。
+ * 成交价：`effective = 0.85 × price + 0.15 × index`（SPEC v5「交易所与行情」）。
+ * 没有新鲜指数时退化为本机价格——指数是锦上添花，不能把交易所拖停。
  */
-export function effectivePrice (price) {
+export function effectivePrice (price, indexPrice = null) {
   const value = Number(price)
   if (!Number.isFinite(value) || value <= 0) return 0
-  return value
+  const remote = Number(indexPrice)
+  if (!Number.isFinite(remote) || remote <= 0) return value
+  return MARKET_LOCAL_WEIGHT * value + MARKET_INDEX_WEIGHT * remote
 }
 
 /** 交易所买价：`bid = round(effective × 0.9)`。 */
-export function bidPrice (price) {
-  return Math.round(effectivePrice(price) * BID_RATIO)
+export function bidPrice (price, indexPrice = null) {
+  return Math.round(effectivePrice(price, indexPrice) * BID_RATIO)
+}
+
+/**
+ * 样本新鲜度：`at` 与本机时钟相差不超过 2 分钟（允许一点表慢/表快）。
+ * 这是接收端唯一的时间判据；协议层只校验时间戳的形状。
+ */
+export function isFreshMarketSample (at, now = Date.now(), maxAgeMs = MARKET_DIGEST_FRESH_MS) {
+  const stamp = Number(at)
+  const current = Number(now)
+  const window = Number(maxAgeMs)
+  if (!Number.isFinite(stamp) || !Number.isFinite(current) || stamp <= 0) return false
+  if (!Number.isFinite(window) || window <= 0) return false
+  return Math.abs(current - stamp) <= window
+}
+
+/** 中位数：奇数取中间，偶数取中间两个的平均；空数组返回 null。 */
+export function medianPrice (values) {
+  if (!Array.isArray(values) || values.length === 0) return null
+  const sorted = values
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right)
+  if (sorted.length === 0) return null
+  const middle = Math.floor(sorted.length / 2)
+  if (sorted.length % 2 === 1) return sorted[middle]
+  return (sorted[middle - 1] + sorted[middle]) / 2
+}
+
+/**
+ * 用「本机 price + 每个 peer 最近一条 digest」算局域网指数。
+ *
+ * `samples` 是 `{ prices, at }[]`（服务层已按 deviceId 只留最近一条）。逐作物：
+ *   - 本机价格永远是一个样本；
+ *   - 只收 2 分钟内、已知作物、`[base×0.5, base×2]` 内的 peer 价格；
+ *   - 至少要有 1 个 peer 样本才产出条目（只有自己 = 本机行情，不叫「局域网指数」）；
+ *   - `samples` 数是参与中位数的样本数（含本机），`at` 取最新 peer 样本的时间。
+ * 坏条目只丢自己，绝不让一种作物拖垮另外两种。
+ */
+export function computeMarketIndex ({ localPrices, samples, now = Date.now() } = {}) {
+  const freshSamples = (Array.isArray(samples) ? samples : [])
+    .filter((sample) => sample !== null && typeof sample === 'object' &&
+      isFreshMarketSample(sample.at, now))
+  const index = {}
+  for (const cropId of CROP_IDS) {
+    const base = CROPS[cropId].base
+    const values = []
+    let newest = 0
+    const local = Number(localPrices?.[cropId]?.price)
+    if (Number.isFinite(local) && local > 0) values.push(clampPrice(local, base))
+    for (const sample of freshSamples) {
+      const raw = Number(sample.prices?.[cropId])
+      if (!Number.isFinite(raw)) continue
+      if (raw < base * PRICE_FLOOR_RATIO || raw > base * PRICE_CEIL_RATIO) continue
+      values.push(raw)
+      const at = Number(sample.at)
+      if (at > newest) newest = at
+    }
+    if (values.length <= 1) continue
+    index[cropId] = {
+      price: medianPrice(values),
+      at: newest > 0 ? newest : Number(now),
+      samples: values.length
+    }
+  }
+  return index
+}
+
+/** 过期指数只用于展示，不再参与定价。 */
+export function freshIndexPrice (entry, now = Date.now()) {
+  if (entry === null || typeof entry !== 'object') return null
+  if (!isFreshMarketSample(entry.at, now)) return null
+  const price = Number(entry.price)
+  return Number.isFinite(price) && price > 0 ? price : null
 }
 
 /** 卖 `qty` 个之后的 price：`price × (1 − 0.12 × qty / 20)`，再夹取。 */
@@ -155,14 +236,26 @@ export function initialMarketState (at = null) {
  * 状态出口/交易所页的只读视图。
  * `withBid` 只给窗口用：`/state.market` 保持 SPEC 的 prices 形状，不额外发明字段。
  */
-export function marketView (state, { historyLimit = MAX_MARKET_HISTORY, withBid = false } = {}) {
+export function marketView (state, {
+  historyLimit = MAX_MARKET_HISTORY,
+  withBid = false,
+  now = Date.now()
+} = {}) {
   const source = state ?? initialMarketState()
   const prices = {}
   for (const cropId of CROP_IDS) {
     const entry = source.prices?.[cropId]
+    // bid 只在窗口视图里出现；它按新鲜指数混一次，和真正成交价同源。
+    const indexPrice = withBid ? freshIndexPrice(source.index?.[cropId], now) : null
     if (entry === undefined) {
       const base = CROPS[cropId].base
-      prices[cropId] = { base, price: base, volume24h: 0, at: null, ...(withBid ? { bid: bidPrice(base) } : {}) }
+      prices[cropId] = {
+        base,
+        price: base,
+        volume24h: 0,
+        at: null,
+        ...(withBid ? { bid: bidPrice(base, indexPrice) } : {})
+      }
       continue
     }
     prices[cropId] = {
@@ -170,13 +263,22 @@ export function marketView (state, { historyLimit = MAX_MARKET_HISTORY, withBid 
       price: entry.price,
       volume24h: entry.volume24h,
       at: entry.at,
-      ...(withBid ? { bid: bidPrice(entry.price) } : {})
+      ...(withBid ? { bid: bidPrice(entry.price, indexPrice) } : {})
     }
   }
   const index = {}
   for (const cropId of CROP_IDS) {
     const entry = source.index?.[cropId]
-    if (entry !== undefined) index[cropId] = { ...entry }
+    if (entry === undefined) continue
+    // `/state` 严格保持 `{price, at, samples}`；窗口多一个 `stale` 用来画灰。
+    index[cropId] = withBid
+      ? {
+          price: entry.price,
+          at: entry.at,
+          samples: entry.samples,
+          stale: !isFreshMarketSample(entry.at, now)
+        }
+      : { price: entry.price, at: entry.at, samples: entry.samples }
   }
   const limit = Number.isFinite(Number(historyLimit))
     ? Math.max(0, Math.floor(Number(historyLimit)))
@@ -191,8 +293,8 @@ export function marketView (state, { historyLimit = MAX_MARKET_HISTORY, withBid 
 }
 
 /** 启动早期（store 还没读出来）也要有完整形状，不能给 undefined。 */
-export function initialMarketView ({ withBid = false } = {}) {
-  return marketView(initialMarketState(), { withBid })
+export function initialMarketView ({ withBid = false, now = Date.now() } = {}) {
+  return marketView(initialMarketState(), { withBid, now })
 }
 
 // ---------------------------------------------------------------------------
@@ -414,6 +516,12 @@ class MarketStore {
   #tradeAt = []
   /** 均值回归的锚点：每满 10 分钟推进一次；不落盘，重启后从这一刻重新计时。 */
   #lastRevertAt = Number.NEGATIVE_INFINITY
+  /**
+   * 每个 peer 最近一条 digest（ticket 42）：deviceId → { prices, at }。
+   * 只活在内存里；落盘的是算出来的 `index`（重启后仍能画灰，但不会假装还新鲜）。
+   * 有界：超过 2 分钟的条目在下一包/下一拍就被清掉，且 deviceId 只来自放行邻居。
+   */
+  #digests = new Map()
 
   constructor ({ dir, log, now }) {
     this.#dir = dir
@@ -459,8 +567,74 @@ class MarketStore {
   }
 
   /** 只读视图：调用方可以随便改返回值，改不到 store。 */
-  snapshot () {
-    return marketView(this.#state, { historyLimit: MAX_MARKET_HISTORY })
+  snapshot ({ historyLimit = MAX_MARKET_HISTORY, withBid = false } = {}) {
+    return marketView(this.#state, {
+      historyLimit,
+      withBid,
+      now: this.#nowMs()
+    })
+  }
+
+  /**
+   * 收到一条已通过协议白名单的 digest（ticket 42）。
+   *
+   * 按 deviceId 只留最近一条；过期条目清掉；重算局域网指数并落盘。
+   * 时间戳/价格范围再兜一遍底：这一层也当网络输入，不信任调用方。
+   * 返回值：`{ ok, changed, persisted }`；`ok:false` 表示这条 digest 形状不可用。
+   */
+  observeDigest (deviceId, digest = {}) {
+    if (typeof deviceId !== 'string' || deviceId === '') {
+      return { ok: false, changed: false, persisted: Promise.resolve(false) }
+    }
+    if (digest === null || typeof digest !== 'object' || Array.isArray(digest)) {
+      return { ok: false, changed: false, persisted: Promise.resolve(false) }
+    }
+    const at = normalizeTimestamp(digest.at)
+    if (at === null || digest.prices === null || typeof digest.prices !== 'object' ||
+      Array.isArray(digest.prices)) {
+      return { ok: false, changed: false, persisted: Promise.resolve(false) }
+    }
+    const now = this.#nowMs()
+    const prices = {}
+    for (const cropId of CROP_IDS) {
+      const value = Number(digest.prices[cropId])
+      if (!Number.isFinite(value)) continue
+      prices[cropId] = clampPrice(value, CROPS[cropId].base)
+    }
+    this.#digests.set(deviceId, { prices, at })
+    this.#pruneDigests(now)
+    const changed = this.#refreshIndex(now)
+    return {
+      ok: true,
+      changed,
+      persisted: changed ? this.#persist() : Promise.resolve(false)
+    }
+  }
+
+  /**
+   * 忘掉某个 peer 的行情（ticket 42/44 接口）：邻居被拒绝/移除后，它的价格
+   * 不该继续留在局域网指数里。没有这条记录时是 no-op。
+   */
+  removeDigest (deviceId) {
+    if (typeof deviceId !== 'string' || !this.#digests.delete(deviceId)) {
+      return { ok: true, changed: false, persisted: Promise.resolve(false) }
+    }
+    const now = this.#nowMs()
+    const hasFresh = [...this.#digests.values()].some((digest) =>
+      isFreshMarketSample(digest.at, now))
+    let changed = false
+    // 没有其它新鲜样本时，被拒绝邻居的价格不能继续以「指数」身份参与定价；
+    // 这与自然过期不同——自然过期要保留最后一次值画灰，拒绝则直接清掉。
+    if (!hasFresh && Object.keys(this.#state.index).length > 0) {
+      this.#state.index = {}
+      changed = true
+    }
+    if (this.#refreshIndex(now)) changed = true
+    return {
+      ok: true,
+      changed,
+      persisted: changed ? this.#persist() : Promise.resolve(false)
+    }
   }
 
   /** 均值回归：每 10 分钟把价格往 base 拉 3%；没有满 10 分钟不写盘。 */
@@ -495,7 +669,8 @@ class MarketStore {
     let unitPrice
     if (side === 'sell') {
       // 这一笔按成交前的 bid 结算；数量冲击只影响下一笔（和现实做市商一样）。
-      unitPrice = bidPrice(priceBefore)
+      // 有新鲜局域网指数时 bid 用混合价，否则退化为本机价格。
+      unitPrice = bidPrice(priceBefore, freshIndexPrice(this.#state.index[cropId], stamp))
       entry.price = sellImpactPrice(priceBefore, entry.base, count)
       entry.at = stamp
     } else {
@@ -503,6 +678,8 @@ class MarketStore {
       unitPrice = CROPS[cropId].seedPrice
     }
     entry.volume24h = Math.min(Number.MAX_SAFE_INTEGER, entry.volume24h + count)
+    // 本机价也是指数样本：成交后立刻重算，开着的交易所页不用等下一包 digest。
+    this.#refreshIndex(stamp)
 
     const trade = {
       crop: cropId,
@@ -536,6 +713,47 @@ class MarketStore {
     return this.#now()
   }
 
+  /** 清掉 2 分钟没更新的 peer digest；指数条目本身保留，用来在界面上画灰。 */
+  #pruneDigests (now) {
+    for (const [deviceId, digest] of this.#digests) {
+      if (!isFreshMarketSample(digest.at, now)) this.#digests.delete(deviceId)
+    }
+  }
+
+  /**
+   * 用当前本机价格 + 新鲜 digest 重算指数。**没有新鲜 peer 样本时不删旧条目**：
+   * 交易所页需要把最后一次指数灰掉，而不是突然变回「本机行情」。
+   */
+  #refreshIndex (now) {
+    const samples = [...this.#digests.values()]
+    const computed = computeMarketIndex({
+      localPrices: this.#state.prices,
+      samples,
+      now
+    })
+    // 区分两种「没有样本」：
+    //   - 有新鲜 peer、只是最新一条里没有这种作物 → 该 peer 不再报价，删掉旧指数；
+    //   - 一个新鲜 peer 都没有 → 全局域网失联，保留最后一次值给交易所页画灰。
+    const hasFreshPeers = samples.some((sample) => isFreshMarketSample(sample.at, now))
+    let changed = false
+    for (const cropId of CROP_IDS) {
+      const next = computed[cropId]
+      if (next === undefined) {
+        if (hasFreshPeers && this.#state.index[cropId] !== undefined) {
+          delete this.#state.index[cropId]
+          changed = true
+        }
+        continue
+      }
+      const previous = this.#state.index[cropId]
+      if (previous !== undefined && previous.price === next.price &&
+        previous.at === next.at && previous.samples === next.samples) continue
+      this.#state.index[cropId] = next
+      changed = true
+    }
+    return changed
+  }
+
   /** 推进已到期的均值回归；返回推进了几个 10 分钟。 */
   #revert (now) {
     const current = Number(now)
@@ -553,6 +771,7 @@ class MarketStore {
         entry.at = current
       }
     }
+    this.#refreshIndex(current)
     return steps
   }
 
