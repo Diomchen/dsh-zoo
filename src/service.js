@@ -11,6 +11,11 @@ import {
   contractMsOf,
   earnedFor,
   feeFor,
+  hireAvailability,
+  MAX_CONTRACT_HOURS,
+  MAX_CONTRACT_WAGE,
+  MIN_CONTRACT_HOURS,
+  MIN_CONTRACT_WAGE,
   normalizeHours,
   refundFor,
   servedMsOf,
@@ -21,13 +26,22 @@ import { createDesktop } from './desktop.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
-import { FARM_LOG_VIEW_LIMIT, PLOT_IDS, createFarmStore, initialFarmView } from './farm.js'
+import {
+  FARM_LOG_VIEW_LIMIT,
+  HELP_PER_VISITOR_PER_DAY,
+  MAX_FARM_LOG,
+  PLOT_IDS,
+  STEAL_PER_VISITOR_PER_DAY,
+  createFarmStore,
+  initialFarmView
+} from './farm.js'
 import {
   CROPS,
   CROP_IDS,
   WORKER_GUARD,
   guardValue,
   isMature,
+  localDayKey,
   plotRemainingMs,
   plotStage,
   stealSucceeds
@@ -340,6 +354,15 @@ export function createService (ctx, options = {}) {
    * **应用之后才写**（失败也写：重试要回同一句，不能第二次重新 roll 守卫）。
    */
   const farmResults = new Map()
+  /** 同一 visitor/day 的「被抓住」桌面提示只发一次（ticket 43/45：不能刷屏）。 */
+  const caughtToastDays = new Map()
+  /**
+   * 访客的驮包（ticket 43/44，只显示）：偷到的作物记到这次串门结束；
+   * 工资从活跃合同派生。**不参与记账**：作物已经进仓库、硬币已经扣/入账。
+   */
+  const carriedCrops = { visitId: null, items: [] }
+  /** 重复的 tick/结算告警只记一次（ticket 45）；key 是操作名，不是整句文案。 */
+  const warnedOnce = new Set()
   /**
    * 访客侧在飞动作：requestId → { deviceId, visitId, data, attempts, nextAt, deadline, resolve }。
    * 一次用户点击只有一个 requestId；重发复用同一串字节，结果只 settle 一次。
@@ -923,6 +946,109 @@ export function createService (ctx, options = {}) {
     }
   }
 
+  /** 有界回放缓存：同一个 key 只留最新一条，超过上限丢最旧（work/farm 两张表共用）。 */
+  function rememberBounded (map, key, value, limit) {
+    map.delete(key)
+    map.set(key, value)
+    while (map.size > limit) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) break
+      map.delete(oldest)
+    }
+  }
+
+  /** 重复的 tick/重试告警只记一次；key 用操作名（`farm-tick` / `settle`…）。 */
+  function warnOnce (key, line) {
+    if (warnedOnce.has(key)) return
+    warnedOnce.add(key)
+    warn(ctx, line)
+  }
+
+  /**
+   * 访客的驮包（只显示，ticket 43/44）：偷来的作物「在驮包里」直到这次串门结束；
+   * 工资从合同派生（active 用 provisionalEarned，ended 未结算用 earned）。
+   * **不改任何账**：作物已经进仓库、硬币已经按合同扣/入账，这里只是把「还在路上」
+   * 这一层如实画出来。串门结束 / 合同结算后条目自然消失。
+   */
+  function carriedView () {
+    const out = room.outboundVisit()
+    const items = []
+    if (out === null || carriedCrops.visitId !== out.visitId) {
+      if (carriedCrops.items.length > 0 || carriedCrops.visitId !== null) {
+        carriedCrops.visitId = null
+        carriedCrops.items = []
+      }
+    } else {
+      const until = Number.isFinite(Number(out.endsAt)) ? Math.floor(Number(out.endsAt)) : null
+      for (const entry of carriedCrops.items) {
+        items.push({ ...entry, until })
+      }
+    }
+    let incoming = []
+    try {
+      incoming = contractsView().incoming
+    } catch {
+      incoming = []
+    }
+    for (const record of incoming) {
+      if (record.status === 'active') {
+        items.push({
+          kind: 'wage',
+          amount: Math.max(0, Math.floor(Number(record.provisionalEarned) || 0)),
+          contractId: record.id,
+          who: record.employerNickname ?? null,
+          at: Number.isFinite(Number(record.startedAt)) ? Math.floor(Number(record.startedAt)) : null,
+          until: Number.isFinite(Number(record.endsAt)) ? Math.floor(Number(record.endsAt)) : null
+        })
+      } else if (record.status === 'ended' && record.settled !== true) {
+        items.push({
+          kind: 'wage',
+          amount: Math.max(0, Math.floor(Number(record.earned) || 0)),
+          contractId: record.id,
+          who: record.employerNickname ?? null,
+          at: Number.isFinite(Number(record.startedAt)) ? Math.floor(Number(record.startedAt)) : null,
+          until: Number.isFinite(Number(record.endedAt)) ? Math.floor(Number(record.endedAt)) : null
+        })
+      }
+    }
+    return items
+  }
+
+  /** 「被抓住」的桌面提示每位访客每天只发一次；日志仍然每次尝试一条（有界 50）。 */
+  function shouldToastCaught (deviceId) {
+    const day = localDayKey(contractClock()) ?? 'unknown'
+    const key = day + ':' + String(deviceId)
+    if (caughtToastDays.has(key)) return false
+    caughtToastDays.set(key, true)
+    while (caughtToastDays.size > 128) {
+      const oldest = caughtToastDays.keys().next().value
+      if (oldest === undefined) break
+      caughtToastDays.delete(oldest)
+    }
+    return true
+  }
+
+  /** 偷到 1 个：只加驮包条目（作物已经由 farm.addCrop 记账）。 */
+  function noteCarriedCrop (out, crop, qty, at) {
+    if (out === null || typeof crop !== 'string' || !Number.isFinite(Number(qty)) || qty <= 0) return
+    if (carriedCrops.visitId !== out.visitId) {
+      carriedCrops.visitId = out.visitId
+      carriedCrops.items = []
+    }
+    const existing = carriedCrops.items.find((entry) => entry.crop === crop)
+    if (existing !== undefined) {
+      existing.qty = Math.min(999, existing.qty + Math.floor(Number(qty)))
+      return
+    }
+    carriedCrops.items.unshift({
+      kind: 'crop',
+      crop,
+      qty: Math.min(999, Math.floor(Number(qty))),
+      at: Number.isFinite(Number(at)) ? Math.floor(Number(at)) : null
+    })
+    if (carriedCrops.items.length > 8) carriedCrops.items.length = 8
+  }
+
   /**
    * `/state` 的农场出口（SPEC v5「状态出口与动作」）：
    * `{ plots, coins, seeds, crops, dew, dewEarned, guard, worker, hire, log }`，log 最近 20 条。
@@ -1100,7 +1226,10 @@ export function createService (ctx, options = {}) {
         : Math.min(MAX_CONTRACTS_PER_SIDE, contracts.outgoing().length + contracts.incoming().length),
       hire: { ...view.hire },
       guard: farmGuard().guard,
-      log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
+      // 记录页要完整的一份（≤50）；`/state.farm.log` 仍按 SPEC 只给 20。
+      log: view.log.slice(0, MAX_FARM_LOG),
+      // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
+      carried: carriedView()
     }
   }
 
@@ -1267,14 +1396,8 @@ export function createService (ctx, options = {}) {
 
   /** 缓存一条 ack 字节（请求/结算都按 deviceId+requestId 原样重放）。 */
   function cacheWorkResult (deviceId, requestId, data) {
-    const key = deviceId + ':' + requestId
-    workResults.delete(key)
-    workResults.set(key, { data, at: contractClock() })
-    while (workResults.size > MAX_WORK_RESULTS) {
-      const oldest = workResults.keys().next().value
-      if (oldest === undefined) break
-      workResults.delete(oldest)
-    }
+    rememberBounded(workResults, deviceId + ':' + requestId,
+      { data, at: contractClock() }, MAX_WORK_RESULTS)
     // 10 分钟前的 ack 不再重放：合同最多 8 小时，但重试风暴只会发生在几分钟内。
     const cutoff = contractClock() - 10 * 60 * 1000
     for (const [candidate, entry] of workResults) {
@@ -1415,6 +1538,8 @@ export function createService (ctx, options = {}) {
       return workFailure(spent.error === 'no-coin' ? 'no-coin' : 'busy')
     }
     await contracts.markCharged(requestId)
+    // 雇佣也是一次农场动作：重置待机计时（SPEC v5「待机、露水与离线生长」）。
+    await farm.touch()
 
     pendingHire = requestId
     refreshContractViews()
@@ -1527,7 +1652,8 @@ export function createService (ctx, options = {}) {
       await contracts.markRefundStarted(fresh.record.id, value)
       const added = await farm.addCoins(value)
       if (added.ok !== true) {
-        warn(ctx, '合同退款没入账（' + (added.error ?? 'unknown') + '），等下一次重试')
+        warnOnce('refund:' + record.id,
+          '合同退款没入账（' + (added.error ?? 'unknown') + '），等下一次重试')
         return 0
       }
       await contracts.markRefunded(fresh.record.id, { amount: value, at: contractClock() })
@@ -1542,14 +1668,16 @@ export function createService (ctx, options = {}) {
   async function setHireListing (body) {
     if (farm === null) return workFailure('starting')
     if (typeof body?.enabled !== 'boolean') return workFailure('bad-enabled')
+    // 范围只有一份真相（contracts-rules）；但挂牌仍显式拒绝小数/越界，不静默夹取。
     const wagePerHour = Number(body?.wagePerHour)
-    if (!Number.isInteger(wagePerHour) || wagePerHour < 1 || wagePerHour > 100) {
+    if (!Number.isInteger(wagePerHour) ||
+      wagePerHour < MIN_CONTRACT_WAGE || wagePerHour > MAX_CONTRACT_WAGE) {
       return workFailure('bad-wage')
     }
     const minHours = Number(body?.minHours)
     const maxHours = Number(body?.maxHours)
     if (!Number.isInteger(minHours) || !Number.isInteger(maxHours) ||
-      minHours < 2 || maxHours > 8 || minHours > maxHours) {
+      minHours < MIN_CONTRACT_HOURS || maxHours > MAX_CONTRACT_HOURS || minHours > maxHours) {
       return workFailure('bad-hours')
     }
     const result = await farm.setHire({ enabled: body.enabled, wagePerHour, minHours, maxHours })
@@ -1573,6 +1701,7 @@ export function createService (ctx, options = {}) {
     }
     if (record.status !== 'active') return workFailure('contract-ended')
     await contracts.setRecallRequested(record.id, contractClock())
+    if (farm !== null) await farm.touch()
     sendRecall(record)
     room.noteFarmEvent('已经通知雇主召回，等对方确认。')
     refreshContractViews()
@@ -1604,6 +1733,7 @@ export function createService (ctx, options = {}) {
       await failWorkRequest(record.requestId, 'contract-ended')
       return { ok: true, action: 'end-contract', contractId, cancelled: true }
     }
+    if (farm !== null) await farm.touch()
     refreshContractViews()
     return { ok: true, action: 'end-contract', contractId }
   }
@@ -1680,6 +1810,9 @@ export function createService (ctx, options = {}) {
         endsAt,
         guard: WORKER_GUARD
       })
+      if (farm !== null) {
+        await farm.noteHire({ who: employerNickname, hours, wage })
+      }
       room.noteFarmEvent('「' + employerNickname + '」雇了你 ' + hours + ' 小时，去打工啦。')
       refreshContractViews()
       sendMarketDigest({ force: true })
@@ -1762,6 +1895,14 @@ export function createService (ctx, options = {}) {
     }
     if (pendingHire === packet.requestId) pendingHire = null
     entry.resolve({ ok: true, action: 'hire', contractId: packet.contractId })
+    if (farm !== null) {
+      const hired = contractFound(packet.contractId)?.record ?? null
+      await farm.noteHire({
+        who: workerNickname,
+        hours: hired?.hours,
+        wage: hired?.wage
+      })
+    }
     room.noteFarmEvent('「' + workerNickname + '」来打工了。')
     refreshContractViews()
     sendMarketDigest({ force: true })
@@ -1908,7 +2049,8 @@ export function createService (ctx, options = {}) {
         })
         const credited = await farm.addCoins(earned)
         if (credited.ok !== true) {
-          warn(ctx, '结算入账失败（' + (credited.error ?? 'unknown') + '），保持 settling 等重试')
+          warnOnce('settle:' + record.id,
+            '结算入账失败（' + (credited.error ?? 'unknown') + '），保持 settling 等重试')
           sendWorkSettleAckPacket(packet.deviceId, {
             contractId: record.id,
             requestId: packet.requestId,
@@ -1927,6 +2069,13 @@ export function createService (ctx, options = {}) {
       const settled = contractFound(record.id)?.record ?? record
       if (room.outboundWork() !== null && room.outboundWork().contractId === record.id) {
         room.endWorking(record.id, { at: contractClock(), reason: 'completed' })
+      }
+      if (farm !== null) {
+        await farm.noteSettle({
+          who: record.employerNickname,
+          wage: record.wage,
+          earned: settled.earned
+        })
       }
       room.noteFarmEvent('结算完成：拿到 ' + settled.earned + ' 硬币。')
       sendWorkSettleAckPacket(packet.deviceId, {
@@ -1977,6 +2126,9 @@ export function createService (ctx, options = {}) {
       settledAt: contractClock(),
       reason: settleReasonOf(record.endReason)
     })
+    if (farm !== null) {
+      await farm.noteSettle({ who: record.workerNickname, wage: record.wage, earned })
+    }
     contractRetryAt.delete(record.id)
     refreshContractViews()
     sendMarketDigest({ force: true })
@@ -2054,7 +2206,7 @@ export function createService (ctx, options = {}) {
         })
         discovery.sendTo(record.workerDeviceId, data)
       } catch (error) {
-        warn(ctx, '结算报文编码失败：' + message(error))
+        warnOnce('settle-encode:' + id, '结算报文编码失败：' + message(error))
       }
       contractRetryAt.set(id, contractClock() + contractRetryDelay(id))
       return true
@@ -2394,7 +2546,7 @@ export function createService (ctx, options = {}) {
       for (const kind of ['steal', 'help']) {
         const entry = view.limits[kind]
         if (entry === null || typeof entry !== 'object') continue
-        entry.perDay = kind === 'steal' ? 10 : 5
+        entry.perDay = kind === 'steal' ? STEAL_PER_VISITOR_PER_DAY : HELP_PER_VISITOR_PER_DAY
         entry.usedToday = farm.visitActionUsed(kind)
       }
     }
@@ -3490,7 +3642,7 @@ export function createService (ctx, options = {}) {
     if (plotId === null) return visitFarmError(kind, 'bad-plot')
     if (identity === null || discovery === null) return visitFarmError(kind, 'no-port')
 
-    const limit = kind === 'steal' ? 10 : 5
+    const limit = kind === 'steal' ? STEAL_PER_VISITOR_PER_DAY : HELP_PER_VISITOR_PER_DAY
     if (farm.visitActionUsed(kind) >= limit) return visitFarmError(kind, 'cap')
 
     // 帮忙先扣露水：否则并发两次 help 都能过“露水够不够”的检查。
@@ -3527,11 +3679,16 @@ export function createService (ctx, options = {}) {
       if (kind === 'steal') {
         const qty = Number.isInteger(settled.qty) && settled.qty > 0 ? settled.qty : 1
         await farm.addCrop(settled.crop, qty)
+        // 驮包只显示：作物已经进仓库；串门结束前 UI 说「在驮包里」（SPEC v5 :107）。
+        noteCarriedCrop(out, settled.crop, qty, contractClock())
       } else {
         await farm.addCoins(1)
       }
       // 成功：拉一份新快照推给窗口（不 await，结果先回给 helper）。
       void loadVisitFarm(out)
+    } else if (kind === 'steal' && settled.caught === true) {
+      // 被抓住也是一次尝试：本机跨农场日账本 +1。否则换新 requestId 就能重试到成功。
+      await farm.noteVisitAction(kind)
     } else if (kind === 'help') {
       // 失败/超时/上限：露水退回。settle 只发生一次，所以最多退一次。
       await farm.refundDew(1)
@@ -3672,14 +3829,8 @@ export function createService (ctx, options = {}) {
   }
 
   function cacheFarmResult (deviceId, requestId, result) {
-    const key = farmResultKey(deviceId, requestId)
-    farmResults.delete(key)
-    farmResults.set(key, { result, at: Date.now() })
-    while (farmResults.size > MAX_FARM_RESULTS) {
-      const oldest = farmResults.keys().next().value
-      if (oldest === undefined) break
-      farmResults.delete(oldest)
-    }
+    rememberBounded(farmResults, farmResultKey(deviceId, requestId),
+      { result, at: Date.now() }, MAX_FARM_RESULTS)
   }
 
   function sendFarmActionResult (deviceId, payload) {
@@ -3742,7 +3893,7 @@ export function createService (ctx, options = {}) {
       room.noteFarmEvent('「' + visitor.nickname + '」偷了 1 个' + cropName(outcome.crop) + '。')
     } else if (outcome.ok === true && packet.action === 'help') {
       room.noteFarmEvent('「' + visitor.nickname + '」来帮忙浇水了。')
-    } else if (outcome.caught === true) {
+    } else if (outcome.caught === true && shouldToastCaught(visitor.deviceId)) {
       room.noteFarmEvent('「' + visitor.nickname + '」被抓住了。')
     }
     // onPeer 的 flush 在 await 之前就跑了：这次必须自己同步桌面/窗口。
@@ -3909,21 +4060,30 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 本机挂牌（ticket 42/44 D1）：42 只发 farm.json 里的挂牌 + 固定守卫 0.5；
-   * `available` 暂时等于 `enabled`，`reason` 为 null。44 会在这里填真实的
-   * 「在家 / 在串门 / 在打工」与原因，但报文形状不再改。
+   * 挂牌随行情广播（ticket 44 D1）：`available`/`reason` 必须是**真实可用性**，
+   * 不是「开了挂牌就等于能雇」——正在串门/去串门/在外打工的宠物，雇主点了也只会
+   * 拿到 `worker-unavailable`。原因枚举由 `hireAvailability` 统一给（off/visiting/
+   * working/ready）。
+   *
+   * `guard` 是**雇工贡献的 0.5**（SPEC v5「雇佣与看家」），不是 `farmGuard()` 的合成值
+   * 0.3/0.5/0.8：接收方把它当成「多一位雇工能加多少守卫」，自己再和主人在家状态相加。
    */
   function hireDigestView () {
     const view = farm?.snapshot() ?? initialFarmView()
     const hire = view.hire
+    const availability = hireAvailability({
+      enabled: hire.enabled === true,
+      visiting: room.outboundVisit() !== null,
+      working: room.outboundWork() !== null
+    })
     return {
       enabled: hire.enabled === true,
       wagePerHour: hire.wagePerHour,
       minHours: hire.minHours,
       maxHours: hire.maxHours,
       guard: WORKER_GUARD,
-      available: hire.enabled === true,
-      reason: null
+      available: availability.available,
+      reason: availability.reason
     }
   }
 
@@ -4005,7 +4165,7 @@ export function createService (ctx, options = {}) {
         at: packet.at
       })
       result?.persisted?.catch?.((error) => {
-        warn(ctx, '行情写盘失败：' + message(error))
+        warnOnce('market-write', '行情写盘失败：' + message(error))
       })
       if (result?.ok === true) {
         peerDigests.set(packet.deviceId, {
@@ -4020,7 +4180,7 @@ export function createService (ctx, options = {}) {
       }
     } catch (error) {
       // 一条坏行情不能把邻居循环/交易所拖垮；下一包照常走。
-      warn(ctx, '行情处理失败，已丢弃：' + message(error))
+      warnOnce('market-digest', '行情处理失败，已丢弃：' + message(error))
     }
   }
 
@@ -4039,10 +4199,10 @@ export function createService (ctx, options = {}) {
     try {
       const result = market.removeDigest(deviceId)
       result?.persisted?.catch?.((error) => {
-        warn(ctx, '行情写盘失败：' + message(error))
+        warnOnce('market-write', '行情写盘失败：' + message(error))
       })
     } catch (error) {
-      warn(ctx, '行情清理失败：' + message(error))
+      warnOnce('market-cleanup', '行情清理失败：' + message(error))
     }
   }
 
@@ -4092,13 +4252,13 @@ export function createService (ctx, options = {}) {
         ticks.push(['农场', farm?.tick()])
         if (market !== null) ticks.push(['交易所', market.tick()])
       } catch (error) {
-        warn(ctx, '农场 tick 失败：' + message(error))
+        warnOnce('farm-tick', '农场 tick 失败：' + message(error))
         return
       }
       for (const [label, ticking] of ticks) {
         if (ticking !== undefined && typeof ticking?.catch === 'function') {
           ticking.catch((error) => {
-            warn(ctx, label + ' tick 失败：' + message(error))
+            warnOnce('tick:' + label, label + ' tick 失败：' + message(error))
           })
         }
       }
@@ -4666,7 +4826,7 @@ export function createService (ctx, options = {}) {
     // ticket 44：room 在 tick 里清掉的合同镜像落进 store（幂等），并跑一次合同巡检。
     for (const ended of room.drainEndedContracts()) {
       applyEndedContract(ended).catch((error) => {
-        warn(ctx, '合同落账失败：' + message(error))
+        warnOnce('contract-end', '合同落账失败：' + message(error))
       })
     }
     runContractTimers()
@@ -4898,6 +5058,8 @@ export function createService (ctx, options = {}) {
     /** ticket 44 的测试/诊断缝：雇工页数据与唯一守卫计算点。 */
     contractWindow: () => contractWindowView(),
     farmGuard: () => farmGuard(),
+    /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
+    carried: () => carriedView(),
     /** 本机 UDP 实际绑定端口（`port:0` 的测试用它拿到临时端口）。 */
     localPort: () => discovery?.address()?.port ?? null,
     dispose () {

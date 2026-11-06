@@ -19,6 +19,12 @@ import {
   offlineElapsed,
   waterPlot
 } from './farm-rules.js'
+import {
+  MAX_CONTRACT_HOURS,
+  MAX_CONTRACT_WAGE,
+  MIN_CONTRACT_HOURS,
+  MIN_CONTRACT_WAGE
+} from './contracts-rules.js'
 import { normalizeTradeQty } from './market.js'
 import { parseJsonText } from './json-text.js'
 
@@ -83,10 +89,11 @@ export const DEFAULT_HIRE = Object.freeze({
   minHours: 2,
   maxHours: 8
 })
-export const MIN_WAGE = 1
-export const MAX_WAGE = 100
-export const MIN_HIRE_HOURS = 2
-export const MAX_HIRE_HOURS = 8
+// 挂牌/雇佣的边界只有一份真相（contracts-rules.js）：这里保留旧名字给农场内部与测试用。
+export const MIN_WAGE = MIN_CONTRACT_WAGE
+export const MAX_WAGE = MAX_CONTRACT_WAGE
+export const MIN_HIRE_HOURS = MIN_CONTRACT_HOURS
+export const MAX_HIRE_HOURS = MAX_CONTRACT_HOURS
 
 /** 手改文件里的生长时长上限（只防一行 JSON 把时间推到几百年后）。 */
 export const MAX_GROW_MS = 30 * 24 * 60 * 60 * 1000
@@ -536,7 +543,20 @@ function normalizeLogEntry (value) {
   const rawQty = finiteNumber(value.qty)
   const qty = rawQty === null ? 0 : Math.min(MAX_STACK, Math.max(0, Math.floor(rawQty)))
   const who = sanitizeWho(value.who)
-  return { at, kind: value.kind, ...(crop === null ? {} : { crop }), qty, ...(who === null ? {} : { who }) }
+  // ticket 44/45：hire/settle 日志带 hours/wage/earned；只保留能被显示的数字。
+  const hours = finiteNumber(value.hours)
+  const wage = finiteNumber(value.wage)
+  const earned = finiteNumber(value.earned)
+  return {
+    at,
+    kind: value.kind,
+    ...(crop === null ? {} : { crop }),
+    qty,
+    ...(who === null ? {} : { who }),
+    ...(hours === null ? {} : { hours: Math.min(MAX_HIRE_HOURS, Math.max(0, Math.floor(hours))) }),
+    ...(wage === null ? {} : { wage: Math.min(MAX_COINS, Math.max(0, Math.floor(wage))) }),
+    ...(earned === null ? {} : { earned: Math.min(MAX_COINS, Math.max(0, Math.floor(earned))) })
+  }
 }
 
 function normalizeLog (value) {
@@ -752,25 +772,26 @@ class FarmStore {
     }
 
     const day = localDayKey(now)
-    if (this.#state.dewDay !== null && day !== null && this.#state.dewDay !== day) {
-      // 跨日重置：不补前一天的零头，也不把前一天的余额带进今天。
-      if (this.#state.dew !== 0) changed = true
-      this.#state.dew = 0
-      changed = true
-    }
-    if (this.#state.dewDayEarned !== null && day !== null && this.#state.dewDayEarned !== day) {
-      // 「今天已挣」独立按日归零；余额被花掉不会让它回退。
-      if (this.#state.dewEarned !== 0) changed = true
-      this.#state.dewEarned = 0
-      changed = true
-    }
-    // 余额一定算进「今天已挣」；旧文件没有计数时从当前余额起算，不白送额度。
-    this.#state.dewEarned = Math.max(this.#state.dewEarned, this.#state.dew)
-    this.#state.dewAt = now
-    if (day !== null) {
-      this.#state.dewDay = day
-      this.#state.dewDayEarned = day
-    }
+    const dayReset = day !== null && (
+      (this.#state.dewDay !== null && this.#state.dewDay !== day) ||
+      (this.#state.dewDayEarned !== null && this.#state.dewDayEarned !== day)
+    )
+    // 跨日重置/「余额算进今天已挣」只有一份实现（advanceDew）；把锚点先放到 now，
+    // 关掉 DSH 的时长不算待机，也不会补前一天剩下的零头。
+    const dew = advanceDew({
+      dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
+      dewAt: now,
+      dewDay: this.#state.dewDay,
+      dewDayEarned: this.#state.dewDayEarned
+    }, now)
+    this.#state.dew = dew.dew
+    this.#state.dewEarned = dew.dewEarned
+    this.#state.dewAt = dew.dewAt
+    if (dew.dewDay !== null) this.#state.dewDay = dew.dewDay
+    if (dew.dewDayEarned !== null) this.#state.dewDayEarned = dew.dewDayEarned
+    // 升级旧文件时不因为「余额补进已挣」白写一次 farm.json；只有跨日重置要立刻落盘。
+    if (dayReset) changed = true
     // 访客日限额同样按本地日重置：昨天用掉的次数不能带到今天。
     // 这是派生字段：**不**因为加载就立刻落盘（升级旧文件不该白写一次 farm.json）；
     // 下一次动作/tick 自然会把新的一天写入。
@@ -852,6 +873,25 @@ class FarmStore {
     return this.#enqueue(() => this.#setHire(raw))
   }
 
+  /**
+   * 任何一次农场动作都重置待机计时（SPEC v5「待机、露水」）。
+   * 工坊动作里只有种/收/浇/施肥/买卖会走各自的 `#resetIdle`；雇佣由 service 显式调这里，
+   * 语义上「主人在玩」就重置，不是「露水又攒了一滴」。
+   */
+  touch () {
+    return this.#enqueue(() => this.#touch())
+  }
+
+  /** 雇工日志（ticket 45 记录页）：谁、多久、多少工资；只显示，不动钱。 */
+  noteHire (raw) {
+    return this.#enqueue(() => this.#noteHire(raw))
+  }
+
+  /** 结算日志（ticket 45 记录页）：谁、工资里拿到多少；只显示，不动钱。 */
+  noteSettle (raw) {
+    return this.#enqueue(() => this.#noteSettle(raw))
+  }
+
   /** 帮人之前先扣 1 露水；不够就明确 no-dew（不进入发送）。 */
   spendDew (qty = 1) {
     return this.#enqueue(() => this.#spendDew(qty))
@@ -864,7 +904,8 @@ class FarmStore {
 
   /**
    * 主人侧的「偷」落账：校验成熟/未偷过/日限额 → 标记 stolenBy → 写日志。
-   * `caught:true` 时只写一条「被抓住」的日志（qty 0），不改地块、不占次数——
+   * `caught:true` 时只写一条「被抓住」的日志（qty 0），不改地块；但**照样消耗**
+   * 访客/农场当天的次数——被抓不能变成「换一个 requestId 重试到成功」。
    * 守卫判定在 service（随机源可注入），这里只负责落账。
    */
   markStolen (plotId, deviceId, options = {}) {
@@ -1141,9 +1182,8 @@ class FarmStore {
       if (held + qty > MAX_STACK) return farmError('cap')
     } else {
       const held = this.#state.crops[cropId] ?? 0
-      // 错误码表里只有 no-seed 这一种「仓库没有」；卖作物时也用同一个码，
-      // 但 notice 说的是作物，窗口/HTTP 拿到的是人话而不是种子文案。
-      if (held < qty) return farmError('no-seed', '没有这种作物了，先种一点再来卖。')
+      // 卖作物和买种子是两个语境：卖的时候仓库没有作物是 no-crop，不借用 no-seed。
+      if (held < qty) return farmError('no-crop', '没有这种作物了，先种一点再来卖。')
     }
 
     let trade
@@ -1237,6 +1277,44 @@ class FarmStore {
       coins: this.#state.coins,
       persisted
     }
+  }
+
+  async #touch () {
+    const now = this.#nowMs()
+    this.#advance(now)
+    this.#resetIdle(now)
+    const persisted = await this.#persist(true)
+    return { ok: true, action: 'touch', dewAt: now, persisted }
+  }
+
+  async #noteHire (raw) {
+    const now = this.#nowMs()
+    this.#advance(now)
+    const entry = { at: now, kind: 'hire', qty: 0 }
+    const who = sanitizeWho(raw?.who)
+    if (who !== null) entry.who = who
+    const hours = positiveInt(raw?.hours, MAX_HIRE_HOURS)
+    if (hours !== null) entry.hours = hours
+    const wage = nonNegativeInt(raw?.wage, MAX_COINS)
+    if (wage !== null) entry.wage = wage
+    this.#appendLog(entry)
+    const persisted = await this.#persist(true)
+    return { ok: true, action: 'note-hire', persisted }
+  }
+
+  async #noteSettle (raw) {
+    const now = this.#nowMs()
+    this.#advance(now)
+    const entry = { at: now, kind: 'settle', qty: 0 }
+    const who = sanitizeWho(raw?.who)
+    if (who !== null) entry.who = who
+    const wage = nonNegativeInt(raw?.wage, MAX_COINS)
+    if (wage !== null) entry.wage = wage
+    const earned = nonNegativeInt(raw?.earned, MAX_COINS)
+    if (earned !== null) entry.earned = earned
+    this.#appendLog(entry)
+    const persisted = await this.#persist(true)
+    return { ok: true, action: 'note-settle', persisted }
   }
 
   async #spendCoins (rawQty) {
@@ -1391,8 +1469,12 @@ class FarmStore {
 
     const crop = plot.crop
     const who = sanitizeWho(options?.who)
+    // 被抓住也是一次真实尝试：先记访客/农场次数，再写 qty 0 的日志。
+    // 地块本身不动（`stolenBy` 只在成功时加），所以同一块地还能再试，但次数会先耗尽——
+    // 不能靠「被抓就重发新 requestId」刷到成功（SPEC v5「偷菜与帮忙」每日上限）。
+    stats.steal.total += 1
+    stats.steal.byVisitor[deviceId] = usedInVisit + 1
     if (options?.caught === true) {
-      // 被抓住也是一次“有人来过”：写一条 qty 0 的日志，但地块与次数都不动。
       this.#appendLog({ at: now, kind: 'steal', crop, qty: 0, ...(who === null ? {} : { who }) })
       const persisted = await this.#persist(true)
       return { ok: false, error: 'guard', caught: true, crop, qty: 0, persisted }
@@ -1400,8 +1482,6 @@ class FarmStore {
 
     const next = { ...plot, stolenBy: [...plot.stolenBy, deviceId] }
     this.#state.plots[index] = next
-    stats.steal.total += 1
-    stats.steal.byVisitor[deviceId] = usedInVisit + 1
     this.#appendLog({ at: now, kind: 'steal', crop, qty: 1, ...(who === null ? {} : { who }) })
 
     const persisted = await this.#persist(true)

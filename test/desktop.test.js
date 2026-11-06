@@ -2164,7 +2164,17 @@ test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status �
   // ticket 45：冒烟切页签的调试命令也走同一条白名单；坏值回到农场页。
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'market' }).command.tab, 'market')
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'hire' }).command.tab, 'hire')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'log' }).command.tab, 'log')
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'nope' }).command.tab, 'farm')
+
+  // 普通运行的 helper 连白名单都进不来：debug 命令只在显式 --dsh-zoo-debug 下可解析。
+  const off = { debug: false }
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'market' }, off).ok, false)
+  assert.equal(shared.normalizeHostCommand({
+    type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1', cropId: 'tomato'
+  }, off).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'farm-window', open: false }, off).ok, true)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-renderer' }, { debug: true }).ok, true)
 })
 
 test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (t) => {
@@ -2205,7 +2215,8 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   assert.equal(command.type, 'farm-window')
   assert.equal(command.open, true)
   assert.equal(command.plotId, 'p1')
-  assert.deepEqual(command.farm, farm)
+  // 完整农场多一个只显示的驮包；没有在途物品时是空数组（helper 只画有值的那几条）。
+  assert.deepEqual(command.farm, { ...farm, carried: [] })
 
   assert.equal(manager.farmWindow({ open: false, farm }), true)
   assert.equal(children[0].parsedLines().at(-1).open, false)

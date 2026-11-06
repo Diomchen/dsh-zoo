@@ -20,6 +20,7 @@ import {
   isHireReason,
   isSettleReason,
   isWorkError,
+  hireAvailability,
   normalizeHours,
   normalizeWage,
   provisionalEarned,
@@ -102,6 +103,20 @@ test('provisionalEarned 只按雇主本地 ack 起点估，不越界', () => {
   assert.equal(provisionalEarned(record, endsAt + 10 * 3600_000), 40)
   // ended 之后不再随时间涨。
   assert.equal(provisionalEarned({ ...record, endedAt: ackedAt + 3600_000 }, endsAt), 10)
+  // 纯函数：时钟必须由调用方给，绝不偷偷用 Date.now()。
+  assert.equal(provisionalEarned(record), 0)
+  assert.equal(provisionalEarned(record, Number.NaN), 0)
+})
+
+test('hireAvailability：off / visiting / working / ready 四态；guard 不在这一层', () => {
+  assert.deepEqual(hireAvailability(), { available: false, reason: 'off' })
+  assert.deepEqual(hireAvailability({ enabled: false }), { available: false, reason: 'off' })
+  assert.deepEqual(hireAvailability({ enabled: true }), { available: true, reason: 'ready' })
+  assert.deepEqual(hireAvailability({ enabled: true, visiting: true }), { available: false, reason: 'visiting' })
+  assert.deepEqual(hireAvailability({ enabled: true, working: true }), { available: false, reason: 'working' })
+  // 同时串门/打工时先报串门（与 room 的互斥状态一致）。
+  assert.deepEqual(hireAvailability({ enabled: true, visiting: true, working: true }),
+    { available: false, reason: 'visiting' })
 })
 
 test('枚举/范围校验', () => {

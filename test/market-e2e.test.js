@@ -167,7 +167,7 @@ test('HTTP：买种 → 种 → 收 → 卖 → 再买；硬币/种子/作物/�
   assert.equal(badQty.status, 409)
   assert.equal(badQty.body.error, 'bad-qty')
   const noCrop = await action(service, { action: 'sell-crop', cropId: 'carrot', qty: 1 })
-  assert.equal(noCrop.body.error, 'no-seed')
+  assert.equal(noCrop.body.error, 'no-crop')
   const noCoin = await action(service, { action: 'buy-seed', cropId: 'pumpkin', qty: 1 })
   assert.equal(noCoin.body.error, 'no-coin')
   assert.equal((await state(service)).body.farm.coins, 27)

@@ -279,6 +279,8 @@ test('守卫：主人在家 0.3 + 雇工 0.5，封顶 0.8；成功率 1 − 守�
   assert.equal(stealSucceeds(0, () => 0), true)
   assert.equal(stealSucceeds(0.8, () => 0.5), false)
   assert.equal(stealSucceeds(2, () => 0.7), false, '超过 0.8 的值按 0.8 夹取')
-  // 随机源坏了不能把判定搞崩：回落到 Math.random，至少返回布尔值。
-  assert.equal(typeof stealSucceeds(0.3, () => 'x'), 'boolean')
+  // 随机源坏了不能回落到全局 Math.random：按 0 处理（守卫 > 0 时必被抓），判定仍是确定的。
+  assert.equal(stealSucceeds(0.3, () => 'x'), false)
+  assert.equal(stealSucceeds(0.3, () => Number.NaN), false)
+  assert.equal(stealSucceeds(0, () => Number.NaN), true)
 })

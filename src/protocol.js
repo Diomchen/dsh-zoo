@@ -16,6 +16,7 @@
  */
 import {
   CONTRACT_END_REASONS as CONTRACT_END_REASON_LIST,
+  HIRE_REASONS as CONTRACT_HIRE_REASON_LIST,
   MAX_CONTRACT_HOURS,
   MAX_CONTRACT_MS,
   MAX_CONTRACT_WAGE,
@@ -24,7 +25,7 @@ import {
   WORK_ERRORS as CONTRACT_WORK_ERROR_LIST,
   WORK_SETTLE_REASONS as CONTRACT_SETTLE_REASON_LIST
 } from './contracts-rules.js'
-import { CROPS, CROP_IDS, isCropId, MINUTE_MS } from './farm-rules.js'
+import { CROPS, CROP_IDS, MAX_GUARD, isCropId, MINUTE_MS } from './farm-rules.js'
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -67,15 +68,16 @@ export const GUEST_TTL_MS = 30000
 export const MARKET_DIGEST_INTERVAL_MS = 30 * 1000
 export const MARKET_DIGEST_FRESH_MS = 2 * MINUTE_MS
 /**
- * 雇工挂牌的固定原因枚举（ticket 44 才填真实值；42 自己只发 null）。
- * 形状先固定，44 的雇工板直接读 digest，不再逐个问邻居。
+ * 雇工挂牌的真实可用性（ticket 44）：`ready` / `off` / `visiting` / `working`。
+ * 枚举与 `src/contracts-rules.js` 同源；`null` 只为兼容旧版本保留。
  */
-export const HIRE_REASONS = Object.freeze(['ready', 'off', 'visiting', 'working'])
-export const HIRE_WAGE_MIN = 1
-export const HIRE_WAGE_MAX = 100
-export const HIRE_HOURS_MIN = 2
-export const HIRE_HOURS_MAX = 8
-export const HIRE_GUARD_MAX = 0.8
+export const HIRE_REASONS = CONTRACT_HIRE_REASON_LIST
+export const HIRE_WAGE_MIN = MIN_CONTRACT_WAGE
+export const HIRE_WAGE_MAX = MAX_CONTRACT_WAGE
+export const HIRE_HOURS_MIN = MIN_CONTRACT_HOURS
+export const HIRE_HOURS_MAX = MAX_CONTRACT_HOURS
+/** 挂牌/合同里守卫值的上界：与纯规则 `MAX_GUARD` 同源（0.8）。 */
+export const HIRE_GUARD_MAX = MAX_GUARD
 /**
  * 雇佣合同（ticket 44）的线上常量。与 `src/contracts-rules.js` 同源（那边是钱的真相，
  * 这里是报文的边界）；`test/contracts-rules.test.js` 有防漂移断言。
@@ -403,7 +405,8 @@ export function normalizeDigestPrices (value) {
 /**
  * 雇工挂牌：字段固定 `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`。
  * 开工前拍板（ticket 44 D1）：42 的 digest 就带 `available/reason/guard`，44 的雇工板直接读。
- * `reason` 允许 `null`（42 本机挂牌还没有真实可用性）或固定枚举（44 填）。
+ * 新版本 `reason` 总是四值之一；`null` 只接受旧版本发来的报文（不整包丢）。
+ * `guard` 是雇工贡献的 0.5，不是 `farmGuard()` 合成后的值。
  */
 export function normalizeDigestHire (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null

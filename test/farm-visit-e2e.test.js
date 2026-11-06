@@ -311,6 +311,17 @@ test('访客窗口 + 偷/帮：快照只给布尔、动作走 UDP、结果回窗
     return last.visit?.state === 'ready' && last.visit.plots[0].stolenByMe === true
   })
 
+  // 驮包只显示：偷来的 1 个番茄同时在仓库（1）和「在驮包里」（1），不是 2 份账。
+  const carriedNow = a.carried()
+  assert.equal(carriedNow.length, 1)
+  assert.equal(carriedNow[0].kind, 'crop')
+  assert.equal(carriedNow[0].crop, 'tomato')
+  assert.equal(carriedNow[0].qty, 1)
+  assert.equal(carriedNow[0].until, a.snapshot().self.out.endsAt)
+  assert.equal(a.snapshot().farm.crops.tomato, 1, '仓库只加一次')
+  const carriedWindow = desktop.calls.windows.at(-1)
+  assert.deepEqual(carriedWindow.farm.carried, carriedNow, '窗口也拿到同一份驮包')
+
   // 帮：先扣 1 露水；成功后 +1 硬币；地块 +10% 且不算 waterings。
   const beforeHelp = (await readFarm(context.dirB)).plots[1]
   desktop.emit({ type: 'action', id: 'f-help', action: 'farm-help', plotId: 'p2' })
@@ -345,6 +356,8 @@ test('访客窗口 + 偷/帮：快照只给布尔、动作走 UDP、结果回窗
   )
   await waitFor(() => desktop.calls.windows.at(-1).visit?.state === 'ended')
   assert.equal(desktop.calls.windows.at(-1).mode, 'visitor')
+  assert.deepEqual(a.carried(), [], '串门结束，驮包清空（货已经在家）')
+  assert.deepEqual(desktop.calls.windows.at(-1).farm.carried, [])
 })
 
 test('访客侧本机日上限：偷 10 次后不再发 UDP，直接 cap', async (t) => {

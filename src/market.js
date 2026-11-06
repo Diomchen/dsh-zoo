@@ -22,8 +22,9 @@ import { MARKET_DIGEST_FRESH_MS } from './protocol.js'
  *   - **卖多了价跌**：每卖一次按数量冲击价格，每 10 分钟向 base 均值回归 3%；
  *   - **价格夹在 [base×0.5, base×2]**：手改文件也不能把交易所推到离谱的价位。
  *
- * 局域网指数（ticket 42）：收方按 deviceId 保留最近一条 digest，取新鲜样本（含本机）
- * 的中位数；`effective = 0.85 × 本机 price + 0.15 × 指数`。指数过期后保留最后一次的值
+ * 局域网指数（ticket 42）：收方按 deviceId 保留最近一条 digest，取新鲜 **peer** 样本的
+ * 中位数（不含本机）；没有 peer 时指数 = 本机价 / `samples: 0`。
+ * `effective = 0.85 × 本机 price + 0.15 × 指数`。指数过期后保留最后一次的值
  * （交易所页灰掉），但不再参与定价（见 `freshIndexPrice`）。
  *
  * 容错与 `src/farm.js` / `src/backpack.js` 同一套路：
@@ -155,26 +156,26 @@ export function medianPrice (values) {
 }
 
 /**
- * 用「本机 price + 每个 peer 最近一条 digest」算局域网指数。
+ * 用每个 peer 最近一条 digest 算局域网指数（**不含本机价格**）。
  *
  * `samples` 是 `{ prices, at }[]`（服务层已按 deviceId 只留最近一条）。逐作物：
- *   - 本机价格永远是一个样本；
  *   - 只收 2 分钟内、已知作物、`[base×0.5, base×2]` 内的 peer 价格；
- *   - 至少要有 1 个 peer 样本才产出条目（只有自己 = 本机行情，不叫「局域网指数」）；
- *   - `samples` 数是参与中位数的样本数（含本机），`at` 取最新 peer 样本的时间。
+ *   - 指数 = peer 价格的中位数，`samples` = peer 样本数（不含本机）；
+ *   - 没有 peer 样本时退化为本机价格、`samples: 0`（`effective = 本机`）——
+ *     交易所页把这一条画成「本机行情」，不是伪造一个有邻居的指数。
  * 坏条目只丢自己，绝不让一种作物拖垮另外两种。
  */
 export function computeMarketIndex ({ localPrices, samples, now = Date.now() } = {}) {
   const freshSamples = (Array.isArray(samples) ? samples : [])
     .filter((sample) => sample !== null && typeof sample === 'object' &&
       isFreshMarketSample(sample.at, now))
+  const current = Number(now)
+  const atFallback = Number.isFinite(current) && current > 0 ? Math.floor(current) : 0
   const index = {}
   for (const cropId of CROP_IDS) {
     const base = CROPS[cropId].base
     const values = []
     let newest = 0
-    const local = Number(localPrices?.[cropId]?.price)
-    if (Number.isFinite(local) && local > 0) values.push(clampPrice(local, base))
     for (const sample of freshSamples) {
       const raw = Number(sample.prices?.[cropId])
       if (!Number.isFinite(raw)) continue
@@ -183,10 +184,17 @@ export function computeMarketIndex ({ localPrices, samples, now = Date.now() } =
       const at = Number(sample.at)
       if (at > newest) newest = at
     }
-    if (values.length <= 1) continue
+    if (values.length === 0) {
+      // 没有邻居报价：指数就是本机价（0 个 peer 样本）。有效价仍等于本机价。
+      const local = Number(localPrices?.[cropId]?.price)
+      if (Number.isFinite(local) && local > 0) {
+        index[cropId] = { price: clampPrice(local, base), at: atFallback, samples: 0 }
+      }
+      continue
+    }
     index[cropId] = {
       price: medianPrice(values),
-      at: newest > 0 ? newest : Number(now),
+      at: newest > 0 ? newest : atFallback,
       samples: values.length
     }
   }
@@ -545,6 +553,7 @@ class MarketStore {
         this.#warnOnce('read', '交易所读不出来，先按初始行情运行（' + errorName(error) + '）')
       }
       this.#state = initialMarketState(now)
+      this.#refreshIndex(now)
       return
     }
 
@@ -554,6 +563,7 @@ class MarketStore {
     } catch {
       this.#warnOnce('parse', '交易所不是合法 JSON，先按初始行情运行')
       this.#state = initialMarketState(now)
+      this.#refreshIndex(now)
       return
     }
 
@@ -564,6 +574,9 @@ class MarketStore {
     } else if (normalized.repaired > 0) {
       this.#warnOnce('entries', '交易所有 ' + normalized.repaired + ' 处格式不对，已按默认值修补')
     }
+    // 不落盘：盘上没有新鲜 peer（digest 只在内存），已有指数保留给窗口画灰，
+    // 缺条目的作物补一条「本机价 / samples 0」，/state 从一开始就有完整形状。
+    this.#refreshIndex(now)
   }
 
   /** 只读视图：调用方可以随便改返回值，改不到 store。 */
@@ -732,8 +745,9 @@ class MarketStore {
       now
     })
     // 区分两种「没有样本」：
-    //   - 有新鲜 peer、只是最新一条里没有这种作物 → 该 peer 不再报价，删掉旧指数；
-    //   - 一个新鲜 peer 都没有 → 全局域网失联，保留最后一次值给交易所页画灰。
+    //   - 有新鲜 peer → 用 peer 中位数；某个 peer 不再报这种作物，就退成「本机 / 0」；
+    //   - 一个新鲜 peer 都没有 → **保留**最后一次局域网指数给交易所页画灰
+    //     （本机兜底条目 `samples:0` 继续跟着本机价走）。
     const hasFreshPeers = samples.some((sample) => isFreshMarketSample(sample.at, now))
     let changed = false
     for (const cropId of CROP_IDS) {
@@ -746,9 +760,15 @@ class MarketStore {
         continue
       }
       const previous = this.#state.index[cropId]
-      if (previous !== undefined && previous.price === next.price &&
-        previous.at === next.at && previous.samples === next.samples) continue
-      this.#state.index[cropId] = next
+      if (!hasFreshPeers && previous !== undefined && previous.samples > 0) continue
+      // 本机兜底条目在价格没变时沿用旧的 at，避免每个 tick 都因为「现在是几点」而落盘。
+      const candidate = next.samples === 0 && previous !== undefined &&
+        previous.samples === 0 && previous.price === next.price
+        ? { ...next, at: previous.at }
+        : next
+      if (previous !== undefined && previous.price === candidate.price &&
+        previous.at === candidate.at && previous.samples === candidate.samples) continue
+      this.#state.index[cropId] = candidate
       changed = true
     }
     return changed

@@ -100,6 +100,7 @@ stolenBy: [deviceId], helpedBy: [deviceId] }`。`grownMs >= growMs` 即成熟；
 
 - 一次偷 **1 个**作物；这块地标记 `stolenBy`，同一访客这一轮不能再偷同一块。
 - 每日上限：同一访客对同一农场 ≤3 次；同一农场 ≤5 次；同一访客对所有农场 ≤10 次。
+  **被抓也算一次尝试**（计入上限）；`stolenBy` 只在成功时标记，不能靠重发换到成功。
 - **守卫**：主人宠物在家且没在打工/串门 = 0.3；有雇工 = 0.5；相加封顶 0.8。
   偷菜成功率 = `1 - 守卫`；失败 = 被抓住，这次白跑，没有罚款。
 - 成功：访客仓库 +1 作物，主人的收获产量 −1（收获时结算）；主人的日志记一条
@@ -120,7 +121,9 @@ stolenBy: [deviceId], helpedBy: [deviceId] }`。`grownMs >= growMs` 即成熟；
 
 **挂牌**：主人在农场小窗的「雇工」页打开 `hire`，写时薪（1–100 硬币/小时）、
 可雇时段（2–8 小时）、守卫值（v1 固定 0.5）。挂牌随行情 digest 广播；只有在线、
-在家、没在打工/串门的宠物能被雇。
+在家、没在打工/串门的宠物能被雇。digest 的 `available`/`reason` 就是这份真实可用性
+（`ready` / `off` / `visiting` / `working`），`guard` 是**雇工贡献的 0.5**，不是
+`farmGuard()` 合成后的 0.3/0.5/0.8。
 
 **雇佣**：
 
@@ -159,7 +162,8 @@ v1 不做技能/等级，守卫值固定；狗/篱笆/装饰放第二层。
 
 **行情 gossip**：每 30 秒向放行邻居发一条 `market-digest`，带本机每种作物的 `price`
 和自己的 `hire` 挂牌。收方只认新鲜（<2 分钟）、已知作物、在 `[base×0.5, base×2]`
-内的价格；取中位数作为局域网指数；坏条目丢掉，不整包丢。1 个 peer 30 秒最多 1 条。
+内的价格；**只取 peer 价格的中位数**作为局域网指数（`samples` = peer 数；没有 peer 时
+指数 = 本机价、`samples: 0`）；坏条目丢掉，不整包丢。1 个 peer 30 秒最多 1 条。
 
 **联邦的意思**：成交永远在本机；想让邻居的交易所成交，得派宠物把货/币背过去（v1.5）。
 各家价格会短暂不同——这是背货套利的机会，不是 bug。
@@ -299,11 +303,12 @@ v1 不做技能/等级，守卫值固定；狗/篱笆/装饰放第二层。
 | `hire` | `{ deviceId, hours }` | 雇一位邻居的宠物 |
 | `recall-worker` | `{ contractId }` | 主人召回自己的雇工 |
 | `end-contract` | `{ contractId }` | 雇主提前结束 |
+| `hire-listing` | `{ enabled, wagePerHour, minHours, maxHours }` | 改自己的挂牌（开关/时薪/时段） |
 
 访客的偷/帮不是本地 action：helper 发 `farm-steal` / `farm-help`（带 `visitId` /
 `plotId`），宿主转成 UDP；结果回同一扇窗。
 
-错误码：`bad-plot` / `bad-crop` / `plot-occupied` / `not-mature` / `no-seed` /
+错误码：`bad-plot` / `bad-crop` / `plot-occupied` / `not-mature` / `no-seed` / `no-crop` /
 `no-coin` / `no-dew` / `already-stolen` / `already-helped` / `cap` / `guard` /
 `no-visit` / `worker-unavailable` / `already-working` / `own-pet` / `bad-wage` /
 `contract-not-found` / `contract-ended` / `market-busy`。

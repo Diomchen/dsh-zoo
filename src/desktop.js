@@ -550,7 +550,7 @@ export function createDesktop (options = {}) {
    * 就被丢掉，不会把一行垃圾留在两个进程之间。
    */
   function sendHostCommand (command) {
-    const normalized = shared.normalizeHostCommand(command)
+    const normalized = shared.normalizeHostCommand(command, { debug })
     if (normalized.ok !== true) return false
     try {
       return send(normalized.command)

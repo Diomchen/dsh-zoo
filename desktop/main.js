@@ -1726,7 +1726,8 @@ function handleHostLine (line) {
     if (debugEnabled) process.stderr.write('[dsh-zoo helper] 忽略非 JSON 行：' + parsed.error + '\n')
     return
   }
-  const normalized = shared.normalizeHostCommand(parsed.value)
+  // 普通运行不接受任何 debug-* 命令；冒烟/调试必须显式带 --dsh-zoo-debug。
+  const normalized = shared.normalizeHostCommand(parsed.value, { debug: debugEnabled })
   if (!normalized.ok) {
     if (debugEnabled) process.stderr.write('[dsh-zoo helper] 忽略命令：' + normalized.error + '\n')
     return
@@ -2057,7 +2058,9 @@ function applyCommand (command) {
         writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
         return
       }
-      const tab = command.tab === 'market' || command.tab === 'hire' ? command.tab : 'farm'
+      const tab = command.tab === 'market' || command.tab === 'hire' || command.tab === 'log'
+        ? command.tab
+        : 'farm'
       const selector = '.tab[data-tab="' + tab + '"]'
       const script = '(() => {' +
         'const tab = document.querySelector(' + JSON.stringify(selector) + ');' +

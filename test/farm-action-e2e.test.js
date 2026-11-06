@@ -323,17 +323,17 @@ test('守卫：random < guard 就 caught/guard，地块不变、日志 qty 0；�
   assert.equal(farm.log[0].who, '阿蟹')
   assert.match(context.service.snapshot().notices[0].text, /被抓住了/)
 
-  // 换成必定成功：三次成功之后第 4 块地 cap（3/访客/农场）。
+  // 被抓也算一次尝试：只剩两次成功额度，之后就是 cap（不能靠换 requestId 重试到成功）。
   randomValue = 1
-  for (const plotId of ['p1', 'p2', 'p3']) {
+  for (const plotId of ['p1', 'p2']) {
     sendAction(context, { requestId: randomUUID(), plotId })
   }
-  await waitFor(() => resultsOf(context.peer.received).length === 4)
+  await waitFor(() => resultsOf(context.peer.received).length === 3)
   assert.equal(resultsOf(context.peer.received).slice(1).every((entry) => entry.parsed.packet.ok === true), true)
   const cappedRequest = randomUUID()
-  sendAction(context, { requestId: cappedRequest, plotId: 'p4' })
-  await waitFor(() => resultsOf(context.peer.received).length === 5)
-  assert.deepEqual(resultsOf(context.peer.received)[4].parsed.packet, {
+  sendAction(context, { requestId: cappedRequest, plotId: 'p3' })
+  await waitFor(() => resultsOf(context.peer.received).length === 4)
+  assert.deepEqual(resultsOf(context.peer.received)[3].parsed.packet, {
     v: PROTOCOL_VERSION,
     type: 'farm-action-result',
     deviceId: context.service.snapshot().self.deviceId,
@@ -342,7 +342,46 @@ test('守卫：random < guard 就 caught/guard，地块不变、日志 qty 0；�
     error: 'cap'
   })
   farm = await readFarm(context.dir)
-  assert.equal(farm.plots.filter((plot) => plot.stolenBy.length > 0).length, 3)
+  assert.equal(farm.plots.filter((plot) => plot.stolenBy.length > 0).length, 2)
+  // 两次被抓的日志都写下了（每次尝试一条），但 stolenBy 只在成功时出现。
+  assert.equal(farm.log.filter((entry) => entry.kind === 'steal' && entry.qty === 0).length, 1)
+  assert.equal(farm.visitStats.steal.byVisitor[context.deviceId], 3, '被抓 + 两次成功 = 3 次尝试')
+})
+
+test('被抓：每次尝试都写日志且占次数，但桌面提示每位访客每天只发一次；requestId 重放心跳不重复', async (t) => {
+  const context = await hostWithVisitor(t, {
+    plots: [maturePlot('p1'), maturePlot('p2'), maturePlot('p3'), maturePlot('p4')],
+    farmRandom: () => 0
+  })
+
+  const firstRequest = randomUUID()
+  sendAction(context, { requestId: firstRequest, plotId: 'p1' })
+  await waitFor(() => resultsOf(context.peer.received).length === 1)
+  // 同一 requestId 重发：命中缓存，原样回放，不再写日志/不再计数。
+  sendAction(context, { requestId: firstRequest, plotId: 'p1' })
+  await waitFor(() => resultsOf(context.peer.received).length === 2)
+  assert.deepEqual(resultsOf(context.peer.received)[1].parsed.packet,
+    resultsOf(context.peer.received)[0].parsed.packet)
+  let farm = await readFarm(context.dir)
+  assert.equal(farm.log.length, 1)
+  assert.equal(farm.visitStats.steal.byVisitor[context.deviceId], 1)
+  const caughtNotices = () => context.service.snapshot().notices.filter((notice) => /被抓住了/.test(notice.text))
+  assert.equal(caughtNotices().length, 1)
+
+  // 再来两次新的被抓：占满 3 次额度；日志 3 条，桌面提示仍然只有 1 条。
+  sendAction(context, { requestId: randomUUID(), plotId: 'p2' })
+  await waitFor(() => resultsOf(context.peer.received).length === 3)
+  sendAction(context, { requestId: randomUUID(), plotId: 'p3' })
+  await waitFor(() => resultsOf(context.peer.received).length === 4)
+  farm = await readFarm(context.dir)
+  assert.equal(farm.log.filter((entry) => entry.qty === 0).length, 3)
+  assert.equal(farm.visitStats.steal.byVisitor[context.deviceId], 3)
+  assert.equal(caughtNotices().length, 1)
+
+  sendAction(context, { requestId: randomUUID(), plotId: 'p4' })
+  await waitFor(() => resultsOf(context.peer.received).length === 5)
+  assert.equal(resultsOf(context.peer.received)[4].parsed.packet.error, 'cap')
+  assert.deepEqual((await readFarm(context.dir)).plots.map((plot) => plot.stolenBy), [[], [], [], []])
 })
 
 test('帮忙：生长中 +10%、helpedBy、日志；同一块地重复 → already-helped', async (t) => {

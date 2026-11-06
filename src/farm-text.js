@@ -25,6 +25,7 @@ const FARM_ERROR_TEXT = Object.freeze({
   'plot-occupied': '这块地已经种上了，先收掉再种。',
   'not-mature': '还没熟呢，再等一会儿。',
   'no-seed': '没有这种种子了，先去交易所买。',
+  'no-crop': '没有这种作物了，先种一点再来卖。',
   'no-coin': '硬币不够，先去卖点作物。',
   'bad-qty': '数量要在 1–99 之间。',
   cap: '仓库装不下了，先卖掉一点再来。',

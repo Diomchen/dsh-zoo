@@ -5,11 +5,12 @@
  * A 的守卫 0.8 → A 提前结束 → B 结束并结算 → 双方守卫回到 0.3、钱只动一次。
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import { FARM_FILE } from '../src/farm.js'
 import { petsFromSnapshot } from '../src/desktop-pets.js'
 import { createService } from '../src/service.js'
 
@@ -164,8 +165,11 @@ async function hireFrom (a, b, bId, hours = 2) {
 }
 
 test('挂牌 → 雇佣 → 雇工画面 → 守卫 0.8/0 → 提前结束 → 结算只发生一次', async (t) => {
-  const { a, b, aId, bId } = await connectedPair(t)
+  const { a, b, dirA, aId, bId } = await connectedPair(t)
   await listOn(b)
+  // 雇佣前记下墙钟：A 的 farm.json 还没有写过时，用时间下界验证「雇佣重置待机」。
+  const beforeHireAt = Date.now()
+  await delay(30)
   await hireFrom(a, b, bId)
 
   // 钱：A 扣 wage 20 + fee 1；B 一分没扣。
@@ -177,6 +181,29 @@ test('挂牌 → 雇佣 → 雇工画面 → 守卫 0.8/0 → 提前结束 → �
   assert.equal(outgoing.workerDeviceId, bId)
   const incoming = b.snapshot().contracts.incoming[0]
   assert.equal(incoming.employerDeviceId, aId)
+
+  // 雇佣也是一次农场动作：待机锚点被推到点击那一刻。
+  const afterHire = JSON.parse(await readFile(join(dirA, FARM_FILE), 'utf8'))
+  assert.ok(afterHire.dewAt >= beforeHireAt + 20, '雇佣重置待机计时（dewAt 被推到点击那一刻）')
+
+  // 记录页：双方各一条 hire 日志，带 who / hours / wage。
+  await waitFor(() => a.snapshot().farm.log.some((entry) => entry.kind === 'hire') &&
+    b.snapshot().farm.log.some((entry) => entry.kind === 'hire'))
+  const aHireLog = a.snapshot().farm.log.find((entry) => entry.kind === 'hire')
+  const bHireLog = b.snapshot().farm.log.find((entry) => entry.kind === 'hire')
+  assert.equal(aHireLog.wage, 20)
+  assert.equal(aHireLog.hours, 2)
+  assert.equal(aHireLog.who.length > 0, true)
+  assert.equal(bHireLog.wage, 20)
+  assert.equal(bHireLog.hours, 2)
+  assert.equal(bHireLog.who.length > 0, true)
+
+  // 驮包只显示：B（雇工）的工资在途；A（雇主）没有工资条目。
+  const bWage = b.carried().find((entry) => entry.kind === 'wage')
+  assert.ok(bWage, '雇工驮包里应有工资')
+  assert.equal(bWage.contractId, incoming.id)
+  assert.equal(a.carried().some((entry) => entry.kind === 'wage'), false)
+  assert.equal(b.snapshot().farm.coins, 30, '工资只显示，不提前入账')
 
   // 房间镜像 + 守卫。
   assert.equal(a.room.inboundWorker().workerNickname.length > 0, true)
@@ -217,6 +244,17 @@ test('挂牌 → 雇佣 → 雇工画面 → 守卫 0.8/0 → 提前结束 → �
   await waitFor(() => a.room.inboundWorker() === null && b.room.outboundWork() === null)
   await waitFor(() => a.farmGuard().guard === 0.3 && b.farmGuard().guard === 0.3)
   assert.equal(a.snapshot().farm.worker, null)
+
+  // 结算日志 + 驮包清空：双方各一条 settle，雇工的工资不再「在途」。
+  await waitFor(() => a.snapshot().farm.log.some((entry) => entry.kind === 'settle') &&
+    b.snapshot().farm.log.some((entry) => entry.kind === 'settle'))
+  const aSettle = a.snapshot().farm.log.find((entry) => entry.kind === 'settle')
+  const bSettle = b.snapshot().farm.log.find((entry) => entry.kind === 'settle')
+  assert.equal(aSettle.earned, 0)
+  assert.equal(bSettle.earned, 0)
+  assert.equal(bSettle.wage, 20)
+  assert.deepEqual(b.carried(), [])
+  assert.deepEqual(a.carried(), [])
 
   // 重复 settle/ack 不双花：等两轮重试窗口，钱不动。
   await delay(300)
