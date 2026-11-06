@@ -1414,6 +1414,77 @@ test('皮自带尺寸：场景里只有 self 带 size，换皮后跟着变', asy
   assert.equal(widthOfSelf(), 162, '693/462 = 1.5，换皮后场景跟着变')
 })
 
+test('多显示器：宠物生在主屏上，不骑在两块屏的接缝上', async (t) => {
+  const dir = await tempDir(t)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+
+  // helper 现在上报整张虚拟桌面（两块 1440×900 并排 = 2880 宽），并带上每块屏。
+  desktop.emit({
+    type: 'ready',
+    pid: 4242,
+    workArea: { x: 0, y: 25, width: 2880, height: 875 },
+    displays: [
+      { id: 1, bounds: { x: 0, y: 0, width: 1440, height: 900 }, workArea: { x: 0, y: 25, width: 1440, height: 875 }, scaleFactor: 2, primary: true },
+      { id: 2, bounds: { x: 1440, y: 0, width: 1440, height: 900 }, workArea: { x: 1440, y: 25, width: 1440, height: 875 }, scaleFactor: 2, primary: false }
+    ]
+  })
+  await delay(30)
+
+  const scene = desktop.calls.scenes.at(-1)
+  assert.ok(scene, 'ready 后应下发场景')
+  const self = scene.items.find((item) => item.role === 'self')
+  assert.ok(self)
+  assert.ok(
+    Math.abs(self.x + self.width / 2 - 720) <= 1,
+    '单只宠物应在主屏中央（窗口局部 x≈720），而不是 2880 正中的接缝（x≈1440）'
+  )
+  assert.ok(self.x + self.width <= 1440, '整只宠物都在主屏里')
+  assert.equal(self.y + self.height, 875 - Math.min(8, 875 - self.height), '地面仍是整张桌面的底边')
+  assert.deepEqual(scene.floors, [
+    { x: 0, y: 0, width: 1440, height: 875 },
+    { x: 1440, y: 0, width: 1440, height: 875 }
+  ], '每块屏的局部矩形随场景下发，渲染端按它选地面')
+})
+
+test('多显示器：主屏比第二块屏矮时，宠物出生在主屏底边（不掉到屏外）', async (t) => {
+  const dir = await tempDir(t)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    skinServer: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+
+  // 主屏 1440×900（矮），第二块屏 1440×1440（高），并排。整张桌面高 1415。
+  desktop.emit({
+    type: 'ready',
+    pid: 4242,
+    workArea: { x: 0, y: 25, width: 2880, height: 1415 },
+    displays: [
+      { id: 1, bounds: { x: 0, y: 0, width: 1440, height: 900 }, workArea: { x: 0, y: 25, width: 1440, height: 875 }, scaleFactor: 2, primary: true },
+      { id: 2, bounds: { x: 1440, y: 0, width: 1440, height: 1440 }, workArea: { x: 1440, y: 25, width: 1440, height: 1415 }, scaleFactor: 2, primary: false }
+    ]
+  })
+  await delay(30)
+
+  const scene = desktop.calls.scenes.at(-1)
+  const self = scene.items.find((item) => item.role === 'self')
+  assert.ok(self)
+  assert.equal(self.y + self.height, 875 - Math.min(8, 875 - self.height), '出生在主屏的底边，不是整张桌面的底边')
+  assert.ok(self.y + self.height < 1415, '绝不能出生在高屏才有的下半截')
+  assert.deepEqual(scene.floors, [
+    { x: 0, y: 0, width: 1440, height: 875 },
+    { x: 1440, y: 0, width: 1440, height: 1415 }
+  ])
+})
+
 test('settings.json 带 BOM 也不该被打回默认值', async (t) => {
   const dir = await tempDir(t)
   await writeFile(join(dir, SETTINGS_FILE),

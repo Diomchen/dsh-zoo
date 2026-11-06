@@ -347,6 +347,97 @@ test('命中数学：右/下边界排他、场景后画的优先、屏幕坐标�
   })
 })
 
+test('桌面表面：所有显示器工作区的并集；单屏与旧行为相同，没有显示器时退回 null', () => {
+  const primary = { workArea: { x: 0, y: 25, width: 1440, height: 875 } }
+  const left = { workArea: { x: -1440, y: 25, width: 1440, height: 875 } }
+  const lower = { workArea: { x: 0, y: 925, width: 1440, height: 875 } }
+
+  assert.deepEqual(shared.desktopArea([primary]), primary.workArea, '单屏 = 那块屏的工作区')
+  assert.deepEqual(shared.desktopArea([primary, left]), { x: -1440, y: 25, width: 2880, height: 875 })
+  assert.deepEqual(shared.desktopArea([primary, lower]), { x: 0, y: 25, width: 1440, height: 1775 })
+  assert.equal(shared.desktopArea([]), null)
+  assert.equal(shared.desktopArea(null), null)
+  assert.equal(shared.desktopArea([{ workArea: { x: 0, y: 0, width: 0, height: 10 } }]), null, '坏工作区直接跳过')
+})
+
+test('petScene 的 homeArea：多屏时宠物生在主屏中央、尺寸按主屏算；单屏时逐像素不变', () => {
+  const pet = { id: 'self', role: 'self', label: '我' }
+  const union = { x: 0, y: 25, width: 2880, height: 875 }
+  const primary = { x: 0, y: 0, width: 1440, height: 875 }
+
+  const seam = shared.petScene([pet], union, { reset: true }).items[0]
+  assert.ok(Math.abs(seam.x + seam.width / 2 - 1440) <= 1, '不传 homeArea 时单只宠物在整张桌面的正中 = 接缝')
+
+  const homed = shared.petScene([pet], union, { reset: true, homeArea: primary }).items[0]
+  assert.ok(Math.abs(homed.x + homed.width / 2 - 720) <= 1, '传了 homeArea 就落在主屏中央')
+  assert.ok(homed.x + homed.width <= 1440, '整只都在主屏里')
+  assert.equal(homed.width, seam.width, '尺寸按主屏算，不随屏幕数量变大')
+  assert.equal(homed.y, seam.y, '地面仍是整张桌面的底边（多屏共用一个物理平面）')
+
+  const single = { x: 0, y: 25, width: 1440, height: 875 }
+  assert.deepEqual(
+    shared.petScene([pet], single, { reset: true }),
+    shared.petScene([pet], single, { reset: true, homeArea: { x: 0, y: 0, width: 1440, height: 875 } }),
+    '单屏显式传 homeArea 与不传完全一致'
+  )
+})
+
+test('多屏地面带：同高相邻合并、异高分开；宠物不会走进矮屏下方的黑区', () => {
+  // 主屏 2560×1440（高）+ 副屏 1920×1080（矮），并排顶对齐：副屏下方是黑区。
+  const union = { x: 0, y: 0, width: 4480, height: 1440 }
+  const floors = [
+    { x: 0, y: 0, width: 2560, height: 1440 },
+    { x: 2560, y: 0, width: 1920, height: 1080 }
+  ]
+  assert.deepEqual(shared.walkBands(floors), [
+    { x: 2560, width: 1920, bottom: 1080 },
+    { x: 0, width: 2560, bottom: 1440 }
+  ], '底边不同 = 两条独立的带（按 bottom 从小到大）')
+
+  assert.deepEqual(shared.walkBands([
+    { x: 0, y: 0, width: 1440, height: 875 },
+    { x: 1440, y: 0, width: 1440, height: 875 }
+  ]), [{ x: 0, width: 2880, bottom: 875 }], '同高相邻的两块屏是一条带，可以来回走')
+
+  assert.deepEqual(shared.walkBands([
+    { x: 0, y: 0, width: 1440, height: 875 },
+    { x: 1544, y: 0, width: 1440, height: 875 }
+  ]).length, 2, '中间有 100px 空洞就不合并')
+  assert.equal(shared.bandAt([], { x: 0, y: 0 }), null)
+  assert.equal(shared.normalizeFloors([{ x: 1 }, null, 'x']).length, 0, '坏矩形直接丢')
+
+  const shortBand = shared.bandAt(shared.walkBands(floors), { x: 2700, y: 1300 })
+  assert.deepEqual(shortBand, { x: 2560, width: 1920, bottom: 1080 }, '黑区里按水平范围回到脚下的矮屏')
+
+  // 松手：x、y 都夹回矮屏，不能留在黑区里。
+  const dropped = shared.confineBodyToBand(
+    { x: 2700, y: 1300, width: 120, height: 160 },
+    union,
+    shortBand
+  )
+  assert.ok(dropped.x >= 2560 && dropped.x + dropped.width <= 4480, 'x 也回到副屏范围内')
+  assert.ok(dropped.y + dropped.height <= 1080 - 8 + 0.01, '脚底在副屏底边之上')
+
+  // 走路：高屏上的宠物一直往右走，最多停在接缝，不会跨进矮屏的黑区。
+  let walker = shared.createBody({ x: 2300, y: 1400, width: 120, height: 160, vx: 400 }, union)
+  for (let index = 0; index < 900; index += 1) {
+    walker = shared.stepOnBand(walker, union, 1 / 60, shared.bandAt(shared.walkBands(floors), {
+      x: walker.x + walker.width / 2,
+      y: walker.y + walker.height / 2
+    }))
+  }
+  assert.ok(walker.x + walker.width <= 2560.01, '没有越过接缝（黑区在 2560..4480 × 1080..1440）')
+  assert.equal(walker.y + walker.height, 1440 - 8, '仍站在高屏的底边上')
+
+  // 单屏：一条带覆盖整块工作区，行为与旧的 stepBody 一致。
+  const single = { x: 0, y: 0, width: 1440, height: 875 }
+  const singleBand = shared.walkBands([{ x: 0, y: 0, width: 1440, height: 875 }])[0]
+  let one = shared.createBody({ x: 700, y: 0, width: 100, height: 120, vx: 200 }, single)
+  for (let index = 0; index < 300; index += 1) one = shared.stepOnBand(one, single, 1 / 60, singleBand)
+  assert.equal(one.y + one.height, 875 - 8)
+  assert.ok(one.x + one.width <= 1440)
+})
+
 test('穿透裁定：光标不在命中区永远是穿透；渲染端确认要新鲜；没确认时按停留兜底', () => {
   const scene = shared.normalizeScene({
     items: [{ id: 'p', kind: 'pet', x: 100, y: 100, width: 50, height: 50 }]

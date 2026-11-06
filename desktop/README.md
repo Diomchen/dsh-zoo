@@ -130,8 +130,10 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `pong` | `id?` | 对 `ping` |
 | `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` 等 |
 
-`ready` 里的 `workArea` 是**主屏**工作区（DIP）。窗口 bounds 永远等于它；场景坐标是窗口局部
-CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿主/测试，换算成了屏幕坐标。
+`ready` 里的 `workArea` 是**整张虚拟桌面**：所有显示器工作区的并集（DIP），也就是窗口实际
+覆盖的那块矩形；`displays` 里带每块屏的 `bounds` / `workArea` / `scaleFactor` / `primary`。
+窗口 bounds 永远等于它；场景坐标是窗口局部 CSS 像素，因此也就是并集局部坐标。
+`hit.rect` 为了方便宿主/测试，换算成了屏幕坐标。
 
 穿透翻转的 `reason`：`initial` / `hovering` / `main-fallback` / `busy-lease` / `outside` /
 `waiting-for-confirmation` / `stale-renderer-confirmation` / `no-scene` / `scene-updated` /
@@ -173,7 +175,11 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
     "prompt": { "deviceId": "9a2b…", "nickname": "泡泡" },
     "notice": { "text": "「阿蟹」没有回应，宠物先留在家里了。", "at": 1762000000000 }
   },
-  "menu": { "tools": [], "groups": [] }
+  "menu": { "tools": [], "groups": [] },
+  "floors": [
+    { "x": 0, "y": 0, "width": 1440, "height": 875 },
+    { "x": 1440, "y": 0, "width": 1440, "height": 875 }
+  ]
 }
 ```
 
@@ -204,6 +210,13 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
   `controls.gifts`，**不**塞进 `items`。
 - **动作降级**：`anim` 是 dsh-pet 动画名；渲染端先试它，404/解码失败退到内置待机片段轮播，
   全失败才画带昵称的 SVG 色块。
+- **多屏地面带**：`floors` 是每块屏工作区在窗口局部坐标里的矩形（宿主从 `ready.displays` 换算，
+  每块屏一条）。渲染端先用 `shared.walkBands()` 把**底边相同且水平相邻**的屏合成一条地面带
+  （两块同高并排的屏 = 一条，可以在上面来回走），再用 `shared.bandAt()` 找宠物所在带。
+  走路只在带内：x 夹在带的左右边界、y 贴带底边——高度不同的屏各自一条带，宠物不会走进
+  矮屏下方那块没有显示器的黑区。拖拽不吃这个限制（整张并集都能拖），松手时
+  `shared.confineBodyToBand()` 把 x、y 都夹回落点所在的带。
+  空数组/缺省 = 老宿主或单屏，物理退回整张桌面（旧行为）。
 - `items` 上限 256；重复 `id`、未知 `kind`、非正尺寸、非 `#rrggbb` 颜色都会被丢弃/回落。
 - 宿主只在宠物集合/动作/昵称变化时下发（签名比较），**不逐帧**：位置与物理在渲染端。
   500ms 的巡检兜底所有状态变化路径（心跳、tick、dsh-pet 轮询、action）。
@@ -315,9 +328,27 @@ CSS 像素，因此也就是工作区局部坐标。`hit.rect` 为了方便宿�
 
 ## 多显示器 / 分辨率
 
-窗口只覆盖主屏工作区；其它屏不显示。插入/拔出/改分辨率会重发 `ready`，宿主重算窗口 bounds。
-同一个 helper 的 `ready`（渲染端没重启）不会 `reset`：渲染端收到 `resize` 后用
-`shared.resizeBodies()` 把所有宠物夹回新工作区（不穿地、不出界、不清速度），再重报矩形。
+**一扇窗铺满所有显示器工作区的并集**，宠物可以在任意一块屏上被看见、被拖动、被点击。
+为什么不是每屏一扇窗：跨屏拖动依赖指针捕获，而指针捕获不能跨窗口——光标一离开 A 窗，
+`pointermove`/`pointerup` 就断了。单屏时并集就是那块屏的工作区，行为与以前完全一致。
+
+- 宠物**出生在主屏**中央，不会骑在两块屏的接缝上（宿主按 `ready.displays` 里的 `primary`
+  把主屏换算成窗口局部矩形，传给 `shared.petScene` 的 `homeArea`）；尺寸也按主屏算。
+- 场景里的物理区域是整张并集：拖到任意一块屏、丢在任意位置都行。**走路有地面带**
+  （场景里的 `floors` → `shared.walkBands()`）：底边相同且水平相邻的屏合成一条带，
+  宠物可以来回走；高度不同的屏各自一条带，走到接缝就停住，不会掉进矮屏下方那块没有
+  显示器的黑区（Windows 的“黑边”）。拖拽不受带限制，松手时 x、y 都夹回落点所在的带
+  （`shared.confineBodyToBand()`），所以拖到黑区里松手也会回到脚下的那块屏。
+- 屏幕之间有水平空洞（非矩形摆法）时，走路同样停在带边界；拖拽可以经过，
+  松手按水平范围回到脚下那块屏。读取位置时不要假设“宠物一定在某个显示器里”。
+- 插入/拔出/改分辨率会重算并集、重设窗口 bounds，再重发 `ready`，宿主重算场景（含 `floors`）。
+  同一个 helper 的 `ready`（渲染端没重启）不会 `reset`：渲染端收到 `resize` 后用
+  `shared.resizeBodies()` 把所有宠物夹回新的并集（不穿地、不出界、不清速度），再重报矩形。
+- `/dsh-zoo/desktop` 的 `status.displays`、`helperStatus.floors` 与 `helperStatus.bounds`
+  是排查多屏/混合 DPI 的三组数：先确认显示器列表本身是否连续，再看窗有没有铺对。
+- 不同缩放比的屏并排时，Electron/Chromium 只能给一扇窗一个 device scale factor，
+  非主屏那一侧可能略糊；坐标与点击判定仍按 DIP，不受影响。`enableLargerThanScreen: true`
+  已经是构造参数，窗口可以大于单个屏幕。
 
 ## 已知限制
 

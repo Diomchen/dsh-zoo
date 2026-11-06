@@ -120,6 +120,8 @@ export function createDesktop (options = {}) {
   let child = null
   let ready = false
   let workArea = null
+  /** 最近一次 ready 上报的显示器列表（DIP）。多屏/混合 DPI 的诊断出口要用。 */
+  let displays = []
   let lastScene = null
   let lastEvent = null
   /** 最近一次 helper 的 status 回执；里面带渲染端上报的当前 clip / failed，用于诊断。 */
@@ -213,6 +215,7 @@ export function createDesktop (options = {}) {
     child = spawned
     ready = false
     workArea = null
+    displays = []
     stdoutParser.reset()
     stderrParser.reset()
     installExitHook()
@@ -265,6 +268,7 @@ export function createDesktop (options = {}) {
       child = null
       ready = false
       workArea = null
+      displays = []
       lastPongAt = 0
       pongKilled = false
       settlePending('helper-exited')
@@ -422,6 +426,7 @@ export function createDesktop (options = {}) {
     if (event.type === 'ready') {
       ready = true
       workArea = event.workArea
+      displays = Array.isArray(event.displays) ? event.displays : []
       notePong()
       // 重启/重载后 helper 是空的：把最后一份场景补给它（服务层在 ready 时还会对账一次）。
       // 这里刻意去掉 reset：新渲染端本来就会按 x/y 出生；显示器变化时保留现场位置更自然。
@@ -696,6 +701,7 @@ export function createDesktop (options = {}) {
       ready,
       restarts: policy.restarts,
       workArea,
+      displays: displays.slice(),
       pongAgeMs: lastPongAt > 0 ? Math.max(0, now() - lastPongAt) : null,
       pongTimeoutMs,
       lastError,

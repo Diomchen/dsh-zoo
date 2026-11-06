@@ -166,6 +166,16 @@ export function createService (ctx, options = {}) {
   let bridge = null
   let desktop = null
   let desktopWorkArea = null
+  /**
+   * 主屏在桌面窗口里的矩形（窗口局部 DIP）。多屏时整张桌面是各屏工作区的并集，
+   * 宠物要生在主屏上（并集的正中是两块屏的接缝），尺寸也只能按主屏算。
+   */
+  let desktopHomeArea = null
+  /**
+   * 每块屏在桌面窗口里的矩形（窗口局部 DIP，宿主侧的 `ready.displays` 换算）。
+   * 随场景下发，渲染端用它把宠物钉在所在那块屏的底边上。
+   */
+  let desktopFloors = []
   let desktopHelperPid = null
   let desktopSceneSignature = null
   let desktopSyncTimer = null
@@ -1416,6 +1426,8 @@ export function createService (ctx, options = {}) {
             // pid 变了 = 换了新 helper（渲染端是空的）→ reset 让它重新出生；
             // 同一个 pid = 只是显示器变化 → 保留现场位置，渲染端按新尺寸夹取。
             desktopWorkArea = event.workArea
+            desktopHomeArea = primaryHomeArea(event)
+            desktopFloors = displayFloors(event)
             const pid = Number.isInteger(event.pid) && event.pid > 0 ? event.pid : null
             const restarted = pid === null || pid !== desktopHelperPid
             desktopHelperPid = pid
@@ -1515,7 +1527,14 @@ export function createService (ctx, options = {}) {
     const signature = JSON.stringify({ pets, controls, menu: desktopMenu, assetRoots })
     if (!reset && signature === desktopSceneSignature) return false
     desktopSceneSignature = signature
-    const scene = shared.petScene(pets, desktopWorkArea, { reset, controls, menu: desktopMenu, assetRoots })
+    const scene = shared.petScene(pets, desktopWorkArea, {
+      reset,
+      controls,
+      menu: desktopMenu,
+      assetRoots,
+      homeArea: desktopHomeArea,
+      floors: desktopFloors
+    })
     try {
       if (reset && typeof desktop.resync === 'function') return desktop.resync(scene)
       return desktop.update(scene)
@@ -2646,6 +2665,64 @@ function actionDeviceId (value) {
   if (typeof value !== 'string') return null
   const id = value.trim()
   return isDeviceId(id) ? id.toLowerCase() : null
+}
+
+/**
+ * 主屏在工作区坐标系里的矩形。
+ *
+ * helper 上报的 `workArea` 是整张虚拟桌面（所有屏工作区的并集，见 shared.desktopArea）。
+ * `displays` 里带 `primary` 标记，所以这里能把主屏换算成窗口局部坐标：
+ *   x = primary.workArea.x - workArea.x
+ * 场景里的出生点因此落在主屏中央，而不是并集的正中（两块屏并排时正好是接缝）。
+ * 拿不到主屏标记（老 helper / 单屏没带 displays）时返回 null，petScene 退回旧行为。
+ */
+function primaryHomeArea (event) {
+  const workArea = event?.workArea
+  if (workArea === null || typeof workArea !== 'object') return null
+  const displays = Array.isArray(event.displays) ? event.displays : []
+  const primary = displays.find((display) => display !== null && typeof display === 'object' && display.primary === true)
+  if (primary === undefined || primary === null || primary.workArea === null || typeof primary.workArea !== 'object') {
+    return null
+  }
+  const local = {
+    x: primary.workArea.x - workArea.x,
+    y: primary.workArea.y - workArea.y,
+    width: primary.workArea.width,
+    height: primary.workArea.height
+  }
+  // 必须落在这块桌面里；显示布局在 ready 之后又变了的竞态下也不越界。
+  // 注意用**窗口局部**的桌面矩形裁剪：workArea 自己带的是屏幕坐标（x/y 可能非 0），
+  // 拿它裁一个局部矩形会把整块区域按屏幕原点整体挪位。
+  return shared.clipRectToArea(local, localSurface(workArea))
+}
+
+/**
+ * 每块屏在窗口局部坐标里的矩形（渲染端的 `floorBottom` 来源）。
+ * 场景里空数组 = 老宿主/单屏，物理退回整张桌面。
+ */
+function displayFloors (event) {
+  const workArea = event?.workArea
+  if (workArea === null || typeof workArea !== 'object') return []
+  const surface = localSurface(workArea)
+  const displays = Array.isArray(event.displays) ? event.displays : []
+  const floors = []
+  for (const display of displays) {
+    const area = display !== null && typeof display === 'object' ? display.workArea : null
+    if (area === null || typeof area !== 'object') continue
+    const floor = shared.clipRectToArea({
+      x: area.x - workArea.x,
+      y: area.y - workArea.y,
+      width: area.width,
+      height: area.height
+    }, surface)
+    if (floor !== null) floors.push(floor)
+  }
+  return floors
+}
+
+/** 桌面窗口自己的矩形，局部坐标（0,0 起）。 */
+function localSurface (workArea) {
+  return { x: 0, y: 0, width: workArea.width, height: workArea.height }
 }
 
 function makeLogger (ctx) {

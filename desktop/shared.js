@@ -11,7 +11,8 @@
  * 坐标约定：
  *   - 场景里的矩形一律是**窗口局部 DIP**（CSS 像素），渲染端直接拿 clientX/clientY 比；
  *   - 主进程拿 screen.getCursorScreenPoint()（屏幕 DIP）减去 win.getBounds() 左上角再比，两者同尺度；
- *   - 窗口 = 主显示器工作区，因此窗口局部坐标也就是工作区局部坐标。
+ *   - 窗口 = 所有显示器工作区的并集，因此窗口局部坐标是整张虚拟桌面的局部坐标；
+ *     每块屏在其中的位置由场景的 `floors` 给出（物理地面按屏算）。
  *
  * 场景 v2 的分工（ticket 08）：
  *   - 宿主只决定「有谁、叫什么、在播什么」（items 的 id/role/label/anim/color）以及
@@ -897,7 +898,9 @@
       // v3：右键菜单的内容。旧场景没有这个字段 → 空菜单，渲染端不弹。
       menu: normalizeMenu(raw !== null && typeof raw === 'object' ? raw.menu : null),
       // ticket 33：当前那张皮的素材目录。缺省 null = 没变，helper 沿用已有的根。
-      assetRoots: normalizeAssetRoots(raw !== null && typeof raw === 'object' ? raw.assetRoots : null)
+      assetRoots: normalizeAssetRoots(raw !== null && typeof raw === 'object' ? raw.assetRoots : null),
+      // 多屏：每块屏在窗口局部坐标里的矩形。空数组 = 老宿主，物理退回整张桌面。
+      floors: normalizeFloors(raw !== null && typeof raw === 'object' ? raw.floors : null)
     }
   }
 
@@ -908,7 +911,8 @@
       items: [],
       controls: emptyControls(),
       menu: emptyMenu(),
-      assetRoots: null
+      assetRoots: null,
+      floors: []
     }
   }
 
@@ -972,6 +976,13 @@
 
   function petScene (pets, workArea, options = {}) {
     const area = normalizeArea(workArea)
+    /**
+     * 出生区域：默认就是整个桌面（单屏时与旧行为逐像素相同）。
+     * 多屏时宿主传「主屏在本窗口里的矩形」：宠物生在主屏上，而不是整张虚拟桌面的正中
+     * ——否则两块屏并排时会正好骑在接缝上。尺寸也按这块区域算，不随屏幕数量变大。
+     */
+    const home = clipRectToArea(options.homeArea, { x: 0, y: 0, width: area.width, height: area.height }) ??
+      { x: 0, y: 0, width: area.width, height: area.height }
     const list = []
     if (Array.isArray(pets)) {
       const seen = new Set()
@@ -1004,11 +1015,11 @@
     }
 
     const sizeOption = Number(options.size)
-    const base = Math.round(Math.min(area.width, area.height) * 0.12)
+    const base = Math.round(Math.min(home.width, home.height) * 0.12)
     const baseSize = Number.isFinite(sizeOption) && sizeOption >= 16
       ? Math.round(sizeOption)
       : base
-    const margin = clampNumber(Math.round(Math.min(area.width, area.height) * 0.035), 8, 48)
+    const margin = clampNumber(Math.round(Math.min(home.width, home.height) * 0.035), 8, 48)
     const count = list.length
 
     // 每只自己的包围盒（ticket 35）：基准尺寸 × 这张皮的比例。两只都是 462 时与旧行为逐像素相同。
@@ -1028,14 +1039,14 @@
 
     // 按累加宽度排（票 35 §布局）：全部一样宽时，下面的公式与旧的 `margin + span*i/(n-1)` 等价。
     const totalWidth = boxes.reduce((sum, box) => sum + box.width, 0)
-    const gap = count <= 1 ? 0 : Math.max(0, (area.width - margin * 2 - totalWidth) / (count - 1))
-    let cursor = margin
+    const gap = count <= 1 ? 0 : Math.max(0, (home.width - margin * 2 - totalWidth) / (count - 1))
+    let cursor = home.x + margin
 
     const items = list.map((pet, index) => {
       const box = boxes[index]
       const x = count <= 1
-        ? Math.round((area.width - box.width) / 2)
-        : Math.round(clampNumber(cursor, 0, Math.max(0, area.width - box.width)))
+        ? home.x + Math.round((home.width - box.width) / 2)
+        : Math.round(clampNumber(cursor, home.x, home.x + Math.max(0, home.width - box.width)))
       cursor += box.width + gap
       return {
         id: pet.id,
@@ -1046,7 +1057,9 @@
         ...(pet.src === undefined ? {} : { src: pet.src }),
         ...(pet.fallback === undefined ? {} : { fallback: pet.fallback }),
         x,
-        y: groundY({ height: box.height }, area),
+        // 出生点贴**主屏**的底边（home 就是主屏；单屏时 home == 整块工作区）。
+        // 用整张并集的底边会让矮屏上的宠物一出生就掉到屏幕外。
+        y: groundY({ height: box.height }, area, home.y + home.height),
         width: box.width,
         height: box.height,
         label: pet.label,
@@ -1059,7 +1072,8 @@
       items,
       controls: normalizeControls(options.controls),
       menu: normalizeMenu(options.menu),
-      assetRoots: normalizeAssetRoots(options.assetRoots)
+      assetRoots: normalizeAssetRoots(options.assetRoots),
+      floors: normalizeFloors(options.floors)
     }
   }
 
@@ -1116,6 +1130,158 @@
       rects.push({ id: normalizeId(candidate.id), ...clipped })
     }
     return rects
+  }
+
+  /**
+   * 场景里的 `floors`：每块显示器的**工作区**换算到窗口局部坐标后的矩形。
+   *
+   * 宿主从 `ready.displays` 算出来随场景下发；渲染端先用 `walkBands()` 合成地面带，
+   * 再用 `bandAt()` 找宠物脚下那条带。多屏高度不一致时，这是宠物不掉进矮屏下方黑区的
+   * 唯一依据——整张并集的下边界只对“所有屏一样高”成立。
+   *
+   * 不可信输入：形状不合法、数量超限都直接丢；空数组 = 老宿主，物理退回整张桌面。
+   */
+  function normalizeFloors (raw) {
+    const floors = []
+    if (!Array.isArray(raw)) return floors
+    for (const candidate of raw) {
+      if (floors.length >= MAX_DISPLAYS) break
+      const floor = normalizeRect(candidate)
+      if (floor !== null) floors.push(floor)
+    }
+    return floors
+  }
+
+  /**
+   * 一条可以连续行走的“地面带”。
+   *
+   * 同一底边（±1 DIP）且水平相邻/重叠的屏合成一条：两块同高的屏可以自由来回走。
+   * 底边不同（分辨率/任务栏/摆放不同）就是两条独立的带——宠物只能在自己那条带上走，
+   * 不会走进矮屏下方那块没有显示器的黑区。拖拽不受这个限制。
+   */
+  function normalizeBands (raw) {
+    const bands = []
+    if (!Array.isArray(raw)) return bands
+    for (const candidate of raw) {
+      if (bands.length >= MAX_DISPLAYS) break
+      if (candidate === null || typeof candidate !== 'object') continue
+      const x = Number(candidate.x)
+      const width = Number(candidate.width)
+      const bottom = Number(candidate.bottom)
+      if (![x, width, bottom].every(Number.isFinite) || width <= 0) continue
+      bands.push({
+        x: clampNumber(x, -MAX_COORD, MAX_COORD),
+        width: clampNumber(width, 0.001, MAX_ITEM_SIZE),
+        bottom: clampNumber(bottom, -MAX_COORD, MAX_COORD)
+      })
+    }
+    return bands
+  }
+
+  /**
+   * 把显示器的 floors 合成地面带：底边相同且水平相邻的屏连成一条。
+   * 返回 `[{ x, width, bottom }]`（窗口局部 DIP，按底边从高到低排列）。
+   */
+  function walkBands (floors) {
+    const entries = normalizeFloors(floors)
+      .map((floor) => ({ left: floor.x, right: floor.x + floor.width, bottom: floor.y + floor.height }))
+      .sort((left, right) => (left.bottom - right.bottom) || (left.left - right.left))
+    const bands = []
+    for (const entry of entries) {
+      let band = null
+      for (const candidate of bands) {
+        if (Math.abs(candidate.bottom - entry.bottom) > 1) continue
+        if (entry.left > candidate.right + 1 || entry.right < candidate.left - 1) continue
+        band = candidate
+        break
+      }
+      if (band === null) {
+        bands.push({ left: entry.left, right: entry.right, bottom: entry.bottom })
+      } else {
+        band.left = Math.min(band.left, entry.left)
+        band.right = Math.max(band.right, entry.right)
+      }
+    }
+    // 合并可能让两条带变得相邻/重叠（≤8 条，直接收敛）。
+    let merged = true
+    while (merged) {
+      merged = false
+      for (let index = 0; index < bands.length && !merged; index += 1) {
+        for (let other = index + 1; other < bands.length; other += 1) {
+          if (Math.abs(bands[index].bottom - bands[other].bottom) > 1) continue
+          if (bands[index].left > bands[other].right + 1 || bands[other].left > bands[index].right + 1) continue
+          bands[index].left = Math.min(bands[index].left, bands[other].left)
+          bands[index].right = Math.max(bands[index].right, bands[other].right)
+          bands.splice(other, 1)
+          merged = true
+          break
+        }
+      }
+    }
+    return bands.map((band) => ({ x: band.left, width: band.right - band.left, bottom: band.bottom }))
+  }
+
+  /**
+   * 点属于哪条地面带。先看水平方向落在哪条带里，再取竖直方向最近的那条——
+   * 这样被拖到矮屏下方的黑区松手时，会回到**脚下那块屏**，而不是旁边更近的高屏。
+   * 水平方向在空洞里（或超出所有带）时退回 2D 最近。
+   */
+  function bandAt (bands, point) {
+    const list = normalizeBands(bands)
+    const target = normalizePoint(point)
+    if (target === null || list.length === 0) return null
+    let best = null
+    let bestDistance = Infinity
+    for (const band of list) {
+      if (target.x < band.x || target.x >= band.x + band.width) continue
+      const distance = Math.abs(target.y - band.bottom)
+      if (distance < bestDistance) {
+        best = band
+        bestDistance = distance
+      }
+    }
+    if (best !== null) return best
+    for (const band of list) {
+      const dx = Math.max(band.x - target.x, 0, target.x - (band.x + band.width))
+      const dy = target.y - band.bottom
+      const distance = dx * dx + dy * dy
+      if (distance < bestDistance) {
+        best = band
+        bestDistance = distance
+      }
+    }
+    return best
+  }
+
+  /**
+   * 走一步，但只允许在这条地面带里走：
+   *   - x 夹在带的左右边界（走到屏边就停下，不会跨进矮屏下方的黑区）；
+   *   - y 贴这条带的底边（被拖进空洞后松手/热插拔也会被拉回带上）。
+   * 拖拽不走这里：`dragBody` 用整张桌面，才能跨屏。
+   */
+  function stepOnBand (body, workArea, dt, band) {
+    const area = normalizeArea(workArea)
+    if (band === null || typeof band !== 'object') return stepBody(body, area, dt)
+    const next = stepBody(body, area, dt, band.bottom)
+    let x = next.x
+    let vx = next.vx
+    if (x < band.x) {
+      x = band.x
+      if (vx < 0) vx = -vx * PHYSICS.WALL_BOUNCE
+    } else if (x + next.width > band.x + band.width) {
+      x = Math.max(band.x, band.x + band.width - next.width)
+      if (vx > 0) vx = -vx * PHYSICS.WALL_BOUNCE
+    }
+    return snapBodyToFloor({ ...next, x, vx }, area, band.bottom)
+  }
+
+  /** 出生/松手/热插拔：把身体整体挪进一条地面带（x、y 都夹），保证它在可见的屏上。 */
+  function confineBodyToBand (body, workArea, band) {
+    const area = normalizeArea(workArea)
+    const current = createBody(body, area)
+    if (band === null || typeof band !== 'object') return current
+    const x = clampNumber(current.x, band.x, Math.max(band.x, band.x + band.width - current.width))
+    return snapBodyToFloor({ ...current, x }, area, band.bottom)
   }
 
   /**
@@ -1664,6 +1830,28 @@
     return { x: left, y: top, width: right - left, height: bottom - top }
   }
 
+  /**
+   * 桌面表面 = 所有显示器工作区的并集（DIP，屏幕坐标）。
+   *
+   * 为什么是一扇铺满并集的窗，而不是每屏一扇：跨屏拖动依赖指针捕获，而指针捕获不能跨窗口
+   * ——光标一离开 A 窗，pointermove/pointerup 就断了。铺满整张虚拟桌面后，拖动全程都在
+   * 同一扇窗里，坐标只是窗口局部的连续值。单屏时并集就是那块屏的工作区，行为不变。
+   *
+   * 拿不到任何显示器（受限环境、screen 抛错）时返回 null，调用方退回主屏工作区。
+   *
+   * @param {Array<{workArea?:object}>} displays `screen.getAllDisplays()` 的结果
+   * @returns {{x:number,y:number,width:number,height:number}|null}
+   */
+  function desktopArea (displays) {
+    if (!Array.isArray(displays)) return null
+    const areas = []
+    for (const display of displays) {
+      const area = display !== null && typeof display === 'object' ? normalizeRect(display.workArea) : null
+      if (area !== null) areas.push(area)
+    }
+    return unionRect(areas)
+  }
+
   function toLocalPoint (screenPoint, bounds) {
     const point = normalizePoint(screenPoint)
     const area = normalizeRect(bounds)
@@ -1685,14 +1873,21 @@
   /**
    * 把任意输入整理成一个合法身体：尺寸不超过工作区，位置永远在工作区内（贴地不算穿地）。
    * 所有物理函数都从这里开始，因此「出界/NaN」不可能被传播出去。
+   *
+   * `floorBottom` 是宠物所在那块屏的底边（窗口局部 DIP，见 `floors`）。多屏高度不一致时，
+   * 地面不能取整张并集的下边界，否则矮屏上的宠物会掉到屏幕外。省略 = 老行为（整个工作区）。
    */
-  function createBody (raw, workArea) {
+  function createBody (raw, workArea, floorBottom) {
     const area = normalizeArea(workArea)
     const source = raw !== null && typeof raw === 'object' ? raw : {}
     const width = clampNumber(isFiniteNumber(source.width) ? source.width : 64, 1, area.width)
     const height = clampNumber(isFiniteNumber(source.height) ? source.height : 64, 1, area.height)
     const x = clampNumber(isFiniteNumber(source.x) ? source.x : 0, 0, area.width - width)
-    const y = clampNumber(isFiniteNumber(source.y) ? source.y : 0, 0, groundY({ height }, area))
+    const y = clampNumber(
+      isFiniteNumber(source.y) ? source.y : 0,
+      0,
+      groundY({ height, y: isFiniteNumber(source.y) ? source.y : 0 }, area, floorBottom)
+    )
     return {
       x,
       y,
@@ -1703,21 +1898,31 @@
     }
   }
 
-  function groundY (body, workArea) {
+  /**
+   * 地面：身体左上角的 y。`floorBottom` 给了就贴那块屏的底边，否则贴整个工作区的底边。
+   * 宠物已经在屏下方（脚底 > 屏底）时不往上夹：它可能被拖到两块屏之间的空洞里，
+   * 这一帧先自由落体到整张桌面的地面，别在半空中瞬移。
+   */
+  function groundY (body, workArea, floorBottom) {
     const area = normalizeArea(workArea)
     const source = body !== null && typeof body === 'object' ? body : {}
     const height = clampNumber(isFiniteNumber(source.height) ? source.height : 0, 0, area.height)
-    const margin = Math.min(PHYSICS.FLOOR_MARGIN, Math.max(0, area.height - height))
-    return Math.max(0, area.height - height - margin)
+    const y = isFiniteNumber(source.y) ? source.y : null
+    const feet = y === null ? null : y + height
+    const bottom = isFiniteNumber(floorBottom) && (feet === null || feet <= floorBottom + 0.5)
+      ? clampNumber(floorBottom, 0, area.height)
+      : area.height
+    const margin = Math.min(PHYSICS.FLOOR_MARGIN, Math.max(0, bottom - height))
+    return Math.max(0, bottom - height - margin)
   }
 
-  function stepBody (body, workArea, dt) {
+  function stepBody (body, workArea, dt, floorBottom) {
     const area = normalizeArea(workArea)
     const step = clampNumber(isFiniteNumber(dt) ? dt : 0, 0, PHYSICS.MAX_DT)
-    const current = createBody(body, area)
+    const current = createBody(body, area, floorBottom)
     if (step <= 0) return current
     let { x, y, width, height, vx, vy } = current
-    const ground = groundY(current, area)
+    const ground = groundY(current, area, floorBottom)
     vy += PHYSICS.GRAVITY * step
     x += vx * step
     y += vy * step
@@ -1743,32 +1948,50 @@
       if (vx > 0) vx = -vx * PHYSICS.WALL_BOUNCE
     }
     if (Math.abs(vx) < 0.5) vx = 0
-    return createBody({ x, y, width, height, vx, vy }, area)
+    return createBody({ x, y, width, height, vx, vy }, area, floorBottom)
   }
 
-  function stepBodies (bodies, workArea, dt) {
+  function stepBodies (bodies, workArea, dt, floorBottom) {
     if (!Array.isArray(bodies)) return []
-    return bodies.map((body) => stepBody(body, workArea, dt))
+    return bodies.map((body) => stepBody(body, workArea, dt, floorBottom))
+  }
+
+  /**
+   * 把身体放回某块屏的地面：脚底低于屏底就抬上去（出生/松手时用）。
+   *
+   * 与 `groundY` 的“不向上夹”相反——拖动可以把宠物丢进屏与屏之间的空洞，
+   * 松手时应该让它出现在最近那块屏的底边上，而不是悬在看不见的地方。
+   */
+  function snapBodyToFloor (body, workArea, floorBottom) {
+    const area = normalizeArea(workArea)
+    const current = createBody(body, area)
+    if (!isFiniteNumber(floorBottom)) return current
+    const bottom = clampNumber(floorBottom, 0, area.height)
+    const margin = Math.min(PHYSICS.FLOOR_MARGIN, Math.max(0, bottom - current.height))
+    const ground = Math.max(0, bottom - current.height - margin)
+    if (current.y <= ground + 0.5) return current
+    return { ...current, y: ground, vy: current.vy > 0 ? 0 : current.vy }
   }
 
   /**
    * 拖拽：弹簧跟随目标（不是硬贴）。目标点已经被夹在工作区里，所以拖到屏幕边缘时
    * 宠物会停在边上，不会被拖出工作区。松手后的初速度由 throwVelocityFromTrail 提供。
+   * 拖拽期间**不传** `floorBottom`：目标可以跨到另一块屏，松手时再按落点选地面。
    */
-  function dragBody (body, target, workArea, dt) {
+  function dragBody (body, target, workArea, dt, floorBottom) {
     const area = normalizeArea(workArea)
     const step = clampNumber(isFiniteNumber(dt) ? dt : 0, 0, PHYSICS.MAX_DT)
     const current = createBody(body, area)
     const point = target !== null && typeof target === 'object' ? target : current
     const targetX = clampNumber(isFiniteNumber(point.x) ? point.x : current.x, 0, area.width - current.width)
-    const targetY = clampNumber(isFiniteNumber(point.y) ? point.y : current.y, 0, groundY(current, area))
+    const targetY = clampNumber(isFiniteNumber(point.y) ? point.y : current.y, 0, groundY(current, area, floorBottom))
     if (step <= 0) return current
     let { x, y, vx, vy } = current
     vx += ((targetX - x) * PHYSICS.DRAG_STIFFNESS - vx * PHYSICS.DRAG_DAMPING) * step
     vy += ((targetY - y) * PHYSICS.DRAG_STIFFNESS - vy * PHYSICS.DRAG_DAMPING) * step
     x += vx * step
     y += vy * step
-    return createBody({ x, y, width: current.width, height: current.height, vx, vy }, area)
+    return createBody({ x, y, width: current.width, height: current.height, vx, vy }, area, floorBottom)
   }
 
   /**
@@ -1809,9 +2032,9 @@
     return { vx, vy }
   }
 
-  function throwBody (body, velocity, workArea) {
+  function throwBody (body, velocity, workArea, floorBottom) {
     const area = normalizeArea(workArea)
-    const current = createBody(body, area)
+    const current = createBody(body, area, floorBottom)
     const source = velocity !== null && typeof velocity === 'object' ? velocity : {}
     let vx = isFiniteNumber(source.vx) ? source.vx : 0
     let vy = isFiniteNumber(source.vy) ? source.vy : 0
@@ -1823,20 +2046,21 @@
       vx = (vx / speed) * PHYSICS.MAX_THROW_SPEED
       vy = (vy / speed) * PHYSICS.MAX_THROW_SPEED
     }
-    return createBody({ ...current, vx, vy }, area)
+    return createBody({ ...current, vx, vy }, area, floorBottom)
   }
 
   /**
    * 工作区变了（分辨率/缩放/显示器热插拔）：把每只宠物重新夹进新工作区。
    * 只夹取，不重置速度；已经落到新地面以下的按落地处理并清掉向下速度。
+   * `floorBottom` 可选：多屏时调用方按宠物所在的那块屏传，否则按整张并集。
    */
-  function resizeBodies (bodies, workArea) {
+  function resizeBodies (bodies, workArea, floorBottom) {
     if (!Array.isArray(bodies)) return []
     const area = normalizeArea(workArea)
     return bodies.map((body) => {
       const source = body !== null && typeof body === 'object' ? body : {}
-      const next = createBody(source, area)
-      const ground = groundY(next, area)
+      const next = createBody(source, area, floorBottom)
+      const ground = groundY(next, area, floorBottom)
       if (isFiniteNumber(source.y) && source.y > ground + 0.5) {
         next.y = ground
         if (next.vy > 0) next.vy = 0
@@ -2010,6 +2234,11 @@
     normalizeMediaReport,
     normalizeInputReport,
     clipRectToArea,
+    desktopArea,
+    normalizeFloors,
+    normalizeBands,
+    walkBands,
+    bandAt,
     normalizeScene,
     normalizeControls,
     normalizeMenu,
@@ -2038,8 +2267,11 @@
     demoPetScene,
     createBody,
     groundY,
+    snapBodyToFloor,
     stepBody,
     stepBodies,
+    stepOnBand,
+    confineBodyToBand,
     dragBody,
     throwVelocityFromTrail,
     throwBody,

@@ -2,7 +2,8 @@
  * dsh-zoo 桌面 helper —— Electron 主进程。
  *
  * 职责：
- *   1. 开**一个**全屏透明、无边框、置顶、不抢焦点的窗口，覆盖主显示器工作区；
+ *   1. 开**一个**全屏透明、无边框、置顶、不抢焦点的窗口，覆盖所有显示器工作区的并集
+ *      （整张虚拟桌面；单屏时就是那块屏）。一扇窗才能让跨屏拖动不断指针捕获。
  *   2. 默认整窗点击穿透（setIgnoreMouseEvents(true, { forward: true })），只有光标真的落在
  *      渲染端上报的命中矩形上、并且（a）渲染端在最近 1.2s 内确认过 inside，或（b）渲染端完全
  *      没有消息但光标已停留 300ms（macOS 后台收不到 forward 事件时的兜底），才短暂接管鼠标；
@@ -113,7 +114,7 @@ try {
   process.stderr.write('[dsh-zoo helper] 注册 dshzoo:// scheme 失败：' + messageOf(error) + '\n')
 }
 
-/** 窗口局部/屏幕 DIP 的换算全部靠它；窗口 = 主显示器工作区。 */
+/** 窗口局部/屏幕 DIP 的换算全部靠它；窗口 = 所有显示器工作区的并集（单屏时就是主屏）。 */
 let win = null
 /**
  * 改名小窗（ticket 13）。它是这套桌宠里**唯一**可聚焦、收键盘的窗口：
@@ -140,7 +141,7 @@ let giftPending = null
 let giftTimer = null
 /** 「带派」申请的流水号，只用于给 action id 起个不重复的名字。 */
 let giftSeq = 0
-/** 主显示器工作区（DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
+/** 桌面窗口覆盖的矩形（所有显示器工作区的并集，DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
 let workArea = null
 let scene = shared.emptyScene()
 let sceneAt = 0
@@ -233,7 +234,7 @@ app.whenReady().then(() => {
   createWindow()
   if (isShotMode) {
     // 冒烟截图不依赖宿主：自己在本地放三只演示宠物，抓完图写 PNG + 同名 .json 说明就退出。
-    scene = shared.demoPetScene(screen.getPrimaryDisplay().workArea)
+    scene = shared.demoPetScene(workArea)
     sceneAt = Date.now()
   } else {
     startHostLink()
@@ -244,8 +245,35 @@ app.whenReady().then(() => {
   shutdown(1)
 })
 
+/**
+ * 桌面表面：所有显示器工作区的并集。
+ *
+ * 一扇窗铺满整张虚拟桌面，跨屏拖动才可能——指针捕获不能跨窗口，光标一离开 A 窗，
+ * pointermove/pointerup 就断了。单屏时并集 == 主屏工作区，行为与以前完全一致。
+ * `screen` 抛错或没有显示器时退回主屏工作区（老平台/受限环境仍能起窗）。
+ */
+function surfaceArea () {
+  let displays = []
+  try {
+    displays = screen.getAllDisplays()
+  } catch {
+    displays = []
+  }
+  const area = shared.desktopArea(displays)
+  if (area !== null) return area
+  return primaryWorkArea()
+}
+
+function primaryWorkArea () {
+  try {
+    return screen.getPrimaryDisplay().workArea
+  } catch {
+    return { x: 0, y: 0, width: 1440, height: 900 }
+  }
+}
+
 function createWindow () {
-  const area = screen.getPrimaryDisplay().workArea
+  const area = surfaceArea()
   workArea = area
   win = new BrowserWindow({
     x: area.x,
@@ -279,6 +307,9 @@ function createWindow () {
       spellcheck: false
     }
   })
+
+  // 以系统实际给的 bounds 为准：小窗贴宠物时用的是 `workArea`，必须与窗口真的覆盖的矩形一致。
+  workArea = surfaceBounds() ?? area
 
   // 'floating' 是 macOS 的置顶层级（dsh-pet 同款）：'screen-saver' 会压过全屏应用和截图。
   // setVisibleOnAllWorkspaces 只有 macOS/Linux 有实现（Windows 上是空操作），单独判平台，
@@ -709,7 +740,7 @@ function startPointerWatchdog () {
   pointerTimer.unref?.()
 }
 
-/** 窗口 = 主屏工作区，窗口局部坐标从 (0,0) 起；命中矩形只允许落在这个范围里。 */
+/** 窗口 = 整张虚拟桌面，窗口局部坐标从 (0,0) 起；命中矩形只允许落在这个范围里。 */
 function localArea () {
   if (win === null || win.isDestroyed()) return null
   try {
@@ -1834,6 +1865,10 @@ function statusEvent (id) {
     id,
     ignoring: ignoreState.ignoring !== false,
     sceneItems: scene.items.length,
+    // 多屏诊断：窗口实际 bounds、显示器列表、随场景下发的每屏矩形。
+    // 混合 DPI 出问题时，这三组数放在一起才能判断是“窗没铺对”还是“屏的坐标就不一致”。
+    displays: displayList(),
+    floors: Array.isArray(scene.floors) ? scene.floors : [],
     hoverInside: hover.inside,
     lastHoverAgeMs: hover.lastAt > 0 ? now - hover.lastAt : null,
     insideForMs: insideSince > 0 ? now - insideSince : null,
@@ -1876,27 +1911,50 @@ function statusEvent (id) {
 
 function sendReady () {
   readySent = true
-  const primary = screen.getPrimaryDisplay()
-  let displays = []
+  writeEvent({
+    type: 'ready',
+    pid: process.pid,
+    // 上报**窗口实际覆盖**的矩形，而不是显示器的理论工作区：场景坐标的原点就是它。
+    // setBounds 可能被系统夹过；渲染端的物理区域又等于窗口自己（innerWidth/Height），
+    // 两者必须是同一个矩形，否则宠物会被宿主放在窗口外（屏幕上看起来就是“不见了”）。
+    workArea: surfaceBounds() ?? surfaceArea(),
+    displays: displayList(),
+    debug: debugEnabled,
+    shotMode: isShotMode
+  })
+}
+
+/**
+ * 当前显示器列表（DIP，屏幕坐标）。`ready` 和 `status` 共用同一份形状：
+ * 排查混合 DPI 的坐标问题时要能直接对比 workArea / bounds / scaleFactor。
+ */
+function displayList () {
+  let primary = null
   try {
-    displays = screen.getAllDisplays().map((display) => ({
+    primary = screen.getPrimaryDisplay()
+  } catch {
+    primary = null
+  }
+  try {
+    return screen.getAllDisplays().map((display) => ({
       id: display.id,
       bounds: display.bounds,
       workArea: display.workArea,
       scaleFactor: display.scaleFactor,
-      primary: display.id === primary.id
+      primary: primary !== null && display.id === primary.id
     }))
   } catch {
-    displays = []
+    return []
   }
-  writeEvent({
-    type: 'ready',
-    pid: process.pid,
-    workArea: primary.workArea,
-    displays,
-    debug: debugEnabled,
-    shotMode: isShotMode
-  })
+}
+
+function surfaceBounds () {
+  if (win === null || win.isDestroyed()) return null
+  try {
+    return shared.normalizeRect(win.getBounds())
+  } catch {
+    return null
+  }
 }
 
 function writeEvent (event) {
@@ -1963,7 +2021,7 @@ async function shotSidecar (image) {
     capturedAt: new Date().toISOString(),
     pixelWidth: size.width,
     pixelHeight: size.height,
-    workArea: screen.getPrimaryDisplay().workArea,
+    workArea: surfaceBounds() ?? surfaceArea(),
     bounds: win !== null && !win.isDestroyed() ? win.getBounds() : null,
     displays: screen.getAllDisplays().map((display) => ({
       id: display.id,
@@ -2024,7 +2082,7 @@ async function waitForMediaReady () {
 }
 
 // ---------------------------------------------------------------------------
-// 显示器变化：窗口跟着工作区走，场景交回宿主重算
+// 显示器变化：窗口跟着虚拟桌面走，场景交回宿主重算
 // ---------------------------------------------------------------------------
 
 function scheduleDisplayRefresh () {
@@ -2032,12 +2090,15 @@ function scheduleDisplayRefresh () {
   displayTimer = setTimeout(() => {
     displayTimer = null
     if (quitting || win === null || win.isDestroyed()) return
-    const area = screen.getPrimaryDisplay().workArea
+    // 插/拔/改分辨率都重算整张虚拟桌面，而不是只盯主屏：拔掉一块屏要缩回来，
+    // 插上一块要扩出去；只改主屏的话，第二块屏永远是“看得见、点不到”。
+    const area = surfaceArea()
     try {
       win.setBounds({ x: area.x, y: area.y, width: area.width, height: area.height })
     } catch {
       // 改不了就继续用旧尺寸：判定仍按真实 bounds，不会错位
     }
+    workArea = surfaceBounds() ?? area
     forceIgnore('display-changed')
     if (isShotMode) {
       scene = shared.demoPetScene(area)

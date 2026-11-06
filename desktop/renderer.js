@@ -65,6 +65,12 @@
 
   let scene = shared.normalizeScene(null)
   let area = readArea()
+  /**
+   * 地面带：宿主随场景下发的 `floors` 合并成“可以连续走的水平带”
+   * （同高相邻的屏是一条；高度不同的屏各自一条，见 `shared.walkBands`）。
+   * 空数组 = 单屏 / 老宿主：不限制，物理退回整张桌面。
+   */
+  let bands = []
   let pointer = null
   let hoverInside = false
   let hoverTimer = null
@@ -118,6 +124,20 @@
       width: Math.max(1, Math.round(window.innerWidth)),
       height: Math.max(1, Math.round(window.innerHeight))
     }
+  }
+
+  /**
+   * 宠物脚下是哪条地面带（窗口局部 DIP）。
+   *
+   * 同高相邻的屏是一条带，可以在上面来回走；高度不同的屏各自一条带，宠物不会走进
+   * 矮屏下方那块没有显示器的黑区。用身体中心找带：中心落在哪条带的水平范围里，
+   * 就取竖直方向最近的那条；中心在水平空洞里才退回 2D 最近。
+   */
+  function bandOf (body) {
+    return shared.bandAt(bands, {
+      x: body.x + body.width / 2,
+      y: body.y + body.height / 2
+    })
   }
 
   function reportHover (inside) {
@@ -382,6 +402,7 @@
     const next = shared.normalizeScene(raw)
     const reset = next.reset === true
     scene = next
+    bands = shared.walkBands(next.floors)
     syncPets(reset)
     applyOrder()
     syncControls(reset)
@@ -404,14 +425,14 @@
           pet.body = spawnBody(item)
           if (drag !== null && drag.id === pet.id) abortDrag()
         } else if (pet.body.width !== item.width || pet.body.height !== item.height) {
-          pet.body = shared.createBody({
+          pet.body = shared.confineBodyToBand({
             x: pet.body.x,
             y: pet.body.y,
             width: item.width,
             height: item.height,
             vx: pet.body.vx,
             vy: pet.body.vy
-          }, area)
+          }, area, bandOf({ ...pet.body, width: item.width, height: item.height }))
         }
         updateNode(pet)
       }
@@ -428,14 +449,14 @@
 
   function spawnBody (item) {
     const velocity = shared.initialVelocity(item.id)
-    return shared.createBody({
+    return shared.confineBodyToBand({
       x: item.x,
       y: item.y,
       width: item.width,
       height: item.height,
       vx: velocity.vx,
       vy: velocity.vy
-    }, area)
+    }, area, shared.bandAt(bands, { x: item.x + item.width / 2, y: item.y + item.height / 2 }))
   }
 
   function createPet (item) {
@@ -844,7 +865,7 @@
       leaveTimer: null
     }
     // 停住：菜单悬停期间它不飞、不漫游（dsh-pet 的 stopThrow/stopMove 同一个意思）。
-    pet.body = shared.createBody({ ...pet.body, vx: 0, vy: 0 }, area)
+    pet.body = shared.confineBodyToBand({ ...pet.body, vx: 0, vy: 0 }, area, bandOf(pet.body))
     openMenuPanel(0, { x, y, width: 0, height: 0 })
     resetOpenTimer()
     reportOverlayRects(true)
@@ -1054,14 +1075,14 @@
   /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */
   function homePet (pet) {
     const spawn = pet.spawn ?? { x: pet.item.x, y: pet.item.y }
-    pet.body = shared.createBody({
+    pet.body = shared.confineBodyToBand({
       x: spawn.x,
       y: spawn.y,
       width: pet.body.width,
       height: pet.body.height,
       vx: 0,
       vy: 0
-    }, area)
+    }, area, shared.bandAt(bands, { x: spawn.x + pet.body.width / 2, y: spawn.y + pet.body.height / 2 }))
     applyTransform(pet)
     reportRects(true)
   }
@@ -2419,7 +2440,7 @@
       hadPopover
     }
     // 抓起来就停住动能，交给弹簧跟随；松手再按轨迹给初速度。
-    pet.body = shared.createBody({ ...pet.body, vx: 0, vy: 0 }, area)
+    pet.body = shared.confineBodyToBand({ ...pet.body, vx: 0, vy: 0 }, area, bandOf(pet.body))
     pet.el.dataset.dragging = 'true'
     if (pointerId !== null) {
       try {
@@ -2466,7 +2487,12 @@
         current.trail.push({ t: now, x, y })
       }
       const velocity = shared.throwVelocityFromTrail(current.trail, performance.now())
-      pet.body = shared.throwBody(pet.body, velocity, area)
+      // 落点按**宠物自己**所在的屏算（不是光标）：弹簧跟随可能还落后在上一块屏。
+      // `bandAt` 先看水平方向落在哪条带里，所以被拖到矮屏下方黑区松手时，会回到
+      // 脚下那块矮屏，而不是旁边更近的高屏；`confineBodyToBand` 连 x 一起夹回去。
+      const band = bandOf(pet.body)
+      pet.body = shared.confineBodyToBand(pet.body, area, band)
+      pet.body = shared.throwBody(pet.body, velocity, area, band === null ? null : band.bottom)
       delete pet.el.dataset.dragging
       if (current.pointerId !== null) {
         try {
@@ -2592,6 +2618,7 @@
   window.addEventListener('resize', () => {
     area = readArea()
     for (const pet of pets.values()) {
+      // 先按新窗口夹回并集；每屏的带子会随宿主的新场景一起到，下一帧再按带子收敛。
       pet.body = shared.resizeBodies([pet.body], area)[0]
       applyTransform(pet)
     }
@@ -2648,9 +2675,12 @@
         continue
       }
       if (drag !== null && drag.id === pet.id) {
+        // 拖拽期间用整张桌面：目标可以跨到另一块屏；松手时按落点选地面带。
         pet.body = shared.dragBody(pet.body, drag.target, area, dt)
       } else {
-        pet.body = shared.stepBody(pet.body, area, dt)
+        // 走路只在当前这条地面带里：同高相邻屏可来回走；高度不同时停在屏边，
+        // 不会掉进矮屏下方那块没有显示器的黑区。
+        pet.body = shared.stepOnBand(pet.body, area, dt, bandOf(pet.body))
       }
       applyTransform(pet)
       updateMedia(pet, now)
@@ -2844,6 +2874,7 @@
       snapshot: () => ({
         at: round(performance.now()),
         area: { width: area.width, height: area.height },
+        bands: bands.map((band) => ({ x: band.x, width: band.width, bottom: band.bottom })),
         busy,
         dragging: drag === null ? null : drag.id,
         dragTarget: drag === null ? null : { x: round(drag.target.x), y: round(drag.target.y) },
