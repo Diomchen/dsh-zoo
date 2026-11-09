@@ -1,16 +1,24 @@
 /**
- * 农场小窗的渲染端（ticket 40 / 41）。
+ * 农场小窗的渲染端（ticket 40 / 41 / 43 / 44 / 46 / 47）。
  *
- * 它只做三件事：把宿主推来的完整 farm view 画成 4 块地；每秒本地递减倒计时；
+ * 它只做三件事：把宿主推来的完整 farm view 画成卡片；每秒本地递减倒计时/推进进度条；
  * 把「种 / 收 / 浇 / 施肥 / 买种 / 卖作物」当**申请**交给主进程。仓库、硬币、成熟与否、
  * 单价与总价全部由宿主算，成功与否也等宿主回执——窗口不自己改状态。
+ *
+ * 布局不写死 4 块地：卡片由 `farm-view.js` 按 `farm.plots` 生成，标题计数也从
+ * `farm.plots.length` 推；未来宿主发 20 块，这里不用改。
  */
 'use strict'
 
 const api = window.dshZooFarm
+const view = window.dshZooFarmView
+const CROP_META = view.CROP_META
+const CROP_IDS = view.CROP_IDS
+
 const plotsEl = document.getElementById('plots')
 const visitorBannerEl = document.getElementById('visitor-banner')
-const inventoryEl = document.getElementById('inventory')
+const seedBagEl = document.getElementById('seed-bag')
+const cropWarehouseEl = document.getElementById('crop-warehouse')
 const logEl = document.getElementById('log')
 const marketRowsEl = document.getElementById('market-rows')
 const tradesEl = document.getElementById('trades')
@@ -31,21 +39,22 @@ const hireMaxEl = document.getElementById('hire-max')
 const hireSaveEl = document.getElementById('hire-save')
 const hireHintEl = document.getElementById('hire-hint')
 const tabs = Array.from(document.querySelectorAll('.tab[data-tab]'))
-const subtitleEl = document.getElementById('subtitle')
-const toastEl = document.getElementById('toast')
+const titleEl = document.getElementById('farm-title')
+const plantedCountEl = document.getElementById('planted-count')
+const coinValueEl = document.getElementById('coin-value')
+const dewValueEl = document.getElementById('dew-value')
+const batchBarEl = document.getElementById('batch-bar')
+const batchPlantEl = document.getElementById('batch-plant')
+const batchHarvestEl = document.getElementById('batch-harvest')
+const toastsEl = document.getElementById('toasts')
+const plantModalEl = document.getElementById('plant-modal')
+const plantBackdropEl = document.getElementById('plant-backdrop')
+const plantTitleEl = document.getElementById('plant-title')
+const seedListEl = document.getElementById('seed-list')
+const plantCloseEl = document.getElementById('plant-modal-close')
+const plantGoMarketEl = document.getElementById('plant-go-market')
 const closeButton = document.getElementById('close')
 
-const CROP_META = {
-  tomato: { name: '小番茄', emoji: '🍅', seedPrice: 6, base: 5 },
-  carrot: { name: '胡萝卜', emoji: '🥕', seedPrice: 14, base: 6 },
-  pumpkin: { name: '南瓜', emoji: '🎃', seedPrice: 36, base: 30 }
-}
-const CROP_IDS = Object.keys(CROP_META)
-const PLOT_LABEL = { 1: '地块 1', 2: '地块 2', 3: '地块 3', 4: '地块 4' }
-const WATER_COST = 1
-const FERTILIZE_COST = 5
-const MIN_TRADE_QTY = 1
-const MAX_TRADE_QTY = 99
 /** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
 const HIRE_WAGE_MIN = 1
 const HIRE_WAGE_MAX = 100
@@ -107,6 +116,10 @@ const VISIT_ERROR_TEXT = {
   refused: '对方没有回应。'
 }
 
+const MIN_TRADE_QTY = 1
+const MAX_TRADE_QTY = 99
+const MAX_TOASTS = 4
+
 let farm = null
 let market = null
 /** 雇工页（ticket 44）：合同/邻居挂牌/在飞状态，全部由宿主 push。 */
@@ -118,33 +131,30 @@ let mode = 'owner'
 let visit = null
 let selectedPlot = null
 let busy = false
-let toastTimer = null
 let activeTab = 'farm'
+/** 播种弹窗当前对应的地块；null = 弹窗关闭。 */
+let plantTarget = null
+/** 一键收割的串行队列：一次只发一个 farm-harvest，等回执再发下一条。 */
+let batch = null
 /** 每种作物上一次输入的数量；宿主刷新价目时不把用户刚填的数字吞掉。 */
 const marketQty = { tomato: 1, carrot: 1, pumpkin: 1 }
 /** plotId → 倒计时节点；tick 只改文本，不重建按钮（重建会打断用户点击）。 */
 const countdowns = new Map()
+/** plotId → 进度条填充节点；tick 原地改 width。 */
+const progressBars = new Map()
 /** contractId → { node, remaining, text }；合同倒计时同理。 */
 const contractCountdowns = new Map()
 
 function cropMeta (cropId) {
-  return CROP_META[cropId] ?? null
+  return view.cropMeta(cropId)
 }
 
-function plotName (plot) {
-  const index = Number(String(plot.id).replace(/^p/, ''))
-  return PLOT_LABEL[index] ?? '地块'
+function plotName (plot, index) {
+  return view.plotLabel(plot, index)
 }
 
 function formatRemaining (ms) {
-  const total = Math.max(0, Math.ceil(Number(ms) / 1000))
-  if (total <= 0) return '马上就好'
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const seconds = total % 60
-  if (hours > 0) return hours + ' 时 ' + minutes + ' 分'
-  if (minutes > 0) return minutes + ' 分 ' + seconds + ' 秒'
-  return seconds + ' 秒'
+  return view.formatRemaining(ms)
 }
 
 function formatTime (at) {
@@ -156,37 +166,23 @@ function formatTime (at) {
   return pad(date.getHours()) + ':' + pad(date.getMinutes())
 }
 
+/** toast 栈：批量动作逐条提示，最多留 4 条，不互相覆盖。 */
 function showToast (text, tone = 'ok') {
   if (typeof text !== 'string' || text.trim() === '') return
-  if (toastTimer !== null) clearTimeout(toastTimer)
-  toastEl.textContent = text.trim()
-  toastEl.dataset.tone = tone
-  toastEl.hidden = false
-  toastTimer = setTimeout(() => {
-    toastEl.hidden = true
-    toastTimer = null
-  }, tone === 'error' ? 4200 : 2400)
-}
-
-function hideToast () {
-  if (toastTimer !== null) clearTimeout(toastTimer)
-  toastTimer = null
-  toastEl.hidden = true
-}
-
-function button (label, options = {}) {
-  const el = document.createElement('button')
-  el.type = 'button'
-  el.className = 'btn' + (options.className === undefined ? '' : ' ' + options.className)
-  el.textContent = label
-  el.dataset.plotId = options.plotId ?? ''
-  el.dataset.plotAction = options.action ?? ''
-  if (options.cropId !== undefined) el.dataset.cropId = options.cropId
-  if (options.disabled === true) {
-    el.disabled = true
-    el.title = options.reason ?? ''
+  if (toastsEl === null) return
+  const toast = document.createElement('div')
+  toast.className = 'toast'
+  toast.dataset.tone = tone
+  toast.textContent = text.trim()
+  toastsEl.appendChild(toast)
+  while (toastsEl.childElementCount > MAX_TOASTS) {
+    const oldest = toastsEl.firstElementChild
+    if (oldest === null) break
+    oldest.remove()
   }
-  return el
+  setTimeout(() => {
+    toast.remove()
+  }, tone === 'error' ? 4200 : 2400)
 }
 
 function visitLimit (kind) {
@@ -245,11 +241,45 @@ function renderVisitorBanner () {
   visitorBannerEl.textContent = '在「' + nickname + '」家 · 守卫 ' + guard + '%' + stealText + helpText
 }
 
-function renderVisitPlots () {
+function renderHeader () {
+  if (titleEl !== null) {
+    if (mode === 'visitor' && visit !== null) {
+      const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
+      titleEl.textContent = '「' + nickname + '」的农场'
+      titleEl.title = titleEl.textContent
+    } else {
+      titleEl.textContent = '我的农场'
+      titleEl.title = '我的农场'
+    }
+  }
+  if (plantedCountEl !== null) {
+    // 访客模式看的是主人家的地：计数跟着 visit.plots；自己的仓库/钱包仍由 header 右侧显示。
+    const statsFarm = mode === 'visitor' && visit !== null && Array.isArray(visit.plots)
+      ? { plots: visit.plots }
+      : farm
+    plantedCountEl.textContent = view.headerStats(statsFarm).text
+  }
+  if (coinValueEl !== null) coinValueEl.textContent = String(Number(farm?.coins) || 0)
+  if (dewValueEl !== null) dewValueEl.textContent = String(Number(farm?.dew) || 0)
+}
+
+function renderBatchBar () {
+  if (batchBarEl === null) return
+  // 批量按钮是外壳的一部分：主人模式跨页签都在；访客模式整行隐藏。
+  const visible = mode === 'owner' && farm !== null
+  batchBarEl.hidden = !visible
+  if (!visible) return
+  const locked = busy || batch !== null
+  if (batchPlantEl !== null) batchPlantEl.disabled = locked
+  if (batchHarvestEl !== null) batchHarvestEl.disabled = locked
+}
+
+/** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */
+function renderVisitorPlots () {
   const plots = visit !== null && Array.isArray(visit.plots) ? visit.plots : []
   if (plots.length === 0) {
     const message = document.createElement('p')
-    message.className = 'empty'
+    message.className = 'plots-empty'
     message.textContent = visit?.state === 'loading'
       ? '正在等主人家的农场快照…'
       : '这次串门没有可看的地块。'
@@ -257,253 +287,133 @@ function renderVisitPlots () {
     return
   }
   const ready = visit?.state === 'ready'
-  for (const plot of plots) {
+  const dew = Number(farm?.dew) || 0
+  for (let index = 0; index < plots.length; index += 1) {
+    const plot = plots[index]
     const meta = cropMeta(plot.crop)
-    const card = document.createElement('article')
-    card.className = 'plot'
-    card.dataset.stage = plot.stage
-    card.dataset.plot = plot.id
-    if (plot.id === selectedPlot) card.dataset.selected = 'true'
-
-    const head = document.createElement('div')
-    head.className = 'plot-head'
-    const name = document.createElement('span')
-    name.textContent = plotName(plot)
-    head.appendChild(name)
-    const badge = document.createElement('span')
-    badge.className = 'badge' + (plot.stage === 'mature' ? ' mature' : '')
-    badge.textContent = plot.stage === 'mature' ? '熟了' : plot.stage === 'growing' ? '生长中' : '空地'
-    head.appendChild(badge)
-    card.appendChild(head)
-
-    const body = document.createElement('div')
-    body.className = 'plot-body'
-    const icon = document.createElement('span')
-    icon.className = 'crop-icon' + (plot.stage === 'empty' ? ' empty' : ' growing')
-    icon.setAttribute('aria-hidden', 'true')
-    icon.textContent = meta === null ? '🟫' : meta.emoji
-    body.appendChild(icon)
-
-    const info = document.createElement('div')
-    info.className = 'plot-info'
-    const headline = document.createElement('strong')
-    headline.textContent = meta === null ? '空地' : meta.name
-    info.appendChild(headline)
-    const detail = document.createElement('span')
-    if (plot.stolenByMe === true) detail.textContent = '这一轮已经偷过了'
-    else if (plot.helpedByMe === true) detail.textContent = '这一轮已经帮过了'
-    else if (plot.stage === 'mature') detail.textContent = '成熟了，可以偷 1 个'
-    else if (plot.stage === 'growing') {
-      detail.textContent = '还要 '
-      const countdown = document.createElement('span')
-      countdown.className = 'countdown'
-      countdown.textContent = formatRemaining(plot.remainingMs)
-      detail.appendChild(countdown)
-      countdowns.set(plot.id, countdown)
-    } else detail.textContent = '还空着'
-    info.appendChild(detail)
-    body.appendChild(info)
-    card.appendChild(body)
-
-    const actions = document.createElement('div')
-    actions.className = 'plot-actions'
-    if (plot.stage === 'mature' && plot.stolenByMe !== true) {
-      actions.appendChild(button('偷 1 个', {
-        plotId: plot.id,
+    const stage = plot.stage === 'mature' ? 'mature' : plot.stage === 'growing' ? 'growing' : 'empty'
+    const actions = []
+    if (stage === 'mature' && plot.stolenByMe !== true) {
+      actions.push({
         action: 'steal',
+        plotId: plot.id,
+        label: '偷 1 个',
         className: 'harvest',
         disabled: busy || !ready || visitCapReached('steal'),
         reason: !ready ? '这次串门已经结束' : '今天的次数用完了'
-      }))
+      })
     }
-    if (plot.stage === 'growing' && plot.helpedByMe !== true) {
-      actions.appendChild(button('帮忙 +10%', {
-        plotId: plot.id,
+    if (stage === 'growing' && plot.helpedByMe !== true) {
+      actions.push({
         action: 'help',
+        plotId: plot.id,
+        label: '帮忙 +10%',
         className: 'primary',
-        disabled: busy || !ready || visitCapReached('help') || (Number(farm?.dew) || 0) < 1,
+        disabled: busy || !ready || visitCapReached('help') || dew < 1,
         reason: !ready ? '这次串门已经结束' : '露水不够或次数用完了'
-      }))
+      })
     }
-    if (plot.stolenByMe === true) actions.appendChild(button('已偷过', { plotId: plot.id, disabled: true }))
-    else if (plot.helpedByMe === true) actions.appendChild(button('已帮过', { plotId: plot.id, disabled: true }))
-    card.appendChild(actions)
-    plotsEl.appendChild(card)
+    if (plot.stolenByMe === true) {
+      actions.push({ action: '', plotId: plot.id, label: '已偷过', disabled: true })
+    } else if (plot.helpedByMe === true) {
+      actions.push({ action: '', plotId: plot.id, label: '已帮过', disabled: true })
+    }
+
+    let detailText = '还空着'
+    let countdownText = ''
+    if (plot.stolenByMe === true) detailText = '这一轮已经偷过了'
+    else if (plot.helpedByMe === true) detailText = '这一轮已经帮过了'
+    else if (stage === 'mature') detailText = '成熟了，可以偷 1 个'
+    else if (stage === 'growing') {
+      detailText = '还要'
+      countdownText = formatRemaining(plot.remainingMs)
+    }
+
+    const card = {
+      plotId: plot.id,
+      label: plotName(plot, index),
+      stage,
+      crop: plot.crop,
+      cropName: meta === null ? '空地' : meta.name,
+      emoji: meta === null ? '＋' : meta.emoji,
+      badge: stage === 'mature' ? '可收割' : stage === 'growing' ? '生长中' : '空地',
+      mature: stage === 'mature',
+      progress: view.progressOf(plot),
+      detailText,
+      countdownText,
+      openPlant: false,
+      selected: plot.id === selectedPlot,
+      actions
+    }
+    const built = view.createPlotCard(document, card)
+    plotsEl.appendChild(built.element)
+    if (built.countdown !== null) countdowns.set(plot.id, built.countdown)
+    if (built.progress !== null) progressBars.set(plot.id, built.progress)
   }
 }
 
 function renderPlots () {
   plotsEl.textContent = ''
   countdowns.clear()
+  progressBars.clear()
   renderVisitorBanner()
   if (mode === 'visitor' && visit !== null) {
-    renderVisitPlots()
+    renderVisitorPlots()
     return
   }
   if (farm === null) {
     const message = document.createElement('p')
-    message.className = 'empty'
+    message.className = 'plots-empty'
     message.textContent = '农场数据还没到，等宿主推过来…'
     plotsEl.appendChild(message)
     return
   }
-  const plots = Array.isArray(farm.plots) ? farm.plots : []
-  for (const plot of plots) {
-    const meta = cropMeta(plot.crop)
-    const card = document.createElement('article')
-    card.className = 'plot'
-    card.dataset.stage = plot.stage
-    card.dataset.plot = plot.id
-    if (plot.id === selectedPlot) card.dataset.selected = 'true'
-
-    const head = document.createElement('div')
-    head.className = 'plot-head'
-    const name = document.createElement('span')
-    name.textContent = plotName(plot)
-    head.appendChild(name)
-    const badge = document.createElement('span')
-    badge.className = 'badge' + (plot.stage === 'mature' ? ' mature' : '')
-    badge.textContent = plot.stage === 'mature' ? '熟了' : plot.stage === 'growing' ? '生长中' : '空地'
-    head.appendChild(badge)
-    card.appendChild(head)
-
-    const body = document.createElement('div')
-    body.className = 'plot-body'
-    const icon = document.createElement('span')
-    icon.className = 'crop-icon' + (plot.stage === 'empty' ? ' empty' : ' growing')
-    icon.setAttribute('aria-hidden', 'true')
-    icon.textContent = meta === null ? '🟫' : meta.emoji
-    body.appendChild(icon)
-
-    const info = document.createElement('div')
-    info.className = 'plot-info'
-    const headline = document.createElement('strong')
-    headline.textContent = meta === null ? '空地' : meta.name
-    info.appendChild(headline)
-    const detail = document.createElement('span')
-    if (plot.stage === 'empty') {
-      detail.textContent = '选一种种子种下'
-    } else if (plot.stage === 'mature') {
-      detail.textContent = '已经成熟，可以收了'
-    } else {
-      detail.textContent = '还要 '
-      const countdown = document.createElement('span')
-      countdown.className = 'countdown'
-      countdown.textContent = formatRemaining(plot.remainingMs)
-      detail.appendChild(countdown)
-      countdowns.set(plot.id, countdown)
-    }
-    info.appendChild(detail)
-    body.appendChild(info)
-    card.appendChild(body)
-
-    const actions = document.createElement('div')
-    actions.className = 'plot-actions'
-    if (plot.stage === 'empty') {
-      for (const cropId of CROP_IDS) {
-        const seeds = Number(farm.seeds?.[cropId]) || 0
-        actions.appendChild(button(
-          CROP_META[cropId].emoji + ' ' + CROP_META[cropId].name,
-          {
-            plotId: plot.id,
-            cropId,
-            action: 'plant',
-            className: 'primary',
-            disabled: busy || seeds <= 0,
-            reason: seeds <= 0 ? '没有这种种子了' : ''
-          }
-        ))
-      }
-    } else if (plot.stage === 'mature') {
-      actions.appendChild(button('收获', {
-        plotId: plot.id,
-        action: 'harvest',
-        className: 'harvest',
-        disabled: busy
-      }))
-      actions.appendChild(button('施肥', {
-        plotId: plot.id,
-        action: 'fertilize',
-        disabled: busy || plot.fertilized === true || (Number(farm.dew) || 0) < FERTILIZE_COST,
-        reason: plot.fertilized === true
-          ? '已经施过肥了'
-          : '露水不够（需要 ' + FERTILIZE_COST + '）'
-      }))
-    } else {
-      actions.appendChild(button('浇水', {
-        plotId: plot.id,
-        action: 'water',
-        disabled: busy || plot.waterings >= 1 || (Number(farm.dew) || 0) < WATER_COST,
-        reason: plot.waterings >= 1
-          ? '这株已经浇过水了'
-          : '露水不够（需要 ' + WATER_COST + '）'
-      }))
-      actions.appendChild(button('施肥', {
-        plotId: plot.id,
-        action: 'fertilize',
-        disabled: busy || plot.fertilized === true || (Number(farm.dew) || 0) < FERTILIZE_COST,
-        reason: plot.fertilized === true
-          ? '已经施过肥了'
-          : '露水不够（需要 ' + FERTILIZE_COST + '）'
-      }))
-    }
-    card.appendChild(actions)
-    plotsEl.appendChild(card)
+  const cards = view.plotCards(farm, { dew: farm.dew, busy, selectedPlot })
+  plotsEl.setAttribute('aria-label', '地块，共 ' + cards.length + ' 块')
+  for (const card of cards) {
+    const built = view.createPlotCard(document, card)
+    plotsEl.appendChild(built.element)
+    if (built.countdown !== null) countdowns.set(card.plotId, built.countdown)
+    if (built.progress !== null) progressBars.set(card.plotId, built.progress)
   }
 }
 
+function stackChip (meta, count, kind, cropId) {
+  const chip = document.createElement('span')
+  chip.className = 'stack-chip' + (count <= 0 ? ' muted' : '')
+  chip.dataset.stackKind = kind
+  chip.dataset.crop = cropId
+  const emoji = document.createElement('span')
+  emoji.setAttribute('aria-hidden', 'true')
+  emoji.textContent = meta.emoji
+  const name = document.createElement('span')
+  name.textContent = meta.name
+  const value = document.createElement('b')
+  value.textContent = String(count)
+  chip.appendChild(emoji)
+  chip.appendChild(name)
+  chip.appendChild(value)
+  return chip
+}
+
+/** 常驻 footer：种子背包 / 收获仓库，跨页签都看得到；空库存也保留位置。 */
 function renderInventory () {
-  inventoryEl.textContent = ''
-  if (mode === 'visitor' && visit !== null) {
-    const row = (label, values) => {
-      const rowEl = document.createElement('div')
-      rowEl.className = 'row'
-      const labelEl = document.createElement('span')
-      labelEl.className = 'label'
-      labelEl.textContent = label
-      rowEl.appendChild(labelEl)
-      for (const [name, count] of values) {
-        const valueEl = document.createElement('span')
-        valueEl.className = 'value'
-        valueEl.textContent = count === '' ? name : name + ' ' + count
-        rowEl.appendChild(valueEl)
-      }
-      inventoryEl.appendChild(rowEl)
-    }
-    const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
-    row('访客', [['在「' + nickname + '」家', '']])
-    row('钱包', [['🪙 硬币', Number(farm?.coins) || 0], ['💧 露水', Number(farm?.dew) || 0]])
-    const steal = visitLimit('steal')
-    const help = visitLimit('help')
-    if (steal !== null || help !== null) {
-      row('次数', [
-        ['偷', steal === null ? '—' : (Number(steal.usedInVisit) || 0) + '/' + (Number(steal.perVisit) || 0)],
-        ['帮', help === null ? '—' : (Number(help.usedInVisit) || 0) + '/' + (Number(help.perVisit) || 0)]
-      ])
+  if (seedBagEl === null || cropWarehouseEl === null) return
+  seedBagEl.textContent = ''
+  cropWarehouseEl.textContent = ''
+  if (farm === null) {
+    for (const holder of [seedBagEl, cropWarehouseEl]) {
+      const chip = document.createElement('span')
+      chip.className = 'stack-chip muted'
+      chip.textContent = '等宿主…'
+      holder.appendChild(chip)
     }
     return
   }
-  if (farm === null) return
-  const row = (label, value) => {
-    const rowEl = document.createElement('div')
-    rowEl.className = 'row'
-    const labelEl = document.createElement('span')
-    labelEl.className = 'label'
-    labelEl.textContent = label
-    rowEl.appendChild(labelEl)
-    for (const [name, count] of value) {
-      const valueEl = document.createElement('span')
-      valueEl.className = 'value'
-      valueEl.textContent = name + ' ' + count
-      rowEl.appendChild(valueEl)
-    }
-    inventoryEl.appendChild(rowEl)
-  }
-  row('种子', CROP_IDS.map((cropId) => [CROP_META[cropId].name, Number(farm.seeds?.[cropId]) || 0]))
-  row('作物', CROP_IDS.map((cropId) => [CROP_META[cropId].name, Number(farm.crops?.[cropId]) || 0]))
-  row('钱包', [['🪙 硬币', Number(farm.coins) || 0], ['💧 露水', Number(farm.dew) || 0]])
-  if (farm.worker !== null && typeof farm.worker === 'object') {
-    row('雇工', [[String(farm.worker.nickname ?? '邻居'), '打工中']])
+  for (const cropId of CROP_IDS) {
+    const meta = CROP_META[cropId]
+    seedBagEl.appendChild(stackChip(meta, Number(farm.seeds?.[cropId]) || 0, 'seed', cropId))
+    cropWarehouseEl.appendChild(stackChip(meta, Number(farm.crops?.[cropId]) || 0, 'crop', cropId))
   }
 }
 
@@ -781,7 +691,6 @@ function renderMarket () {
   }
 }
 
-
 /** 合同剩余时间：窗口本地每秒递减（宿主只给那一刻的 remainingMs）。 */
 function contractRemainingText (contract) {
   const remaining = Math.max(0, Number(contract.remainingMs) || 0)
@@ -982,7 +891,7 @@ function submitHireListing () {
 
 /** 雇工页的倒计时只改文本：每 1 秒一次，合同归零时重画一次。 */
 function tickContracts () {
-  if (activeTab !== 'hire' || contracts === null) return false
+  if (contracts === null) return false
   let needsRender = false
   for (const [id, entry] of contractCountdowns) {
     entry.remaining = Math.max(0, entry.remaining - 1000)
@@ -996,60 +905,104 @@ function tickContracts () {
   return needsRender
 }
 
-function renderSubtitle () {
-  if (mode === 'visitor' && visit !== null) {
-    const nickname = typeof visit.nickname === 'string' && visit.nickname !== '' ? visit.nickname : '邻居'
-    const guard = Math.round((Number(visit.guard) || 0) * 100)
-    subtitleEl.textContent = '「' + nickname + '」家 · 守卫 ' + guard + '% · 🪙 ' +
-      (Number(farm?.coins) || 0) + ' · 💧 ' + (Number(farm?.dew) || 0)
+/** 播种弹窗：三种种子的库存、生长时长/产量；库存 0 禁用；不做随机买种。 */
+function renderPlantModal () {
+  if (plantModalEl === null) return
+  if (plantTarget === null || mode !== 'owner' || farm === null) {
+    plantModalEl.hidden = true
     return
   }
-  if (farm === null) {
-    subtitleEl.textContent = '正在等宿主把地块送过来…'
+  const index = farm.plots.findIndex((plot) => plot.id === plantTarget)
+  const plot = index >= 0 ? farm.plots[index] : null
+  if (plot === null || plot.stage !== 'empty') {
+    plantTarget = null
+    plantModalEl.hidden = true
     return
   }
-  const parts = [
-    '🪙 ' + (Number(farm.coins) || 0),
-    '💧 ' + (Number(farm.dew) || 0)
-  ]
-  if (selectedPlot !== null) parts.push('已选 ' + selectedPlot)
-  subtitleEl.textContent = parts.join(' · ')
+  plantModalEl.hidden = false
+  plantTitleEl.textContent = '播种 · ' + plotName(plot, index)
+  seedListEl.textContent = ''
+  for (const cropId of CROP_IDS) {
+    const meta = CROP_META[cropId]
+    const count = Number(farm.seeds?.[cropId]) || 0
+    const row = document.createElement('button')
+    row.type = 'button'
+    row.className = 'seed-row'
+    row.dataset.plotAction = 'plant'
+    row.dataset.plotId = plantTarget
+    row.dataset.cropId = cropId
+    row.disabled = busy || count <= 0
+    if (count <= 0) row.title = '没有这种种子了'
+    row.setAttribute('aria-label', meta.name + '，库存 ' + count)
+    const emoji = document.createElement('span')
+    emoji.className = 'seed-emoji'
+    emoji.setAttribute('aria-hidden', 'true')
+    emoji.textContent = meta.emoji
+    const info = document.createElement('span')
+    info.className = 'seed-info'
+    const name = document.createElement('strong')
+    name.textContent = meta.name
+    const detail = document.createElement('span')
+    detail.className = 'seed-meta'
+    detail.textContent = '生长 ' + view.formatGrowTime(meta.growMs) + ' · 收获 ' + meta.yield + ' 个'
+    info.appendChild(name)
+    info.appendChild(detail)
+    const stock = document.createElement('span')
+    stock.className = 'seed-stock'
+    stock.dataset.seedStock = cropId
+    stock.textContent = '×' + count
+    row.appendChild(emoji)
+    row.appendChild(info)
+    row.appendChild(stock)
+    seedListEl.appendChild(row)
+  }
+}
+
+function openPlantModal (plotId) {
+  if (mode !== 'owner' || farm === null) return
+  if (typeof plotId !== 'string' || plotId === '') return
+  const plot = farm.plots.find((candidate) => candidate.id === plotId)
+  if (plot === undefined || plot.stage !== 'empty') return
+  plantTarget = plotId
+  renderPlantModal()
+  if (plantModalEl.hidden === false) {
+    const first = seedListEl.querySelector('button:not(:disabled)')
+    if (first !== null) first.focus()
+    else if (plantCloseEl !== null) plantCloseEl.focus()
+  }
+}
+
+function closePlantModal () {
+  plantTarget = null
+  if (plantModalEl !== null) plantModalEl.hidden = true
+  if (seedListEl !== null) seedListEl.textContent = ''
+}
+
+/** 只重画农场页/常驻外壳：tick 让作物成熟时不能顺手重建雇工页（合同倒计时会跳回去）。 */
+function renderFarmSurface () {
+  renderHeader()
+  renderBatchBar()
+  renderPlots()
+  renderInventory()
+  renderCarried()
+  renderPlantModal()
 }
 
 function render () {
-  renderSubtitle()
-  renderPlots()
-  renderInventory()
+  renderFarmSurface()
   renderLog()
-  renderCarried()
-  renderMarket()
+  if (activeTab === 'market') renderMarket()
   if (activeTab === 'hire') renderHire()
 }
 
-function tick () {
-  if (activeTab === 'hire') {
-    tickContracts()
-    return
-  }
+/** 每秒本地推进：倒计时文本 + 进度条；成熟那一刻重画整页。 */
+function tickPlots () {
+  const plots = mode === 'visitor' && visit !== null && Array.isArray(visit.plots)
+    ? visit.plots
+    : (farm !== null && Array.isArray(farm.plots) ? farm.plots : null)
+  if (plots === null) return
   let needsRender = false
-  if (mode === 'visitor' && visit !== null && Array.isArray(visit.plots)) {
-    for (const plot of visit.plots) {
-      if (plot.stage !== 'growing') continue
-      plot.remainingMs = Math.max(0, Number(plot.remainingMs) - 1000)
-      if (plot.remainingMs === 0) {
-        plot.stage = 'mature'
-        plot.mature = true
-        needsRender = true
-        continue
-      }
-      const node = countdowns.get(plot.id)
-      if (node !== undefined) node.textContent = formatRemaining(plot.remainingMs)
-    }
-    if (needsRender) render()
-    return
-  }
-  if (farm === null) return
-  for (const plot of farm.plots) {
+  for (const plot of plots) {
     if (plot.stage !== 'growing') continue
     plot.remainingMs = Math.max(0, Number(plot.remainingMs) - 1000)
     if (plot.remainingMs === 0) {
@@ -1060,46 +1013,140 @@ function tick () {
     }
     const node = countdowns.get(plot.id)
     if (node !== undefined) node.textContent = formatRemaining(plot.remainingMs)
+    const fill = progressBars.get(plot.id)
+    if (fill !== undefined) fill.style.width = Math.round(view.progressOf(plot) * 100) + '%'
   }
-  if (needsRender) render()
+  if (needsRender) renderFarmSurface()
 }
 
-function submit (payload) {
-  const ready = farm !== null || (mode === 'visitor' && visit !== null && visit.state === 'ready')
-  if (busy || !ready || api === null || typeof api?.submit !== 'function') return
+function tick () {
+  if (activeTab === 'hire') tickContracts()
+  tickPlots()
+}
+
+/** 真正把一次申请交给主进程；批量队列在两条申请之间复用这条窄口。 */
+function dispatch (payload) {
   busy = true
-  hideToast()
   render()
   try {
     api.submit(payload)
   } catch {
     busy = false
+    batch = null
     showToast('窗口没有把这次操作交出去，再试一次。', 'error')
     render()
   }
+}
+
+/** 用户主动点的动作：busy / 批量进行中一律挡住。 */
+function submit (payload) {
+  const ready = farm !== null || (mode === 'visitor' && visit !== null && visit.state === 'ready')
+  if (busy || batch !== null || !ready || api === null || typeof api?.submit !== 'function') return
+  dispatch(payload)
+}
+
+/** 一键播种：第一个空地 + 第一种还有库存的种子，只发一条 farm-plant。 */
+function startBatchPlant () {
+  if (busy || batch !== null || farm === null) return
+  const target = view.batchPlantTarget(farm)
+  if (target.ok !== true) {
+    showToast(target.reason === 'no-seed' ? '种子袋空了，去交易所买种吧。' : '没有空地了，先收一块吧。', 'info')
+    return
+  }
+  submit({ action: 'farm-plant', plotId: target.plotId, cropId: target.cropId })
+}
+
+function sendNextHarvest () {
+  if (batch === null) return
+  const plotId = batch.queue.shift()
+  if (plotId === undefined) {
+    const done = batch.done
+    batch = null
+    busy = false
+    render()
+    showToast('一键收割完成：收了 ' + done + ' 块地。', 'reward')
+    return
+  }
+  batch.inFlight = true
+  dispatch({ action: 'farm-harvest', plotId })
+}
+
+/** 一键收割：按当前顺序把所有成熟地块排进队列，逐条等回执。 */
+function startBatchHarvest () {
+  if (busy || batch !== null || farm === null) return
+  const targets = view.batchHarvestTargets(farm)
+  if (targets.length === 0) {
+    showToast('没有成熟的地块，再等等吧。', 'info')
+    return
+  }
+  batch = { queue: targets, done: 0, total: targets.length, inFlight: false }
+  sendNextHarvest()
 }
 
 plotsEl.addEventListener('click', (event) => {
   const target = event.target
   if (!(target instanceof Element)) return
   const buttonEl = target.closest('button[data-plot-action]')
-  if (buttonEl === null || buttonEl.disabled) return
-  const plotId = buttonEl.dataset.plotId
-  const action = buttonEl.dataset.plotAction
-  if (typeof plotId !== 'string' || plotId === '') return
-  if (action === 'plant') {
-    submit({ action: 'farm-plant', plotId, cropId: buttonEl.dataset.cropId })
+  if (buttonEl !== null) {
+    if (buttonEl.disabled) return
+    const plotId = buttonEl.dataset.plotId
+    if (typeof plotId !== 'string' || plotId === '') return
+    const action = buttonEl.dataset.plotAction
+    if (action === 'plant') {
+      submit({ action: 'farm-plant', plotId, cropId: buttonEl.dataset.cropId })
+      return
+    }
+    if (action === 'harvest' || action === 'water' || action === 'fertilize') {
+      submit({ action: 'farm-' + action, plotId })
+      return
+    }
+    // 访客模式（ticket 43）：只发 plotId；visitId/requestId 由宿主生成并复用。
+    if (action === 'steal' || action === 'help') {
+      submit({ action: 'farm-' + action, plotId })
+    }
     return
   }
-  if (action === 'harvest' || action === 'water' || action === 'fertilize') {
-    submit({ action: 'farm-' + action, plotId })
-    return
-  }
-  // 访客模式（ticket 43）：只发 plotId；visitId/requestId 由宿主生成并复用。
-  if (action === 'steal' || action === 'help') {
-    submit({ action: 'farm-' + action, plotId })
-  }
+  const cardEl = target.closest('.plot-card[data-open-plant="true"]')
+  if (cardEl === null) return
+  if (busy || mode !== 'owner') return
+  openPlantModal(cardEl.dataset.plot)
 })
+
+plotsEl.addEventListener('keydown', (event) => {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const cardEl = target.closest('.plot-card[data-open-plant="true"]')
+  if (cardEl === null) return
+  event.preventDefault()
+  if (busy || mode !== 'owner') return
+  openPlantModal(cardEl.dataset.plot)
+})
+
+if (plantCloseEl !== null) plantCloseEl.addEventListener('click', closePlantModal)
+if (plantBackdropEl !== null) plantBackdropEl.addEventListener('click', closePlantModal)
+if (plantGoMarketEl !== null) {
+  plantGoMarketEl.addEventListener('click', () => {
+    closePlantModal()
+    selectTab('market')
+  })
+}
+
+if (seedListEl !== null) {
+  seedListEl.addEventListener('click', (event) => {
+    const target = event.target
+    if (!(target instanceof Element)) return
+    const buttonEl = target.closest('button[data-plot-action="plant"]')
+    if (buttonEl === null || buttonEl.disabled) return
+    const plotId = buttonEl.dataset.plotId
+    const cropId = buttonEl.dataset.cropId
+    closePlantModal()
+    submit({ action: 'farm-plant', plotId, cropId })
+  })
+}
+
+if (batchPlantEl !== null) batchPlantEl.addEventListener('click', startBatchPlant)
+if (batchHarvestEl !== null) batchHarvestEl.addEventListener('click', startBatchHarvest)
 
 function selectTab (name) {
   activeTab = name === 'market' ? 'market' : name === 'hire' ? 'hire' : name === 'log' ? 'log' : 'farm'
@@ -1110,8 +1157,11 @@ function selectTab (name) {
   }
   farmPageEl.hidden = activeTab !== 'farm'
   marketPageEl.hidden = activeTab !== 'market'
-  if (hirePageEl !== null) hirePageEl.hidden = activeTab !== 'hire'
-  if (logPageEl !== null) logPageEl.hidden = activeTab !== 'log'
+  hirePageEl.hidden = activeTab !== 'hire'
+  logPageEl.hidden = activeTab !== 'log'
+  if (activeTab !== 'farm') closePlantModal()
+  renderBatchBar()
+  if (activeTab === 'market') renderMarket()
   if (activeTab === 'hire') renderHire()
 }
 
@@ -1197,6 +1247,10 @@ closeButton.addEventListener('click', () => api?.close())
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return
   event.preventDefault()
+  if (plantTarget !== null) {
+    closePlantModal()
+    return
+  }
   api?.close()
 })
 
@@ -1210,23 +1264,43 @@ api?.onState((payload) => {
     ? payload.visit
     : null
   selectedPlot = typeof payload.plotId === 'string' && payload.plotId !== '' ? payload.plotId : null
-  busy = false
-  // 不在这里 hideToast：动作成功后宿主紧接着会推新状态，toast 不能被这次刷新抹掉。
+  if (mode !== 'owner') {
+    // 访客模式没有一键播种/收割，也没有播种弹窗；正在跑的批量队列立刻停。
+    batch = null
+    closePlantModal()
+  }
+  // 不在这里把 busy 复位：宿主会在 action-result 之前推一份新 farm-state，
+  // 这时动作还在飞，提前解锁会让用户点到一条会被主进程静默丢掉的动作。
   render()
 })
 
 api?.onResult((result) => {
+  const wasBatch = batch !== null && batch.inFlight === true
   busy = false
+  if (wasBatch) batch.inFlight = false
   if (result === null || typeof result !== 'object') {
+    if (batch !== null) batch = null
     render()
     return
   }
   if (result.ok === true) {
+    const notice = typeof result.notice === 'string' && result.notice.trim() !== ''
+      ? result.notice
+      : '完成了。'
+    if (wasBatch) {
+      batch.done += 1
+      render()
+      // 先 toast 这一条，再发下一条；批量收完时 sendNextHarvest 会追加一条汇总。
+      showToast(notice)
+      sendNextHarvest()
+      return
+    }
     render()
     // 成功不关窗：收完还要接着种。宿主紧接着会推新的 farm-state。
-    showToast(typeof result.notice === 'string' && result.notice.trim() !== '' ? result.notice : '完成了。')
+    showToast(notice)
     return
   }
+  if (batch !== null) batch = null
   render()
   const notice = typeof result.notice === 'string' && result.notice.trim() !== ''
     ? result.notice

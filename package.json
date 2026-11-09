@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "test": "node --test --test-concurrency=4 test/*.test.js",
-    "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --check desktop/farm.js && node --check desktop/farm-preload.js && node --test --test-concurrency=4 test/*.test.js",
+    "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --check desktop/farm-view.js && node --check desktop/farm.js && node --check desktop/farm-preload.js && node --test --test-concurrency=4 test/*.test.js",
     "install:profile": "node scripts/install.mjs",
     "uninstall:profile": "node scripts/uninstall.mjs",
     "stop-helper": "node scripts/stop-helper.mjs",

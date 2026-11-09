@@ -230,11 +230,12 @@
    * 农场（ticket 40）。下面的数字与 `src/farm-rules.js` / `src/farm.js` 同源，但这一层是
    * **普通 script**（渲染页 `<script>` 加载、主进程 require），不能 import 宿主的 ESM；
    * 所以按 `desktop/shared.js` 的老规矩再守一次边界，改的时候两边一起改：
-   *   - 4 块地，id 由宿主生成（p1–p4，与 `src/farm.js` 的 PLOT_IDS 一致）；
+   *   - 宿主现在发 4 块地（p1–p4，与 `src/farm.js` 的 PLOT_IDS 一致），但窗口/helper
+   *     边界不写死 4：上限留到 20，未来宿主多发几块，卡片和标题自动跟上（ticket 47）；
    *   - 三种作物，与 SPEC v5 的作物表一致；
    *   - 硬币/种子/作物/露水/合同/日志的硬上限与 SPEC v5「货币、仓库与限额」一致。
    */
-  const MAX_FARM_PLOTS = 4
+  const MAX_FARM_PLOTS = 20
   const CROP_IDS = ['tomato', 'carrot', 'pumpkin']
   const FARM_STAGES = ['empty', 'growing', 'mature']
   const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle']
@@ -270,7 +271,7 @@
   const MAX_CONTRACT_EARNED = HIRE_HOURS_MAX * HIRE_WAGE_MAX
   const CONTRACT_STATUSES = ['pending', 'active', 'ended', 'cancelled']
   const HIRE_REASONS = ['ready', 'off', 'visiting', 'working']
-  /** 地块 id 的形状：宿主只发 p1–p4，这里允许短标识符，大小写统一成小写。 */
+  /** 地块 id 的形状：宿主现在发 p1–p4；窗口按 pN 通用，未来 20 块不用改这里。 */
   const PLOT_ID_RE = /^[a-z0-9_-]{1,16}$/
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
@@ -950,7 +951,7 @@
   function normalizeFarmVisitPlot (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const id = normalizePlotId(raw.id)
-    if (id === null || !/^p[1-4]$/.test(id)) return null
+    if (id === null || !/^p\d{1,3}$/.test(id)) return null
     const crop = raw.crop === null || raw.crop === undefined ? null : normalizeCropId(raw.crop)
     if (raw.crop !== null && raw.crop !== undefined && crop === null) return null
     const stage = crop === null ? 'empty' : (raw.stage === 'mature' || raw.mature === true ? 'mature' : 'growing')
@@ -2211,6 +2212,15 @@
           ? raw.tab
           : 'farm'
         return { ok: true, command: { type, id, tab } }
+      }
+      case 'debug-farm-plant-open':
+      case 'debug-farm-plant-close':
+        // 冒烟用（ticket 47）：点空地卡打开播种弹窗 / 点 × 关上，走窗口的真实点击。
+        return { ok: true, command: { type, id } }
+      case 'debug-farm-batch': {
+        // 冒烟用（ticket 47）：点「一键播种 / 一键收割」，验批量队列真的发动作。
+        const kind = raw.kind === 'plant' ? 'plant' : 'harvest'
+        return { ok: true, command: { type, id, kind } }
       }
       case 'debug-farm-close': {
         // 冒烟用：像用户一样关窗（点 × 或按 Esc），验小窗自己的关闭路径。
