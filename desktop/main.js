@@ -2097,6 +2097,55 @@ function applyCommand (command) {
       void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
       return
     }
+    case 'debug-farm-plant-open': {
+      // 冒烟用：点一张空地卡，打开真实的播种底部弹窗（走窗口里的点击委托）。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const card = document.querySelector(".plot-card[data-open-plant=\\"true\\"]");' +
+        'if (!card) return false;' +
+        'card.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-plant-close': {
+      // 冒烟用：关掉播种弹窗（× 按钮），随后还能继续截别的页。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const button = document.getElementById("plant-modal-close");' +
+        'if (!button) return false;' +
+        'button.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-batch': {
+      // 冒烟用：点「一键播种 / 一键收割」，验证批量队列真的从窗口发出动作。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const target = command.kind === 'plant' ? 'batch-plant' : 'batch-harvest'
+      const script = '(() => {' +
+        'const button = document.getElementById(' + JSON.stringify(target) + ');' +
+        'if (!button || button.disabled) return false;' +
+        'button.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
     case 'debug-farm-close': {
       // 冒烟用：像用户一样关窗。`button` 点右上角 ×，`escape` 在窗口里按 Esc；
       // 两条都走 farm.js → preload → IPC 的真实路径，不是直接 destroy。

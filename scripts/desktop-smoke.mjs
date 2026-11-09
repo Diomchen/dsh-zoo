@@ -2318,7 +2318,7 @@ async function verifyFarmWindow () {
     { id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 12 * 60 * 1000 },
     { id: 'p2', crop: 'carrot', stage: 'mature', mature: true, remainingMs: 0 },
     { id: 'p3', crop: null, stage: 'empty', mature: false, remainingMs: 0 },
-    { id: 'p4', crop: 'pumpkin', stage: 'growing', mature: false, remainingMs: 60 * 60 * 1000 }
+    { id: 'p4', crop: 'pumpkin', stage: 'mature', mature: true, remainingMs: 0 }
   ]
   const fullFarm = {
     plots: farmPlots.map((plot) => ({ ...plot, waterings: 0, fertilized: false })),
@@ -2500,7 +2500,7 @@ async function verifyFarmWindow () {
   const afterBlur = await client.status()
   assert(afterBlur.farmOpen === true, '失焦不关农场小窗（输入法候选窗会触发 blur）')
 
-  const pngPath = join(OUT_DIR, 'farm.png')
+  const pngPath = join(OUT_DIR, '47-farm-window.png')
   const shotMark = client.mark()
   client.send({ type: 'shot', id: 'smoke-farm-shot', path: pngPath, window: 'farm' })
   const shotEvent = await client.waitFrom(
@@ -2520,10 +2520,64 @@ async function verifyFarmWindow () {
   assert(visible > image.width * image.height * 0.2,
     '小窗里画出了可见内容（' + visible + '/' + (image.width * image.height) + ' px）')
 
+  // 票 47：点空地卡打开播种底部弹窗（真实点击委托），截一张再关上。
+  client.send({ type: 'debug-farm-plant-open', id: 'smoke-farm-plant-open' })
+  await sleep(500)
+  const plantModalPath = join(OUT_DIR, '47-farm-plant-modal.png')
+  client.send({ type: 'shot', id: 'smoke-farm-plant-modal-shot', path: plantModalPath, window: 'farm' })
+  const plantModalShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-plant-modal-shot',
+    8000,
+    '播种弹窗截图'
+  )
+  assert(plantModalShot.width > 0 && existsSync(plantModalPath), '播种弹窗截图落盘：' + plantModalPath)
+  const plantModalImage = decodePng(readFileSync(plantModalPath))
+  let plantModalVisible = 0
+  for (let index = 3; index < plantModalImage.data.length; index += 4) {
+    if (plantModalImage.data[index] > 16) plantModalVisible += 1
+  }
+  assert(plantModalVisible > plantModalImage.width * plantModalImage.height * 0.2, '播种弹窗画出了可见内容')
+  client.send({ type: 'debug-farm-plant-close', id: 'smoke-farm-plant-close' })
+  await sleep(350)
+
+  // 票 47：一键收割真的从窗口发出顺序 farm-harvest；先收唯一成熟的 p2。
+  const batchPath = join(OUT_DIR, '47-farm-batch-harvest.png')
+  const batchMark = client.mark()
+  client.send({ type: 'debug-farm-batch', kind: 'harvest', id: 'smoke-farm-batch' })
+  const batchAction = await client.waitFrom(
+    batchMark,
+    (event) => event.type === 'action' && event.action === 'farm-harvest',
+    5000,
+    '一键收割提交 farm-harvest'
+  )
+  assert(batchAction.plotId === 'p2', '一键收割先收第一块成熟地（' + batchAction.plotId + '）')
+  client.send({ type: 'shot', id: 'smoke-farm-batch-shot', path: batchPath, window: 'farm' })
+  const batchShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-batch-shot',
+    8000,
+    '一键收割截图'
+  )
+  assert(batchShot.width > 0 && existsSync(batchPath), '一键收割截图落盘：' + batchPath)
+  // 第一块收完，窗口应自动发第二块（p4），证明「顺序、逐条、等回执」。
+  const secondBatchMark = client.mark()
+  client.send({ type: 'action-result', id: batchAction.id, ok: true, notice: '收了 3 个小番茄。' })
+  const secondBatchAction = await client.waitFrom(
+    secondBatchMark,
+    (event) => event.type === 'action' && event.action === 'farm-harvest',
+    5000,
+    '一键收割继续提交第二块'
+  )
+  assert(secondBatchAction.plotId === 'p4', '一键收割第二块是 p4（' + secondBatchAction.plotId + '）')
+  client.send({ type: 'action-result', id: secondBatchAction.id, ok: true, notice: '收了 3 个南瓜。' })
+  await sleep(2600)
+  assert((await client.status()).farmOpen === true, '一键收割完成后农场小窗还开着')
+
   // 票 45：交易所页 / 雇工页分别切页截图；页签由 debug-farm-tab 真点一次。
-  const marketPath = join(OUT_DIR, 'farm-market.png')
+  const marketPath = join(OUT_DIR, '47-farm-market.png')
   client.send({ type: 'debug-farm-tab', tab: 'market', id: 'smoke-farm-market-tab' })
-  await sleep(600)
+  await sleep(750)
   client.send({ type: 'shot', id: 'smoke-farm-market-shot', path: marketPath, window: 'farm' })
   const marketShot = await client.waitFrom(
     client.mark(),
@@ -2539,9 +2593,9 @@ async function verifyFarmWindow () {
   }
   assert(marketVisible > marketImage.width * marketImage.height * 0.2, '交易所页画出了可见内容')
 
-  const hirePath = join(OUT_DIR, 'farm-hire.png')
+  const hirePath = join(OUT_DIR, '47-farm-hire.png')
   client.send({ type: 'debug-farm-tab', tab: 'hire', id: 'smoke-farm-hire-tab' })
-  await sleep(600)
+  await sleep(750)
   client.send({ type: 'shot', id: 'smoke-farm-hire-shot', path: hirePath, window: 'farm' })
   const hireShot = await client.waitFrom(
     client.mark(),
@@ -2558,9 +2612,9 @@ async function verifyFarmWindow () {
   assert(hireVisible > hireImage.width * hireImage.height * 0.2, '雇工页画出了可见内容')
 
   // 票 45：记录页是第四页签，50 条日志自己滚动；驮包条也在这页可见。
-  const logPath = join(OUT_DIR, 'farm-log.png')
+  const logPath = join(OUT_DIR, '47-farm-log.png')
   client.send({ type: 'debug-farm-tab', tab: 'log', id: 'smoke-farm-log-tab' })
-  await sleep(600)
+  await sleep(750)
   client.send({ type: 'shot', id: 'smoke-farm-log-shot', path: logPath, window: 'farm' })
   const logShot = await client.waitFrom(
     client.mark(),
@@ -2693,7 +2747,7 @@ async function verifyFarmWindow () {
   })
   client.send({ type: 'debug-farm-tab', tab: 'farm', id: 'smoke-farm-visitor-tab' })
   await sleep(700)
-  const stealPath = join(OUT_DIR, 'farm-steal.png')
+  const stealPath = join(OUT_DIR, '47-farm-steal.png')
   client.send({ type: 'shot', id: 'smoke-farm-steal-shot', path: stealPath, window: 'farm' })
   const stealShot = await client.waitFrom(
     client.mark(),
@@ -2733,11 +2787,13 @@ async function verifyFarmWindow () {
       info('农场截图笔记：' + dest)
       return dest
     }
-    noteComposite(pngPath, '46-farm-window-composited.png')
-    noteComposite(marketPath, '46-farm-market-composited.png')
-    noteComposite(hirePath, '46-farm-hire-composited.png')
-    noteComposite(logPath, '46-farm-log-composited.png')
-    noteComposite(stealPath, '46-farm-steal-composited.png')
+    noteComposite(pngPath, '47-farm-window-composited.png')
+    noteComposite(plantModalPath, '47-farm-plant-modal-composited.png')
+    noteComposite(batchPath, '47-farm-batch-harvest-composited.png')
+    noteComposite(marketPath, '47-farm-market-composited.png')
+    noteComposite(hirePath, '47-farm-hire-composited.png')
+    noteComposite(logPath, '47-farm-log-composited.png')
+    noteComposite(stealPath, '47-farm-steal-composited.png')
     // 菜单截图是整张透明桌面：裁到菜单 + 宠物附近，能同时看到「农场」菜单项和没有地块条。
     const menuPanel = menuState.menu.panels[0]
     const menuPet = menuState.pets.find((pet) => pet.id === 'self') ?? selfPet
@@ -2770,7 +2826,18 @@ async function verifyFarmWindow () {
   client.send({ type: 'quit' })
   const exit = await Promise.race([client.exited, sleep(10000).then(() => null)])
   assert(exit !== null, '农场用例结束后 helper 自己退出')
-  return { pngPath, menuPath, marketPath, hirePath, stealPath, workerPath, notePaths }
+  return {
+    pngPath,
+    plantModalPath,
+    batchPath,
+    menuPath,
+    marketPath,
+    hirePath,
+    logPath,
+    stealPath,
+    workerPath,
+    notePaths
+  }
 }
 
 async function verifyManager () {
@@ -2968,8 +3035,11 @@ try {
   if (farmWindow !== null) {
     console.log('农场菜单截图：' + farmWindow.menuPath)
     console.log('农场小窗截图：' + farmWindow.pngPath)
+    console.log('播种弹窗截图：' + farmWindow.plantModalPath)
+    console.log('一键收割截图：' + farmWindow.batchPath)
     console.log('交易所页截图：' + farmWindow.marketPath)
     console.log('雇工页截图：' + farmWindow.hirePath)
+    console.log('记录页截图：' + farmWindow.logPath)
     console.log('访客偷/帮截图：' + farmWindow.stealPath)
     console.log('雇工宠物截图：' + farmWindow.workerPath)
     for (const note of farmWindow.notePaths) console.log('  农场截图笔记: ' + note)

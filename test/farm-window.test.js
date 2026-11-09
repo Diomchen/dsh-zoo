@@ -10,6 +10,7 @@
  *   4. 失败码（bad-plot）回一句人话；没有桌面层时 `farm-open` / `farm-close` 都是 `desktop-off`。
  */
 import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -20,6 +21,10 @@ import { FARM_FILE, FARM_VERSION, initialFarmState } from '../src/farm.js'
 import { MINUTE_MS } from '../src/farm-rules.js'
 import { MARKET_FILE, MARKET_VERSION } from '../src/market.js'
 import { createService } from '../src/service.js'
+
+const require = createRequire(import.meta.url)
+// ticket 47：渲染页和 Node 测试共用同一份纯视图模型（desktop/ 是 CommonJS）。
+const farmView = require('../desktop/farm-view.js')
 
 const NOON = new Date(2026, 4, 6, 12, 0, 0).getTime()
 
@@ -516,7 +521,7 @@ test('访客动作：shared 只放行 farm-steal/farm-help + plotId；helper 事
   }).ok, false)
 })
 
-test('farm-window：mode/visit 白名单只留布尔与四块地；坏地块/坏状态退化', () => {
+test('farm-window：mode/visit 白名单只留布尔与 pN 地块；坏地块/坏状态退化', () => {
   const other = '99999999-9999-4999-8999-999999999999'
   const command = shared.normalizeHostCommand({
     type: 'farm-window',
@@ -546,9 +551,11 @@ test('farm-window：mode/visit 白名单只留布尔与四块地；坏地块/坏
   assert.equal(command.command.visit.state, 'ready')
   assert.equal(command.command.visit.guard, 0.8)
   assert.equal(command.command.visit.nickname, '楼上的 柯基')
+  // ticket 47：地块 id 不再只认 p1–p4；p9 是合法 pN，未知作物（p3）才整块丢。
   assert.deepEqual(command.command.visit.plots, [
     { id: 'p1', crop: 'tomato', stage: 'mature', mature: true, remainingMs: 0, stolenByMe: true, helpedByMe: false },
-    { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: true }
+    { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: true },
+    { id: 'p9', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: false }
   ])
   const text = JSON.stringify(command.command)
   assert.equal(text.includes(other), false, '别的访客 deviceId 不进 helper')
@@ -684,4 +691,182 @@ test('×/Esc 关窗仍由小窗自己发 farm-close；宿主只负责打开/刷�
   const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
   assert.match(main, /ipcMain\.on\('dsh-zoo:farm-close'/)
   assert.match(main, /closeFarmWindow\('close'\)/)
+})
+
+// ---------------------------------------------------------------------------
+// ticket 47：治愈系卡片农场外壳、播种弹窗、批量动作与「未来 20 块地」
+// ---------------------------------------------------------------------------
+
+/** 只够 `farm-view.createPlotCard` 用的最小 document/element 替身（不跑整页脚本）。 */
+function fakeElement (tag) {
+  return {
+    tagName: String(tag).toUpperCase(),
+    className: '',
+    dataset: {},
+    style: {},
+    children: [],
+    attributes: {},
+    hidden: false,
+    disabled: false,
+    title: '',
+    textContent: '',
+    type: '',
+    appendChild (child) {
+      this.children.push(child)
+      return child
+    },
+    setAttribute (name, value) {
+      this.attributes[name] = String(value)
+    },
+    getAttribute (name) {
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null
+    }
+  }
+}
+
+function collectCards (node, out = []) {
+  const classes = typeof node.className === 'string' ? node.className.split(' ') : []
+  if (classes.includes('plot-card')) out.push(node)
+  for (const child of node.children) collectCards(child, out)
+  return out
+}
+
+test('20 块地的 farm-window：标题按 plots.length、渲染 20 张卡，不写死 4', async () => {
+  const plots = Array.from({ length: 20 }, (_, index) => ({
+    id: 'p' + (index + 1),
+    crop: index % 2 === 0 ? 'tomato' : null,
+    stage: index % 4 === 0 ? 'growing' : index % 4 === 1 ? 'mature' : 'empty',
+    remainingMs: index % 4 === 0 ? 12 * 60 * 1000 : 0,
+    waterings: 0,
+    fertilized: false
+  }))
+  // 走真实 helper 窄口：20 块地不能被 normalizeFarm 截成 4 块。
+  const payload = shared.normalizeFarmWindow({
+    open: true,
+    farm: {
+      plots,
+      seeds: { tomato: 2, carrot: 0, pumpkin: 0 },
+      crops: { tomato: 0, carrot: 0, pumpkin: 0 },
+      coins: 30,
+      dew: 5
+    }
+  })
+  assert.equal(payload.farm.plots.length, 20)
+  const stats = farmView.headerStats(payload.farm)
+  assert.equal(stats.total, 20)
+  assert.equal(stats.planted, 10)
+  assert.equal(stats.text, '10/20 已种植')
+  assert.match(stats.text, /20/)
+
+  const cards = farmView.plotCards(payload.farm, { dew: 5, busy: false })
+  assert.equal(cards.length, 20)
+  assert.equal(cards[0].label, '地块 1')
+  assert.equal(cards[19].label, '地块 20')
+  assert.equal(cards[19].plotId, 'p20')
+
+  const documentDouble = { createElement: (tag) => fakeElement(tag) }
+  const root = fakeElement('div')
+  for (const card of cards) root.appendChild(farmView.createPlotCard(documentDouble, card).element)
+  assert.equal(collectCards(root).length, 20, '20 块地必须建出 20 张 plot-card')
+
+  // 网格按数量自适应；标签/计数没有 PLOT_LABEL 这种写死 1–4 的表。
+  const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
+  assert.match(html, /grid-template-columns: repeat\(auto-fill, minmax\(150px, 1fr\)\)/)
+  assert.match(html, /<script src="farm-view\.js"><\/script>/)
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  assert.equal(renderer.includes('PLOT_LABEL'), false)
+  assert.match(renderer, /view\.headerStats\(/)
+  assert.match(renderer, /view\.plotCards\(farm/)
+})
+
+test('一键播种/一键收割：第一个空地 + 第一份有库存的种子；成熟地块按序入队', () => {
+  const farm = {
+    plots: [
+      { id: 'p1', stage: 'mature' },
+      { id: 'p2', stage: 'growing' },
+      { id: 'p3', stage: 'empty' },
+      { id: 'p5', stage: 'mature' },
+      { id: 'p6', stage: 'empty' }
+    ],
+    seeds: { tomato: 0, carrot: 2, pumpkin: 1 }
+  }
+  assert.deepEqual(farmView.batchPlantTarget(farm), { ok: true, plotId: 'p3', cropId: 'carrot' })
+  assert.deepEqual(farmView.batchHarvestTargets(farm), ['p1', 'p5'])
+  assert.deepEqual(
+    farmView.batchPlantTarget({ plots: [{ id: 'p1', stage: 'empty' }], seeds: {} }),
+    { ok: false, reason: 'no-seed' }
+  )
+  assert.deepEqual(
+    farmView.batchPlantTarget({ plots: [{ id: 'p1', stage: 'mature' }], seeds: { tomato: 1 } }),
+    { ok: false, reason: 'no-plot' }
+  )
+  assert.deepEqual(farmView.batchHarvestTargets({ plots: [{ id: 'p1', stage: 'growing' }] }), [])
+
+  // 进度条：生长中按 remainingMs 推，成熟恒为 100%，空地 0。
+  assert.equal(farmView.progressOf({ stage: 'growing', crop: 'tomato', remainingMs: 15 * MINUTE_MS }), 0.5)
+  assert.equal(farmView.progressOf({ stage: 'mature', crop: 'tomato', remainingMs: 0 }), 1)
+  assert.equal(farmView.progressOf({ stage: 'empty', crop: null, remainingMs: 0 }), 0)
+})
+
+test('播种弹窗与批量条：三份种子库存/生长/产量、0 禁用、去交易所；没有随机买种', async () => {
+  const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
+  assert.match(html, /id="plant-modal"/)
+  assert.match(html, /id="seed-list"/)
+  assert.match(html, /id="plant-modal-close"/)
+  assert.match(html, /id="plant-go-market"/)
+  assert.match(html, /id="batch-plant"/)
+  assert.match(html, /id="batch-harvest"/)
+  assert.match(html, /一键播种/)
+  assert.match(html, /一键收割/)
+  assert.match(html, /id="seed-bag"/)
+  assert.match(html, /id="crop-warehouse"/)
+  assert.match(html, /id="toasts"/)
+  assert.match(html, /我的农场/)
+
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  // 三份种子逐个建行；0 库存禁用；显示生长时长与产量；「去交易所」只是切页签。
+  assert.match(renderer, /for \(const cropId of CROP_IDS\)/)
+  assert.match(renderer, /row\.disabled = busy \|\| count <= 0/)
+  assert.match(renderer, /view\.formatGrowTime\(meta\.growMs\)/)
+  assert.match(renderer, /meta\.yield/)
+  assert.match(renderer, /selectTab\('market'\)/)
+  assert.equal(renderer.includes('Math.random'), false, '不做随机买种')
+  assert.equal(renderer.includes('buyRandomSeed'), false)
+  // 动作名与窄口不变：种/收是字面量，浇/施肥走同一条 `farm-` 前缀。
+  for (const action of ['farm-plant', 'farm-harvest']) {
+    assert.match(renderer, new RegExp(action))
+  }
+  assert.match(renderer, /action === 'harvest' \|\| action === 'water' \|\| action === 'fertilize'/)
+  assert.match(renderer, /action: 'farm-' \+ action/)
+  // 批量 guard：busy / batch / 顺序等回执。
+  assert.match(renderer, /batch !== null/)
+  assert.match(renderer, /sendNextHarvest/)
+  assert.match(renderer, /batch\.queue\.shift\(\)/)
+})
+
+test('新外壳与配色：header/tabs/可滚动页/footer/toast/系统字体，没有远程资源', async () => {
+  const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
+  for (const token of ['id="farm-title"', 'id="planted-count"', 'id="coin-value"', 'id="dew-value"', 'id="close"']) {
+    assert.ok(html.includes(token), '新外壳应该有 ' + token)
+  }
+  assert.equal((html.match(/data-tab="/g) ?? []).length, 4)
+  assert.match(html, /data-tab="farm"/)
+  assert.match(html, /data-tab="market"/)
+  assert.match(html, /data-tab="hire"/)
+  assert.match(html, /data-tab="log"/)
+  assert.match(html, /#faf8f5/i)
+  assert.match(html, /--emerald:/)
+  assert.match(html, /--amber:/)
+  assert.match(html, /--sky:/)
+  assert.match(html, /border-radius: 22px/)
+  assert.match(html, /@keyframes mature-bounce/)
+  assert.match(html, /::-webkit-scrollbar-thumb/)
+  assert.equal(html.includes('https://'), false, '不加载远程资源')
+  assert.equal(html.includes('fonts.googleapis'), false)
+  assert.equal(html.includes('cdn.tailwindcss'), false)
+  assert.equal(html.includes('lucide'), false)
+  // 窗宽仍是 420×560，外壳靠 flex + 滚动适配，不改窗口尺寸。
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  assert.match(main, /const FARM_WIDTH = 420/)
+  assert.match(main, /const FARM_HEIGHT = 560/)
 })

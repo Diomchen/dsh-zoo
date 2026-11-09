@@ -2161,6 +2161,11 @@ test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status �
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'nope' }).command.tab, 'farm')
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-close', via: 'escape' }).command.via, 'escape')
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-close', via: 'nope' }).command.via, 'button')
+  // ticket 47：播种弹窗与一键收割的冒烟命令也只走白名单。
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-plant-open' }).command.type, 'debug-farm-plant-open')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-plant-close' }).command.type, 'debug-farm-plant-close')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-batch', kind: 'plant' }).command.kind, 'plant')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-batch', kind: 'nope' }).command.kind, 'harvest')
 
   // 普通运行的 helper 连白名单都进不来：debug 命令只在显式 --dsh-zoo-debug 下可解析。
   const off = { debug: false }

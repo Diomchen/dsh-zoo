@@ -105,6 +105,9 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-gift-remove` | — | 调试/冒烟：点「带派」小窗背包列表里第一个可撤的「撤掉」 |
 | `debug-farm-submit` | `action`, `plotId?`, `cropId?`, `qty?`, `deviceId?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 调试/冒烟：在农场小窗里提交一次动作，走和用户点击相同的 preload → IPC 窄口 |
 | `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'\|'log'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
+| `debug-farm-plant-open` | — | 调试/冒烟：点第一张空地卡，打开真实的播种底部弹窗 |
+| `debug-farm-plant-close` | — | 调试/冒烟：点播种弹窗的 × 关上 |
+| `debug-farm-batch` | `kind:'plant'\|'harvest'` | 调试/冒烟：点「一键播种 / 一键收割」，验批量队列真的发动作 |
 | `debug-farm-close` | `via:'button'\|'escape'` | 调试/冒烟：像用户一样点 × 或按 Esc 关农场小窗（走真实 IPC，不直接 destroy） |
 
 ## 右键菜单（ticket 22）
@@ -333,21 +336,38 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
 - 只有这扇窗自己的 `webContents` 能发 `dsh-zoo:gift-*`（`isGiftSender`），与改名窗同一个模型。
 
-## 农场小窗（ticket 40 / 43 / 44 / 46）
+## 农场小窗（ticket 40 / 43 / 44 / 46 / 47）
 
 农场小窗和改名/带派同一种模型：**宿主算数据，helper 只画和收输入**。窗口是 `file://`
 页面，没有 Node、没有网络、读不到 `/state`；地块、种子、作物、交易所、合同和访客快照
 全部随 `farm-window` 命令下发，成功/失败走 `action-result`，窗口不自动关。
 
+- **新外壳（ticket 47）**：奶白 `#FAF8F5` 底 + 祖母绿/琥珀/天空蓝，16–24px 圆角卡片、
+  软阴影、胶囊、进度条、成熟轻微弹跳、细滚动条；系统字体 + emoji/内联 SVG，CSP 仍然
+  是 `default-src 'none'`，不加载任何 CDN/远程字体/图标库。窗口仍是 420×560
+  （`FARM_WIDTH` / `FARM_HEIGHT` 未改），内容区自己滚动。
+  header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / ×」，下面是 4 段页签、农场页专属的
+  「一键播种 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
+- **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
+  浇水/施肥；成熟轻微弹跳并给收获/施肥。动作 id 仍是 `farm-plant` / `farm-harvest` /
+  `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。
+- **播种弹窗**：三种种子的库存、生长时长、产量；库存 0 禁用；「去交易所买种」只切页签，
+  没有随机买种。批量：一键播种 = 第一个空地 + 第一份有库存的种子；一键收割 = 所有成熟
+  地块按顺序逐条发 `farm-harvest`，busy 守卫 + 逐条 toast，不新增宿主动作。
+- **不写死 4 块地**：`desktop/farm-view.js` 是纯视图模型（渲染页和 Node 测试共用），
+  卡片、标题计数和 `plot.id` 标签都按 `farm.plots.length` / id 推；CSS 用
+  `repeat(auto-fill, minmax(150px, 1fr))`。helper 的 `MAX_FARM_PLOTS` 留到 20，当前宿主
+  仍只发 4 块；传 20 块的 `farm-window` 会画 20 张卡、标题显示 20（有测试）。
 - 打开：右键菜单「农场」→ 渲染端只发一个 `farm-open`（不带 `plotId`）；宿主发
   `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
   小窗开着时再点「农场」= 宿主发 `farm-window { open:false, close:true }` 关窗；
   宿主按 helper 回报的 `farm-window-state` / `desktop.status().farmOpen` 决定开还是关。
   桌面没有地块条，也没有 `controls.farm`（ticket 46）。
   正出门串门时同一扇窗进入访客模式，先推 `visit.state:'loading'`，拿到主人快照后变
-  `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。
-- 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 50 条；窗口顶部有一条
-  「驮包」只显示偷来的作物与在途工资（宿主算好下发，窗口不记账）。
+  `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。访客保留 banner、
+  偷/帮卡与次数/守卫提示，隐藏一键播种/收割和播种弹窗。
+- 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 50 条；窗口顶部的「驮包」
+  只显示偷来的作物与在途工资（宿主算好下发，窗口不记账）。
 - 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
   （只带 `plotId`，种地再带 `cropId`）；交易所 `farm-buy-seed` / `farm-sell-crop`
   （只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
@@ -362,8 +382,11 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   blur，和改名/带派同一条取舍）。×/Esc 走窗口自己的 `dsh-zoo:farm-close` IPC，
   宿主只负责打开/刷新/显式 `close:true`。
 - 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会验
-  右键「农场」开窗、再点关闭、×/Esc 关闭和雇工仍带「打工」角标；并截农场菜单、农场页、
-  交易所页、雇工页、记录页和访客偷/帮视图。`debug-farm-tab` / `debug-farm-close` 只用于这一步。
+  右键「农场」开窗、再点关闭、×/Esc 关闭和雇工仍带「打工」角标；并截农场菜单、
+  农场页、播种弹窗、一键收割、交易所页、雇工页、记录页和访客偷/帮视图，
+  小窗截图笔记为 `.scratch/dsh-zoo/notes/47-*.png`。
+  `debug-farm-tab` / `debug-farm-plant-open` / `debug-farm-plant-close` /
+  `debug-farm-batch` / `debug-farm-close` 只用于这一步。
 
 ## 多显示器 / 分辨率
 
