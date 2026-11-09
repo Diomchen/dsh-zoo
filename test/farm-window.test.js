@@ -1,11 +1,13 @@
 /**
- * 票 40：农场小窗 + 桌面地块的宿主侧集成。
+ * 票 40/46：农场小窗的宿主侧集成（桌面不再有地块条）。
  *
- * 覆盖三件事，全部走真实的 service / 磁盘（桌面层用只记录命令的替身）：
+ * 覆盖：
  *   1. `farm-open` → `desktop.farmWindow({open:true, farm, plotId})`，窗口拿到完整视图
- *      （阶段/remainingMs/种子/作物/日志），而场景里的 `controls.farm` 只有摘要；
- *   2. 窗口提交（helper 事件）`farm-plant` → 39 的 store → action-result；日志/地块/仓库跟着变；
- *   3. 失败码（bad-plot）回一句人话；没有桌面层时 `farm-open` 是 `desktop-off`。
+ *      （阶段/remainingMs/种子/作物/日志）；场景里没有 `controls.farm`；
+ *   2. 再点一次「农场」/ `farm-close` → `farm-window {open:false, close:true}`；×/Esc 关窗后
+ *      再点「农场」会重新打开；
+ *   3. 窗口提交（helper 事件）`farm-plant` → 39 的 store → action-result；日志/地块/仓库跟着变；
+ *   4. 失败码（bad-plot）回一句人话；没有桌面层时 `farm-open` / `farm-close` 都是 `desktop-off`。
  */
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -14,7 +16,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { FARM_FILE, FARM_VERSION, PLOT_IDS, initialFarmState } from '../src/farm.js'
+import { FARM_FILE, FARM_VERSION, initialFarmState } from '../src/farm.js'
 import { MINUTE_MS } from '../src/farm-rules.js'
 import { MARKET_FILE, MARKET_VERSION } from '../src/market.js'
 import { createService } from '../src/service.js'
@@ -103,6 +105,7 @@ function callAction (service, body) {
 function desktopDouble () {
   const calls = { scenes: [], windows: [], results: [] }
   let onEvent = null
+  let farmOpen = false
   return {
     calls,
     factory (options) {
@@ -111,8 +114,12 @@ function desktopDouble () {
         start () { return { ok: true, pid: 4242 } },
         update (scene) { calls.scenes.push(scene); return true },
         resync (scene) { calls.scenes.push(scene); return true },
+        // ticket 46：宿主读这个数决定右键「农场」是开还是关。
+        status () { return { farmOpen } },
         farmWindow (payload) {
           calls.windows.push(payload)
+          if (payload.close === true) farmOpen = false
+          else if (payload.open === true) farmOpen = true
           return true
         },
         bringWindow () { return true },
@@ -127,11 +134,17 @@ function desktopDouble () {
     },
     emit (event) {
       onEvent?.(event)
-    }
+    },
+    /** 模拟用户在窗口里点 × / 按 Esc：helper 关窗，并把真实状态回报宿主。 */
+    userCloseFarm () {
+      farmOpen = false
+      onEvent?.({ type: 'farm-window-state', open: false })
+    },
+    isFarmOpen () { return farmOpen }
   }
 }
 
-test('farm-open：窗口拿完整农场（含 remainingMs/种子/日志），场景只拿摘要', async (t) => {
+test('farm-open：窗口拿完整农场；场景没有 controls.farm；再点一次关闭', async (t) => {
   const dir = await tempDir(t)
   const clock = { value: NOON }
   const desktop = desktopDouble()
@@ -146,13 +159,10 @@ test('farm-open：窗口拿完整农场（含 remainingMs/种子/日志），场
   desktop.ready()
   await waitFor(() => desktop.calls.scenes.length > 0)
 
-  // 场景里的摘要：4 块空地 + 30 硬币；没有 seeds/crops/log（完整视图不进场景）。
+  // ticket 46：桌面没有农场摘要/地块条；宠物场景里只有 room 的控件。
   const scene = desktop.calls.scenes.at(-1)
-  assert.equal(scene.controls.farm.plots.length, PLOT_IDS.length)
-  assert.deepEqual(scene.controls.farm.plots[0], { id: 'p1', crop: null, stage: 'empty', mature: false })
-  assert.equal(scene.controls.farm.coins, 30)
-  assert.equal('seeds' in scene.controls.farm, false)
-  assert.equal('log' in scene.controls.farm, false)
+  assert.equal('farm' in scene.controls, false)
+  assert.equal('farm' in shared.emptyControls(), false)
 
   // `/state.farm` 仍是 39 的全量形状（原始地块 + guard/hire/log），不是窗口形状。
   const state = await call(service, '/dsh-zoo/state')
@@ -162,7 +172,7 @@ test('farm-open：窗口拿完整农场（含 remainingMs/种子/日志），场
   assert.equal('stage' in state.body.farm.plots[0], false)
   assert.equal(state.body.farm.guard, 0.3)
 
-  // 菜单/地块点击 → 宿主发 farm-window，窗口拿到完整视图 + 预选地块。
+  // 菜单点击 → 宿主发 farm-window，窗口拿到完整视图 + 预选地块。
   const opened = await callAction(service, { action: 'farm-open', plotId: 'p2' })
   assert.equal(opened.status, 200)
   assert.equal(opened.body.ok, true)
@@ -187,6 +197,33 @@ test('farm-open：窗口拿完整农场（含 remainingMs/种子/日志），场
   assert.equal(window.farm.dew, 0)
   assert.deepEqual(window.farm.log, [])
 
+  // ticket 46：再点一次「农场」= 关窗；宿主按 helper 报的真实窗口状态决定。
+  const toggled = await callAction(service, { action: 'farm-open' })
+  assert.equal(toggled.status, 200)
+  assert.equal(toggled.body.ok, true)
+  assert.equal(toggled.body.action, 'farm-open')
+  assert.equal(toggled.body.window, 'closed')
+  const closeCommand = desktop.calls.windows.at(-1)
+  assert.equal(closeCommand.open, false)
+  assert.equal(closeCommand.close, true)
+  assert.equal(desktop.isFarmOpen(), false)
+
+  // HTTP/脚本的 `farm-close` 走同一个出口；已经关着也幂等成功。
+  const explicit = await callAction(service, { action: 'farm-close' })
+  assert.equal(explicit.status, 200)
+  assert.equal(explicit.body.ok, true)
+  assert.equal(explicit.body.action, 'farm-close')
+  assert.equal(explicit.body.window, 'closed')
+  assert.equal(desktop.calls.windows.at(-1).close, true)
+
+  // 用户点 ×/Esc 关窗（helper 回报 open:false）之后，再点「农场」必须重新打开。
+  desktop.userCloseFarm()
+  const reopened = await callAction(service, { action: 'farm-open' })
+  assert.equal(reopened.status, 200)
+  assert.equal(reopened.body.window, 'opened')
+  assert.equal(desktop.calls.windows.at(-1).open, true)
+  assert.equal(desktop.isFarmOpen(), true)
+
   // 没有桌面层：明确失败 + 人话，不静默。
   const offline = makeService(t, {
     dataDir: await tempDir(t),
@@ -199,9 +236,12 @@ test('farm-open：窗口拿完整农场（含 remainingMs/种子/日志），场
   assert.equal(noDesktop.status, 409)
   assert.equal(noDesktop.body.error, 'desktop-off')
   assert.match(noDesktop.body.notice, /桌面层/)
+  const noDesktopClose = await callAction(offline, { action: 'farm-close' })
+  assert.equal(noDesktopClose.status, 409)
+  assert.equal(noDesktopClose.body.error, 'desktop-off')
 })
 
-test('窗口动作：farm-plant → 39 的 store → action-result；下一帧 controls.farm 跟着变', async (t) => {
+test('窗口动作：farm-plant → 39 的 store → action-result；开着的窗口自动刷新', async (t) => {
   const dir = await tempDir(t)
   const clock = { value: NOON }
   const desktop = desktopDouble()
@@ -223,17 +263,12 @@ test('窗口动作：farm-plant → 39 的 store → action-result；下一帧 c
     id: 'farm-1',
     result: { ok: true, notice: null, error: null }
   })
-  await waitFor(() => {
-    const farm = desktop.calls.scenes.at(-1).controls.farm
-    return farm.plots[0].crop === 'tomato' && farm.plots[0].stage === 'growing'
-  })
-  const planted = desktop.calls.scenes.at(-1).controls.farm
-  assert.equal(planted.plots[0].mature, false)
   // 种子扣了 1，作物还没收。
   const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.body.farm.seeds.tomato, 1)
+  assert.equal(state.body.farm.plots[0].crop, 'tomato')
 
-  // 农场窗口的完整视图也应该是新的一份（重新打开时宿主现算）。
+  // 农场窗口的完整视图是新的一份（重新打开时宿主现算）。
   const reopened = await callAction(service, { action: 'farm-open' })
   assert.equal(reopened.body.ok, true)
   const farm = desktop.calls.windows.at(-1).farm
@@ -251,6 +286,12 @@ test('窗口动作：farm-plant → 39 的 store → action-result；下一帧 c
   assert.equal(harvested.body.farm.crops.tomato, 3)
   assert.equal(harvested.body.farm.plots[0].crop, null)
   assert.equal(harvested.body.farm.log[0].kind, 'harvest')
+  // 开着的窗口不能停在旧地块：refreshFarmWindow 推一份新数据（open:false，不关窗）。
+  const refreshed = desktop.calls.windows.at(-1)
+  assert.equal(refreshed.open, false)
+  assert.equal('close' in refreshed, false)
+  assert.equal(refreshed.farm.crops.tomato, 3)
+  assert.equal(refreshed.farm.plots[0].crop, null)
 
   // 空地再浇一次：39 的 bad-plot 必须变成一句人话（不是 code）。
   desktop.emit({ type: 'action', id: 'farm-3', action: 'farm-water', plotId: 'p1' })
@@ -325,7 +366,7 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   assert.equal(normalizedWindow.market.index.tomato.price, 10)
   assert.equal('alien' in normalizedWindow.market.index, false)
 
-  // 开窗：完整视图里带交易所，且交易所不混进场景的 controls.farm。
+  // 开窗：完整视图里带交易所；桌面场景里没有农场（ticket 46）。
   const opened = await callAction(service, { action: 'farm-open' })
   assert.equal(opened.body.ok, true)
   const window = desktop.calls.windows.at(-1)
@@ -343,7 +384,7 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
     carrot: { price: 6, at: NOON, samples: 0, stale: false },
     pumpkin: { price: 30, at: NOON, samples: 0, stale: false }
   })
-  assert.equal('market' in desktop.calls.scenes.at(-1).controls.farm, false)
+  assert.equal('farm' in desktop.calls.scenes.at(-1).controls, false)
 
   // 窗口提交买 2 颗番茄种子：宿主回人话，并推一份新的完整窗口状态（open:false）。
   desktop.emit({ type: 'action', id: 'market-1', action: 'farm-buy-seed', cropId: 'tomato', qty: 2 })
@@ -431,8 +472,10 @@ test('交易所页的局域网指数：新鲜时混进 bid，过期后标 stale 
   assert.equal(fresh.prices.tomato.bid, 8)
 
   // 2 分钟后：指数不再参与 bid，窗口拿到 stale:true 画灰。
+  // 重新开窗拿一份新数据（ticket 46：再点一次「农场」是关窗，不会刷新）。
   clock.value += 2 * MINUTE_MS + 1
-  assert.equal((await callAction(service, { action: 'farm-open' })).body.ok, true)
+  assert.equal((await callAction(service, { action: 'farm-close' })).body.ok, true)
+  assert.equal((await callAction(service, { action: 'farm-open' })).body.window, 'opened')
   const stale = desktop.calls.windows.at(-1).market
   assert.equal(stale.index.tomato.stale, true)
   assert.equal(stale.prices.tomato.bid, 9, '本机 10 → bid 9')
@@ -532,7 +575,7 @@ test('farm-window：mode/visit 白名单只留布尔与四块地；坏地块/坏
   assert.deepEqual(broken.visit.plots, [])
 })
 
-test('主人日志的「谁」：full 视图保留 who（≤32 码点），场景摘要仍不带日志', () => {
+test('主人日志的「谁」：完整视图保留 who（≤32 码点），且不带 owner 摘要字段', () => {
   const normalized = shared.normalizeFarm({
     plots: [],
     coins: 30,
@@ -550,7 +593,7 @@ test('主人日志的「谁」：full 视图保留 who（≤32 码点），场�
       { kind: 'crop', crop: 'alien', qty: 1 },
       { kind: 'wage', amount: -1 }
     ]
-  }, { full: true })
+  })
   assert.equal(normalized.log[0].who, '阿蟹')
   assert.equal(Array.from(normalized.log[1].who).length, 32)
   assert.equal('who' in normalized.log[2], false)
@@ -560,10 +603,8 @@ test('主人日志的「谁」：full 视图保留 who（≤32 码点），场�
     { kind: 'crop', crop: 'tomato', qty: 2, at: NOON, until: NOON + 1000 },
     { kind: 'wage', amount: 12, contractId: '11111111-1111-4111-8111-111111111111', at: NOON }
   ], '坏驮包条目只丢自己')
-  assert.equal('log' in shared.normalizeFarmSummary({
-    plots: [], coins: 30, dew: 1, log: [{ at: NOON, kind: 'steal', qty: 1, who: '阿蟹' }]
-  }), false)
-  assert.equal('carried' in shared.normalizeFarmSummary({ plots: [], coins: 30, carried: [] }), false)
+  // ticket 46：`owner.presence` 只服务已删的地块条，不再出现在任何农场视图里。
+  assert.equal('owner' in normalized, false)
 })
 
 test('访客窗口的渲染端/预加载/主进程都走同一条动作线（静态窄口检查）', async () => {
@@ -630,4 +671,17 @@ test('记录页：窗口拿 50 条、/state 只给 20 条；hire/settle 日志�
   assert.match(renderer, /slice\(0, 50\)/)
   assert.match(renderer, /page-log/)
   assert.match(renderer, /carried/)
+})
+
+test('×/Esc 关窗仍由小窗自己发 farm-close；宿主只负责打开/刷新', async () => {
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  // × 按钮与 Esc 都只调用桥的 close()，不自己改数据、不自己销毁窗口。
+  assert.match(renderer, /closeButton\.addEventListener\('click', \(\) => api\?\.close\(\)\)/)
+  assert.match(renderer, /event\.key !== 'Escape'/)
+  assert.match(renderer, /api\?\.close\(\)/)
+  const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
+  assert.match(preload, /ipcRenderer\.send\('dsh-zoo:farm-close'\)/)
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  assert.match(main, /ipcMain\.on\('dsh-zoo:farm-close'/)
+  assert.match(main, /closeFarmWindow\('close'\)/)
 })

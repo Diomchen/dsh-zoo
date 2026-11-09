@@ -54,3 +54,6 @@
 > 留给 44：地块条在宠物出门/打工时的文案目前是反的（away 显示「看家中」），
 > 44 用 `owner.presence`（home/visiting/working）一并修。
 > 提交：`5f26919`。
+>
+> ticket 46 收掉了桌面地块条与 `controls.farm`：农场只在右键「农场」唤醒的小窗里；
+> 雇工宠物保留在桌面。

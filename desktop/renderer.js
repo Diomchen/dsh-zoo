@@ -97,8 +97,6 @@
     // ticket 23：giftId → { el, deviceId, giftId, status, titleEl, bodyEl, statusEl, signature }
     gifts: new Map(),
     recall: null, // { el }
-    // ticket 40：宠物旁的地块条；null = 没有农场（老宿主/没有桌面层），不是「4 块空地」。
-    farm: null, // { el, plotsEl, plots: Map(plotId → { el, badge, icon, ... }), signature }
     notice: null, // { text, at, el, timer }
     hiddenPromptKey: null,
     hoverSuppressed: false,
@@ -307,17 +305,6 @@
       for (const button of entry.el.querySelectorAll('[data-lp-action]')) {
         add('ui:gift-btn:' + button.dataset.lpAction + ':' + entry.giftId, button)
       }
-    }
-
-    // 桌面地块条（ticket 40）：容器 → 4 块地 → 「农场」按钮。按钮最后，倒序扫描时优先命中。
-    // 不桥接宠物与地块条：并集会挖掉一大片本该穿透的桌面（和菜单只桥接一级面板同一个理由）。
-    const farmRect = ui.farm === null ? null : rectOf('ui:farm-strip', ui.farm.el)
-    if (farmRect !== null) {
-      rects.push(farmRect)
-      for (const [plotId, entry] of ui.farm.plots) {
-        add('ui:farm:' + plotId, entry.el)
-      }
-      add('ui:farm-open', ui.farm.openButton)
     }
 
     const streetRect = ui.street === null ? null : rectOf('ui:street', ui.street.el)
@@ -690,8 +677,6 @@
     if (typeof options.deviceId === 'string' && options.deviceId !== '') button.dataset.lpDevice = options.deviceId
     // 礼物按钮必须带 giftId：矩形 id 与 action 都要能落回具体那一张卡（两张卡不撞名）。
     if (typeof options.giftId === 'string' && options.giftId !== '') button.dataset.lpGift = options.giftId
-    // 农场地块（ticket 40）：同一个 `farm-open` 靠 plotId 区分点的是哪一块地。
-    if (typeof options.plotId === 'string' && options.plotId !== '') button.dataset.lpPlot = options.plotId
     if (options.disabled === true) {
       button.dataset.disabled = 'true'
       button.dataset.reason = typeof options.reason === 'string' ? options.reason : ''
@@ -1095,7 +1080,7 @@
       return
     }
     // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
-    // 「农场」（ticket 40）：同样是空申请，开窗与农场数据全在宿主（窗口读不到 /state）。
+    // 「农场」（ticket 40/46）：同样是空申请；开/关由宿主按小窗的真实状态切换。
     // 扫描外观（ticket 37）：和「重载配置」一样只是一次申请，扫与写全在宿主那边。
     if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins' || id === 'farm') {
       requestAction(id === 'farm' ? 'farm-open' : id)
@@ -1787,166 +1772,6 @@
   }
 
   // -------------------------------------------------------------------------
-  // 桌面地块条（ticket 40）
-  //
-  // 场景里的 `controls.farm` 只是摘要（哪块地/什么阶段/熟没熟/硬币/露水）；
-  // 完整农场（种子/作物/日志/剩余时间）在宿主那扇 `farm-window` 里，渲染端不拿。
-  // -------------------------------------------------------------------------
-
-  const FARM_CROP_META = {
-    tomato: { name: '小番茄', emoji: '🍅' },
-    carrot: { name: '胡萝卜', emoji: '🥕' },
-    pumpkin: { name: '南瓜', emoji: '🎃' }
-  }
-
-  function farmPlotTitle (plot) {
-    const index = Number(String(plot.id).replace(/^p/, ''))
-    const label = Number.isFinite(index) && index > 0 ? '地块 ' + index : '地块'
-    const crop = FARM_CROP_META[plot.crop]
-    if (crop === undefined) return label + '：空地'
-    if (plot.mature === true) return label + '：' + crop.name + '熟了'
-    return label + '：' + crop.name + '生长中'
-  }
-
-  function hideFarm () {
-    if (ui.farm === null) return
-    const el = ui.farm.el
-    ui.farm = null
-    try {
-      el.remove()
-    } catch {
-      // 已经没了
-    }
-    reportOverlayRects(true)
-  }
-
-  function buildFarmStrip () {
-    const el = document.createElement('div')
-    el.className = 'lp-farm-strip'
-    el.setAttribute('role', 'group')
-    el.setAttribute('aria-label', '农场地块')
-    const plotsEl = document.createElement('div')
-    plotsEl.className = 'lp-farm-plots'
-    el.appendChild(plotsEl)
-    const statusEl = document.createElement('span')
-    statusEl.className = 'lp-farm-status'
-    statusEl.hidden = true
-    el.appendChild(statusEl)
-    // 「农场」按钮：没有 plotId，点了开窗但不预选地块。
-    const openButton = document.createElement('button')
-    openButton.type = 'button'
-    openButton.className = 'lp-farm-open'
-    openButton.dataset.lpAction = 'farm-open'
-    openButton.textContent = '农场'
-    openButton.title = '打开农场小窗'
-    el.appendChild(openButton)
-    el.addEventListener('pointerdown', (event) => event.stopPropagation())
-    uiLayer.appendChild(el)
-    ui.farm = {
-      el,
-      plotsEl,
-      statusEl,
-      openButton,
-      plots: new Map(),
-      plotIds: '',
-      signature: ''
-    }
-  }
-
-  function buildFarmPlot (plot) {
-    const el = document.createElement('button')
-    el.type = 'button'
-    el.className = 'lp-farm-plot'
-    // 同一个 farm-open 动作：点击靠 `data-lp-plot` 落回具体那一块。
-    el.dataset.lpAction = 'farm-open'
-    el.dataset.lpPlot = plot.id
-    const icon = document.createElement('span')
-    icon.className = 'lp-farm-plot-icon'
-    icon.setAttribute('aria-hidden', 'true')
-    const badge = document.createElement('span')
-    badge.className = 'lp-farm-plot-badge'
-    badge.hidden = true
-    badge.textContent = '熟'
-    const label = document.createElement('span')
-    label.className = 'lp-farm-plot-label'
-    el.appendChild(icon)
-    el.appendChild(badge)
-    el.appendChild(label)
-    return { el, icon, badge, label }
-  }
-
-  function updateFarmPlot (entry, plot) {
-    const crop = FARM_CROP_META[plot.crop]
-    const label = farmPlotTitle(plot)
-    entry.el.dataset.crop = plot.crop ?? ''
-    entry.el.dataset.stage = plot.stage
-    entry.el.dataset.mature = plot.mature === true ? 'true' : 'false'
-    entry.el.setAttribute('aria-label', label)
-    entry.el.title = label
-    if (entry.icon.textContent !== (crop === undefined ? '🟫' : crop.emoji)) {
-      entry.icon.textContent = crop === undefined ? '🟫' : crop.emoji
-    }
-    entry.icon.dataset.stage = plot.stage
-    const badgeVisible = plot.mature === true
-    if (entry.badge.hidden === badgeVisible) entry.badge.hidden = !badgeVisible
-    const index = Number(String(plot.id).replace(/^p/, ''))
-    const text = Number.isFinite(index) && index > 0 ? String(index) : ''
-    if (entry.label.textContent !== text) entry.label.textContent = text
-  }
-
-  function syncFarm () {
-    const farm = scene.controls.farm
-    if (farm === null || typeof farm !== 'object' || !Array.isArray(farm.plots) || farm.plots.length === 0) {
-      hideFarm()
-      return
-    }
-    if (ui.farm === null) buildFarmStrip()
-    const signature = JSON.stringify(farm)
-    if (ui.farm.signature === signature) {
-      // 地块没变，但主人出门/打工/回家了：状态角标要跟着变（ticket 44 修正反向文案）。
-      syncFarmStatus(farm)
-      return
-    }
-    ui.farm.signature = signature
-    const ids = farm.plots.map((plot) => plot.id).join(',')
-    if (ui.farm.plotIds !== ids) {
-      ui.farm.plotsEl.textContent = ''
-      ui.farm.plots.clear()
-      for (const plot of farm.plots) {
-        const entry = buildFarmPlot(plot)
-        ui.farm.plots.set(plot.id, entry)
-        ui.farm.plotsEl.appendChild(entry.el)
-      }
-      ui.farm.plotIds = ids
-    }
-    for (const plot of farm.plots) {
-      const entry = ui.farm.plots.get(plot.id)
-      if (entry !== undefined) updateFarmPlot(entry, plot)
-    }
-    // 自己出门/打工时，桌面没有 self；地块条上要有一句状态（SPEC v5「桌面地块条」）。
-    syncFarmStatus(farm)
-    layoutUi(true)
-  }
-
-  /**
-   * 地块条的状态角标（ticket 44）。以宿主的 `farm.owner.presence` 为准：
-   * home = 看家中 / visiting = 串门中 / working = 在外打工。
-   * 老宿主没有 owner 时退回「桌面有没有 self」——注意旧文案写反了，这里顺手修正。
-   */
-  function syncFarmStatus (farm) {
-    if (ui.farm === null) return
-    const presence = farm?.owner?.presence
-    let text = ''
-    if (presence === 'working') text = '在外打工'
-    else if (presence === 'visiting') text = '串门中'
-    else if (presence === 'home') text = '看家中'
-    // 老宿主没有 owner：不知道是串门还是打工，就不写（不再沿用 40 的反向「看家中」）。
-    else text = ''
-    ui.farm.statusEl.hidden = text === ''
-    if (ui.farm.statusEl.textContent !== text) ui.farm.statusEl.textContent = text
-  }
-
-  // -------------------------------------------------------------------------
   // 召回胶囊（自己出门时桌面没有 self）
   // -------------------------------------------------------------------------
 
@@ -2102,14 +1927,6 @@
       })
     }
 
-    // 地块条跟着宠物走（自己出门时用最后的位置）；不占 occupied，避免和召回胶囊互相让位。
-    if (ui.farm !== null) {
-      positionFloating(ui.farm.el, promptAnchor(), {
-        avoid: petRects.concat(occupied),
-        gap: UI_GAP
-      })
-    }
-
     if (ui.recall !== null) {
       positionFloating(ui.recall.el, promptAnchor(), {
         avoid: petRects.concat(occupied),
@@ -2138,7 +1955,6 @@
     syncPrompt()
     syncGifts()
     syncStreet()
-    syncFarm()
     syncRecallChip()
     syncNotice()
     layoutUi(true)
@@ -2218,9 +2034,6 @@
       skinId: typeof options.skinId === 'string' && options.skinId !== '' ? options.skinId : undefined,
       // 礼物动作只带 giftId；路径与磁盘操作全在宿主那边，渲染端连字符串都拿不到。
       giftId: typeof options.giftId === 'string' && options.giftId !== '' ? options.giftId : undefined,
-      // 农场（ticket 40）：点某块地时带 plotId；四个地块动作走窗口那条支线，不在这里。
-      plotId: typeof options.plotId === 'string' && options.plotId !== '' ? options.plotId : undefined,
-      cropId: typeof options.cropId === 'string' && options.cropId !== '' ? options.cropId : undefined,
       // 失败时的本机兜底（点播不可达 → 本机播一次）。只能影响本地表现，绝不能改状态。
       fallback: typeof options.fallback === 'function' ? options.fallback : null,
       prompt: options.prompt === true,
@@ -2251,9 +2064,7 @@
         deviceId: pending.deviceId,
         name: pending.name,
         skinId: pending.skinId,
-        giftId: pending.giftId,
-        plotId: pending.plotId,
-        cropId: pending.cropId
+        giftId: pending.giftId
       })
     } catch {
       settleAction(id, { ok: false, notice: ACTION_FAILED_NOTICE })
@@ -2288,17 +2099,6 @@
       // 「串门」先开那条街：挑谁去哪家，而不是替用户掷骰子（ticket 21）。
       closePopover('action')
       openStreet('self')
-      return
-    }
-    if (action === 'farm-open') {
-      // 地块条上的地块/「农场」按钮：开窗与数据全由宿主决定。点地块时带上 plotId，
-      // 窗口用它高亮那一块；没有 plotId 就是菜单里的「农场」。
-      closePopover('action')
-      closeStreet('action')
-      const plotId = typeof button.dataset.lpPlot === 'string' && button.dataset.lpPlot !== ''
-        ? button.dataset.lpPlot
-        : undefined
-      requestAction('farm-open', undefined, plotId === undefined ? {} : { plotId })
       return
     }
     if (action === 'street-more') {
@@ -2907,7 +2707,7 @@
     // 窗口翻回穿透——菜单画着，点击却落到后面的 app 上（用户报的"点了没反应、穿透"）。
     // reportOverlayRects 自己按 300ms 节流，逐帧调用不会刷屏。
     if (ui.popover !== null || ui.prompt !== null || ui.recall !== null || ui.notice !== null ||
-      ui.menu !== null || ui.street !== null || ui.gifts.size > 0 || ui.farm !== null) {
+      ui.menu !== null || ui.street !== null || ui.gifts.size > 0) {
       layoutUi(false)
       reportOverlayRects(false)
     }
@@ -3142,35 +2942,6 @@
           streetOpen: ui.street !== null,
           streetShowBlocked: ui.street === null ? false : ui.street.showBlocked,
           recallChip: ui.recall === null ? null : { nickname: scene.controls.recall.nickname },
-          // 农场（ticket 40）：冒烟要能断言 4 块地、成熟数、命中矩形与「看家中」。
-          farm: ui.farm === null
-            ? null
-            : (() => {
-                const box = ui.farm.el.getBoundingClientRect()
-                const control = scene.controls.farm
-                return {
-                  plots: [...ui.farm.plots.values()].map((entry) => ({
-                    id: entry.el.dataset.lpPlot,
-                    crop: entry.el.dataset.crop ?? null,
-                    stage: entry.el.dataset.stage,
-                    mature: entry.el.dataset.mature === 'true',
-                    label: entry.el.getAttribute('aria-label')
-                  })),
-                  mature: control === null
-                    ? 0
-                    : control.plots.filter((plot) => plot.mature === true).length,
-                  coins: control === null ? 0 : control.coins,
-                  dew: control === null ? 0 : control.dew,
-                  // ticket 44/45：冒烟要断言摘要里的雇工昵称与合同数，别只断言角标。
-                  worker: control === null ? null : control.worker,
-                  contractCount: control === null ? 0 : control.contractCount,
-                  status: ui.farm.statusEl.hidden ? null : ui.farm.statusEl.textContent,
-                  x: round(box.left),
-                  y: round(box.top),
-                  width: round(box.width),
-                  height: round(box.height)
-                }
-              })(),
           notice: ui.notice === null ? null : { text: ui.notice.text, at: ui.notice.at },
           pending: [...ui.pending.values()].map((pending) => ({
             id: pending.id,

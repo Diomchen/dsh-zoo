@@ -681,9 +681,10 @@ export function createService (ctx, options = {}) {
     if (action === 'end-contract') return endContract(body?.contractId)
     if (action === 'hire-listing') return setHireListing(body)
 
-    // 农场小窗（ticket 40）：菜单「农场」或桌面地块把一次开窗申请交给宿主。
+    // 农场小窗（ticket 40/46）：菜单「农场」是对开/关的同一入口；`farm-close` 给 HTTP/脚本。
     // 数据由宿主算好（窗口是 file:// 页面，读不到 /state），失败必须回人话。
     if (action === 'farm-open') return handleFarmOpen(body?.plotId)
+    if (action === 'farm-close') return closeFarmWindow('farm-close')
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') {
@@ -919,7 +920,9 @@ export function createService (ctx, options = {}) {
    */
   function stateView () {
     return {
-      ...desktopSnapshot(),
+      ...room.snapshot(),
+      // 农场（ticket 39）：这是磁盘视图，和 room 的纯快照在这里合成；桌面场景不再带它。
+      farm: farmStateView(),
       // 当前那张皮（ticket 32）：换皮只看这一项，别的状态都不该动。
       skin: activeSkin === null
         ? null
@@ -930,19 +933,6 @@ export function createService (ctx, options = {}) {
       market: marketStateView(),
       // 雇佣合同（ticket 44）：store 没起来也给完整空形状，绝不 undefined。
       contracts: contractsView()
-    }
-  }
-
-  /**
-   * 桌面层拿到的快照（ticket 40）：room 的纯快照 + 39 的农场全量视图。
-   *
-   * **room 一行不改**：农场和 backpack/gifts 一样是「room 快照 + 磁盘视图」，由这里合成。
-   * `controlsFromSnapshot` 只把它裁成地块条要的摘要；窗口那份完整视图走 `farm-window`。
-   */
-  function desktopSnapshot () {
-    return {
-      ...room.snapshot(),
-      farm: farmStateView()
     }
   }
 
@@ -1077,7 +1067,7 @@ export function createService (ctx, options = {}) {
   /**
    * 守卫的唯一计算点（ticket 43/44）：主人在家 = 既没有出门串门，也没有在外打工。
    * 雇工镜像存在 = 有人在我家打工。`/state.farm.guard`、访客快照的 `guardParts`、
-   * 桌面摘要全部从这里出，绝不三个地方各写一遍 0.3。
+   * 农场小窗的守卫全部从这里出，绝不三个地方各写一遍 0.3。
    */
   function farmGuard () {
     const out = room.outboundVisit()
@@ -1234,7 +1224,10 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 菜单「农场」/ 桌面地块的申请：打开或聚焦小窗。没有桌面层就回 `desktop-off`。
+   * 菜单「农场」的申请（ticket 40/46）：小窗开着就关闭，否则打开/聚焦。
+   *
+   * 「开着」以 helper 报上来的真实窗口状态为准（`desktop.status().farmOpen`）：
+   * 用户用 ×/Esc 关过窗后，再点「农场」必须重新打开，而不是对着空气发一条关闭。
    *
    * ticket 43：正在串门时同一扇窗进入**访客模式**——先立刻推 owner 数据 + `visit.loading`，
    * 再去拉主人的快照（不阻塞开窗）；拉回来推 `ready`，404 推 `ended`。
@@ -1243,6 +1236,8 @@ export function createService (ctx, options = {}) {
     if (desktop === null || typeof desktop.farmWindow !== 'function') {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
+    // ticket 46：再点一次「农场」= 关窗。返回 action 仍是 farm-open，窗口字段说明发生了什么。
+    if (farmWindowOpenNow()) return closeFarmWindow('farm-open')
     const plotId = typeof rawPlotId === 'string' ? rawPlotId : null
     const out = room.outboundVisit()
     const visit = out === null ? null : loadingVisitView(out)
@@ -1267,6 +1262,43 @@ export function createService (ctx, options = {}) {
     return { ok: true, action: 'farm-open', window: 'opened', mode: out === null ? 'owner' : 'visitor' }
   }
 
+  /**
+   * 小窗此刻是否真的开着（ticket 46）。
+   *
+   * 以 helper 回报的 `farm-window-state` 为准（用户点 ×/Esc 也会更新）；测试替身或老 helper
+   * 没有 `status()` 时退回宿主自己的“我发过 open”记录。
+   */
+  function farmWindowOpenNow () {
+    if (desktop !== null && typeof desktop.status === 'function') {
+      const status = desktop.status()
+      if (status !== null && typeof status === 'object' && typeof status.farmOpen === 'boolean') {
+        return status.farmOpen
+      }
+    }
+    return farmWindowOpened === true
+  }
+
+  /**
+   * 关窗的唯一出口（ticket 46）：右键「农场」再点一次和 `farm-close` 动作共用。
+   * `close:true` 与刷新用的 `open:false` 明确分开——刷新不能把窗口关掉。
+   */
+  function closeFarmWindow (action = 'farm-close') {
+    if (desktop === null || typeof desktop.farmWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+    }
+    let sent = false
+    try {
+      sent = desktop.farmWindow({ open: false, close: true }) === true
+    } catch {
+      sent = false
+    }
+    farmWindowOpened = false
+    if (sent !== true) {
+      return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+    }
+    return { ok: true, action, window: 'closed' }
+  }
+
   /** `farm-window` 命令的公共载荷：owner 数据 + 交易所 + 可选访客块。 */
   function farmWindowPayload ({ open, plotId = null, mode = null, visit = null } = {}) {
     const out = room.outboundVisit()
@@ -1278,7 +1310,7 @@ export function createService (ctx, options = {}) {
       open: open === true,
       mode: effectiveMode,
       farm: farmWindowView(),
-      // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进 controls.farm。
+      // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进农场视图。
       market: marketWindowView(),
       // ticket 44：雇工页的数据也由宿主 push（窗口读不到 /state）。
       contracts: contractWindowView(),
@@ -3443,6 +3475,9 @@ export function createService (ctx, options = {}) {
             // 也算“有人在用这台机器”。helper 只在穿透翻转时发 hit，所以这是粗粒度信号；
             // 它够用来防止“人明明在电脑前，宠物却因为没敲 DSH 而不出门”。
             noteActivity('pointer')
+          } else if (event?.type === 'farm-window-state') {
+            // ticket 46：小窗真的开了/关了（含用户点 ×/Esc）。右键「农场」靠它决定开还是关。
+            farmWindowOpened = event.open === true
           } else if (event?.type === 'action') {
             // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
             // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。
@@ -3501,8 +3536,8 @@ export function createService (ctx, options = {}) {
    */
   function syncDesktop ({ reset = false } = {}) {
     if (disposed || desktop === null || desktopWorkArea === null) return false
-    // 40：农场和背包/礼物一样是「room 快照 + 磁盘视图」；room 自己不碰农场。
-    const snapshot = desktopSnapshot()
+    // 桌面场景只有 room 的纯快照（ticket 46：农场不进场景，只走 farm-window）。
+    const snapshot = room.snapshot()
     const pets = petsFromSnapshot(snapshot).map((pet) => {
       // 本机宠物：把当前这张皮的动作名交给渲染端轮播，并带上它的尺寸（票 32 / 35）。
       if (pet.role === 'self') {
@@ -3528,8 +3563,7 @@ export function createService (ctx, options = {}) {
     const dropped = droppedVisitors(snapshot)
     if (dropped > 0) room.noteSceneOverflow(dropped)
     // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 dshzoo:// URL。
-    // 40：这里也必须用 desktopSnapshot —— 用 room.snapshot 会把农场从控件里漏掉。
-    const controls = controlsFromSnapshot(dropped > 0 ? desktopSnapshot() : snapshot, { thumbOf: giftThumb })
+    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const assetRoots = assetRootsFor(activeSkin)
     // 目录也进签名：两张皮的素材同名但不同目录时，换皮必须让渲染端跟着换根（ticket 33）。
