@@ -2520,6 +2520,95 @@ async function verifyFarmWindow () {
   assert(visible > image.width * image.height * 0.2,
     '小窗里画出了可见内容（' + visible + '/' + (image.width * image.height) + ' px）')
 
+  // 47.1：多地块倒计时必须按真实时间走，不是每次 setInterval 只减 1s。
+  // 注入三块生长中，阻塞渲染进程 5s 再读；三张卡都应少约 5s（旧实现只少 1–2s）。
+  const countdownSeconds = (text) => {
+    const minutes = /(\d+)\s*分/.exec(text)
+    const seconds = /(\d+)\s*秒/.exec(text)
+    return (minutes === null ? 0 : Number(minutes[1]) * 60) + (seconds === null ? 0 : Number(seconds[1]))
+  }
+  const readCountdowns = async (id) => {
+    const mark = client.mark()
+    client.send({ type: 'debug-farm-read', id })
+    const event = await client.waitFrom(
+      mark,
+      (candidate) => candidate.type === 'farm-read' && candidate.id === id,
+      5000,
+      '读农场倒计时'
+    )
+    return Array.isArray(event.plots) ? event.plots : []
+  }
+  const threeFarm = {
+    ...fullFarm,
+    plots: [
+      { id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 60 * 1000, waterings: 0, fertilized: false },
+      { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 60 * 1000, waterings: 0, fertilized: false },
+      { id: 'p3', crop: 'pumpkin', stage: 'growing', mature: false, remainingMs: 60 * 1000, waterings: 0, fertilized: false }
+    ]
+  }
+  client.send({ type: 'farm-window', open: true, farm: threeFarm, market: fullMarket, contracts: fullContracts })
+  await sleep(600)
+  const countdownBefore = await readCountdowns('smoke-farm-countdown-before')
+  assert(countdownBefore.length === 3, '三块地都画出卡')
+  const beforeSeconds = countdownBefore.map((plot) => countdownSeconds(plot.text))
+  client.send({ type: 'debug-farm-block', id: 'smoke-farm-block', ms: 5000 })
+  await client.waitFrom(
+    client.mark(),
+    (candidate) => candidate.type === 'farm-block' && candidate.id === 'smoke-farm-block',
+    10000,
+    '阻塞渲染进程'
+  )
+  await sleep(120)
+  const countdownAfter = await readCountdowns('smoke-farm-countdown-after')
+  assert(countdownAfter.length === 3, '三块地都还在')
+  for (let index = 0; index < 3; index += 1) {
+    const dropped = beforeSeconds[index] - countdownSeconds(countdownAfter[index].text)
+    assert(dropped >= 4, '第 ' + (index + 1) + ' 块倒计时按真实时间走了（dropped=' + dropped + 's）')
+  }
+  // C：到 0 不本地标成熟；先请宿主确认，宿主回 mature 后才画收获按钮。
+  const overdueFarm = {
+    ...threeFarm,
+    plots: [
+      { ...threeFarm.plots[0], remainingMs: 400 },
+      threeFarm.plots[1],
+      threeFarm.plots[2]
+    ]
+  }
+  const refreshMark = client.mark()
+  client.send({ type: 'farm-window', open: true, farm: overdueFarm, market: fullMarket, contracts: fullContracts })
+  await sleep(1400)
+  const overdue = await readCountdowns('smoke-farm-overdue')
+  const overdueP1 = overdue.find((plot) => plot.id === 'p1')
+  assert(
+    overdueP1 !== undefined && overdueP1.stage === 'growing',
+    '到 0 先等宿主确认，不本地标成熟（stage=' + (overdueP1?.stage ?? 'missing') + '）'
+  )
+  const refreshAction = await client.waitFrom(
+    refreshMark,
+    (candidate) => candidate.type === 'action' && candidate.action === 'farm-refresh',
+    3000,
+    '到点确认 farm-refresh'
+  )
+  // 冒烟里的宿主替身要把这条回执放掉，否则后面的批量动作会等在同一条动作管道上。
+  client.send({ type: 'action-result', id: refreshAction.id, ok: true })
+  const matureFarm = {
+    ...threeFarm,
+    plots: [
+      { ...threeFarm.plots[0], stage: 'mature', mature: true, remainingMs: 0 },
+      threeFarm.plots[1],
+      threeFarm.plots[2]
+    ]
+  }
+  client.send({ type: 'farm-window', open: true, farm: matureFarm, market: fullMarket, contracts: fullContracts })
+  await sleep(300)
+  const confirmed = await readCountdowns('smoke-farm-confirmed')
+  const confirmedP1 = confirmed.find((plot) => plot.id === 'p1')
+  assert(confirmedP1 !== undefined && confirmedP1.stage === 'mature', '宿主确认后才标成熟')
+
+  // 恢复完整农场：后面的播种/批量用例仍按 p2/p4 成熟、p3 空地继续。
+  client.send({ type: 'farm-window', open: true, farm: fullFarm, market: fullMarket, contracts: fullContracts })
+  await sleep(500)
+
   // 票 47：点空地卡打开播种底部弹窗（真实点击委托），截一张再关上。
   client.send({ type: 'debug-farm-plant-open', id: 'smoke-farm-plant-open' })
   await sleep(500)

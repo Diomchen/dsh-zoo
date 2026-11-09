@@ -1558,6 +1558,9 @@ function openFarmWindow () {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // 倒计时是每秒 tick；后台节流会让窗口看起来“卡住”。真正的正确性靠
+      // farm.js 的 Date.now() 基线，这里只是让可见时也保持顺滑。
+      backgroundThrottling: false,
       devTools: debugEnabled,
       spellcheck: false
     }
@@ -2166,6 +2169,47 @@ function applyCommand (command) {
           'return true;' +
           '})()'
       void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-read': {
+      // 冒烟用（ticket 47.1）：读农场小窗的真实 DOM——每张卡的 stage 和倒计时文本。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => Array.from(document.querySelectorAll(".plot-card")).map((el) => ({' +
+        'id: el.dataset.plot || "",' +
+        'stage: el.dataset.stage || "",' +
+        'text: (el.querySelector(".countdown")?.textContent || "")' +
+        '})))()'
+      void farmWin.webContents.executeJavaScript(script, true)
+        .then((plots) => writeEvent({ type: 'farm-read', id: command.id, plots }))
+        .catch((error) => writeEvent({
+          type: 'error',
+          id: command.id,
+          code: 'farm-read-failed',
+          message: String(error?.message ?? error)
+        }))
+      return
+    }
+    case 'debug-farm-block': {
+      // 冒烟用（ticket 47.1）：阻塞渲染进程，模拟 interval 被调度延迟/后台节流。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const ms = Math.min(15000, Math.max(0, Math.floor(Number(command.ms) || 0)))
+      const script = '(() => { const end = Date.now() + ' + ms + '; while (Date.now() < end) {} return true })()'
+      void farmWin.webContents.executeJavaScript(script, true)
+        .then(() => writeEvent({ type: 'farm-block', id: command.id, ok: true }))
+        .catch((error) => writeEvent({
+          type: 'error',
+          id: command.id,
+          code: 'farm-block-failed',
+          message: String(error?.message ?? error)
+        }))
       return
     }
     case 'debug-freeze-hover':

@@ -144,6 +144,9 @@ const countdowns = new Map()
 const progressBars = new Map()
 /** contractId → { node, remaining, text }；合同倒计时同理。 */
 const contractCountdowns = new Map()
+/** 到点确认的节流：一秒最多请宿主推一次，避免本地贴着 0 时刷屏。 */
+let refreshPending = false
+let refreshAt = 0
 
 function cropMeta (cropId) {
   return view.cropMeta(cropId)
@@ -995,28 +998,70 @@ function render () {
   if (activeTab === 'hire') renderHire()
 }
 
-/** 每秒本地推进：倒计时文本 + 进度条；成熟那一刻重画整页。 */
+/** 收到宿主 state 时记下每块地的倒计时基线；tick 用 Date.now() 算真实经过时间。 */
+function primeCountdowns (plots) {
+  if (!Array.isArray(plots)) return
+  const at = Date.now()
+  for (const plot of plots) {
+    if (plot === null || typeof plot !== 'object' || plot.stage !== 'growing') continue
+    const remaining = Number(plot.remainingMs)
+    plot.baseRemainingMs = Number.isFinite(remaining) ? remaining : 0
+    plot.baseAt = at
+  }
+}
+
+/** 本地到 0 时请宿主重推 state：成熟与否只认宿主的 stage，窗口不自己标 mature。 */
+function requestFarmRefresh () {
+  const now = Date.now()
+  if (refreshPending || now - refreshAt < 1000) return
+  if (api === null || typeof api.submit !== 'function') return
+  refreshPending = true
+  refreshAt = now
+  try {
+    api.submit({ action: 'farm-refresh' })
+  } catch {
+    refreshPending = false
+  }
+}
+
+/**
+ * 每秒推进：倒计时 = 基线 − (Date.now() − 基线时刻)。
+ *
+ * 不再“每次 interval 减 1s”：Electron 的 interval 会被后台/渲染忙延迟，减 1s 会累积误差；
+ * 种下一块触发 state 刷新时，老卡片就会跳。按真实时间算，延迟多久下一次 tick 都能追上。
+ * 到 0 也不本地标 mature——请宿主确认，避免本地时钟早几毫秒时收获被回 not-mature。
+ */
 function tickPlots () {
   const plots = mode === 'visitor' && visit !== null && Array.isArray(visit.plots)
     ? visit.plots
     : (farm !== null && Array.isArray(farm.plots) ? farm.plots : null)
   if (plots === null) return
-  let needsRender = false
+  const now = Date.now()
   for (const plot of plots) {
     if (plot.stage !== 'growing') continue
-    plot.remainingMs = Math.max(0, Number(plot.remainingMs) - 1000)
-    if (plot.remainingMs === 0) {
-      plot.stage = 'mature'
-      plot.mature = true
-      needsRender = true
-      continue
+    try {
+      const base = Number.isFinite(Number(plot.baseRemainingMs))
+        ? Number(plot.baseRemainingMs)
+        : Number(plot.remainingMs)
+      const baseAt = Number.isFinite(Number(plot.baseAt)) ? Number(plot.baseAt) : now
+      plot.remainingMs = Math.max(0, base - (now - baseAt))
+      if (plot.remainingMs === 0) {
+        // 先把这张卡停在「马上就好」，再请宿主确认；不直接标 mature。
+        const done = countdowns.get(plot.id)
+        if (done !== undefined) done.textContent = formatRemaining(0)
+        const full = progressBars.get(plot.id)
+        if (full !== undefined) full.style.width = '100%'
+        requestFarmRefresh()
+        continue
+      }
+      const node = countdowns.get(plot.id)
+      if (node !== undefined) node.textContent = formatRemaining(plot.remainingMs)
+      const fill = progressBars.get(plot.id)
+      if (fill !== undefined) fill.style.width = Math.round(view.progressOf(plot) * 100) + '%'
+    } catch {
+      // 一张坏卡不能拖住其它地块的倒计时（ticket 47.1）。
     }
-    const node = countdowns.get(plot.id)
-    if (node !== undefined) node.textContent = formatRemaining(plot.remainingMs)
-    const fill = progressBars.get(plot.id)
-    if (fill !== undefined) fill.style.width = Math.round(view.progressOf(plot) * 100) + '%'
   }
-  if (needsRender) renderFarmSurface()
 }
 
 function tick () {
@@ -1264,6 +1309,10 @@ api?.onState((payload) => {
     ? payload.visit
     : null
   selectedPlot = typeof payload.plotId === 'string' && payload.plotId !== '' ? payload.plotId : null
+  // ticket 47.1：每次宿主 state 都是新的倒计时基线；重置“到点确认”的在飞标记。
+  primeCountdowns(farm?.plots)
+  primeCountdowns(visit?.plots)
+  refreshPending = false
   if (mode !== 'owner') {
     // 访客模式没有一键播种/收割，也没有播种弹窗；正在跑的批量队列立刻停。
     batch = null
@@ -1275,6 +1324,11 @@ api?.onState((payload) => {
 })
 
 api?.onResult((result) => {
+  // ticket 47.1：到点确认不是用户动作，不弹 toast，也不碰 busy/批量队列。
+  if (result !== null && typeof result === 'object' && result.action === 'farm-refresh') {
+    refreshPending = false
+    return
+  }
   const wasBatch = batch !== null && batch.inFlight === true
   busy = false
   if (wasBatch) batch.inFlight = false
@@ -1310,5 +1364,16 @@ api?.onResult((result) => {
 
 selectTab('farm')
 render()
+
+// 切走/失焦后 interval 可能被节流；回来先按真实时间补一帧。
+// 不在这里请宿主重推：focus 在冒烟/真实输入里很频繁，会和用户动作争同一条动作管道。
+window.addEventListener('focus', () => {
+  tick()
+})
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return
+  tick()
+})
+
 setInterval(tick, 1000)
 api?.ready()

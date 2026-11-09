@@ -902,3 +902,33 @@ test('farm-open：两个地块时倒计时从当前时刻算，不用上一次 t
   assert.equal(p1.remainingMs, 25 * 60 * 1000)
   assert.equal(p2.remainingMs, 25 * 60 * 1000)
 })
+
+test('farm-refresh：到点确认只重推当前窗口，不关窗', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: NOON }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.body.ok, true)
+  const before = desktop.calls.windows.length
+  const refreshed = await callAction(service, { action: 'farm-refresh' })
+  assert.equal(refreshed.status, 200)
+  assert.equal(refreshed.body.ok, true)
+  assert.equal(refreshed.body.action, 'farm-refresh')
+  assert.equal(desktop.calls.windows.length, before + 1)
+  const payload = desktop.calls.windows.at(-1)
+  assert.equal(payload.open, false)
+  assert.equal(payload.close, undefined)
+  assert.equal(payload.farm.plots.length, 4)
+  assert.equal(desktop.isFarmOpen(), true)
+})

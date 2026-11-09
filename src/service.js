@@ -685,6 +685,18 @@ export function createService (ctx, options = {}) {
     // 数据由宿主算好（窗口是 file:// 页面，读不到 /state），失败必须回人话。
     if (action === 'farm-open') return handleFarmOpen(body?.plotId)
     if (action === 'farm-close') return closeFarmWindow('farm-close')
+    // ticket 47.1：窗口倒计时到 0 时请宿主重推当前视图，由宿主 stage 决定是否成熟。
+    // 窗口不自己标 mature，避免本地时钟早几毫秒时收获被回 not-mature。
+    if (action === 'farm-refresh') {
+      if (desktop === null || typeof desktop.farmWindow !== 'function') {
+        return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+      }
+      if (farmWindowOpenNow() !== true) {
+        return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+      }
+      refreshFarmWindow()
+      return { ok: true, action: 'farm-refresh' }
+    }
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') {
@@ -3637,11 +3649,15 @@ export function createService (ctx, options = {}) {
     try {
       const target = desktop ?? manager
       if (target !== null && typeof target.actionResult === 'function') {
-        target.actionResult(event.id, {
+        const reply = {
           ok: result?.ok === true,
           notice,
           error: typeof result?.error === 'string' ? result.error : null
-        })
+        }
+        // 47.1：只有「到点确认」带 action；窗口用它静默处理，不弹 toast。
+        // 其它动作的回执形状保持不变，老渲染端/测试不用跟着改。
+        if (event.action === 'farm-refresh') reply.action = 'farm-refresh'
+        target.actionResult(event.id, reply)
       }
     } catch {
       // 回话失败只影响这一次气泡；渲染端自己的超时会兜底

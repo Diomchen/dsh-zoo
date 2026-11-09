@@ -156,7 +156,12 @@
    * 总价/手续费/硬币全由宿主算，窗口一概不传。
    */
   const FARM_HIRE_ACTIONS = ['hire', 'recall-worker', 'end-contract', 'hire-listing']
-  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS, FARM_HIRE_ACTIONS)
+  /**
+   * 窗口端倒计时到 0 时请宿主确认成熟（ticket 47.1）。窗口不自己标 mature：
+   * 本地时钟可能比宿主早/晚几毫秒，标早了收获会被宿主回 not-mature。
+   */
+  const FARM_REFRESH_ACTIONS = ['farm-refresh']
+  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS, FARM_HIRE_ACTIONS, FARM_REFRESH_ACTIONS)
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
@@ -1069,6 +1074,8 @@
       if (minHours < HIRE_HOURS_MIN || maxHours > HIRE_HOURS_MAX || minHours > maxHours) return null
       return { action, enabled: raw.enabled, wagePerHour, minHours, maxHours }
     }
+    // 到点确认没有地块字段：只请宿主重推一份当前 farm-window。
+    if (action === 'farm-refresh') return { action }
     const plotId = normalizePlotId(raw.plotId)
     if (plotId === null) return null
     // 偷/帮只可能是 p1..p4（访客没有别的可点）；在主进程那一层就挡住 p9。
@@ -2227,6 +2234,14 @@
         const via = raw.via === 'escape' ? 'escape' : 'button'
         return { ok: true, command: { type, id, via } }
       }
+      case 'debug-farm-read':
+        // 冒烟用：读农场小窗里每张卡的 stage / countdown 文本，验多地块倒计时。
+        return { ok: true, command: { type, id } }
+      case 'debug-farm-block': {
+        // 冒烟用：阻塞渲染进程 N 毫秒，模拟 setInterval 被延迟/后台节流。
+        const ms = Math.min(15000, Math.max(0, Math.floor(Number(raw.ms) || 0)))
+        return { ok: true, command: { type, id, ms } }
+      }
       case 'debug-gift-submit':
         // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
         if (typeof raw.text !== 'string') return { ok: false, error: 'bad-text' }
@@ -2405,6 +2420,24 @@
             message: normalizeText(raw.message, 'unknown error', MAX_ERROR_LENGTH)
           }
         }
+      case 'farm-read': {
+        // 冒烟用（ticket 47.1）：农场小窗里每张卡的 stage / countdown 文本。
+        const plots = []
+        if (Array.isArray(raw.plots)) {
+          for (const candidate of raw.plots.slice(0, 20)) {
+            if (candidate === null || typeof candidate !== 'object') continue
+            plots.push({
+              id: normalizeToken(candidate.id),
+              stage: normalizeLabel(candidate.stage, ''),
+              text: normalizeLabel(candidate.text, '')
+            })
+          }
+        }
+        return { ok: true, event: { type, id, plots } }
+      }
+      case 'farm-block':
+        // 冒烟用（ticket 47.1）：渲染进程阻塞结束。
+        return { ok: true, event: { type, id, ok: raw.ok === true } }
       case 'farm-window-state':
         // ticket 46：小窗真的开了/关了。宿主用它切换右键「农场」的开/关语义；
         // 用户点 ×/Esc 关窗也走这一条，所以不能只靠宿主自己的“我发过 open”。
