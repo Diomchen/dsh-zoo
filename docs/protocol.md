@@ -181,7 +181,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | 农场 / 交易所 | `plant` / `harvest` / `water` / `fertilize` / `buy-seed` / `sell-crop`，小窗用同义 `farm-*` | 见「农场、交易所与雇佣 · 本机动作」。成功 `200`，失败 `409 { ok:false, error }` |
 | 雇佣 | `hire` / `hire-listing` / `recall-worker` / `end-contract` | 见「农场、交易所与雇佣 · 雇佣」。雇佣请求最多等 1.8 秒（3 次发送） |
 | 访客农场 | `farm-steal` / `farm-help` | 只在串门期间；`{ plotId, visitId? }`。宿主等 UDP 结果（~1.8 秒）后回一次 `action-result` |
-| 农场小窗 | `farm-open` | `{ plotId? }`；没有桌面层回 `409 desktop-off` |
+| 农场小窗 | `farm-open` / `farm-close` | `farm-open`（`{ plotId? }`）是开关：窗口开着就关、否则打开/聚焦；`farm-close` 只关（幂等）。没有桌面层回 `409 desktop-off` |
 
 ### 名字只有一份（ADR-0007）
 
@@ -578,7 +578,8 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 | `end-contract` | `{ contractId }` | `{ ok, action, contractId }`；还在 pending 时带 `cancelled: true` | `bad-device-id` `contract-not-found` `starting` |
 | `hire-listing` | `{ enabled, wagePerHour, minHours, maxHours }` | `{ ok, action, hire }` | `bad-enabled` `bad-wage` `bad-hours` `starting` |
 | `farm-steal` / `farm-help` | `{ plotId, visitId? }` | `{ ok, action, plotId, crop?, qty?, caught?, notice }` | 见「偷菜与帮忙」 |
-| `farm-open` | `{ plotId? }` | `{ ok, action, window: "opened", mode: "owner"\|"visitor" }` | `desktop-off` |
+| `farm-open` | `{ plotId? }` | 开关：关着时打开/聚焦，返回 `{ ok, action:"farm-open", window:"opened", mode }`；已开着时关闭，返回 `{ ok, action:"farm-open", window:"closed" }` | `desktop-off` |
+| `farm-close` | 无 | `{ ok, action:"farm-close", window:"closed" }`；已经关着也成功（幂等） | `desktop-off` |
 
 `plant` / `harvest` / `water` / `fertilize` 的 `plot` 是修改后的完整地块；
 `buy-seed` / `sell-crop` 的 `qty` 必须是 1–99，每分钟最多 10 笔（买 + 卖共享），
@@ -768,7 +769,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
   `gift` 都按本文的兼容口径降级；没有农场报文时，本地农场照常运行，只是不能跨机偷/帮/雇。
 - **降级**：旧邻居 → 串门/礼物/记录照常，没有农场入口；对方没开局域网端口 → 串门照常、
   快照取不到、偷/帮/雇不可用；对方离线 → 不能偷/帮/雇，行情过期，合同按最后心跳结束；
-  没有桌面层 → HTTP 动作与 `state` 可用，没有地块条/农场窗。
+  没有桌面层 → HTTP 动作与 `state` 可用，没有农场窗，也没有雇工宠物。
 
 ### 改名前后的路径（ADR-0014）
 

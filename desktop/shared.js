@@ -270,7 +270,6 @@
   const MAX_CONTRACT_EARNED = HIRE_HOURS_MAX * HIRE_WAGE_MAX
   const CONTRACT_STATUSES = ['pending', 'active', 'ended', 'cancelled']
   const HIRE_REASONS = ['ready', 'off', 'visiting', 'working']
-  const OWNER_PRESENCES = ['home', 'visiting', 'working']
   /** 地块 id 的形状：宿主只发 p1–p4，这里允许短标识符，大小写统一成小写。 */
   const PLOT_ID_RE = /^[a-z0-9_-]{1,16}$/
 
@@ -537,7 +536,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // 农场（ticket 40）：桌面地块条只拿摘要，小窗拿完整视图。
+  // 农场（ticket 40/46）：只服务农场小窗；桌面场景不再有农场摘要。
   // -------------------------------------------------------------------------
 
   function normalizePlotId (value) {
@@ -572,23 +571,18 @@
   }
 
   /**
-   * 一块地。
+   * 一块地（只服务农场小窗）。
    *
-   * 两种输入共用这一个函数：
-   *   - 场景摘要来自 `/state.farm` 的完整地块（crop/grownMs/growMs），阶段要推；
-   *   - 小窗视图来自宿主算好的 `stage/mature/remainingMs`（`src/farm-rules.js` 推的），
-   *     这里只做二次校验。
-   * 不一致时以 `crop === null` 优先判空、其余以 `mature` 为准（`stage` 只是显示用的派生值）。
+   * 输入来自宿主算好的 `stage/mature/remainingMs`（`src/farm-rules.js` 推的），这里只做
+   * 二次校验；`crop === null` 优先判空，其余以 `mature` 为准（`stage` 只是显示用的派生值）。
    */
-  function normalizeFarmPlot (raw, full) {
+  function normalizeFarmPlot (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const id = normalizePlotId(raw.id)
     if (id === null) return null
     const crop = normalizeCropId(raw.crop)
     if (crop === null) {
-      return full
-        ? { id, crop: null, stage: 'empty', mature: false, remainingMs: 0, waterings: 0, fertilized: false }
-        : { id, crop: null, stage: 'empty', mature: false }
+      return { id, crop: null, stage: 'empty', mature: false, remainingMs: 0, waterings: 0, fertilized: false }
     }
 
     const growMs = Number(raw.growMs)
@@ -600,7 +594,6 @@
       else if (Number.isFinite(growMs) && growMs > 0 && Number.isFinite(grownMs)) mature = grownMs >= growMs
     }
     const summary = { id, crop, stage: mature ? 'mature' : 'growing', mature }
-    if (full !== true) return summary
 
     // 宿主给 remainingMs 就信它（窗口倒计时以那一份为准）；没给就从生长进度推。
     let remaining = Number(raw.remainingMs)
@@ -687,21 +680,19 @@
   }
 
   /**
-   * 农场视图归一化。
+   * 农场小窗的完整视图归一化（`farm-window` 命令）。
    *
-   * `full:false`（桌面地块条）= 摘要：`{ plots:[{id,crop,stage,mature}], coins, dew, worker, contractCount }`。
-   * `full:true`（farm-window 命令）= 小窗要的完整一份：多 `seeds/crops/log` 与每块地的
-   * `remainingMs/waterings/fertilized`。**不要把完整视图塞进场景**：`controls` 是每帧比较的
-   * 契约，日志/仓库只会让签名狂变；窗口数据走 `farm-window`。
+   * 桌面场景里没有农场摘要（ticket 46：地块条已删）：`controls` 是每帧比较的契约，
+   * 日志/仓库只会让签名狂变；农场数据只走 `farm-window`，窗口不读 `/state`。
    */
-  function normalizeFarm (raw, { full = false } = {}) {
+  function normalizeFarm (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const plots = []
     const seen = new Set()
     if (Array.isArray(raw.plots)) {
       for (const candidate of raw.plots) {
         if (plots.length >= MAX_FARM_PLOTS) break
-        const plot = normalizeFarmPlot(candidate, full === true)
+        const plot = normalizeFarmPlot(candidate)
         if (plot === null || seen.has(plot.id)) continue
         seen.add(plot.id)
         plots.push(plot)
@@ -719,8 +710,6 @@
         ? Math.min(MAX_FARM_CONTRACTS, Math.max(0, Math.floor(contracts)))
         : 0
     }
-    // ticket 44：只有地块条摘要需要「主人在哪」；完整视图没有这个字段。
-    if (full !== true) return { ...farm, owner: normalizeFarmOwner(raw.owner) }
 
     const log = []
     if (Array.isArray(raw.log)) {
@@ -743,13 +732,7 @@
     }
   }
 
-  /** 地块条的主人状态：`home` / `visiting` / `working`；认不出按 home。 */
-  function normalizeFarmOwner (raw) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { presence: 'home' }
-    return { presence: OWNER_PRESENCES.includes(raw.presence) ? raw.presence : 'home' }
-  }
-
-  /** 小窗的挂牌（只有完整视图才有；摘要里刻意不带 hire）。 */
+  /** 小窗的挂牌（只有完整视图才有）。 */
   function normalizeFarmHire (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const wage = Number(raw.wagePerHour)
@@ -854,11 +837,6 @@
       now: Number.isFinite(now) ? Math.floor(now) : 0,
       feeRate: HIRE_FEE_RATE
     }
-  }
-
-  /** 地块条只吃的摘要；完整农场进来也只留下摘要。null = 没有桌面层/没有农场。 */
-  function normalizeFarmSummary (raw) {
-    return normalizeFarm(raw, { full: false })
   }
 
   /** 交易所数量：1–99 的整数；字符串数字也认（input.value 常见）。 */
@@ -1037,14 +1015,19 @@
     }
   }
 
-  /** 宿主 → helper 的 `farm-window` 命令体：打开/刷新 + 完整农场视图 + 可选地块/访客块。 */
+  /**
+   * 宿主 → helper 的 `farm-window` 命令体：打开/刷新/关闭 + 完整农场视图 + 可选访客块。
+   * `open:true` 打开或聚焦；`open:false` 只刷新已开着的窗；`close:true` 明确关窗
+   * （ticket 46：再点一次「农场」或 `farm-close` 动作，不能和“刷新”混在一起）。
+   */
   function normalizeFarmWindow (raw) {
     const plotId = normalizePlotId(raw.plotId)
     const visit = normalizeFarmVisit(raw.visit)
     return {
       open: raw.open === true,
+      ...(raw.close === true ? { close: true } : {}),
       mode: raw.mode === 'visitor' ? 'visitor' : 'owner',
-      farm: normalizeFarm(raw.farm, { full: true }),
+      farm: normalizeFarm(raw.farm),
       market: normalizeMarket(raw.market),
       // ticket 44：雇工页的合同/挂牌由宿主 push，窗口永远不自己发请求。
       contracts: normalizeContracts(raw.contracts),
@@ -1280,8 +1263,6 @@
       visitors: [],
       street: [],
       gifts: [],
-      // ticket 40：桌面地块条的摘要；null = 没有农场（老宿主/没有桌面层），不是「4 块空地」。
-      farm: null,
       prompt: null,
       notice: null
     }
@@ -1394,10 +1375,6 @@
         })
       }
     }
-
-    // 农场（ticket 40）：场景里只放摘要，完整视图走 farm-window 命令。
-    // 缺省/坏形状 = null（老宿主/没有桌面层），渲染端据此不画地块条。
-    controls.farm = normalizeFarmSummary(raw.farm)
 
     const prompt = raw.prompt
     if (prompt !== null && typeof prompt === 'object' && !Array.isArray(prompt)) {
@@ -2235,6 +2212,11 @@
           : 'farm'
         return { ok: true, command: { type, id, tab } }
       }
+      case 'debug-farm-close': {
+        // 冒烟用：像用户一样关窗（点 × 或按 Esc），验小窗自己的关闭路径。
+        const via = raw.via === 'escape' ? 'escape' : 'button'
+        return { ok: true, command: { type, id, via } }
+      }
       case 'debug-gift-submit':
         // 冒烟用：把一段字条填进「带派」小窗并提交——验窗口 → 主进程 → 宿主那条回路。
         if (typeof raw.text !== 'string') return { ok: false, error: 'bad-text' }
@@ -2411,6 +2393,17 @@
             id,
             code: normalizeLabel(raw.code, 'helper-error'),
             message: normalizeText(raw.message, 'unknown error', MAX_ERROR_LENGTH)
+          }
+        }
+      case 'farm-window-state':
+        // ticket 46：小窗真的开了/关了。宿主用它切换右键「农场」的开/关语义；
+        // 用户点 ×/Esc 关窗也走这一条，所以不能只靠宿主自己的“我发过 open”。
+        return {
+          ok: true,
+          event: {
+            type,
+            id,
+            open: raw.open === true
           }
         }
       case 'action': {
@@ -2930,7 +2923,6 @@
     MAX_CONTRACT_EARNED,
     CONTRACT_STATUSES,
     HIRE_REASONS,
-    OWNER_PRESENCES,
     GIFT_STATUSES,
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
@@ -2948,11 +2940,9 @@
     MARKET_MIN_QTY,
     MARKET_MAX_QTY,
     normalizeFarm,
-    normalizeFarmSummary,
     normalizeFarmWindow,
     normalizeFarmAction,
     normalizeFarmHire,
-    normalizeFarmOwner,
     normalizeContracts,
     normalizeBadge,
     normalizeMarket,

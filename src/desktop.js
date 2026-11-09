@@ -126,6 +126,8 @@ export function createDesktop (options = {}) {
   let lastEvent = null
   /** 最近一次 helper 的 status 回执；里面带渲染端上报的当前 clip / failed，用于诊断。 */
   let lastStatus = null
+  /** 农场小窗的真实开关状态（ticket 46）：helper 在小窗开关时主动报，不靠宿主猜。 */
+  let farmWindowOpen = false
   let lastError = null
   let helperErrors = 0
   let restartTimer = null
@@ -434,6 +436,8 @@ export function createDesktop (options = {}) {
     } else if (event.type === 'shot' || event.type === 'status') {
       if (event.type === 'status') lastStatus = event
       settleReply(event)
+    } else if (event.type === 'farm-window-state') {
+      farmWindowOpen = event.open === true
     } else if (event.type === 'pong') {
       notePong()
     } else if (event.type === 'error') {
@@ -593,14 +597,16 @@ export function createDesktop (options = {}) {
   }
 
   /**
-   * 农场小窗（ticket 40）：把宿主算好的完整 farm view 交给 helper。
-   * `open:true` 打开/聚焦；`open:false` 只刷新已经开着的那扇（种/收之后）。
+   * 农场小窗（ticket 40/46）：把宿主算好的完整 farm view 交给 helper。
+   * `open:true` 打开/聚焦；`open:false` 只刷新已经开着的那扇；`close:true` 关窗
+   * （和刷新分开：刷新不能把窗口关掉）。
    * 窗口拿不到 `/state`，所以种子/作物/日志/剩余毫秒必须随这条命令一起走。
    */
   function farmWindow (payload = {}) {
     return sendHostCommand({
       type: 'farm-window',
       open: payload?.open === true,
+      ...(payload?.close === true ? { close: true } : {}),
       mode: payload?.mode === 'visitor' ? 'visitor' : 'owner',
       farm: payload?.farm ?? null,
       market: payload?.market ?? null,
@@ -725,6 +731,8 @@ export function createDesktop (options = {}) {
       helperErrors,
       lastEvent,
       lastStatus,
+      // ticket 46：右键「农场」按这个开关（用户用 ×/Esc 关窗也会同步过来）。
+      farmOpen: farmWindowOpen,
       assetRoots: assetRoots.slice(),
       giftsRoot,
       stderr: stderrLines.slice(),

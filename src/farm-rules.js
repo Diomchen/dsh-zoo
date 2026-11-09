@@ -80,7 +80,7 @@ export function isMature (plot) {
   return Number.isFinite(grownMs) && grownMs >= growMs
 }
 
-/** UI 用的阶段：empty / growing / mature（ticket 40 的地块条与状态出口共用）。 */
+/** UI 用的阶段：empty / growing / mature（ticket 40 的农场小窗与状态出口共用）。 */
 export function plotStage (plot) {
   if (!isCropId(plot?.crop)) return 'empty'
   return isMature(plot) ? 'mature' : 'growing'

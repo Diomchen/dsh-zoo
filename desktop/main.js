@@ -144,7 +144,8 @@ let giftSeq = 0
 /**
  * 农场小窗（ticket 40）。和改名/带派同一类独立窗口，但**刻意不按失焦关闭**：
  * macOS 中文输入法候选窗会抢焦点，blur 关窗会重演「打中文时小窗消失」。
- * 关窗只由 Esc / 右上角 × / 主窗 hide / 退出驱动；10 秒是**动作等待**超时，不是窗口寿命。
+ * 关窗只由 Esc / 右上角 × / 宿主 `close:true`（再点一次「农场」）/ 主窗 hide / 退出驱动；
+ * 10 秒是**动作等待**超时，不是窗口寿命。
  */
 let farmWin = null
 /** 宿主交下来的完整 farm view（地块/种子/作物/硬币/露水/日志），窗口打开或刷新时原样转发。 */
@@ -161,6 +162,11 @@ let farmPlotId = null
 /** 正在等宿主答复的那次农场动作（action id）与它的计时器。 */
 let farmPending = null
 let farmTimer = null
+/**
+ * 最近一次报给宿主的农场小窗开关（ticket 46）。宿主靠它把右键「农场」变成开/关切换；
+ * 只在真的变了时发，避免每次 ready/status 都刷一条。
+ */
+let lastFarmWindowOpen = null
 /** 农场申请的流水号，只用于给 action id 起个不重复的名字。 */
 let farmSeq = 0
 /** 桌面窗口覆盖的矩形（所有显示器工作区的并集，DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
@@ -1559,6 +1565,7 @@ function openFarmWindow () {
   farmWin = created
   farmPending = null
   clearFarmTimer()
+  notifyFarmWindowState()
   try {
     created.setAlwaysOnTop(true, process.platform === 'darwin' ? 'floating' : 'screen-saver')
   } catch {
@@ -1566,12 +1573,13 @@ function openFarmWindow () {
   }
   created.webContents.on('context-menu', (event) => event.preventDefault())
   // **不要**在 blur 时关窗：macOS 上打中文时输入法候选窗会抢走键盘焦点，这扇窗也会 blur。
-  // 农场窗没有输入框也一样——41/44 的页签迟早会加输入。关窗只由 Esc / × / hide / 退出驱动；
-  // 10 秒超时是「等宿主回执」的上限，不是窗口寿命。
+  // 农场窗没有输入框也一样——41/44 的页签迟早会加输入。关窗只由 Esc / × / 宿主 close:true /
+  // hide / 退出驱动；10 秒超时是「等宿主回执」的上限，不是窗口寿命。
   created.on('closed', () => {
     if (farmWin === created) farmWin = null
     farmPending = null
     clearFarmTimer()
+    notifyFarmWindowState()
   })
   created.once('ready-to-show', () => {
     if (farmWin !== created || created.isDestroyed()) return
@@ -1588,12 +1596,25 @@ function closeFarmWindow (reason) {
   clearFarmTimer()
   const target = farmWin
   farmWin = null
-  if (target === null || target.isDestroyed()) return
-  try {
-    target.destroy()
-  } catch {
-    // 已经没了
+  if (target !== null && !target.isDestroyed()) {
+    try {
+      target.destroy()
+    } catch {
+      // 已经没了
+    }
   }
+  notifyFarmWindowState()
+}
+
+/**
+ * 把农场小窗的真实开关报给宿主（ticket 46）：首次 ready 时 dedupe 会被重置。
+ * 只报变化；×/Esc/宿主 `close:true`/hide/退出都汇到这一条。
+ */
+function notifyFarmWindowState () {
+  const open = farmWin !== null && !farmWin.isDestroyed()
+  if (open === lastFarmWindowOpen) return
+  lastFarmWindowOpen = open
+  writeEvent({ type: 'farm-window-state', open })
 }
 
 function clearFarmTimer () {
@@ -1839,7 +1860,12 @@ function applyCommand (command) {
     }
     case 'farm-window': {
       // 宿主交下来的完整农场 + 交易所 + 访客块（ticket 40/41/43）：不落盘、不拼路径。
-      // `open:true` 打开/聚焦（已开则只刷新）；`open:false` 刷新已开着的窗。
+      // `open:true` 打开/聚焦（已开则只刷新）；`open:false` 刷新已开着的窗；
+      // `close:true` 才是关窗（ticket 46：再点一次「农场」/ `farm-close`），别和刷新混用。
+      if (command.close === true) {
+        closeFarmWindow('host')
+        return
+      }
       farmState = command.farm
       farmMarket = command.market
       farmContracts = command.contracts ?? null
@@ -2071,6 +2097,28 @@ function applyCommand (command) {
       void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
       return
     }
+    case 'debug-farm-close': {
+      // 冒烟用：像用户一样关窗。`button` 点右上角 ×，`escape` 在窗口里按 Esc；
+      // 两条都走 farm.js → preload → IPC 的真实路径，不是直接 destroy。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = command.via === 'escape'
+        ? '(() => {' +
+          'document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));' +
+          'return true;' +
+          '})()'
+        : '(() => {' +
+          'const button = document.getElementById("close");' +
+          'if (!button) return false;' +
+          'button.click();' +
+          'return true;' +
+          '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
     case 'debug-freeze-hover':
       if (!debugEnabled) return
       hover.frozen = command.frozen === true
@@ -2274,6 +2322,10 @@ function sendReady () {
     debug: debugEnabled,
     shotMode: isShotMode
   })
+  // ticket 46：新 helper 从「没有农场窗」开始。这里强制报一次真实状态，
+  // 宿主重启/重连后不会沿用上一个 helper 的旧开关。
+  lastFarmWindowOpen = null
+  notifyFarmWindowState()
 }
 
 /**

@@ -140,8 +140,7 @@
       .lp-popover,
       .lp-card,
       .lp-recall-chip,
-      .lp-notice,
-      .lp-farm-strip {
+      .lp-notice {
         position: absolute;
         left: 0;
         top: 0;
@@ -694,110 +693,6 @@
         font-size: 10.5px;
         font-weight: 500;
         color: rgba(244, 248, 255, 0.66);
-      }
-      /* 桌面地块条（ticket 40）：4 块小地 + 「农场」按钮。
-         只有按钮接指针（容器本身继续穿透）；地块用泥土色，成熟时金边 + 「熟」角标。 */
-      .lp-farm-strip {
-        display: flex;
-        align-items: center;
-        gap: 5px;
-        padding: 5px 6px;
-        border-radius: 12px;
-        background: rgba(15, 21, 29, 0.82);
-        border: 1px solid rgba(255, 255, 255, 0.14);
-        box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
-        pointer-events: none;
-      }
-      .lp-farm-plots {
-        display: flex;
-        gap: 4px;
-      }
-      .lp-farm-plot {
-        position: relative;
-        appearance: none;
-        width: 31px;
-        height: 36px;
-        padding: 2px 0 1px;
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 1px;
-        border: 1px solid rgba(255, 255, 255, 0.18);
-        border-radius: 8px;
-        background: linear-gradient(180deg, rgba(201, 165, 122, 0.5), rgba(137, 101, 68, 0.72));
-        color: #fff8ee;
-        font: inherit;
-        cursor: pointer;
-        pointer-events: auto;
-      }
-      .lp-farm-plot:hover {
-        border-color: rgba(255, 255, 255, 0.4);
-      }
-      .lp-farm-plot[data-stage='empty'] {
-        background: linear-gradient(180deg, rgba(170, 145, 116, 0.42), rgba(110, 91, 70, 0.6));
-      }
-      .lp-farm-plot[data-mature='true'] {
-        border-color: #e0a33c;
-        box-shadow: 0 0 0 1px rgba(224, 163, 60, 0.55), 0 3px 9px rgba(224, 163, 60, 0.24);
-      }
-      .lp-farm-plot-icon {
-        font-size: 15px;
-        line-height: 1;
-      }
-      .lp-farm-plot[data-stage='empty'] .lp-farm-plot-icon {
-        font-size: 12px;
-        opacity: 0.7;
-      }
-      .lp-farm-plot-label {
-        font-size: 7.5px;
-        font-weight: 700;
-        line-height: 1;
-        opacity: 0.7;
-      }
-      .lp-farm-plot-badge {
-        position: absolute;
-        top: -5px;
-        right: -5px;
-        min-width: 14px;
-        height: 14px;
-        padding: 0 2px;
-        border-radius: 999px;
-        background: #e0a33c;
-        color: #3d2f1b;
-        font-size: 8px;
-        font-weight: 800;
-        line-height: 14px;
-        text-align: center;
-        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-      }
-      .lp-farm-plot-badge[hidden] {
-        display: none !important;
-      }
-      .lp-farm-status {
-        padding: 0 2px;
-        font-size: 9px;
-        font-weight: 600;
-        color: rgba(244, 248, 255, 0.62);
-        white-space: nowrap;
-      }
-      .lp-farm-open {
-        appearance: none;
-        padding: 5px 9px;
-        border: 1px solid rgba(111, 155, 95, 0.7);
-        border-radius: 8px;
-        background: #547c46;
-        color: #fff;
-        font: inherit;
-        font-size: 10px;
-        font-weight: 700;
-        line-height: 1.2;
-        cursor: pointer;
-        white-space: nowrap;
-        pointer-events: auto;
-      }
-      .lp-farm-open:hover {
-        background: #456a3a;
       }
       .lp-notice {
         max-width: 246px;

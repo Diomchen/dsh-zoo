@@ -229,33 +229,11 @@ function isThumbName (name) {
 }
 
 /**
- * 农场摘要（ticket 40）：桌面地块条只画「哪块地、什么阶段、熟没熟」，完整视图
- * （种子/作物/日志/剩余毫秒）由宿主在 `farm-window` 命令里给窗口，**不进场景**。
- *
- * `snapshot.farm` 是 39 的 `/state.farm` 形状（`src/farm.js` 的 `farmView`）；摘要的裁剪
- * 与上限跟 helper 共用 `shared.normalizeFarmSummary`，避免两处各写一套。没有农场
- * （老宿主 / 39 没起来 / 没有桌面层）时返回 null，渲染端据此不画地块条。
- */
-function farmFromSnapshot (snapshot) {
-  if (snapshot === null || typeof snapshot !== 'object') return null
-  if (snapshot.farm === null || typeof snapshot.farm !== 'object') return null
-  return shared.normalizeFarmSummary({ ...snapshot.farm, owner: ownerFrom(snapshot.self) })
-}
-
-/**
- * 主人自己的宠物在哪（ticket 44）：地块条要显示「看家中 / 串门中 / 在外打工」。
- * 优先级 work > out > home；老快照没有 work 时自然落到 out/home。
- */
-function ownerFrom (self) {
-  if (self === null || typeof self !== 'object') return { presence: 'home' }
-  if (self.work !== null && typeof self.work === 'object') return { presence: 'working' }
-  if (self.out !== null && typeof self.out === 'object') return { presence: 'visiting' }
-  return { presence: 'home' }
-}
-
-/**
  * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
  * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
+ *
+ * 农场不在桌面控件里（ticket 46）：地块条已删，完整农场只走 `farm-window` 命令；
+ * 桌面只保留 `role:'worker'` 的雇工宠物（它是宠物，不是农场）。
  *
  * 文案必须是人话——渲染端只负责显示，不猜 error code；失败/置灰都不允许静默。
  * 渲染端只会把这些按钮点击翻译成 action 申请，状态变化仍然等下一次快照。
@@ -309,7 +287,6 @@ export function controlsFromSnapshot (snapshot, options = {}) {
 
   controls.street = streetFromSnapshot(snapshot)
   controls.gifts = giftsFromSnapshot(snapshot, options)
-  controls.farm = farmFromSnapshot(snapshot)
 
   const prompt = snapshot.prompt !== null && typeof snapshot.prompt === 'object' ? snapshot.prompt : null
   if (prompt !== null) {

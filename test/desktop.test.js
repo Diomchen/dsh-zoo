@@ -1989,18 +1989,12 @@ test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后
 // ticket 40：农场摘要 / farm-window / 地块动作的窄口
 // ---------------------------------------------------------------------------
 
-test('场景 controls.farm：只留地块摘要；完整视图（种子/作物/日志）不进场景', () => {
+test('场景不含 controls.farm：农场只走小窗，老宿主多发的摘要被丢掉', () => {
   const scene = shared.normalizeScene({
     items: [],
     controls: {
       farm: {
-        plots: [
-          { id: 'p1', crop: 'tomato', grownMs: 100, growMs: 1000 },
-          { id: 'p2', crop: 'carrot', grownMs: 2000, growMs: 1000 },
-          { id: 'p1', crop: 'pumpkin', grownMs: 0, growMs: 1 },
-          { id: 'bad id', crop: 'tomato' },
-          { id: 'p3', crop: 'unknown' }
-        ],
+        plots: [{ id: 'p1', crop: 'tomato', grownMs: 100, growMs: 1000 }],
         seeds: { tomato: 2 },
         crops: { carrot: 5 },
         coins: 30.7,
@@ -2012,26 +2006,10 @@ test('场景 controls.farm：只留地块摘要；完整视图（种子/作物/�
       }
     }
   })
-  const farm = scene.controls.farm
-  assert.deepEqual(farm.plots, [
-    { id: 'p1', crop: 'tomato', stage: 'growing', mature: false },
-    { id: 'p2', crop: 'carrot', stage: 'mature', mature: true },
-    { id: 'p3', crop: null, stage: 'empty', mature: false }
-  ])
-  assert.equal(farm.coins, 30)
-  assert.equal(farm.dew, shared.MAX_FARM_DEW)
-  assert.deepEqual(farm.worker, { nickname: '阿蟹' })
-  assert.equal(farm.contractCount, shared.MAX_FARM_CONTRACTS)
-  // 完整农场才有的字段不许漏进场景（否则 controls 每帧签名被日志/仓库带着狂变）。
-  for (const key of ['seeds', 'crops', 'log', 'hire']) assert.equal(key in farm, false, key)
-  // 没有农场 = null（老宿主/没有桌面层），不是“4 块空地”。
-  assert.equal(shared.normalizeControls({}).farm, null)
-  assert.equal(shared.normalizeControls({ farm: null }).farm, null)
-  assert.equal(shared.normalizeControls({ farm: 'nope' }).farm, null)
-  const capped = shared.normalizeFarmSummary({
-    plots: ['p1', 'p2', 'p3', 'p4', 'p5'].map((id) => ({ id, crop: null }))
-  })
-  assert.equal(capped.plots.length, shared.MAX_FARM_PLOTS)
+  assert.equal('farm' in scene.controls, false)
+  assert.equal('farm' in shared.emptyControls(), false)
+  assert.equal('farm' in shared.normalizeControls({}), false)
+  assert.equal('farm' in shared.normalizeControls({ farm: null }), false)
 })
 
 test('farm-window：完整视图带上 remainingMs/waterings/fertilized/种子/日志，坏值夹取', () => {
@@ -2088,6 +2066,11 @@ test('farm-window：完整视图带上 remainingMs/waterings/fertilized/种子/�
   assert.equal(refresh.command.open, false)
   assert.equal(refresh.command.farm, null)
   assert.equal('plotId' in refresh.command, false)
+  // ticket 46：关窗是显式 `close:true`，刷新（open:false）绝不会关窗。
+  assert.equal('close' in refresh.command, false)
+  const close = shared.normalizeHostCommand({ type: 'farm-window', open: false, close: true })
+  assert.equal(close.command.close, true)
+  assert.equal(close.command.open, false)
 })
 
 test('helper 动作：农场四条必须带 plotId，种地还要 cropId；farm-open 可省 plotId', () => {
@@ -2146,6 +2129,16 @@ test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status �
   assert.equal(status.event.status.farmVisible, true)
   assert.equal(status.event.status.farmFocused, false)
 
+  // ticket 46：helper 在小窗开关时主动报状态，宿主靠它做开/关切换。
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'farm-window-state', open: true }),
+    { ok: true, event: { type: 'farm-window-state', id: null, open: true } }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'farm-window-state' }),
+    { ok: true, event: { type: 'farm-window-state', id: null, open: false } }
+  )
+
   const debugFarm = shared.normalizeHostCommand({
     type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1', cropId: 'tomato'
   }).command
@@ -2166,6 +2159,8 @@ test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status �
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'hire' }).command.tab, 'hire')
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'log' }).command.tab, 'log')
   assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'nope' }).command.tab, 'farm')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-close', via: 'escape' }).command.via, 'escape')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-close', via: 'nope' }).command.via, 'button')
 
   // 普通运行的 helper 连白名单都进不来：debug 命令只在显式 --dsh-zoo-debug 下可解析。
   const off = { debug: false }
@@ -2215,10 +2210,20 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   assert.equal(command.type, 'farm-window')
   assert.equal(command.open, true)
   assert.equal(command.plotId, 'p1')
+  assert.equal('close' in command, false)
   // 完整农场多一个只显示的驮包；没有在途物品时是空数组（helper 只画有值的那几条）。
   assert.deepEqual(command.farm, { ...farm, carried: [] })
 
   assert.equal(manager.farmWindow({ open: false, farm }), true)
   assert.equal(children[0].parsedLines().at(-1).open, false)
   assert.equal('plotId' in children[0].parsedLines().at(-1), false)
+
+  // ticket 46：关窗是显式字段；宿主 status() 的 farmOpen 跟着 helper 的窗口状态走。
+  assert.equal(manager.status().farmOpen, false)
+  children[0].emitLine({ type: 'farm-window-state', open: true })
+  assert.equal(manager.status().farmOpen, true)
+  assert.equal(manager.farmWindow({ open: false, close: true }), true)
+  assert.equal(children[0].parsedLines().at(-1).close, true)
+  children[0].emitLine({ type: 'farm-window-state', open: false })
+  assert.equal(manager.status().farmOpen, false)
 })

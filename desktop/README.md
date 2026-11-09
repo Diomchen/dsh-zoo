@@ -82,7 +82,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
 | `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行。地址可能带 DSH 的 launch token：helper 只转交，不写日志、也不回传给渲染端 |
 | `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
-| `farm-window` | `open`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'`, `visit?`, `plotId?` | 打开或刷新农场小窗（ticket 40/41/43/44）。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
+| `farm-window` | `open`, `close?`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'`, `visit?`, `plotId?` | 打开/刷新/关闭农场小窗（ticket 40/41/43/44/46）。`close:true` 才关窗（再点一次「农场」或 `farm-close`），`open:false` 只刷新。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
 | `shot` | `id?`, `path`（绝对路径）, `window?:'bring'\|'farm'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` / `window:'farm'` 抓对应小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
@@ -105,6 +105,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-gift-remove` | — | 调试/冒烟：点「带派」小窗背包列表里第一个可撤的「撤掉」 |
 | `debug-farm-submit` | `action`, `plotId?`, `cropId?`, `qty?`, `deviceId?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 调试/冒烟：在农场小窗里提交一次动作，走和用户点击相同的 preload → IPC 窄口 |
 | `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'\|'log'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
+| `debug-farm-close` | `via:'button'\|'escape'` | 调试/冒烟：像用户一样点 × 或按 Esc 关农场小窗（走真实 IPC，不直接 destroy） |
 
 ## 右键菜单（ticket 22）
 
@@ -128,6 +129,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
+| `farm-window-state` | `open` | 农场小窗真的开了/关了（含用户点 ×/Esc）；宿主靠它把右键「农场」变成开/关切换 |
 | `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?`, `plotId?`, `cropId?`, `qty?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`/`farm-*`/`hire`/`recall-worker`/`end-contract`/`hire-listing`/`farm-open`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），农场动作只带 `plotId`/`cropId`/`qty`，雇佣只带 `deviceId`/`hours`/`contractId`/挂牌四字段；helper 只校验形状，清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
@@ -331,14 +333,17 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
 - 只有这扇窗自己的 `webContents` 能发 `dsh-zoo:gift-*`（`isGiftSender`），与改名窗同一个模型。
 
-## 农场小窗（ticket 40 / 43 / 44）
+## 农场小窗（ticket 40 / 43 / 44 / 46）
 
 农场小窗和改名/带派同一种模型：**宿主算数据，helper 只画和收输入**。窗口是 `file://`
 页面，没有 Node、没有网络、读不到 `/state`；地块、种子、作物、交易所、合同和访客快照
 全部随 `farm-window` 命令下发，成功/失败走 `action-result`，窗口不自动关。
 
-- 打开：右键菜单「农场」、桌面地块条或点某块地 → 渲染端发 `farm-open`（可带 `plotId`）；
-  宿主发 `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
+- 打开：右键菜单「农场」→ 渲染端只发一个 `farm-open`（不带 `plotId`）；宿主发
+  `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
+  小窗开着时再点「农场」= 宿主发 `farm-window { open:false, close:true }` 关窗；
+  宿主按 helper 回报的 `farm-window-state` / `desktop.status().farmOpen` 决定开还是关。
+  桌面没有地块条，也没有 `controls.farm`（ticket 46）。
   正出门串门时同一扇窗进入访客模式，先推 `visit.state:'loading'`，拿到主人快照后变
   `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。
 - 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 50 条；窗口顶部有一条
@@ -353,10 +358,12 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   偷/帮由宿主等 UDP 结果（最多约 1.8 秒），窗口只发一次申请。
 - 每块地、每份合同、每条日志都有二次校验：`shared.normalizeFarm` 只重建白名单字段，
   未知作物/坏阶段/坏价格/坏合同只丢自己，不把错误数据画进窗口。
-- 失焦、Esc、主窗 `hide`、helper 退出都会关窗；失焦不关（macOS 中文输入法候选窗会触发
-  blur，和改名/带派同一条取舍）。
-- 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会分别
-  截桌面地块条、农场页、交易所页、雇工页、记录页和访客偷/帮视图；`debug-farm-tab` 只用于这一步。
+- ×、Esc、主窗 `hide`、helper 退出都会关窗；失焦不关（macOS 中文输入法候选窗会触发
+  blur，和改名/带派同一条取舍）。×/Esc 走窗口自己的 `dsh-zoo:farm-close` IPC，
+  宿主只负责打开/刷新/显式 `close:true`。
+- 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会验
+  右键「农场」开窗、再点关闭、×/Esc 关闭和雇工仍带「打工」角标；并截农场菜单、农场页、
+  交易所页、雇工页、记录页和访客偷/帮视图。`debug-farm-tab` / `debug-farm-close` 只用于这一步。
 
 ## 多显示器 / 分辨率
 

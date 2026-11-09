@@ -2305,7 +2305,7 @@ async function verifyBringWindow () {
 }
 
 // ---------------------------------------------------------------------------
-// 2.6) 农场（ticket 40）：桌面 4 块地 + 真窗口打开 + 动作回路 + 不按失焦关窗
+// 2.6) 农场（ticket 40/46）：右键开/关 + 真窗口 + 动作回路 + ×/Esc + 雇工宠物
 // ---------------------------------------------------------------------------
 
 async function verifyFarmWindow () {
@@ -2320,19 +2320,6 @@ async function verifyFarmWindow () {
     { id: 'p3', crop: null, stage: 'empty', mature: false, remainingMs: 0 },
     { id: 'p4', crop: 'pumpkin', stage: 'growing', mature: false, remainingMs: 60 * 60 * 1000 }
   ]
-  const summary = {
-    plots: farmPlots.map((plot) => ({
-      id: plot.id,
-      crop: plot.crop,
-      stage: plot.stage,
-      mature: plot.mature
-    })),
-    coins: 30,
-    dew: 5,
-    worker: null,
-    contractCount: 0,
-    owner: { presence: 'home' }
-  }
   const fullFarm = {
     plots: farmPlots.map((plot) => ({ ...plot, waterings: 0, fertilized: false })),
     seeds: { tomato: 2, carrot: 0, pumpkin: 0 },
@@ -2399,7 +2386,7 @@ async function verifyFarmWindow () {
     pendingHire: false
   }
 
-  // 1) 主窗的桌面地块条：4 块地 + 成熟角标 + 「农场」按钮都在命中矩形里。
+  // 1) ticket 46：桌面没有地块条/农场摘要；「农场」只在右键菜单里。
   client.send({
     type: 'update',
     scene: shared.petScene([
@@ -2411,48 +2398,61 @@ async function verifyFarmWindow () {
         visitors: [],
         street: [],
         gifts: [],
-        farm: summary,
         prompt: null,
         notice: null
+      },
+      menu: {
+        tools: [
+          { id: 'bring', label: '带派' },
+          { id: 'farm', label: '农场' },
+          { id: 'home', label: '回到初始位置' },
+          { id: 'reload', label: '重载配置' }
+        ],
+        groups: [{ label: '待机', actions: ['东张西望'] }]
       }
     })
   })
   await sleep(900)
-  const stripState = await client.rendererState()
-  assert(stripState.controls.farm !== null, '渲染端画出农场摘要')
-  assert(stripState.controls.farm.plots.length === 4, '桌面上有 4 块地')
-  assert(stripState.controls.farm.mature === 1, '成熟角标跟摘要走（1 块熟）')
-  const stripIds = stripState.uiRects.map((rect) => rect.id)
-  for (const id of ['ui:farm-strip', 'ui:farm:p1', 'ui:farm:p2', 'ui:farm:p3', 'ui:farm:p4', 'ui:farm-open']) {
-    assert(stripIds.includes(id), '地块条命中矩形：' + id)
-  }
-  const stripPath = join(OUT_DIR, 'farm-strip.png')
-  client.send({ type: 'shot', id: 'smoke-farm-strip', path: stripPath })
-  await client.waitFrom(client.mark(), (event) => event.type === 'shot', 6000, '桌面地块条截图')
-  assert(existsSync(stripPath), '桌面地块条截图落盘：' + stripPath)
+  const desktopState = await client.rendererState()
+  assert(desktopState.controls.farm === undefined, '桌面场景不再有农场摘要')
+  const farmRectIds = desktopState.uiRects.map((rect) => rect.id).filter((id) => id.startsWith('ui:farm'))
+  assert(farmRectIds.length === 0, '桌面没有 ui:farm-* 命中矩形（' + farmRectIds.join(',') + '）')
 
-  // 点第 2 块地：渲染端必须把 farm-open + plotId 当一次申请交给宿主。
-  const plotRect = stripState.uiRects.find((rect) => rect.id === 'ui:farm:p2')
-  assert(plotRect !== undefined, '第 2 块地有命中矩形可点')
+  // 右键自己 → 菜单里有「农场」；点它只发一个 farm-open，不带 plotId。
+  // 宠物会走：每次右键前现取位置，别用几百毫秒前的那份坐标。
+  const menuMark = client.mark()
+  const beforeMenu = await client.rendererState()
+  const selfPet = beforeMenu.pets.find((pet) => pet.id === 'self')
+  assert(selfPet !== undefined, '场景里有自己')
+  const selfCenter = screenCenter(selfPet, ready.workArea)
+  client.send({ type: 'debug-dispatch', phase: 'context', x: selfCenter.x, y: selfCenter.y })
+  await waitUntil(async () => (await client.rendererState()).menu !== null, 3000, '右键菜单打开')
+  const menuState = await client.rendererState()
+  const farmRow = menuState.menu.rows.find((row) => row.kind === 'tool' && row.label === '农场')
+  assert(Boolean(farmRow), '菜单里有「农场」')
+  const menuPath = join(OUT_DIR, 'farm-menu.png')
+  client.send({ type: 'shot', id: 'smoke-farm-menu', path: menuPath })
+  await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-menu',
+    6000,
+    '农场菜单截图'
+  )
+  assert(existsSync(menuPath), '农场菜单截图落盘：' + menuPath)
+  const farmPoint = rectCenterScreen(farmRow, ready.workArea)
   const clickMark = client.mark()
-  client.send({
-    type: 'debug-dispatch',
-    phase: 'click',
-    // debug-dispatch 的坐标是屏幕 DIP；uiRects 是窗口局部 DIP，要加上工作区原点。
-    x: ready.workArea.x + plotRect.x + plotRect.width / 2,
-    y: ready.workArea.y + plotRect.y + plotRect.height / 2
-  })
-  const clickAction = await client.waitFrom(
+  client.send({ type: 'debug-dispatch', phase: 'click', x: farmPoint.x, y: farmPoint.y })
+  const menuAction = await client.waitFrom(
     clickMark,
     (event) => event.type === 'action' && event.action === 'farm-open',
     5000,
-    '点地块开窗申请'
+    '菜单「农场」开窗申请'
   )
-  assert(clickAction.plotId === 'p2', '点第 2 块地带的就是 plotId=p2（' + clickAction.plotId + '）')
-  client.send({ type: 'action-result', id: clickAction.id, ok: true })
+  assert(menuAction.plotId === undefined, '菜单「农场」不带 plotId')
+  client.send({ type: 'action-result', id: menuAction.id, ok: true })
+  await waitUntil(async () => (await client.rendererState()).menu === null, 2000, '点完收起菜单')
 
-  // 票 44：雇工宠物带 role:'worker' + badge:'work'；self 在 out/work 时消失由宿主决定，
-  // 这里直接喂场景验渲染端四层白名单。
+  // 票 44/46：雇工宠物仍在桌面，带 role:'worker' + badge:'work'；它不再依赖地块条。
   client.send({
     type: 'update',
     scene: shared.petScene([
@@ -2472,7 +2472,6 @@ async function verifyFarmWindow () {
         visitors: [],
         street: [],
         gifts: [],
-        farm: { ...summary, worker: { nickname: '阿蟹' }, contractCount: 1 },
         prompt: null,
         notice: null
       }
@@ -2483,11 +2482,11 @@ async function verifyFarmWindow () {
   const workerPet = workerState.pets.find((pet) => pet.role === 'worker')
   assert(workerPet !== undefined, '渲染端画出 role:worker 的雇工')
   assert(workerPet.badge === 'work', '雇工带 work 角标')
-  assert(workerState.controls.farm.worker.nickname === '阿蟹', '摘要里带雇工昵称')
-  const workerStripPath = join(OUT_DIR, 'farm-worker-strip.png')
-  client.send({ type: 'shot', id: 'smoke-farm-worker-strip', path: workerStripPath })
-  await client.waitFrom(client.mark(), (event) => event.type === 'shot', 6000, '雇工地块条截图')
-  assert(existsSync(workerStripPath), '雇工地块条截图落盘：' + workerStripPath)
+  assert(workerState.controls.farm === undefined, '雇工场景同样没有农场摘要')
+  const workerPath = join(OUT_DIR, 'farm-worker.png')
+  client.send({ type: 'shot', id: 'smoke-farm-worker', path: workerPath })
+  await client.waitFrom(client.mark(), (event) => event.type === 'shot', 6000, '雇工桌面截图')
+  assert(existsSync(workerPath), '雇工桌面截图落盘：' + workerPath)
 
   // 2) 宿主开窗：完整农场（种子/作物/日志/remainingMs）+ contracts（雇工页）随命令下发。
   client.send({ type: 'farm-window', open: true, farm: fullFarm, market: fullMarket, contracts: fullContracts, plotId: 'p1' })
@@ -2640,6 +2639,30 @@ async function verifyFarmWindow () {
   // 失败 toast 会活 4.2 秒；等它消失再截访客视图，别把上一段的错误画进验收图。
   await sleep(4300)
 
+  // 7) ticket 46 的三种关窗：宿主 close:true（再点一次「农场」）、×、Esc。
+  client.send({ type: 'farm-window', open: false, close: true })
+  await client.waitStatus((status) => status.farmOpen === false, 4000, '宿主 close:true 关窗')
+
+  const reopenFarm = async (label) => {
+    client.send({
+      type: 'farm-window',
+      open: true,
+      farm: fullFarm,
+      market: fullMarket,
+      contracts: fullContracts,
+      plotId: 'p1'
+    })
+    await client.waitStatus((status) => status.farmOpen === true, 5000, label + '：重新打开')
+  }
+
+  await reopenFarm('× 前')
+  client.send({ type: 'debug-farm-close', via: 'button' })
+  await client.waitStatus((status) => status.farmOpen === false, 4000, '点 × 关窗')
+
+  await reopenFarm('Esc 前')
+  client.send({ type: 'debug-farm-close', via: 'escape' })
+  await client.waitStatus((status) => status.farmOpen === false, 4000, '按 Esc 关窗')
+
   // 票 43/45：访客视图（偷/帮按钮、守卫、上限）单独截一张；数据全由宿主 push。
   const visitorVisit = {
     state: 'ready',
@@ -2694,35 +2717,41 @@ async function verifyFarmWindow () {
       info('农场截图笔记：' + dest)
       return dest
     }
-    noteComposite(pngPath, '45-farm-window-composited.png')
-    noteComposite(marketPath, '45-farm-market-composited.png')
-    noteComposite(hirePath, '45-farm-hire-composited.png')
-    noteComposite(logPath, '45-farm-log-composited.png')
-    noteComposite(stealPath, '45-farm-steal-composited.png')
-    // 地块条截图是整张透明桌面；按命中矩形裁到地块条附近再合成，笔记里才看得清。
-    const noteStrip = (src, state, name) => {
+    const noteCrop = (src, rect, name, pad = 24) => {
       const srcImage = decodePng(readFileSync(src))
-      const rect = state.uiRects.find((candidate) => candidate.id === 'ui:farm-strip')
-      if (rect === undefined) return null
       const scale = srcImage.width / ready.workArea.width
-      const pad = 24 * scale
-      const left = Math.max(0, Math.floor(rect.x * scale - pad))
-      const top = Math.max(0, Math.floor(rect.y * scale - pad))
-      const width = Math.min(srcImage.width - left, Math.floor(rect.width * scale + pad * 2))
-      const height = Math.min(srcImage.height - top, Math.floor(rect.height * scale + pad * 2))
+      const left = Math.max(0, Math.floor((rect.x - pad) * scale))
+      const top = Math.max(0, Math.floor((rect.y - pad) * scale))
+      const right = Math.min(srcImage.width, Math.ceil((rect.x + rect.width + pad) * scale))
+      const bottom = Math.min(srcImage.height, Math.ceil((rect.y + rect.height + pad) * scale))
+      const width = right - left
+      const height = bottom - top
       if (width <= 0 || height <= 0) return null
       const dest = join(NOTES_DIR, name)
       writeFileSync(dest, encodePng(compositeOverCheckerboard(cropImage(srcImage, left, top, width, height))))
       notePaths.push(dest)
-      info('农场地块条截图笔记：' + dest)
+      info('农场截图笔记：' + dest)
       return dest
     }
-    noteStrip(stripPath, stripState, '45-farm-strip.png')
-    noteStrip(workerStripPath, workerState, '45-farm-worker-strip.png')
-    // 雇工角标特写：地块条里看不到宠物本体，单独裁一张 worker pet 的图。
+    noteComposite(pngPath, '46-farm-window-composited.png')
+    noteComposite(marketPath, '46-farm-market-composited.png')
+    noteComposite(hirePath, '46-farm-hire-composited.png')
+    noteComposite(logPath, '46-farm-log-composited.png')
+    noteComposite(stealPath, '46-farm-steal-composited.png')
+    // 菜单截图是整张透明桌面：裁到菜单 + 宠物附近，能同时看到「农场」菜单项和没有地块条。
+    const menuPanel = menuState.menu.panels[0]
+    const menuPet = menuState.pets.find((pet) => pet.id === 'self') ?? selfPet
+    if (menuPanel !== undefined && menuPet !== undefined) {
+      const left = Math.min(menuPanel.x, menuPet.x)
+      const top = Math.min(menuPanel.y, menuPet.y)
+      const right = Math.max(menuPanel.x + menuPanel.width, menuPet.x + menuPet.width)
+      const bottom = Math.max(menuPanel.y + menuPanel.height, menuPet.y + menuPet.height)
+      noteCrop(menuPath, { x: left, y: top, width: right - left, height: bottom - top }, '46-farm-menu.png')
+    }
+    // 雇工特写：按 worker pet 的位置裁，证明它仍是桌面宠物（带「打工」角标）。
     const workerPetState = workerState.pets.find((pet) => pet.role === 'worker')
     if (workerPetState !== undefined) {
-      const srcImage = decodePng(readFileSync(workerStripPath))
+      const srcImage = decodePng(readFileSync(workerPath))
       const scale = srcImage.width / ready.workArea.width
       const pad = 18 * scale
       const left = Math.max(0, Math.floor((workerPetState.x - 18) * scale))
@@ -2730,10 +2759,10 @@ async function verifyFarmWindow () {
       const width = Math.min(srcImage.width - left, Math.floor((workerPetState.width + 36) * scale))
       const height = Math.min(srcImage.height - top, Math.floor((workerPetState.height + 36) * scale))
       if (width > 0 && height > 0) {
-        const dest = join(NOTES_DIR, '45-farm-worker.png')
+        const dest = join(NOTES_DIR, '46-farm-worker.png')
         writeFileSync(dest, encodePng(compositeOverCheckerboard(cropImage(srcImage, left, top, width, height))))
         notePaths.push(dest)
-        info('雇工角标特写：' + dest)
+        info('雇工宠物特写：' + dest)
       }
     }
   }
@@ -2741,7 +2770,7 @@ async function verifyFarmWindow () {
   client.send({ type: 'quit' })
   const exit = await Promise.race([client.exited, sleep(10000).then(() => null)])
   assert(exit !== null, '农场用例结束后 helper 自己退出')
-  return { pngPath, stripPath, marketPath, hirePath, stealPath, workerStripPath, notePaths }
+  return { pngPath, menuPath, marketPath, hirePath, stealPath, workerPath, notePaths }
 }
 
 async function verifyManager () {
@@ -2908,7 +2937,7 @@ try {
   const gifts = wants('gift') ? await run('礼物卡：字条卡片 / 复制 / 扔掉 / 命中矩形', verifyGifts) : null
   const bring = wants('bring') ? await run('带派小窗：真窗口打开 / 背包列表 / 截图 / 退出', verifyBringWindow) : null
   const farmWindow = wants('farm')
-    ? await run('农场：桌面 4 块地 / 小窗打开 / 动作回路 / 失焦不关', verifyFarmWindow)
+    ? await run('农场：右键开/关 / ×·Esc / 小窗动作回路 / 雇工仍在桌面', verifyFarmWindow)
     : null
   if (wants('manager')) await run('manager：ready / update / resync / shot / 崩溃重启 / dispose', verifyManager)
   if (wants('kill')) await run('生命周期：宿主被 SIGKILL 后 helper 自行退出', verifyHostKill)
@@ -2937,11 +2966,12 @@ try {
     if (bring.notePath !== null) console.log('  带派小窗（棋盘格合成）: ' + bring.notePath)
   }
   if (farmWindow !== null) {
-    console.log('桌面地块条截图：' + farmWindow.stripPath)
+    console.log('农场菜单截图：' + farmWindow.menuPath)
     console.log('农场小窗截图：' + farmWindow.pngPath)
     console.log('交易所页截图：' + farmWindow.marketPath)
     console.log('雇工页截图：' + farmWindow.hirePath)
     console.log('访客偷/帮截图：' + farmWindow.stealPath)
+    console.log('雇工宠物截图：' + farmWindow.workerPath)
     for (const note of farmWindow.notePaths) console.log('  农场截图笔记: ' + note)
   }
   if (standalone !== null) console.log('截图模式输出：' + standalone.pngPath)

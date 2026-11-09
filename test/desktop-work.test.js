@@ -1,5 +1,5 @@
 /**
- * 票 44：桌面的 worker 层（role/badge/owner presence/contracts 白名单）。
+ * 票 44/46：桌面的 worker 层（role/badge/contracts 白名单；农场摘要已删）。
  *
  * 四层都要过：`normalizeScene`（wire）→ `petScene`（host）→ `normalizeItem`（helper）
  * → 渲染端读到的 `item.role`/`item.badge`。这里从 helper 的 shared 入口与宿主翻译层两侧验。
@@ -36,13 +36,6 @@ function snapshotWith (overrides = {}) {
     visitTargets: [],
     visitBlockedReason: null,
     worker: null,
-    farm: {
-      plots: [{ id: 'p1', crop: null, stage: 'empty', mature: false }],
-      coins: 30,
-      dew: 0,
-      worker: null,
-      contractCount: 0
-    },
     ...overrides
   }
 }
@@ -74,8 +67,8 @@ test('petsFromSnapshot：worker 在 self 之后、visitors 之前，带 role/bad
   assert.equal(pets[1].label, '阿蟹')
   assert.equal(pets[1].anim, '打工中')
   assert.equal(pets[1].badge, 'work')
-  // worker 不占访客名额。
-  assert.equal(shared.normalizeControls({ farm: shared.normalizeFarmSummary(snapshot.farm) }).farm.owner.presence, 'home')
+  // worker 不占访客名额；桌面场景也不再有农场摘要（ticket 46）。
+  assert.equal('farm' in controlsFromSnapshot(snapshot), false)
 })
 
 test('self.work：本机宠物在外打工时 self 从桌面消失；controls 给出「不能串门」', () => {
@@ -103,28 +96,7 @@ test('self.work：本机宠物在外打工时 self 从桌面消失；controls �
   const controls = controlsFromSnapshot(snapshot)
   assert.equal(controls.visit.enabled, false)
   assert.match(controls.visit.reason, /在外打工/)
-  assert.equal(controls.farm.owner.presence, 'working')
   assert.equal(controls.recall.enabled, false, '召回只服务串门，雇工合同在农场窗里召回')
-})
-
-test('farm owner presence：home / visiting / working，缺省回 home', () => {
-  const home = controlsFromSnapshot(snapshotWith()).farm
-  assert.deepEqual(home.owner, { presence: 'home' })
-
-  const visiting = controlsFromSnapshot(snapshotWith({
-    self: {
-      ...snapshotWith().self,
-      out: { deviceId: EMPLOYER, nickname: '柯基', visitId: randomUUID(), phase: 'active', startedAt: 1, endsAt: 2 }
-    }
-  })).farm
-  assert.deepEqual(visiting.owner, { presence: 'visiting' })
-
-  // 老宿主没有 owner：normalizeFarmSummary 给 home，不画「看家中」的反向文案。
-  const legacy = shared.normalizeFarmSummary({ plots: [], coins: 0, dew: 0, worker: null, contractCount: 0 })
-  assert.deepEqual(legacy.owner, { presence: 'home' })
-  // 认不出的值不猜。
-  assert.deepEqual(shared.normalizeFarmSummary({ ...snapshotWith().farm, owner: { presence: 'nope' } }).owner,
-    { presence: 'home' })
 })
 
 test('helper 四层：PET_ROLES 含 worker，normalizeItem/petScene 保留 badge，非法 badge 丢弃', () => {
@@ -171,6 +143,7 @@ test('helper 四层：PET_ROLES 含 worker，normalizeItem/petScene 保留 badge
   ], { width: 1000, height: 700 }, {
     reset: true,
     controls: {
+      // 老宿主可能还在发 controls.farm；helper 必须丢掉（ticket 46：桌面没有地块条）。
       farm: {
         plots: [{ id: 'p1', crop: null }],
         coins: 30,
@@ -184,16 +157,12 @@ test('helper 四层：PET_ROLES 含 worker，normalizeItem/petScene 保留 badge
   assert.equal(scene.items.length, 3)
   assert.equal(scene.items[1].role, 'worker')
   assert.equal(scene.items[1].badge, 'work')
-  assert.equal(scene.controls.farm.owner.presence, 'home')
+  assert.equal('farm' in scene.controls, false, '老宿主的 controls.farm 不再进场景')
   // 坏 badge 不进入场景（固定枚举，不是自由文本）。
   const hostile = shared.normalizeScene({
     items: [{ id: 'worker:y', kind: 'pet', role: 'worker', badge: '<script>', label: 'x', x: 1, y: 2, width: 10, height: 10 }]
   })
   assert.equal(hostile.items[0].badge, undefined)
-  // 场景里仍然只有摘要，没有 hire/guard/seeds/log。
-  for (const key of ['hire', 'guard', 'seeds', 'crops', 'log']) {
-    assert.equal(key in scene.controls.farm, false, key)
-  }
 })
 
 test('farm-window：contracts 白名单只留公开字段，坏条目只丢自己', () => {
@@ -253,7 +222,7 @@ test('farm-window：contracts 白名单只留公开字段，坏条目只丢自�
   assert.equal(window.farm.hire.wagePerHour, 10)
   assert.equal(window.farm.guard, 0.8)
   assert.equal(window.farm.worker.nickname, '阿蟹')
-  // 完整视图不带 owner（那是地块条摘要的字段）。
+  // 完整视图不带 owner（那是已删的地块条摘要字段）。
   assert.equal('owner' in window.farm, false)
   assert.equal(window.contracts.outgoing.length, 1)
   assert.equal(window.contracts.outgoing[0].workerNickname, '阿蟹')
@@ -321,4 +290,27 @@ test('helper 事件：hire/recall-worker/end-contract/hire-listing 的字段白�
   assert.equal(debug.ok, true)
   assert.equal(debug.command.deviceId, WORKER)
   assert.equal(debug.command.hours, 2)
+})
+
+test('worker 宠物不依赖农场摘要：快照没有 farm 也照样出 role:worker', () => {
+  const snapshot = snapshotWith()
+  delete snapshot.farm
+  const worker = snapshotWith({
+    worker: {
+      contractId: randomUUID(),
+      workerDeviceId: WORKER,
+      workerNickname: '阿蟹',
+      startedAt: 1,
+      endsAt: 2,
+      guard: 0.5,
+      anim: null,
+      lastSeen: 1
+    }
+  })
+  delete worker.farm
+  const pets = petsFromSnapshot(worker)
+  const found = pets.find((pet) => pet.role === 'worker')
+  assert.equal(found.id, 'worker:' + WORKER)
+  assert.equal(found.badge, 'work')
+  assert.equal('farm' in controlsFromSnapshot(snapshot), false)
 })
