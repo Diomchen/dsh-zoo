@@ -802,8 +802,14 @@ class FarmStore {
     return changed
   }
 
-  /** 只读视图：调用方可以随便改返回值，改不到 store。 */
+  /**
+   * 只读视图：调用方可以随便改返回值，改不到 store。
+   *
+   * 先把生长/露水推进到 now 再取视图：`farm-open`/`/state` 不能拿上一次 60 秒 tick
+   * 的旧 `remainingMs`，否则窗口会先显示偏长的倒计时，下一次动作再跳回去。
+   */
   snapshot () {
+    this.#advance(this.#nowMs())
     return farmView(this.#state)
   }
 

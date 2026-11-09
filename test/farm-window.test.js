@@ -870,3 +870,35 @@ test('新外壳与配色：header/tabs/可滚动页/footer/toast/系统字体，
   assert.match(main, /const FARM_WIDTH = 420/)
   assert.match(main, /const FARM_HEIGHT = 560/)
 })
+
+test('farm-open：两个地块时倒计时从当前时刻算，不用上一次 tick 的旧快照', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: NOON }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value,
+    farmTickMs: 60 * 60 * 1000
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const planted = await callAction(service, { action: 'plant', plotId: 'p1', cropId: 'tomato' })
+  assert.equal(planted.body.ok, true)
+  const planted2 = await callAction(service, { action: 'plant', plotId: 'p2', cropId: 'tomato' })
+  assert.equal(planted2.body.ok, true)
+
+  // 5 分钟没有 farm tick：窗口打开时必须从「现在」算，不是上一次 tick 的 30:00/2h。
+  clock.value += 5 * 60 * 1000
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.body.ok, true)
+  const window = desktop.calls.windows.at(-1)
+  const p1 = window.farm.plots.find((plot) => plot.id === 'p1')
+  const p2 = window.farm.plots.find((plot) => plot.id === 'p2')
+  assert.equal(p1.remainingMs, 25 * 60 * 1000)
+  assert.equal(p2.remainingMs, 25 * 60 * 1000)
+})
