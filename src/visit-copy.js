@@ -22,6 +22,8 @@ export const VISIT_REASON_CODES = Object.freeze([
   'denied',
   'visits-off',
   'already-out',
+  // ticket 44：在外打工和出门一字之差，但下一步完全不同（等合同/召回）。
+  'already-working',
   'no-admitted',
   'no-online',
   'no-visitor',
@@ -54,6 +56,9 @@ export function visitReasonText (reason, nickname) {
   }
   if (reason === 'already-out') {
     return `宠物已经在「${name}」家了，先召回来再说。`
+  }
+  if (reason === 'already-working') {
+    return '宠物在外打工，合同结束前不能去串门。'
   }
   if (reason === 'no-admitted') {
     return '还没有人放行你，宠物出不了门。'

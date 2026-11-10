@@ -24,7 +24,7 @@ async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-smoke-'))
   t.after(async () => {
     await new Promise((resolve) => setTimeout(resolve, 50))
-    await rm(dir, { recursive: true, force: true })
+    await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 })
   })
   return dir
 }

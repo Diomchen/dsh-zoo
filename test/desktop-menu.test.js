@@ -13,6 +13,7 @@ test('菜单：工具项只认固定 id，坏条目只丢自己', () => {
     tools: [
       { id: 'home', label: '回到初始位置' },
       { id: 'open-site', label: '打开软件', hint: 'Ctrl+左键' },
+      { id: 'farm', label: '农场' },
       { id: 'rm-rf', label: '删库跑路' },
       { id: 'home', label: '重复的' },
       { id: 'reload' },
@@ -23,6 +24,7 @@ test('菜单：工具项只认固定 id，坏条目只丢自己', () => {
   assert.deepEqual(menu.tools, [
     { id: 'home', label: '回到初始位置' },
     { id: 'open-site', label: '打开软件', hint: 'Ctrl+左键' },
+    { id: 'farm', label: '农场' },
     { id: 'reload', label: '重载配置' }
   ])
 })

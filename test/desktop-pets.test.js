@@ -604,7 +604,7 @@ test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客�
 
 test('素材目录解析：环境覆盖 → 用户素材 → 包解析 → profiles 扫描，profile 名不写死', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-assets-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const user = join(dir, 'dsh-pet', 'main-animation', 'webm')
   const packageDir = join(dir, 'custom', 'dsh-pet')
   const packageAssets = join(packageDir, 'assets', 'webm')

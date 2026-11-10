@@ -4,18 +4,19 @@ import { readFile, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 
-import { GIFT_ROUTES, SKIN_ROUTES, matchRoute } from './lan-routes.js'
+import { FARM_ROUTES, GIFT_ROUTES, SKIN_ROUTES, matchRoute } from './lan-routes.js'
 import { MAX_GIFT_BYTES, isVisitId } from './protocol.js'
 
 /**
  * 局域网只读服务（ticket 15 的素材源 + ticket 25 的礼物源）。
  *
  * 这是 dsh-zoo 自己开的**只读** HTTP 端口——不能复用 DSH 的 webServer，它只绑
- * 127.0.0.1，邻居访问不到。同一个端口挂两套路由：
+ * 127.0.0.1，邻居访问不到。同一个端口挂三套路由：
  *   GET /dsh-zoo-skin/manifest            → 默认源的 manifest（含每个文件的 sha256）
  *   GET /dsh-zoo-skin/asset/<动作>         → WebM，支持 Range
  *   GET /dsh-zoo-skin/<源 id>/...          → 多源时的显式路由
  *   GET /dsh-zoo-gift/<giftId>             → 文件礼物的本体（只在 armed 期间可读）
+ *   GET /dsh-zoo-farm/<visitId>            → 访客视角的农场快照（只在串门活跃期可读）
  *
  * 改名前的老路径 `/local-pet-skin/*` 与 `/local-pet-gift/*` 仍在（src/lan-routes.js）：
  * 改名前的邻居（≤0.5.7）不会知道新名字，兼容期内照常能取。它们同样是只读的。
@@ -29,6 +30,7 @@ import { MAX_GIFT_BYTES, isVisitId } from './protocol.js'
  */
 
 export {
+  FARM_ROUTE,
   GIFT_ROUTE,
   LEGACY_GIFT_ROUTE,
   LEGACY_SKIN_ROUTE,
@@ -68,6 +70,11 @@ export async function startLanServer (options = {}) {
    * 表里没有 = 404；表里有但过期 = 404；文件被改/删 = 410；超过 16 MiB = 413。
    */
   const lookupGift = typeof options.lookupGift === 'function' ? options.lookupGift : null
+  /**
+   * 农场快照的唯一入口：`visitId → 访客视图`。service 每次现查 room + farm store，
+   * 表不在 server 里；返回 null/undefined 一律 404。视图里**绝不能**有路径或别人的 deviceId。
+   */
+  const lookupFarm = typeof options.lookupFarm === 'function' ? options.lookupFarm : null
 
   /** 建一张「源 id → 源」的表；坏条目只丢自己。 */
   function indexSources (list) {
@@ -166,6 +173,12 @@ export async function startLanServer (options = {}) {
         if (gift.rest === '' || gift.rest.includes('/')) return sendText(response, 404, 'not found')
         return handleGift(request, response, gift.rest)
       }
+      // 农场快照（ticket 43）：同样只有一层 visitId；形状/授权由 lookupFarm 决定。
+      const farm = matchRoute(pathname, FARM_ROUTES)
+      if (farm !== null) {
+        if (farm.rest === '' || farm.rest.includes('/')) return sendText(response, 404, 'not found')
+        return handleFarm(request, response, farm.rest)
+      }
       const skin = matchRoute(pathname, SKIN_ROUTES)
       if (skin === null) return sendText(response, 404, 'not found')
       return handleSkin(request, response, skin.rest)
@@ -224,6 +237,27 @@ export async function startLanServer (options = {}) {
       }
     })
     stream.pipe(response)
+  }
+
+  /**
+   * 农场快照：**只在这次串门活跃期间**可读。和礼物不同，表不在 server 里：
+   * service 每次现查 room + farm store；查不到 = 串门已结束 = 404
+   * （服务端不区分“从没来过”和“刚走”，也不泄露那次串门存在过）。
+   *
+   * `sendJson` 已经带 `cache-control: no-store` 并处理 HEAD，不另写一份。
+   * 视图由 service 构造（只含白名单字段）；这里只原样 JSON.stringify，不拼任何路径。
+   */
+  async function handleFarm (request, response, rawId) {
+    if (!isVisitId(rawId)) return sendText(response, 404, 'not found')
+    let view
+    try {
+      view = lookupFarm === null ? null : lookupFarm(rawId.toLowerCase())
+    } catch {
+      // 查询失败与“没有这次串门”同形：404 最不泄露，也不让一次坏请求变成 500。
+      view = null
+    }
+    if (view === null || view === undefined) return sendText(response, 404, 'not found')
+    return sendJson(response, 200, view, request.method === 'HEAD')
   }
 
   async function handleSkin (request, response, rest) {

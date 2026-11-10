@@ -10,6 +10,8 @@
 /** 新路径：本版本的规范写法。 */
 export const SKIN_ROUTE = '/dsh-zoo-skin'
 export const GIFT_ROUTE = '/dsh-zoo-gift'
+/** 农场快照（ticket 43）：只有新路径；改名前的邻居没有农场，不需要旧名字。 */
+export const FARM_ROUTE = '/dsh-zoo-farm'
 
 /** 旧路径：改名前的邻居还在用；纯兼容，不新增功能。 */
 export const LEGACY_SKIN_ROUTE = '/local-pet-skin'
@@ -18,6 +20,7 @@ export const LEGACY_GIFT_ROUTE = '/local-pet-gift'
 /** 按优先级排列：客户端按这个顺序试，服务端按同一张表匹配。 */
 export const SKIN_ROUTES = Object.freeze([SKIN_ROUTE, LEGACY_SKIN_ROUTE])
 export const GIFT_ROUTES = Object.freeze([GIFT_ROUTE, LEGACY_GIFT_ROUTE])
+export const FARM_ROUTES = Object.freeze([FARM_ROUTE])
 
 /**
  * pathname 命中哪条路由。

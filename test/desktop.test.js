@@ -1002,13 +1002,13 @@ function fakeCtx () {
 async function assetEnv (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-assets-'))
   await writeFile(join(dir, 'idle.webm'), Buffer.from('webm'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return { ...process.env, DSH_ZOO_DSH_PET_ASSETS: dir }
 }
 
 test('service：桌面层启动、ready 时下发占位场景、dispose 收掉；desktop:false 完全不碰', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
 
   const calls = { start: 0, dispose: 0, updates: [], resync: 0 }
   let captured = null
@@ -1070,7 +1070,7 @@ test('service：桌面层启动、ready 时下发占位场景、dispose 收掉�
 
 test('service：桌面工厂抛错只降级成一行告警，服务照常 ready', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const { ctx, warnings } = fakeCtx()
   const service = createService(ctx, {
     network: false,
@@ -1087,7 +1087,7 @@ test('service：桌面工厂抛错只降级成一行告警，服务照常 ready'
 
 test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作无需逐帧 update）', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-sync-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const updates = []
   let captured = null
   const factory = (options) => {
@@ -1147,7 +1147,7 @@ test('service：桌面场景跟着 snapshot 走（串门访客出现/换动作�
 
 test('service：桌面控件申请走同一套 action 并回 action-result；失败一定带人话 notice', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-desktop-actions-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const updates = []
   const results = []
   let captured = null
@@ -1230,7 +1230,7 @@ async function waitFor (predicate, timeoutMs) {
 test('DSH_ZOO_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常', async (t) => {
   for (const value of ['0', 'false', 'off', 'NO']) {
     const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
-    t.after(() => rm(dir, { recursive: true, force: true }))
+    t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
     let spawned = 0
     const { ctx } = fakeCtx()
     const service = createService(ctx, {
@@ -1250,7 +1250,7 @@ test('DSH_ZOO_DESKTOP 是逃生开关：关闭后不启动 helper，服务照常
 test('DSH_ZOO_DESKTOP 为空或其它值时仍然启动桌面层', async (t) => {
   for (const value of [undefined, '1', 'on']) {
     const dir = await mkdtemp(join(tmpdir(), 'lp-kill-'))
-    t.after(() => rm(dir, { recursive: true, force: true }))
+    t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
     let spawned = 0
     const { ctx } = fakeCtx()
     const service = createService(ctx, {
@@ -1376,7 +1376,7 @@ test('manager：pong 看门狗——超过 15s 没回 pong 杀掉并按现有退
 
 test('service：访客超出场景上限时不静默丢宠物，宿主给一条人话提示（A5）', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-overflow-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const updates = []
   let captured = null
   const factory = (options) => {
@@ -1983,4 +1983,252 @@ test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后
   )
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: 'relative/gifts' }), ['/h'])
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: '' }), ['/h'])
+})
+
+// ---------------------------------------------------------------------------
+// ticket 40：农场摘要 / farm-window / 地块动作的窄口
+// ---------------------------------------------------------------------------
+
+test('场景不含 controls.farm：农场只走小窗，老宿主多发的摘要被丢掉', () => {
+  const scene = shared.normalizeScene({
+    items: [],
+    controls: {
+      farm: {
+        plots: [{ id: 'p1', crop: 'tomato', grownMs: 100, growMs: 1000 }],
+        seeds: { tomato: 2 },
+        crops: { carrot: 5 },
+        coins: 30.7,
+        dew: 999,
+        worker: { nickname: '  阿蟹  ', endsAt: 123 },
+        contractCount: 99,
+        log: [{ at: 1, kind: 'plant', crop: 'tomato', qty: 1 }],
+        hire: { enabled: true }
+      }
+    }
+  })
+  assert.equal('farm' in scene.controls, false)
+  assert.equal('farm' in shared.emptyControls(), false)
+  assert.equal('farm' in shared.normalizeControls({}), false)
+  assert.equal('farm' in shared.normalizeControls({ farm: null }), false)
+})
+
+test('farm-window：完整视图带上 remainingMs/waterings/fertilized/种子/日志，坏值夹取', () => {
+  const command = shared.normalizeHostCommand({
+    type: 'farm-window',
+    open: true,
+    plotId: 'P1',
+    farm: {
+      plots: [
+        { id: 'p1', crop: 'tomato', stage: 'growing', remainingMs: 123456, waterings: 1, fertilized: true },
+        { id: 'p2', crop: 'carrot', stage: 'mature', mature: true, remainingMs: 999999999999 },
+        { id: 'p3', crop: null, remainingMs: 5, waterings: 9 },
+        { id: 'p4', crop: 'pumpkin', growMs: 0 }
+      ],
+      seeds: { tomato: 2, carrot: 99999, weed: 4 },
+      crops: { pumpkin: 1 },
+      coins: 30,
+      dew: 3,
+      worker: null,
+      contractCount: 0,
+      log: [
+        { at: 1700000000000, kind: 'plant', crop: 'tomato', qty: 1 },
+        { at: 1700000000001, kind: 'nope' },
+        { at: -1, kind: 'harvest' }
+      ]
+    }
+  })
+  assert.equal(command.ok, true)
+  assert.equal(command.command.type, 'farm-window')
+  assert.equal(command.command.open, true)
+  assert.equal(command.command.plotId, 'p1')
+  const farm = command.command.farm
+  assert.equal(farm.plots.length, 4)
+  assert.deepEqual(farm.plots[0], {
+    id: 'p1',
+    crop: 'tomato',
+    stage: 'growing',
+    mature: false,
+    remainingMs: 123456,
+    waterings: 1,
+    fertilized: true
+  })
+  assert.equal(farm.plots[1].mature, true)
+  assert.equal(farm.plots[1].remainingMs, 0, '成熟地不倒数')
+  assert.equal(farm.plots[2].remainingMs, 0, '空地不倒数')
+  assert.equal(farm.plots[2].waterings, 0)
+  assert.equal(farm.seeds.tomato, 2)
+  assert.equal(farm.seeds.carrot, shared.MAX_FARM_STACK)
+  assert.equal('weed' in farm.seeds, false)
+  assert.equal(farm.crops.pumpkin, 1)
+  assert.equal(farm.log.length, 1)
+  // open 缺省 false；没有 farm 时是 null（窗口仍可打开，只是显示“等数据”）。
+  const refresh = shared.normalizeHostCommand({ type: 'farm-window' })
+  assert.equal(refresh.command.open, false)
+  assert.equal(refresh.command.farm, null)
+  assert.equal('plotId' in refresh.command, false)
+  // ticket 46：关窗是显式 `close:true`，刷新（open:false）绝不会关窗。
+  assert.equal('close' in refresh.command, false)
+  const close = shared.normalizeHostCommand({ type: 'farm-window', open: false, close: true })
+  assert.equal(close.command.close, true)
+  assert.equal(close.command.open, false)
+})
+
+test('helper 动作：农场四条必须带 plotId，种地还要 cropId；farm-open 可省 plotId', () => {
+  const plot = shared.normalizeHelperEvent({ type: 'action', id: 'a1', action: 'farm-plant', plotId: 'p1', cropId: 'tomato' })
+  assert.equal(plot.ok, true)
+  assert.equal(plot.event.plotId, 'p1')
+  assert.equal(plot.event.cropId, 'tomato')
+
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a2', action: 'farm-harvest' }),
+    { ok: false, error: 'bad-plot' }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a3', action: 'farm-water', plotId: '../p1' }),
+    { ok: false, error: 'bad-plot' }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a4', action: 'farm-plant', plotId: 'p1' }),
+    { ok: false, error: 'bad-crop' }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a5', action: 'farm-fertilize', plotId: 'p2', cropId: 'tomato' }),
+    { ok: true, event: { type: 'action', id: 'a5', action: 'farm-fertilize', deviceId: null, nickname: null, plotId: 'p2' } }
+  )
+
+  const open = shared.normalizeHelperEvent({ type: 'action', id: 'a6', action: 'farm-open' })
+  assert.equal(open.ok, true)
+  assert.equal('plotId' in open.event, false)
+  assert.equal(
+    shared.normalizeHelperEvent({ type: 'action', id: 'a7', action: 'farm-open', plotId: 'p3' }).event.plotId,
+    'p3'
+  )
+  // 四个动作和开窗都进了帮助侧白名单，渲染端才发得出来；菜单工具 id 也要认。
+  for (const action of shared.FARM_ACTIONS) {
+    assert.equal(shared.CONTROL_ACTIONS.includes(action), true, action)
+    assert.equal(shared.DESKTOP_ACTIONS.includes(action), true, action)
+  }
+  assert.equal(shared.MENU_ACTION_IDS.includes('farm-open'), true)
+  assert.equal(shared.MENU_TOOL_IDS.includes('farm'), true)
+})
+
+test('farm-window 命令的窗口白名单：shot/debug-blur 认 farm，status 放行三个字段', () => {
+  assert.equal(shared.normalizeHostCommand({ type: 'shot', path: '/tmp/a.png', window: 'farm' }).command.window, 'farm')
+  assert.equal(shared.normalizeHostCommand({ type: 'shot', path: '/tmp/a.png', window: 'nope' }).command.window, undefined)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur', window: 'farm' }).command.window, 'farm')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-blur', window: 'nope' }).command.window, 'rename')
+
+  const status = shared.normalizeHelperEvent({
+    type: 'status',
+    id: 's1',
+    farmOpen: true,
+    farmVisible: true,
+    farmFocused: false
+  })
+  assert.equal(status.event.status.farmOpen, true)
+  assert.equal(status.event.status.farmVisible, true)
+  assert.equal(status.event.status.farmFocused, false)
+
+  // ticket 46：helper 在小窗开关时主动报状态，宿主靠它做开/关切换。
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'farm-window-state', open: true }),
+    { ok: true, event: { type: 'farm-window-state', id: null, open: true } }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'farm-window-state' }),
+    { ok: true, event: { type: 'farm-window-state', id: null, open: false } }
+  )
+
+  const debugFarm = shared.normalizeHostCommand({
+    type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1', cropId: 'tomato'
+  }).command
+  assert.equal(debugFarm.type, 'debug-farm-submit')
+  assert.equal(debugFarm.action, 'farm-plant')
+  assert.equal(debugFarm.plotId, 'p1')
+  assert.equal(debugFarm.cropId, 'tomato')
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-farm-submit', action: 'farm-harvest', plotId: 'p1' }).ok,
+    true
+  )
+  assert.equal(
+    shared.normalizeHostCommand({ type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1' }).ok,
+    false
+  )
+  // ticket 45：冒烟切页签的调试命令也走同一条白名单；坏值回到农场页。
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'market' }).command.tab, 'market')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'hire' }).command.tab, 'hire')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'log' }).command.tab, 'log')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'nope' }).command.tab, 'farm')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-close', via: 'escape' }).command.via, 'escape')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-close', via: 'nope' }).command.via, 'button')
+  // ticket 47：播种弹窗与一键收割的冒烟命令也只走白名单。
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-plant-open' }).command.type, 'debug-farm-plant-open')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-plant-close' }).command.type, 'debug-farm-plant-close')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-batch', kind: 'plant' }).command.kind, 'plant')
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-batch', kind: 'nope' }).command.kind, 'harvest')
+
+  // 普通运行的 helper 连白名单都进不来：debug 命令只在显式 --dsh-zoo-debug 下可解析。
+  const off = { debug: false }
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-farm-tab', tab: 'market' }, off).ok, false)
+  assert.equal(shared.normalizeHostCommand({
+    type: 'debug-farm-submit', action: 'farm-plant', plotId: 'p1', cropId: 'tomato'
+  }, off).ok, false)
+  assert.equal(shared.normalizeHostCommand({ type: 'farm-window', open: false }, off).ok, true)
+  assert.equal(shared.normalizeHostCommand({ type: 'debug-renderer' }, { debug: true }).ok, true)
+})
+
+test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4500 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    log: { info: () => {}, warn: () => {} },
+    pingMs: 100000,
+    assetRoots: []
+  })
+  t.after(() => manager.dispose())
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4500, workArea: { x: 0, y: 30, width: 100, height: 100 } })
+
+  const farm = {
+    plots: [{ id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 1000, waterings: 0, fertilized: false }],
+    seeds: { tomato: 2, carrot: 0, pumpkin: 0 },
+    crops: { tomato: 0, carrot: 0, pumpkin: 0 },
+    coins: 30,
+    dew: 1,
+    worker: null,
+    contractCount: 0,
+    log: []
+  }
+  assert.equal(manager.farmWindow({ open: true, farm, plotId: 'p1' }), true)
+  const command = children[0].parsedLines().at(-1)
+  assert.equal(command.type, 'farm-window')
+  assert.equal(command.open, true)
+  assert.equal(command.plotId, 'p1')
+  assert.equal('close' in command, false)
+  // 完整农场多一个只显示的驮包；没有在途物品时是空数组（helper 只画有值的那几条）。
+  assert.deepEqual(command.farm, { ...farm, carried: [] })
+
+  assert.equal(manager.farmWindow({ open: false, farm }), true)
+  assert.equal(children[0].parsedLines().at(-1).open, false)
+  assert.equal('plotId' in children[0].parsedLines().at(-1), false)
+
+  // ticket 46：关窗是显式字段；宿主 status() 的 farmOpen 跟着 helper 的窗口状态走。
+  assert.equal(manager.status().farmOpen, false)
+  children[0].emitLine({ type: 'farm-window-state', open: true })
+  assert.equal(manager.status().farmOpen, true)
+  assert.equal(manager.farmWindow({ open: false, close: true }), true)
+  assert.equal(children[0].parsedLines().at(-1).close, true)
+  children[0].emitLine({ type: 'farm-window-state', open: false })
+  assert.equal(manager.status().farmOpen, false)
 })

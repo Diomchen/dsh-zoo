@@ -104,6 +104,24 @@
       .lp-pet[data-role='guest'] .lp-pet-name {
         background: rgba(40, 48, 60, 0.58);
       }
+      /* ticket 44：来打工的邻居宠物（与访客绿区分，用暖金色）。 */
+      .lp-pet[data-role='worker'] .lp-pet-name {
+        background: rgba(194, 145, 59, 0.8);
+      }
+      .lp-pet-badge {
+        position: absolute;
+        right: 2px;
+        top: 2px;
+        padding: 0 5px;
+        border-radius: 999px;
+        background: rgba(194, 145, 59, 0.92);
+        color: #fff8e8;
+        font-size: 9px;
+        font-weight: 700;
+        line-height: 1.5;
+        letter-spacing: 0.04em;
+        pointer-events: none;
+      }
       /* ------------------------------------------------------------------
        * 桌面控件（ticket 11）：弹层 / 放行卡 / 召回胶囊 / 提示气泡
        * 全部是鼠标控件；窗口没有键盘输入（focusable:false）。

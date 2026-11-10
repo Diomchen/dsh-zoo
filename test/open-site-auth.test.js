@@ -105,7 +105,7 @@ async function call (service, path, { method = 'GET', body } = {}) {
 /** 起一只带桌面层的服务；`connection` 就是 DSH 宿主会递给插件的那一面。 */
 async function boot (t, connection) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-open-site-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
 
   const server = dshAuthServer()
   const origin = await listen(server)
