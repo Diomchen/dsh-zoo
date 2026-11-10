@@ -28,8 +28,10 @@ function deviceIdOf (value) {
 
 function selfDescriptor (self) {
   if (self === null || typeof self !== 'object') return null
-  // 出门了（请求中/已抵达）：本机桌面不再显示自己。ticket 09 直接依赖这一条。
+  // 出门串门（请求中/已抵达）或在外打工：本机桌面不再显示自己。ticket 09/44。
+  // 必须判 `typeof === 'object'`：老快照没有 work，`undefined !== null` 会把自己误藏。
   if (self.out !== null && typeof self.out === 'object') return null
+  if (self.work !== null && typeof self.work === 'object') return null
   const pet = self.pet !== null && typeof self.pet === 'object' ? self.pet : null
   const label = shared.normalizeLabel(pet?.name, '') || shared.normalizeLabel(self.nickname, '')
   return {
@@ -58,8 +60,28 @@ function visitorDescriptor (raw) {
 }
 
 /**
+ * 别人家的宠物在我家打工（ticket 44）。它不是访客：不能送客，只有合同能结束它；
+ * 角标是固定枚举 `work`，皮肤复用访客素材（`worker:` 前缀）。
+ */
+function workerDescriptor (raw) {
+  if (raw === null || typeof raw !== 'object') return null
+  const deviceId = deviceIdOf(raw.workerDeviceId)
+  if (deviceId === null) return null
+  const palette = shared.PET_COLORS.slice(1)
+  const color = palette[shared.hashString(deviceId) % palette.length]
+  return {
+    id: 'worker:' + deviceId,
+    role: 'worker',
+    label: shared.normalizeLabel(raw.workerNickname, '邻居'),
+    anim: shared.normalizeAnim(raw.anim),
+    color,
+    badge: 'work'
+  }
+}
+
+/**
  * @param {object} snapshot room.snapshot()
- * @returns {Array<{id:string,role:'self'|'visitor',label:string,anim:string|null,color:string}>}
+ * @returns {Array<{id:string,role:'self'|'visitor'|'worker',label:string,anim:string|null,color:string,badge?:string}>}
  */
 export function petsFromSnapshot (snapshot) {
   const pets = []
@@ -67,6 +89,10 @@ export function petsFromSnapshot (snapshot) {
 
   const self = selfDescriptor(snapshot.self)
   if (self !== null) pets.push(self)
+
+  // ticket 44：雇工画在访客之前（场景顺序 = DOM 顺序，访客在上层）。
+  const worker = workerDescriptor(snapshot.worker)
+  if (worker !== null) pets.push(worker)
 
   // 只有 visitors 是“此刻在我家串门的宠物”。guests 是心跳影子，刻意不画。
   const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
@@ -206,6 +232,9 @@ function isThumbName (name) {
  * 快照 → 桌面控件状态（ticket 11）。宿主仍然是权威：这里只把 room 的
  * “能不能串门/召回了/谁可以送客/有没有待放行”翻译成渲染端可画的布尔与文案。
  *
+ * 农场不在桌面控件里（ticket 46）：地块条已删，完整农场只走 `farm-window` 命令；
+ * 桌面只保留 `role:'worker'` 的雇工宠物（它是宠物，不是农场）。
+ *
  * 文案必须是人话——渲染端只负责显示，不猜 error code；失败/置灰都不允许静默。
  * 渲染端只会把这些按钮点击翻译成 action 申请，状态变化仍然等下一次快照。
  *
@@ -218,14 +247,19 @@ export function controlsFromSnapshot (snapshot, options = {}) {
 
   const self = snapshot.self !== null && typeof snapshot.self === 'object' ? snapshot.self : null
   const out = self !== null && self.out !== null && typeof self.out === 'object' ? self.out : null
+  const work = self !== null && self.work !== null && typeof self.work === 'object' ? self.work : null
   const away = out !== null
+  const working = work !== null
   const awayNickname = away ? shared.normalizeLabel(out.nickname, '邻居') : null
 
   const targets = Array.isArray(snapshot.visitTargets) ? snapshot.visitTargets : []
-  const canVisit = !away && targets.length > 0
+  const canVisit = !away && !working && targets.length > 0
   controls.visit.enabled = canVisit
   if (canVisit) {
     controls.visit.reason = null
+  } else if (working) {
+    // ticket 44：在外打工与出门串门是两种「不在家」，下一步不同。
+    controls.visit.reason = visitReasonText('already-working', null)
   } else if (away) {
     // 和 room 的 already-out notice 是同一句话：按钮和气泡不许各说各的。
     controls.visit.reason = visitReasonText('already-out', awayNickname)
@@ -237,6 +271,7 @@ export function controlsFromSnapshot (snapshot, options = {}) {
       : 'no-admitted'
     controls.visit.reason = visitReasonText(blocked, null)
   }
+  // 召回只服务串门；雇工合同在农场窗里召回（recall-worker）。
   controls.recall.enabled = away
   controls.recall.nickname = awayNickname
 

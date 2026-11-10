@@ -467,8 +467,14 @@
     mediaBox.className = 'lp-pet-media'
     const nameEl = document.createElement('span')
     nameEl.className = 'lp-pet-name'
+    // ticket 44：雇工角标固定「打工」，不是自由文本（host 只发枚举 badge:'work'）。
+    const badgeEl = document.createElement('span')
+    badgeEl.className = 'lp-pet-badge'
+    badgeEl.textContent = '打工'
+    badgeEl.hidden = true
     el.appendChild(mediaBox)
     el.appendChild(nameEl)
+    el.appendChild(badgeEl)
     el.addEventListener('pointerdown', onPetPointerDown)
     el.addEventListener('mousedown', onPetMouseDown)
     el.addEventListener('contextmenu', onPetContextMenu)
@@ -484,6 +490,7 @@
       el,
       mediaBox,
       nameEl,
+      badgeEl,
       video: null,
       svg: null,
       badge: null,
@@ -513,8 +520,13 @@
 
   function updateNode (pet) {
     const item = pet.item
-    const role = item.role === 'self' || item.role === 'visitor' ? item.role : 'guest'
+    const role = item.role === 'self' || item.role === 'visitor' || item.role === 'worker'
+      ? item.role
+      : 'guest'
     if (pet.el.dataset.role !== role) pet.el.dataset.role = role
+    // 角标是固定枚举：只有 work 才画（渲染端不猜也不接受任意字符串）。
+    const showBadge = item.badge === 'work'
+    if (pet.badgeEl.hidden !== !showBadge) pet.badgeEl.hidden = !showBadge
     if (pet.el.getAttribute('aria-label') !== item.label) {
       pet.el.setAttribute('aria-label', item.label)
       pet.el.setAttribute('role', 'img')
@@ -1068,8 +1080,11 @@
       return
     }
     // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
+    // 「农场」（ticket 40/46）：同样是空申请；开/关由宿主按小窗的真实状态切换。
     // 扫描外观（ticket 37）：和「重载配置」一样只是一次申请，扫与写全在宿主那边。
-    if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins') requestAction(id)
+    if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins' || id === 'farm') {
+      requestAction(id === 'farm' ? 'farm-open' : id)
+    }
   }
 
   /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */
@@ -1955,6 +1970,7 @@
     if (action === 'end-visit') return '这位访客已经不在桌面上了。'
     if (action === 'admit' || action === 'reject') return '这位邻居已经不在了，刷新后再试。'
     if (action === 'dismiss') return '这张卡片暂时关不掉，稍后再试。'
+    if (action === 'farm-open') return '农场窗口没有打开，稍后再试。'
     if (action.startsWith('gift-')) return '这张礼物卡已经不在了。'
     return ACTION_FAILED_NOTICE
   }
@@ -2973,6 +2989,7 @@
         pets: [...pets.values()].map((pet) => ({
           id: pet.id,
           role: pet.item.role,
+          badge: pet.item.badge ?? null,
           label: pet.item.label,
           anim: pet.item.anim,
           x: round(pet.body.x),

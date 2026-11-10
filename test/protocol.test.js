@@ -7,6 +7,9 @@ import {
   DEFAULT_PORT,
   GUEST_TTL_MS,
   HEARTBEAT_INTERVAL_MS,
+  HIRE_REASONS,
+  MARKET_DIGEST_FRESH_MS,
+  MARKET_DIGEST_INTERVAL_MS,
   MAX_PACKET_BYTES,
   PACKET_TYPES,
   PEER_LOST_MS,
@@ -14,6 +17,7 @@ import {
   VISIT_MAX_MS,
   createRateLimiter,
   encodeHeartbeat,
+  encodeMarketDigest,
   encodePacket,
   encodeVisitAck,
   encodeVisitDeny,
@@ -40,6 +44,31 @@ function validPacket (overrides = {}) {
 
 function encodeJson (value) {
   return Buffer.from(JSON.stringify(value), 'utf8')
+}
+
+function validHire (overrides = {}) {
+  return {
+    enabled: true,
+    wagePerHour: 12,
+    minHours: 2,
+    maxHours: 8,
+    guard: 0.5,
+    available: true,
+    reason: null,
+    ...overrides
+  }
+}
+
+function validDigest (overrides = {}) {
+  return {
+    v: PROTOCOL_VERSION,
+    type: 'market-digest',
+    deviceId: randomUUID(),
+    at: 1700000000000,
+    prices: { tomato: 5, carrot: 6, pumpkin: 30 },
+    hire: validHire(),
+    ...overrides
+  }
 }
 
 test('编码只写白名单字段，解析后形状完全一致', () => {
@@ -152,6 +181,39 @@ test('心跳同样接受版本、deviceId、4 KiB 的校验', () => {
   assert.equal(parsePacket(Buffer.alloc(MAX_PACKET_BYTES + 1, 0x61)).reason, 'too-large')
 })
 
+function workPayload (type, deviceId) {
+  const contractId = randomUUID()
+  const requestId = randomUUID()
+  const base = { v: PROTOCOL_VERSION, type, deviceId }
+  if (type === 'work-request') {
+    return { ...base, requestId, hours: 2, wagePerHour: 5, fee: 1 }
+  }
+  if (type === 'work-ack') {
+    return { ...base, requestId, ok: true, contractId, startedAt: 1700000000000, endsAt: 1700007200000, guard: 0.5 }
+  }
+  if (type === 'work-recall') return { ...base, contractId }
+  if (type === 'work-recall-ack') return { ...base, contractId, ok: true }
+  if (type === 'work-end') return { ...base, contractId, reason: 'employer-end' }
+  if (type === 'work-end-ack') return { ...base, contractId, requestId, ok: true }
+  if (type === 'work-settle') {
+    return { ...base, contractId, requestId, servedMs: 3600000, earned: 5, reason: 'completed' }
+  }
+  return { ...base, contractId, requestId, ok: true, earned: 5 }
+}
+
+function workKeys (type) {
+  return {
+    'work-request': ['v', 'type', 'deviceId', 'requestId', 'hours', 'wagePerHour', 'fee'],
+    'work-ack': ['v', 'type', 'deviceId', 'requestId', 'ok', 'contractId', 'startedAt', 'endsAt', 'guard'],
+    'work-recall': ['v', 'type', 'deviceId', 'contractId'],
+    'work-recall-ack': ['v', 'type', 'deviceId', 'contractId', 'ok'],
+    'work-end': ['v', 'type', 'deviceId', 'contractId', 'reason'],
+    'work-end-ack': ['v', 'type', 'deviceId', 'contractId', 'requestId', 'ok'],
+    'work-settle': ['v', 'type', 'deviceId', 'contractId', 'requestId', 'servedMs', 'earned', 'reason'],
+    'work-settle-ack': ['v', 'type', 'deviceId', 'contractId', 'requestId', 'ok', 'earned']
+  }[type]
+}
+
 test('任何报文都不含坐标字段（包括串门报文）', () => {
   const deviceId = randomUUID()
   const visitId = randomUUID()
@@ -205,6 +267,41 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'market-digest') {
+      raw = {
+        ...validDigest({ deviceId }),
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type === 'farm-action') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        visitId: randomUUID(),
+        requestId: randomUUID(),
+        action: 'steal',
+        plotId: 'p1',
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type === 'farm-action-result') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        requestId: randomUUID(),
+        ok: true,
+        crop: 'tomato',
+        qty: 1,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type.startsWith('work-')) {
+      raw = { ...workPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('visit-')) {
       raw = {
         v: PROTOCOL_VERSION,
@@ -239,9 +336,17 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
             ? ['v', 'type', 'deviceId', 'visitId', 'reason']
             : type === 'gift-received'
               ? ['v', 'type', 'deviceId', 'visitId', 'giftId']
-              : type.startsWith('visit-')
-                ? ['v', 'type', 'deviceId', 'visitId']
-                : ['v', 'type', 'deviceId', 'nickname', 'port']
+              : type === 'market-digest'
+                ? ['v', 'type', 'deviceId', 'at', 'prices', 'hire']
+                : type === 'farm-action'
+                  ? ['v', 'type', 'deviceId', 'visitId', 'requestId', 'action', 'plotId']
+                  : type === 'farm-action-result'
+                    ? ['v', 'type', 'deviceId', 'requestId', 'ok', 'crop', 'qty']
+                    : type.startsWith('work-')
+                      ? workKeys(type)
+                      : type.startsWith('visit-')
+                        ? ['v', 'type', 'deviceId', 'visitId']
+                        : ['v', 'type', 'deviceId', 'nickname', 'port']
     )
   }
 })
@@ -511,10 +616,13 @@ test('环境变量只在合法时覆盖默认端口', () => {
   assert.equal(resolvePort({ DSH_ZOO_PORT: 'abc' }), DEFAULT_PORT)
 })
 
-test('默认参数：发现 5 秒、心跳 2 秒、心跳影子 30 秒、出门上限 30 分钟、失联 2 分钟', () => {
+test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟、心跳影子 30 秒、出门上限 30 分钟、失联 2 分钟', () => {
   assert.equal(BEACON_INTERVAL_MS, 5000)
   assert.equal(DEFAULT_PORT, 45871)
   assert.equal(HEARTBEAT_INTERVAL_MS, 2000)
+  assert.equal(MARKET_DIGEST_INTERVAL_MS, 30 * 1000)
+  assert.equal(MARKET_DIGEST_FRESH_MS, 2 * 60 * 1000)
+  assert.deepEqual(HIRE_REASONS, ['ready', 'off', 'visiting', 'working'])
   assert.equal(GUEST_TTL_MS, 30000)
   assert.equal(VISIT_MAX_MS, 30 * 60 * 1000)
   assert.equal(PEER_LOST_MS, 2 * 60 * 1000)
@@ -527,8 +635,155 @@ test('默认参数：发现 5 秒、心跳 2 秒、心跳影子 30 秒、出门�
     'visit-deny',
     'visit-recall',
     'visit-recall-ack',
-    'gift-received'
+    'gift-received',
+    'market-digest',
+    'farm-action',
+    'farm-action-result',
+    'work-request',
+    'work-ack',
+    'work-recall',
+    'work-recall-ack',
+    'work-end',
+    'work-end-ack',
+    'work-settle',
+    'work-settle-ack'
   ])
+})
+
+test('market-digest：编码只写 v/type/deviceId/at/prices/hire，解析后形状一致', () => {
+  const deviceId = randomUUID()
+  const data = encodeMarketDigest({
+    deviceId: deviceId.toUpperCase(),
+    at: 1700000000123,
+    prices: { tomato: 7.5, carrot: 6, pumpkin: 30 },
+    hire: validHire({ enabled: false, available: false })
+  })
+  const raw = JSON.parse(data.toString('utf8'))
+  assert.deepEqual(Object.keys(raw), ['v', 'type', 'deviceId', 'at', 'prices', 'hire'])
+  assert.deepEqual(Object.keys(raw.hire), [
+    'enabled', 'wagePerHour', 'minHours', 'maxHours', 'guard', 'available', 'reason'
+  ])
+  assert.equal(raw.deviceId, deviceId.toLowerCase())
+  assert.deepEqual(raw.prices, { tomato: 7.5, carrot: 6, pumpkin: 30 })
+  assert.deepEqual(parsePacket(data), {
+    ok: true,
+    packet: {
+      v: PROTOCOL_VERSION,
+      type: 'market-digest',
+      deviceId: deviceId.toLowerCase(),
+      at: 1700000000123,
+      prices: { tomato: 7.5, carrot: 6, pumpkin: 30 },
+      hire: validHire({ enabled: false, available: false })
+    }
+  })
+
+  // 缺省 at 用本机时钟；extra 字段（昵称/端口/visitId/坐标）一个都不写。
+  const idle = encodeMarketDigest({
+    deviceId,
+    prices: { tomato: 5 },
+    hire: validHire(),
+    nickname: '不该出现',
+    port: 1,
+    visitId: randomUUID(),
+    x: 1,
+    y: 2
+  })
+  const idleRaw = JSON.parse(idle.toString('utf8'))
+  assert.deepEqual(Object.keys(idleRaw), ['v', 'type', 'deviceId', 'at', 'prices', 'hire'])
+  assert.ok(Number.isSafeInteger(idleRaw.at) && idleRaw.at > 0)
+  assert.equal(idleRaw.nickname, undefined)
+  assert.equal(idleRaw.port, undefined)
+  assert.equal(idleRaw.visitId, undefined)
+})
+
+test('market-digest：未知作物/坏价格只丢条目；未知字段消失；整包超 4 KiB 仍拒收', () => {
+  const deviceId = randomUUID()
+  const parsed = parsePacket(encodeJson(validDigest({
+    deviceId,
+    prices: {
+      tomato: 7.5,
+      carrot: 999, // 越界：丢
+      pumpkin: '30', // 非数字：丢
+      alien: 5, // 未知作物：丢
+      x: 1
+    },
+    nickname: '伪造',
+    port: 1,
+    visitId: randomUUID(),
+    extra: { path: '/tmp/x' }
+  })))
+  assert.equal(parsed.ok, true)
+  assert.deepEqual(Object.keys(parsed.packet), ['v', 'type', 'deviceId', 'at', 'prices', 'hire'])
+  assert.deepEqual(parsed.packet.prices, { tomato: 7.5 })
+  assert.equal(parsed.packet.nickname, undefined)
+  assert.equal(parsed.packet.port, undefined)
+  assert.equal(parsed.packet.visitId, undefined)
+
+  // 空 prices 对象是合法的（对端可能一种作物都拿不出来），不是整包损坏。
+  assert.deepEqual(parsePacket(encodeJson(validDigest({ prices: {} }))).packet.prices, {})
+  // 但 prices 本身不是对象就整包丢。
+  for (const prices of [null, 42, 'x', []]) {
+    assert.equal(parsePacket(encodeJson(validDigest({ prices }))).reason, 'prices', String(prices))
+  }
+  assert.equal(parsePacket(Buffer.alloc(MAX_PACKET_BYTES + 1, 0x61)).reason, 'too-large')
+})
+
+test('market-digest：at / hire 坏字段整包丢；reason 只认 null 或固定枚举', () => {
+  for (const at of [undefined, null, 0, -1, 1.5, '1700000000000', Number.MAX_SAFE_INTEGER + 2]) {
+    assert.equal(parsePacket(encodeJson(validDigest({ at }))).reason, 'at', String(at))
+  }
+  for (const hire of [undefined, null, 42, [], {}, validHire({ wagePerHour: 0 }), validHire({ wagePerHour: 101 }),
+    validHire({ minHours: 1 }), validHire({ maxHours: 9 }), validHire({ minHours: 8, maxHours: 2 }),
+    validHire({ guard: -0.1 }), validHire({ guard: 0.9 }), validHire({ available: 'yes' }),
+    validHire({ reason: '自由文本' })]) {
+    assert.equal(parsePacket(encodeJson(validDigest({ hire }))).reason, 'hire', JSON.stringify(hire))
+  }
+  for (const reason of HIRE_REASONS) {
+    assert.equal(parsePacket(encodeJson(validDigest({ hire: validHire({ reason }) }))).packet.hire.reason, reason)
+  }
+})
+
+test('market-digest：价格与挂牌边界是闭区间', () => {
+  const boundary = parsePacket(encodeJson(validDigest({
+    prices: { tomato: 2.5, carrot: 12, pumpkin: 15 },
+    hire: validHire({
+      wagePerHour: 100,
+      minHours: 8,
+      maxHours: 8,
+      guard: 0.8,
+      reason: 'ready'
+    })
+  })))
+  assert.equal(boundary.ok, true)
+  assert.deepEqual(boundary.packet.prices, { tomato: 2.5, carrot: 12, pumpkin: 15 })
+  assert.equal(boundary.packet.hire.wagePerHour, 100)
+  assert.equal(boundary.packet.hire.guard, 0.8)
+
+  const low = parsePacket(encodeJson(validDigest({
+    prices: { tomato: 2.499, carrot: 2.999, pumpkin: 14.999 }
+  })))
+  assert.deepEqual(low.packet.prices, {}, '刚过下界一丁点就丢条目')
+  const high = parsePacket(encodeJson(validDigest({
+    prices: { tomato: 10.001, carrot: 12.001, pumpkin: 60.001 }
+  })))
+  assert.deepEqual(high.packet.prices, {})
+
+  assert.equal(parsePacket(encodeJson(validDigest({
+    hire: validHire({ wagePerHour: 1, minHours: 2, maxHours: 2, guard: 0 })
+  }))).ok, true)
+})
+
+test('market-digest：本地字段非法在编码阶段失败；旧 peer 的类型静默丢弃', () => {
+  const deviceId = randomUUID()
+  assert.throws(() => encodeMarketDigest({ deviceId: 'nope', prices: {}, hire: validHire() }), /deviceId/)
+  assert.throws(() => encodeMarketDigest({ deviceId, at: 0, prices: {}, hire: validHire() }), /digest time/)
+  assert.throws(() => encodeMarketDigest({ deviceId, prices: null, hire: validHire() }), /digest prices/)
+  assert.throws(() => encodeMarketDigest({ deviceId, prices: {}, hire: validHire({ wagePerHour: 0 }) }), /digest hire/)
+  assert.throws(() => encodePacket({ type: 'market-digest', deviceId }), /digest prices/)
+
+  // 旧版本的邻居 TYPE_SET 里没有这个类型：parsePacket 返回 type，发现层静默丢包。
+  assert.equal(parsePacket(encodeJson(validDigest({ type: 'market-digest-v2' }))).reason, 'type')
+  assert.equal(parsePacket(encodeJson(validDigest({ extra: true }))).ok, true)
 })
 
 test('每来源限速：窗口内超限丢弃，窗口后恢复', () => {

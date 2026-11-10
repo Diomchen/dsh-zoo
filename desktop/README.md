@@ -37,8 +37,10 @@ env -u ELECTRON_RUN_AS_NODE DSH_ZOO_DESKTOP_DEBUG=1 \
 ```
 
 debug 模式 = `--dsh-zoo-debug` **或** 环境变量 `DSH_ZOO_DESKTOP_DEBUG=1`。
-它打开 devTools，并接受下面那组 `debug-*` / `pointer` 命令；两者效果完全一样，
+它打开 devTools，并接受下面那组 `debug-*` / `pointer` 命令；两者效果完全一样。
 后者只是方便在宿主 spawn 出来的 helper 上临时开调试，不用改 argv。
+普通运行（没有 `--dsh-zoo-debug`）的 helper 在 `normalizeHostCommand` 就拒绝全部 `debug-*`，
+不会执行、也不会静默通过。
 
 **所有 helper 自己的开关都必须带 `--dsh-zoo-` 前缀**：Electron 会消费 `--debug` 之类的已知
 开关（实测 `--debug` 直接以 exit 9 退出），前缀保证它们原样落到 `process.argv`。
@@ -80,7 +82,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
 | `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行。地址可能带 DSH 的 launch token：helper 只转交，不写日志、也不回传给渲染端 |
 | `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
-| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` 抓的是「带派」小窗 |
+| `farm-window` | `open`, `close?`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'`, `visit?`, `plotId?` | 打开/刷新/关闭农场小窗（ticket 40/41/43/44/46）。`close:true` 才关窗（再点一次「农场」或 `farm-close`），`open:false` 只刷新。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
+| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'\|'farm'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` / `window:'farm'` 抓对应小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
 | `quit` | — | 优雅退出 |
@@ -100,6 +103,12 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-lock-input` | `locked` | 调试/冒烟：锁住真实鼠标/焦点事件，只接受 `debug-dispatch` 的合成输入（同时清掉悬停与租约） |
 | `debug-gift-submit` | `text` | 调试/冒烟：在「带派」小窗里填一段字条并按提交（走真实 form submit 处理器），验窗口 → 主进程 → 宿主的申请链路 |
 | `debug-gift-remove` | — | 调试/冒烟：点「带派」小窗背包列表里第一个可撤的「撤掉」 |
+| `debug-farm-submit` | `action`, `plotId?`, `cropId?`, `qty?`, `deviceId?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 调试/冒烟：在农场小窗里提交一次动作，走和用户点击相同的 preload → IPC 窄口 |
+| `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'\|'log'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
+| `debug-farm-plant-open` | — | 调试/冒烟：点第一张空地卡，打开真实的播种底部弹窗 |
+| `debug-farm-plant-close` | — | 调试/冒烟：点播种弹窗的 × 关上 |
+| `debug-farm-batch` | `kind:'plant'\|'harvest'` | 调试/冒烟：点「一键播种 / 一键收割」，验批量队列真的发动作 |
+| `debug-farm-close` | `via:'button'\|'escape'` | 调试/冒烟：像用户一样点 × 或按 Esc 关农场小窗（走真实 IPC，不直接 destroy） |
 
 ## 右键菜单（ticket 22）
 
@@ -123,12 +132,13 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | --- | --- | --- |
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
-| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），helper 只校验形状，清洗交给宿主 |
+| `farm-window-state` | `open` | 农场小窗真的开了/关了（含用户点 ×/Esc）；宿主靠它把右键「农场」变成开/关切换 |
+| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?`, `plotId?`, `cropId?`, `qty?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`/`farm-*`/`hire`/`recall-worker`/`end-contract`/`hire-listing`/`farm-open`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），农场动作只带 `plotId`/`cropId`/`qty`，雇佣只带 `deviceId`/`hours`/`contractId`/挂牌四字段；helper 只校验形状，清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
 | `pong` | `id?` | 对 `ping` |
-| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` 等 |
+| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` / `farmOpen` / `farmVisible` / `farmFocused` 等 |
 
 `ready` 里的 `workArea` 是**整张虚拟桌面**：所有显示器工作区的并集（DIP），也就是窗口实际
 覆盖的那块矩形；`displays` 里带每块屏的 `bounds` / `workArea` / `scaleFactor` / `primary`。
@@ -326,6 +336,58 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
 - 只有这扇窗自己的 `webContents` 能发 `dsh-zoo:gift-*`（`isGiftSender`），与改名窗同一个模型。
 
+## 农场小窗（ticket 40 / 43 / 44 / 46 / 47）
+
+农场小窗和改名/带派同一种模型：**宿主算数据，helper 只画和收输入**。窗口是 `file://`
+页面，没有 Node、没有网络、读不到 `/state`；地块、种子、作物、交易所、合同和访客快照
+全部随 `farm-window` 命令下发，成功/失败走 `action-result`，窗口不自动关。
+
+- **新外壳（ticket 47）**：奶白 `#FAF8F5` 底 + 祖母绿/琥珀/天空蓝，16–24px 圆角卡片、
+  软阴影、胶囊、进度条、成熟轻微弹跳、细滚动条；系统字体 + emoji/内联 SVG，CSP 仍然
+  是 `default-src 'none'`，不加载任何 CDN/远程字体/图标库。窗口仍是 420×560
+  （`FARM_WIDTH` / `FARM_HEIGHT` 未改），内容区自己滚动。
+  header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / ×」，下面是 4 段页签、农场页专属的
+  「一键播种 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
+- **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
+  浇水/施肥；成熟轻微弹跳并给收获/施肥。动作 id 仍是 `farm-plant` / `farm-harvest` /
+  `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。
+- **播种弹窗**：三种种子的库存、生长时长、产量；库存 0 禁用；「去交易所买种」只切页签，
+  没有随机买种。批量：一键播种 = 第一个空地 + 第一份有库存的种子；一键收割 = 所有成熟
+  地块按顺序逐条发 `farm-harvest`，busy 守卫 + 逐条 toast，不新增宿主动作。
+- **不写死 4 块地**：`desktop/farm-view.js` 是纯视图模型（渲染页和 Node 测试共用），
+  卡片、标题计数和 `plot.id` 标签都按 `farm.plots.length` / id 推；CSS 用
+  `repeat(auto-fill, minmax(150px, 1fr))`。helper 的 `MAX_FARM_PLOTS` 留到 20，当前宿主
+  仍只发 4 块；传 20 块的 `farm-window` 会画 20 张卡、标题显示 20（有测试）。
+- 打开：右键菜单「农场」→ 渲染端只发一个 `farm-open`（不带 `plotId`）；宿主发
+  `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
+  小窗开着时再点「农场」= 宿主发 `farm-window { open:false, close:true }` 关窗；
+  宿主按 helper 回报的 `farm-window-state` / `desktop.status().farmOpen` 决定开还是关。
+  桌面没有地块条，也没有 `controls.farm`（ticket 46）。
+  正出门串门时同一扇窗进入访客模式，先推 `visit.state:'loading'`，拿到主人快照后变
+  `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。访客保留 banner、
+  偷/帮卡与次数/守卫提示，隐藏一键播种/收割和播种弹窗。
+- 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 50 条；窗口顶部的「驮包」
+  只显示偷来的作物与在途工资（宿主算好下发，窗口不记账）。
+- 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
+  （只带 `plotId`，种地再带 `cropId`）；交易所 `farm-buy-seed` / `farm-sell-crop`
+  （只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
+  `recall-worker` / `end-contract` / `hire-listing`；访客偷/帮 `farm-steal` / `farm-help`。
+  `shared.normalizeFarmAction` 与 `main.js` 的 `farmPending` 双重防串 id；一次只能有
+  一个在飞动作，宿主回 `action-result` 后窗口才解锁。
+- 成功不关窗：种/收/买卖/挂牌/雇佣都只 toast 并刷新数据；失败留在窗里显示 `notice`。
+  偷/帮由宿主等 UDP 结果（最多约 1.8 秒），窗口只发一次申请。
+- 每块地、每份合同、每条日志都有二次校验：`shared.normalizeFarm` 只重建白名单字段，
+  未知作物/坏阶段/坏价格/坏合同只丢自己，不把错误数据画进窗口。
+- ×、Esc、主窗 `hide`、helper 退出都会关窗；失焦不关（macOS 中文输入法候选窗会触发
+  blur，和改名/带派同一条取舍）。×/Esc 走窗口自己的 `dsh-zoo:farm-close` IPC，
+  宿主只负责打开/刷新/显式 `close:true`。
+- 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会验
+  右键「农场」开窗、再点关闭、×/Esc 关闭和雇工仍带「打工」角标；并截农场菜单、
+  农场页、播种弹窗、一键收割、交易所页、雇工页、记录页和访客偷/帮视图，
+  小窗截图笔记为 `.scratch/dsh-zoo/notes/47-*.png`。
+  `debug-farm-tab` / `debug-farm-plant-open` / `debug-farm-plant-close` /
+  `debug-farm-batch` / `debug-farm-close` 只用于这一步。
+
 ## 多显示器 / 分辨率
 
 **一扇窗铺满所有显示器工作区的并集**，宠物可以在任意一块屏上被看见、被拖动、被点击。
@@ -353,7 +415,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 ## 已知限制
 
 - `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/改名/放行卡）都是鼠标点击，没有
-  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是**改名小窗**与**带派小窗**（见下）。
+  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是 **改名小窗**、
+  **带派小窗**与**农场小窗**（见上）。
 - 悬停弹层依赖渲染端收到 `pointermove`；macOS 上 `forward: true` 失效时，主进程仍能靠 300ms
   兜底让弹层打开后的按钮可点，但“悬停即出现”本身可能延迟到兜底接管。
 - 控件位置每 100ms 跟一次宠物；宠物被快速拖动时弹层会有一点跟手延迟（不影响点击）。

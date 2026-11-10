@@ -141,6 +141,34 @@ let giftPending = null
 let giftTimer = null
 /** 「带派」申请的流水号，只用于给 action id 起个不重复的名字。 */
 let giftSeq = 0
+/**
+ * 农场小窗（ticket 40）。和改名/带派同一类独立窗口，但**刻意不按失焦关闭**：
+ * macOS 中文输入法候选窗会抢焦点，blur 关窗会重演「打中文时小窗消失」。
+ * 关窗只由 Esc / 右上角 × / 宿主 `close:true`（再点一次「农场」）/ 主窗 hide / 退出驱动；
+ * 10 秒是**动作等待**超时，不是窗口寿命。
+ */
+let farmWin = null
+/** 宿主交下来的完整 farm view（地块/种子/作物/硬币/露水/日志），窗口打开或刷新时原样转发。 */
+let farmState = null
+/** 交易所页 / `farm-window` 里随农场一起下发的 market view（价目/历史/index）。 */
+let farmMarket = null
+/** 雇工页（ticket 44）：合同/邻居挂牌/在飞状态，和 farm 一起下发、一起缓存。 */
+let farmContracts = null
+/** 访客模式（ticket 43）：`owner` / `visitor` 与主人家的快照块（state/guard/plots/limits）。 */
+let farmMode = 'owner'
+let farmVisit = null
+/** 点某块地开窗时带上的 plotId；窗口用它高亮那一块。 */
+let farmPlotId = null
+/** 正在等宿主答复的那次农场动作（action id）与它的计时器。 */
+let farmPending = null
+let farmTimer = null
+/**
+ * 最近一次报给宿主的农场小窗开关（ticket 46）。宿主靠它把右键「农场」变成开/关切换；
+ * 只在真的变了时发，避免每次 ready/status 都刷一条。
+ */
+let lastFarmWindowOpen = null
+/** 农场申请的流水号，只用于给 action id 起个不重复的名字。 */
+let farmSeq = 0
 /** 桌面窗口覆盖的矩形（所有显示器工作区的并集，DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
 let workArea = null
 let scene = shared.emptyScene()
@@ -893,6 +921,39 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '这个外观没有名字，换不了。', error: 'bad-skin-id' })
     return
   }
+  // 农场（ticket 40）：点地块开窗可带 plotId，四个地块动作必须带；种地再要 cropId。
+  // 交易所（ticket 41）：不碰地块，只带 cropId + qty（1–99）。
+  // 这一层是渲染端 → 宿主的窄口，漏掉一个字段，到 store 就只剩一句 bad-plot。
+  const isMarketAction = shared.FARM_MARKET_ACTIONS.includes(action)
+  const needsPlot = shared.FARM_PLOT_ACTIONS.includes(action)
+  const plotId = needsPlot || action === 'farm-open' ? shared.normalizePlotId(payload?.plotId) : null
+  if (needsPlot && plotId === null) {
+    sendActionResult({ id, ok: false, notice: '这块地不在桌面上，刷新后再试。', error: 'bad-plot' })
+    return
+  }
+  const cropId = action === 'farm-plant' || isMarketAction
+    ? shared.normalizeCropId(payload?.cropId)
+    : null
+  if ((action === 'farm-plant' || isMarketAction) && cropId === null) {
+    sendActionResult({ id, ok: false, notice: '这种作物种不了，换一种吧。', error: 'bad-crop' })
+    return
+  }
+  const qty = isMarketAction ? shared.normalizeTradeQty(payload?.qty) : null
+  if (isMarketAction && qty === null) {
+    sendActionResult({ id, ok: false, notice: '数量要在 1–99 之间。', error: 'bad-qty' })
+    return
+  }
+  // 雇佣（ticket 44）：四个动作共用 normalizeFarmAction，窗口与主窗走同一道白名单。
+  if (shared.FARM_HIRE_ACTIONS.includes(action)) {
+    const normalized = shared.normalizeFarmAction({ ...payload, action })
+    if (normalized === null) {
+      sendActionResult({ id, ok: false, notice: '这个雇佣操作缺少字段，再试一次。', error: 'bad-farm-action' })
+      return
+    }
+    const hireWritten = writeEvent({ type: 'action', id, ...normalized })
+    if (!hireWritten) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接。', error: 'host-unavailable' })
+    return
+  }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
   const written = writeEvent({
     type: 'action',
@@ -901,7 +962,10 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     deviceId,
     ...(name === null ? {} : { name }),
     ...(skinId === null ? {} : { skinId }),
-    ...(giftId === null ? {} : { giftId })
+    ...(giftId === null ? {} : { giftId }),
+    ...(plotId === null ? {} : { plotId }),
+    ...(cropId === null ? {} : { cropId }),
+    ...(qty === null ? {} : { qty })
   })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
@@ -1029,6 +1093,37 @@ function isGiftSender (event) {
   return giftWin !== null && !giftWin.isDestroyed() && event.sender === giftWin.webContents
 }
 
+// ---------------------------------------------------------------------------
+// 农场小窗的 IPC：只认这扇窗自己的 webContents
+// ---------------------------------------------------------------------------
+
+ipcMain.on('dsh-zoo:farm-ready', (event) => {
+  if (!isFarmSender(event)) return
+  sendFarmState()
+})
+
+ipcMain.on('dsh-zoo:farm-close', (event) => {
+  if (!isFarmSender(event)) return
+  closeFarmWindow('close')
+})
+
+ipcMain.on('dsh-zoo:farm-submit', (event, payload) => {
+  if (!isFarmSender(event)) return
+  // 同一时间只等一条结果：连续点两次时，第二条会静默落空——窗口的 busy 也会挡住它。
+  if (farmPending !== null) return
+  const action = shared.normalizeFarmAction(payload)
+  if (action === null) {
+    sendFarmResult({ ok: false, code: 'bad-farm-action' })
+    return
+  }
+  startFarmPending(action.action, action)
+})
+
+/** 三条农场 IPC 共用的一行守卫：只认这扇窗自己的 webContents。 */
+function isFarmSender (event) {
+  return farmWin !== null && !farmWin.isDestroyed() && event.sender === farmWin.webContents
+}
+
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
@@ -1068,6 +1163,13 @@ const RENAME_TIMEOUT_MS = 10000
 const GIFT_WIDTH = 380
 const GIFT_HEIGHT = 480
 const GIFT_TIMEOUT_MS = 10000
+/**
+ * 农场小窗（ticket 40）：比带派再大一圈，要放下 4 块地、库存行与记录。
+ * 10 秒是**一次动作**等宿主回执的上限；窗口本身不因时间关闭（41/44 的页签要久留）。
+ */
+const FARM_WIDTH = 420
+const FARM_HEIGHT = 560
+const FARM_TIMEOUT_MS = 10000
 
 /** 自己那只宠物最近的命中矩形（窗口局部 DIP）；`normalizeRects` 输出的是扁平矩形。 */
 function selfPetRect () {
@@ -1393,6 +1495,186 @@ async function pickGiftFile () {
   sendGiftInit()
 }
 
+// ---------------------------------------------------------------------------
+// 农场小窗（ticket 40）
+//
+// 数据全部来自宿主（`farm-window` 命令），窗口是 file:// 页面，不读盘、不联网。
+// 安全模型与改名/带派一致：独立 preload、只把「种/收/浇/施肥」当申请交上去；
+// **与它们唯一的区别是不按 blur 关窗**（IME 候选窗会抢焦点），见 openFarmWindow。
+// ---------------------------------------------------------------------------
+
+/** 贴着宠物开窗；没有命中矩形（宠物刚出门/还没画出来）就落在工作区中央。 */
+function farmBounds () {
+  const area = workArea ?? screen.getPrimaryDisplay().workArea
+  const pet = selfPetRect()
+  if (pet === null) {
+    return {
+      x: Math.round(area.x + (area.width - FARM_WIDTH) / 2),
+      y: Math.round(area.y + (area.height - FARM_HEIGHT) / 2)
+    }
+  }
+  const petX = area.x + pet.x
+  const petY = area.y + pet.y
+  const x = Math.round(Math.min(
+    Math.max(area.x + 8, petX + pet.width / 2 - FARM_WIDTH / 2),
+    area.x + area.width - FARM_WIDTH - 8
+  ))
+  const above = petY - FARM_HEIGHT - 12
+  const below = petY + pet.height + 12
+  const y = Math.round(above >= area.y + 8
+    ? above
+    : Math.min(Math.max(area.y + 8, below), area.y + area.height - FARM_HEIGHT - 8))
+  return { x, y }
+}
+
+function openFarmWindow () {
+  if (farmWin !== null && !farmWin.isDestroyed()) {
+    farmWin.focus()
+    // 已经开着：把最新农场推一遍（可能刚在别处种/收过）。
+    sendFarmState()
+    return true
+  }
+  if (win === null || win.isDestroyed()) return false
+  const created = new BrowserWindow({
+    ...farmBounds(),
+    width: FARM_WIDTH,
+    height: FARM_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    alwaysOnTop: true,
+    skipTaskbar: true,
+    hasShadow: true,
+    focusable: true,
+    acceptFirstMouse: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'farm-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      // 倒计时是每秒 tick；后台节流会让窗口看起来“卡住”。真正的正确性靠
+      // farm.js 的 Date.now() 基线，这里只是让可见时也保持顺滑。
+      backgroundThrottling: false,
+      devTools: debugEnabled,
+      spellcheck: false
+    }
+  })
+  farmWin = created
+  farmPending = null
+  clearFarmTimer()
+  notifyFarmWindowState()
+  try {
+    created.setAlwaysOnTop(true, process.platform === 'darwin' ? 'floating' : 'screen-saver')
+  } catch {
+    // 置顶已由构造参数保证
+  }
+  created.webContents.on('context-menu', (event) => event.preventDefault())
+  // **不要**在 blur 时关窗：macOS 上打中文时输入法候选窗会抢走键盘焦点，这扇窗也会 blur。
+  // 农场窗没有输入框也一样——41/44 的页签迟早会加输入。关窗只由 Esc / × / 宿主 close:true /
+  // hide / 退出驱动；10 秒超时是「等宿主回执」的上限，不是窗口寿命。
+  created.on('closed', () => {
+    if (farmWin === created) farmWin = null
+    farmPending = null
+    clearFarmTimer()
+    notifyFarmWindowState()
+  })
+  created.once('ready-to-show', () => {
+    if (farmWin !== created || created.isDestroyed()) return
+    created.show()
+    focusAppForDialog()
+    created.focus()
+  })
+  created.loadFile(path.join(__dirname, 'farm.html')).catch(() => closeFarmWindow('load-failed'))
+  return true
+}
+
+function closeFarmWindow (reason) {
+  farmPending = null
+  clearFarmTimer()
+  const target = farmWin
+  farmWin = null
+  if (target !== null && !target.isDestroyed()) {
+    try {
+      target.destroy()
+    } catch {
+      // 已经没了
+    }
+  }
+  notifyFarmWindowState()
+}
+
+/**
+ * 把农场小窗的真实开关报给宿主（ticket 46）：首次 ready 时 dedupe 会被重置。
+ * 只报变化；×/Esc/宿主 `close:true`/hide/退出都汇到这一条。
+ */
+function notifyFarmWindowState () {
+  const open = farmWin !== null && !farmWin.isDestroyed()
+  if (open === lastFarmWindowOpen) return
+  lastFarmWindowOpen = open
+  writeEvent({ type: 'farm-window-state', open })
+}
+
+function clearFarmTimer () {
+  if (farmTimer === null) return
+  clearTimeout(farmTimer)
+  farmTimer = null
+}
+
+/** 窗口的完整农场数据（地块带 remainingMs，另有种子/作物/硬币/露水/日志/交易所）。 */
+function sendFarmState () {
+  if (farmWin === null || farmWin.isDestroyed()) return
+  try {
+    farmWin.webContents.send('dsh-zoo:farm-state', {
+      farm: farmState,
+      market: farmMarket,
+      contracts: farmContracts,
+      mode: farmMode,
+      visit: farmVisit,
+      plotId: farmPlotId
+    })
+  } catch {
+    // 页面还没挂上：ready 会再来一次
+  }
+}
+
+function sendFarmResult (result) {
+  if (farmWin === null || farmWin.isDestroyed()) return
+  try {
+    farmWin.webContents.send('dsh-zoo:farm-result', result)
+  } catch {
+    // 窗口刚被关掉：结果没人接就算了
+  }
+}
+
+/**
+ * 把一次种/收/浇/施肥交给宿主，并等 action-result。
+ * 与改名/带派同一条 action-result 通道：id 对得上才收；成功**不关窗**（toast 一下继续种）。
+ */
+function startFarmPending (action, event) {
+  farmSeq += 1
+  const id = 'farm-' + String(farmSeq) + '-' + Date.now().toString(36)
+  farmPending = { id, action }
+  clearFarmTimer()
+  farmTimer = setTimeout(() => {
+    if (farmPending === null || farmPending.id !== id) return
+    farmPending = null
+    sendFarmResult({ ok: false, code: 'timeout' })
+  }, FARM_TIMEOUT_MS)
+  farmTimer.unref?.()
+  const written = writeEvent({ ...event, type: 'action', id })
+  if (!written) {
+    clearFarmTimer()
+    farmPending = null
+    sendFarmResult({ ok: false, code: 'host-unavailable' })
+  }
+}
+
 function pruneRendererRects () {
   if (rendererRects.length === 0) return
   const ids = new Set(scene.items.map((item) => item.id))
@@ -1468,7 +1750,8 @@ function handleHostLine (line) {
     if (debugEnabled) process.stderr.write('[dsh-zoo helper] 忽略非 JSON 行：' + parsed.error + '\n')
     return
   }
-  const normalized = shared.normalizeHostCommand(parsed.value)
+  // 普通运行不接受任何 debug-* 命令；冒烟/调试必须显式带 --dsh-zoo-debug。
+  const normalized = shared.normalizeHostCommand(parsed.value, { debug: debugEnabled })
   if (!normalized.ok) {
     if (debugEnabled) process.stderr.write('[dsh-zoo helper] 忽略命令：' + normalized.error + '\n')
     return
@@ -1496,6 +1779,8 @@ function applyCommand (command) {
       // 上报的。主进程每一拍都用**新场景 + 新矩形**复核真实光标位置，光标不在命中区就恢复穿透。
       applyDecision('scene-updated')
       sendScene()
+      // ticket 40：窗口开着就补推一份新农场；否则收完菜窗口还显示旧硬币/旧地块。
+      if (farmWin !== null && !farmWin.isDestroyed()) sendFarmState()
       return
     }
     case 'action-result':
@@ -1527,6 +1812,18 @@ function applyCommand (command) {
         }
         return
       }
+      // 农场小窗（ticket 40）：按 id 认领，**成功也留在窗里**——收完还要接着种。
+      // 结果只把宿主的人话（或错误码）交给窗口做 toast，关窗与否由用户决定。
+      if (farmPending !== null && command.id === farmPending.id) {
+        farmPending = null
+        clearFarmTimer()
+        sendFarmResult({
+          ok: command.ok === true,
+          notice: command.notice,
+          code: command.error
+        })
+        return
+      }
       sendActionResult({
         id: command.id,
         ok: command.ok === true,
@@ -1543,6 +1840,7 @@ function applyCommand (command) {
       forceIgnore('hide')
       closeRenameWindow('hide')
       closeGiftWindow('hide')
+      closeFarmWindow('hide')
       if (win !== null && !win.isDestroyed()) win.hide()
       return
     case 'bring-window': {
@@ -1560,6 +1858,29 @@ function applyCommand (command) {
         }
       } else if (giftWin !== null && !giftWin.isDestroyed()) {
         sendGiftInit()
+      }
+      return
+    }
+    case 'farm-window': {
+      // 宿主交下来的完整农场 + 交易所 + 访客块（ticket 40/41/43）：不落盘、不拼路径。
+      // `open:true` 打开/聚焦（已开则只刷新）；`open:false` 刷新已开着的窗；
+      // `close:true` 才是关窗（ticket 46：再点一次「农场」/ `farm-close`），别和刷新混用。
+      if (command.close === true) {
+        closeFarmWindow('host')
+        return
+      }
+      farmState = command.farm
+      farmMarket = command.market
+      farmContracts = command.contracts ?? null
+      farmMode = command.mode === 'visitor' ? 'visitor' : 'owner'
+      farmVisit = command.visit ?? null
+      farmPlotId = typeof command.plotId === 'string' ? command.plotId : null
+      if (command.open === true) {
+        if (!openFarmWindow()) {
+          writeEvent({ type: 'error', id: command.id, code: 'farm-window-failed', message: 'cannot open farm window' })
+        }
+      } else if (farmWin !== null && !farmWin.isDestroyed()) {
+        sendFarmState()
       }
       return
     }
@@ -1631,13 +1952,19 @@ function applyCommand (command) {
       return
     }
     case 'shot':
-      // 冒烟可以点名抓「带派」小窗；主窗没就绪不影响那扇窗的截图。
-      if (command.window === 'bring') {
-        if (giftWin === null || giftWin.isDestroyed()) {
-          writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'bring window not open' })
+      // 冒烟可以点名抓「带派」/农场小窗；主窗没就绪不影响那扇窗的截图。
+      if (command.window === 'bring' || command.window === 'farm') {
+        const target = command.window === 'bring' ? giftWin : farmWin
+        if (target === null || target.isDestroyed()) {
+          writeEvent({
+            type: 'error',
+            id: command.id,
+            code: 'not-ready',
+            message: command.window + ' window not open'
+          })
           return
         }
-        void captureTo(command.path, command.id, 'bring')
+        void captureTo(command.path, command.id, command.window)
         return
       }
       if (!rendererReady) {
@@ -1675,10 +2002,12 @@ function applyCommand (command) {
       return
     }
     case 'debug-blur': {
-      // 冒烟用：模拟“输入法候选窗/别的窗口抢走键盘焦点”。小窗不该因此关掉
-      // （现场：打中文时改名小窗消失）。
+      // 冒烟用：模拟“输入法候选窗/别的窗口抢走键盘焦点”。任何小窗都不该因此关掉
+      // （现场：打中文时小窗消失；农场窗同样不按 blur 关闭）。
       if (!debugEnabled) return
-      const target = command.window === 'bring' ? giftWin : renameWin
+      const target = command.window === 'bring'
+        ? giftWin
+        : command.window === 'farm' ? farmWin : renameWin
       if (target !== null && !target.isDestroyed()) target.blur()
       return
     }
@@ -1721,6 +2050,166 @@ function applyCommand (command) {
         'return true;' +
         '})()'
       void giftWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-submit': {
+      // 冒烟用：在农场小窗里提交一次动作，走的是和用户点击一模一样的 preload → IPC。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const payload = JSON.stringify({
+        action: command.action,
+        plotId: command.plotId,
+        cropId: command.cropId,
+        qty: command.qty,
+        deviceId: command.deviceId,
+        hours: command.hours,
+        contractId: command.contractId,
+        wagePerHour: command.wagePerHour,
+        minHours: command.minHours,
+        maxHours: command.maxHours,
+        enabled: command.enabled
+      })
+      const script = '(() => {' +
+        'if (!window.dshZooFarm) return false;' +
+        'window.dshZooFarm.submit(' + payload + ');' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-tab': {
+      // 冒烟用：切到农场小窗的某个页签，好分别截农场/交易所/雇工三页。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const tab = command.tab === 'market' || command.tab === 'hire' || command.tab === 'log'
+        ? command.tab
+        : 'farm'
+      const selector = '.tab[data-tab="' + tab + '"]'
+      const script = '(() => {' +
+        'const tab = document.querySelector(' + JSON.stringify(selector) + ');' +
+        'if (!tab) return false;' +
+        'tab.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-plant-open': {
+      // 冒烟用：点一张空地卡，打开真实的播种底部弹窗（走窗口里的点击委托）。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const card = document.querySelector(".plot-card[data-open-plant=\\"true\\"]");' +
+        'if (!card) return false;' +
+        'card.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-plant-close': {
+      // 冒烟用：关掉播种弹窗（× 按钮），随后还能继续截别的页。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const button = document.getElementById("plant-modal-close");' +
+        'if (!button) return false;' +
+        'button.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-batch': {
+      // 冒烟用：点「一键播种 / 一键收割」，验证批量队列真的从窗口发出动作。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const target = command.kind === 'plant' ? 'batch-plant' : 'batch-harvest'
+      const script = '(() => {' +
+        'const button = document.getElementById(' + JSON.stringify(target) + ');' +
+        'if (!button || button.disabled) return false;' +
+        'button.click();' +
+        'return true;' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-close': {
+      // 冒烟用：像用户一样关窗。`button` 点右上角 ×，`escape` 在窗口里按 Esc；
+      // 两条都走 farm.js → preload → IPC 的真实路径，不是直接 destroy。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = command.via === 'escape'
+        ? '(() => {' +
+          'document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }));' +
+          'return true;' +
+          '})()'
+        : '(() => {' +
+          'const button = document.getElementById("close");' +
+          'if (!button) return false;' +
+          'button.click();' +
+          'return true;' +
+          '})()'
+      void farmWin.webContents.executeJavaScript(script, true).catch(() => {})
+      return
+    }
+    case 'debug-farm-read': {
+      // 冒烟用（ticket 47.1）：读农场小窗的真实 DOM——每张卡的 stage 和倒计时文本。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => Array.from(document.querySelectorAll(".plot-card")).map((el) => ({' +
+        'id: el.dataset.plot || "",' +
+        'stage: el.dataset.stage || "",' +
+        'text: (el.querySelector(".countdown")?.textContent || "")' +
+        '})))()'
+      void farmWin.webContents.executeJavaScript(script, true)
+        .then((plots) => writeEvent({ type: 'farm-read', id: command.id, plots }))
+        .catch((error) => writeEvent({
+          type: 'error',
+          id: command.id,
+          code: 'farm-read-failed',
+          message: String(error?.message ?? error)
+        }))
+      return
+    }
+    case 'debug-farm-block': {
+      // 冒烟用（ticket 47.1）：阻塞渲染进程，模拟 interval 被调度延迟/后台节流。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const ms = Math.min(15000, Math.max(0, Math.floor(Number(command.ms) || 0)))
+      const script = '(() => { const end = Date.now() + ' + ms + '; while (Date.now() < end) {} return true })()'
+      void farmWin.webContents.executeJavaScript(script, true)
+        .then(() => writeEvent({ type: 'farm-block', id: command.id, ok: true }))
+        .catch((error) => writeEvent({
+          type: 'error',
+          id: command.id,
+          code: 'farm-block-failed',
+          message: String(error?.message ?? error)
+        }))
       return
     }
     case 'debug-freeze-hover':
@@ -1900,6 +2389,10 @@ function statusEvent (id) {
     renameFocused: renameWin !== null && !renameWin.isDestroyed() && renameWin.isFocused(),
     /** 「带派」小窗是否开着（ticket 24）；冒烟用它等窗口真的出来。 */
     bringOpen: giftWin !== null && !giftWin.isDestroyed(),
+    /** 农场小窗（ticket 40）：和改名窗一样分开报「开着 / 看得见 / 拿到焦点」。 */
+    farmOpen: farmWin !== null && !farmWin.isDestroyed(),
+    farmVisible: farmWin !== null && !farmWin.isDestroyed() && farmWin.isVisible(),
+    farmFocused: farmWin !== null && !farmWin.isDestroyed() && farmWin.isFocused(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
     alwaysOnTop: winFlag((candidate) => candidate.isAlwaysOnTop()),
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
@@ -1922,6 +2415,10 @@ function sendReady () {
     debug: debugEnabled,
     shotMode: isShotMode
   })
+  // ticket 46：新 helper 从「没有农场窗」开始。这里强制报一次真实状态，
+  // 宿主重启/重连后不会沿用上一个 helper 的旧开关。
+  lastFarmWindowOpen = null
+  notifyFarmWindowState()
 }
 
 /**
@@ -1993,8 +2490,9 @@ function reportError (code, error) {
 // ---------------------------------------------------------------------------
 
 async function captureTo (filePath, id, target = 'main') {
-  // 冒烟可以点名抓「带派」小窗：主窗与它各自 capturePage，别把两扇窗的坐标混在一起。
-  const image = await capturePage(target === 'bring' ? giftWin : win)
+  // 冒烟可以点名抓小窗：主窗与它们各自 capturePage，别把两扇窗的坐标混在一起。
+  const window = target === 'bring' ? giftWin : target === 'farm' ? farmWin : win
+  const image = await capturePage(window)
   if (image === null) {
     writeEvent({ type: 'error', id, code: 'shot-failed', message: 'capturePage failed' })
     return null
@@ -2129,6 +2627,7 @@ function shutdown (code) {
   stopTimers()
   closeRenameWindow('shutdown')
   closeGiftWindow('shutdown')
+  closeFarmWindow('shutdown')
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()
   } catch {
