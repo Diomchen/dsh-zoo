@@ -898,9 +898,9 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
   const id = shared.normalizeId(payload?.id)
   const action = typeof payload?.action === 'string' ? payload.action.trim().toLowerCase() : ''
   if (id === null || !shared.DESKTOP_ACTIONS.includes(action)) return
-  const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss' ||
-    // 票 54：看田与派它去偷都**必须有对象**——右键的是哪一户，就看/偷哪一户。
-    action === 'farm-look' || action === 'farm-raid'
+  // 谁必须带对象只写一份（`shared.DEVICE_ACTIONS`）：票 54 的两个农场动作曾经只加在这一行，
+  // 宿主那一侧的白名单没跟上，deviceId 到宿主就变成 null 了。
+  const needsDevice = shared.DEVICE_ACTIONS.includes(action)
   // `visit` 是「可能带对象」：从邻居面板点某一户就带 deviceId；没有就交给宿主随机挑一位
   // （HTTP 口的老行为）。needsDevice 的那几个动作则必须有对象，缺了直接拒绝。
   const deviceId = needsDevice || action === 'visit' ? shared.normalizeId(payload?.deviceId) : null
