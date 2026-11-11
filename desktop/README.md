@@ -82,7 +82,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `action-result` | `id`, `ok`, `notice?`, `error?` | 回复渲染端的一次控件申请；失败必须带人话 `notice`，渲染端会冒泡 |
 | `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行。地址可能带 DSH 的 launch token：helper 只转交，不写日志、也不回传给渲染端 |
 | `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
-| `farm-window` | `open`, `close?`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'`, `visit?`, `plotId?` | 打开/刷新/关闭农场小窗（ticket 40/41/43/44/46）。`close:true` 才关窗（再点一次「农场」或 `farm-close`），`open:false` 只刷新。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
+| `farm-window` | `open`, `close?`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'\|'look'`, `visit?`, `look?`, `neighbors?`, `plotId?` | 打开/刷新/关闭农场小窗（ticket 40/41/43/44/46/52/55）。`close:true` 才关窗（再点一次「农场」或 `farm-close`），`open:false` 只刷新。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
 | `shot` | `id?`, `path`（绝对路径）, `window?:'bring'\|'farm'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` / `window:'farm'` 抓对应小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
@@ -107,7 +107,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-farm-tab` | `tab:'farm'\|'market'\|'hire'\|'log'` | 调试/冒烟：切到农场小窗的某个页签，用来分别截图 |
 | `debug-farm-plant-open` | — | 调试/冒烟：点第一张空地卡，打开真实的播种底部弹窗 |
 | `debug-farm-plant-close` | — | 调试/冒烟：点播种弹窗的 × 关上 |
-| `debug-farm-batch` | `kind:'plant'\|'harvest'` | 调试/冒烟：点「一键播种 / 一键收割」，验批量队列真的发动作 |
+| `debug-farm-batch` | `kind:'plant'\|'harvest'` | 调试/冒烟：点「一键种满 / 一键收割」，验批量队列真的发动作 |
 | `debug-farm-close` | `via:'button'\|'escape'` | 调试/冒烟：像用户一样点 × 或按 Esc 关农场小窗（走真实 IPC，不直接 destroy） |
 
 ## 右键菜单（ticket 22）
@@ -347,17 +347,21 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   是 `default-src 'none'`，不加载任何 CDN/远程字体/图标库。窗口仍是 420×560
   （`FARM_WIDTH` / `FARM_HEIGHT` 未改），内容区自己滚动。
   header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / ×」，下面是 4 段页签、农场页专属的
-  「一键播种 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
+  「一键种满 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
+- **雇工挂牌（ticket 44）**：`contracts.listings[]` 带 `expiresAt`——宿主按**本机收到行情**
+  的时刻 + `peerLostMs` 算（默认 120 秒 = 4 个 30 秒广播），不是邻居的墙上时钟。
+  窗口每秒自己比一次：到点把「可雇」变「行情过期」并收起雇佣控件，不用等下一次 push；
+  `stale` 保留作老宿主兜底。
 - **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
   浇水/施肥；成熟轻微弹跳并给收获/施肥。动作 id 仍是 `farm-plant` / `farm-harvest` /
   `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。
 - **播种弹窗**：三种种子的库存、生长时长、产量；库存 0 禁用；「去交易所买种」只切页签，
-  没有随机买种。批量：一键播种 = 第一个空地 + 第一份有库存的种子；一键收割 = 所有成熟
+  没有随机买种。批量：一键种满 = 按空地与种子库存逐块种下（种子用完即停）；一键收割 = 所有成熟
   地块按顺序逐条发 `farm-harvest`，busy 守卫 + 逐条 toast，不新增宿主动作。
 - **不写死 4 块地**：`desktop/farm-view.js` 是纯视图模型（渲染页和 Node 测试共用），
   卡片、标题计数和 `plot.id` 标签都按 `farm.plots.length` / id 推；CSS 用
-  `repeat(auto-fill, minmax(150px, 1fr))`。helper 的 `MAX_FARM_PLOTS` 留到 20，当前宿主
-  仍只发 4 块；传 20 块的 `farm-window` 会画 20 张卡、标题显示 20（有测试）。
+  `repeat(auto-fill, minmax(150px, 1fr))`。helper 的 `MAX_FARM_PLOTS` 是 50、`MIN_FARM_PLOTS`
+  是 4；宿主开局发 4 块、最多 50 块，传 20 块的 `farm-window` 会画 20 张卡、标题显示 20（有测试）。
 - 打开：右键菜单「农场」→ 渲染端只发一个 `farm-open`（不带 `plotId`）；宿主发
   `farm-window { open:true, mode:'owner'|'visitor', farm, market, contracts, plotId? }`。
   小窗开着时再点「农场」= 宿主发 `farm-window { open:false, close:true }` 关窗；
@@ -365,12 +369,13 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   桌面没有地块条，也没有 `controls.farm`（ticket 46）。
   正出门串门时同一扇窗进入访客模式，先推 `visit.state:'loading'`，拿到主人快照后变
   `ready`，404/结束变 `ended`；窗口保留最后一帧只读，不自动关。访客保留 banner、
-  偷/帮卡与次数/守卫提示，隐藏一键播种/收割和播种弹窗。
-- 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 50 条；窗口顶部的「驮包」
+  偷/帮卡与次数/守卫提示，隐藏一键种满/收割、播种弹窗与解锁卡。
+- 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 100 条；窗口顶部的「驮包」
   只显示偷来的作物与在途工资（宿主算好下发，窗口不记账）。
 - 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
-  （只带 `plotId`，种地再带 `cropId`）；交易所 `farm-buy-seed` / `farm-sell-crop`
-  （只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
+  （只带 `plotId`，种地再带 `cropId`）；解锁 `farm-unlock`（只带可选的
+  `expectedUnlocked`，4–50 的乐观锁，价格由宿主算）；交易所 `farm-buy-seed` /
+  `farm-sell-crop`（只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
   `recall-worker` / `end-contract` / `hire-listing`；访客偷/帮 `farm-steal` / `farm-help`。
   `shared.normalizeFarmAction` 与 `main.js` 的 `farmPending` 双重防串 id；一次只能有
   一个在飞动作，宿主回 `action-result` 后窗口才解锁。
