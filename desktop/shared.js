@@ -171,6 +171,16 @@
    * `farm-raid` 还可以带 `plots`（最多 50 个 pN）；不带就让主人那边挑。
    */
   const FARM_LOOK_ACTIONS = ['farm-look', 'farm-raid']
+  /**
+   * **必须带对象**的动作：没有 `deviceId` 这条申请就没有意义，宁可整条拒掉。
+   *
+   * 只写一份、两边都用（`desktop/main.js` 的 IPC 窄口 + 这里的 helper 事件窄口）。
+   * 票 54 加 `farm-look` / `farm-raid` 时只改了 main.js 那一份，宿主这一份照旧只认
+   * 四个旧动作，于是 `deviceId` 在 helper → 宿主这一跳被削成 null：宿主回
+   * `bad-device-id`，桌面上就是「这位邻居已经不在桌面上了」——每一位邻居都这样。
+   * `visit` 不在这里：它是「可以带对象」，不带就由宿主随机挑一位。
+   */
+  const DEVICE_ACTIONS = ['end-visit', 'admit', 'reject', 'dismiss', ...FARM_LOOK_ACTIONS]
   // 只拼**动作名**数组：这里以前误把 `normalizeFarmLook` / `normalizeNeighborChips`
   // 两个函数也 concat 进来，还重复拼了一次 FARM_LOOK_ACTIONS。`.includes()` 看不出来，
   // 但白名单里混进函数是定时炸弹（序列化/遍历时就爆）。
@@ -2604,7 +2614,8 @@
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
         if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
         if (id === null) return { ok: false, error: 'bad-id' }
-        const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
+        // 谁必须有对象写在 DEVICE_ACTIONS 里：main.js 和这里共用同一份，免得再漂一次。
+        const needsDevice = DEVICE_ACTIONS.includes(action)
         // `visit` 是「可能带对象」：邻居面板点某一户就带 deviceId；不带则由宿主随机挑。
         const deviceId = needsDevice || action === 'visit' ? normalizeId(raw.deviceId) : null
         if (needsDevice && deviceId === null) return { ok: false, error: 'bad-device-id' }
@@ -3109,6 +3120,7 @@
     FARM_MARKET_ACTIONS,
     FARM_LAND_ACTIONS,
     FARM_LOOK_ACTIONS,
+    DEVICE_ACTIONS,
     normalizeFarmLook,
     normalizeNeighborChips,
     FARM_VISIT_ACTIONS,
