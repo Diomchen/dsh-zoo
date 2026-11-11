@@ -12,6 +12,8 @@ export const SKIN_ROUTE = '/dsh-zoo-skin'
 export const GIFT_ROUTE = '/dsh-zoo-gift'
 /** 农场快照（ticket 43）：只有新路径；改名前的邻居没有农场，不需要旧名字。 */
 export const FARM_ROUTE = '/dsh-zoo-farm'
+/** 公开只读视图（票 52）：`/dsh-zoo-farm/open/<viewerDeviceId>`，不需要串门。 */
+export const FARM_OPEN_SEGMENT = 'open'
 
 /** 旧路径：改名前的邻居还在用；纯兼容，不新增功能。 */
 export const LEGACY_SKIN_ROUTE = '/local-pet-skin'

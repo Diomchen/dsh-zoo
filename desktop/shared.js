@@ -130,7 +130,7 @@
   // ticket 44：worker 是「别人家的宠物在我家打工」，与 guest/visitor 都不是一回事。
   const PET_ROLES = ['self', 'guest', 'visitor', 'worker']
   /** 宠物角标的固定枚举（跨进程传输，不能用自由文本）。 */
-  const PET_BADGES = ['work']
+  const PET_BADGES = ['work', 'steal']
   const SCENE_VERSION = 3
   /**
    * 农场小窗能提交的动作。地块四条（ticket 40）只带 plotId（种地再带 cropId）；
@@ -161,7 +161,26 @@
    * 本地时钟可能比宿主早/晚几毫秒，标早了收获会被宿主回 not-mature。
    */
   const FARM_REFRESH_ACTIONS = ['farm-refresh']
-  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(FARM_MARKET_ACTIONS, FARM_HIRE_ACTIONS, FARM_REFRESH_ACTIONS)
+  /**
+   * 地块解锁（ticket 48）：只带可选的 `expectedUnlocked`（窗口看到的已解锁数）。
+   * 价格与下一块地在哪全由宿主算；窗口不传钱、不传地块 id。
+   */
+  const FARM_LAND_ACTIONS = ['farm-unlock']
+  /**
+   * 票 52/53：在家看田、派它去偷。两条都带 `deviceId`（看谁/去谁家），
+   * `farm-raid` 还可以带 `plots`（最多 50 个 pN）；不带就让主人那边挑。
+   */
+  const FARM_LOOK_ACTIONS = ['farm-look', 'farm-raid']
+  // 只拼**动作名**数组：这里以前误把 `normalizeFarmLook` / `normalizeNeighborChips`
+  // 两个函数也 concat 进来，还重复拼了一次 FARM_LOOK_ACTIONS。`.includes()` 看不出来，
+  // 但白名单里混进函数是定时炸弹（序列化/遍历时就爆）。
+  const FARM_ACTIONS = FARM_PLOT_ACTIONS.concat(
+    FARM_MARKET_ACTIONS,
+    FARM_HIRE_ACTIONS,
+    FARM_REFRESH_ACTIONS,
+    FARM_LAND_ACTIONS,
+    FARM_LOOK_ACTIONS
+  )
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
    * `rename` 是唯一带正文的动作：它把输入框里的新名字交给宿主，由宿主再决定写到哪
@@ -189,7 +208,11 @@
   /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
   const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
   /** 菜单项的动作（ticket 22 / 24 / 32 / 40）：点播 / 重载 / 打开软件 / 带派 / 换皮 / 农场。同样只是一次「申请」。 */
-  const MENU_ACTION_IDS = ['play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins', 'farm-open']
+  const MENU_ACTION_IDS = [
+    'play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins', 'farm-open',
+    // 票 52/53：右键邻居看田、从看田窗派它去偷（都只带 deviceId）。
+    'farm-look', 'farm-raid'
+  ]
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
   const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
@@ -235,20 +258,22 @@
    * 农场（ticket 40）。下面的数字与 `src/farm-rules.js` / `src/farm.js` 同源，但这一层是
    * **普通 script**（渲染页 `<script>` 加载、主进程 require），不能 import 宿主的 ESM；
    * 所以按 `desktop/shared.js` 的老规矩再守一次边界，改的时候两边一起改：
-   *   - 宿主现在发 4 块地（p1–p4，与 `src/farm.js` 的 PLOT_IDS 一致），但窗口/helper
-   *     边界不写死 4：上限留到 20，未来宿主多发几块，卡片和标题自动跟上（ticket 47）；
+   *   - 宿主开局 4 块地（p1–p4），最多解锁到 50 块（ticket 48）；窗口/helper
+   *     边界不写死 4：卡片和标题完全跟 `farm.plots` 走；
    *   - 三种作物，与 SPEC v5 的作物表一致；
    *   - 硬币/种子/作物/露水/合同/日志的硬上限与 SPEC v5「货币、仓库与限额」一致。
    */
-  const MAX_FARM_PLOTS = 20
+  const MAX_FARM_PLOTS = 50
+  /** 起始地块数：与宿主 `START_PLOTS` 同源；窗口不接受 1–3 这种宿主永远发不出的状态。 */
+  const MIN_FARM_PLOTS = 4
   const CROP_IDS = ['tomato', 'carrot', 'pumpkin']
   const FARM_STAGES = ['empty', 'growing', 'mature']
-  const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle']
+  const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock']
   const MAX_FARM_COINS = 1000000
   const MAX_FARM_STACK = 999
   const MAX_FARM_DEW = 48
   const MAX_FARM_CONTRACTS = 20
-  const MAX_FARM_LOG = 50
+  const MAX_FARM_LOG = 200
   /**
    * 交易所（ticket 41）的窄口：底价表与 `src/farm-rules.js` 同源；
    * 价格夹在 [base×0.5, base×2]，成交历史最多 50 条进窗口。
@@ -276,7 +301,7 @@
   const MAX_CONTRACT_EARNED = HIRE_HOURS_MAX * HIRE_WAGE_MAX
   const CONTRACT_STATUSES = ['pending', 'active', 'ended', 'cancelled']
   const HIRE_REASONS = ['ready', 'off', 'visiting', 'working']
-  /** 地块 id 的形状：宿主现在发 p1–p4；窗口按 pN 通用，未来 20 块不用改这里。 */
+  /** 地块 id 的形状：宿主开局 p1–p4、最多 p1–p50；窗口按 pN 通用。 */
   const PLOT_ID_RE = /^[a-z0-9_-]{1,16}$/
 
   /** 宠物色板：self 固定第一格，访客按 deviceId 散列到其余颜色。 */
@@ -632,6 +657,9 @@
     const wage = Number(raw.wage)
     const earned = Number(raw.earned)
     const hours = Number(raw.hours)
+    // ticket 48：unlock 日志带 plot（第几块地）与 cost（解锁花了多少硬币）。
+    const cost = Number(raw.cost)
+    const plot = Number(raw.plot)
     return {
       at: Math.floor(at),
       kind: raw.kind,
@@ -640,7 +668,9 @@
       ...(who === null ? {} : { who }),
       ...(Number.isFinite(wage) ? { wage: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(wage))) } : {}),
       ...(Number.isFinite(earned) ? { earned: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(earned))) } : {}),
-      ...(Number.isFinite(hours) ? { hours: Math.min(HIRE_HOURS_MAX, Math.max(0, Math.floor(hours))) } : {})
+      ...(Number.isFinite(hours) ? { hours: Math.min(HIRE_HOURS_MAX, Math.max(0, Math.floor(hours))) } : {}),
+      ...(Number.isFinite(cost) ? { cost: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(cost))) } : {}),
+      ...(Number.isFinite(plot) ? { plot: Math.min(MAX_FARM_PLOTS, Math.max(1, Math.floor(plot))) } : {})
     }
   }
 
@@ -727,8 +757,28 @@
     }
     const hire = normalizeFarmHire(raw.hire)
     const guard = Number(raw.guard)
+    const unlocked = typeof raw.unlocked === 'number' && Number.isFinite(raw.unlocked)
+      ? Math.min(MAX_FARM_PLOTS, Math.max(MIN_FARM_PLOTS, Math.floor(raw.unlocked)))
+      : null
+    const maxPlots = typeof raw.maxPlots === 'number' && Number.isFinite(raw.maxPlots)
+      ? Math.min(MAX_FARM_PLOTS, Math.max(MIN_FARM_PLOTS, Math.floor(raw.maxPlots)))
+      : null
+    const nextCost = typeof raw.nextCost === 'number' && Number.isFinite(raw.nextCost)
+      ? Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(raw.nextCost)))
+      : null
+    const unlockLadder = Array.isArray(raw.unlockLadder)
+      ? raw.unlockLadder
+        .slice(0, 6)
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+        .map((value) => Math.min(MAX_FARM_COINS, Math.floor(value)))
+      : []
     return {
       ...farm,
+      ...(unlocked === null ? {} : { unlocked }),
+      ...(maxPlots === null ? {} : { maxPlots }),
+      ...(nextCost === null ? {} : { nextCost }),
+      ...(unlockLadder.length === 0 ? {} : { unlockLadder }),
       seeds: normalizeFarmStacks(raw.seeds),
       crops: normalizeFarmStacks(raw.crops),
       ...(hire === null ? {} : { hire }),
@@ -830,7 +880,12 @@
           minHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(minHours))),
           maxHours: Math.min(HIRE_HOURS_MAX, Math.max(HIRE_HOURS_MIN, Math.floor(maxHours))),
           guard: Number.isFinite(Number(candidate.guard)) ? Math.min(MAX_FARM_GUARD, Math.max(0, Number(candidate.guard))) : 0,
-          stale: candidate.stale === true
+          stale: candidate.stale === true,
+          // 窗口自己走秒用：宿主按**本机收到行情**的时刻 + peerLostMs 算好。
+          // 0 / 缺失 = 老宿主，窗口退回 stale 快照。
+          expiresAt: Number.isFinite(Number(candidate.expiresAt)) && Number(candidate.expiresAt) > 0
+            ? Math.floor(Number(candidate.expiresAt))
+            : 0
         })
       }
     }
@@ -990,6 +1045,39 @@
     }
   }
 
+  /**
+   * 票 52：只读查看邻居农场的画面。白名单只认请求者自己看得到的字段——
+   * 主人的仓库/硬币/种子从来不下发，这里也就不会漏画。
+   */
+  function normalizeFarmLook (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const deviceId = normalizeUuid(raw.deviceId)
+    if (deviceId === null) return null
+    const guard = Number(raw.guard)
+    const int = (value) => {
+      const num = Number(value)
+      return Number.isFinite(num) ? Math.min(50, Math.max(0, Math.floor(num))) : 0
+    }
+    const plots = []
+    for (const candidate of Array.isArray(raw.plots) ? raw.plots : []) {
+      if (plots.length >= MAX_FARM_PLOTS) break
+      const plot = normalizeFarmVisitPlot(candidate)
+      if (plot === null) continue
+      plots.push(plot)
+    }
+    const query = raw.quotas !== null && typeof raw.quotas === 'object' ? raw.quotas : {}
+    const nickname = typeof raw.host?.nickname === 'string'
+      ? raw.host.nickname.trim().slice(0, 32)
+      : '邻居'
+    return {
+      deviceId,
+      nickname: nickname === '' ? '邻居' : nickname,
+      guard: Number.isFinite(guard) ? Math.min(1, Math.max(0, guard)) : 0,
+      plots,
+      quotas: { perTrip: int(query.perTrip), perTripLeft: int(query.perTripLeft) }
+    }
+  }
+
   function normalizeFarmVisit (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const state = FARM_VISIT_STATES.includes(raw.state) ? raw.state : 'error'
@@ -1026,23 +1114,67 @@
    * `open:true` 打开或聚焦；`open:false` 只刷新已开着的窗；`close:true` 明确关窗
    * （ticket 46：再点一次「农场」或 `farm-close` 动作，不能和“刷新”混在一起）。
    */
+  /** 票 55：窗口里的邻居切换器。只认 uuid + 昵称 + 两个能力位，别的字段进不来。 */
+  function normalizeNeighborChips (raw) {
+    const chips = []
+    for (const candidate of Array.isArray(raw) ? raw : []) {
+      if (chips.length >= 8) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const deviceId = normalizeUuid(candidate.deviceId)
+      if (deviceId === null) continue
+      if (chips.some((chip) => chip.deviceId === deviceId)) continue
+      const nickname = typeof candidate.nickname === 'string' ? candidate.nickname.trim().slice(0, 32) : ''
+      const ripe = Number(candidate.ripePlots)
+      const guard = Number(candidate.guard)
+      chips.push({
+        deviceId,
+        nickname: nickname === '' ? '邻居' : nickname,
+        ...(candidate.canRaid === true ? { canRaid: true } : {}),
+        // 票 56：排序与副标题要的三样（宿主算，窗口只画）。
+        ...(Number.isFinite(ripe) ? { ripePlots: Math.min(50, Math.max(0, Math.floor(ripe))) } : {}),
+        ...(Number.isFinite(guard) ? { guard: Math.min(1, Math.max(0, guard)) } : {}),
+        ...(candidate.old === true ? { old: true } : {})
+      })
+    }
+    return chips
+  }
+
   function normalizeFarmWindow (raw) {
     const plotId = normalizePlotId(raw.plotId)
     const visit = normalizeFarmVisit(raw.visit)
+    const look = normalizeFarmLook(raw.look)
     return {
       open: raw.open === true,
       ...(raw.close === true ? { close: true } : {}),
-      mode: raw.mode === 'visitor' ? 'visitor' : 'owner',
+      mode: look !== null ? 'look' : raw.mode === 'visitor' ? 'visitor' : 'owner',
+      neighbors: normalizeNeighborChips(raw.neighbors),
       farm: normalizeFarm(raw.farm),
       market: normalizeMarket(raw.market),
       // ticket 44：雇工页的合同/挂牌由宿主 push，窗口永远不自己发请求。
       contracts: normalizeContracts(raw.contracts),
       ...(visit === null ? {} : { visit }),
+      ...(look === null ? {} : { look }),
       ...(plotId === null ? {} : { plotId })
     }
   }
 
   /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
+  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
+  function normalizeRaidPlots (raw) {
+    if (raw === undefined || raw === null) return null
+    if (!Array.isArray(raw)) return false
+    const out = []
+    for (const entry of raw) {
+      // 和主人侧同一个上限：p1–p50，`normalizePlotId` 太松（它会放 pX 过门）。
+      if (typeof entry !== 'string') return false
+      const plotId = entry.trim().toLowerCase()
+      if (!/^p(?:[1-9]|[1-4][0-9]|50)$/.test(plotId)) return false
+      if (!out.includes(plotId)) out.push(plotId)
+      if (out.length > 50) return false
+    }
+    return out.length === 0 ? null : out
+  }
+
   function normalizeFarmAction (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
@@ -1074,12 +1206,28 @@
       if (minHours < HIRE_HOURS_MIN || maxHours > HIRE_HOURS_MAX || minHours > maxHours) return null
       return { action, enabled: raw.enabled, wagePerHour, minHours, maxHours }
     }
+    // 票 52/53：看田与派它去偷。只认 UUID 与 pN 数组，其余一律不传。
+    if (FARM_LOOK_ACTIONS.includes(action)) {
+      const deviceId = normalizeUuid(raw.deviceId)
+      if (deviceId === null) return null
+      if (action === 'farm-look') return { action, deviceId }
+      const plots = normalizeRaidPlots(raw.plots)
+      if (plots === false) return null
+      return plots === null ? { action, deviceId } : { action, deviceId, plots }
+    }
     // 到点确认没有地块字段：只请宿主重推一份当前 farm-window。
     if (action === 'farm-refresh') return { action }
+    // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
+    if (action === 'farm-unlock') {
+      if (raw.expectedUnlocked === undefined || raw.expectedUnlocked === null) return { action }
+      const expected = Number(raw.expectedUnlocked)
+      if (!Number.isInteger(expected) || expected < MIN_FARM_PLOTS || expected > MAX_FARM_PLOTS) return null
+      return { action, expectedUnlocked: expected }
+    }
     const plotId = normalizePlotId(raw.plotId)
     if (plotId === null) return null
-    // 偷/帮只可能是 p1..p4（访客没有别的可点）；在主进程那一层就挡住 p9。
-    if (FARM_VISIT_ACTIONS.includes(action) && !/^p[1-4]$/.test(plotId)) return null
+    // 偷/帮只可能是主人已解锁的地块（窗口只画这些）；这里先挡住 p51+。
+    if (FARM_VISIT_ACTIONS.includes(action) && !/^p(?:[1-9]|[1-4][0-9]|50)$/.test(plotId)) return null
     if (action === 'farm-plant') {
       const cropId = normalizeCropId(raw.cropId)
       return cropId === null ? null : { action, plotId, cropId }
@@ -2225,7 +2373,7 @@
         // 冒烟用（ticket 47）：点空地卡打开播种弹窗 / 点 × 关上，走窗口的真实点击。
         return { ok: true, command: { type, id } }
       case 'debug-farm-batch': {
-        // 冒烟用（ticket 47）：点「一键播种 / 一键收割」，验批量队列真的发动作。
+        // 冒烟用（ticket 47/49）：点「一键种满 / 一键收割」，验批量队列真的发动作。
         const kind = raw.kind === 'plant' ? 'plant' : 'harvest'
         return { ok: true, command: { type, id, kind } }
       }
@@ -2424,12 +2572,15 @@
         // 冒烟用（ticket 47.1）：农场小窗里每张卡的 stage / countdown 文本。
         const plots = []
         if (Array.isArray(raw.plots)) {
-          for (const candidate of raw.plots.slice(0, 20)) {
+          for (const candidate of raw.plots.slice(0, 50)) {
             if (candidate === null || typeof candidate !== 'object') continue
             plots.push({
               id: normalizeToken(candidate.id),
               stage: normalizeLabel(candidate.stage, ''),
-              text: normalizeLabel(candidate.text, '')
+              text: normalizeLabel(candidate.text, ''),
+              // ticket 49：锁定卡没有 plotId，用 locked + badge 让冒烟能断言。
+              locked: candidate.locked === true,
+              badge: normalizeLabel(candidate.badge, '')
             })
           }
         }
@@ -2956,6 +3107,10 @@
     FARM_ACTIONS,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
+    FARM_LAND_ACTIONS,
+    FARM_LOOK_ACTIONS,
+    normalizeFarmLook,
+    normalizeNeighborChips,
     FARM_VISIT_ACTIONS,
     FARM_HIRE_ACTIONS,
     HIRE_WAGE_MIN,
@@ -2971,6 +3126,7 @@
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
     MAX_FARM_PLOTS,
+    MIN_FARM_PLOTS,
     CROP_IDS,
     CROP_BASE_PRICE,
     MAX_FARM_COINS,

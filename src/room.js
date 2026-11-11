@@ -11,9 +11,11 @@ import {
   normalizeAnimation,
   normalizeGift,
   normalizeNickname,
+  normalizeCaps,
   normalizeSay,
   normalizeSemantic,
-  sanitizeLabel
+  sanitizeLabel,
+  RAID_MAX_MS
 } from './protocol.js'
 import {
   MAX_VISIT_RECORD_MS,
@@ -384,12 +386,14 @@ export function createRoom ({
    * **对方也放行了我**——这正是自发出门/手动串门需要的条件（不是我喜欢它就行）。
    * 邻居表里没有它时补一条 allowed 邻居（昵称来自我的放行名单，不来自心跳）。
    */
-  function markPeerHeartbeat (deviceId, nickname, at) {
+  function markPeerHeartbeat (deviceId, nickname, at, caps = null) {
     const neighbor = state.neighbors.get(deviceId)
     if (neighbor !== undefined) {
       neighbor.heartbeatAt = Number.isFinite(neighbor.heartbeatAt)
         ? Math.max(neighbor.heartbeatAt, at)
         : at
+      // 票 54：心跳带的能力声明也记下来（广播那一刻可能还没到）。
+      if (caps !== null) neighbor.caps = caps
       refreshNeighbor(deviceId, at)
       return
     }
@@ -399,6 +403,7 @@ export function createRoom ({
       nickname: nickname ?? FALLBACK_NICKNAME,
       status: 'allowed',
       lastSeen: at,
+      ...(caps === null ? {} : { caps }),
       port: null,
       heartbeatAt: at
     })
@@ -412,7 +417,9 @@ export function createRoom ({
       visitId: out.visitId,
       phase: out.phase,
       startedAt: out.startedAt,
-      endsAt: out.endsAt
+      endsAt: out.endsAt,
+      ...(out.purpose === 'steal' ? { purpose: 'steal', plots: [...(out.plots ?? [])] } : {}),
+      ...(Number.isFinite(out.raidUntil) ? { raidUntil: out.raidUntil } : {})
     }
   }
 
@@ -463,9 +470,11 @@ export function createRoom ({
       anim: visitor.anim,
       visitId: visitor.visitId,
       since: visitor.since,
-      // 入站访客没有时间上限：endsAt 固定为 null，客户端不要画倒计时。
+      // 只加字段、不改名：来玩的访客没有 kind，形状与 ticket 10 完全一致。
+      ...(visitor.kind === 'raid' ? { kind: 'raid' } : {}),
+      // 来玩的没有时间上限（endsAt = null）；来偷的由一轮一趟的硬上限兜着。
       lastSeen: visitor.lastSeen,
-      endsAt: null,
+      endsAt: visitor.endsAt ?? null,
       // 只加字段、不改名：没有礼物的访客，快照形状与 ticket 10 完全一致。
       ...(visitor.gift === undefined ? {} : { gift: { ...visitor.gift } })
     }
@@ -540,7 +549,9 @@ export function createRoom ({
       startedAt: record.startedAt,
       durationMs: record.durationMs,
       // 可选字段只加不改：没有礼物的记录与 ticket 06 的形状完全一致。
-      ...(record.gift === undefined ? {} : { gift: { ...record.gift } })
+      ...(record.gift === undefined ? {} : { gift: { ...record.gift } }),
+      // 票 53：行程（来偷）的那一条带 kind，其余记录没有这个字段。
+      ...(record.kind === 'raid' ? { kind: 'raid' } : {})
     }
   }
 
@@ -567,7 +578,7 @@ export function createRoom ({
    * `gift` 是可选的第 5 个参数：来访者身上那件礼物，或这次出门带在路上的那一件。
    * 只留 kind 与文件名；非法/没有就只是少一个字段，记录本身照写。
    */
-  function recordVisit (direction, nickname, startedAt, endedAt, gift = null) {
+  function recordVisit (direction, nickname, startedAt, endedAt, gift = null, kind = null) {
     const start = Number.isFinite(startedAt) ? Math.max(0, startedAt) : nowMs()
     const end = Number.isFinite(endedAt) ? Math.max(start, endedAt) : nowMs()
     const record = {
@@ -578,6 +589,8 @@ export function createRoom ({
     }
     const cleanGift = normalizeVisitGift(gift)
     if (cleanGift !== null) record.gift = cleanGift
+    // 票 53：来偷的那一趟在记录里是 `raid`，和来玩的分得开。
+    if (kind === 'raid') record.kind = 'raid'
     state.visits.unshift(record)
     if (state.visits.length > VISIT_RECORD_LIMIT) state.visits.length = VISIT_RECORD_LIMIT
     // room 不落盘：完成的记录排队，service 在 tick/action 之后交给 visits.json。
@@ -597,8 +610,15 @@ export function createRoom ({
     state.out = null
     let record = null
     if (wasActive) {
-      record = recordVisit('out', out.nickname, out.startedAt, at, out.gift)
-      if (notifyRemote) state.pendingRecalls.push({ deviceId: out.deviceId, visitId: out.visitId })
+      record = recordVisit('out', out.nickname, out.startedAt, at, out.gift, out.purpose === 'steal' ? 'raid' : null)
+      if (notifyRemote) {
+        state.pendingRecalls.push({
+          deviceId: out.deviceId,
+          visitId: out.visitId,
+          // 票 53：来偷的那一趟要走上免放行的单播出口，所以把目的带出去。
+          ...(out.purpose === 'steal' ? { purpose: 'steal' } : {})
+        })
+      }
     }
     if (notice !== null) pushNotice(notice, at)
     return { visit: copyOutbound(out), record }
@@ -641,7 +661,7 @@ export function createRoom ({
     if (visitor === undefined) return null
     state.visitors.delete(deviceId)
     rememberEndedInboundGift(visitor)
-    return recordVisit('in', visitor.nickname, visitor.since, at, visitor.gift)
+    return recordVisit('in', visitor.nickname, visitor.since, at, visitor.gift, visitor.kind === 'raid' ? 'raid' : null)
   }
 
   /**
@@ -1003,6 +1023,9 @@ export function createRoom ({
         existing.nickname = nickname
         existing.lastSeen = lastSeen
         if (port !== null) existing.port = port
+        // 票 52/54：能力声明随广播/心跳刷新；老版本没有这个字段 = 只会串门。
+        const caps = normalizeCaps(peer.caps)
+        if (caps !== null) existing.caps = caps
         // 广播只证明“它在线”，不证明“它放行了我”；heartbeatAt 只能由心跳刷新。
         if (!Number.isFinite(existing.heartbeatAt)) existing.heartbeatAt = 0
         // 队列满时没排上的邻居，等下一次广播再试（不重复入队）。
@@ -1015,7 +1038,16 @@ export function createRoom ({
       const status = state.trust.allowed.has(deviceId)
         ? 'allowed'
         : state.trust.denied.has(deviceId) ? 'denied' : 'pending'
-      state.neighbors.set(deviceId, { deviceId, nickname, status, lastSeen, port, heartbeatAt: 0 })
+      const caps = normalizeCaps(peer.caps)
+      state.neighbors.set(deviceId, {
+        deviceId,
+        nickname,
+        status,
+        lastSeen,
+        port,
+        heartbeatAt: 0,
+        ...(caps === null ? {} : { caps })
+      })
       if (status === 'pending') enqueuePrompt(deviceId)
       rememberSeen({ deviceId, nickname, lastSeen, status })
     },
@@ -1037,6 +1069,12 @@ export function createRoom ({
       const neighbor = state.neighbors.get(deviceId)
       const nickname = normalizeNickname(neighbor?.nickname ?? state.trust.allowed.get(deviceId))
       if (nickname === null) return false
+      // 票 54：心跳也带能力声明。只认广播的话，重启后要等最多 60 秒那一拍才会知道
+      // 对方是 1.3——这期间看田/去偷会被误判成"对方版本太老"。
+      if (neighbor !== undefined) {
+        const caps = normalizeCaps(peer.caps)
+        if (caps !== null) neighbor.caps = caps
+      }
       const anim = normalizeAnimation(peer.anim)
       // 心跳带来的不止动作片段：动作名和一句话都留着，街上的那一户要念出来（ticket 20）。
       const action = normalizeAnimation(peer.action)
@@ -1084,7 +1122,7 @@ export function createRoom ({
 
       // 心跳证明这位邻居还在线，也证明它放行了我：邻居灯不用等下一次 5 秒广播，
       // 串门目标表也不用猜“对方到底放没放行我”。
-      markPeerHeartbeat(deviceId, nickname, lastSeen)
+      markPeerHeartbeat(deviceId, nickname, lastSeen, normalizeCaps(peer.caps))
       return true
     },
 
@@ -1133,7 +1171,7 @@ export function createRoom ({
      * 同一只宠物只能有一次出门。失败时返回 { ok:false, error } 并写一条人话 notice：
      * not-admitted / peer-offline / already-out / starting。
      */
-    beginVisit (rawDeviceId, { at = clock(), visitId } = {}) {
+    beginVisit (rawDeviceId, { at = clock(), visitId, purpose = null, plots = null } = {}) {
       const now = stampOf(at)
       if (state.self.deviceId === null) return failWithNotice('starting', null, now)
       if (state.out !== null) {
@@ -1156,11 +1194,14 @@ export function createRoom ({
       if (deviceId === null) return { ok: false, error: 'bad-device-id' }
       if (!isVisitId(visitId)) return { ok: false, error: 'bad-visit-id' }
 
+      const raiding = purpose === 'steal'
       const neighbor = state.neighbors.get(deviceId)
-      if (!canTalkTo(deviceId)) {
+      // 票 53：派它去偷不需要放行（ADR-0018），只要有地址——没地址才是 peer-offline。
+      if (!raiding && !canTalkTo(deviceId)) {
         if (neighbor === undefined) return failWithNotice('peer-offline', null, now)
         return failWithNotice('not-admitted', neighbor.nickname, now)
       }
+      if (raiding && neighbor === undefined) return failWithNotice('peer-offline', null, now)
 
       const nickname = normalizeNickname(
         neighbor?.nickname ?? state.trust.allowed.get(deviceId)
@@ -1176,7 +1217,10 @@ export function createRoom ({
         lastSeen: now,
         // 这次出门捎的东西（ticket 27）。只进记录、不进快照；sendVisitRequest 成功后才由
         // service 用 markOutboundGift 填上（编码层丢掉 gift 时就不会误记成“带上了”）。
-        gift: null
+        gift: null,
+        // 票 53：这一趟的目的。`steal` = 派它去偷，不是串门。
+        purpose: raiding ? 'steal' : null,
+        plots: raiding && Array.isArray(plots) ? [...plots] : []
       }
       // 冷却从“开始出门”算，而不是从 ack 算：即使这次请求最终失败，
       // 宠物也已经试过一次，不该在 30 秒后的下一轮策略里再试一次。
@@ -1209,10 +1253,22 @@ export function createRoom ({
       const now = stampOf(at)
       out.phase = 'active'
       out.startedAt = now
-      out.endsAt = now + maxVisitMs
+      // 票 53：一趟偷最多 60 秒，不是串门的 30 分钟。
+      out.endsAt = now + (out.purpose === 'steal' ? RAID_MAX_MS : maxVisitMs)
       out.lastSeen = now
       refreshNeighbor(deviceId, now)
       return { ok: true, visit: copyOutbound(out) }
+    },
+
+    /**
+     * 票 53：记下"这一趟亮到什么时候"。`copyOutbound` 只给副本，所以必须在这里改真身。
+     */
+    markRaidUntil (visitId, until) {
+      const out = state.out
+      if (out === null || out.visitId !== visitId) return false
+      if (!Number.isFinite(until)) return false
+      out.raidUntil = Math.floor(until)
+      return true
     },
 
     /** 收到 visit-deny：请求中 → 明确失败；理由决定提示文案（没放行 / 关掉了串门）。 */
@@ -1274,7 +1330,7 @@ export function createRoom ({
       if (visitor !== undefined) {
         state.visitors.delete(deviceId)
         rememberEndedInboundGift(visitor)
-        const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
+        const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift, visitor.kind === 'raid' ? 'raid' : null)
         return {
           ok: true,
           side: 'in',
@@ -1304,11 +1360,14 @@ export function createRoom ({
       if (deviceId === null || visitId === null) {
         return { reply: 'ignore', error: 'bad-visit' }
       }
+      // 票 51 / ADR-0018：来偷不需要放行，也不受 acceptVisits 约束——它拦不住，
+      // 但一定留记录。免放行只对 purpose:'steal' 开口，普通串门一个字没变。
+      const raiding = peer.purpose === 'steal'
       // 开关先于信任判断：关掉时连已放行的邻居也进不来，理由对发起方是明确的。
-      if (!state.acceptVisits) {
+      if (!raiding && !state.acceptVisits) {
         return { reply: 'deny', deviceId, visitId, reason: 'visits-off' }
       }
-      if (!canTalkTo(deviceId)) {
+      if (!raiding && !canTalkTo(deviceId)) {
         // 未知/未放行/已拒绝：给发起方一句明确的 deny，不创建任何本机状态。
         return { reply: 'deny', deviceId, visitId, reason: 'not-admitted' }
       }
@@ -1329,6 +1388,7 @@ export function createRoom ({
         existing.nickname = nickname
         existing.anim = anim
         existing.lastSeen = now
+        if (raiding) existing.endsAt = now + RAID_MAX_MS
         // 重发的是同一件礼物：状态（可能已经 received）原样保留，绝不退回 pending，
         // 否则每丢一包 ack，桌面上的卡片就会闪一下“正在收下”。
         // 换了一件新的：换卡；没带礼物：这次访客身上原来那件留着（东西已经在磁盘上了）。
@@ -1351,6 +1411,9 @@ export function createRoom ({
         nickname,
         anim,
         since: now,
+        // 来偷的那种：`endsAt` 是一趟的硬上限；来玩的是 null（没有时间上限）。
+        kind: raiding ? 'raid' : null,
+        endsAt: raiding ? now + RAID_MAX_MS : null,
         lastSeen: now,
         ...(gift === null ? {} : { gift })
       }
@@ -1409,7 +1472,7 @@ export function createRoom ({
       const now = stampOf(at)
       state.visitors.delete(deviceId)
       rememberEndedInboundGift(visitor)
-      const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift)
+      const record = recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift, visitor.kind === 'raid' ? 'raid' : null)
       state.pendingRecalls.push({ deviceId: visitor.deviceId, visitId: visitor.visitId })
       return {
         ok: true,
@@ -1728,6 +1791,14 @@ export function createRoom ({
 
       // ticket 10：入站访客没有 TTL，唯一的自动清场是“对方 2 分钟没有心跳”。
       for (const [deviceId, visitor] of state.visitors) {
+        // 票 51：偷客到点自己走（一趟最多 RAID_MAX_MS）。这不是失联，不写串门记录——
+        // 行程那条记录归发起方的票（53）。
+        if (visitor.kind === 'raid' && Number.isFinite(visitor.endsAt) && now >= visitor.endsAt) {
+          state.visitors.delete(deviceId)
+          rememberEndedInboundGift(visitor)
+          recordVisit('in', visitor.nickname, visitor.since, now, visitor.gift, 'raid')
+          continue
+        }
         if (now - visitor.lastSeen >= lostMs) {
           state.visitors.delete(deviceId)
           rememberEndedInboundGift(visitor)

@@ -101,7 +101,7 @@ test('self.work：本机宠物在外打工时 self 从桌面消失；controls �
 
 test('helper 四层：PET_ROLES 含 worker，normalizeItem/petScene 保留 badge，非法 badge 丢弃', () => {
   assert.deepEqual(shared.PET_ROLES, ['self', 'guest', 'visitor', 'worker'])
-  assert.deepEqual(shared.PET_BADGES, ['work'])
+  assert.deepEqual(shared.PET_BADGES, ['work', 'steal'])
 
   const wire = shared.normalizeScene({
     items: [{

@@ -157,6 +157,10 @@ let farmContracts = null
 /** 访客模式（ticket 43）：`owner` / `visitor` 与主人家的快照块（state/guard/plots/limits）。 */
 let farmMode = 'owner'
 let farmVisit = null
+/** 票 52：只读查看邻居农场时的视图（`mode:'look'`）。 */
+let farmLook = null
+/** 票 55：窗口里的邻居切换器。 */
+let farmNeighbors = []
 /** 点某块地开窗时带上的 plotId；窗口用它高亮那一块。 */
 let farmPlotId = null
 /** 正在等宿主答复的那次农场动作（action id）与它的计时器。 */
@@ -894,7 +898,9 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
   const id = shared.normalizeId(payload?.id)
   const action = typeof payload?.action === 'string' ? payload.action.trim().toLowerCase() : ''
   if (id === null || !shared.DESKTOP_ACTIONS.includes(action)) return
-  const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss'
+  const needsDevice = action === 'end-visit' || action === 'admit' || action === 'reject' || action === 'dismiss' ||
+    // 票 54：看田与派它去偷都**必须有对象**——右键的是哪一户，就看/偷哪一户。
+    action === 'farm-look' || action === 'farm-raid'
   // `visit` 是「可能带对象」：从邻居面板点某一户就带 deviceId；没有就交给宿主随机挑一位
   // （HTTP 口的老行为）。needsDevice 的那几个动作则必须有对象，缺了直接拒绝。
   const deviceId = needsDevice || action === 'visit' ? shared.normalizeId(payload?.deviceId) : null
@@ -943,6 +949,17 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     sendActionResult({ id, ok: false, notice: '数量要在 1–99 之间。', error: 'bad-qty' })
     return
   }
+  // 地块解锁（ticket 48）：窗口带自己看到的已解锁数做乐观锁；0/越界都当坏形状。
+  const isLandAction = shared.FARM_LAND_ACTIONS.includes(action)
+  let expectedUnlocked = null
+  if (isLandAction && payload?.expectedUnlocked !== undefined) {
+    const expected = Number(payload.expectedUnlocked)
+    if (!Number.isInteger(expected) || expected < shared.MIN_FARM_PLOTS || expected > shared.MAX_FARM_PLOTS) {
+      sendActionResult({ id, ok: false, notice: '农场刚刚变过，刷新后再试。', error: 'stale' })
+      return
+    }
+    expectedUnlocked = expected
+  }
   // 雇佣（ticket 44）：四个动作共用 normalizeFarmAction，窗口与主窗走同一道白名单。
   if (shared.FARM_HIRE_ACTIONS.includes(action)) {
     const normalized = shared.normalizeFarmAction({ ...payload, action })
@@ -965,7 +982,8 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     ...(giftId === null ? {} : { giftId }),
     ...(plotId === null ? {} : { plotId }),
     ...(cropId === null ? {} : { cropId }),
-    ...(qty === null ? {} : { qty })
+    ...(qty === null ? {} : { qty }),
+    ...(expectedUnlocked === null ? {} : { expectedUnlocked })
   })
   if (!written) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接，这次操作没有生效。', error: 'host-unavailable' })
 })
@@ -1636,6 +1654,8 @@ function sendFarmState () {
       contracts: farmContracts,
       mode: farmMode,
       visit: farmVisit,
+      look: farmLook,
+      neighbors: farmNeighbors,
       plotId: farmPlotId
     })
   } catch {
@@ -1872,8 +1892,10 @@ function applyCommand (command) {
       farmState = command.farm
       farmMarket = command.market
       farmContracts = command.contracts ?? null
-      farmMode = command.mode === 'visitor' ? 'visitor' : 'owner'
+      farmMode = command.mode === 'look' ? 'look' : command.mode === 'visitor' ? 'visitor' : 'owner'
       farmVisit = command.visit ?? null
+      farmLook = farmMode === 'look' ? (command.look ?? null) : null
+      farmNeighbors = Array.isArray(command.neighbors) ? command.neighbors : []
       farmPlotId = typeof command.plotId === 'string' ? command.plotId : null
       if (command.open === true) {
         if (!openFarmWindow()) {
@@ -2133,7 +2155,7 @@ function applyCommand (command) {
       return
     }
     case 'debug-farm-batch': {
-      // 冒烟用：点「一键播种 / 一键收割」，验证批量队列真的从窗口发出动作。
+      // 冒烟用：点「一键种满 / 一键收割」，验证批量队列真的从窗口发出动作。
       if (!debugEnabled) return
       if (farmWin === null || farmWin.isDestroyed()) {
         writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
@@ -2181,7 +2203,9 @@ function applyCommand (command) {
       const script = '(() => Array.from(document.querySelectorAll(".plot-card")).map((el) => ({' +
         'id: el.dataset.plot || "",' +
         'stage: el.dataset.stage || "",' +
-        'text: (el.querySelector(".countdown")?.textContent || "")' +
+        'text: (el.querySelector(".countdown")?.textContent || ""),' +
+        'locked: el.classList.contains("locked"),' +
+        'badge: (el.querySelector(".plot-badge")?.textContent || "")' +
         '})))()'
       void farmWin.webContents.executeJavaScript(script, true)
         .then((plots) => writeEvent({ type: 'farm-read', id: command.id, plots }))

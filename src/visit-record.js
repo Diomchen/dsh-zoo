@@ -49,5 +49,7 @@ export function normalizeVisitRecord (raw) {
   // 可选字段：非法只丢它自己，绝不因此丢掉整条记录。
   const gift = normalizeVisitGift(raw.gift)
   if (gift !== null) record.gift = gift
+  // 票 53：来偷的那一趟标成 `raid`（其余记录没有这个字段，形状与旧版本一致）。
+  if (raw.kind === 'raid') record.kind = 'raid'
   return record
 }

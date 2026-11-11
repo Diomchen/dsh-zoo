@@ -502,7 +502,12 @@ test('访客动作：shared 只放行 farm-steal/farm-help + plotId；helper 事
     { action: 'farm-help', plotId: 'p4' }
   )
   assert.equal(shared.normalizeFarmAction({ action: 'farm-steal' }), null)
-  assert.equal(shared.normalizeFarmAction({ action: 'farm-steal', plotId: 'p9' }), null)
+  // ticket 48：p1–p50 都是合法地块；p51 越界。
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-steal', plotId: 'p9' }),
+    { action: 'farm-steal', plotId: 'p9' }
+  )
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-steal', plotId: 'p51' }), null)
 
   const steal = shared.normalizeHelperEvent({
     type: 'action', id: 'f1', action: 'farm-steal', plotId: 'p1'
@@ -629,10 +634,10 @@ test('访客窗口的渲染端/预加载/主进程都走同一条动作线（静
   assert.match(main, /farmPending/)
 })
 
-test('记录页：窗口拿 50 条、/state 只给 20 条；hire/settle 日志字段齐全', async (t) => {
+test('记录页：窗口拿 100 条、/state 只给 20 条；hire/settle 日志字段齐全', async (t) => {
   const dir = await tempDir(t)
   const clock = { value: NOON }
-  const entries = Array.from({ length: 55 }, (_, index) => {
+  const entries = Array.from({ length: 105 }, (_, index) => {
     if (index === 0) return { at: NOON, kind: 'hire', who: '阿蟹', hours: 2, wage: 20 }
     if (index === 1) return { at: NOON - 1, kind: 'settle', who: '阿蟹', wage: 20, earned: 5 }
     return { at: NOON - 2 - index, kind: index % 2 === 0 ? 'plant' : 'harvest', crop: 'tomato', qty: 1 }
@@ -659,7 +664,7 @@ test('记录页：窗口拿 50 条、/state 只给 20 条；hire/settle 日志�
   const opened = await callAction(service, { action: 'farm-open' })
   assert.equal(opened.body.ok, true)
   const window = desktop.calls.windows.at(-1)
-  assert.equal(window.farm.log.length, 50, '窗口记录页给最近 50 条')
+  assert.equal(window.farm.log.length, 100, '窗口记录页给最近 100 条')
   assert.equal(window.farm.log[0].kind, 'hire')
   assert.equal(window.farm.log[0].wage, 20)
   assert.equal(window.farm.log[1].kind, 'settle')
@@ -675,7 +680,7 @@ test('记录页：窗口拿 50 条、/state 只给 20 条；hire/settle 日志�
   assert.match(html, /id="page-log"/)
   assert.equal(html.includes('记录还没开放'), false)
   const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
-  assert.match(renderer, /slice\(0, 50\)/)
+  assert.match(renderer, /slice\(0, 100\)/)
   assert.match(renderer, /page-log/)
   assert.match(renderer, /carried/)
 })
@@ -779,6 +784,155 @@ test('20 块地的 farm-window：标题按 plots.length、渲染 20 张卡，不
   assert.match(renderer, /view\.plotCards\(farm/)
 })
 
+test('50 块与锁定卡：header 显示 x/50、下一块地价、种满队列', () => {
+  const plots = Array.from({ length: 50 }, (_, index) => ({
+    id: 'p' + (index + 1),
+    stage: index < 2 ? 'empty' : 'empty'
+  }))
+  const full = {
+    plots,
+    seeds: { tomato: 2, carrot: 1, pumpkin: 0 },
+    coins: 100,
+    unlocked: 50,
+    maxPlots: 50,
+    nextCost: null
+  }
+  assert.equal(farmView.headerStats(full).text, '0/50 已种植 · 地块 50/50')
+  assert.equal(farmView.unlockCard(full), null, '到 50 块没有锁定卡')
+
+  const five = {
+    ...full,
+    plots: plots.slice(0, 5),
+    unlocked: 5,
+    nextCost: 65,
+    unlockLadder: [65, 75, 80, 90, 95]
+  }
+  assert.equal(farmView.headerStats(five).text, '0/5 已种植 · 地块 5/50 · 下一块 65')
+  const card = farmView.unlockCard(five)
+  assert.equal(card.label, '地块 6')
+  assert.equal(card.nextCost, 65)
+  assert.equal(card.affordable, true, '100 ≥ 65 + 6')
+  assert.deepEqual(card.ladder, [65, 75, 80, 90, 95])
+  const poor = farmView.unlockCard({ ...five, coins: 68 })
+  assert.equal(poor.affordable, false, '68 − 65 = 3 < 6，留不出种子钱')
+
+  const documentDouble = { createElement: (tag) => fakeElement(tag) }
+  const built = farmView.createUnlockCard(documentDouble, card)
+  assert.ok(built.element.className.includes('locked'))
+  assert.equal(built.button.dataset.landAction, 'unlock')
+  assert.equal(built.button.disabled, false)
+  // 买不起时按钮仍可点：确认弹层要能打开，让用户看到还差多少和后续价格；
+  // 真正该禁用是弹层里的「解锁 · 65 硬币」确认键。
+  const openable = farmView.createUnlockCard(documentDouble, poor)
+  assert.equal(openable.button.disabled, false)
+  assert.equal(openable.element.dataset.affordable, 'false')
+  assert.equal(openable.button.title, '留 6 硬币买种子')
+
+  // 种满：按空地与种子库存排队；种子用完就停。
+  assert.deepEqual(farmView.batchPlantTargets(five), [
+    { plotId: 'p1', cropId: 'tomato' },
+    { plotId: 'p2', cropId: 'tomato' },
+    { plotId: 'p3', cropId: 'carrot' }
+  ])
+  assert.deepEqual(farmView.batchPlantTargets({ plots: [], seeds: {} }), [])
+})
+
+test('农场窗静态窄口：解锁动作、锁定卡、种满与 100 条日志', async () => {
+  const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
+  assert.match(html, /id="unlock-modal"/)
+  assert.match(html, /id="unlock-confirm"/)
+  assert.match(html, /id="unlock-modal-close"/)
+  assert.match(html, /一键种满/)
+  assert.match(html, /最近 100 条/)
+
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  assert.match(renderer, /farm-unlock/)
+  assert.match(renderer, /expectedUnlocked/)
+  assert.match(renderer, /data-land-action="unlock"/)
+  assert.match(renderer, /sendNextBatch/)
+  assert.match(renderer, /slice\(0, 100\)/)
+  assert.match(renderer, /view\.unlockCard\(farm\)/)
+  assert.match(renderer, /view\.batchPlantTargets\(farm\)/)
+  assert.match(renderer, /emptyPlotCount\(farm\)/)
+  assert.match(renderer, /解锁后余额 /, '确认弹层要显示解锁后余额（买不起也要显示）')
+  // ticket 49/UI：买满空地仍然只改数量；现在拆成「买满」与「全卖」两个快捷量。
+  assert.match(renderer, /data-fill-buy/)
+  assert.match(renderer, /data-fill-sell/)
+  // visitor 模式整块不画锁定卡/解锁入口。
+  assert.match(renderer, /if \(mode === 'visitor' && visit !== null\)/)
+
+  const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
+  assert.match(preload, /expectedUnlocked: action\.expectedUnlocked/, 'preload 必须把乐观锁带下去')
+
+  assert.equal(shared.FARM_ACTIONS.includes('farm-unlock'), true)
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-unlock', expectedUnlocked: 7 }),
+    { action: 'farm-unlock', expectedUnlocked: 7 }
+  )
+  assert.deepEqual(shared.normalizeFarmAction({ action: 'farm-unlock' }), { action: 'farm-unlock' })
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-unlock', expectedUnlocked: 0 }), null)
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-unlock', expectedUnlocked: 3 }), null)
+  assert.equal(shared.normalizeFarmAction({ action: 'farm-unlock', expectedUnlocked: 51 }), null)
+  // 窗口契约与宿主同源：unlocked 最少 4，不是 1。
+  assert.equal(shared.normalizeFarm({ plots: [], unlocked: 3 }).unlocked, 4)
+  assert.equal(shared.normalizeFarm({ plots: [], unlocked: 1 }).unlocked, 4)
+  assert.equal(shared.normalizeFarm({ plots: [], unlocked: 50 }).unlocked, 50)
+})
+
+test('farm-unlock：扣钱、加地块、stale；窗口推新视图与地价梯子', async (t) => {
+  const dir = await tempDir(t)
+  const farmState = {
+    ...initialFarmState(),
+    version: FARM_VERSION,
+    coins: 500,
+    lastTickAt: NOON,
+    dewAt: NOON
+  }
+  await writeFile(join(dir, FARM_FILE), JSON.stringify(farmState), 'utf8')
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => NOON
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.body.ok, true)
+  let window = desktop.calls.windows.at(-1)
+  assert.equal(window.farm.unlocked, 4)
+  assert.equal(window.farm.maxPlots, 50)
+  assert.equal(window.farm.plots.length, 4)
+  assert.equal(window.farm.nextCost, 60)
+  assert.deepEqual(window.farm.unlockLadder, [60, 65, 75, 80, 90, 95])
+
+  const unlocked = await callAction(service, { action: 'farm-unlock', expectedUnlocked: 4 })
+  assert.equal(unlocked.status, 200)
+  assert.equal(unlocked.body.ok, true)
+  assert.equal(unlocked.body.unlocked, 5)
+  assert.equal(unlocked.body.cost, 60)
+  assert.equal(unlocked.body.coins, 440)
+  assert.equal(unlocked.body.nextCost, 65)
+  assert.match(unlocked.body.notice, /解锁了第 5 块地/)
+  window = desktop.calls.windows.at(-1)
+  assert.equal(window.farm.unlocked, 5)
+  assert.equal(window.farm.plots.length, 5)
+  assert.equal(window.farm.nextCost, 65)
+  assert.equal(window.farm.log[0].kind, 'unlock')
+
+  // 连点：第二次带旧的 expectedUnlocked 来，宿主回 stale，不重复扣钱。
+  const stale = await callAction(service, { action: 'farm-unlock', expectedUnlocked: 4 })
+  assert.equal(stale.status, 409)
+  assert.equal(stale.body.error, 'stale')
+  const state = await call(service, '/dsh-zoo/state')
+  assert.equal(state.body.farm.unlocked, 5)
+  assert.equal(state.body.farm.coins, 440)
+})
+
 test('一键播种/一键收割：第一个空地 + 第一份有库存的种子；成熟地块按序入队', () => {
   const farm = {
     plots: [
@@ -790,15 +944,18 @@ test('一键播种/一键收割：第一个空地 + 第一份有库存的种子�
     ],
     seeds: { tomato: 0, carrot: 2, pumpkin: 1 }
   }
-  assert.deepEqual(farmView.batchPlantTarget(farm), { ok: true, plotId: 'p3', cropId: 'carrot' })
+  assert.deepEqual(farmView.batchPlantTargets(farm), [
+    { plotId: 'p3', cropId: 'carrot' },
+    { plotId: 'p6', cropId: 'carrot' }
+  ])
   assert.deepEqual(farmView.batchHarvestTargets(farm), ['p1', 'p5'])
   assert.deepEqual(
-    farmView.batchPlantTarget({ plots: [{ id: 'p1', stage: 'empty' }], seeds: {} }),
-    { ok: false, reason: 'no-seed' }
+    farmView.batchPlantTargets({ plots: [{ id: 'p1', stage: 'empty' }], seeds: {} }),
+    []
   )
   assert.deepEqual(
-    farmView.batchPlantTarget({ plots: [{ id: 'p1', stage: 'mature' }], seeds: { tomato: 1 } }),
-    { ok: false, reason: 'no-plot' }
+    farmView.batchPlantTargets({ plots: [{ id: 'p1', stage: 'mature' }], seeds: { tomato: 1 } }),
+    []
   )
   assert.deepEqual(farmView.batchHarvestTargets({ plots: [{ id: 'p1', stage: 'growing' }] }), [])
 
@@ -816,7 +973,7 @@ test('播种弹窗与批量条：三份种子库存/生长/产量、0 禁用、�
   assert.match(html, /id="plant-go-market"/)
   assert.match(html, /id="batch-plant"/)
   assert.match(html, /id="batch-harvest"/)
-  assert.match(html, /一键播种/)
+  assert.match(html, /一键种满/)
   assert.match(html, /一键收割/)
   assert.match(html, /id="seed-bag"/)
   assert.match(html, /id="crop-warehouse"/)
@@ -840,7 +997,7 @@ test('播种弹窗与批量条：三份种子库存/生长/产量、0 禁用、�
   assert.match(renderer, /action: 'farm-' \+ action/)
   // 批量 guard：busy / batch / 顺序等回执。
   assert.match(renderer, /batch !== null/)
-  assert.match(renderer, /sendNextHarvest/)
+  assert.match(renderer, /sendNextBatch/)
   assert.match(renderer, /batch\.queue\.shift\(\)/)
 })
 
@@ -931,4 +1088,74 @@ test('farm-refresh：到点确认只重推当前窗口，不关窗', async (t) =
   assert.equal(payload.close, undefined)
   assert.equal(payload.farm.plots.length, 4)
   assert.equal(desktop.isFarmOpen(), true)
+})
+
+test('窗口载荷永远带一份邻居切换器（没有邻居时是空数组）', async (t) => {
+  const dir = await tempDir(t)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.body.ok, true)
+  const payload = desktop.calls.windows.at(-1)
+  assert.ok(Array.isArray(payload.neighbors), 'neighbors 必须是数组')
+  assert.deepEqual(payload.neighbors, [], '没有邻居时是空的，不是 undefined')
+})
+
+test('从"看田"切回「我的农场」：farm-refresh 推回 owner 模式，不带 look', async (t) => {
+  const dir = await tempDir(t)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  await callAction(service, { action: 'farm-open' })
+  assert.equal(desktop.isFarmOpen(), true)
+
+  // 窗口里点「我的农场」→ 只发一次 farm-refresh；宿主按 self.out 重算，没出门就是 owner。
+  const refreshed = await callAction(service, { action: 'farm-refresh' })
+  assert.equal(refreshed.body.ok, true)
+
+  const payload = desktop.calls.windows.at(-1)
+  assert.equal(payload.mode, 'owner')
+  assert.equal(payload.look, undefined, '不能把上一次的邻居视图带回来')
+  assert.ok(Array.isArray(payload.neighbors), '切回来之后切换器还在')
+})
+
+test('邻居切换器的形状：少就圆片，多就胶囊，排序看熟地', () => {
+  const three = farmView.neighborSwitch([
+    { deviceId: 'a', nickname: '一飞', ripePlots: 0, guard: 0.3 },
+    { deviceId: 'b', nickname: '鱼姐', ripePlots: 2, guard: 0.8 },
+    { deviceId: 'c', nickname: '吾鲸', old: true }
+  ], null)
+  assert.equal(three.mode, 'chips')
+  assert.deepEqual(three.items.map((item) => item.label), ['鱼姐', '吾鲸', '一飞'])
+  assert.equal(three.stealable, 1)
+  assert.equal(three.items[1].old, true)
+
+  const many = farmView.neighborSwitch(Array.from({ length: 6 }, (_, index) => ({
+    deviceId: 'd' + index,
+    nickname: '邻居' + index,
+    ripePlots: index % 3,
+    guard: 0.3
+  })), 'd4')
+  assert.equal(many.mode, 'menu')
+  assert.equal(many.currentLabel, '邻居4')
+  assert.equal(many.items.find((item) => item.active)?.label, '邻居4')
+  // 能偷的排最前
+  assert.ok(many.items.slice(0, 2).every((item) => item.ripePlots === 2))
 })

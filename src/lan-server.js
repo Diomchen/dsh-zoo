@@ -4,8 +4,8 @@ import { readFile, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 
-import { FARM_ROUTES, GIFT_ROUTES, SKIN_ROUTES, matchRoute } from './lan-routes.js'
-import { MAX_GIFT_BYTES, isVisitId } from './protocol.js'
+import { FARM_OPEN_SEGMENT, FARM_ROUTES, GIFT_ROUTES, SKIN_ROUTES, matchRoute } from './lan-routes.js'
+import { MAX_GIFT_BYTES, isDeviceId, isVisitId } from './protocol.js'
 
 /**
  * 局域网只读服务（ticket 15 的素材源 + ticket 25 的礼物源）。
@@ -75,6 +75,11 @@ export async function startLanServer (options = {}) {
    * 表不在 server 里；返回 null/undefined 一律 404。视图里**绝不能**有路径或别人的 deviceId。
    */
   const lookupFarm = typeof options.lookupFarm === 'function' ? options.lookupFarm : null
+  /**
+   * 公开只读视图（票 52）：`viewerDeviceId → view`。**不查放行**（ADR-0018）——
+   * viewer 只用来算"我自己偷过没有"，拿它当授权就错了。
+   */
+  const lookupOpenFarm = typeof options.lookupOpenFarm === 'function' ? options.lookupOpenFarm : null
 
   /** 建一张「源 id → 源」的表；坏条目只丢自己。 */
   function indexSources (list) {
@@ -176,7 +181,11 @@ export async function startLanServer (options = {}) {
       // 农场快照（ticket 43）：同样只有一层 visitId；形状/授权由 lookupFarm 决定。
       const farm = matchRoute(pathname, FARM_ROUTES)
       if (farm !== null) {
-        if (farm.rest === '' || farm.rest.includes('/')) return sendText(response, 404, 'not found')
+        // 票 52：`open/<viewerId>` 是两层，其余形状仍然只允许一层。
+        const open = farm.rest.startsWith(FARM_OPEN_SEGMENT + '/')
+        if (farm.rest === '' || (!open && farm.rest.includes('/'))) {
+          return sendText(response, 404, 'not found')
+        }
         return handleFarm(request, response, farm.rest)
       }
       const skin = matchRoute(pathname, SKIN_ROUTES)
@@ -248,6 +257,19 @@ export async function startLanServer (options = {}) {
    * 视图由 service 构造（只含白名单字段）；这里只原样 JSON.stringify，不拼任何路径。
    */
   async function handleFarm (request, response, rawId) {
+    // 票 52：`/dsh-zoo-farm/open/<viewerId>` 是公开视图；其余形状仍是串门期快照。
+    if (rawId.startsWith(FARM_OPEN_SEGMENT + '/')) {
+      const viewer = rawId.slice(FARM_OPEN_SEGMENT.length + 1)
+      if (!isDeviceId(viewer)) return sendText(response, 404, 'not found')
+      let open
+      try {
+        open = lookupOpenFarm === null ? null : lookupOpenFarm(viewer.toLowerCase())
+      } catch {
+        open = null
+      }
+      if (open === null || open === undefined) return sendText(response, 404, 'not found')
+      return sendJson(response, 200, open, request.method === 'HEAD')
+    }
     if (!isVisitId(rawId)) return sendText(response, 404, 'not found')
     let view
     try {

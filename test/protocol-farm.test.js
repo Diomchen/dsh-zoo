@@ -88,14 +88,14 @@ test('farm-action：坏 visitId/requestId/action/plotId 整包丢弃（固定 re
   assert.equal(parsePacket(encodeJson({ ...base, requestId: 'nope' })).reason, 'request-id')
   assert.equal(parsePacket(encodeJson({ ...base, action: 'rob' })).reason, 'action')
   assert.equal(parsePacket(encodeJson({ ...base, action: null })).reason, 'action')
-  assert.equal(parsePacket(encodeJson({ ...base, plotId: 'p9' })).reason, 'plot-id')
+  assert.equal(parsePacket(encodeJson({ ...base, plotId: 'p51' })).reason, 'plot-id')
   assert.equal(parsePacket(encodeJson({ ...base, plotId: '../p1' })).reason, 'plot-id')
   // 编码侧是本地程序错误：非法入参必须抛，不能悄悄发出去。
   for (const broken of [
     actionInput({ visitId: 'nope' }),
     actionInput({ requestId: 'nope' }),
     actionInput({ action: 'rob' }),
-    actionInput({ plotId: 'p9' })
+    actionInput({ plotId: 'p51' })
   ]) {
     assert.throws(() => encodeFarmAction(broken))
   }

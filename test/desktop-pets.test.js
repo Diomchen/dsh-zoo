@@ -64,6 +64,21 @@ test('petScene：reset 传递、未知角色回落 guest、坏条目丢弃、数
   assert.ok(line !== null && line.length < shared.MAX_LINE_LENGTH, '最坏情况的场景也必须塞进一行')
 })
 
+test('偷客带「偷菜」角标：来玩的访客没有', () => {
+  const pets = petsFromSnapshot({
+    visitors: [
+      { deviceId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', nickname: '小蓝', anim: '待机', kind: 'raid' },
+      { deviceId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb', nickname: '泡泡', anim: '待机' }
+    ],
+    guests: [],
+    workers: []
+  })
+  const raid = pets.find((pet) => pet.nickname === '小蓝' || pet.label === '小蓝')
+  const plain = pets.find((pet) => pet.nickname === '泡泡' || pet.label === '泡泡')
+  assert.equal(raid?.badge, 'steal')
+  assert.equal(plain?.badge, undefined)
+})
+
 test('petScene：极小/缺失工作区也能给出不越界的矩形', () => {
   const tiny = shared.petScene([{ id: 'self', role: 'self', label: '我' }], { width: 40, height: 30 })
   const item = tiny.items[0]

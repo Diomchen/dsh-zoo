@@ -1164,8 +1164,15 @@
     if (row.canVisit === true) {
       house.type = 'button'
       house.dataset.lpAction = 'visit'
-      house.dataset.lpDevice = row.deviceId
     }
+    house.dataset.lpDevice = row.deviceId
+    // 票 54：右键这一户 = 看看他家的农场（ADR-0018 之后不需要放行）。
+    // 左键仍然是「去串门」，两个动作不抢同一个手势。
+    house.addEventListener('contextmenu', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      requestAction('farm-look', row.deviceId)
+    })
 
     const top = document.createElement('span')
     top.className = 'lp-house-top'

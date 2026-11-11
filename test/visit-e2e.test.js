@@ -766,7 +766,9 @@ test('送客的 recall 丢第一包：重发到达后对方立刻回家，记录
  */
 test('访客换皮：邻居桌面拿到的是访客自己的素材，换皮后 src 立刻跟着换', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-zoo-skin-visit-'))
-  t.after(() => rm(root, { recursive: true, force: true }))
+  // 这条链会在 root 底下同时开两个 service（各自还在写素材缓存）：不给重试的话，
+  // macOS 上偶尔会撞上 ENOTEMPTY（文件刚被另一个 writer 创建）。
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const fishDir = join(root, 'fish')
   const catDir = join(root, 'cat')
   const dirA = join(root, 'a')

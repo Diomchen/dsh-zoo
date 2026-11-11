@@ -388,3 +388,28 @@ test('访客侧本机日上限：偷 10 次后不再发 UDP，直接 cap', async
   assert.deepEqual(after.plots[0].stolenBy, before.plots[0].stolenBy)
   assert.equal(b.snapshot().visitors.length, 1)
 })
+
+test('访客快照只含已解锁地块：10 块时是 p1–p10，限额随主人规模放大', async (t) => {
+  const plots = Array.from({ length: 10 }, (_, index) => plot(
+    'p' + (index + 1),
+    index % 2 === 0 ? 'tomato' : 'carrot'
+  ))
+  // 访客是 A、主人是 B：快照读的是 B 的农场。
+  const context = await twoServices(t, {
+    aFarm: farmFile(),
+    bFarm: farmFile({ unlocked: 10, plots })
+  })
+  const response = await fetch('http://127.0.0.1:' + context.skinPortB + '/dsh-zoo-farm/' + context.visitId)
+  assert.equal(response.status, 200)
+  const snapshot = await response.json()
+  assert.deepEqual(
+    snapshot.plots.map((entry) => entry.id),
+    Array.from({ length: 10 }, (_, index) => 'p' + (index + 1))
+  )
+  // n=10：偷 3/访客/农场、5+floor(6/5)=6/农场/天、10/访客/天；帮 3/6/5。
+  assert.equal(snapshot.limits.steal.perVisit, 3)
+  assert.equal(snapshot.limits.steal.perFarm, 6)
+  // 跨农场 perDay 只有访客本机算得清；主人快照明确留 0，由访客侧覆盖。
+  assert.equal(snapshot.limits.steal.perDay, 0)
+  assert.equal(snapshot.limits.help.perFarm, 6)
+})

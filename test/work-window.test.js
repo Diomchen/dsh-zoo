@@ -211,6 +211,9 @@ test('farm-window 带 contracts/hire/guard；雇工页动作走桌面窄口', as
   const listingWindow = desktop.calls.windows.at(-1)
   const listing = listingWindow.contracts.listings.find((entry) => entry.deviceId === bId)
   assert.equal(listing.wagePerHour, 10)
+  // 新鲜度按本机收到行情的时间算：窗口拿到的 expiresAt 必须是未来（peerLostMs=20s）。
+  assert.equal(listing.stale, false)
+  assert.ok(listing.expiresAt > Date.now(), 'expiresAt 应该是本机的未来时间：' + listing.expiresAt)
 
   // 雇佣：桌面事件只带 deviceId + hours。
   desktop.emit({ type: 'action', id: 'w3', action: 'hire', deviceId: bId, hours: 2 })

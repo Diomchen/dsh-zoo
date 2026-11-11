@@ -7,9 +7,13 @@ import {
   CROP_IDS,
   FERTILIZE_COST,
   MAX_DEW,
+  MAX_PLOTS,
+  PLOT_UNLOCK_RESERVE,
+  START_PLOTS,
   WATER_COST,
   advanceDew,
   advanceGrowth,
+  clampPlotCount,
   fertilizePlot,
   harvestYield,
   helpPlot,
@@ -17,6 +21,8 @@ import {
   isMature,
   localDayKey,
   offlineElapsed,
+  plotUnlockCost,
+  visitLimitsFor,
   waterPlot
 } from './farm-rules.js'
 import {
@@ -25,6 +31,7 @@ import {
   MIN_CONTRACT_HOURS,
   MIN_CONTRACT_WAGE
 } from './contracts-rules.js'
+import { farmErrorText } from './farm-text.js'
 import { normalizeTradeQty } from './market.js'
 import { parseJsonText } from './json-text.js'
 
@@ -69,16 +76,19 @@ import { parseJsonText } from './json-text.js'
 
 export const FARM_FILE = 'farm.json'
 export const FARM_VERSION = 1
-/** 4 块地，id 固定 p1–p4（SPEC v5「农场与作物」）。 */
-export const PLOT_IDS = Object.freeze(['p1', 'p2', 'p3', 'p4'])
+/** 地块 id 固定 p1–p50；前 4 块开局可用，其余按顺序解锁（ticket 48）。 */
+export const PLOT_IDS = Object.freeze(
+  Array.from({ length: MAX_PLOTS }, (_, index) => 'p' + (index + 1))
+)
 export const START_COINS = 30
 export const START_SEEDS = Object.freeze({ tomato: 2 })
 /** 硬币/种子/作物的硬上限（SPEC v5「货币、仓库与限额」）。 */
 export const MAX_COINS = 1_000_000
 export const MAX_STACK = 999
-/** 农场日志最多 50 条；状态出口只给最近 20 条。 */
-export const MAX_FARM_LOG = 50
+/** 农场日志文件最多 200 条；窗口取 100，`/state` 只给最近 20 条。 */
+export const MAX_FARM_LOG = 200
 export const FARM_LOG_VIEW_LIMIT = 20
+export const FARM_LOG_WINDOW_LIMIT = 100
 /** 写盘节流：tick 有变化也最多每 30 秒落一次；动作总是立即落盘。 */
 export const SAVE_THROTTLE_MS = 30 * 1000
 
@@ -100,21 +110,17 @@ export const MAX_GROW_MS = 30 * 24 * 60 * 60 * 1000
 /** 单块地的偷/帮名单上限；正常一轮只可能有一两个 deviceId。 */
 export const MAX_PLOT_VISITORS = 50
 /**
- * 访客每日限额（SPEC v5「偷菜与帮忙」，ticket 43）。
+ * 访客每日限额（SPEC v5「偷菜与帮忙」，ticket 43；ticket 48 随地块放大）。
  *
  * 主人侧能算的只有「这位访客在我家」和「我家今天一共」；「这位访客在所有农场」
  * 只有访客自己知道，所以 `mine` 是访客本机账本，`byVisitor`/`total` 是主人侧账本。
  * 两本账永远不可能强一致（ADR-0016 明确接受），这里只防误操作与刷屏。
+ * 具体数字见 `farm-rules.js` 的 `visitLimitsFor()`：只有一份真相。
  */
-export const STEAL_PER_VISITOR_PER_FARM = 3
-export const STEAL_PER_FARM_PER_DAY = 5
-export const STEAL_PER_VISITOR_PER_DAY = 10
-export const HELP_PER_VISITOR_PER_FARM = 3
-export const HELP_PER_VISITOR_PER_DAY = 5
 /** 每日访客计数最多记多少位访客；超出的按最旧丢（内存/文件都有界）。 */
 export const MAX_VISIT_STATS_VISITORS = 64
 
-const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle'])
+const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock'])
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const WHO_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
 
@@ -159,6 +165,8 @@ export function initialFarmState () {
     dewDay: null,
     dewDayEarned: null,
     lastTickAt: null,
+    // ticket 48：前 4 块免费，其余按顺序解锁；内部始终存 p1–p50 的完整数组。
+    unlocked: START_PLOTS,
     plots: PLOT_IDS.map(emptyPlot),
     hire: { ...DEFAULT_HIRE },
     visitStats: emptyVisitStats(),
@@ -168,15 +176,20 @@ export function initialFarmState () {
 
 /** 状态出口/窗口只读的那一份；`lastTickAt` 等内部计时不出去。 */
 export function farmView (state) {
+  const unlocked = clampPlotCount(state.unlocked)
   return {
-    plots: state.plots.map(copyPlot),
+    // 只把已解锁的地块发出去；锁着的地块连 id 都不出现在视图里。
+    plots: state.plots.slice(0, unlocked).map(copyPlot),
+    unlocked,
+    maxPlots: MAX_PLOTS,
+    nextCost: plotUnlockCost(unlocked),
     coins: state.coins,
     seeds: { ...state.seeds },
     crops: { ...state.crops },
     dew: state.dew,
     dewEarned: state.dewEarned,
     hire: { ...state.hire },
-    // 完整日志（≤50）；`/state` 只取最近 20，农场小窗的记录页要的是完整的一份。
+    // 完整日志（≤200）；`/state` 只取最近 20，农场小窗的记录页要的是完整的一份。
     log: state.log.map(copyLogEntry)
   }
 }
@@ -547,6 +560,9 @@ function normalizeLogEntry (value) {
   const hours = finiteNumber(value.hours)
   const wage = finiteNumber(value.wage)
   const earned = finiteNumber(value.earned)
+  // ticket 48：unlock 日志带 plot（第 n 块地）与 cost（花了多少硬币）；只保留能显示的数字。
+  const cost = finiteNumber(value.cost)
+  const plot = finiteNumber(value.plot)
   return {
     at,
     kind: value.kind,
@@ -555,7 +571,9 @@ function normalizeLogEntry (value) {
     ...(who === null ? {} : { who }),
     ...(hours === null ? {} : { hours: Math.min(MAX_HIRE_HOURS, Math.max(0, Math.floor(hours))) }),
     ...(wage === null ? {} : { wage: Math.min(MAX_COINS, Math.max(0, Math.floor(wage))) }),
-    ...(earned === null ? {} : { earned: Math.min(MAX_COINS, Math.max(0, Math.floor(earned))) })
+    ...(earned === null ? {} : { earned: Math.min(MAX_COINS, Math.max(0, Math.floor(earned))) }),
+    ...(cost === null ? {} : { cost: Math.min(MAX_COINS, Math.max(0, Math.floor(cost))) }),
+    ...(plot === null ? {} : { plot: Math.min(MAX_PLOTS, Math.max(1, Math.floor(plot))) })
   }
 }
 
@@ -602,11 +620,12 @@ export function normalizeFarmFile (value) {
   const dew = normalizeDew(value.dew)
   const dewEarned = normalizeDewEarned(value.dewEarned)
   const plots = normalizePlots(value.plots)
+  const unlocked = normalizeUnlocked(value.unlocked)
   const hire = normalizeHire(value.hire)
   const visitStats = normalizeVisitStats(value.visitStats)
   const log = normalizeLog(value.log)
   repaired += coins.repaired + seeds.repaired + crops.repaired +
-    dew.repaired + dewEarned.repaired + plots.repaired + hire.repaired +
+    dew.repaired + dewEarned.repaired + plots.repaired + unlocked.repaired + hire.repaired +
     visitStats.repaired + log.repaired
 
   const dewDay = normalizeDayKey(value.dewDay)
@@ -624,6 +643,7 @@ export function normalizeFarmFile (value) {
       dewDay,
       dewDayEarned,
       lastTickAt: normalizeTimestamp(value.lastTickAt),
+      unlocked: unlocked.unlocked,
       plots: plots.plots,
       hire: hire.hire,
       visitStats: visitStats.stats,
@@ -638,6 +658,16 @@ function normalizePlotId (value) {
   if (typeof value !== 'string') return null
   const id = value.trim().toLowerCase()
   return PLOT_IDS.includes(id) ? id : null
+}
+
+/** `unlocked` 缺失按起始 4 块；越界/非整数修补回起点（只算一处坏值）。 */
+function normalizeUnlocked (value) {
+  if (value === undefined) return { unlocked: START_PLOTS, repaired: 0 }
+  const count = Number(value)
+  if (!Number.isInteger(count) || count < START_PLOTS || count > MAX_PLOTS) {
+    return { unlocked: START_PLOTS, repaired: 1 }
+  }
+  return { unlocked: count, repaired: 0 }
 }
 
 /** 访客 deviceId 只用于名单/计数：短标识符即可，形状校验由协议层负责。 */
@@ -673,6 +703,7 @@ function toFileState (state) {
     dewDay: state.dewDay,
     dewDayEarned: state.dewDayEarned,
     lastTickAt: state.lastTickAt,
+    unlocked: clampPlotCount(state.unlocked),
     plots: state.plots.map(copyPlot),
     hire: { ...state.hire },
     visitStats: copyVisitStats(state.visitStats),
@@ -851,6 +882,15 @@ class FarmStore {
     return this.#enqueue(() => this.#trade('sell-crop', cropId, qty))
   }
 
+  /**
+   * 解锁下一块地（ticket 48）：扣硬币、`unlocked+1`、写 `unlock` 日志。
+   * `expectedUnlocked` 是乐观锁：窗口带着自己看到的数字来，宿主发现已经变了就回
+   * `stale`，连点不会一次买两块。
+   */
+  unlockPlot (expectedUnlocked) {
+    return this.#enqueue(() => this.#unlockPlot(expectedUnlocked))
+  }
+
   // -------------------------------------------------------------------------
   // 访客相关的仓库动作（ticket 43）：偷到的作物、帮忙的硬币、先扣后退的露水。
   // 全部走同一条串行队列，绝不绕开 #persist。
@@ -933,6 +973,12 @@ class FarmStore {
     return this.#visitActionUsed(kind)
   }
 
+  /** 访客本机今天还能偷/帮几次（按自己农场的大小放大；ticket 48）。 */
+  visitDailyLimit (kind) {
+    const limits = visitLimitsFor(this.#state.unlocked)
+    return kind === 'help' ? limits.help.perVisitorDay : limits.steal.perVisitorDay
+  }
+
   /** 访客本机成功一次偷/帮：先查上限，再计数（跨农场 10/5）。 */
   noteVisitAction (kind) {
     return this.#enqueue(() => this.#noteVisitAction(kind))
@@ -1004,6 +1050,12 @@ class FarmStore {
     if (this.#state.log.length > MAX_FARM_LOG) this.#state.log.length = MAX_FARM_LOG
   }
 
+  /** 已解锁地块的下标；未知或锁着的地块统一 -1（种/收/浇/施肥/偷/帮共用）。 */
+  #plotIndex (plotId) {
+    const index = PLOT_IDS.indexOf(plotId)
+    return index >= 0 && index < this.#state.unlocked ? index : -1
+  }
+
   async #plant (rawPlotId, rawCropId) {
     const plotId = normalizePlotId(rawPlotId)
     if (plotId === null) return farmError('bad-plot')
@@ -1013,7 +1065,8 @@ class FarmStore {
     const now = this.#nowMs()
     this.#advance(now)
 
-    const index = PLOT_IDS.indexOf(plotId)
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     if (plot === undefined || plot.crop !== null) return farmError('plot-occupied')
 
@@ -1061,7 +1114,8 @@ class FarmStore {
     const now = this.#nowMs()
     this.#advance(now)
 
-    const index = PLOT_IDS.indexOf(plotId)
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     if (plot === undefined || !isCropId(plot.crop) || !isMature(plot)) {
       return farmError('not-mature')
@@ -1098,7 +1152,8 @@ class FarmStore {
     const now = this.#nowMs()
     this.#advance(now)
 
-    const index = PLOT_IDS.indexOf(plotId)
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     // 空地/成熟地没有可浇的生长；不把露水浪费在一个不会发生的变化上。
     if (plot === undefined || !isCropId(plot.crop) || isMature(plot)) return farmError('bad-plot')
@@ -1133,7 +1188,8 @@ class FarmStore {
     const now = this.#nowMs()
     this.#advance(now)
 
-    const index = PLOT_IDS.indexOf(plotId)
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     if (plot === undefined || !isCropId(plot.crop)) return farmError('bad-plot')
     if (plot.fertilized === true) return farmError('already-fertilized')
@@ -1198,7 +1254,9 @@ class FarmStore {
         side: kind === 'buy-seed' ? 'buy' : 'sell',
         cropId,
         qty,
-        now
+        now,
+        // ticket 48：卖价冲击的分母随农场规模放大；4 块时仍是 20，行为不变。
+        depth: 5 * this.#state.unlocked
       })
     } catch {
       return farmError('market-busy')
@@ -1243,6 +1301,57 @@ class FarmStore {
       dewEarned: this.#state.dewEarned,
       notice,
       persisted: farmPersisted === true && marketPersisted !== false
+    }
+  }
+
+  /**
+   * 解锁下一块地（ticket 48 / ADR-0017）。
+   * 失败：`max-plots`（已到 50）、`stale`（expected 与当前不符）、`no-coin`（不够）、
+   * `reserve`（解锁后不够买一颗最便宜种子）。成功：扣币、`unlocked+1`、写 `unlock` 日志、
+   * 重置待机计时；新地块是空地，不送种子。
+   */
+  async #unlockPlot (rawExpected) {
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const current = this.#state.unlocked
+    if (current >= MAX_PLOTS) return farmError('max-plots', farmErrorText('max-plots'))
+    if (rawExpected !== undefined && rawExpected !== null) {
+      const expected = Number(rawExpected)
+      if (!Number.isInteger(expected) || expected !== current) {
+        return farmError('stale', farmErrorText('stale'))
+      }
+    }
+
+    // 状态里的 unlocked 永远在 4–50，走到这里 plotUnlockCost 不会为空。
+    const cost = plotUnlockCost(current)
+    if (this.#state.coins < cost) {
+      return farmError('no-coin', '硬币不够：解锁下一块要 ' + cost + ' 硬币。')
+    }
+    if (this.#state.coins - cost < PLOT_UNLOCK_RESERVE) {
+      return farmError(
+        'reserve',
+        '解锁后至少要留 ' + PLOT_UNLOCK_RESERVE + ' 硬币买种子，先卖点作物吧。'
+      )
+    }
+
+    this.#state.coins -= cost
+    this.#state.unlocked = current + 1
+    this.#appendLog({ at: now, kind: 'unlock', qty: 1, plot: this.#state.unlocked, cost })
+    this.#resetIdle(now)
+
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'unlock',
+      unlocked: this.#state.unlocked,
+      maxPlots: MAX_PLOTS,
+      cost,
+      coins: this.#state.coins,
+      nextCost: plotUnlockCost(this.#state.unlocked),
+      plot: copyPlot(this.#state.plots[current]),
+      notice: '解锁了第 ' + this.#state.unlocked + ' 块地，花了 ' + cost + ' 硬币。',
+      persisted
     }
   }
 
@@ -1413,24 +1522,27 @@ class FarmStore {
   #visitLimits (rawDeviceId) {
     const deviceId = normalizeDeviceId(rawDeviceId)
     const stats = this.#visitStatsAt(this.#nowMs())
+    const limits = visitLimitsFor(this.#state.unlocked)
     const stealUsed = deviceId === null ? 0 : Number(stats.steal.byVisitor[deviceId]) || 0
     const helpUsed = deviceId === null ? 0 : Number(stats.help.byVisitor[deviceId]) || 0
     return {
       steal: {
-        perVisit: STEAL_PER_VISITOR_PER_FARM,
+        perVisit: limits.steal.perVisitorFarm,
         usedInVisit: stealUsed,
-        perFarm: STEAL_PER_FARM_PER_DAY,
+        perFarm: limits.steal.perFarmDay,
         usedOnFarm: Number(stats.steal.total) || 0,
-        perDay: STEAL_PER_VISITOR_PER_DAY,
-        usedToday: Number(stats.mine.steal) || 0
+        // 跨农场额度只有访客本机算得清：主人快照留 0，访客侧拿到后覆盖。
+        perDay: 0,
+        usedToday: 0
       },
       help: {
-        perVisit: HELP_PER_VISITOR_PER_FARM,
+        perVisit: limits.help.perVisitorFarm,
         usedInVisit: helpUsed,
-        perFarm: HELP_PER_VISITOR_PER_DAY,
+        perFarm: limits.help.perFarmDay,
         usedOnFarm: Number(stats.help.total) || 0,
-        perDay: HELP_PER_VISITOR_PER_DAY,
-        usedToday: Number(stats.mine.help) || 0
+        // 同上：跨农场额度由访客本机补。
+        perDay: 0,
+        usedToday: 0
       }
     }
   }
@@ -1445,7 +1557,7 @@ class FarmStore {
     if (kind !== 'steal' && kind !== 'help') return farmError('bad-action')
     const now = this.#nowMs()
     this.#advance(now)
-    const limit = kind === 'steal' ? STEAL_PER_VISITOR_PER_DAY : HELP_PER_VISITOR_PER_DAY
+    const limit = this.visitDailyLimit(kind)
     const used = Number(this.#state.visitStats.mine[kind]) || 0
     if (used >= limit) return { ok: false, error: 'cap', used, limit, persisted: false }
     this.#state.visitStats.mine[kind] = used + 1
@@ -1461,15 +1573,17 @@ class FarmStore {
 
     const now = this.#nowMs()
     this.#advance(now)
-    const index = PLOT_IDS.indexOf(plotId)
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     if (plot === undefined || !isCropId(plot.crop)) return farmError('bad-plot')
     if (!isMature(plot)) return farmError('not-mature')
     if (plot.stolenBy.includes(deviceId)) return farmError('already-stolen')
 
     const stats = this.#state.visitStats
+    const limits = visitLimitsFor(this.#state.unlocked)
     const usedInVisit = Number(stats.steal.byVisitor[deviceId]) || 0
-    if (usedInVisit >= STEAL_PER_VISITOR_PER_FARM || stats.steal.total >= STEAL_PER_FARM_PER_DAY) {
+    if (usedInVisit >= limits.steal.perVisitorFarm || stats.steal.total >= limits.steal.perFarmDay) {
       return farmError('cap')
     }
 
@@ -1512,14 +1626,18 @@ class FarmStore {
 
     const now = this.#nowMs()
     this.#advance(now)
-    const index = PLOT_IDS.indexOf(plotId)
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     if (plot === undefined || !isCropId(plot.crop) || isMature(plot)) return farmError('bad-plot')
     if (plot.helpedBy.includes(deviceId)) return farmError('already-helped')
 
     const stats = this.#state.visitStats
+    const limits = visitLimitsFor(this.#state.unlocked)
     const usedInVisit = Number(stats.help.byVisitor[deviceId]) || 0
-    if (usedInVisit >= HELP_PER_VISITOR_PER_FARM) return farmError('cap')
+    if (usedInVisit >= limits.help.perVisitorFarm || stats.help.total >= limits.help.perFarmDay) {
+      return farmError('cap')
+    }
 
     const helped = helpPlot(plot)
     if (helped === null) return farmError('bad-plot')

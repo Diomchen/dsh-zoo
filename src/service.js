@@ -28,10 +28,8 @@ import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './deskt
 import { createDiscovery } from './discovery.js'
 import {
   FARM_LOG_VIEW_LIMIT,
-  HELP_PER_VISITOR_PER_DAY,
-  MAX_FARM_LOG,
+  FARM_LOG_WINDOW_LIMIT,
   PLOT_IDS,
-  STEAL_PER_VISITOR_PER_DAY,
   createFarmStore,
   initialFarmView
 } from './farm.js'
@@ -40,19 +38,24 @@ import {
   CROP_IDS,
   WORKER_GUARD,
   guardValue,
+  isCropId,
   isMature,
+  visitLimitsFor,
   localDayKey,
   plotRemainingMs,
   plotStage,
+  plotUnlockCost,
   stealSucceeds
 } from './farm-rules.js'
 import { createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
+import { openFarmView } from './farm-open.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
   createMarketStore,
   initialMarketView,
   isFreshMarketSample,
+  isFreshPeerDigest,
   marketView
 } from './market.js'
 import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
@@ -79,9 +82,13 @@ import { resolveSkinPort, startLanServer } from './lan-server.js'
 import { DEFAULT_SKIN_ID, appendSkinSources, idlePoolOf, loadSkinSources, readSkinEntries } from './skin-sources.js'
 import { createSkinFetcher } from './skin-fetch.js'
 import {
+  CAPS,
   HEARTBEAT_INTERVAL_MS,
   MARKET_DIGEST_INTERVAL_MS,
   MAX_GIFT_BYTES,
+  MAX_RAID_PLOTS,
+  PLOT_ID_RE,
+  normalizeCaps,
   createRateLimiter,
   encodeFarmAction,
   encodeFarmActionResult,
@@ -361,6 +368,10 @@ export function createService (ctx, options = {}) {
    * 工资从活跃合同派生。**不参与记账**：作物已经进仓库、硬币已经扣/入账。
    */
   const carriedCrops = { visitId: null, items: [] }
+  /** 票 53：一趟偷亮多久再回家（桌面和窗口要靠它看见那只宠物）。 */
+  const raidVisibleMs = positiveOption(options.raidVisibleMs, 8000, 0)
+  /** 票 54：本机广告哪些能力。测试可以把它调空来演"老版本"。 */
+  const advertisedCaps = Array.isArray(options.caps) ? (normalizeCaps(options.caps) ?? []) : CAPS
   /** 重复的 tick/结算告警只记一次（ticket 45）；key 是操作名，不是整句文案。 */
   const warnedOnce = new Set()
   /**
@@ -638,6 +649,12 @@ export function createService (ctx, options = {}) {
 
     // 访客在邻居农场里偷/帮（ticket 43）：不是本地动作，走 UDP farm-action。
     // 这里会 await 结果（最长 1.8s），所以 handleDesktopAction 只回一次 action-result。
+    // 票 52：在家看一眼邻居的农场。不需要串门、也不看放行——只要有地址和 LAN 端口。
+    if (action === 'farm-look') return lookAtNeighborFarm(body?.deviceId)
+
+    // 票 53：派它去偷。一趟一个邻居，额度沿用旧的 perVisit；回家才清驮包。
+    if (action === 'farm-raid') return startRaid(body?.deviceId, body?.plots)
+
     if (action === 'farm-steal' || action === 'farm-help') {
       return handleVisitFarmAction(action, body?.plotId, body?.visitId)
     }
@@ -653,6 +670,15 @@ export function createService (ctx, options = {}) {
         ? await farm.plant(body?.plotId, body?.cropId)
         : await farm[kind](body?.plotId)
       // 开着的窗口不能停在旧地块：种/收/浇/施肥成功后都推一份新的完整视图。
+      if (result?.ok === true) refreshFarmWindow()
+      return result
+    }
+
+    // 地块解锁（ticket 48）：窗口带 expectedUnlocked 做乐观锁；HTTP 可以不带。
+    // 成功也推一份新视图：硬币、地块数、下一块地价都变了。
+    if (action === 'farm-unlock') {
+      if (farm === null) return { ok: false, error: 'starting' }
+      const result = await farm.unlockPlot(body?.expectedUnlocked)
       if (result?.ok === true) refreshFarmWindow()
       return result
     }
@@ -699,20 +725,7 @@ export function createService (ctx, options = {}) {
     }
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
-    if (action === 'recall') {
-      const result = room.recallOutbound()
-      if (!result.ok) return result
-      request = null
-      // 本地召回 = 这次串门结束：礼物立刻不可读（26 会在这里同时退包）。
-      unarmGift(result.visit?.visitId)
-      return {
-        ok: true,
-        action: 'recall',
-        cancelled: result.cancelled === true,
-        visit: result.visit,
-        record: result.record
-      }
-    }
+    if (action === 'recall') return recallPet()
 
     // 接收方提前结束一次入站串门：写 in 记录，并尽力通知对方回家。
     if (action === 'end-visit') {
@@ -1063,6 +1076,9 @@ export function createService (ctx, options = {}) {
     const view = farm?.snapshot() ?? initialFarmView()
     return {
       plots: view.plots,
+      unlocked: view.unlocked,
+      maxPlots: view.maxPlots,
+      nextCost: view.nextCost,
       coins: view.coins,
       seeds: view.seeds,
       crops: view.crops,
@@ -1133,7 +1149,13 @@ export function createService (ctx, options = {}) {
       const hire = digest?.hire
       if (hire === null || typeof hire !== 'object') continue
       const at = Number(digest.at)
-      const fresh = Number.isFinite(at) && now - at <= 120 * 1000
+      const seenAt = Number(digest.seenAt)
+      // 新鲜度只认**本机收到**这条行情的时间：邻居的表快/慢不该让挂牌看起来过期。
+      // 窗口拿 expiresAt 自己走秒（见 farm.js 的 listingIsStale），不用等下一次 push。
+      const fresh = isFreshPeerDigest(digest, now, peerLostMs)
+      const expiresAt = Number.isFinite(seenAt) && seenAt > 0
+        ? seenAt + peerLostMs
+        : (Number.isFinite(at) ? at + peerLostMs : 0)
       const active = digest.nickname !== null && digest.nickname !== undefined
         ? digest.nickname
         : neighborNickname(deviceId)
@@ -1149,6 +1171,7 @@ export function createService (ctx, options = {}) {
         guard: hire.guard,
         feeRate: WORK_FEE_RATE,
         stale: !fresh,
+        expiresAt,
         at: Number.isFinite(at) ? at : 0
       })
     }
@@ -1194,7 +1217,7 @@ export function createService (ctx, options = {}) {
    *   - 这里每块地多 `stage / mature / remainingMs / waterings / fertilized`，
    *     阶段与倒计时用 39 的纯规则（`plotStage` / `plotRemainingMs`）在**下发那一刻**算；
    *   - `seeds/crops` 补全三种作物（0 也要有键），窗口不用猜缺键；
-   *   - `log` 只给最近 20 条：窗口记录页在 41 之后才接，先给能显示的一份。
+   *   - `log` 给最近 100 条（文件最多 200，`/state` 仍只给 20）。
    *
    * 交易所（41）是 `farm-window` 命令里与 `farm` 并列的另一份视图（见 `handleFarmOpen`），
    * 不塞进农场视图，更不塞进场景。
@@ -1204,10 +1227,21 @@ export function createService (ctx, options = {}) {
    */
   function farmWindowView () {
     const view = farm?.snapshot() ?? initialFarmView()
+    // 当前这块 + 后续最多 5 块，共 6 个价格：窗口不复制地价公式，宿主算好下发。
+    const unlockLadder = []
+    for (let offset = 0; offset < 6; offset += 1) {
+      const cost = plotUnlockCost(view.unlocked + offset)
+      if (cost === null) break
+      unlockLadder.push(cost)
+    }
     const stacks = (source) => Object.fromEntries(
       Object.keys(CROPS).map((cropId) => [cropId, source[cropId] ?? 0])
     )
     return {
+      unlocked: view.unlocked,
+      maxPlots: view.maxPlots,
+      nextCost: view.nextCost,
+      unlockLadder,
       plots: view.plots.map((plot) => ({
         id: plot.id,
         crop: plot.crop,
@@ -1228,8 +1262,8 @@ export function createService (ctx, options = {}) {
         : Math.min(MAX_CONTRACTS_PER_SIDE, contracts.outgoing().length + contracts.incoming().length),
       hire: { ...view.hire },
       guard: farmGuard().guard,
-      // 记录页要完整的一份（≤50）；`/state.farm.log` 仍按 SPEC 只给 20。
-      log: view.log.slice(0, MAX_FARM_LOG),
+      // 记录页要完整的一份（≤100）；`/state.farm.log` 仍按 SPEC 只给 20。
+      log: view.log.slice(0, FARM_LOG_WINDOW_LIMIT),
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
       carried: carriedView()
     }
@@ -1312,7 +1346,7 @@ export function createService (ctx, options = {}) {
   }
 
   /** `farm-window` 命令的公共载荷：owner 数据 + 交易所 + 可选访客块。 */
-  function farmWindowPayload ({ open, plotId = null, mode = null, visit = null } = {}) {
+  function farmWindowPayload ({ open, plotId = null, mode = null, visit = null, look = null } = {}) {
     const out = room.outboundVisit()
     const effectiveMode = mode ?? (out === null ? 'owner' : 'visitor')
     const effectiveVisit = visit ?? (out !== null && farmWindowVisitId === out.visitId
@@ -1322,13 +1356,41 @@ export function createService (ctx, options = {}) {
       open: open === true,
       mode: effectiveMode,
       farm: farmWindowView(),
+      // 票 55：窗口里那排邻居小圆片——只给"能看田"的邻居（广告过 `look`），
+      // 老版本连进来点了也只会说"版本太老"，不如不列。
+      neighbors: neighborChipsView(),
       // 交易所与农场并列：`/state` 里也是两个兄弟字段，别把 market 塞进农场视图。
       market: marketWindowView(),
       // ticket 44：雇工页的数据也由宿主 push（窗口读不到 /state）。
       contracts: contractWindowView(),
       ...(effectiveVisit === null ? {} : { visit: effectiveVisit }),
+      // 票 52：只读查看邻居农场的画面（`mode:'look'`）。
+      ...(look === null ? {} : { look }),
       ...(plotId === null ? {} : { plotId })
     }
+  }
+
+  /** 窗口里的邻居切换器：只留广告过 `look` 的，最多 8 个。 */
+  function neighborChipsView () {
+    const view = farm?.snapshot() ?? null
+    const guard = farmGuard().guard
+    const chips = []
+    for (const neighbor of room.snapshot().neighbors) {
+      if (chips.length >= 12) break
+      if (neighbor.status !== 'allowed') continue
+      const caps = Array.isArray(neighbor.caps) ? neighbor.caps : []
+      const old = !caps.includes('look')
+      // 票 56：老版本**不再过滤掉**，标 old 让窗口画成灰的——隐藏会让人以为对方掉线。
+      chips.push({
+        deviceId: neighbor.deviceId,
+        nickname: neighbor.nickname,
+        ...(caps.includes('raid') ? { canRaid: true } : {}),
+        ripePlots: view === null ? 0 : view.plots.filter((plot) => isCropId(plot.crop) && isMature(plot)).length,
+        guard,
+        ...(old ? { old: true } : {})
+      })
+    }
+    return chips
   }
 
   /**
@@ -1531,8 +1593,8 @@ export function createService (ctx, options = {}) {
     const hire = digest.hire
     if (hire === null || typeof hire !== 'object') return null
     const now = contractClock()
-    const at = Number(digest.at)
-    if (!Number.isFinite(at) || now - at > 2 * 60 * 1000) return null
+    // 和窗口同一条判据：本机多久没听到这一户（peerLostMs），而不是邻居的墙上时钟。
+    if (!isFreshPeerDigest(digest, now, peerLostMs)) return null
     if (hire.enabled !== true || hire.available !== true) return null
     if (!Number.isInteger(hours) || hours < hire.minHours || hours > hire.maxHours) return null
     return hire
@@ -2400,6 +2462,149 @@ export function createService (ctx, options = {}) {
    * 三个条件缺一不可：visitId 能映射到当前访客、访客仍被放行、农场 store 在。
    * 任何一条不满足都 404（不区分“没来过”和“刚走”，也不泄露那次串门存在过）。
    */
+  /** 把宠物叫回家（手动「召回」与一趟偷到点都走它）。 */
+  function recallPet () {
+    const result = room.recallOutbound()
+    if (!result.ok) return result
+    request = null
+    // 本地召回 = 这次串门结束：礼物立刻不可读（26 会在这里同时退包）。
+    unarmGift(result.visit?.visitId)
+    return {
+      ok: true,
+      action: 'recall',
+      cancelled: result.cancelled === true,
+      visit: result.visit,
+      record: result.record
+    }
+  }
+
+  /**
+   * 票 53：派宠物去偷（一趟一个邻居）。
+   * 省略 `plots` 就由主人那边挑（见 applyRaid）——主人才是权威，客户端只提议。
+   */
+  async function startRaid (rawDeviceId, rawPlots) {
+    if (disposed || farm === null || discovery === null || identity === null) {
+      return { ok: false, error: 'starting' }
+    }
+    const deviceId = actionDeviceId(rawDeviceId)
+    if (deviceId === null) return { ok: false, error: 'bad-device-id' }
+    // 票 54：对方没广告 `raid` 就是老版本——明确回一句，而不是发出一趟没人接的行程。
+    if (!neighborCaps(deviceId).includes('raid')) return { ok: false, error: 'old-neighbor' }
+    const plots = Array.isArray(rawPlots)
+      ? rawPlots
+        .filter((entry) => typeof entry === 'string' && PLOT_ID_RE.test(entry.trim().toLowerCase()))
+        .map((entry) => entry.trim().toLowerCase())
+        .slice(0, MAX_RAID_PLOTS)
+      : []
+    const visitId = randomUUID()
+    const begun = room.beginVisit(deviceId, { visitId, purpose: 'steal', plots })
+    if (!begun.ok) return begun
+    const sent = sendVisitRequest(visitId, null)
+    if (!sent.ok) {
+      room.failOutboundVisit('no-address')
+      return { ok: false, error: 'no-address' }
+    }
+    return { ok: true, action: 'farm-raid', deviceId, visitId, plots }
+  }
+
+  /**
+   * 收到 `visit-ack.raid`：偷到的作物立刻记账（崩溃不吞），驮包只负责"还没到家"的显示；
+   * 这一趟再亮 `raidVisibleMs` 秒就自己回家（主人那边也才看得见那只宠物）。
+   */
+  function applyRaidResult (packet, out) {
+    const raid = packet.raid
+    if (raid === null || raid === undefined || out === null) return
+    const at = Date.now()
+    for (const entry of Array.isArray(raid.stolen) ? raid.stolen : []) {
+      try {
+        farm?.addCrop(entry.crop, 1)?.catch?.(() => {})
+      } catch {
+        // 记账失败只告警：这一块白偷，行程照常结束
+      }
+      noteCarriedCrop(out, entry.crop, 1, at)
+    }
+    // 回家的时机交给 tick（`sweepRaidTrips`）：一次性 setTimeout 在这里太脆。
+    // 注意 `out` 是副本——必须回到 room 去改真身。
+    room.markRaidUntil(out.visitId, at + raidVisibleMs)
+  }
+
+  /** 这位邻居广告过哪些能力（老版本没有这个字段 = 只会串门）。 */
+  function neighborCaps (deviceId) {
+    const neighbor = room.snapshot().neighbors.find((entry) => entry.deviceId === deviceId)
+    return Array.isArray(neighbor?.caps) ? neighbor.caps : []
+  }
+
+  /** 一趟偷亮够了就自己回家（每拍巡检一次）。 */
+  function sweepRaidTrips () {
+    const out = room.outboundVisit()
+    if (out === null || out.purpose !== 'steal') return false
+    const until = Number.isFinite(out.raidUntil) ? out.raidUntil : null
+    if (until === null || Date.now() < until) return false
+    recallPet()
+    return true
+  }
+
+  /**
+   * 票 52：拉一份邻居的公开视图。只要求"认得到这台机器"（有地址 + 记过 LAN 端口），
+   * 不要求放行——看田和偷菜对任何邻居都开着（ADR-0018）。
+   */
+  async function lookAtNeighborFarm (rawDeviceId) {
+    const deviceId = actionDeviceId(rawDeviceId)
+    if (deviceId === null) return { ok: false, error: 'bad-device-id' }
+    if (farmFetcher === null || discovery === null || identity === null) {
+      return { ok: false, error: 'starting' }
+    }
+    // 票 54：对方没广告 `look` 就是老版本（没有那条只读路由，问了也是 404）。
+    if (!neighborCaps(deviceId).includes('look')) return { ok: false, error: 'old-neighbor' }
+    const endpoint = discovery.addressOf(deviceId)
+    const port = freshPeerLanPort(deviceId)
+    if (endpoint === null || port === null) return { ok: false, error: 'no-port' }
+    const result = await farmFetcher.open({
+      address: endpoint.address,
+      port,
+      deviceId: identity.deviceId
+    })
+    if (result.ok !== true) return { ok: false, error: result.error }
+    // 顺手把那扇窗切到只读模式：`farm-look` 既是一次查询，也是"打开看田"这个动作。
+    farmWindowOpened = false
+    const opened = desktop?.farmWindow?.(farmWindowPayload({
+      open: true,
+      mode: 'look',
+      look: { ...result.view, deviceId }
+    })) === true
+    if (opened) farmWindowOpened = true
+    return { ok: true, action: 'farm-look', deviceId, view: result.view, window: opened ? 'opened' : 'closed' }
+  }
+
+  /**
+   * 票 52：公开只读视图。`viewerDeviceId` 只用来算"我自己偷过没有"和剩余次数，
+   * **不参与授权**——ADR-0018 之后，看田对任何邻居都开着。
+   */
+  function openFarmLookup (rawViewer) {
+    if (typeof rawViewer !== 'string' || !isDeviceId(rawViewer)) return null
+    if (farm === null || identity === null) return null
+    const viewer = rawViewer.toLowerCase()
+    const view = farm.snapshot()
+    const guard = farmGuard()
+    let usedByViewer = 0
+    try {
+      usedByViewer = farm.visitLimits(viewer)?.steal?.usedInVisit ?? 0
+    } catch {
+      usedByViewer = 0
+    }
+    return openFarmView({
+      viewerDeviceId: viewer,
+      host: { deviceId: identity.deviceId, nickname: identity.nickname },
+      plots: view.plots,
+      unlocked: view.unlocked,
+      guard: guard.guard,
+      guardParts: { ownerHome: guard.ownerHome, worker: guard.worker },
+      usedByViewer,
+      caps: CAPS,
+      now: Date.now()
+    })
+  }
+
   function lookupFarmView (rawVisitId) {
     if (typeof rawVisitId !== 'string' || !isVisitId(rawVisitId)) return null
     let visitor
@@ -2416,7 +2621,7 @@ export function createService (ctx, options = {}) {
 
   /**
    * 访客视角的快照。硬约束（每条都有测试）：
-   *   - 4 块地固定 p1..p4；阶段/成熟/remainingMs 由纯规则算；
+   *   - 只发主人**已解锁**的地块；阶段/成熟/remainingMs 由纯规则算；
    *   - **只给 stolenByMe / helpedByMe 两个布尔**，绝不回传 stolenBy/helpedBy 原数组；
    *   - 不含任何 path/dir、不含别人的 deviceId；
    *   - limits 只给这位访客自己的计数 + 本农场总数（不泄露全农场别的访客）。
@@ -2424,15 +2629,14 @@ export function createService (ctx, options = {}) {
   function farmVisitView (visitor) {
     const view = farm?.snapshot() ?? initialFarmView()
     const guard = farmGuard()
-    const byId = new Map(view.plots.map((plot) => [plot.id, plot]))
     return {
       v: 1,
       visitId: visitor.visitId,
       host: { nickname: room.snapshot().self.nickname ?? identity?.nickname ?? '邻居' },
       guard: guard.guard,
       guardParts: { ownerHome: guard.ownerHome, worker: guard.worker },
-      plots: PLOT_IDS.map((id) => {
-        const plot = byId.get(id) ?? { id, crop: null, grownMs: 0, growMs: 0, stolenBy: [], helpedBy: [] }
+      plots: view.plots.map((plot) => {
+        const id = plot.id
         return {
           id,
           crop: plot.crop,
@@ -2590,7 +2794,7 @@ export function createService (ctx, options = {}) {
       for (const kind of ['steal', 'help']) {
         const entry = view.limits[kind]
         if (entry === null || typeof entry !== 'object') continue
-        entry.perDay = kind === 'steal' ? STEAL_PER_VISITOR_PER_DAY : HELP_PER_VISITOR_PER_DAY
+        entry.perDay = farm.visitDailyLimit(kind)
         entry.usedToday = farm.visitActionUsed(kind)
       }
     }
@@ -2973,6 +3177,7 @@ export function createService (ctx, options = {}) {
         if (disposed) return
         const port = options.port ?? resolvePort(env)
         discovery = createDiscovery({
+          caps: advertisedCaps,
           identity,
           port,
           // 下面几项只为测试注入：回环上跑两个实例，不依赖真实广播域。
@@ -3007,7 +3212,10 @@ export function createService (ctx, options = {}) {
               noteVisitorSkin(packet)
             } else if (packet.type === 'visit-ack') {
               const result = room.observeVisitAck(packet)
-              if (result.ok) clearRequest(packet.visitId)
+              if (result.ok) {
+                clearRequest(packet.visitId)
+                if (result.visit?.purpose === 'steal') applyRaidResult(packet, result.visit)
+              }
             } else if (packet.type === 'visit-deny') {
               const result = room.observeVisitDeny(packet)
               if (result.ok) {
@@ -3275,7 +3483,9 @@ export function createService (ctx, options = {}) {
         // 串门模块与服务器之间只通过这张表耦合：路由拿不到任何报文里的路径。
         lookupGift: lookupArmedGift,
         // 农场快照（ticket 43）：每次现查 room 的活跃访客 + 本地农场，没有第二张 armed 表。
-        lookupFarm: lookupFarmView
+        lookupFarm: lookupFarmView,
+        // 公开只读视图（票 52）：不看访客、不看放行——谁问都能看（ADR-0018）。
+        lookupOpenFarm: openFarmLookup
       })
       if (skinServer === null) {
         log.warn('素材源端口没起来：访客先用本机素材，没有就画通用小人；礼物也发不出去')
@@ -3628,6 +3838,8 @@ export function createService (ctx, options = {}) {
         visitId: event.visitId ?? undefined,
         // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
         qty: event.qty ?? undefined,
+        // 票 53：派它去偷时带的地块列表（`farm-raid` 才用；白名单在 shared 已经过一遍）。
+        plots: Array.isArray(event.plots) ? event.plots : undefined,
         // 雇佣（ticket 44）：只接这些窄字段；硬币/总价/服务时长窗口一概不传。
         hours: event.hours ?? undefined,
         contractId: event.contractId ?? undefined,
@@ -3692,7 +3904,7 @@ export function createService (ctx, options = {}) {
     if (plotId === null) return visitFarmError(kind, 'bad-plot')
     if (identity === null || discovery === null) return visitFarmError(kind, 'no-port')
 
-    const limit = kind === 'steal' ? STEAL_PER_VISITOR_PER_DAY : HELP_PER_VISITOR_PER_DAY
+    const limit = farm.visitDailyLimit(kind)
     if (farm.visitActionUsed(kind) >= limit) return visitFarmError(kind, 'cap')
 
     // 帮忙先扣露水：否则并发两次 help 都能过“露水够不够”的检查。
@@ -3986,6 +4198,57 @@ export function createService (ctx, options = {}) {
         }
   }
 
+  /**
+   * 一趟偷：把请求里的地块逐块过一遍 `applyFarmAction`，成功/被抓/不合格分开算。
+   * `plots` 缺省时由主人按"成熟、没被这位偷过"挑——主人才是权威，客户端只提议。
+   * 一旦撞上额度（`cap`），后面的地块直接不再尝试（不然 skipped 会被额度噪音灌满）。
+   */
+  async function applyRaid (packet, visitor) {
+    const thief = {
+      deviceId: visitor?.deviceId ?? packet.deviceId,
+      nickname: visitor?.nickname ?? packet.nickname
+    }
+    const wanted = Array.isArray(packet.plots) && packet.plots.length > 0
+      ? packet.plots
+      : pickRaidPlots(thief.deviceId)
+    const stolen = []
+    const skipped = []
+    let caught = 0
+    for (const plotId of wanted) {
+      const outcome = await applyFarmAction({ action: 'steal', plotId }, thief)
+      if (outcome === null) {
+        skipped.push(plotId)
+        continue
+      }
+      if (outcome.ok === true) {
+        stolen.push({ plot: plotId, crop: outcome.crop })
+        continue
+      }
+      if (outcome.caught === true) {
+        caught += 1
+        continue
+      }
+      if (outcome.error === 'cap') break
+      skipped.push(plotId)
+    }
+    return { stolen, caught, skipped }
+  }
+
+  function pickRaidPlots (deviceId) {
+    const view = farm?.snapshot() ?? null
+    if (view === null) return []
+    const limits = visitLimitsFor(view.unlocked)
+    const cap = Math.min(MAX_RAID_PLOTS, limits.steal.perVisitorFarm)
+    const picked = []
+    for (const plot of view.plots) {
+      if (picked.length >= cap) break
+      if (!isCropId(plot.crop) || !isMature(plot)) continue
+      if (Array.isArray(plot.stolenBy) && plot.stolenBy.includes(deviceId)) continue
+      picked.push(plot.id)
+    }
+    return picked
+  }
+
   function cropName (cropId) {
     return CROPS[cropId]?.name ?? '作物'
   }
@@ -4062,7 +4325,9 @@ export function createService (ctx, options = {}) {
         semantic: pet?.semantic ?? null,
         say: pet?.say ?? null,
         skinPort: skinRef?.port,
-        skinId: skinRef?.id
+        skinId: skinRef?.id,
+        // 票 51：能力声明。老版本不认这个字段，看到也不影响。
+        caps: advertisedCaps
       })
     } catch {
       // 本机身份坏了只停心跳，不影响邻居灯和本地影子。
@@ -4222,6 +4487,8 @@ export function createService (ctx, options = {}) {
           prices: { ...packet.prices },
           hire: { ...packet.hire },
           at: packet.at,
+          // 本机收到的时间：挂牌新鲜度只认这个（邻居的表不准也不该影响「还活着吗」）。
+          seenAt: now,
           nickname: neighborNickname(packet.deviceId)
         })
         // 雇工板直接读 digest（D1）：新挂牌/可用性变化要推给开着的农场窗，
@@ -4273,6 +4540,8 @@ export function createService (ctx, options = {}) {
     const interval = positiveOption(options.tickIntervalMs, NEIGHBOR_TICK_MS, 10)
     tickTimer = setInterval(() => {
       room.tick()
+      // 票 53：一趟偷亮够了就自己回家（在 room.tick 之后，别让同拍的两个结束路径打架）。
+      sweepRaidTrips()
       // tick 可能让一次串门到期/失联：记录交给 visits.json，recall 交给 socket；
       // 礼物表按“当前出门的 visitId”对账，任何已结束的条目立刻失效。
       unarmEndedGifts()
@@ -4623,6 +4892,9 @@ export function createService (ctx, options = {}) {
         say: pet?.say ?? null,
         skinPort: skinRef?.port,
         skinId: skinRef?.id,
+        ...(out.purpose === 'steal'
+          ? { purpose: 'steal', plots: out.plots }
+          : {}),
         gift
       })
     } catch {
@@ -4630,7 +4902,10 @@ export function createService (ctx, options = {}) {
     }
     let sent = false
     try {
-      sent = discovery.sendTo(out.deviceId, built.data)
+      // 来偷的这一趟对方多半没放行我：走免放行的单播出口（ADR-0018）。
+      sent = out.purpose === 'steal'
+        ? discovery.sendDirect(out.deviceId, built.data)
+        : discovery.sendTo(out.deviceId, built.data)
     } catch {
       sent = false
     }
@@ -4643,14 +4918,18 @@ export function createService (ctx, options = {}) {
   }
 
   /** 收到请求：放行且开关开 → ack；否则 deny（带理由，走 sendReply 例外）。 */
-  function handleVisitRequest (packet) {
+  async function handleVisitRequest (packet) {
     const result = room.observeVisitRequest(packet)
     if (result.reply !== 'ack') {
       if (result.reply === 'deny') sendVisitDeny(result.deviceId, result.visitId, result.reason)
       return
     }
+    // 票 51：来偷的这一趟先把账落完，结果随 ack 一起回去（ack 本身就是幂等重放载体）。
+    const raid = packet.purpose === 'steal'
+      ? await applyRaid(packet, result.visit)
+      : null
     // ack 先发：串门本身不等待磁盘。字条在后台落盘，写成功才把卡片从 pending 推到 received。
-    sendVisitAck(result.deviceId, result.visitId)
+    sendVisitAck(result.deviceId, result.visitId, raid)
     if (packet.gift !== undefined && packet.gift !== null) {
       // 已经「扔掉」的那一件：对方没收到 ack 又重发时，绝不再写回磁盘、也绝不再长卡片。
       if (!room.isGiftDiscarded(packet.gift.id)) void receiveGift(packet)
@@ -4808,10 +5087,16 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  function sendVisitAck (deviceId, visitId) {
+  function sendVisitAck (deviceId, visitId, raid = null) {
     if (disposed || discovery === null || identity === null) return false
     try {
-      return discovery.sendTo(deviceId, encodeVisitAck({ deviceId: identity.deviceId, visitId }))
+      const data = encodeVisitAck({
+        deviceId: identity.deviceId,
+        visitId,
+        ...(raid === null ? {} : { raid })
+      })
+      // 来偷的那只多半没被放行：`sendTo` 过不去，和 visit-deny 走同一条免门控出口。
+      return raid === null ? discovery.sendTo(deviceId, data) : discovery.sendReply(deviceId, data)
     } catch {
       return false
     }
@@ -4826,10 +5111,13 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  function sendVisitRecall (deviceId, visitId) {
+  function sendVisitRecall (deviceId, visitId, raiding = false) {
     if (disposed || discovery === null || identity === null) return false
     try {
-      return discovery.sendTo(deviceId, encodeVisitRecall({ deviceId: identity.deviceId, visitId }))
+      const data = encodeVisitRecall({ deviceId: identity.deviceId, visitId })
+      // 票 53：来偷的那一趟对方没放行我，`sendTo` 过不去——和那次请求走同一个免门控出口。
+      // 不发出去的话，那只偷客要在人家桌面上待满 60 秒才自己走。
+      return raiding ? discovery.sendDirect(deviceId, data) : discovery.sendTo(deviceId, data)
     } catch {
       return false
     }
@@ -4889,13 +5177,15 @@ export function createService (ctx, options = {}) {
    * 登记一次要发的 recall 并立刻发第一包。对方已经不可达（没地址/不再放行）时
    * 不排队：重试也不会成功，白占计时器。
    */
-  function queueRecall ({ deviceId, visitId }) {
+  function queueRecall ({ deviceId, visitId, purpose = null }) {
     if (disposed || typeof deviceId !== 'string' || typeof visitId !== 'string') return false
     if (recalls.has(visitId)) return false
-    if (!sendVisitRecall(deviceId, visitId)) return false
+    const raiding = purpose === 'steal'
+    if (!sendVisitRecall(deviceId, visitId, raiding)) return false
     const now = Date.now()
     recalls.set(visitId, {
       deviceId,
+      raiding,
       attempts: 1,
       nextAt: now + recallRetryMs,
       deadline: now + recallTimeoutMs
@@ -4916,7 +5206,7 @@ export function createService (ctx, options = {}) {
         continue
       }
       if (now < recall.nextAt) continue
-      if (!sendVisitRecall(recall.deviceId, visitId)) {
+      if (!sendVisitRecall(recall.deviceId, visitId, recall.raiding === true)) {
         // 对方离线/不再放行：再发也不会到，收手。
         recalls.delete(visitId)
         continue
@@ -5175,6 +5465,7 @@ export function createService (ctx, options = {}) {
       skinRef = null
       skinFetcher = null
       visitorSkins.clear()
+
       skinPool = []
       // 礼物端口随服务器一起关了：内存里的 armed 表与在途标记不再有意义。
       armedGifts.clear()

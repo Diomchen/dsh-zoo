@@ -49,6 +49,7 @@ export function createDiscovery ({
   beaconIntervalMs = BEACON_INTERVAL_MS,
   mayTalkTo = () => false,
   skin = null,
+  caps = null,
   onPeer,
   log,
   now = () => Date.now()
@@ -75,6 +76,7 @@ export function createDiscovery ({
     maxSources: 128,
     now
   })
+  const directLimiter = createRateLimiter({ windowMs: 5000, max: 4 })
   const replyLimiter = createRateLimiter({
     windowMs: REPLY_WINDOW_MS,
     max: REPLY_MAX,
@@ -102,7 +104,8 @@ export function createDiscovery ({
       nickname: identity?.nickname,
       port: advertisedPort(),
       skinPort: current?.port,
-      skinId: current?.id
+      skinId: current?.id,
+      ...(caps === null ? {} : { caps })
     })
   }
 
@@ -230,6 +233,22 @@ export function createDiscovery ({
     return true
   }
 
+  /**
+   * 票 53：给"来偷"这条链的免放行单播出口（ADR-0018：偷不需要放行）。
+   * 只用于 `visit-request(purpose:'steal')` 与那一趟的 recall；每来源 4 次 / 5 秒，
+   * 够"请求 + 两次重试 + 回执"用，又不给反射放大留空间。其余应用层出站仍必须过 `sendTo`。
+   */
+  function sendDirect (deviceId, data) {
+    if (disposed || !started || socket === null) return false
+    if (typeof deviceId !== 'string' || deviceId === '') return false
+    if (!(data instanceof Uint8Array) || data.length === 0 || data.length > MAX_PACKET_BYTES) return false
+    const endpoint = endpoints.get(deviceId)
+    if (endpoint === undefined) return false
+    if (!directLimiter.allow(endpoint.address, now())) return false
+    sendPacket(data, endpoint.port, endpoint.address)
+    return true
+  }
+
   function onMessage (buffer, rinfo) {
     if (disposed || !started) return
     const source = rinfo?.address
@@ -347,6 +366,7 @@ export function createDiscovery ({
     inbound.clear()
     ackLimiter.clear()
     replyLimiter.clear()
+    directLimiter.clear()
     endpoints.clear()
     if (socket !== null) {
       try {
@@ -367,6 +387,7 @@ export function createDiscovery ({
     addressOf,
     sendTo,
     sendReply,
+    sendDirect,
     dispose
   }
 }

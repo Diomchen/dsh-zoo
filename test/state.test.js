@@ -180,7 +180,8 @@ test('ticket 45：/state 的 farm / market / contracts 形状与 docs/protocol.m
   const state = await call(service, '/dsh-zoo/state')
   assert.equal(state.status, 200)
   assert.deepEqual(Object.keys(state.body.farm).sort(), [
-    'coins', 'crops', 'dew', 'dewEarned', 'guard', 'hire', 'log', 'plots', 'seeds', 'worker'
+    'coins', 'crops', 'dew', 'dewEarned', 'guard', 'hire', 'log', 'maxPlots', 'nextCost',
+    'plots', 'seeds', 'unlocked', 'worker'
   ])
   assert.deepEqual(Object.keys(state.body.farm.plots[0]).sort(), [
     'crop', 'fertilized', 'growMs', 'grownMs', 'helpedBy', 'id', 'plantedAt', 'stolenBy', 'waterings'

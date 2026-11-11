@@ -33,6 +33,10 @@ const FARM_ERROR_TEXT = Object.freeze({
   'no-dew': '露水不够，先让宠物待机攒一会儿。',
   'already-watered': '这株已经浇过水了。',
   'already-fertilized': '这株已经施过肥了。',
+  // 地块解锁（ticket 48）
+  'max-plots': '已经到 50 块地了，没有可解锁的地块。',
+  reserve: '解锁后至少要留一点种子钱，先卖点作物吧。',
+  stale: '农场刚刚变过，刷新后再试。',
   // 雇佣合同（ticket 44）
   'own-pet': '不能雇自己的宠物。',
   'worker-unavailable': '这只宠物现在不能来打工：可能不在家、在串门，或者已经接了别的活。',
@@ -48,6 +52,8 @@ const FARM_ERROR_TEXT = Object.freeze({
   // 访客动作（ticket 43）
   'no-visit': '这次串门已经结束了。',
   'no-port': '对方没开局域网端口，看不到他家的农场。',
+  // 票 54：对面是 1.2 及更早的版本，既没有只读视图也没有免放行的偷。
+  'old-neighbor': '对方的版本太老，还不支持远程看田和派它去偷。',
   'already-stolen': '这块地这一轮已经被你偷过了。',
   'already-helped': '这块地这一轮已经帮过了。',
   guard: '被抓住了，这次白跑（没有罚款）。'

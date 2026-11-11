@@ -41,6 +41,52 @@ export const CROPS = Object.freeze({
 
 export const CROP_IDS = Object.freeze(Object.keys(CROPS))
 
+/**
+ * 地块解锁（ticket 48 / ADR-0017）：4 块起步、50 块封顶、只能按顺序买。
+ * 地价 = round5(60 × 1.10^(已解锁数 − 4))；取整到 5，窗口与宿主用同一份纯函数。
+ */
+export const START_PLOTS = 4
+export const MAX_PLOTS = 50
+export const PLOT_UNLOCK_FIRST_COST = 60
+export const PLOT_UNLOCK_RATE = 1.10
+/** 解锁后至少留一颗最便宜种子的钱，避免「全空地 + 0 硬币 + 0 种子」的软锁。 */
+export const PLOT_UNLOCK_RESERVE = Math.min(...CROP_IDS.map((id) => CROPS[id].seedPrice))
+
+/** 地块数夹到 [START_PLOTS, MAX_PLOTS]；坏值按起点算。 */
+export function clampPlotCount (value) {
+  const count = Number(value)
+  if (!Number.isInteger(count)) return START_PLOTS
+  return Math.min(MAX_PLOTS, Math.max(START_PLOTS, count))
+}
+
+/** 下一块地的价格；已到上限返回 null。越界/坏值按 null（调用方不显示解锁入口）。 */
+export function plotUnlockCost (unlocked) {
+  const count = Number(unlocked)
+  if (!Number.isInteger(count) || count < START_PLOTS || count >= MAX_PLOTS) return null
+  const raw = PLOT_UNLOCK_FIRST_COST * Math.pow(PLOT_UNLOCK_RATE, count - START_PLOTS)
+  return Math.round(raw / 5) * 5
+}
+
+/**
+ * 偷/帮的每日上限：随已解锁地块数温和放大（ADR-0017）。
+ * 跨农场的 `perVisitorDay` 用访客自己农场的大小算：两本账最终一致，额度随自家规模长。
+ */
+export function visitLimitsFor (unlocked) {
+  const extra = Math.max(0, clampPlotCount(unlocked) - START_PLOTS)
+  return {
+    steal: {
+      perVisitorFarm: 3 + Math.floor(extra / 10),
+      perFarmDay: 5 + Math.floor(extra / 5),
+      perVisitorDay: 10 + Math.floor(extra / 10)
+    },
+    help: {
+      perVisitorFarm: 3 + Math.floor(extra / 10),
+      perFarmDay: 5 + Math.floor(extra / 5),
+      perVisitorDay: 5 + Math.floor(extra / 10)
+    }
+  }
+}
+
 /** 露水：每 10 分钟待机 +1，每天最多挣 48、余额也封顶 48（SPEC v5）。 */
 export const DEW_INTERVAL_MS = 10 * MINUTE_MS
 export const MAX_DEW = 48
