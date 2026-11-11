@@ -116,6 +116,13 @@ npm 不是上架 dsh-market 的必要条件；发布后市场会多显示下载�
 
 1. `package.json` 不能有 `"private": true`（本项目已移除）；
 2. `repository` 要指回 `https://github.com/Diomchen/dsh-zoo`；
-3. `npm publish --access public`。
+3. `npm publish --registry=https://registry.npmjs.org --access public`
+   （本机默认 registry 是 npmmirror，往镜像发布会被拒）；
+4. 用 granular token 时，权限要选 `Read and write (publish and stage)`，并勾上
+   `Bypass two-factor authentication`；选成 `stage only` 只能把版本送进暂存区。
 
 npm 包和精选列表是自动关联的，不需要在 YAML 里写 `npm:` 字段。
+
+> **本项目已经发布到 npm**（首个版本 `dsh-zoo@1.3.0`）。目录里的 `npm` / `version`
+> 字段来自 npm，市场也会优先用 npm 包，所以**以后每个正式 tag 都要同步发 npm**；
+> 只推 tag 不发 npm 的话，市场会继续把用户留在 npm 上的旧版本。
