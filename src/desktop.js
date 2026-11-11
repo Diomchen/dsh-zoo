@@ -607,10 +607,16 @@ export function createDesktop (options = {}) {
       type: 'farm-window',
       open: payload?.open === true,
       ...(payload?.close === true ? { close: true } : {}),
-      mode: payload?.mode === 'visitor' ? 'visitor' : 'owner',
+      // 票 52/55：`look` 与 `neighbors` 必须过这道白名单——它以前只放
+      // owner/visitor/farm/market/visit，所以宿主明明发了、窗口永远收不到
+      //（冒烟是直接发 IPC 的，绕过了这里，所以一直没暴露）。
+      mode: payload?.mode === 'look' ? 'look' : payload?.mode === 'visitor' ? 'visitor' : 'owner',
       farm: payload?.farm ?? null,
       market: payload?.market ?? null,
+      contracts: payload?.contracts ?? null,
       visit: payload?.visit ?? null,
+      look: payload?.look ?? null,
+      neighbors: Array.isArray(payload?.neighbors) ? payload.neighbors : [],
       ...(typeof payload?.plotId === 'string' ? { plotId: payload.plotId } : {})
     })
   }

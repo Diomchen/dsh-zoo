@@ -24,7 +24,7 @@ import {
   MAX_FARM_LOG,
   MAX_STACK
 } from '../src/farm.js'
-import { CROPS, MAX_DEW, MAX_GUARD } from '../src/farm-rules.js'
+import { CROPS, MAX_DEW, MAX_GUARD, MAX_PLOTS, PLOT_UNLOCK_RESERVE, START_PLOTS } from '../src/farm-rules.js'
 import {
   HIRE_GUARD_MAX,
   HIRE_HOURS_MAX,
@@ -83,6 +83,11 @@ test('desktop/farm-view.js 的作物显示表与宿主一致（名称/emoji/价�
   }
 })
 
+test('解锁的种子钱在窗口与宿主两边同源（ticket 48）', () => {
+  assert.equal(farmView.UNLOCK_RESERVE, PLOT_UNLOCK_RESERVE)
+  assert.equal(PLOT_UNLOCK_RESERVE, 6)
+})
+
 test('desktop/shared.js 的常量与宿主一致（含守卫 0.8 与底价表）', async () => {
   const source = await readFile(SHARED_JS, 'utf8')
   assert.equal(numberConstant(source, 'HIRE_WAGE_MIN'), MIN_CONTRACT_WAGE)
@@ -92,6 +97,8 @@ test('desktop/shared.js 的常量与宿主一致（含守卫 0.8 与底价表）
   assert.equal(numberConstant(source, 'HIRE_FEE_RATE'), WORK_FEE_RATE)
   assert.equal(numberConstant(source, 'MAX_FARM_GUARD'), MAX_GUARD)
   assert.equal(numberConstant(source, 'MAX_FARM_LOG'), MAX_FARM_LOG)
+  assert.equal(numberConstant(source, 'MAX_FARM_PLOTS'), MAX_PLOTS)
+  assert.equal(numberConstant(source, 'MIN_FARM_PLOTS'), START_PLOTS)
   assert.equal(numberConstant(source, 'MAX_FARM_COINS'), MAX_COINS)
   assert.equal(numberConstant(source, 'MAX_FARM_STACK'), MAX_STACK)
   assert.equal(numberConstant(source, 'MAX_FARM_DEW'), MAX_DEW)

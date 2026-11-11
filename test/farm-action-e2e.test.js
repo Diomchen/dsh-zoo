@@ -12,7 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { FARM_FILE, FARM_VERSION } from '../src/farm.js'
+import { FARM_FILE, FARM_VERSION, PLOT_IDS } from '../src/farm.js'
 import { CROPS } from '../src/farm-rules.js'
 import { PROTOCOL_VERSION, encodeFarmAction, parsePacket } from '../src/protocol.js'
 import { createService } from '../src/service.js'
@@ -381,7 +381,7 @@ test('被抓：每次尝试都写日志且占次数，但桌面提示每位访�
   sendAction(context, { requestId: randomUUID(), plotId: 'p4' })
   await waitFor(() => resultsOf(context.peer.received).length === 5)
   assert.equal(resultsOf(context.peer.received)[4].parsed.packet.error, 'cap')
-  assert.deepEqual((await readFarm(context.dir)).plots.map((plot) => plot.stolenBy), [[], [], [], []])
+  assert.deepEqual((await readFarm(context.dir)).plots.map((plot) => plot.stolenBy), PLOT_IDS.map(() => []))
 })
 
 test('帮忙：生长中 +10%、helpedBy、日志；同一块地重复 → already-helped', async (t) => {

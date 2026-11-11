@@ -112,7 +112,77 @@ export const FARM_ACTION_ERRORS = Object.freeze([
   'guard',
   'starting'
 ])
-export const PLOT_ID_RE = /^p[1-4]$/
+/** 地块 id：开局 p1–p4，最多解锁到 p50（ticket 48）。 */
+export const PLOT_ID_RE = /^p(?:[1-9]|[1-4][0-9]|50)$/
+
+/**
+ * 能力声明（ticket 51 / ADR-0018）：老版本不发也不认，缺省 = 只支持串门。
+ * `raid` = 能收「来偷」的串门请求（免放行）；`look` = 有 `/dsh-zoo-farm/open` 只读视图。
+ */
+export const CAPS = Object.freeze(['raid', 'look'])
+export const MAX_CAPS = 4
+/** 一趟行程的硬上限（ticket 51）：到点自己回家，不写串门记录。 */
+export const RAID_MAX_MS = 60 * 1000
+export const RAID_PURPOSE = 'steal'
+/** 一次请求最多带多少块地；回执里的 stolen/skipped/caught 也用这个上限。 */
+export const MAX_RAID_PLOTS = 50
+
+export function normalizeCaps (value) {
+  if (!Array.isArray(value)) return null
+  const out = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const name = entry.trim()
+    if (!CAPS.includes(name) || out.includes(name)) continue
+    out.push(name)
+    if (out.length >= MAX_CAPS) break
+  }
+  return out.length === 0 ? null : out
+}
+
+function capsExtras (value) {
+  const caps = normalizeCaps(value)
+  return caps === null ? {} : { caps }
+}
+
+/** 请求里的地块：去重、只认 pN、最多 50 个；坏项只丢自己。 */
+function normalizeRaidPlots (value) {
+  if (!Array.isArray(value)) return null
+  const out = []
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue
+    const id = entry.trim().toLowerCase()
+    if (!PLOT_ID_RE.test(id) || out.includes(id)) continue
+    out.push(id)
+    if (out.length >= MAX_RAID_PLOTS) break
+  }
+  return out.length === 0 ? null : out
+}
+
+/**
+ * 回执里的结果。`stolen` / `skipped` 形状不对就当整包没有（敌意输入，不猜）：
+ * 数组里坏的条目丢自己，但字段本身不是数组就说明这条回执没意义。
+ */
+function normalizeRaidResult (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (value.stolen !== undefined && !Array.isArray(value.stolen)) return null
+  if (value.skipped !== undefined && !Array.isArray(value.skipped)) return null
+  const stolen = []
+  for (const entry of Array.isArray(value.stolen) ? value.stolen : []) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    if (typeof entry.plot !== 'string') continue
+    const plot = entry.plot.trim().toLowerCase()
+    if (!PLOT_ID_RE.test(plot) || !isCropId(entry.crop)) continue
+    stolen.push({ plot, crop: entry.crop })
+    if (stolen.length >= MAX_RAID_PLOTS) break
+  }
+  const skipped = normalizeRaidPlots(value.skipped) ?? []
+  const caughtRaw = Number(value.caught)
+  const caught = Number.isFinite(caughtRaw)
+    ? Math.min(MAX_RAID_PLOTS, Math.max(0, Math.floor(caughtRaw)))
+    : 0
+  return { stolen, caught, skipped }
+}
 /** 一次偷只拿 1 个；结果里的 qty 只能是 0..1。 */
 export const MAX_FARM_QTY = 1
 const FARM_ACTION_KIND_SET = new Set(FARM_ACTION_KINDS)
@@ -515,6 +585,10 @@ function buildPacket ({
   guard,
   servedMs,
   earned,
+  caps,
+  purpose,
+  plots,
+  raid,
   now = Date.now()
 } = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
@@ -529,18 +603,22 @@ function buildPacket ({
   const skin = skinExtras({ skinPort, skinId })
   let packet
   if (type === 'heartbeat') {
-    packet = { ...base, anim: normalizeAnimation(anim), ...pet, ...skin }
+    packet = { ...base, anim: normalizeAnimation(anim), ...pet, ...skin, ...capsExtras(caps) }
   } else if (type === 'visit-request') {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     const safeNickname = normalizeNickname(nickname)
     if (safeNickname === null) throw new Error('protocol: invalid nickname')
+    const steals = purpose === RAID_PURPOSE
+    const safePlots = steals ? normalizeRaidPlots(plots) : null
     packet = {
       ...base,
       visitId: visitId.toLowerCase(),
       nickname: safeNickname,
       anim: normalizeAnimation(anim),
       ...pet,
-      ...skin
+      ...skin,
+      ...(steals ? { purpose: RAID_PURPOSE } : {}),
+      ...(safePlots === null ? {} : { plots: safePlots })
     }
   } else if (type === 'visit-deny') {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
@@ -736,7 +814,12 @@ function buildPacket ({
     if (!isPort(port)) throw new Error('protocol: invalid port')
     const safeNickname = normalizeNickname(nickname)
     if (safeNickname === null) throw new Error('protocol: invalid nickname')
-    packet = { ...base, nickname: safeNickname, port, ...skin }
+    packet = { ...base, nickname: safeNickname, port, ...skin, ...capsExtras(caps) }
+  }
+
+  if (type === 'visit-ack' && raid !== undefined && raid !== null) {
+    const safeRaid = normalizeRaidResult(raid)
+    if (safeRaid !== null) packet = { ...packet, raid: safeRaid }
   }
 
   let giftDropped = false
@@ -805,8 +888,8 @@ export function encodeVisitRequest ({ deviceId, visitId, nickname, anim, action,
   })
 }
 
-export function encodeVisitAck ({ deviceId, visitId } = {}) {
-  return encodePacket({ type: 'visit-ack', deviceId, visitId })
+export function encodeVisitAck ({ deviceId, visitId, raid } = {}) {
+  return encodePacket({ type: 'visit-ack', deviceId, visitId, raid })
 }
 
 export function encodeVisitDeny ({ deviceId, visitId, reason } = {}) {
@@ -959,7 +1042,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         deviceId: raw.deviceId.toLowerCase(),
         anim: raw.anim === null ? null : raw.anim.trim(),
         ...petExtras({ action: raw.action, semantic: raw.semantic, say: raw.say, now }),
-        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
+        ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId }),
+        ...capsExtras(raw.caps)
       }
     }
   }
@@ -984,6 +1068,10 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         anim: raw.anim === null ? null : raw.anim.trim(),
         ...petExtras({ action: raw.action, semantic: raw.semantic, say: raw.say, now }),
         ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId }),
+        ...(raw.purpose === RAID_PURPOSE ? { purpose: RAID_PURPOSE } : {}),
+        ...(raw.purpose === RAID_PURPOSE && normalizeRaidPlots(raw.plots) !== null
+          ? { plots: normalizeRaidPlots(raw.plots) }
+          : {}),
         ...(gift === null ? {} : { gift })
       }
     }
@@ -1302,13 +1390,15 @@ export function parsePacket (input, { now = Date.now() } = {}) {
   // ack / recall 只关联一次串门：除了 id 什么都不接受。
   if (VISIT_TYPES.has(raw.type)) {
     if (!isVisitId(raw.visitId)) return fail('visit-id')
+    const raid = raw.type === 'visit-ack' ? normalizeRaidResult(raw.raid) : null
     return {
       ok: true,
       packet: {
         v: PROTOCOL_VERSION,
         type: raw.type,
         deviceId: raw.deviceId.toLowerCase(),
-        visitId: raw.visitId.toLowerCase()
+        visitId: raw.visitId.toLowerCase(),
+        ...(raid === null ? {} : { raid })
       }
     }
   }
@@ -1326,7 +1416,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       deviceId: raw.deviceId.toLowerCase(),
       nickname,
       port: raw.port,
-      ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId })
+      ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId }),
+      ...capsExtras(raw.caps)
     }
   }
 }

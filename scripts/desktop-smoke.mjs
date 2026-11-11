@@ -44,7 +44,14 @@ import { resolveDshPetAssetDirs } from '../src/pet-assets.js'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
 const OUT_DIR = join(tmpdir(), 'dsh-zoo-desktop-smoke-' + process.pid)
-const NOTES_DIR = join(ROOT, '.scratch', 'dsh-zoo', 'notes')
+/**
+ * 截图笔记落哪儿。默认是仓库里的 `.scratch/dsh-zoo/notes/`；但这份脚本也**会随包发布**
+ * （`files` 里有 `scripts`），装进 `node_modules` 之后再跑 `DSH_ZOO_SMOKE_NOTES=1` 就会往
+ * 包里写图——Windows 验收时真发生过（958 KB / 10 张）。装好的包一律写系统临时目录。
+ */
+const NOTES_DIR = /[\\/]node_modules[\\/]/.test(ROOT)
+  ? join(tmpdir(), 'dsh-zoo-smoke-notes')
+  : join(ROOT, '.scratch', 'dsh-zoo', 'notes')
 /** ticket 25：礼物缩略图走 helper 的 dshzoo://gifts 根；冒烟自己造一个真目录 + 真 PNG。 */
 const GIFTS_ROOT = join(OUT_DIR, 'gifts')
 const GIFT_THUMB_DIR = '20261103-153245-ab12cd12'
@@ -2321,6 +2328,11 @@ async function verifyFarmWindow () {
     { id: 'p4', crop: 'pumpkin', stage: 'mature', mature: true, remainingMs: 0 }
   ]
   const fullFarm = {
+    // ticket 48/49：4 块已解锁 + 一张「下一块」锁定卡，截图里能看见地价。
+    unlocked: 4,
+    maxPlots: 50,
+    nextCost: 60,
+    unlockLadder: [60, 65, 75, 80, 90],
     plots: farmPlots.map((plot) => ({ ...plot, waterings: 0, fertilized: false })),
     seeds: { tomato: 2, carrot: 0, pumpkin: 0 },
     crops: { tomato: 0, carrot: 0, pumpkin: 0 },
@@ -2520,6 +2532,20 @@ async function verifyFarmWindow () {
   assert(visible > image.width * image.height * 0.2,
     '小窗里画出了可见内容（' + visible + '/' + (image.width * image.height) + ' px）')
 
+  // ticket 49：4 块已解锁 + 一张带地价的锁定卡，不能只靠截图肉眼确认。
+  const cardsMark = client.mark()
+  client.send({ type: 'debug-farm-read', id: 'smoke-farm-cards' })
+  const cardsEvent = await client.waitFrom(
+    cardsMark,
+    (event) => event.type === 'farm-read' && event.id === 'smoke-farm-cards',
+    5000,
+    '读农场卡'
+  )
+  const lockedCard = (Array.isArray(cardsEvent.plots) ? cardsEvent.plots : [])
+    .find((card) => card.locked === true)
+  assert(lockedCard !== undefined, '农场窗末尾有锁定卡')
+  assert(String(lockedCard.badge).includes('60'), '锁定卡徽标带地价 60：' + lockedCard.badge)
+
   // 47.1：多地块倒计时必须按真实时间走，不是每次 setInterval 只减 1s。
   // 注入三块生长中，阻塞渲染进程 5s 再读；三张卡都应少约 5s（旧实现只少 1–2s）。
   const countdownSeconds = (text) => {
@@ -2540,6 +2566,9 @@ async function verifyFarmWindow () {
   }
   const threeFarm = {
     ...fullFarm,
+    // 这一段只验证三块地的倒计时，不要多一张锁定卡。
+    unlocked: 4,
+    nextCost: null,
     plots: [
       { id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 60 * 1000, waterings: 0, fertilized: false },
       { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 60 * 1000, waterings: 0, fertilized: false },
@@ -2846,6 +2875,44 @@ async function verifyFarmWindow () {
   )
   assert(stealShot.width > 0 && existsSync(stealPath), '访客偷/帮截图落盘：' + stealPath)
 
+  // 票 54：看田（`mode:'look'`）——没有页签、没有单块按钮，底部一条「派它去偷」。
+  const lookDevice = '33333333-3333-4333-8333-333333333333'
+  client.send({
+    type: 'farm-window',
+    open: true,
+    mode: 'look',
+    farm: fullFarm,
+    market: fullMarket,
+    contracts: fullContracts,
+    // 票 55：窗口里的邻居切换器（当前这家高亮）。
+    neighbors: [
+      { deviceId: lookDevice, nickname: '泡泡', canRaid: true },
+      { deviceId: '44444444-4444-4444-8444-444444444444', nickname: '鱼姐', canRaid: true }
+    ],
+    look: {
+      deviceId: lookDevice,
+      host: { nickname: '泡泡' },
+      guard: 0.3,
+      quotas: { perTrip: 3, perTripLeft: 2 },
+      plots: [
+        { id: 'p1', crop: 'tomato', stage: 'mature', mature: true, remainingMs: 0, stolenByMe: false, helpedByMe: false },
+        { id: 'p2', crop: 'carrot', stage: 'growing', mature: false, remainingMs: 25 * 60 * 1000, stolenByMe: false, helpedByMe: false },
+        { id: 'p3', crop: null, stage: 'empty', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: false },
+        { id: 'p4', crop: 'pumpkin', stage: 'mature', mature: true, remainingMs: 0, stolenByMe: true, helpedByMe: false }
+      ]
+    }
+  })
+  await sleep(700)
+  const lookPath = join(OUT_DIR, '54-farm-look.png')
+  client.send({ type: 'shot', id: 'smoke-farm-look-shot', path: lookPath, window: 'farm' })
+  const lookShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-look-shot',
+    8000,
+    '看田截图'
+  )
+  assert(lookShot.width > 0 && existsSync(lookPath), '看田截图落盘：' + lookPath)
+
   client.send({ type: 'hide' })
   await client.waitStatus((status) => status.farmOpen === false, 4000, 'hide 关掉农场小窗')
 
@@ -2877,6 +2944,7 @@ async function verifyFarmWindow () {
       return dest
     }
     noteComposite(pngPath, '47-farm-window-composited.png')
+    noteComposite(lookPath, '54-farm-look-composited.png')
     noteComposite(plantModalPath, '47-farm-plant-modal-composited.png')
     noteComposite(batchPath, '47-farm-batch-harvest-composited.png')
     noteComposite(marketPath, '47-farm-market-composited.png')
@@ -2924,6 +2992,7 @@ async function verifyFarmWindow () {
     hirePath,
     logPath,
     stealPath,
+    lookPath,
     workerPath,
     notePaths
   }

@@ -142,6 +142,27 @@ export function isFreshMarketSample (at, now = Date.now(), maxAgeMs = MARKET_DIG
   return Math.abs(current - stamp) <= window
 }
 
+/**
+ * 一条**邻居行情包**算不算新鲜：以本机收到它的时间（`seenAt`）为准。
+ *
+ * 为什么不用报文里的 `at`：那是邻居的墙上时钟。两边差 90 秒时，每包 30 秒一次，
+ * 用 `at` 算会在「刚收到」就显示过期；差 2 分钟以上则整包被 `isFreshMarketSample`
+ * 丢掉。`seenAt` 是接收端自己的时间，只表示「我多久没听到这一户了」，与邻居的表无关。
+ *
+ * `at` 仍然保留给交易所指数（样本年龄是网络时间语义）；这里只回答「这户的行情还活着吗」。
+ * 没有 `seenAt` 的旧数据（或手写测试）退回 `at`，行为与以前一致。
+ */
+export function isFreshPeerDigest (digest, now = Date.now(), maxAgeMs = MARKET_DIGEST_FRESH_MS) {
+  const current = Number(now)
+  const window = Number(maxAgeMs)
+  if (!Number.isFinite(current) || !Number.isFinite(window) || window <= 0) return false
+  const seenAt = Number(digest?.seenAt)
+  if (Number.isFinite(seenAt) && seenAt > 0) {
+    return Math.abs(current - seenAt) <= window
+  }
+  return isFreshMarketSample(digest?.at, current, window)
+}
+
 /** 中位数：奇数取中间，偶数取中间两个的平均；空数组返回 null。 */
 export function medianPrice (values) {
   if (!Array.isArray(values) || values.length === 0) return null
@@ -209,12 +230,15 @@ export function freshIndexPrice (entry, now = Date.now()) {
   return Number.isFinite(price) && price > 0 ? price : null
 }
 
-/** 卖 `qty` 个之后的 price：`price × (1 − 0.12 × qty / 20)`，再夹取。 */
-export function sellImpactPrice (price, base, qty) {
+/** 卖 `qty` 个之后的 price：`price × (1 − 0.12 × qty / depth)`，再夹取；depth 默认 20。 */
+export function sellImpactPrice (price, base, qty, depth = SELL_IMPACT_QTY) {
   const current = clampPrice(price, base)
   const count = normalizeTradeQty(qty)
   if (count === null) return current
-  const factor = 1 - SELL_IMPACT_RATE * count / SELL_IMPACT_QTY
+  // ticket 48：大农场按比例卖货不更容易砸价；坏 depth 退回默认 20。
+  const capacity = Number(depth)
+  const divisor = Number.isFinite(capacity) && capacity > 0 ? capacity : SELL_IMPACT_QTY
+  const factor = 1 - SELL_IMPACT_RATE * count / divisor
   return clampPrice(current * factor, base)
 }
 
@@ -663,7 +687,7 @@ class MarketStore {
    * **同步**修改内存，调用方（FarmStore）可以在同一个同步段里接着改硬币/仓库，
    * 两本账不会在 await 之间被 tick 插进来。返回的 `persisted` 是写盘 Promise。
    */
-  applyTrade ({ side, cropId, qty, now } = {}) {
+  applyTrade ({ side, cropId, qty, now, depth = SELL_IMPACT_QTY } = {}) {
     if (!isTradeSide(side)) return { ok: false, error: 'bad-trade', persisted: false }
     if (!isCropId(cropId)) return { ok: false, error: 'bad-crop', persisted: false }
     const count = normalizeTradeQty(qty)
@@ -684,7 +708,7 @@ class MarketStore {
       // 这一笔按成交前的 bid 结算；数量冲击只影响下一笔（和现实做市商一样）。
       // 有新鲜局域网指数时 bid 用混合价，否则退化为本机价格。
       unitPrice = bidPrice(priceBefore, freshIndexPrice(this.#state.index[cropId], stamp))
-      entry.price = sellImpactPrice(priceBefore, entry.base, count)
+      entry.price = sellImpactPrice(priceBefore, entry.base, count, depth)
       entry.at = stamp
     } else {
       // 种子按表里的固定价卖；买种子不影响作物价（未来供应市场看不见）。

@@ -2219,6 +2219,23 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   // 完整农场多一个只显示的驮包；没有在途物品时是空数组（helper 只画有值的那几条）。
   assert.deepEqual(command.farm, { ...farm, carried: [] })
 
+  // 票 55：这条白名单以前会吃掉 look / neighbors / contracts——宿主发了、窗口收不到。
+  assert.equal(manager.farmWindow({
+    open: true,
+    mode: 'look',
+    farm,
+    look: { deviceId: 'e801672e-5a4a-4eb0-b81a-582d07ad6504', host: { nickname: '鱼姐' }, plots: [] },
+    neighbors: [{ deviceId: 'e801672e-5a4a-4eb0-b81a-582d07ad6504', nickname: '鱼姐', canRaid: true }],
+    contracts: { outgoing: [], incoming: [] }
+  }), true)
+  const lookCommand = children[0].parsedLines().at(-1)
+  assert.equal(lookCommand.mode, 'look')
+  assert.equal(lookCommand.look?.nickname, '鱼姐')
+  assert.equal(lookCommand.neighbors.length, 1)
+  // 合同块会补上 feeRate/listings/now（窗口画挂牌要用）；这里只确认它没被白名单吃掉。
+  assert.deepEqual(lookCommand.contracts?.outgoing, [])
+  assert.deepEqual(lookCommand.contracts?.incoming, [])
+
   assert.equal(manager.farmWindow({ open: false, farm }), true)
   assert.equal(children[0].parsedLines().at(-1).open, false)
   assert.equal('plotId' in children[0].parsedLines().at(-1), false)

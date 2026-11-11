@@ -121,7 +121,11 @@ test('HTTP：初始农场 → 种 → 等 → 收 → 再种；硬币/种子/作
 
   // store 还没读出来时也要是完整形状，不能是 undefined。
   const early = await state(service)
-  assert.deepEqual(early.body.farm.plots.map((plot) => plot.id), [...PLOT_IDS])
+  // ticket 48：/state 只回已解锁的地块；开局 4 块。
+  assert.deepEqual(early.body.farm.plots.map((plot) => plot.id), PLOT_IDS.slice(0, 4))
+  assert.equal(early.body.farm.unlocked, 4)
+  assert.equal(early.body.farm.maxPlots, 50)
+  assert.equal(early.body.farm.nextCost, 60)
   assert.equal(early.body.farm.coins, 30)
   assert.deepEqual(early.body.farm.seeds, { tomato: 2 })
   assert.deepEqual(early.body.farm.log, [])

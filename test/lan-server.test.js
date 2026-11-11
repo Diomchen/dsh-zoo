@@ -430,3 +430,44 @@ test('农场路由：lookupFarm 抛异常也只回 404，不变成 500', async (
   })
   assert.equal((await fetch(url(server, FARM_ROUTE + '/' + visitId))).status, 404)
 })
+
+test('公开只读视图：GET/HEAD 正常，形状不对 404，不看放行', async (t) => {
+  const { openFarmView } = await import('../src/farm-open.js')
+  const viewer = '22222222-2222-4222-8222-222222222222'
+  const server = await startLanServer({
+    port: 0,
+    host: '127.0.0.1',
+    lookupOpenFarm (deviceId) {
+      if (deviceId !== viewer) return null
+      return openFarmView({
+        viewerDeviceId: deviceId,
+        host: { deviceId: '11111111-1111-4111-8111-111111111111', nickname: '小黄' },
+        plots: [{ id: 'p1', crop: null, plantedAt: null, grownMs: 0, growMs: 0, stolenBy: [], helpedBy: [] }],
+        unlocked: 4,
+        guard: 0.3,
+        guardParts: { ownerHome: true, worker: false },
+        usedByViewer: 0,
+        caps: ['raid', 'look'],
+        now: Date.now()
+      })
+    }
+  })
+  t.after(() => server.close())
+
+  const base = 'http://127.0.0.1:' + server.port
+  const ok = await fetch(base + FARM_ROUTE + '/open/' + viewer)
+  assert.equal(ok.status, 200)
+  assert.equal(ok.headers.get('cache-control'), 'no-store')
+  const body = await ok.json()
+  assert.deepEqual(body.host, { nickname: '小黄' })
+  assert.deepEqual(body.plots.map((plot) => plot.id), ['p1'])
+
+  const head = await fetch(base + FARM_ROUTE + '/open/' + viewer, { method: 'HEAD' })
+  assert.equal(head.status, 200)
+
+  const other = '44444444-4444-4444-8444-444444444444'
+  assert.equal((await fetch(base + FARM_ROUTE + '/open/' + other)).status, 404)
+  assert.equal((await fetch(base + FARM_ROUTE + '/open/not-a-uuid')).status, 404)
+  // 串门期的旧形状不能被"open"这个段吃掉
+  assert.equal((await fetch(base + FARM_ROUTE + '/open')).status, 404)
+})

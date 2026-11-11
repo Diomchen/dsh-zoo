@@ -24,18 +24,29 @@
         --card: #fffdfa;
         --ink: #2f3a34;
         --ink-soft: #6c746d;
-        --muted: #9a9a90;
+        /* 9–10px 的说明文字也必须是 4.5:1：旧的 #9a9a90 在奶白卡上只有 2.8:1。 */
+        --muted: #666d66;
         --line: #ede5da;
+        --line-strong: #ded4c4;
         --emerald: #2e9e6b;
         --emerald-deep: #1f7a52;
+        /* 按钮底：白字在 #2e9e6b 上只有 3.38:1；#23815a 是 4.82:1。 */
+        --emerald-btn: #23815a;
+        --emerald-btn-deep: #1b6b4a;
         --emerald-soft: #e8f6ee;
         --amber: #e7a23a;
         --amber-deep: #c77e18;
+        --amber-ink: #8a5a12;
         --amber-soft: #fdf3e2;
         --sky: #4c9fd8;
         --sky-soft: #eaf5fc;
         --rose: #c25b50;
+        --rose-ink: #a8352a;
         --rose-soft: #fbeae7;
+        --disabled-bg: #f2efe8;
+        --disabled-line: #e6e0d5;
+        --disabled-ink: #8d8b82;
+        --focus: #1f7a52;
         --shadow-soft: 0 4px 14px rgba(63, 54, 38, 0.07);
         --shadow-lift: 0 10px 26px rgba(63, 54, 38, 0.13);
       }
@@ -59,6 +70,14 @@
       button,
       input {
         font-family: inherit;
+      }
+      /* 键盘焦点必须在任何控件上都看得见（含弹层里的按钮）；鼠标点不画环。 */
+      :focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 2px;
+      }
+      input:focus-visible {
+        outline-offset: 1px;
       }
       .app {
         position: relative;
@@ -178,6 +197,107 @@
       }
 
       /* 2. 分段页签 */
+      /* 票 55：农场窗头部的邻居切换器（我的农场 / 各邻居）。 */
+      .nn-switch {
+        /* 地块区是 CSS grid：这两条必须横跨整行，否则会被当成一个格子。 */
+        grid-column: 1 / -1;
+        display: flex;
+        gap: 6px;
+        padding: 2px 2px 8px;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+
+      .nn-switch::-webkit-scrollbar { display: none; }
+
+      .nn-chip {
+        flex: 0 0 auto;
+        padding: 5px 10px;
+        border: 1px solid #d9e2dc;
+        border-radius: 999px;
+        background: #fff;
+        color: #46604f;
+        font-size: 12px;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      .nn-chip[aria-pressed="true"] {
+        background: #2f7d4f;
+        border-color: #2f7d4f;
+        color: #fff;
+      }
+
+      .nn-chip[disabled] { cursor: default; }
+
+      /* 票 56：邻居多的时候收进胶囊，点开是这张列表（最多 8 行，内部滚动）。 */
+      .nn-capsule { font-weight: 600; }
+
+      .nn-menu {
+        position: absolute;
+        z-index: 6;
+        margin-top: 34px;
+        width: 232px;
+        max-height: 60vh;
+        overflow-y: auto;
+        padding: 6px;
+        border: 1px solid #e3e9e4;
+        border-radius: 14px;
+        background: #fff;
+        box-shadow: 0 10px 24px rgba(30, 58, 42, 0.16);
+      }
+
+      .nn-item {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        width: 100%;
+        padding: 8px 10px;
+        border: 0;
+        border-radius: 10px;
+        background: transparent;
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .nn-item:hover { background: #f3f8f4; }
+
+      .nn-item[aria-selected="true"] {
+        background: #eaf4ee;
+        box-shadow: inset 3px 0 0 #2f7d4f;
+      }
+
+      .nn-item[data-old="true"] { opacity: 0.45; cursor: default; }
+
+      .nn-item-name { font-size: 13px; color: #1f3b2b; font-weight: 600; }
+      .nn-item-sub { font-size: 11px; color: #6b7f72; }
+
+      /* 票 52：看田模式底部只有「派它去偷」这一条。 */
+      .look-bar {
+        grid-column: 1 / -1;
+        display: flex;
+        gap: 8px;
+        padding: 10px 2px 4px;
+      }
+
+      .look-bar .primary {
+        flex: 1;
+        height: 40px;
+        border: 0;
+        border-radius: 12px;
+        background: #2f7d4f;
+        color: #fff;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .look-bar .primary[disabled] {
+        background: #cfd8d2;
+        color: #6b7a72;
+        cursor: default;
+      }
+
       .tabs {
         flex: none;
         display: flex;
@@ -200,7 +320,7 @@
         border: 0;
         border-radius: 11px;
         background: transparent;
-        color: #7b7b70;
+        color: #5f665f;
         font: inherit;
         font-size: 10.5px;
         font-weight: 700;
@@ -221,7 +341,7 @@
         cursor: default;
       }
 
-      /* 3. 一键播种 / 一键收割 */
+      /* 3. 一键种满 / 一键收割 */
       .batch-bar {
         flex: none;
         display: flex;
@@ -397,6 +517,48 @@
         border-color: #f0d49a;
         background: linear-gradient(180deg, #fff9ec, #fdefd4);
         box-shadow: 0 6px 16px rgba(222, 148, 39, 0.16);
+      }
+      /* 锁定卡（ticket 49）：只显示「下一块」，到 50 块自动消失。 */
+      .plot-card.locked {
+        border-style: dashed;
+        border-color: #e2d9cc;
+        background: linear-gradient(180deg, #fbf8f2, #f4efe6);
+      }
+      .plot-card.locked .plot-badge {
+        align-self: flex-start;
+        margin: 0;
+        background: #efe9df;
+        color: #8a8175;
+      }
+      .plot-card.locked .plot-title {
+        margin: 0;
+        color: var(--ink-soft);
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .plot-card.locked .plot-emoji {
+        margin: 0;
+        color: #9a9285;
+        font-size: 20px;
+        line-height: 1.1;
+        text-align: center;
+      }
+      .plot-card.locked .plot-hint {
+        min-height: 24px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 9px;
+        line-height: 1.35;
+      }
+      .plot-card.locked .chip-btn.unlock {
+        margin-top: 2px;
+      }
+      .plot-card.locked[data-affordable='false'] .chip-btn.unlock {
+        opacity: 0.8;
+      }
+      .plot-card.locked .chip-btn.unlock:disabled {
+        opacity: 0.55;
+        cursor: not-allowed;
       }
       .plot-card[data-selected='true'] {
         outline: 2px solid rgba(46, 158, 107, 0.5);
@@ -814,7 +976,7 @@
       .toasts {
         position: absolute;
         left: 50%;
-        bottom: 70px;
+        bottom: 78px;
         z-index: 50;
         display: flex;
         flex-direction: column;
@@ -855,11 +1017,24 @@
         gap: 8px;
         padding: 2px 2px 0;
         color: var(--ink-soft);
-        font-size: 9.5px;
+        font-size: 10px;
       }
       .market-head strong {
         color: var(--ink);
-        font-size: 11px;
+        font-size: 11.5px;
+      }
+      .market-wallet {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 2px 8px;
+        border: 1px solid #f2dfbe;
+        border-radius: 999px;
+        background: #fbf1de;
+        color: var(--amber-ink);
+        font-size: 10px;
+        font-weight: 800;
+        font-variant-numeric: tabular-nums;
       }
       .market-rows {
         display: flex;
@@ -869,120 +1044,312 @@
       .market-row {
         display: flex;
         flex-direction: column;
-        gap: 6px;
-        padding: 8px 9px;
+        gap: 4px;
+        padding: 8px 10px 6px;
         border: 1px solid var(--line);
         border-radius: 16px;
         background: var(--card);
         box-shadow: var(--shadow-soft);
       }
+      .market-row[aria-busy='true'] {
+        border-color: #cfe6da;
+        box-shadow: 0 0 0 2px rgba(35, 129, 90, 0.08), var(--shadow-soft);
+      }
       .market-row-head {
         display: flex;
         align-items: center;
         gap: 7px;
+        min-width: 0;
       }
       .market-row-head .emoji {
-        font-size: 18px;
+        font-size: 19px;
         line-height: 1;
       }
       .market-row-head .name {
         flex: 1 1 auto;
-        font-size: 11.5px;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
         font-weight: 800;
       }
       .market-row-head .last {
+        flex: none;
         color: var(--muted);
-        font-size: 9px;
+        font-size: 9.5px;
         font-variant-numeric: tabular-nums;
       }
-      .market-stats {
+      /* 一行价目：卖出价是这一行最该被看见的数。 */
+      .market-prices {
         display: flex;
-        flex-wrap: wrap;
-        gap: 3px 9px;
+        align-items: baseline;
+        gap: 8px;
+        min-height: 18px;
+      }
+      .market-prices .price-main {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 3px;
+        color: var(--ink);
+        font-size: 10px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+      .market-prices .price-main b {
+        font-size: 16px;
+        font-weight: 800;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.01em;
+      }
+      .market-prices .price-main .unit {
         color: var(--ink-soft);
         font-size: 9px;
+        font-weight: 600;
       }
-      .market-stats b {
+      .market-prices .price-sub {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 3px;
+        color: var(--ink-soft);
+        font-size: 9.5px;
+        white-space: nowrap;
+      }
+      .market-prices .price-sub b {
         color: var(--ink);
+        font-weight: 800;
         font-variant-numeric: tabular-nums;
       }
-      /* 局域网指数（ticket 42）：本机行情退成次要色；过期样本整项灰掉。 */
-      .market-stats .index-local {
+      /* 过期样本不用 opacity 压字：那会把 9.5px 的文字一起压到 4.5:1 以下。 */
+      .market-prices .index-stale b,
+      .market-prices .index-stale .unit {
+        color: var(--muted);
+        font-weight: 600;
+      }
+      .market-prices .index-local {
         color: var(--muted);
       }
-      .market-stats .index-stale,
-      .market-stats .index-stale b {
-        opacity: 0.55;
-        color: var(--muted);
-      }
+
+      /* 数量步进器 + 买卖：一行放下，按钮至少 28px 高（WCAG 2.2 目标 ≥24px）。 */
       .market-trade {
         display: flex;
-        flex-wrap: wrap;
         align-items: center;
-        gap: 5px;
+        gap: 6px;
       }
-      .market-trade .qty-label {
-        color: var(--muted);
-        font-size: 9px;
+      .qty-stepper {
+        display: inline-flex;
+        align-items: center;
+        flex: none;
+        height: 28px;
+        border: 1px solid var(--line-strong);
+        border-radius: 10px;
+        background: #fff;
+        overflow: hidden;
       }
-      .market-trade input {
-        width: 48px;
-        padding: 3px 5px;
-        border: 1px solid var(--line);
-        border-radius: 8px;
+      .qty-stepper button {
+        appearance: none;
+        width: 25px;
+        height: 26px;
+        padding: 0;
+        border: 0;
+        background: transparent;
+        color: var(--ink-soft);
+        font: inherit;
+        font-size: 14px;
+        font-weight: 800;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .qty-stepper button:hover:not(:disabled) {
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .qty-stepper button:disabled {
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .qty-stepper input {
+        width: 34px;
+        height: 26px;
+        padding: 0;
+        border: 0;
+        border-inline: 1px solid var(--line);
         background: #fff;
         color: var(--ink);
         font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+        -moz-appearance: textfield;
+      }
+      .qty-stepper input::-webkit-outer-spin-button,
+      .qty-stepper input::-webkit-inner-spin-button {
+        margin: 0;
+        -webkit-appearance: none;
+      }
+      .qty-stepper input[aria-invalid='true'] {
+        border-color: var(--rose);
+        background: var(--rose-soft);
+      }
+      .trade-actions {
+        display: flex;
+        flex: 1 1 auto;
+        gap: 6px;
+        min-width: 0;
+      }
+      .trade-actions .btn {
+        flex: 1 1 0;
+        min-width: 0;
+        min-height: 28px;
+        padding: 0 6px;
         font-size: 10px;
         font-variant-numeric: tabular-nums;
       }
-      .market-trade .total {
-        margin-left: auto;
-        color: var(--ink-soft);
-        font-size: 9px;
-        font-variant-numeric: tabular-nums;
+      /* 为什么不能点：一行解释，高度预留，任何一行都不会跳。 */
+      .trade-hint {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 6px;
+        min-height: 24px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 9.5px;
+        line-height: 1.4;
       }
-      .btn {
+      .trade-hint[data-tone='warn'] {
+        color: var(--amber-ink);
+      }
+      .trade-hint .hint-text {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .trade-hint .quick {
+        flex: none;
+        display: inline-flex;
+        gap: 6px;
+      }
+      .trade-hint .quick button {
         appearance: none;
-        padding: 4px 8px;
-        border: 1px solid rgba(46, 158, 107, 0.22);
-        border-radius: 9px;
-        background: #fff;
+        min-height: 24px;
+        padding: 0 5px;
+        border: 0;
+        background: transparent;
         color: var(--emerald-deep);
         font: inherit;
         font-size: 9.5px;
         font-weight: 700;
-        line-height: 1.25;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        cursor: pointer;
+      }
+      .trade-hint .quick button:hover:not(:disabled) {
+        color: var(--emerald-btn-deep);
+      }
+      .trade-hint .quick button:disabled {
+        color: var(--disabled-ink);
+        text-decoration: none;
+        cursor: not-allowed;
+      }
+
+      /* 按钮（交易所 / 雇工共用）：28px 高、4.5:1 白字、禁用态一眼可辨。 */
+      .btn {
+        appearance: none;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 4px;
+        min-height: 28px;
+        padding: 0 10px;
+        border: 1px solid rgba(46, 158, 107, 0.24);
+        border-radius: 10px;
+        background: #fff;
+        color: var(--emerald-deep);
+        font: inherit;
+        font-size: 10px;
+        font-weight: 700;
+        line-height: 1.2;
         white-space: nowrap;
         cursor: pointer;
+        transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
       }
       .btn:hover:not(:disabled) {
         background: #f0faf4;
       }
-      .btn:disabled {
-        border-color: #ede7dd;
-        background: #fbfaf6;
-        color: #b1afa4;
-        cursor: default;
+      .btn:active:not(:disabled) {
+        transform: translateY(1px);
       }
-      .btn.primary,
-      .market-trade .btn.buy {
-        border-color: var(--emerald);
-        background: var(--emerald);
+      .btn:disabled,
+      .qty-stepper input:disabled {
+        border-color: var(--disabled-line);
+        background: var(--disabled-bg);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+        box-shadow: none;
+      }
+      /* 关键：带 :not(:disabled)。.market-trade .btn.buy 的优先级高于 .btn:disabled，
+         不写这一句，灰掉的「买种」会和可点的一模一样——这就是「点了没反应」的根因。 */
+      .btn.primary:not(:disabled),
+      .market-trade .btn.buy:not(:disabled) {
+        border-color: var(--emerald-btn);
+        background: var(--emerald-btn);
         color: #fff;
       }
       .btn.primary:hover:not(:disabled),
       .market-trade .btn.buy:hover:not(:disabled) {
-        background: var(--emerald-deep);
+        border-color: var(--emerald-btn-deep);
+        background: var(--emerald-btn-deep);
       }
-      .market-trade .btn.sell {
-        border-color: transparent;
-        background: linear-gradient(135deg, #f0b24f, #de9427);
-        color: #fff;
+      /* 卖出是副操作：琥珀描边而不是实心，白字在琥珀上只有 2.5:1。 */
+      .market-trade .btn.sell:not(:disabled) {
+        border-color: #e8c58c;
+        background: #fff8ec;
+        color: var(--amber-ink);
       }
       .market-trade .btn.sell:hover:not(:disabled) {
-        background: linear-gradient(135deg, #f5bd63, #e29b2f);
+        border-color: #d9ab63;
+        background: #fdf0d8;
       }
+      .btn.block {
+        width: 100%;
+      }
+      .btn.ghost:not(:disabled) {
+        border-color: var(--line);
+        background: #fbf8f2;
+        color: var(--ink-soft);
+      }
+      .btn.ghost:not(:disabled):hover {
+        background: #f4efe6;
+      }
+      .btn.danger:not(:disabled) {
+        border-color: #eccbc4;
+        background: #fff;
+        color: var(--rose-ink);
+      }
+      .btn.danger:not(:disabled):hover {
+        background: var(--rose-soft);
+      }
+
+      .market-empty {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 18px 12px;
+        border: 1px dashed var(--line-strong);
+        border-radius: 16px;
+        background: #fffdf8;
+        color: var(--ink-soft);
+        font-size: 10.5px;
+        line-height: 1.5;
+      }
+      .market-empty b {
+        color: var(--ink);
+        font-size: 11.5px;
+      }
+
       .trades {
         display: flex;
         flex-direction: column;
@@ -992,7 +1359,7 @@
       .log h2 {
         margin: 0;
         color: var(--ink-soft);
-        font-size: 9.5px;
+        font-size: 10px;
         font-weight: 800;
         letter-spacing: 0.04em;
       }
@@ -1005,7 +1372,7 @@
         padding: 0;
         list-style: none;
         color: var(--ink-soft);
-        font-size: 9.5px;
+        font-size: 10px;
         line-height: 1.45;
       }
       .trades li,
@@ -1013,7 +1380,7 @@
         display: flex;
         justify-content: space-between;
         gap: 8px;
-        padding: 5px 8px;
+        padding: 6px 8px;
         border: 1px solid var(--line);
         border-radius: 10px;
         background: var(--card);
@@ -1030,103 +1397,336 @@
         justify-content: flex-start;
       }
 
-      /* 雇工页（ticket 44） */
+      /* 雇工页（ticket 44）：挂牌 → 合同 → 邻居挂牌，三块卡；字段带单位与就地校验。 */
       .hire-box {
         display: flex;
         flex-direction: column;
-        gap: 6px;
-        padding: 8px 9px;
+        gap: 8px;
+        padding: 10px 10px 9px;
         border: 1px solid var(--line);
         border-radius: 16px;
         background: var(--card);
         box-shadow: var(--shadow-soft);
       }
+      .hire-box-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
       .hire-box h2 {
         margin: 0;
         color: var(--ink);
-        font-size: 11px;
+        font-size: 11.5px;
+        font-weight: 800;
       }
-      .hire-form {
-        display: flex;
-        flex-wrap: wrap;
+      .hire-status {
+        display: inline-flex;
         align-items: center;
-        gap: 5px 8px;
+        gap: 4px;
+        padding: 2px 8px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fbf8f2;
         color: var(--ink-soft);
         font-size: 9.5px;
+        font-weight: 700;
       }
-      .hire-form label {
+      .hire-status[data-on='true'] {
+        border-color: #cfe6da;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .hire-status[data-on='false'] {
+        border-color: #e2d9cc;
+        background: #fbf8f2;
+        color: var(--ink-soft);
+      }
+      /* 开关行：整行可点，至少 30px 高。 */
+      .hire-toggle {
         display: flex;
         align-items: center;
-        gap: 3px;
+        justify-content: space-between;
+        gap: 10px;
+        min-height: 30px;
+        padding: 4px 2px;
+        color: var(--ink);
+        cursor: pointer;
       }
-      .hire-form input[type='number'] {
-        width: 42px;
-        padding: 2px 4px;
-        border: 1px solid var(--line);
-        border-radius: 7px;
+      .hire-toggle .switch-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
+        min-width: 0;
+        font-size: 10.5px;
+        font-weight: 700;
+        line-height: 1.35;
+      }
+      .hire-toggle .switch-copy small {
+        color: var(--ink-soft);
+        font-size: 9px;
+        font-weight: 600;
+      }
+      .hire-toggle input[type='checkbox'] {
+        appearance: none;
+        flex: none;
+        position: relative;
+        width: 38px;
+        height: 22px;
+        margin: 0;
+        border: 1px solid var(--line-strong);
+        border-radius: 999px;
+        background: #e9e3d8;
+        cursor: pointer;
+        transition: background-color 0.16s ease, border-color 0.16s ease;
+      }
+      .hire-toggle input[type='checkbox']::after {
+        content: '';
+        position: absolute;
+        top: 2px;
+        left: 2px;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: #fff;
+        box-shadow: 0 1px 3px rgba(63, 54, 38, 0.25);
+        transition: transform 0.16s ease;
+      }
+      .hire-toggle input[type='checkbox']:checked {
+        border-color: var(--emerald-btn);
+        background: var(--emerald-btn);
+      }
+      .hire-toggle input[type='checkbox']:checked::after {
+        transform: translateX(16px);
+      }
+      .hire-fields {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 6px;
+      }
+      .hire-field {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 2px 4px;
+        min-width: 0;
+        color: var(--ink-soft);
+        font-size: 9.5px;
+        font-weight: 700;
+      }
+      .hire-field .unit {
+        color: var(--muted);
+        font-size: 9px;
+        font-weight: 600;
+      }
+      .hire-field input[type='number'] {
+        flex: 1 1 100%;
+        width: 100%;
+        min-height: 28px;
+        padding: 0 8px;
+        border: 1px solid var(--line-strong);
+        border-radius: 9px;
         background: #fff;
         color: var(--ink);
         font: inherit;
-        font-size: 9.5px;
+        font-size: 12px;
+        font-weight: 700;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
       }
-      .hire-form input[type='number'][aria-invalid='true'] {
-        border-color: #b04a36;
+      .hire-field input[type='number'][aria-invalid='true'] {
+        border-color: var(--rose);
+        background: var(--rose-soft);
       }
-      .hire-toggle {
+      /* 就地错误：预留一行，开关/输入时出现不会把下面的按钮推走。 */
+      .hire-field .field-error {
         flex: 1 1 100%;
+        min-height: 11px;
+        color: var(--rose-ink);
+        font-size: 9px;
+        font-weight: 700;
+        line-height: 1.2;
       }
       .hire-hint {
         margin: 0;
-        color: var(--muted);
-        font-size: 9px;
+        color: var(--ink-soft);
+        font-size: 9.5px;
         line-height: 1.45;
+      }
+      .hire-hint b {
+        color: var(--amber-ink);
+        font-variant-numeric: tabular-nums;
+      }
+      .hire-form-status {
+        margin: 0;
+        min-height: 12px;
+        color: var(--emerald-deep);
+        font-size: 9.5px;
+        font-weight: 700;
+        line-height: 1.3;
+      }
+      .hire-form-status[data-tone='error'] {
+        color: var(--rose-ink);
+      }
+      .hire-form-status[data-tone='warn'] {
+        color: var(--amber-ink);
+      }
+      .hire-quote[data-tone='error'] {
+        color: var(--rose-ink);
       }
       .hire-list {
         display: flex;
         flex-direction: column;
-        gap: 4px;
-        max-height: 150px;
-        overflow-y: auto;
-        scrollbar-width: thin;
-        scrollbar-color: #d8d0c4 transparent;
+        gap: 6px;
       }
       .hire-row {
         display: flex;
-        flex-wrap: wrap;
-        align-items: center;
+        flex-direction: column;
         gap: 6px;
-        padding: 4px 6px;
+        padding: 8px 9px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: #fdfbf6;
+      }
+      .hire-row[data-side='outgoing'] {
+        border-color: #d8ece1;
+        background: #f7fcf9;
+      }
+      .hire-row-head {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+      }
+      .hire-row-head .avatar {
+        flex: none;
+        width: 26px;
+        height: 26px;
+        display: grid;
+        place-items: center;
         border-radius: 9px;
-        background: #faf7f1;
+        background: #eef6f1;
+        color: var(--emerald-deep);
+        font-size: 13px;
+        font-weight: 800;
+        line-height: 1;
+      }
+      .hire-row-head .btn {
+        flex: none;
+        min-height: 24px;
+        padding: 0 8px;
+        font-size: 9.5px;
+      }
+      .hire-row-head .grow {
+        flex: 1 1 auto;
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 1px;
       }
       .hire-row .name {
-        flex: 1 1 auto;
         min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-        font-size: 10px;
-        font-weight: 700;
+        color: var(--ink);
+        font-size: 10.5px;
+        font-weight: 800;
       }
       .hire-row .meta {
-        flex: none;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
         color: var(--ink-soft);
-        font-size: 9px;
+        font-size: 9.5px;
         font-variant-numeric: tabular-nums;
       }
-      .hire-row .btn {
+      .hire-pill {
         flex: none;
-        padding: 2px 6px;
+        padding: 2px 7px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: #fff;
+        color: var(--ink-soft);
         font-size: 9px;
+        font-weight: 700;
+      }
+      .hire-pill[data-tone='ok'] {
+        border-color: #cfe6da;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .hire-pill[data-tone='off'] {
+        border-color: #e2d9cc;
+        background: #f6f1e9;
+        color: var(--ink-soft);
+      }
+      .hire-row-foot {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      .hire-hours {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        color: var(--ink-soft);
+        font-size: 9.5px;
+        font-weight: 700;
+        white-space: nowrap;
+      }
+      .hire-hours input {
+        width: 42px;
+        min-height: 26px;
+        padding: 0 4px;
+        border: 1px solid var(--line-strong);
+        border-radius: 8px;
+        background: #fff;
+        color: var(--ink);
+        font: inherit;
+        font-size: 11px;
+        font-weight: 700;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+      .hire-quote {
+        flex: 1 1 auto;
+        min-width: 0;
+        color: var(--ink-soft);
+        font-size: 9.5px;
+        font-variant-numeric: tabular-nums;
+      }
+      .hire-quote b {
+        color: var(--ink);
+        font-weight: 800;
+      }
+      .hire-row-foot .btn {
+        flex: none;
+        min-height: 27px;
+        padding: 0 10px;
       }
       .hire-row[data-stale='true'] .name,
       .hire-row[data-stale='true'] .meta {
         color: var(--muted);
       }
       .hire-empty {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
         margin: 0;
-        color: var(--muted);
-        font-size: 9.5px;
+        padding: 10px 10px;
+        border: 1px dashed var(--line-strong);
+        border-radius: 12px;
+        background: #fffdf8;
+        color: var(--ink-soft);
+        font-size: 10px;
+        line-height: 1.5;
+      }
+      .hire-empty b {
+        color: var(--ink);
+        font-size: 10.5px;
       }
 
       @keyframes mature-bounce {
@@ -1175,6 +1775,36 @@
           transition-duration: 0.001ms !important;
         }
       }
+      /* 解锁确认弹层（ticket 49） */
+      .unlock-body {
+        display: grid;
+        gap: 4px;
+        padding: 2px 18px 0;
+        color: var(--ink-soft);
+        font-size: 11px;
+      }
+      .unlock-body p {
+        margin: 0;
+        line-height: 1.5;
+      }
+      .unlock-body h4 {
+        margin: 8px 0 0;
+        color: var(--muted);
+        font-size: 9.5px;
+        font-weight: 800;
+        letter-spacing: 0.04em;
+      }
+      .unlock-body ul {
+        margin: 0;
+        padding-left: 16px;
+        display: grid;
+        gap: 2px;
+        color: var(--ink-soft);
+        font-size: 10.5px;
+      }
+      #unlock-confirm {
+        margin: 12px 18px 18px;
+      }
     </style>
   </head>
   <body>
@@ -1214,7 +1844,7 @@
       </nav>
 
       <div class="batch-bar" id="batch-bar" hidden>
-        <button class="batch-btn plant" id="batch-plant" type="button">＋ 一键播种</button>
+        <button class="batch-btn plant" id="batch-plant" type="button">＋ 一键种满</button>
         <button class="batch-btn harvest" id="batch-harvest" type="button">✨ 一键收割</button>
       </div>
 
@@ -1232,7 +1862,7 @@
 
         <section class="page" id="page-log" role="tabpanel" aria-label="记录" hidden>
           <section class="log">
-            <h2>最近 50 条</h2>
+            <h2>最近 100 条</h2>
             <ul id="log"></ul>
           </section>
         </section>
@@ -1240,44 +1870,61 @@
         <section class="page" id="page-market" role="tabpanel" aria-label="交易所" hidden>
           <div class="market-head">
             <strong>本机交易所</strong>
-            <span id="market-wallet">🪙 0 · 永远有流动性</span>
+            <span class="market-wallet" id="market-wallet">🪙 0</span>
           </div>
           <div class="market-rows" id="market-rows"></div>
-          <section class="trades">
+          <section class="trades" aria-label="最近成交">
             <h2>最近成交</h2>
             <ul id="trades"></ul>
           </section>
         </section>
 
         <section class="page" id="page-hire" role="tabpanel" aria-label="雇工" hidden>
-          <section class="hire-box">
-            <h2>我的挂牌</h2>
-            <div class="hire-form" id="hire-form">
-              <label class="hire-toggle">
-                <input type="checkbox" id="hire-enabled" data-hire-field="enabled">
-                <span>允许邻居雇我的宠物看家</span>
-              </label>
-              <label>时薪
-                <input type="number" id="hire-wage" data-hire-field="wagePerHour" min="1" max="100" step="1" inputmode="numeric">
-              </label>
-              <label>最短
-                <input type="number" id="hire-min" data-hire-field="minHours" min="2" max="8" step="1" inputmode="numeric">
-              </label>
-              <label>最长
-                <input type="number" id="hire-max" data-hire-field="maxHours" min="2" max="8" step="1" inputmode="numeric">
-              </label>
-              <button class="btn primary" type="button" id="hire-save">保存挂牌</button>
+          <section class="hire-box" aria-labelledby="hire-listing-title">
+            <div class="hire-box-head">
+              <h2 id="hire-listing-title">我的挂牌</h2>
+              <span class="hire-status" id="hire-status" data-on="false">休息中</span>
             </div>
-            <p class="hire-hint" id="hire-hint">时薪 1–100，时段 2–8 小时；手续费 5%（最低 1 硬币，烧掉）。</p>
+            <div id="hire-form">
+              <label class="hire-toggle">
+                <span class="switch-copy">允许邻居雇我的宠物看家
+                  <small>挂牌每 30 秒随行情广播；打工期间自家没有守卫</small>
+                </span>
+                <input type="checkbox" id="hire-enabled" data-hire-field="enabled" role="switch">
+              </label>
+              <div class="hire-fields">
+                <label class="hire-field">时薪 <span class="unit">硬币/时</span>
+                  <input type="number" id="hire-wage" data-hire-field="wagePerHour" min="1" max="100" step="1" inputmode="numeric" aria-describedby="hire-wage-error">
+                  <em class="field-error" id="hire-wage-error"></em>
+                </label>
+                <label class="hire-field">最短 <span class="unit">小时</span>
+                  <input type="number" id="hire-min" data-hire-field="minHours" min="2" max="8" step="1" inputmode="numeric" aria-describedby="hire-min-error">
+                  <em class="field-error" id="hire-min-error"></em>
+                </label>
+                <label class="hire-field">最长 <span class="unit">小时</span>
+                  <input type="number" id="hire-max" data-hire-field="maxHours" min="2" max="8" step="1" inputmode="numeric" aria-describedby="hire-max-error">
+                  <em class="field-error" id="hire-max-error"></em>
+                </label>
+              </div>
+              <p class="hire-hint" id="hire-hint">手续费 5%（最低 1 硬币，烧掉）。</p>
+              <button class="btn primary block" type="button" id="hire-save">保存挂牌</button>
+            </div>
+            <p class="hire-form-status" id="hire-form-status" role="status" aria-live="polite"></p>
           </section>
 
-          <section class="hire-box">
-            <h2>我的合同</h2>
+          <section class="hire-box" aria-labelledby="hire-contracts-title">
+            <div class="hire-box-head">
+              <h2 id="hire-contracts-title">我的合同</h2>
+              <span class="hire-status" id="hire-contract-count" aria-live="polite">0 份</span>
+            </div>
             <div class="hire-list" id="contracts"></div>
           </section>
 
-          <section class="hire-box">
-            <h2>邻居挂牌</h2>
+          <section class="hire-box" aria-labelledby="hire-listings-title">
+            <div class="hire-box-head">
+              <h2 id="hire-listings-title">邻居挂牌</h2>
+              <span class="hire-status" id="hire-listing-count" aria-live="polite">0 位</span>
+            </div>
             <div class="hire-list" id="listings"></div>
           </section>
         </section>
@@ -1297,6 +1944,22 @@
 
       <!-- 6. toast 栈 -->
       <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+      <!-- 解锁确认（ticket 49）：价格、余额、接下来 5 块的价格 -->
+      <div class="modal" id="unlock-modal" hidden>
+        <div class="modal-backdrop" id="unlock-backdrop"></div>
+        <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="unlock-title">
+          <header class="sheet-head">
+            <div>
+              <h3 id="unlock-title">解锁地块</h3>
+              <p id="unlock-sub">价格 · 余额</p>
+            </div>
+            <button class="sheet-close" id="unlock-modal-close" type="button" aria-label="关闭解锁">×</button>
+          </header>
+          <div class="unlock-body" id="unlock-body"></div>
+          <button class="batch-btn plant" id="unlock-confirm" type="button">解锁</button>
+        </section>
+      </div>
 
       <!-- 播种底部弹窗 -->
       <div class="modal" id="plant-modal" hidden>

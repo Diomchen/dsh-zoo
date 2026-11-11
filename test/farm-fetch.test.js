@@ -13,6 +13,7 @@ import {
   FARM_FETCH_TIMEOUT_MS,
   MAX_FARM_VIEW_BYTES,
   createFarmFetcher,
+  normalizeOpenView,
   normalizeVisitView
 } from '../src/farm-fetch.js'
 
@@ -157,6 +158,7 @@ test('normalizeVisitView：只输出 stolenByMe/helpedByMe 布尔，绝不泄露
         helpedByMe: false
       },
       { id: 'p9', crop: 'tomato', stolenBy: [otherA] },
+      { id: 'p51', crop: 'tomato', stolenBy: [otherA] },
       { id: 'p2', crop: 'alien', stolenByMe: true }
     ],
     market: {
@@ -167,7 +169,9 @@ test('normalizeVisitView：只输出 stolenByMe/helpedByMe 布尔，绝不泄露
   assert.equal(view.visitId, visitId)
   assert.equal(view.host.nickname, '楼上 的柯基')
   assert.equal(view.guard, 0.8)
-  assert.equal(view.plots.length, 4)
+  // p9 合法、p51 越界、p2 的作物认不出 → 只留 p1 与 p9；不再补 p1–p4。
+  assert.equal(view.plots.length, 2)
+  assert.deepEqual(view.plots.map((plot) => plot.id), ['p1', 'p9'])
   assert.deepEqual(view.plots[0], {
     id: 'p1',
     crop: 'tomato',
@@ -188,4 +192,58 @@ test('normalizeVisitView：只输出 stolenByMe/helpedByMe 布尔，绝不泄露
 
   assert.equal(normalizeVisitView(null), null)
   assert.equal(normalizeVisitView({ ...viewPayload(visitId), visitId: 'nope' }), null)
+})
+
+test('v1.1 邻居只发 4 块：新访客原样显示 4 块，不补也不截', () => {
+  const plots = ['p1', 'p2', 'p3', 'p4'].map((id) => ({
+    id,
+    crop: id === 'p2' ? null : 'tomato',
+    stage: id === 'p2' ? 'empty' : 'mature',
+    mature: id !== 'p2',
+    remainingMs: 0,
+    stolenByMe: false,
+    helpedByMe: false
+  }))
+  const view = normalizeVisitView(viewPayload(randomUUID(), { plots }))
+  assert.deepEqual(view.plots.map((plot) => plot.id), ['p1', 'p2', 'p3', 'p4'])
+})
+
+test('open：打到 /open/<viewerId>，白名单重建，硬币与多余字段进不来', async () => {
+  const host = '11111111-1111-4111-8111-111111111111'
+  const viewer = '22222222-2222-4222-8222-222222222222'
+  let seenUrl = null
+  const fetcher = createFarmFetcher({
+    fetchImpl: async (url) => {
+      seenUrl = url
+      return response(JSON.stringify({
+        v: 1,
+        deviceId: host,
+        host: { nickname: '小黄' },
+        guard: 0.3,
+        guardParts: { ownerHome: true, worker: false },
+        plots: [{ id: 'p1', crop: 'tomato', stage: 'mature', mature: true, remainingMs: 0 }],
+        quotas: { perTrip: 3, perTripLeft: 2 },
+        caps: ['raid', 'look', 'nope'],
+        // 远端塞进来的多余字段：一律不进结果
+        coins: 999,
+        crops: { tomato: 5 }
+      }))
+    }
+  })
+
+  const result = await fetcher.open({ address: '127.0.0.1', port: 45873, deviceId: viewer })
+  assert.equal(result.ok, true)
+  assert.ok(seenUrl.endsWith('/dsh-zoo-farm/open/' + viewer), seenUrl)
+  assert.equal(result.view.deviceId, host)
+  assert.deepEqual(result.view.caps, ['raid', 'look'])
+  assert.equal(result.view.quotas.perTripLeft, 2)
+  assert.equal(result.view.coins, undefined)
+  assert.equal(result.view.crops, undefined)
+
+  // 视图不合法 = bad-shape，并且进冷却
+  const broken = createFarmFetcher({ fetchImpl: async () => response('{"deviceId":"nope"}') })
+  assert.deepEqual(await broken.open({ address: '127.0.0.1', port: 45873, deviceId: viewer }), {
+    ok: false,
+    error: 'bad-shape'
+  })
 })

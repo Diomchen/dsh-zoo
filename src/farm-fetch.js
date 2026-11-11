@@ -4,9 +4,9 @@ import {
   MIN_CONTRACT_HOURS,
   MIN_CONTRACT_WAGE
 } from './contracts-rules.js'
-import { CROP_IDS, MAX_GUARD, isCropId } from './farm-rules.js'
+import { CROP_IDS, MAX_GUARD, MAX_PLOTS, isCropId } from './farm-rules.js'
 import { isPrivateAddress } from './skin-fetch.js'
-import { isVisitId, normalizeNickname } from './protocol.js'
+import { PLOT_ID_RE, isDeviceId, isVisitId, normalizeNickname } from './protocol.js'
 
 /**
  * 访客宿主拉主人的农场快照（ticket 43）。
@@ -25,8 +25,7 @@ import { isVisitId, normalizeNickname } from './protocol.js'
 export const FARM_FETCH_TIMEOUT_MS = 2000
 export const MAX_FARM_VIEW_BYTES = 64 * 1024
 export const FARM_FETCH_COOLDOWN_MS = 60 * 1000
-/** 快照响应体在窗口里的硬上限：4 块地 + 行情摘要远小于此（留出将来字段余量）。 */
-const MAX_PLOTS = 4
+/** 快照响应体在窗口里的硬上限：50 块地 + 行情摘要仍远小于 64 KiB。 */
 const STAGES = new Set(['empty', 'growing', 'mature'])
 const MAX_LIMIT = 99
 
@@ -44,6 +43,26 @@ export function createFarmFetcher (options = {}) {
     : FARM_FETCH_COOLDOWN_MS
   const failures = new Map()
 
+  /**
+   * 票 52：拉一份公开只读视图。和 `get` 同一套口径（2s / 64 KiB / 私网 / 冷却），
+   * 只是路径换成 `/open/<viewerDeviceId>`，而且**不需要串门**。
+   */
+  async function open ({ address, port, deviceId } = {}) {
+    if (!isPrivateAddress(address)) return { ok: false, error: 'refused' }
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) return { ok: false, error: 'no-port' }
+    if (!isDeviceId(deviceId)) return { ok: false, error: 'refused' }
+    // 看田是**用户点出来的**，不走 60 秒冷却：失败一次他应该能马上再点一次。
+    // （后台轮询的 `get` 仍然按 address:port 冷却，那条是防止每 3 秒去打一台坏邻居。）
+    const key = address.trim().toLowerCase() + ':' + port
+
+    const url = 'http://' + address + ':' + port + '/dsh-zoo-farm/open/' + encodeURIComponent(deviceId.toLowerCase())
+    const result = await grab(url, key)
+    if (result.ok !== true) return result
+    const view = normalizeOpenView(result.raw)
+    if (view === null) return { ok: false, error: 'bad-shape' }
+    return { ok: true, view }
+  }
+
   async function get ({ address, port, visitId } = {}) {
     if (!isPrivateAddress(address)) return { ok: false, error: 'refused' }
     if (!Number.isInteger(port) || port <= 0 || port > 65535) return { ok: false, error: 'no-port' }
@@ -55,6 +74,16 @@ export function createFarmFetcher (options = {}) {
     }
 
     const url = 'http://' + address + ':' + port + '/dsh-zoo-farm/' + encodeURIComponent(visitId.toLowerCase())
+    const result = await grab(url, key)
+    if (result.ok !== true) return result
+    const view = normalizeVisitView(result.raw)
+    if (view === null) return fail(key, 'bad-shape')
+    failures.delete(key)
+    return { ok: true, view }
+  }
+
+  /** 真正的 HTTP 往返：超时、限量、JSON 解析都在这里，`get` 与 `open` 共用。 */
+  async function grab (url, key) {
     const controller = typeof AbortController === 'function' ? new AbortController() : null
     let timer = null
     try {
@@ -98,10 +127,8 @@ export function createFarmFetcher (options = {}) {
       } catch {
         return fail(key, 'bad-json')
       }
-      const view = normalizeVisitView(raw)
-      if (view === null) return fail(key, 'bad-shape')
       failures.delete(key)
-      return { ok: true, view }
+      return { ok: true, raw }
     } catch (error) {
       if (error?.name === 'AbortError') return fail(key, 'timeout')
       return fail(key, 'refused')
@@ -119,7 +146,7 @@ export function createFarmFetcher (options = {}) {
     failures.clear()
   }
 
-  return { get, clear }
+  return { get, open, clear }
 }
 
 async function readLimited (response, maxBytes) {
@@ -176,13 +203,8 @@ export function normalizeVisitView (raw) {
     seen.add(plot.id)
     plots.push(plot)
   }
-  // 固定 p1..p4：缺的补空地，窗口永远画四块（和主人的农场视图同形）。
-  for (const id of ['p1', 'p2', 'p3', 'p4']) {
-    if (!seen.has(id)) {
-      plots.push({ id, crop: null, stage: 'empty', mature: false, remainingMs: 0, stolenByMe: false, helpedByMe: false })
-    }
-  }
-  plots.sort((left, right) => left.id.localeCompare(right.id))
+  // 只画主人发来的已解锁地块（最多 50 块）；不补 p1–p4。
+  plots.sort((left, right) => Number(left.id.slice(1)) - Number(right.id.slice(1)))
 
   const limits = normalizeLimits(raw.limits)
   const hire = normalizeHire(raw.hire)
@@ -203,10 +225,58 @@ export function normalizeVisitView (raw) {
   }
 }
 
+/**
+ * 公开只读视图（票 52）的白名单重建。地块复用访客视图那套（坏地块只丢自己）；
+ * `quotas`/`caps` 只留数字与已知能力名——远端塞进来的多余字段一律不进结果。
+ */
+export function normalizeOpenView (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  if (!isDeviceId(raw.deviceId)) return null
+
+  const host = raw.host !== null && typeof raw.host === 'object' && !Array.isArray(raw.host)
+    ? { nickname: normalizeNickname(raw.host.nickname) ?? '邻居' }
+    : { nickname: '邻居' }
+
+  const plots = []
+  const seen = new Set()
+  for (const candidate of Array.isArray(raw.plots) ? raw.plots : []) {
+    if (plots.length >= MAX_PLOTS) break
+    const plot = normalizeVisitPlot(candidate)
+    if (plot === null || seen.has(plot.id)) continue
+    seen.add(plot.id)
+    plots.push(plot)
+  }
+  plots.sort((left, right) => Number(left.id.slice(1)) - Number(right.id.slice(1)))
+
+  const quotas = raw.quotas !== null && typeof raw.quotas === 'object' && !Array.isArray(raw.quotas)
+    ? {
+        perTrip: limitInt(raw.quotas.perTrip),
+        perTripLeft: limitInt(raw.quotas.perTripLeft)
+      }
+    : { perTrip: 0, perTripLeft: 0 }
+
+  const at = Number(raw.at)
+  return {
+    v: 1,
+    deviceId: raw.deviceId.toLowerCase(),
+    host,
+    guard: clampNumber(raw.guard, 0, MAX_GUARD, 0),
+    guardParts: raw.guardParts !== null && typeof raw.guardParts === 'object'
+      ? { ownerHome: raw.guardParts.ownerHome === true, worker: raw.guardParts.worker === true }
+      : { ownerHome: false, worker: false },
+    plots,
+    quotas,
+    caps: Array.isArray(raw.caps)
+      ? raw.caps.filter((entry) => entry === 'raid' || entry === 'look')
+      : [],
+    at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0
+  }
+}
+
 function normalizeVisitPlot (raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
   const id = typeof raw.id === 'string' ? raw.id.trim().toLowerCase() : ''
-  if (!/^p[1-4]$/.test(id)) return null
+  if (!PLOT_ID_RE.test(id)) return null
   const crop = raw.crop === null || raw.crop === undefined ? null : (isCropId(raw.crop) ? raw.crop : null)
   if (raw.crop !== null && raw.crop !== undefined && crop === null) return null
   const stage = STAGES.has(raw.stage) ? raw.stage : (crop === null ? 'empty' : 'growing')

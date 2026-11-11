@@ -31,6 +31,8 @@
   const CROP_IDS = Object.keys(CROP_META)
   const WATER_COST = 1
   const FERTILIZE_COST = 5
+  /** 解锁后至少留一颗最便宜种子的钱；与宿主 PLOT_UNLOCK_RESERVE 同源（drift 测试会读）。 */
+  const UNLOCK_RESERVE = 6
   const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割' }
 
   function cropMeta (cropId) {
@@ -82,15 +84,69 @@
   }
 
   /** 标题下的「X/Y 已种植」：Y 永远等于 farm.plots.length，不写死 4。 */
+  /**
+   * 票 56：邻居切换器的形状。邻居少就铺一排圆片（一眼全见），多了就收进
+   * 「当前视图」胶囊后面的列表——420px 宽的窗里，五颗圆片就开始挤。
+   *
+   * 排序按**能偷的熟地数**降序：打开这扇窗的目的九成是"去谁家拿点什么"。
+   * 老版本邻居不隐藏，标 `old` 灰掉——隐藏会让人以为对方掉线。
+   */
+  function neighborSwitch (neighbors, currentDeviceId = null, chipsMax = 3) {
+    const items = []
+    for (const candidate of Array.isArray(neighbors) ? neighbors : []) {
+      if (candidate === null || typeof candidate !== 'object') continue
+      const deviceId = typeof candidate.deviceId === 'string' ? candidate.deviceId : ''
+      if (deviceId === '') continue
+      const ripe = Number(candidate.ripePlots)
+      const guard = Number(candidate.guard)
+      const old = candidate.old === true
+      items.push({
+        deviceId,
+        label: typeof candidate.nickname === 'string' && candidate.nickname !== '' ? candidate.nickname : '邻居',
+        ripePlots: Number.isFinite(ripe) ? Math.max(0, Math.floor(ripe)) : 0,
+        guard: Number.isFinite(guard) ? Math.min(1, Math.max(0, guard)) : 0,
+        old,
+        active: deviceId === currentDeviceId,
+        sub: old
+          ? '旧版本，看不了'
+          : '守卫 ' + Math.round((Number.isFinite(guard) ? Math.min(1, Math.max(0, guard)) : 0) * 100) + '%' +
+            (Number.isFinite(ripe) && ripe > 0 ? ' · 可偷 ' + Math.floor(ripe) + ' 块' : ' · 没熟地')
+      })
+    }
+    // 能偷的在前；同分按名字，保证顺序稳定（不然每来一包就会跳一下）。
+    items.sort((left, right) => {
+      if (left.ripePlots !== right.ripePlots) return right.ripePlots - left.ripePlots
+      return left.label.localeCompare(right.label, 'zh-Hans-CN')
+    })
+    const mode = items.length <= chipsMax ? 'chips' : 'menu'
+    const current = items.find((item) => item.active) ?? null
+    return {
+      mode,
+      items,
+      currentLabel: current === null ? '我的农场' : current.label,
+      stealable: items.filter((item) => item.ripePlots > 0 && item.old !== true).length
+    }
+  }
+
   function headerStats (farm) {
     const plots = farm !== null && typeof farm === 'object' && Array.isArray(farm.plots) ? farm.plots : []
     const planted = plots.reduce((count, plot) => (
       plot !== null && typeof plot === 'object' && plot.stage !== 'empty' ? count + 1 : count
     ), 0)
+    const unlocked = Number(farm?.unlocked)
+    const maxPlots = Number(farm?.maxPlots)
+    const nextCost = Number(farm?.nextCost)
+    const land = Number.isFinite(unlocked) && Number.isFinite(maxPlots)
+      ? ' · 地块 ' + unlocked + '/' + maxPlots
+      : ''
+    // 下一块的地价放进标题：锁定卡被滚到折叠线以下时也看得见。
+    const next = Number.isFinite(nextCost) && nextCost > 0 ? ' · 下一块 ' + nextCost : ''
     return {
       planted,
       total: plots.length,
-      text: planted + '/' + plots.length + ' 已种植'
+      ...(Number.isFinite(unlocked) ? { unlocked } : {}),
+      ...(Number.isFinite(maxPlots) ? { maxPlots } : {}),
+      text: planted + '/' + plots.length + ' 已种植' + land + next
     }
   }
 
@@ -115,6 +171,102 @@
       ...(spec.className === undefined ? {} : { className: spec.className }),
       disabled: spec.disabled === true,
       ...(spec.reason === undefined ? {} : { reason: spec.reason })
+    }
+  }
+
+  /**
+   * 邻居挂牌过期没有：宿主算好的 `expiresAt` 是本机时间，窗口自己走秒即可；
+   * 老宿主没有这个字段（0/缺失）时退回 push 那一刻的 `stale` 快照。
+   * 这样邻居断线两分钟后，开着的雇工页会自己变灰，而不是停在「可雇」。
+   */
+  function listingIsStale (listing, now = Date.now()) {
+    const expiresAt = Number(listing?.expiresAt)
+    const current = Number(now)
+    if (Number.isFinite(expiresAt) && expiresAt > 0 && Number.isFinite(current)) {
+      return current >= expiresAt
+    }
+    return listing?.stale === true
+  }
+
+  const MIN_TRADE_QTY = 1
+  const MAX_TRADE_QTY = 99
+  /** 与宿主 shared.js 的 MAX_FARM_STACK 同源：种子叠到 999 就不能再买。 */
+  const MAX_SEED_STACK = 999
+
+  /**
+   * 交易所一行的纯模型：这一行此刻能不能买/卖、为什么不能、总价多少。
+   *
+   * 「为什么不能」必须一起返回，而不是只给一个 disabled：窗口以前只把按钮灰掉，
+   * 而灰掉的买卖按钮和可点的长得一模一样（CSS 优先级），点下去既不发申请也不给提示，
+   * 看起来就是「交易所坏了」。现在按钮下面永远有一行解释（buyHint / sellHint），
+   * 空串才表示可以点。
+   */
+  function tradeView (farm, market, cropId, rawQty) {
+    const meta = cropMeta(cropId)
+    if (meta === null) return null
+    const qty = Number(rawQty)
+    const valid = Number.isInteger(qty) && qty >= MIN_TRADE_QTY && qty <= MAX_TRADE_QTY
+    const coins = Math.max(0, Math.floor(Number(farm?.coins) || 0))
+    const seeds = Math.max(0, Math.floor(Number(farm?.seeds?.[cropId]) || 0))
+    const crops = Math.max(0, Math.floor(Number(farm?.crops?.[cropId]) || 0))
+    const entry = market?.prices?.[cropId]
+    const rawBid = Number(entry?.bid)
+    const price = Number(entry?.price)
+    const bid = Number.isFinite(rawBid) && rawBid >= 0
+      ? Math.max(0, Math.round(rawBid))
+      : Number.isFinite(price)
+        ? Math.max(0, Math.round(price * 0.9))
+        : Math.max(0, Math.round(meta.base * 0.9))
+    const count = valid ? qty : 0
+    const seedTotal = meta.seedPrice * count
+    const sellTotal = bid * count
+    const stackLeft = Math.max(0, MAX_SEED_STACK - seeds)
+    const canBuy = valid && coins >= seedTotal && qty <= stackLeft
+    const canSell = valid && crops >= qty
+    const buyHint = !valid
+      ? '数量要在 ' + MIN_TRADE_QTY + '–' + MAX_TRADE_QTY + ' 之间'
+      : coins < seedTotal
+        ? '硬币还差 ' + (seedTotal - coins) + '（需要 ' + seedTotal + '）'
+        : qty > stackLeft
+          ? '种子最多 ' + MAX_SEED_STACK + ' 颗（已有 ' + seeds + '）'
+          : ''
+    const sellHint = !valid
+      ? '数量要在 ' + MIN_TRADE_QTY + '–' + MAX_TRADE_QTY + ' 之间'
+      : crops === 0
+        ? '仓库里还没有' + meta.name
+        : crops < qty
+          ? '仓库只有 ' + crops + ' 个' + meta.name
+          : ''
+    // 按钮自己的短标签：按钮在折叠线附近时，原因也必须在按钮上看得见。
+    const buyShort = !valid
+      ? '数量 1–99'
+      : coins < seedTotal
+        ? '差 ' + (seedTotal - coins) + ' 硬币'
+        : qty > stackLeft ? '种子已满' : ''
+    const sellShort = !valid
+      ? '数量 1–99'
+      : crops === 0 ? '没有可卖的' : crops < qty ? '只有 ' + crops + ' 个' : ''
+    return {
+      cropId,
+      name: meta.name,
+      emoji: meta.emoji,
+      seedPrice: meta.seedPrice,
+      qty: count,
+      valid,
+      coins,
+      seeds,
+      crops,
+      bid,
+      seedTotal,
+      sellTotal,
+      canBuy,
+      canSell,
+      buyHint,
+      sellHint,
+      buyShort,
+      sellShort,
+      maxBuy: Math.max(0, Math.min(MAX_TRADE_QTY, Math.floor(coins / meta.seedPrice), stackLeft)),
+      maxSell: Math.max(0, Math.min(MAX_TRADE_QTY, crops))
     }
   }
 
@@ -197,17 +349,96 @@
   }
 
   /**
-   * 一键播种选目标：第一个空地 + 第一种还有库存的种子（CROP_IDS 固定顺序）。
-   * 返回窄形状；窗口只负责把它变成一次 `farm-plant`。
+   * 一键种满（ticket 49）：按空地与种子库存排一条队列。
+   * 每块空地消耗一颗种子，种子用完了就停；作物顺序按 CROP_IDS 固定顺序。
    */
-  function batchPlantTarget (farm) {
+  function batchPlantTargets (farm) {
     const plots = farm !== null && typeof farm === 'object' && Array.isArray(farm.plots) ? farm.plots : []
-    const empty = plots.find((plot) => plot !== null && typeof plot === 'object' && plot.stage === 'empty')
-    if (empty === undefined) return { ok: false, reason: 'no-plot' }
-    const seeds = farm.seeds !== null && typeof farm.seeds === 'object' ? farm.seeds : {}
-    const cropId = CROP_IDS.find((id) => Number(seeds[id]) > 0)
-    if (cropId === undefined) return { ok: false, reason: 'no-seed' }
-    return { ok: true, plotId: empty.id, cropId }
+    const source = farm.seeds !== null && typeof farm.seeds === 'object' ? farm.seeds : {}
+    const seeds = {}
+    for (const id of CROP_IDS) seeds[id] = Math.max(0, Math.floor(Number(source[id]) || 0))
+    const targets = []
+    for (const plot of plots) {
+      if (plot === null || typeof plot !== 'object' || plot.stage !== 'empty') continue
+      const cropId = CROP_IDS.find((id) => seeds[id] > 0)
+      if (cropId === undefined) break
+      seeds[cropId] -= 1
+      targets.push({ plotId: plot.id, cropId })
+    }
+    return targets
+  }
+
+  /**
+   * 锁定卡（ticket 49）：只画「下一块地」。到上限、没有地价、价格坏掉都返回 null。
+   * `affordable` 已经算上「至少留一颗种子钱」的 6 硬币；窗口不再自己定规则。
+   */
+  function unlockCard (farm) {
+    if (farm === null || typeof farm !== 'object') return null
+    const unlocked = Number(farm.unlocked)
+    const maxPlots = Number(farm.maxPlots)
+    const nextCost = Number(farm.nextCost)
+    if (!Number.isFinite(unlocked) || !Number.isFinite(maxPlots)) return null
+    if (unlocked >= maxPlots) return null
+    if (!Number.isFinite(nextCost) || nextCost <= 0) return null
+    const coins = Number(farm.coins) || 0
+    const reserve = UNLOCK_RESERVE
+    const ladder = Array.isArray(farm.unlockLadder)
+      ? farm.unlockLadder.filter((value) => Number.isFinite(Number(value)) && Number(value) > 0).slice(0, 6).map(Number)
+      : []
+    return {
+      kind: 'unlock',
+      plotNumber: unlocked + 1,
+      label: '地块 ' + (unlocked + 1),
+      nextCost,
+      coins,
+      reserve,
+      ladder,
+      affordable: coins >= nextCost + reserve,
+      shortText: coins < nextCost
+        ? '还差 ' + (nextCost - coins) + ' 硬币'
+        : '留 ' + reserve + ' 硬币买种子',
+      priceText: nextCost + ' 硬币'
+    }
+  }
+
+  /** 锁定卡的 DOM（与地块卡同一套 .plot-card 外壳；按钮带 data-land-action）。 */
+  function createUnlockCard (document, card) {
+    const element = document.createElement('article')
+    element.className = 'plot-card locked'
+    element.dataset.locked = 'true'
+    if (card.affordable !== true) element.dataset.affordable = 'false'
+
+    const badge = document.createElement('p')
+    badge.className = 'plot-badge'
+    // 价格放进徽标：网格滚到折叠线时也能先看见地价。
+    badge.textContent = '未解锁 · ' + card.priceText
+    const title = document.createElement('h3')
+    title.className = 'plot-title'
+    title.textContent = card.label
+    const emoji = document.createElement('p')
+    emoji.className = 'plot-emoji'
+    emoji.setAttribute('aria-hidden', 'true')
+    emoji.textContent = '🔒'
+    const hint = document.createElement('p')
+    hint.className = 'plot-hint'
+    hint.textContent = card.affordable === true ? '解锁后可以种一株' : card.shortText
+
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'chip-btn unlock'
+    button.dataset.landAction = 'unlock'
+    button.textContent = '解锁'
+    // 买不起时也能点开确认层（看还差多少、接下来 5 块的价格）；
+    // 真正拦住交易的是弹层里的确认键。
+    button.title = card.affordable === true ? '解锁' + card.label : card.shortText
+
+    element.appendChild(badge)
+    element.appendChild(title)
+    // 按钮紧跟标题：网格滚到一半时也能先看见价格、点到解锁。
+    element.appendChild(button)
+    element.appendChild(hint)
+    element.appendChild(emoji)
+    return { element, button }
   }
 
   /** 一键收割：按当前顺序列出所有成熟地块，窗口逐条发 `farm-harvest`。 */
@@ -322,16 +553,25 @@
     CROP_IDS,
     WATER_COST,
     FERTILIZE_COST,
+    UNLOCK_RESERVE,
+    MIN_TRADE_QTY,
+    MAX_TRADE_QTY,
+    MAX_SEED_STACK,
     cropMeta,
     formatRemaining,
     formatGrowTime,
     plotNumber,
     plotLabel,
     headerStats,
+    neighborSwitch,
     progressOf,
+    tradeView,
+    listingIsStale,
     plotCards,
-    batchPlantTarget,
+    batchPlantTargets,
     batchHarvestTargets,
+    unlockCard,
+    createUnlockCard,
     createButton,
     createPlotCard
   }

@@ -145,7 +145,8 @@ test('normalizeFarmFile：损坏整份 → 初始农场；字段/地块/日志�
     const normalized = normalizeFarmFile(bad)
     assert.equal(normalized.corrupt, true, JSON.stringify(bad))
     assert.equal(normalized.farm.coins, START_COINS)
-    assert.equal(normalized.farm.plots.length, 4)
+    assert.equal(normalized.farm.plots.length, PLOT_IDS.length)
+    assert.equal(normalized.farm.unlocked, 4)
     assert.deepEqual(normalized.farm.seeds, { tomato: 2 })
   }
 
@@ -192,7 +193,8 @@ test('normalizeFarmFile：损坏整份 → 初始农场；字段/地块/日志�
   assert.equal(normalized.farm.dewDay, null)
   assert.equal(normalized.farm.dewDayEarned, null)
   assert.equal(normalized.farm.lastTickAt, null)
-  assert.deepEqual(normalized.farm.plots.map((plot) => plot.id), ['p1', 'p2', 'p3', 'p4'])
+  assert.deepEqual(normalized.farm.plots.map((plot) => plot.id), [...PLOT_IDS])
+  assert.equal(normalized.farm.unlocked, 4, '旧文件没有 unlocked 时按 4 块')
   assert.equal(normalized.farm.plots[0].crop, null, '坏作物整块回空地')
   assert.equal(normalized.farm.plots[1].crop, 'tomato')
   assert.equal(normalized.farm.plots[1].grownMs, CROPS.tomato.growMs, 'grownMs 夹到 growMs')

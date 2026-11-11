@@ -55,7 +55,9 @@ function visitorDescriptor (raw) {
     role: 'visitor',
     label: shared.normalizeLabel(raw.nickname, '邻居'),
     anim: shared.normalizeAnim(raw.anim),
-    color
+    color,
+    // 票 54：来偷的那只带「偷菜」角标（和雇工的「打工」同一套）。
+    ...(raw.kind === 'raid' ? { badge: 'steal' } : {})
   }
 }
 

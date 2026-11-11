@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
-import { GUEST_TTL_MS, MAX_NEIGHBORS, NEIGHBOR_TTL_MS } from '../src/protocol.js'
+import { GUEST_TTL_MS, MAX_NEIGHBORS, NEIGHBOR_TTL_MS, RAID_MAX_MS } from '../src/protocol.js'
 import { MAX_GUESTS, MAX_PROMPTS, PROMPT_SNOOZE_MS, createRoom } from '../src/room.js'
 import { visitReasonText } from '../src/visit-copy.js'
 
@@ -942,4 +942,55 @@ test('noteFarmEvent：进 noticed 快照；空文本/null 不产生一条', () =
   assert.equal(room.noteFarmEvent('   ', T0), null)
   assert.equal(room.noteFarmEvent(null, T0), null)
   assert.equal(room.snapshot().notices[0].text, '「阿蟹」偷了 1 个番茄。')
+})
+
+test('偷客到点自己走；来玩的没有到期时间', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '阿蓝' })
+
+  // 来偷的：不放行也进得来，带 kind 和 endsAt。
+  const raid = room.observeVisitRequest({
+    deviceId: 'neighbor-raid',
+    visitId: randomUUID(),
+    nickname: '小蓝',
+    anim: '待机',
+    purpose: 'steal'
+  })
+  assert.equal(raid.reply, 'ack')
+  const visitor = room.snapshot().visitors.find((entry) => entry.deviceId === 'neighbor-raid')
+  assert.equal(visitor.kind, 'raid')
+  assert.equal(visitor.endsAt, T0 + RAID_MAX_MS)
+
+  // 到点前还在，到点后自己走（不写串门记录、不发提示）。
+  room.tick(T0 + RAID_MAX_MS - 1)
+  assert.equal(room.snapshot().visitors.length, 1)
+  room.tick(T0 + RAID_MAX_MS)
+  assert.equal(room.snapshot().visitors.length, 0)
+  // 双方各留一条记录（票 53）：主人这边是入站的那一条，标成 raid。
+  const records = room.snapshot().visits
+  assert.equal(records.length, 1)
+  assert.deepEqual(
+    { direction: records[0].direction, kind: records[0].kind },
+    { direction: 'in', kind: 'raid' }
+  )
+})
+
+test('能力声明：只收到心跳也要记下来（重启后不用等那一拍广播）', () => {
+  const room = roomAt()
+  room.setIdentity({ deviceId: 'me-1', nickname: '阿蓝' })
+  const peer = 'neighbor-cap'
+  // 只放行、不给广播：邻居表靠心跳建起来，`caps` 全靠心跳带进来。
+  room.observeBeacon({ deviceId: peer, nickname: '小黄', port: 45871 })
+  room.admit(peer)
+  room.observeHeartbeat({ deviceId: peer, anim: '待机', caps: ['raid', 'look'] })
+
+  const neighbor = room.snapshot().neighbors.find((entry) => entry.deviceId === peer)
+  assert.deepEqual(neighbor.caps, ['raid', 'look'])
+
+  // 老版本心跳不带 caps：不该把已知的能力清空。
+  room.observeHeartbeat({ deviceId: peer, anim: '待机' })
+  assert.deepEqual(
+    room.snapshot().neighbors.find((entry) => entry.deviceId === peer).caps,
+    ['raid', 'look']
+  )
 })
