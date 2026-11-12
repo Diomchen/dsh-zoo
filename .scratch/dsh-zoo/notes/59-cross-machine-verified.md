@@ -44,3 +44,25 @@ node scripts/verify-catalog-sync.mjs desktop-699dn63.local --local http://127.0.
 
 beacon 指纹 → `crop-catalog-request` → `crop-catalog` 分片 → 合并去重 → 落盘 →
 按哈希取图，整条链路在真实的两台机器、两个系统之间跑通。
+
+## 5. 反方向（对面 → 我，2026-11-13 01:04）
+
+用一个**干净**的临时实例（全新数据目录、没有 `crops.json`）只向 `10.10.10.110` 单播，
+本该从 6 种开始，让它去把鱼姐那台的目录拉回来：
+
+```
+BEFORE {"hash":"5aeb15d0c5e2d292","count":6}
+FETCH  http://10.10.10.110:45873/dsh-zoo-crops/7c2e42ebebf1b79b.svg
+FETCH-RESULT status=200 bytes=312
+AFTER  {"hash":"b1c1ccd45a3037e9","count":7}
+ART    ["7c2e42ebebf1b79b.svg"]
+INFO   取回 1 张邻居作物图
+INFO   从邻居收到 1 种新作物：blueberry
+```
+
+这次是**对方当发布者、本机当接收者**：请求发出去了、分片收齐了、合并落盘了、图也按哈希取回。
+两个方向都通，说明同步不是单向的广播。
+
+> 注：本机同时跑着正式插件，它每 5 秒的 beacon 会占掉对面「每来源 4.5 秒 1 个 ack」的额度，
+> 所以临时实例要抢到 ack 才能拿到对方的 skinPort 去取图；第一次试跑就因为没抢到 ack
+> 只同步了定义没有图（ART 为空），第二次拿到了。
