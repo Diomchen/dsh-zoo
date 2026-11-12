@@ -2276,10 +2276,21 @@ export function createService (ctx, options = {}) {
     if (entry.timer !== null) clearTimeout(entry.timer)
     entry.done = true
     const now = contractClock()
+    // ticket 61：合同的时间锚点只用**本机**钟。ack 里的 startedAt/endsAt 是雇工那台机器
+    // 的绝对时间，带着它的时钟差；直接拿来当自己的到期时刻，倒计时就会凭空多/少一段
+    // （快 30 分钟 →「还剩 2 小时 30 分」，慢 2 小时 → 一成交就快到期）。
+    // 时长只认自己那份 pending 记录里的 hours：两台机器各有各的锚点，但墙钟上是同一时刻到期。
+    const pendingRecord = contractByRequest(packet.requestId)?.record ?? null
+    const requestedHours = Number(pendingRecord?.hours)
+    const contractMs = Number.isFinite(requestedHours) && requestedHours > 0
+      ? requestedHours * 60 * 60 * 1000
+      : contractMsOf(packet.startedAt, packet.endsAt)
+    const startedAt = now
+    const endsAt = now + contractMs
     const confirmed = await contracts.confirmOutgoing(packet.requestId, {
       contractId: packet.contractId,
-      startedAt: packet.startedAt,
-      endsAt: packet.endsAt,
+      startedAt,
+      endsAt,
       guard: packet.guard,
       ackedAt: now
     })
@@ -2294,8 +2305,8 @@ export function createService (ctx, options = {}) {
       contractId: packet.contractId,
       workerDeviceId: packet.deviceId,
       workerNickname,
-      startedAt: packet.startedAt,
-      endsAt: packet.endsAt,
+      startedAt,
+      endsAt,
       guard: packet.guard,
       lastSeen: now
     })

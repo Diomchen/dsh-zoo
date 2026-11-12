@@ -494,23 +494,25 @@ node scripts/stop-helper.mjs
 
 ## 开发
 
-测试分两档（票 60）：**默认那条不碰网络**，因为大家机器上都开着 DSH，网络用例会开
-socket、绑端口、跑真实计时器，既慢又容易互相干扰。
+只有一档：`npm test` 跑 `test/` 下全部 `*.test.js`，几秒跑完（`npm run check` 用的就是这条）。
 
 ```sh
-npm test              # 核心用例：不碰网络，几秒跑完（npm run check 用的就是这条）
-npm run test:net      # 只跑回环网络用例（UDP 发现/串门、本机 HTTP 素材源），显式才跑
-npm run test:all      # 两档都跑，发版前用
-npm run test:net -- --list   # 只列文件、不执行
+npm test                     # 全部用例（原来那 21 个开 socket 的回环用例已在票 62 删掉）
+node scripts/run-tests.mjs --list   # 只列文件、不执行
 ```
 
-网络用例**全部只打回环**（`127.0.0.1` + 随机端口），不广播到局域网。跨机联调按需手动做，
-而且只对指定机器（`DESKTOP-699DN63`）单播验证，不要对着整个网段跑。
+票 60 曾经把它分成「核心档 / 网络档」，票 62 按用户要求把网络档**整档删除**：那些用例
+（UDP 发现/串门/礼物/雇工、本机 HTTP 素材源）会开 socket、绑端口、跑真实计时器，既慢又容易
+和正在跑的 DSH 互相干扰。真正的跨机验证改在目标机器上做，而且只对那台机器：
+
+- 目标机器：**`DESKTOP-699DN63`**（唯一验收机；不要对着整个网段跑，也不要对其他机器做）
+- 验收方式：把那台机器当被控端，用 cross-agent 下发「跑 `npm test` + 真窗口倒计时回路」，
+  结果回读；跨机网络行为按需用 `scripts/two-pets.mjs` / `scripts/peer-probe.mjs` 单播验
 
 ```sh
 node scripts/peer-probe.mjs <host>          # 只对一台机器单播：看版本/目录指纹
 node scripts/verify-catalog-sync.mjs <host> # 跨机验收：一边加作物，等两边指纹收敛
-npm run check         # 语法检查 + 核心测试
+npm run check         # 语法检查 + 全部测试
 npm run smoke:desktop # 真 Electron 冒烟，不进 npm test
 DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop  # 只跑农场段并写截图
 npm run fake-peer     # 在本机模拟一位邻居
