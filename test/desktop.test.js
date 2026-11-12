@@ -111,11 +111,18 @@ test('场景 v3 归一化：role/anim/reset/menu 保留，未知字段、未知 
 
 test('场景 v2 controls：置灰理由/召回/可送客/放行卡/notice 归一化，坏条目丢弃', () => {
   const deviceId = '33333333-3333-4333-8333-333333333333'
+  const contractId = '55555555-5555-4555-8555-555555555555'
   const scene = shared.normalizeScene({
     items: [],
     controls: {
       visit: { enabled: false, reason: '  还没有人放行你  ' },
-      recall: { enabled: true, nickname: '  阿蟹  ' },
+      recall: {
+        enabled: true,
+        mode: 'working',
+        text: '  在「阿蟹」家打工  ',
+        title: '  小蓝在「阿蟹」家打工  ',
+        contractId: contractId.toUpperCase()
+      },
       visitors: [
         { deviceId, label: '阿蟹' },
         { deviceId, label: '重复' },
@@ -126,7 +133,14 @@ test('场景 v2 controls：置灰理由/召回/可送客/放行卡/notice 归一
     }
   })
   assert.deepEqual(scene.controls.visit, { enabled: false, reason: '还没有人放行你' })
-  assert.deepEqual(scene.controls.recall, { enabled: true, nickname: '阿蟹' })
+  // ticket 57：mode 是固定枚举，文案原样透传，合同号归一成小写 UUID。
+  assert.deepEqual(scene.controls.recall, {
+    enabled: true,
+    mode: 'working',
+    text: '在「阿蟹」家打工',
+    title: '小蓝在「阿蟹」家打工',
+    contractId
+  })
   assert.deepEqual(scene.controls.visitors, [{ deviceId, label: '阿蟹' }])
   assert.deepEqual(scene.controls.prompt, { deviceId, nickname: '泡泡' })
   assert.equal(scene.controls.notice.text, '「阿蟹」没有回应，宠物先留在家里了。')
@@ -139,6 +153,18 @@ test('场景 v2 controls：置灰理由/召回/可送客/放行卡/notice 归一
   })
   assert.deepEqual(enabled.controls.visit, { enabled: true, reason: null })
   assert.equal(enabled.controls.notice, null)
+  // 认不出的 mode / 坏合同号一律不给：渲染端靠 mode 决定按钮是召回还是叫它回家。
+  const badAway = shared.normalizeScene({
+    items: [],
+    controls: { recall: { enabled: true, mode: 'sneaking', text: '乱来', contractId: 'not-a-uuid' } }
+  })
+  assert.deepEqual(badAway.controls.recall, {
+    enabled: true,
+    mode: null,
+    text: '乱来',
+    title: null,
+    contractId: null
+  })
   assert.deepEqual(shared.normalizeScene({ items: [], controls: 'nope' }).controls, shared.emptyControls())
 })
 
@@ -163,6 +189,27 @@ test('helper 动作：白名单 + id + deviceId 校验；坏动作/缺 id/缺 de
     type: 'action', id: 'act-7', action: 'rename', nickname: '喵'.repeat(100)
   })
   assert.equal(longName.event.nickname.length, shared.MAX_ACTION_TEXT)
+
+  // ticket 57：胶囊面板的「叫它回家」= recall-worker + 合同号；deviceId 之类一律削掉，
+  // 缺合同号整条拒（宿主只认这一种形状）。
+  const contractId = '55555555-5555-4555-8555-555555555555'
+  const recallWork = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'act-8',
+    action: 'recall-worker',
+    contractId,
+    deviceId
+  })
+  assert.equal(recallWork.ok, true)
+  assert.deepEqual(recallWork.event, {
+    type: 'action',
+    id: 'act-8',
+    action: 'recall-worker',
+    contractId,
+    deviceId: null,
+    nickname: null
+  })
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-9', action: 'recall-worker' }).ok, false)
 
   assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'act-3', action: 'quit' }).ok, false)
   assert.equal(shared.normalizeHelperEvent({ type: 'action', action: 'visit' }).ok, false)
@@ -1985,6 +2032,21 @@ test('helper argv 带 giftsRoot：只接受绝对路径，且排在 cache 之后
   assert.deepEqual(buildHelperArgs({ helperPath: '/h', giftsRoot: '' }), ['/h'])
 })
 
+test('helper argv 带 cropArtRoot（票 59）：同样只接受绝对路径', () => {
+  assert.deepEqual(
+    buildHelperArgs({
+      helperPath: '/h',
+      cacheRoot: '/tmp/skin-cache',
+      giftsRoot: '/tmp/data/gifts',
+      cropArtRoot: '/tmp/data/crop-art'
+    }),
+    ['/h', '--dsh-zoo-cache', '/tmp/skin-cache', '--dsh-zoo-gifts', '/tmp/data/gifts',
+      '--dsh-zoo-crops', '/tmp/data/crop-art']
+  )
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', cropArtRoot: 'relative/crop-art' }), ['/h'])
+  assert.deepEqual(buildHelperArgs({ helperPath: '/h', cropArtRoot: '' }), ['/h'])
+})
+
 // ---------------------------------------------------------------------------
 // ticket 40：农场摘要 / farm-window / 地块动作的窄口
 // ---------------------------------------------------------------------------
@@ -2202,8 +2264,8 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
 
   const farm = {
     plots: [{ id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 1000, waterings: 0, fertilized: false }],
-    seeds: { tomato: 2, carrot: 0, pumpkin: 0 },
-    crops: { tomato: 0, carrot: 0, pumpkin: 0 },
+    seeds: { tomato: 2, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0 },
+    crops: { tomato: 0, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0 },
     coins: 30,
     dew: 1,
     worker: null,

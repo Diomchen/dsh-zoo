@@ -26,6 +26,7 @@ import {
   WORK_SETTLE_REASONS as CONTRACT_SETTLE_REASON_LIST
 } from './contracts-rules.js'
 import { CROPS, CROP_IDS, MAX_GUARD, isCropId, MINUTE_MS } from './farm-rules.js'
+import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -119,7 +120,7 @@ export const PLOT_ID_RE = /^p(?:[1-9]|[1-4][0-9]|50)$/
  * 能力声明（ticket 51 / ADR-0018）：老版本不发也不认，缺省 = 只支持串门。
  * `raid` = 能收「来偷」的串门请求（免放行）；`look` = 有 `/dsh-zoo-farm/open` 只读视图。
  */
-export const CAPS = Object.freeze(['raid', 'look'])
+export const CAPS = Object.freeze(['raid', 'look', 'crops'])
 export const MAX_CAPS = 4
 /** 一趟行程的硬上限（ticket 51）：到点自己回家，不写串门记录。 */
 export const RAID_MAX_MS = 60 * 1000
@@ -157,6 +158,62 @@ function normalizeRaidPlots (value) {
     if (out.length >= MAX_RAID_PLOTS) break
   }
   return out.length === 0 ? null : out
+}
+
+/**
+ * 票 59：作物目录在 wire 上的几个常量。
+ *
+ * 目录本身不走 beacon——它可能好几 KB，而 beacon 每 30 秒发一次（4 KiB 上限）。
+ * beacon 只带「我这边的目录指纹」，两边不一样再单独拉一次完整目录。
+ */
+export const CATALOG_VERSION = 1
+/** 一条 catalog 报文最多塞这么多条定义：每条 ~150 字节，8 条连信封一起稳在 4 KiB 内。 */
+export const MAX_CATALOG_ENTRIES_PER_PACKET = 8
+/** 一份目录最多切这么多片（8 × 32 = 256 条，比 MAX_CROPS 宽出一截，留余量）。 */
+export const MAX_CATALOG_CHUNKS = 32
+
+const HEX16_RE = /^[0-9a-f]{16}$/
+
+function normalizeCatalogAnnounce (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const hash = typeof value.hash === 'string' ? value.hash.trim().toLowerCase() : ''
+  if (!HEX16_RE.test(hash)) return null
+  const count = Number(value.count)
+  if (!Number.isInteger(count) || count < 1 || count > MAX_CROPS) return null
+  return { v: CATALOG_VERSION, hash, count }
+}
+
+function normalizeCatalogArt (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const hash = typeof value.hash === 'string' ? value.hash.trim().toLowerCase() : ''
+  const ext = typeof value.ext === 'string' ? value.ext.trim().toLowerCase() : ''
+  const bytes = Number(value.bytes)
+  if (!HEX16_RE.test(hash)) return null
+  if (ext !== 'svg' && ext !== 'png') return null
+  if (!Number.isInteger(bytes) || bytes <= 0 || bytes > 256 * 1024) return null
+  return { hash, ext, bytes }
+}
+
+/** 一条定义：数值部分交给 `normalizeCropDef`（和本机文件同一套夹取），图只带哈希。 */
+function normalizeCatalogEntry (value) {
+  const def = normalizeCropDef(value)
+  if (def === null) return null
+  const art = normalizeCatalogArt(value.art)
+  return { ...def, ...(art === null ? {} : { art }) }
+}
+
+function normalizeCatalogEntries (value) {
+  if (!Array.isArray(value)) return null
+  const out = []
+  // 先挑合格的、再截断：坏条目只丢自己，不该占掉别人的位置。
+  // 只扫有限条，别让一条恶意报文把解析拖成 O(n²)。
+  for (const candidate of value.slice(0, MAX_CATALOG_ENTRIES_PER_PACKET * 8)) {
+    const entry = normalizeCatalogEntry(candidate)
+    if (entry === null) continue
+    out.push(entry)
+    if (out.length >= MAX_CATALOG_ENTRIES_PER_PACKET) break
+  }
+  return out
 }
 
 /**
@@ -215,6 +272,9 @@ export const PACKET_TYPES = Object.freeze([
   'visit-recall-ack',
   'gift-received',
   'market-digest',
+  // 票 59：运行时作物目录。老版本会按「未知类型」直接丢掉这两条，不崩。
+  'crop-catalog-request',
+  'crop-catalog',
   'farm-action',
   'farm-action-result',
   // ticket 44：雇佣合同。**故意不放进 VISIT_TYPES**——那条分支只重建四个字段，
@@ -589,6 +649,13 @@ function buildPacket ({
   purpose,
   plots,
   raid,
+  // 票 59：作物目录与它的指纹
+  crops,
+  catalogHash,
+  chunk,
+  total,
+  entries,
+  hash,
   now = Date.now()
 } = {}, { maxBytes = MAX_PACKET_BYTES } = {}) {
   if (!TYPE_SET.has(type)) throw new Error('protocol: invalid packet type')
@@ -807,6 +874,24 @@ function buildPacket ({
         error
       }
     }
+  } else if (type === 'crop-catalog-request') {
+    // 「你那边的目录指纹是多少」——只带发起方自己的指纹，对方一样就没必要回。
+    const safeHash = typeof hash === 'string' ? hash.trim().toLowerCase() : ''
+    if (!HEX16_RE.test(safeHash)) throw new Error('protocol: invalid catalog hash')
+    packet = { ...base, hash: safeHash }
+  } else if (type === 'crop-catalog') {
+    const safeCatalogHash = typeof catalogHash === 'string' ? catalogHash.trim().toLowerCase() : ''
+    if (!HEX16_RE.test(safeCatalogHash)) throw new Error('protocol: invalid catalog hash')
+    if (!Number.isInteger(chunk) || chunk < 0 || chunk >= MAX_CATALOG_CHUNKS) {
+      throw new Error('protocol: invalid catalog chunk')
+    }
+    if (!Number.isInteger(total) || total < 1 || total > MAX_CATALOG_CHUNKS) {
+      throw new Error('protocol: invalid catalog total')
+    }
+    if (chunk >= total) throw new Error('protocol: invalid catalog chunk')
+    const safeEntries = normalizeCatalogEntries(entries)
+    if (safeEntries === null) throw new Error('protocol: invalid catalog entries')
+    packet = { ...base, catalogHash: safeCatalogHash, chunk, total, entries: safeEntries }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -814,7 +899,16 @@ function buildPacket ({
     if (!isPort(port)) throw new Error('protocol: invalid port')
     const safeNickname = normalizeNickname(nickname)
     if (safeNickname === null) throw new Error('protocol: invalid nickname')
-    packet = { ...base, nickname: safeNickname, port, ...skin, ...capsExtras(caps) }
+    // 票 59：beacon 只带目录指纹（三个数），完整目录在两边不一致时单独拉。
+    const announce = normalizeCatalogAnnounce(crops)
+    packet = {
+      ...base,
+      nickname: safeNickname,
+      port,
+      ...skin,
+      ...capsExtras(caps),
+      ...(announce === null ? {} : { crops: announce })
+    }
   }
 
   if (type === 'visit-ack' && raid !== undefined && raid !== null) {
@@ -926,6 +1020,22 @@ export function encodeMarketDigest ({ deviceId, at, prices, hire, now } = {}) {
  * 农场动作（ticket 43）：访客 → 主人。
  * 只带这次动作的全部输入；没有昵称、端口、坐标、路径或自由文本。
  */
+/**
+ * 票 59：请邻居把他的作物目录发过来（只带自己的指纹，对方一致就不回）。
+ * 收到请求的一方按每邻居 30 秒最多回一次的频率答复，见 service 的 `catalogPeers`。
+ */
+export function encodeCropCatalogRequest ({ deviceId, hash } = {}) {
+  return encodePacket({ type: 'crop-catalog-request', deviceId, hash })
+}
+
+/**
+ * 票 59：作物目录的一片。`chunk`/`total` 从 0 起；每片最多
+ * `MAX_CATALOG_ENTRIES_PER_PACKET` 条，保证整包仍在 4 KiB 里。
+ */
+export function encodeCropCatalog ({ deviceId, catalogHash, chunk, total, entries } = {}) {
+  return encodePacket({ type: 'crop-catalog', deviceId, catalogHash, chunk, total, entries })
+}
+
 export function encodeFarmAction ({ deviceId, visitId, requestId, action, plotId } = {}) {
   return encodePacket({ type: 'farm-action', deviceId, visitId, requestId, action, plotId })
 }
@@ -1403,6 +1513,43 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     }
   }
 
+  // 票 59：作物目录的两条报文。老版本不认识这两个类型，会在最上面按「未知类型」丢掉。
+  if (raw.type === 'crop-catalog-request') {
+    const hash = typeof raw.hash === 'string' ? raw.hash.trim().toLowerCase() : ''
+    if (!HEX16_RE.test(hash)) return fail('hash')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        hash
+      }
+    }
+  }
+
+  if (raw.type === 'crop-catalog') {
+    const catalogHash = typeof raw.catalogHash === 'string' ? raw.catalogHash.trim().toLowerCase() : ''
+    if (!HEX16_RE.test(catalogHash)) return fail('catalog-hash')
+    if (!Number.isInteger(raw.chunk) || raw.chunk < 0 || raw.chunk >= MAX_CATALOG_CHUNKS) return fail('catalog-chunk')
+    if (!Number.isInteger(raw.total) || raw.total < 1 || raw.total > MAX_CATALOG_CHUNKS) return fail('catalog-total')
+    if (raw.chunk >= raw.total) return fail('catalog-chunk')
+    const entries = normalizeCatalogEntries(raw.entries)
+    if (entries === null) return fail('catalog-entries')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        catalogHash,
+        chunk: raw.chunk,
+        total: raw.total,
+        entries
+      }
+    }
+  }
+
   const nickname = normalizeNickname(raw.nickname)
   if (nickname === null) return fail('nickname')
   if (!isPort(raw.port)) return fail('port')
@@ -1417,7 +1564,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       nickname,
       port: raw.port,
       ...skinExtras({ skinPort: raw.skinPort, skinId: raw.skinId }),
-      ...capsExtras(raw.caps)
+      ...capsExtras(raw.caps),
+      ...(normalizeCatalogAnnounce(raw.crops) === null ? {} : { crops: normalizeCatalogAnnounce(raw.crops) })
     }
   }
 }

@@ -4,7 +4,14 @@ import { readFile, stat } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 
-import { FARM_OPEN_SEGMENT, FARM_ROUTES, GIFT_ROUTES, SKIN_ROUTES, matchRoute } from './lan-routes.js'
+import {
+  CROP_ART_ROUTES,
+  FARM_OPEN_SEGMENT,
+  FARM_ROUTES,
+  GIFT_ROUTES,
+  SKIN_ROUTES,
+  matchRoute
+} from './lan-routes.js'
 import { MAX_GIFT_BYTES, isDeviceId, isVisitId } from './protocol.js'
 
 /**
@@ -75,6 +82,11 @@ export async function startLanServer (options = {}) {
    * 表不在 server 里；返回 null/undefined 一律 404。视图里**绝不能**有路径或别人的 deviceId。
    */
   const lookupFarm = typeof options.lookupFarm === 'function' ? options.lookupFarm : null
+  /**
+   * 作物图（票 59）：`<hash>.<svg|png> → { bytes, contentType }`。service 只认自己
+   * crop-art 目录里登记过的哈希；返回 null 一律 404。
+   */
+  const lookupCropArt = typeof options.lookupCropArt === 'function' ? options.lookupCropArt : null
   /**
    * 公开只读视图（票 52）：`viewerDeviceId → view`。**不查放行**（ADR-0018）——
    * viewer 只用来算"我自己偷过没有"，拿它当授权就错了。
@@ -179,6 +191,11 @@ export async function startLanServer (options = {}) {
         return handleGift(request, response, gift.rest)
       }
       // 农场快照（ticket 43）：同样只有一层 visitId；形状/授权由 lookupFarm 决定。
+      const cropArt = matchRoute(pathname, CROP_ART_ROUTES)
+      if (cropArt !== null) {
+        if (cropArt.rest === '' || cropArt.rest.includes('/')) return sendText(response, 404, 'crop art not found')
+        return await handleCropArt(request, response, cropArt.rest)
+      }
       const farm = matchRoute(pathname, FARM_ROUTES)
       if (farm !== null) {
         // 票 52：`open/<viewerId>` 是两层，其余形状仍然只允许一层。
@@ -280,6 +297,34 @@ export async function startLanServer (options = {}) {
     }
     if (view === null || view === undefined) return sendText(response, 404, 'not found')
     return sendJson(response, 200, view, request.method === 'HEAD')
+  }
+
+  /**
+   * `GET /dsh-zoo-crops/<16 位哈希>.<svg|png>`（票 59）。
+   * 只读、只 GET/HEAD、只服务 service 认得的那几张（按内容哈希寻址，可以放心缓存）。
+   */
+  async function handleCropArt (request, response, name) {
+    if (request.method !== 'GET' && request.method !== 'HEAD') return sendText(response, 405, 'method not allowed')
+    if (lookupCropArt === null) return sendText(response, 404, 'crop art not found')
+    let entry = null
+    try {
+      entry = await lookupCropArt(name)
+    } catch {
+      entry = null
+    }
+    if (entry === null || entry === undefined) return sendText(response, 404, 'crop art not found')
+    const bytes = entry.bytes
+    if (!(bytes instanceof Uint8Array) || bytes.length === 0) return sendText(response, 404, 'crop art not found')
+    response.statusCode = 200
+    response.setHeader('content-type', entry.contentType ?? 'application/octet-stream')
+    response.setHeader('content-length', String(bytes.length))
+    // 内容寻址：同名即同图，缓存不会串。
+    response.setHeader('cache-control', 'public, max-age=300')
+    if (request.method === 'HEAD') {
+      response.end()
+      return
+    }
+    response.end(Buffer.from(bytes))
   }
 
   async function handleSkin (request, response, rest) {

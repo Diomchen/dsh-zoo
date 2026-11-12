@@ -128,3 +128,26 @@ test('雇工表单有就地错误：每个字段一个 aria-describedby 的错�
   assert.match(renderer, /不能超过最长/)
   assert.match(renderer, /不能短于最短/)
 })
+
+test('票 58：作物图是包内 SVG —— CSP 放行同源图片，卡片尺寸不靠 emoji 字体', () => {
+  // farm.html 是 file:// 页面：`default-src 'none'` 会把 <img> 全拦掉（实测 naturalWidth=0），
+  // 所以必须显式放行 `img-src 'self'`；不放 data:/file: 是为了别把口子开大。
+  assert.match(html, /img-src 'self'/, 'CSP 要放行同源图片')
+  // 票 59：自定义作物图走 helper 的 `dshzoo://crops/<hash>.<ext>`，所以还要放行这个 scheme。
+  assert.match(html, /img-src 'self' dshzoo:/, '自定义作物图要放行 dshzoo:')
+  assert.equal(html.includes("img-src 'self' data:"), false, '不需要 data: 就别开')
+
+  const art = bodyOf('.crop-art-img')
+  assert.match(art, /width:\s*1\.2em/, '图跟着外层字号缩放，种子行/交易所共用一套')
+  assert.match(art, /height:\s*1\.2em/)
+  assert.match(art, /object-fit:\s*contain/, 'SVG 不能被裁掉边缘')
+
+  const card = bodyOf('.crop-emoji .crop-art-img')
+  assert.match(card, /width:\s*26px/, '34px 的地块图框里留出白边')
+  assert.match(card, /height:\s*26px/)
+
+  // 阶段样式挂在 `.crop-emoji` 这个盒子上（不是 emoji 文字）：换成 <img> 以后
+  // 成熟那张卡照样轻弹。生长中由整张卡的 data-stage 规则压色，不用单独给图写一套。
+  assert.match(css, /\.plot-card\[data-stage='mature'\] \.crop-emoji \{[^}]*animation:/)
+  assert.match(css, /\.plot-card\[data-stage='growing'\] \{/)
+})

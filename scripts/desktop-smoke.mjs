@@ -624,6 +624,36 @@ function screenCenter (pet, workArea) {
   }
 }
 
+/**
+ * 悬停一只会走路的宠物：坐标是从上一帧快照里算的，宠物会走开，所以落空就重新取一次。
+ * 这不是产品行为，纯粹是冒烟的采样问题——别因为宠物走了 30px 就判红。
+ */
+async function hoverPetById (client, workArea, petId = 'self', label = '悬停宠物') {
+  let last = null
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const state = await client.rendererState()
+    const pet = state !== null && Array.isArray(state.pets)
+      ? state.pets.find((entry) => entry.id === petId)
+      : undefined
+    if (pet === undefined) throw new Error('场景里没有 ' + petId + '，没法' + label)
+    const point = screenCenter(pet, workArea)
+    const start = client.mark()
+    client.send({ type: 'debug-dispatch', phase: 'move', x: point.x, y: point.y })
+    try {
+      last = await client.waitFrom(
+        start,
+        (event) => event.type === 'hit' && event.interactive === true && event.itemId === petId,
+        1200,
+        label
+      )
+      return { point, hit: last }
+    } catch {
+      // 宠物走开了：重新读位置再试
+    }
+  }
+  throw new Error('等待超时：' + label + (last === null ? '' : '（最后 ' + JSON.stringify(last) + '）'))
+}
+
 function hitMatchesPet (hit, pet, workArea, tolerance = 2) {
   if (hit.rect === null) return false
   return Math.abs(hit.rect.x - (workArea.x + pet.x)) <= tolerance &&
@@ -752,8 +782,9 @@ async function verifyControls () {
   let self = state.pets.find((pet) => pet.id === 'self')
   let center = screenCenter(self, workArea)
   let start = client.mark()
-  client.send({ type: 'debug-dispatch', phase: 'move', x: center.x, y: center.y })
-  const hoverHit = await client.waitFrom(start, (event) => event.type === 'hit' && event.interactive === true, 3000, '悬停自己')
+  const hovered = await hoverPetById(client, workArea, 'self', '悬停自己')
+  const hoverHit = hovered.hit
+  center = hovered.point
   assert(hoverHit.itemId === 'self', '悬停命中自己的宠物')
   await waitUntil(async () => {
     const snapshot = await client.rendererState()
@@ -1047,14 +1078,27 @@ async function verifyControls () {
   client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
   await client.waitStatus((status) => status.busy === false, 3000, '改名后弹层收好、没有残留租约')
 
-  // 自己出门：桌面没有 self → 常驻「召回」胶囊（否则召回按钮没有锚点）。
+  // 等上一条失败气泡自己消失：它不接指针，但会进后面几张截图（这是真实行为，只是别拍进去）。
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.notice === null
+  }, 6000, '置灰按钮的气泡已经收起')
+
+  // 自己出门（ticket 11/57）：桌面没有 self → 常驻胶囊。它不再只是「召回」，
+  // 而是点开一个面板：农场 / 邻居 / 带派 / 改名 / 召回或叫它回家 / 更多。
   const awayScene = shared.petScene([
     { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
   ], workArea, {
     reset: true,
     controls: {
       visit: { enabled: false, reason: '宠物在「阿蟹」家，先召回再串门。' },
-      recall: { enabled: true, nickname: '阿蟹' },
+      recall: {
+        enabled: true,
+        mode: 'visiting',
+        text: '在「阿蟹」家',
+        title: '小蓝在「阿蟹」家',
+        contractId: null
+      },
       visitors: [{ deviceId: visitorId, label: '阿蟹' }],
       prompt: null,
       notice: null
@@ -1064,16 +1108,209 @@ async function verifyControls () {
   await waitUntil(async () => {
     const snapshot = await client.rendererState()
     return snapshot.controls.recallChip !== null
-  }, 2500, '出门后出现召回胶囊')
+  }, 2500, '出门后出现不在家胶囊')
   state = await client.rendererState()
+  assert(state.controls.recallChip.mode === 'visiting', '胶囊带 mode=visiting')
+  assert(state.controls.recallChip.text === '在「阿蟹」家', '胶囊上写的是人话（' + state.controls.recallChip.text + '）')
   const chip = state.uiRects.find((rect) => rect.id === 'ui:recall-chip')
-  assert(Boolean(chip), '召回胶囊有命中矩形（没有 self 时也能点）')
-  const chipPoint = rectCenterScreen(chip, workArea)
-  start = client.mark()
+  assert(Boolean(chip), '胶囊有命中矩形（没有 self 时也能点）')
+
+  // 点胶囊 → 面板。六个入口都在，命中矩形也都有（点得到，不是画着好看）。
+  let chipPoint = rectCenterScreen(chip, workArea)
+
+  // 胶囊要能拖走（现场反馈：它常驻在宠物最后出现的位置，挡住视线时没法挪）。
+  // 拖动 = 按住胶囊、跟着指针走、松手停在原地；这一下不能当成点击（不弹面板）。
+  const dragFrom = { x: workArea.x + chip.x + chip.width / 2, y: workArea.y + chip.y + chip.height / 2 }
+  const dragTo = { x: dragFrom.x + 120, y: dragFrom.y - 160 }
+  client.send({ type: 'debug-dispatch', phase: 'down', x: dragFrom.x, y: dragFrom.y })
+  await sleep(80)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: dragTo.x, y: dragTo.y })
+  await sleep(120)
+  client.send({ type: 'debug-dispatch', phase: 'up', x: dragTo.x, y: dragTo.y })
+  await sleep(300)
+  state = await client.rendererState()
+  const chipMoved = state.uiRects.find((rect) => rect.id === 'ui:recall-chip')
+  assert(Boolean(chipMoved), '拖动之后胶囊还在桌面上')
+  assert(
+    Math.abs(chipMoved.x - (chip.x + 120)) <= 2 && Math.abs(chipMoved.y - (chip.y - 160)) <= 2,
+    '胶囊跟着指针挪到 (' + Math.round(chipMoved.x) + ',' + Math.round(chipMoved.y) + ')'
+  )
+  assert(state.controls.awayPanel === null, '拖一下不算点击：不弹面板')
+  chipPoint = rectCenterScreen(chipMoved, workArea)
+
   client.send({ type: 'debug-dispatch', phase: 'click', x: chipPoint.x, y: chipPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.awayPanel !== null
+  }, 2500, '点胶囊后弹出不在家面板')
+  state = await client.rendererState()
+  assert(state.controls.awayPanel.title === '小蓝在「阿蟹」家', '面板标题带宠物名字')
+  assert(
+    JSON.stringify(state.controls.awayPanel.buttons) ===
+      JSON.stringify(['farm-open', 'street-open', 'bring', 'rename', 'recall', 'away-more']),
+    '面板上的入口：农场/邻居/带派/改名/召回/更多（' + state.controls.awayPanel.buttons.join(',') + '）'
+  )
+  const panelRect = state.uiRects.find((rect) => rect.id === 'ui:away-panel')
+  const farmButton = state.uiRects.find((rect) => rect.id === 'ui:away:farm-open')
+  const recallButton = state.uiRects.find((rect) => rect.id === 'ui:away:recall')
+  assert(Boolean(panelRect), '面板有命中矩形')
+  assert(Boolean(farmButton), '「农场」按钮有命中矩形')
+  assert(Boolean(recallButton), '「召回」按钮有命中矩形')
+  assert(state.uiRects.some((rect) => rect.id === 'ui:bridge:away'), '胶囊与面板之间有桥接矩形')
+
+  // 截图：胶囊 + 面板真的被画出来了（不是只有命中矩形）。
+  const awayPng = join(OUT_DIR, 'away-panel.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-away', path: awayPng })
+  await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-away', 8000, '不在家面板截图')
+  const awayVerified = verifyShot(awayPng, awayPng + '.json', 1)
+  assertControlPixels(awayVerified, [panelRect, farmButton, recallButton])
+  info('不在家面板截图：' + awayPng)
+
+  // 面板 -> 农场：这只宠物不在家时也能打开农场小窗（这就是用户报的那个坑）。
+  start = client.mark()
+  const farmPoint = rectCenterScreen(farmButton, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: farmPoint.x, y: farmPoint.y })
+  const farmAction = await client.waitFrom(start, (event) => event.type === 'action' && event.action === 'farm-open', 3000, '农场申请')
+  assert(typeof farmAction.id === 'string' && farmAction.id !== '', '农场申请带 id')
+  client.send({ type: 'action-result', id: farmAction.id, ok: true })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.awayPanel === null
+  }, 2500, '点完面板按钮后收起来')
+
+  // 再点开 → 「改名」：不在家时也能改（改名小窗贴屏幕中央，输入框预填最后一次见到的名字）。
+  client.send({ type: 'debug-dispatch', phase: 'click', x: chipPoint.x, y: chipPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.awayPanel !== null
+  }, 2500, '面板再次打开')
+  state = await client.rendererState()
+  const renameBtn = state.uiRects.find((rect) => rect.id === 'ui:away:rename')
+  assert(Boolean(renameBtn), '「改名」有命中矩形')
+  const awayRenamePoint = rectCenterScreen(renameBtn, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: awayRenamePoint.x, y: awayRenamePoint.y })
+  current = await client.waitStatus((status) => status.renameOpen === true, 4000, '不在家时改名小窗也能打开')
+  assert(current.focusable === false, '改名小窗开着时主窗仍不可聚焦')
+  client.send({ type: 'debug-rename', close: true })
+  await client.waitStatus((status) => status.renameOpen === false, 4000, '不在家时的改名小窗关闭')
+
+  // 再点开 → 「召回」：串门/偷菜走的还是 recall。
+  client.send({ type: 'debug-dispatch', phase: 'click', x: chipPoint.x, y: chipPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.awayPanel !== null
+  }, 2500, '面板再次打开（召回）')
+  state = await client.rendererState()
+  const recallBtn = state.uiRects.find((rect) => rect.id === 'ui:away:recall')
+  start = client.mark()
+  const recallPoint = rectCenterScreen(recallBtn, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: recallPoint.x, y: recallPoint.y })
   const recallAction = await client.waitFrom(start, (event) => event.type === 'action' && event.action === 'recall', 3000, '召回申请')
   assert(typeof recallAction.id === 'string' && recallAction.id !== '', '召回申请带 id')
   client.send({ type: 'action-result', id: recallAction.id, ok: true })
+
+  // 在外打工（ticket 57 的主场景）：以前桌面上什么都不剩；现在胶囊写「在……家打工」，
+  // 主按钮换成「叫它回家」，带的是宿主下发的合同号（recall-worker）。
+  const contractId = '55555555-5555-4555-8555-555555555555'
+  const workingScene = shared.petScene([
+    { id: 'visitor:' + visitorId, role: 'visitor', label: '阿蟹', anim: '螃蟹走路', color: shared.PET_COLORS[1] }
+  ], workArea, {
+    reset: true,
+    controls: {
+      visit: { enabled: false, reason: '宠物在外打工，合同结束前不能去串门。' },
+      recall: {
+        enabled: true,
+        mode: 'working',
+        text: '在「柯基」家打工',
+        title: '小蓝在「柯基」家打工',
+        contractId
+      },
+      visitors: [{ deviceId: visitorId, label: '阿蟹' }],
+      prompt: null,
+      notice: null
+    },
+    // 「更多」打开的是宿主下发的这棵树：宠物不在家时只少「回到初始位置」。
+    menu: {
+      tools: [
+        { id: 'farm', label: '农场' },
+        { id: 'home', label: '回到初始位置' }
+      ],
+      groups: [],
+      skins: [],
+      activeSkin: null
+    }
+  })
+  client.send({ type: 'update', scene: workingScene })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.recallChip?.mode === 'working'
+  }, 2500, '打工时也有不在家胶囊')
+  state = await client.rendererState()
+  assert(state.controls.recallChip.text === '在「柯基」家打工', '打工的胶囊说的是打工')
+  const workChip = state.uiRects.find((rect) => rect.id === 'ui:recall-chip')
+  assert(Boolean(workChip), '打工胶囊也有命中矩形')
+  const workChipPoint = rectCenterScreen(workChip, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: workChipPoint.x, y: workChipPoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.awayPanel !== null
+  }, 2500, '打工面板打开')
+  state = await client.rendererState()
+  assert(state.controls.awayPanel.buttons.includes('recall-worker'), '打工面板的主按钮是「叫它回家」')
+  assert(state.controls.awayPanel.buttons.includes('recall') === false, '打工时不出现「召回」假按钮')
+  const homeBtn = state.uiRects.find((rect) => rect.id === 'ui:away:recall-worker')
+  assert(Boolean(homeBtn), '「叫它回家」有命中矩形')
+  const workPng = join(OUT_DIR, 'away-panel-work.png')
+  start = client.mark()
+  client.send({ type: 'shot', id: 'shot-away-work', path: workPng })
+  await client.waitFrom(start, (event) => event.type === 'shot' && event.id === 'shot-away-work', 8000, '打工面板截图')
+  const workVerified = verifyShot(workPng, workPng + '.json', 1)
+  assertControlPixels(workVerified, [state.uiRects.find((rect) => rect.id === 'ui:away-panel'), homeBtn])
+  info('打工面板截图：' + workPng)
+
+  // 「更多」= 完整右键菜单：不在家时没有「回到初始位置」（点了什么也不会发生），
+  // 其余工具（农场/带派/…）照旧 —— 宠物在外打工不等于桌面被拿走。
+  const moreBtn = state.uiRects.find((rect) => rect.id === 'ui:away:away-more')
+  assert(Boolean(moreBtn), '「更多」有命中矩形')
+  const morePoint = rectCenterScreen(moreBtn, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: morePoint.x, y: morePoint.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu !== null
+  }, 2500, '「更多」打开完整菜单')
+  state = await client.rendererState()
+  assert(state.menu.petId === null, '菜单锚在胶囊上（没有可停住的宠物）')
+  assert(state.menu.rows.some((row) => row.kind === 'tool' && row.label === '农场'), '菜单里有「农场」')
+  assert(!state.menu.rows.some((row) => row.kind === 'tool' && row.label === '回到初始位置'),
+    '宠物不在家时菜单里没有「回到初始位置」')
+  assert(state.controls.awayPanel === null, '开菜单时面板已经收起（两套入口不抢鼠标）')
+  client.send({ type: 'debug-dispatch', phase: 'move', x: outside.x, y: outside.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.menu === null
+  }, 3000, '光标离开后菜单自己收起')
+
+  // 重新打开面板 → 「叫它回家」。
+  state = await client.rendererState()
+  const workChip2 = state.uiRects.find((rect) => rect.id === 'ui:recall-chip')
+  assert(Boolean(workChip2), '菜单收起后胶囊还在')
+  const workChipPoint2 = rectCenterScreen(workChip2, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: workChipPoint2.x, y: workChipPoint2.y })
+  await waitUntil(async () => {
+    const snapshot = await client.rendererState()
+    return snapshot.controls.awayPanel !== null
+  }, 2500, '打工面板再次打开')
+  state = await client.rendererState()
+  const homeBtn2 = state.uiRects.find((rect) => rect.id === 'ui:away:recall-worker')
+  assert(Boolean(homeBtn2), '「叫它回家」仍然在')
+  start = client.mark()
+  const homePoint = rectCenterScreen(homeBtn2, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'click', x: homePoint.x, y: homePoint.y })
+  const endAction = await client.waitFrom(start,
+    (event) => event.type === 'action' && event.action === 'recall-worker', 3000, '叫它回家申请')
+  assert(endAction.contractId === contractId, '「叫它回家」带的是这一份合同号（' + endAction.contractId + '）')
+  client.send({ type: 'action-result', id: endAction.id, ok: true })
 
   // 收尾：quit 自己退出。
   const exitPromise = client.exited
@@ -1474,7 +1711,10 @@ async function verifyHelper () {
   await sleep(120)
 
   // 输入态卡住时的踢法：不重启，重放一次 setIgnoreMouseEvents(true → false)
-  client.send({ type: 'debug-dispatch', phase: 'move', x: trustPoint.x, y: trustPoint.y })
+  // 宠物会走路，用刚读过的最新位置（上面几百毫秒的等待足够它挪开）。
+  const trustNow = (await client.rendererState()).pets.find((pet) => pet.id === 'self')
+  const trustPointNow = screenCenter(trustNow, workArea)
+  client.send({ type: 'debug-dispatch', phase: 'move', x: trustPointNow.x, y: trustPointNow.y })
   await client.waitStatus((status) => status.ignoring === false, 2000, '光标进命中区后窗口可交互')
   client.send({ type: 'debug-kick-input' })
   await sleep(250)

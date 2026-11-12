@@ -49,6 +49,8 @@ export function createDiscovery ({
   beaconIntervalMs = BEACON_INTERVAL_MS,
   mayTalkTo = () => false,
   skin = null,
+  // 票 59：作物目录指纹（`{v,hash,count}` 或 null）。每拍现取，目录变了下一拍就是新的。
+  crops = null,
   caps = null,
   onPeer,
   log,
@@ -98,6 +100,7 @@ export function createDiscovery ({
   function packetFor (type) {
     // 素材源端口可能比 discovery 晚起来（或压根起不来）：每拍现取，取不到就不带。
     const current = typeof skin === 'function' ? skin() : skin
+    const announce = typeof crops === 'function' ? crops() : crops
     return encodePacket({
       type,
       deviceId: identity?.deviceId,
@@ -105,7 +108,8 @@ export function createDiscovery ({
       port: advertisedPort(),
       skinPort: current?.port,
       skinId: current?.id,
-      ...(caps === null ? {} : { caps })
+      ...(caps === null ? {} : { caps }),
+      ...(announce === null || announce === undefined ? {} : { crops: announce })
     })
   }
 

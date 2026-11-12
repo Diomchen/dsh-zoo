@@ -22,13 +22,83 @@
   /**
    * 作物显示表。数值与宿主 `src/farm-rules.js` 的 CROPS 同源（ticket 45 的 drift
    * 测试逐项比对）；这里只用于显示生长时长/产量和进度条，从不参与结算。
+   *
+   * 票 58：外观不再是一个 emoji，而是包内自带的 SVG（`desktop/crops/<id>.svg`）。
+   * `emoji` 留着当兜底——旧版本邻居传来的、或将来加了作物却忘了放图的 id 走这一支，
+   * 至少不会在卡片上留一个空格子。路径是相对 `farm.html` 的，窗口用
+   * `file://` 加载，CSP 里放行了 `img-src 'self'`。
    */
-  const CROP_META = {
-    tomato: { name: '小番茄', emoji: '🍅', seedPrice: 6, base: 5, growMs: 30 * MINUTE_MS, yield: 3 },
-    carrot: { name: '胡萝卜', emoji: '🥕', seedPrice: 14, base: 6, growMs: 2 * HOUR_MS, yield: 5 },
-    pumpkin: { name: '南瓜', emoji: '🎃', seedPrice: 36, base: 30, growMs: 8 * HOUR_MS, yield: 3 }
+  const BUILTIN_META = Object.freeze({
+    tomato: { name: '小番茄', emoji: '🍅', art: 'crops/tomato.svg', seedPrice: 6, base: 5, growMs: 30 * MINUTE_MS, yield: 3 },
+    strawberry: { name: '草莓', emoji: '🍓', art: 'crops/strawberry.svg', seedPrice: 9, base: 7, growMs: 45 * MINUTE_MS, yield: 4 },
+    carrot: { name: '胡萝卜', emoji: '🥕', art: 'crops/carrot.svg', seedPrice: 14, base: 6, growMs: 2 * HOUR_MS, yield: 5 },
+    corn: { name: '玉米', emoji: '🌽', art: 'crops/corn.svg', seedPrice: 22, base: 9, growMs: 4 * HOUR_MS, yield: 6 },
+    pumpkin: { name: '南瓜', emoji: '🎃', art: 'crops/pumpkin.svg', seedPrice: 36, base: 30, growMs: 8 * HOUR_MS, yield: 3 },
+    grape: { name: '葡萄', emoji: '🍇', art: 'crops/grape.svg', seedPrice: 52, base: 24, growMs: 12 * HOUR_MS, yield: 5 }
+  })
+  /** 没有图的作物（`crops.json` 里手写的、还没画图的）用这个当兜底。 */
+  const FALLBACK_EMOJI = '🌱'
+
+  /**
+   * 当前窗口认的作物表（票 59）。
+   *
+   * 默认是内置六种；宿主每一包都会带 `crops`，`setCrops()` 用它整份换掉。
+   * 数值一律以宿主下发为准，这一层只画；内置条目继续用包里的 SVG，
+   * 宿主认识但包里没图的条目退回 emoji（将来图会随目录一起下发）。
+   */
+  const CROP_META = {}
+  const CROP_IDS = []
+
+  function fillMeta (list) {
+    for (const id of Object.keys(CROP_META)) delete CROP_META[id]
+    CROP_IDS.length = 0
+    const source = Array.isArray(list) && list.length > 0 ? list : null
+    if (source === null) {
+      for (const id of Object.keys(BUILTIN_META)) {
+        CROP_META[id] = BUILTIN_META[id]
+        CROP_IDS.push(id)
+      }
+      return
+    }
+    for (const entry of source) {
+      if (entry === null || typeof entry !== 'object') continue
+      const id = typeof entry.id === 'string' ? entry.id : ''
+      const name = typeof entry.name === 'string' ? entry.name : ''
+      if (id === '' || name === '') continue
+      const builtin = Object.prototype.hasOwnProperty.call(BUILTIN_META, id) ? BUILTIN_META[id] : null
+      CROP_META[id] = {
+        name,
+        emoji: builtin === null ? FALLBACK_EMOJI : builtin.emoji,
+        // 宿主给了图就用宿主的（自定义作物按内容哈希寻址）；没给就回落到包里的 SVG。
+        art: typeof entry.art === 'string' && entry.art !== ''
+          ? entry.art
+          : builtin === null ? '' : builtin.art,
+        seedPrice: Number(entry.seedPrice) || 0,
+        base: Number(entry.base) || 0,
+        growMs: Number(entry.growMs) || 0,
+        yield: Number(entry.yield) || 0
+      }
+      CROP_IDS.push(id)
+    }
+    // 宿主没发目录、或者发了个空数组：退回内置六种，别把窗口画成空的。
+    if (CROP_IDS.length === 0) {
+      fillMeta(null)
+      return
+    }
+    CROP_IDS.sort((left, right) => {
+      if (CROP_META[left].growMs !== CROP_META[right].growMs) return CROP_META[left].growMs - CROP_META[right].growMs
+      return left < right ? -1 : left > right ? 1 : 0
+    })
   }
-  const CROP_IDS = Object.keys(CROP_META)
+
+  fillMeta(null)
+
+  /** 宿主下发整份目录时调用（每包一次）；传 null/空数组 = 回到内置六种。 */
+  function setCrops (list) {
+    fillMeta(list)
+  }
+
+
   const WATER_COST = 1
   const FERTILIZE_COST = 5
   /** 解锁后至少留一颗最便宜种子的钱；与宿主 PLOT_UNLOCK_RESERVE 同源（drift 测试会读）。 */
@@ -37,6 +107,34 @@
 
   function cropMeta (cropId) {
     return Object.prototype.hasOwnProperty.call(CROP_META, cropId) ? CROP_META[cropId] : null
+  }
+
+  /**
+   * 作物外观：有图就给 `<img>`，没图（空地、未知作物、旧数据）退回 emoji 文本。
+   *
+   * 外面永远套一个带 `className` 的 span：现有的字号/阶段滤镜（生长中灰掉、成熟轻弹）
+   * 都是挂在这个盒子上的，换成图片不用改 CSS 选择器；图自己按 `1.2em` 缩放，
+   * 19px 的种子行/行情行和 34px 的地块卡图框都不用各写一套。
+   */
+  function cropEmblem (document, spec, className) {
+    const span = document.createElement('span')
+    span.className = className
+    span.setAttribute('aria-hidden', 'true')
+    const art = spec !== null && typeof spec === 'object' ? spec.art : ''
+    if (typeof art === 'string' && art !== '') {
+      const img = document.createElement('img')
+      img.className = 'crop-art-img'
+      img.setAttribute('src', art)
+      // 装饰图：名字在旁边的 <strong> 里已经念过一遍了，读屏不用重复。
+      img.setAttribute('alt', '')
+      img.setAttribute('draggable', 'false')
+      span.appendChild(img)
+    } else {
+      span.textContent = spec !== null && typeof spec === 'object' && typeof spec.emoji === 'string'
+        ? spec.emoji
+        : ''
+    }
+    return span
   }
 
   function clamp (value, min, max) {
@@ -250,6 +348,7 @@
       cropId,
       name: meta.name,
       emoji: meta.emoji,
+      art: meta.art,
       seedPrice: meta.seedPrice,
       qty: count,
       valid,
@@ -294,6 +393,7 @@
         crop: meta === null ? null : plot.crop,
         cropName: meta === null ? '空地' : meta.name,
         emoji: meta === null ? '＋' : meta.emoji,
+        art: meta === null ? '' : meta.art,
         badge: STAGE_TEXT[mature ? 'mature' : growing ? 'growing' : 'empty'],
         mature,
         progress: progressOf(plot),
@@ -497,10 +597,7 @@
 
     const body = document.createElement('div')
     body.className = 'plot-body'
-    const emoji = document.createElement('span')
-    emoji.className = 'crop-emoji'
-    emoji.setAttribute('aria-hidden', 'true')
-    emoji.textContent = card.emoji
+    const emoji = cropEmblem(document, card, 'crop-emoji')
     const info = document.createElement('div')
     info.className = 'plot-info'
     const name = document.createElement('strong')
@@ -551,6 +648,8 @@
   return {
     CROP_META,
     CROP_IDS,
+    BUILTIN_META,
+    setCrops,
     WATER_COST,
     FERTILIZE_COST,
     UNLOCK_RESERVE,
@@ -558,6 +657,7 @@
     MAX_TRADE_QTY,
     MAX_SEED_STACK,
     cropMeta,
+    cropEmblem,
     formatRemaining,
     formatGrowTime,
     plotNumber,

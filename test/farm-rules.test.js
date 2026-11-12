@@ -54,20 +54,34 @@ function tomatoPlot (overrides = {}) {
 // 作物表 / 生长 / 成熟
 // ---------------------------------------------------------------------------
 
-test('作物表：三种作物的生长、种子价、产量、底价与 SPEC v5 一致', () => {
-  assert.deepEqual(Object.keys(CROPS), ['tomato', 'carrot', 'pumpkin'])
-  assert.deepEqual(
-    { growMs: CROPS.tomato.growMs, seedPrice: CROPS.tomato.seedPrice, yield: CROPS.tomato.yield, base: CROPS.tomato.base },
-    { growMs: 30 * MINUTE_MS, seedPrice: 6, yield: 3, base: 5 }
-  )
-  assert.deepEqual(
-    { growMs: CROPS.carrot.growMs, seedPrice: CROPS.carrot.seedPrice, yield: CROPS.carrot.yield, base: CROPS.carrot.base },
-    { growMs: 2 * HOUR_MS, seedPrice: 14, yield: 5, base: 6 }
-  )
-  assert.deepEqual(
-    { growMs: CROPS.pumpkin.growMs, seedPrice: CROPS.pumpkin.seedPrice, yield: CROPS.pumpkin.yield, base: CROPS.pumpkin.base },
-    { growMs: 8 * HOUR_MS, seedPrice: 36, yield: 3, base: 30 }
-  )
+test('作物表：六种作物的生长、种子价、产量、底价与 SPEC v5 一致', () => {
+  // 票 58：三种 → 六种。顺序按生长时长，窗口的种子列表和行情页就照这个顺序画。
+  assert.deepEqual(Object.keys(CROPS), ['tomato', 'strawberry', 'carrot', 'corn', 'pumpkin', 'grape'])
+  const expected = {
+    tomato: { growMs: 30 * MINUTE_MS, seedPrice: 6, yield: 3, base: 5 },
+    strawberry: { growMs: 45 * MINUTE_MS, seedPrice: 9, yield: 4, base: 7 },
+    carrot: { growMs: 2 * HOUR_MS, seedPrice: 14, yield: 5, base: 6 },
+    corn: { growMs: 4 * HOUR_MS, seedPrice: 22, yield: 6, base: 9 },
+    pumpkin: { growMs: 8 * HOUR_MS, seedPrice: 36, yield: 3, base: 30 },
+    grape: { growMs: 12 * HOUR_MS, seedPrice: 52, yield: 5, base: 24 }
+  }
+  for (const cropId of Object.keys(expected)) {
+    const crop = CROPS[cropId]
+    assert.equal(crop.id, cropId, cropId + ' 的 id 与键不一致')
+    assert.equal(typeof crop.name, 'string', cropId + ' 缺名字')
+    assert.deepEqual(
+      { growMs: crop.growMs, seedPrice: crop.seedPrice, yield: crop.yield, base: crop.base },
+      expected[cropId],
+      cropId
+    )
+  }
+  // 越久的那一档种子越贵、每小时毛收越低（点一次管更久的代价），
+  // 而且最便宜的仍是小番茄——地块解锁的保底 6 硬币因此不变。
+  const grows = Object.values(CROPS).map((crop) => crop.growMs)
+  assert.deepEqual(grows, [...grows].sort((left, right) => left - right), '作物表按生长时长排序')
+  const seeds = Object.values(CROPS).map((crop) => crop.seedPrice)
+  assert.deepEqual(seeds, [...seeds].sort((left, right) => left - right), '长的作物种子更贵')
+  assert.equal(Math.min(...seeds), 6)
   assert.equal(isCropId('tomato'), true)
   assert.equal(isCropId('Tomato'), false)
   assert.equal(isCropId('alien'), false)

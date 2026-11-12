@@ -8,7 +8,7 @@ Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与�
 - `preload.js` — 渲染端唯一桥：`ready` / `reportHover` / `reportRects` / `reportOverlayRects` /
   `setBusy` / `requestAction` / `onActionResult` / `onScene`
 - `index.html` + `renderer.js` — 透明画布；每只宠物一个 DOM 节点，60fps 本地物理；
-  悬停/点击控件（串门/召回/送客/放行卡/提示气泡）也在这里
+  悬停/点击控件（串门/送客/放行卡/「不在家」胶囊与面板/提示气泡）也在这里
 - `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v3（含 `controls` / `menu`）、物理、
   命中判定、穿透裁定
 
@@ -64,7 +64,7 @@ DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop   # 额外写 .scratch/dsh-zoo/notes
 有像素、`dshzoo://` 真的加载了 WebM；再跑点击穿透两条通道、输入租约（含超时）、拖拽/投掷、
 场景增删/reset、素材缺失时的 SVG 降级、崩溃重启、dispose、宿主被 SIGKILL 后 helper 自行退出。
 ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给宿主、失败 `notice` 冒泡、
-放行卡接受/拒绝、送客、自己出门时的召回胶囊，以及点击穿透的几条硬线（A2/A3）：
+放行卡接受/拒绝、送客、自己出门时的「不在家」胶囊与它的面板，以及点击穿透的几条硬线（A2/A3）：
 弹层打开但光标离开宠物与弹层时整窗必须穿透、宠物与弹层之间的空隙由桥接矩形接管、
 拖拽租约必须在 `ui:drag` 盖住光标时才生效、租约超时（冻住心跳）和连续持有硬上限
 （心跳仍在续租，`debug-busy-max` 缩短到 700ms）。
@@ -115,7 +115,10 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 菜单内容由宿主随场景下发（`scene.menu`），helper 只画：
 
 - 只挂**自己**（`role: 'self'`）；访客和空白桌面都不弹，也不吞鼠标。
-- 一级 = 工具项（`open-site` / `bring` / `home` / `reload`）+「动作」；二级 = 分类；三级 = 动画名。
+- 一级 = 工具项（`open-site` / `bring` / `farm` / `home` / `reload` / `scan-skins`）+「动作」；
+  二级 = 分类；三级 = 动画名。
+- 宠物不在家时菜单从「不在家」胶囊打开（`petId:null`）：工具项照旧，只少「回到初始位置」
+  ——没有 self 可回，留着就是一个点了没反应的假入口。
 - 每级是**平级面板**：贴右/贴下自动翻到另一侧，各自独立滚动；面板矩形进 `overlay-rects`，
   一级面板与宠物之间有桥接矩形。
 - 菜单打开时宠物停住（不飞、不漫游、不轮播换段）。
@@ -177,7 +180,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   ],
   "controls": {
     "visit": { "enabled": true, "reason": null },
-    "recall": { "enabled": false, "nickname": null },
+    "recall": { "enabled": false, "mode": null, "text": null, "title": null, "contractId": null },
     "visitors": [{ "deviceId": "6f1c…", "label": "阿蟹" }],
     "gifts": [{ "deviceId": "6f1c…", "giftId": "…", "kind": "file", "name": "照片.png",
                 "title": "「阿蟹」捎来一个文件", "status": "received",
@@ -196,8 +199,22 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 `controls` 是 ticket 11 的宿主权威状态（全部可缺省，缺省即“没有控件”）：
 
 - `visit`：串门按钮；`enabled:false` 时 `reason` 必须是能直接显示给人看的一句话。
-- `recall`：自己出门时桌面没有 `self`，渲染端用一个常驻「召回」胶囊代替；
-  `nickname` 用来显示“在「阿蟹」家”。
+- `recall`（ticket 11/57）：宠物不在家时常驻的那颗胶囊。三种不在家都算——`visiting`（串门）、
+  `raiding`（去偷）、`working`（在外打工）；`enabled:false` 时胶囊不出现。
+  `text` / `title` 是宿主算好的人话（`src/away-text.js`），渲染端只画，不猜 mode；
+  `contractId` 只在 `working` 时给，胶囊面板里的「叫它回家」用它发 `recall-worker`。
+  宠物不在家时 `items` 里没有 `self`，这一项长这样：
+
+  ```json
+  { "enabled": true, "mode": "working", "text": "在「阿蟹」家打工",
+    "title": "小蓝在「阿蟹」家打工", "contractId": "5f1c8a2e-…" }
+  ```
+
+  点胶囊打开「不在家」面板（农场 / 邻居 / 带派 / 改名 / 召回或叫它回家 / 更多），
+  右键胶囊直接开完整菜单：宠物出门不等于桌面上的操作被拿走。
+  胶囊默认锚在宠物最后出现的位置；**按住可以拖走**（位置是渲染端自己的，ADR-0003），
+  松手后本次运行一直记住，窗口缩小时夹回工作区。拖动期间持输入租约 + `ui:chip-drag`
+  命中矩形（和宠物拖拽同一套 fail-closed 约定），位移小于 5px 仍按点击处理。
 - `visitors`：当前可送客的访客；`item.id` 是 `visitor:<deviceId>`，两边按 deviceId 对上。
 - `gifts`：贴着访客的礼物卡（ticket 23/25）。状态与标题由宿主算好；`text` 只在
   `received` 时给，`thumb` 只给图片且只接受 `dshzoo://gifts/...`。卡片/按钮/桥接矩形
@@ -237,7 +254,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 
 1. 渲染端每次物理步进后用 `dsh-zoo:rects` 上报所有宠物矩形（移动 ~30Hz，静止 300ms 心跳，
    窗口局部 DIP）。矩形带 `id`；主进程按 `id` 把场景里已经删掉的宠物立刻从命中区移除。
-2. 控件（弹层、放行卡、召回胶囊、按钮）用另一条 `dsh-zoo:overlay-rects` 上报，同样带
+2. 控件（弹层、放行卡、「不在家」胶囊与面板、按钮）用另一条 `dsh-zoo:overlay-rects` 上报，同样带
    时间戳、同样 900ms 过期。它们不参与物理，但决定了“光标压在按钮上”时窗口是否接管鼠标；
    **宠物矩形排在控件矩形后面**，重叠时宠物优先（`hit.itemId` 不会变成 `ui:*`）。
    弹层还多报一条 `ui:bridge:popover`：宠物与弹层之间 8px 间隙的并集，光标横穿时不会落空。
@@ -263,8 +280,10 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
    悬停确认恢复）。
    `forceIgnore()`（隐藏、失焦、显示器变化、宿主失联、退出）会收回租约并要求渲染端重新确认。
    **窗口失焦/渲染端死掉时，最多 1.2s + 一个 100ms 轮询就恢复穿透。**
-8. 放行卡/召回胶囊是常驻控件，**不持有租约**；它们靠 `overlay-rects` 在光标真正压上去时
-   接管鼠标，并用“宠物 + 控件”的桥接矩形盖住间隙。
+8. 放行卡/「不在家」胶囊是常驻控件，**不持有租约**；它们靠 `overlay-rects` 在光标真正压上去时
+   接管鼠标，并用“宠物/胶囊 + 控件”的桥接矩形（`ui:bridge:prompt` / `ui:bridge:away`）盖住间隙。
+   **拖胶囊是唯一的例外**：拖动期间和宠物拖拽一样持租约，并额外上报 `ui:chip-drag`
+   （胶囊 + 光标附近 80px 的并集），松手立刻撤掉。
 
 ## 素材协议 `dshzoo://`
 
@@ -343,8 +362,9 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 全部随 `farm-window` 命令下发，成功/失败走 `action-result`，窗口不自动关。
 
 - **新外壳（ticket 47）**：奶白 `#FAF8F5` 底 + 祖母绿/琥珀/天空蓝，16–24px 圆角卡片、
-  软阴影、胶囊、进度条、成熟轻微弹跳、细滚动条；系统字体 + emoji/内联 SVG，CSP 仍然
-  是 `default-src 'none'`，不加载任何 CDN/远程字体/图标库。窗口仍是 420×560
+  软阴影、胶囊、进度条、成熟轻微弹跳、细滚动条；系统字体 + 内联 SVG，CSP 是
+  `default-src 'none'` + `img-src 'self'`（只放行包内作物图，见下条），不加载任何
+  CDN/远程字体/图标库。窗口仍是 420×560
   （`FARM_WIDTH` / `FARM_HEIGHT` 未改），内容区自己滚动。
   header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / ×」，下面是 4 段页签、农场页专属的
   「一键种满 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
@@ -355,9 +375,25 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 - **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
   浇水/施肥；成熟轻微弹跳并给收获/施肥。动作 id 仍是 `farm-plant` / `farm-harvest` /
   `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。
-- **播种弹窗**：三种种子的库存、生长时长、产量；库存 0 禁用；「去交易所买种」只切页签，
+- **播种弹窗**：六种种子的库存、生长时长、产量；库存 0 禁用；「去交易所买种」只切页签，
   没有随机买种。批量：一键种满 = 按空地与种子库存逐块种下（种子用完即停）；一键收割 = 所有成熟
   地块按顺序逐条发 `farm-harvest`，busy 守卫 + 逐条 toast，不新增宿主动作。
+- **作物外观（ticket 58）**：不再用 emoji，改成包内自带的 `desktop/crops/<id>.svg`
+  （六个：小番茄/草莓/胡萝卜/玉米/南瓜/葡萄）。`desktop/farm-view.js` 的 `CROP_META`
+  同时带 `art` 和 `emoji`：有图渲染 `<img class="crop-art-img">`，没图（空地、旧邻居
+  传来的未知作物、将来漏放的作物）退回 emoji。图外面仍套 `.crop-emoji` / `.seed-emoji`
+  那个盒子，所以字号、阶段滤镜和布局都不用改；尺寸按 `1.2em` 走，只有地块卡单独钉 26px。
+  `farm.html` 是 `file://` 页面，`default-src 'none'` 会把 `<img>` 全拦掉（实测
+  `naturalWidth = 0`），所以 CSP 必须放行 `img-src 'self'`。
+- **目录随包下发（票 59）**：宿主每一包都带 `crops`（内置六种 + `<dataDir>/crops.json`），
+  `farm.js` 在 `onState` 开头调 `view.setCrops(payload.crops)`，`shared.normalizeFarmWindow`
+  也按这份目录校验种子/作物/行情（`applyCropCatalog`）。所以窗口不再自己写死六种：
+  宿主加一种，种子列表、行情行、地块卡一起多一行。窗口认识但包里没图的条目退成 🌱。
+  六颗小圆片塞不进 footer
+  一行（370 > 325，实测），`.bag-chips` 因此改成换行——横向滚动条本来是隐藏的，
+  右下角那颗会被当成画错。加一种作物 = 宿主
+  `src/farm-rules.js` + 窗口 `CROP_META` + 一个 SVG 文件，`test/farm-constants-drift.test.js`
+  会逐项比对并把漏放的图报成失败。
 - **不写死 4 块地**：`desktop/farm-view.js` 是纯视图模型（渲染页和 Node 测试共用），
   卡片、标题计数和 `plot.id` 标签都按 `farm.plots.length` / id 推；CSS 用
   `repeat(auto-fill, minmax(150px, 1fr))`。helper 的 `MAX_FARM_PLOTS` 是 50、`MIN_FARM_PLOTS`

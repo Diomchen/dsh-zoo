@@ -94,13 +94,13 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `plotId` | `farm-action` | 地块 id，`p1`–`p50`，且必须是主人**已解锁**的地块；不能是路径或自由文本 |
 | `ok` / `error`（访客动作） | `farm-action-result` | `ok` 布尔；失败时 `error` 是固定枚举（`no-visit` / `bad-plot` / `bad-action` / `not-mature` / `already-stolen` / `already-helped` / `cap` / `guard` / `starting`） |
 | `ok` / `error`（合同） | `work-ack`、`work-recall-ack`、`work-end-ack`、`work-settle-ack` | `ok` 布尔；失败时 `error` 是固定枚举（`own-pet` / `worker-unavailable` / `already-working` / `already-hired` / `bad-wage` / `bad-hours` / `no-coin` / `contract-not-found` / `contract-ended` / `contract-busy` / `busy` / `starting`）。`timeout` / `bad-device-id` / `disposed` 只在本机 HTTP/桌面结果里出现，不上线 |
-| `crop` / `qty` | `farm-action-result` | 成功时作物 id（`tomato`/`carrot`/`pumpkin`）与 0..1 的数量；失败不带 |
+| `crop` / `qty` | `farm-action-result` | 成功时作物 id（作物表里的六个之一，见 README「作物」）与 0..1 的数量；失败不带 |
 | `caught` | `farm-action-result` | 只能与 `error:'guard'` 一起出现；表示被守卫抓住（没有罚款） |
 | `reason`（访客） | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
 | `reason`（合同结束） | `work-end` | 固定枚举 `expired` / `offline` / `recall` / `employer-end` / `denied` / `cancelled` / `shutdown` / `restart` / `completed` |
 | `reason`（结算） | `work-settle` | 固定枚举 `completed` / `recall` / `employer-end` / `offline` / `expired` |
 | `at` | `market-digest` | 发起方时钟的正整数毫秒；接收方只认与本机时钟相差 ≤2 分钟的样本 |
-| `prices` | `market-digest` | `{ <cropId>: number }`；只认三种作物、有限数、夹在 `[base×0.5, base×2]`；坏条目只丢那一种 |
+| `prices` | `market-digest` | `{ <cropId>: number }`；只认作物表里的六种、有限数、夹在 `[base×0.5, base×2]`；坏条目只丢那一种 |
 | `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working`（旧版本可能给 `null`）；`available` 只在这只宠物真的能被雇时为 true；坏形状整包丢 |
 | `contractId` | `work-ack`、`work-recall`、`work-end`、`work-settle` | 合同 UUID；`work-end` 在取消一笔还没 ack 的请求时可改用 `requestId` |
 | `hours` / `wagePerHour` / `fee` | `work-request` | 时长 2–8 小时、时薪 1–100 的整数；`fee` 是 1..40 的整数，必须等于 `ceil(时薪 × 时长 × 5%)`（最低 1） |
@@ -625,6 +625,12 @@ GET /dsh-zoo-gift/<giftId>   → 文件本体
 | `busy` / `starting` / `disposed` | 上一笔还在联系中 / 宿主还没起来 / 正在关闭 |
 | `timeout` | 1.8 秒内没收到对方结果；访客动作可能白跑，雇佣请求会退款 |
 
+### 作物图（HTTP，只读，票 59）
+
+`GET /dsh-zoo-crops/<16 位内容哈希>.<svg|png>`：只服务 `<dataDir>/crop-art` 里真实存在的图，
+名字不合法或文件不存在一律 404；`content-type` 按扩展名，`cache-control: public, max-age=300`
+（内容寻址，同名即同图）。只接受 GET/HEAD，其余 405。
+
 ### 农场快照（HTTP，ticket 43）
 
 访客打开主人的农场时，由**访客的宿主服务**（不是 helper）向主人拉一份只读 JSON：
@@ -697,7 +703,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 - 发送走 `discovery.sendTo`（内部再查 `mayTalkTo`），失败不重试，下一拍自然补；
   没有放行邻居时不算“发过”。
 - 接收端四道门：只认已放行邻居；`at` 与本机时钟相差 ≤**2 分钟**；同一 peer
-  **30 秒最多 1 条**；价格只认三种作物、有限数、`[base×0.5, base×2]`。坏价格只丢那一种，
+  **30 秒最多 1 条**；价格只认作物表里的六种、有限数、`[base×0.5, base×2]`。坏价格只丢那一种，
   坏 `hire`/形状/时间才整包丢。未知字段在解析时丢掉。
 - 每家按 `deviceId` 只留最近一条 digest；指数只取**新鲜 peer 价格的中位数**（不含本机），
   `samples` 是 peer 样本数（一个 peer 时是 1）。没有 peer 样本时指数退化为本机价、
@@ -708,6 +714,38 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
   种子按表里的固定价卖，买种子不影响作物价。
 - 指数过期后保留最后一次值（交易所页画灰），但不再参与定价；邻居被拒绝/移除时
   它的 digest 和指数贡献一起清掉。
+
+### 运行时作物目录（`crop-catalog-request` / `crop-catalog`，票 59）
+
+`GET /dsh-zoo/state` 里多一项 `crops: { hash, count }`：**目录指纹**（不含内容）。
+跨机验收时把它和邻居 beacon 的 `crops.hash` 比，一致就说明两边目录收敛了。
+
+作物表不再是编译期常量：本机可以在 `<dataDir>/crops.json` 里加，局域网里的邻居也会自动同步到。
+**beacon 里只带指纹**，完整目录按需单播拉：
+
+```json
+{ "v": 1, "type": "beacon", "deviceId": "<uuid>", "nickname": "小黄", "port": 45871,
+  "caps": ["raid", "look", "crops"],
+  "crops": { "v": 1, "hash": "0123456789abcdef", "count": 7 } }
+```
+
+- 收到 beacon，`crops.hash` 和自己不一样 → 向它单播一条 `crop-catalog-request`
+  （`{ "v":1, "type":"crop-catalog-request", "deviceId":"<uuid>", "hash":"<我这边>" }`）。
+  **每邻居 30 秒最多问一次**；走 `sendDirect`（不看放行，任何发现的邻居都能同步），
+  仍有每来源 4 次 / 5 秒的反射放大保护。
+- 对方回 `crop-catalog`，分片发送：每片 ≤**8** 条定义、整包仍 ≤4 KiB，
+  `{ "catalogHash": "...", "chunk": 0, "total": 2, "entries": [ ... ] }`。
+  条目形状：`{ id, name, growMs, seedPrice, yield, base, art?: { hash, ext, bytes } }`；
+  数值在两端都按同一套 clamp（`growMs` 1 分钟–30 天、`seedPrice`/`base` 1–1000000、
+  `yield` 1–99），坏条目只丢自己。
+- 图**不走 UDP**：`art` 只带内容哈希/扩展名/字节数，邻居用局域网 HTTP 取
+  `GET /dsh-zoo-crops/<hash>.<svg|png>`（服务端只认自己 crop-art 目录里的文件），
+  单张 ≤256 KB、5 秒超时；取不到就退 emoji，不影响玩法。
+- 合并规则：**本机 `crops.json` 永远赢**；收到的同 id 不同定义按定义哈希字典序小者胜
+  （与到达顺序无关，所有机器收敛到同一份）；结果写 `<dataDir>/crop-catalog.json`，
+  发布者关机也不丢。目录**只增不减**——删定义会让别人地里的作物变空地。
+- 兼容：老版本不认识这两个类型，会在最外层按「未知类型」丢掉；它看到的新作物仍是空地，
+  行情里也不会有。beacon 里多余的 `crops` 字段对老版本无影响。
 
 ### 雇佣合同（8 种 `work-*`，ticket 44）
 
@@ -836,7 +874,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
   `action`/`error` 是固定枚举，`caught` 只能跟 `guard` 一起出现。
   `farm-action-result` 只按 `requestId` 回放已落账的结果；未授权动作静默丢弃。
   动作的日限额与每块地每轮一次把刷屏限制在有界范围内，不另叠滑动窗口。
-- `market-digest` 只读三种作物、有限数、`[base×0.5, base×2]` 的价格与固定形状的 `hire`；
+- `market-digest` 只读作物表里的六种、有限数、`[base×0.5, base×2]` 的价格与固定形状的 `hire`；
   只认放行邻居、2 分钟内、每 peer 30 秒 1 条。坏价格只丢那一种，坏形状整包丢。
 - 8 种 `work-*` 各自校验 UUID/整数范围/固定枚举；`work-*` 不落进 `VISIT_TYPES` 的
   四字段分支。合同只能由本机 action（`hire` / `hire-listing` / `recall-worker` /

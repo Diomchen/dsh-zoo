@@ -390,6 +390,7 @@ function renderVisitorPlots () {
       crop: plot.crop,
       cropName: meta === null ? '空地' : meta.name,
       emoji: meta === null ? '＋' : meta.emoji,
+      art: meta === null ? '' : meta.art,
       badge: stage === 'mature' ? '可收割' : stage === 'growing' ? '生长中' : '空地',
       mature: stage === 'mature',
       progress: view.progressOf(plot),
@@ -438,6 +439,7 @@ function renderLookPlots () {
       crop: plot.crop,
       cropName: meta === null ? '空地' : meta.name,
       emoji: meta === null ? '＋' : meta.emoji,
+      art: meta === null ? '' : meta.art,
       badge: stage === 'mature' ? '可收割' : stage === 'growing' ? '生长中' : '空地',
       mature: stage === 'mature',
       progress: view.progressOf(plot),
@@ -626,9 +628,7 @@ function stackChip (meta, count, kind, cropId) {
   chip.className = 'stack-chip' + (count <= 0 ? ' muted' : '')
   chip.dataset.stackKind = kind
   chip.dataset.crop = cropId
-  const emoji = document.createElement('span')
-  emoji.setAttribute('aria-hidden', 'true')
-  emoji.textContent = meta.emoji
+  const emoji = view.cropEmblem(document, meta, 'stack-emoji')
   const name = document.createElement('span')
   name.textContent = meta.name
   const value = document.createElement('b')
@@ -732,8 +732,9 @@ function renderCarried () {
     } else if (entry !== null && typeof entry === 'object' && entry.kind === 'crop') {
       const crop = cropMeta(entry.crop)
       const qty = Number(entry.qty)
-      item.textContent = (crop === null ? '作物' : crop.emoji + ' ' + crop.name) +
-        ' ×' + (Number.isFinite(qty) && qty > 0 ? Math.floor(qty) : 1) + ' · 在驮包里'
+      item.appendChild(view.cropEmblem(document, crop, 'carried-art'))
+      item.appendChild(document.createTextNode(' ' + (crop === null ? '作物' : crop.name) +
+        ' ×' + (Number.isFinite(qty) && qty > 0 ? Math.floor(qty) : 1) + ' · 在驮包里'))
     } else {
       continue
     }
@@ -886,10 +887,7 @@ function renderMarket () {
 
     const head = document.createElement('div')
     head.className = 'market-row-head'
-    const emoji = document.createElement('span')
-    emoji.className = 'emoji'
-    emoji.setAttribute('aria-hidden', 'true')
-    emoji.textContent = meta.emoji
+    const emoji = view.cropEmblem(document, meta, 'emoji')
     const name = document.createElement('span')
     name.className = 'name'
     name.textContent = meta.name
@@ -1493,10 +1491,7 @@ function renderPlantModal () {
     row.disabled = busy || count <= 0
     if (count <= 0) row.title = '没有这种种子了'
     row.setAttribute('aria-label', meta.name + '，库存 ' + count)
-    const emoji = document.createElement('span')
-    emoji.className = 'seed-emoji'
-    emoji.setAttribute('aria-hidden', 'true')
-    emoji.textContent = meta.emoji
+    const emoji = view.cropEmblem(document, meta, 'seed-emoji')
     const info = document.createElement('span')
     info.className = 'seed-info'
     const name = document.createElement('strong')
@@ -1998,6 +1993,9 @@ document.addEventListener('keydown', (event) => {
 
 api?.onState((payload) => {
   if (payload === null || typeof payload !== 'object') return
+  // 票 59：作物目录随每一包下发（内置六种 + `<dataDir>/crops.json` 里手写的）。
+  // 先换目录再画，不然新作物会被当成未知 id 画成空地。
+  view.setCrops(payload.crops)
   farm = payload.farm !== null && typeof payload.farm === 'object' ? payload.farm : null
   market = payload.market !== null && typeof payload.market === 'object' ? payload.market : null
   contracts = payload.contracts !== null && typeof payload.contracts === 'object' ? payload.contracts : null

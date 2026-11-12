@@ -170,7 +170,8 @@ test('normalizeMarketFile：整份损坏 → 初始价；逐项夹取/丢弃/裁
 test('normalizeMarketFile：缺 prices/history/index 不崩，补成完整形状', () => {
   const normalized = normalizeMarketFile({ version: MARKET_VERSION })
   assert.equal(normalized.corrupt, false)
-  assert.deepEqual(Object.keys(normalized.market.prices).sort(), ['carrot', 'pumpkin', 'tomato'])
+  assert.deepEqual(Object.keys(normalized.market.prices).sort(),
+    ['carrot', 'corn', 'grape', 'pumpkin', 'strawberry', 'tomato'])
   assert.deepEqual(normalized.market.history, [])
   assert.deepEqual(normalized.market.index, {})
 
@@ -347,8 +348,11 @@ test('形状不对：坏价格/坏历史/坏指数只修不崩，且只告警一
   assert.equal(store.snapshot().history.length, 1)
   assert.deepEqual(store.snapshot().index, {
     tomato: { price: 5, at: NOON, samples: 1 },
+    strawberry: { price: 7, at: NOON, samples: 0 },
     carrot: { price: 12, at: NOON, samples: 0 },
-    pumpkin: { price: 15, at: NOON, samples: 0 }
+    corn: { price: 9, at: NOON, samples: 0 },
+    pumpkin: { price: 15, at: NOON, samples: 0 },
+    grape: { price: 24, at: NOON, samples: 0 }
   })
 })
 

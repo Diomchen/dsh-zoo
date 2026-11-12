@@ -11,14 +11,14 @@
  */
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
 import { FARM_FILE, FARM_VERSION, initialFarmState } from '../src/farm.js'
-import { MINUTE_MS } from '../src/farm-rules.js'
+import { MINUTE_MS, resetCropCatalog } from '../src/farm-rules.js'
 import { MARKET_FILE, MARKET_VERSION } from '../src/market.js'
 import { createService } from '../src/service.js'
 
@@ -72,6 +72,9 @@ function makeService (t, options = {}) {
   })
   service.routes = routes
   t.after(() => service.dispose())
+  // 票 59：运行时作物表是进程级状态（生产里一个进程一个 service）。
+  // 用例之间必须复位，否则上一条用例写进 crops.json 的作物会漏给下一条。
+  t.after(() => resetCropCatalog())
   return service
 }
 
@@ -196,8 +199,12 @@ test('farm-open：窗口拿完整农场；场景没有 controls.farm；再点一
     waterings: 0,
     fertilized: false
   })
-  assert.deepEqual(window.farm.seeds, { tomato: 2, carrot: 0, pumpkin: 0 })
-  assert.deepEqual(window.farm.crops, { tomato: 0, carrot: 0, pumpkin: 0 })
+  assert.deepEqual(window.farm.seeds, {
+    tomato: 2, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+  })
+  assert.deepEqual(window.farm.crops, {
+    tomato: 0, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+  })
   assert.equal(window.farm.coins, 30)
   assert.equal(window.farm.dew, 0)
   assert.deepEqual(window.farm.log, [])
@@ -386,8 +393,11 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   // 没有 peer：指数仍是完整形状，但每条都是「本机价 / samples 0」。
   assert.deepEqual(window.market.index, {
     tomato: { price: 5, at: NOON, samples: 0, stale: false },
+    strawberry: { price: 7, at: NOON, samples: 0, stale: false },
     carrot: { price: 6, at: NOON, samples: 0, stale: false },
-    pumpkin: { price: 30, at: NOON, samples: 0, stale: false }
+    corn: { price: 9, at: NOON, samples: 0, stale: false },
+    pumpkin: { price: 30, at: NOON, samples: 0, stale: false },
+    grape: { price: 24, at: NOON, samples: 0, stale: false }
   })
   assert.equal('farm' in desktop.calls.scenes.at(-1).controls, false)
 
@@ -401,7 +411,9 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   await waitFor(() => desktop.calls.windows.at(-1).open === false)
   const refreshed = desktop.calls.windows.at(-1)
   assert.equal(refreshed.farm.coins, 18)
-  assert.deepEqual(refreshed.farm.seeds, { tomato: 4, carrot: 0, pumpkin: 0 })
+  assert.deepEqual(refreshed.farm.seeds, {
+    tomato: 4, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+  })
   assert.equal(refreshed.market.prices.tomato.volume24h, 2)
   assert.equal(refreshed.market.history[0].side, 'buy')
 
@@ -424,7 +436,9 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   await waitFor(() => desktop.calls.windows.length > beforeSell)
   const soldWindow = desktop.calls.windows.at(-1)
   assert.equal(soldWindow.farm.coins, 33)
-  assert.deepEqual(soldWindow.farm.crops, { tomato: 0, carrot: 0, pumpkin: 0 })
+  assert.deepEqual(soldWindow.farm.crops, {
+    tomato: 0, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+  })
   assert.equal(soldWindow.market.history[0].side, 'sell')
   assert.equal(soldWindow.market.history[0].price, 5)
   assert.ok(soldWindow.market.prices.tomato.price < 5)
@@ -1158,4 +1172,166 @@ test('邻居切换器的形状：少就圆片，多就胶囊，排序看熟地',
   assert.equal(many.items.find((item) => item.active)?.label, '邻居4')
   // 能偷的排最前
   assert.ok(many.items.slice(0, 2).every((item) => item.ripePlots === 2))
+})
+
+// ---------------------------------------------------------------------------
+// 票 58：作物外观是包内 SVG，emoji 只做兜底
+// ---------------------------------------------------------------------------
+
+test('作物图：有 art 就给 <img>，没 art 才退回 emoji', () => {
+  const documentDouble = { createElement: (tag) => fakeElement(tag) }
+
+  const withArt = farmView.cropEmblem(documentDouble, { art: 'crops/corn.svg', emoji: '🌽' }, 'seed-emoji')
+  assert.equal(withArt.className, 'seed-emoji')
+  assert.equal(withArt.textContent, '')
+  assert.equal(withArt.children.length, 1)
+  const img = withArt.children[0]
+  assert.equal(img.tagName, 'IMG')
+  assert.equal(img.getAttribute('src'), 'crops/corn.svg')
+  // 装饰图：名字在旁边的文字里，读屏只念一次。
+  assert.equal(img.getAttribute('alt'), '')
+
+  // 空地（art 为空）和未知作物（null）都走 emoji/文本这一支，格子不会空着。
+  const noArt = farmView.cropEmblem(documentDouble, { art: '', emoji: '＋' }, 'crop-emoji')
+  assert.equal(noArt.children.length, 0)
+  assert.equal(noArt.textContent, '＋')
+  const unknown = farmView.cropEmblem(documentDouble, null, 'crop-emoji')
+  assert.equal(unknown.children.length, 0)
+  assert.equal(unknown.textContent, '')
+})
+
+test('地块卡模型：认识六种作物，每种都带图路径', () => {
+  const plots = Object.keys(farmView.CROP_META).map((cropId, index) => ({
+    id: 'p' + (index + 1),
+    crop: cropId,
+    stage: 'growing',
+    remainingMs: 60 * 1000,
+    waterings: 0,
+    fertilized: false
+  }))
+  const cards = farmView.plotCards({ plots, dew: 0 }, {})
+  assert.deepEqual(cards.map((card) => card.crop), Object.keys(farmView.CROP_META))
+  for (const card of cards) {
+    assert.equal(card.art, 'crops/' + card.crop + '.svg')
+    assert.equal(JSON.stringify(card.emoji).length > 2, true)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 票 59：作物目录随每一包下发，窗口按目录画
+// ---------------------------------------------------------------------------
+
+test('crops.json 里的作物：窗口拿到目录，地块卡画名字而不是空地', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, 'crops.json'), JSON.stringify({
+    version: 1,
+    crops: [{ id: 'blueberry', name: '蓝莓', growMs: 90 * MINUTE_MS, seedPrice: 30, yield: 4, base: 18 }]
+  }))
+  const clock = { value: NOON }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  // 种一种新作物：宿主要真的认它。
+  const bought = await callAction(service, { action: 'farm-buy-seed', cropId: 'blueberry', qty: 1 })
+  assert.equal(bought.body.ok, true, JSON.stringify(bought.body))
+  const planted = await callAction(service, { action: 'farm-plant', plotId: 'p1', cropId: 'blueberry' })
+  assert.equal(planted.body.ok, true, JSON.stringify(planted.body))
+
+  await callAction(service, { action: 'farm-open' })
+  const window = desktop.calls.windows.at(-1)
+  const catalog = window.crops
+  assert.ok(Array.isArray(catalog), '窗口必须收到作物目录')
+  assert.deepEqual(catalog.map((entry) => entry.id).sort(),
+    ['blueberry', 'carrot', 'corn', 'grape', 'pumpkin', 'strawberry', 'tomato'])
+  assert.deepEqual(catalog.find((entry) => entry.id === 'blueberry'),
+    { id: 'blueberry', name: '蓝莓', growMs: 90 * MINUTE_MS, yield: 4, seedPrice: 30, base: 18 })
+  // 仓库里也有这个键（不然窗口会把它当成未知作物）。
+  assert.equal(window.farm.seeds.blueberry, 0)
+  assert.equal(window.farm.plots[0].crop, 'blueberry')
+
+  // 视图层照目录画：名字是「蓝莓」，不是「空地」。窗口里是 farm.js 在每一包开头调
+  // `view.setCrops(payload.crops)`；这里照同一条路径走，用完复位（模块级状态）。
+  farmView.setCrops(window.crops)
+  t.after(() => farmView.setCrops(null))
+  const card = farmView.plotCards(window.farm, { dew: 0 })[0]
+  assert.equal(card.cropName, '蓝莓')
+  assert.equal(card.art, '', '还没画图：走 emoji 兜底')
+  assert.equal(card.emoji, '🌱')
+})
+
+test('自定义作物带图（票 59）：宿主落 <hash>.<ext>，窗口拿到 dshzoo://crops/...', async (t) => {
+  const dir = await tempDir(t)
+  await mkdir(join(dir, 'crops'), { recursive: true })
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><circle cx="50" cy="50" r="40"/></svg>'
+  await writeFile(join(dir, 'crops', 'kiwi.svg'), svg)
+  await writeFile(join(dir, 'crops.json'), JSON.stringify({
+    version: 1,
+    crops: [{ id: 'kiwi', name: '猕猴桃', growMs: 2 * 60 * MINUTE_MS, seedPrice: 20, yield: 5, base: 12 }]
+  }))
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  await callAction(service, { action: 'farm-open' })
+  const catalog = desktop.calls.windows.at(-1).crops
+  const kiwi = catalog.find((entry) => entry.id === 'kiwi')
+  assert.match(kiwi.art, /^dshzoo:\/\/crops\/[0-9a-f]{16}\.svg$/)
+  // 内置六种没有 art 字段：窗口按 id 回落到包里的 SVG。
+  assert.equal('art' in catalog.find((entry) => entry.id === 'tomato'), false)
+
+  // 图真落盘了，而且名字就是 URL 里那个哈希。
+  const name = kiwi.art.replace('dshzoo://crops/', '')
+  const bytes = await readFile(join(dir, 'crop-art', name), 'utf8')
+  assert.equal(bytes, svg)
+
+  // 视图层认这个 URL：整份目录换进去以后，猕猴桃有图、不是 🌱。
+  farmView.setCrops(catalog)
+  t.after(() => farmView.setCrops(null))
+  assert.equal(farmView.CROP_META.kiwi.art, kiwi.art)
+  assert.equal(farmView.CROP_META.tomato.art, 'crops/tomato.svg')
+})
+
+test('热加载（票 59）：改 crops.json 不重启，窗口自己多出一种作物', async (t) => {
+  const dir = await tempDir(t)
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    cropPollMs: 20
+  })
+  t.after(() => resetCropCatalog())
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  await callAction(service, { action: 'farm-open' })
+  assert.equal((desktop.calls.windows.at(-1).crops ?? []).some((entry) => entry.id === 'kiwi'), false)
+
+  // 用户把文件写进去，不重启、不点任何东西。
+  await writeFile(join(dir, 'crops.json'), JSON.stringify({
+    version: 1,
+    crops: [{ id: 'kiwi', name: '猕猴桃', growMs: 2 * 60 * MINUTE_MS, seedPrice: 20, yield: 5, base: 12 }]
+  }))
+
+  await waitFor(() => (desktop.calls.windows.at(-1).crops ?? []).some((entry) => entry.id === 'kiwi'))
+  const entry = desktop.calls.windows.at(-1).crops.find((candidate) => candidate.id === 'kiwi')
+  assert.equal(entry.base, 12)
+  assert.equal(entry.growMs, 2 * 60 * MINUTE_MS)
+  // 宿主认了，地块卡才能画名字；这条顺手确认运行时表也更新了。
+  assert.equal(desktop.calls.windows.at(-1).farm.seeds.kiwi, 0)
 })

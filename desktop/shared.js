@@ -131,6 +131,11 @@
   const PET_ROLES = ['self', 'guest', 'visitor', 'worker']
   /** 宠物角标的固定枚举（跨进程传输，不能用自由文本）。 */
   const PET_BADGES = ['work', 'steal']
+  /**
+   * 宠物「不在家」的三种状态（ticket 57）。与 `src/away-text.js` 的 AWAY_MODES 同源
+   * （渲染端不能 import Node 模块，只能抄一份；`test/away-desktop.test.js` 有相等性断言）。
+   */
+  const AWAY_MODES = ['visiting', 'raiding', 'working']
   const SCENE_VERSION = 3
   /**
    * 农场小窗能提交的动作。地块四条（ticket 40）只带 plotId（种地再带 cropId）；
@@ -270,13 +275,18 @@
    * 所以按 `desktop/shared.js` 的老规矩再守一次边界，改的时候两边一起改：
    *   - 宿主开局 4 块地（p1–p4），最多解锁到 50 块（ticket 48）；窗口/helper
    *     边界不写死 4：卡片和标题完全跟 `farm.plots` 走；
-   *   - 三种作物，与 SPEC v5 的作物表一致；
+   *   - 六种作物，与 SPEC v5 的作物表一致（票 58 由三种扩到六种）；
    *   - 硬币/种子/作物/露水/合同/日志的硬上限与 SPEC v5「货币、仓库与限额」一致。
    */
   const MAX_FARM_PLOTS = 50
   /** 起始地块数：与宿主 `START_PLOTS` 同源；窗口不接受 1–3 这种宿主永远发不出的状态。 */
   const MIN_FARM_PLOTS = 4
-  const CROP_IDS = ['tomato', 'carrot', 'pumpkin']
+  /**
+   * 票 59：窗口认哪些作物、底价多少，都由宿主随 `farm-window` 下发的 `crops` 决定。
+   * 这两份是可变的默认值：内置六种打底，`applyCropCatalog()` 原地换内容，
+   * 所有 `for (const id of CROP_IDS)` 在调用时读到的是最新那份。
+   */
+  const CROP_IDS = ['tomato', 'strawberry', 'carrot', 'corn', 'pumpkin', 'grape']
   const FARM_STAGES = ['empty', 'growing', 'mature']
   const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock']
   const MAX_FARM_COINS = 1000000
@@ -288,7 +298,60 @@
    * 交易所（ticket 41）的窄口：底价表与 `src/farm-rules.js` 同源；
    * 价格夹在 [base×0.5, base×2]，成交历史最多 50 条进窗口。
    */
-  const CROP_BASE_PRICE = { tomato: 5, carrot: 6, pumpkin: 30 }
+  const CROP_BASE_PRICE = { tomato: 5, strawberry: 7, carrot: 6, corn: 9, pumpkin: 30, grape: 24 }
+  /** 目录上限：与 `src/crop-catalog.js` 的 MAX_CROPS 同源（drift 测试会读）。 */
+  const MAX_FARM_CROPS = 64
+  const MAX_CROP_NAME = 16
+  const MAX_FARM_GROW_MS = 30 * 24 * 60 * 60 * 1000
+
+  /**
+   * 用宿主下发的目录换掉上面两份（票 59）。
+   * 只认 `{ id, name, base }` 这一层——窗口不需要产量/生长时长以外的字段，
+   * 但底价必须跟着走，否则新作物在交易所行里会被 `normalizeMarketPrice` 判成坏的。
+   */
+  /**
+   * 作物图只认两种 URL：包里的相对路径，或 helper 的 `dshzoo://crops/<16 位哈希>.<svg|png>`。
+   * 宿主已经校验过，窗口这边再挡一次——IPC 上的东西一律当不可信输入。
+   */
+  function normalizeCropArt (value) {
+    if (typeof value !== 'string') return null
+    if (/^crops\/[a-z0-9_-]{2,24}\.(?:svg|png)$/.test(value)) return value
+    if (/^dshzoo:\/\/crops\/[0-9a-f]{16}\.(?:svg|png)$/.test(value)) return value
+    return null
+  }
+
+  function applyCropCatalog (list) {
+    if (!Array.isArray(list) || list.length === 0) return null
+    const entries = []
+    const ids = []
+    const bases = {}
+    for (const raw of list.slice(0, MAX_FARM_CROPS)) {
+      if (raw === null || typeof raw !== 'object') continue
+      const id = typeof raw.id === 'string' ? raw.id.trim().toLowerCase() : ''
+      const name = typeof raw.name === 'string' ? raw.name.trim().slice(0, MAX_CROP_NAME) : ''
+      if (id === '' || name === '') continue
+      const base = Number(raw.base)
+      if (!Number.isFinite(base) || base <= 0) continue
+      const entry = {
+        id,
+        name,
+        base: Math.min(MAX_FARM_COINS, Math.max(1, Math.floor(base))),
+        ...(normalizeCropArt(raw.art) === null ? {} : { art: normalizeCropArt(raw.art) }),
+        seedPrice: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(Number(raw.seedPrice) || 0))),
+        growMs: Math.min(MAX_FARM_GROW_MS, Math.max(0, Math.floor(Number(raw.growMs) || 0))),
+        yield: Math.min(999, Math.max(0, Math.floor(Number(raw.yield) || 0)))
+      }
+      entries.push(entry)
+      ids.push(id)
+      bases[id] = entry.base
+    }
+    if (ids.length === 0) return null
+    CROP_IDS.length = 0
+    CROP_IDS.push(...ids)
+    for (const id of Object.keys(CROP_BASE_PRICE)) delete CROP_BASE_PRICE[id]
+    Object.assign(CROP_BASE_PRICE, bases)
+    return entries
+  }
   const MAX_FARM_MARKET_HISTORY = 50
   const MARKET_SIDES = ['buy', 'sell']
   const MARKET_MIN_QTY = 1
@@ -1150,6 +1213,9 @@
   }
 
   function normalizeFarmWindow (raw) {
+    // 票 59：目录必须先换、再校验——`normalizeCropId` 是按当前目录判的，
+    // 顺序反了的话这一包里的新作物会被当成未知 id 丢掉（地块变空地、种子清零）。
+    const crops = applyCropCatalog(raw.crops)
     const plotId = normalizePlotId(raw.plotId)
     const visit = normalizeFarmVisit(raw.visit)
     const look = normalizeFarmLook(raw.look)
@@ -1157,6 +1223,8 @@
       open: raw.open === true,
       ...(raw.close === true ? { close: true } : {}),
       mode: look !== null ? 'look' : raw.mode === 'visitor' ? 'visitor' : 'owner',
+      // 票 59：窗口按这份目录画新作物；老宿主没这一项 = 只有内置六种。
+      ...(crops === null ? {} : { crops }),
       neighbors: normalizeNeighborChips(raw.neighbors),
       farm: normalizeFarm(raw.farm),
       market: normalizeMarket(raw.market),
@@ -1415,7 +1483,11 @@
    *
    * control 的字段刻意保持扁平：
    *   visit    { enabled, reason }        串门按钮（reason 只在置灰时出现，必须是给人看的一句话）
-   *   recall   { enabled, nickname }      召回入口（自己出门时桌面没有 self，需要常驻小胶囊）
+   *   recall   { enabled, mode, text, title, contractId }
+   *                                       「宠物不在家」的常驻胶囊（ticket 11/57）。三种不在家都算：
+   *                                       visiting（串门）/ raiding（去偷）/ working（在外打工）；
+   *                                       text/title 是宿主算好的人话，contractId 只给打工
+   *                                       （叫它回家 = recall-worker）
    *   visitors [{ deviceId, label }]      可以送客的访客（item id 是 visitor:<deviceId>）
    *   street   [{ deviceId, label, action, canVisit, blockedReason }]  邻居面板那一排房子（ticket 21）
    *   gifts    [{ deviceId, giftId, kind, status, title, text?, statusText? }]  贴着访客的礼物卡（ticket 23）
@@ -1425,7 +1497,7 @@
   function emptyControls () {
     return {
       visit: { enabled: false, reason: null },
-      recall: { enabled: false, nickname: null },
+      recall: { enabled: false, mode: null, text: null, title: null, contractId: null },
       visitors: [],
       street: [],
       gifts: [],
@@ -1448,10 +1520,15 @@
 
     const recall = raw.recall
     if (recall !== null && typeof recall === 'object' && !Array.isArray(recall)) {
-      controls.recall.enabled = recall.enabled === true
-      controls.recall.nickname = controls.recall.enabled
-        ? normalizeLabel(recall.nickname, '邻居')
-        : null
+      // 不在家（ticket 57）：mode 决定按钮是「召回」还是「叫它回家」，渲染端不猜；
+      // 文案由宿主算好（away-text.js），这里只守形状与长度。
+      if (recall.enabled === true) {
+        controls.recall.enabled = true
+        controls.recall.mode = AWAY_MODES.includes(recall.mode) ? recall.mode : null
+        controls.recall.text = normalizeText(recall.text, null, MAX_REASON_LENGTH)
+        controls.recall.title = normalizeText(recall.title, null, MAX_REASON_LENGTH)
+        controls.recall.contractId = normalizeUuid(recall.contractId)
+      }
     }
 
     const seenVisitors = new Set()
@@ -3112,6 +3189,7 @@
     ITEM_KINDS,
     PET_ROLES,
     PET_BADGES,
+    AWAY_MODES,
     SCENE_VERSION,
     CONTROL_ACTIONS,
     GIFT_ACTIONS,
@@ -3152,6 +3230,7 @@
     MARKET_MAX_QTY,
     normalizeFarm,
     normalizeFarmWindow,
+    applyCropCatalog,
     normalizeFarmAction,
     normalizeFarmHire,
     normalizeContracts,

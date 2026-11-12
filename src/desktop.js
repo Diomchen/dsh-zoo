@@ -71,6 +71,7 @@ function safe (fn, fallback) {
  * @param {Function} [options.exists] 路径存在性注入
  * @param {string[]} [options.assetRoots] 宿主解析好的 dsh-pet 素材目录（helper 的 dshzoo:// 根）
  * @param {string} [options.cacheRoot] 远端素材缓存目录（helper 的 dshzoo://cache 根）
+ * @param {string} [options.cropArtRoot] 作物图目录（helper 的 dshzoo://crops 根，票 59）
  * @param {string} [options.giftsRoot] 收到的礼物根目录（helper 的 dshzoo://gifts 根，ticket 25）
  * @param {Function} [options.onEvent] 收到 helper 事件（ready/hit/...）时回调；异常被吞
  */
@@ -93,6 +94,8 @@ export function createDesktop (options = {}) {
   const cacheRoot = typeof options.cacheRoot === 'string' && options.cacheRoot !== '' ? options.cacheRoot : null
   /** ticket 25：礼物根目录，只给 helper 的 `dshzoo://gifts/...` 缩略图用。 */
   const giftsRoot = typeof options.giftsRoot === 'string' && options.giftsRoot !== '' ? options.giftsRoot : null
+  /** 票 59：作物图目录，只给 helper 的 `dshzoo://crops/<hash>.<ext>` 用。 */
+  const cropArtRoot = typeof options.cropArtRoot === 'string' && options.cropArtRoot !== '' ? options.cropArtRoot : null
   const debug = options.debug === true
   const pingMs = Number.isFinite(options.pingMs) && options.pingMs >= 100 ? options.pingMs : DESKTOP_PING_MS
   const pongTimeoutMs = Number.isFinite(options.pongTimeoutMs) && options.pongTimeoutMs >= 5000
@@ -198,7 +201,15 @@ export function createDesktop (options = {}) {
     if (disposed || child !== null || availability === null || !availability.ok) {
       return { ok: false, reason: 'not-running' }
     }
-    const args = buildHelperArgs({ helperPath: helperMain, hostPid, debug, assetRoots, cacheRoot, giftsRoot })
+    const args = buildHelperArgs({
+      helperPath: helperMain,
+      hostPid,
+      debug,
+      assetRoots,
+      cacheRoot,
+      giftsRoot,
+      cropArtRoot
+    })
     policy.onStart(now())
     let spawned = null
     try {

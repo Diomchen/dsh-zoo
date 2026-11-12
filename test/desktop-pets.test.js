@@ -547,7 +547,13 @@ test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客�
   })
   const controls = controlsFromSnapshot(snapshot)
   assert.deepEqual(controls.visit, { enabled: true, reason: null })
-  assert.deepEqual(controls.recall, { enabled: false, nickname: null })
+  assert.deepEqual(controls.recall, {
+    enabled: false,
+    mode: null,
+    text: null,
+    title: null,
+    contractId: null
+  })
   assert.deepEqual(controls.visitors, [{ deviceId: visitorId, label: '阿蟹' }])
   assert.deepEqual(controls.prompt, { deviceId: promptId, nickname: '泡泡' })
   assert.equal(controls.notice.text, '「阿蟹」没有回应，等了一会儿，宠物先留在家里了。')
@@ -595,11 +601,81 @@ test('controlsFromSnapshot：串门可用性/置灰理由、召回、可送客�
     }
   }))
   assert.equal(away.visit.enabled, false)
-  assert.equal(away.recall.enabled, true)
-  assert.equal(away.recall.nickname, '阿蟹')
+  assert.deepEqual(away.recall, {
+    enabled: true,
+    mode: 'visiting',
+    text: '在「阿蟹」家',
+    title: '小蓝在「阿蟹」家',
+    contractId: null
+  })
   assert.equal(away.visit.reason, visitReasonText('already-out', '阿蟹'))
   assert.match(away.visit.reason, /阿蟹/)
   assert.match(away.visit.reason, /召回/)
+
+  // 去偷也是一次出门（ticket 53）：胶囊照样在，但文案说“去偷菜了”，不是“在它家”。
+  const raiding = controlsFromSnapshot(snapshotWith({
+    self: {
+      ...snapshotWith().self,
+      out: {
+        deviceId: visitorId,
+        nickname: '阿蟹',
+        visitId: 'v2',
+        phase: 'active',
+        purpose: 'steal',
+        startedAt: 1,
+        endsAt: 2
+      }
+    }
+  }))
+  assert.equal(raiding.visit.enabled, false)
+  assert.equal(raiding.recall.enabled, true)
+  assert.equal(raiding.recall.mode, 'raiding')
+  assert.equal(raiding.recall.text, '去「阿蟹」家偷菜了')
+  assert.equal(raiding.recall.contractId, null)
+
+  // 在外打工（ticket 44/57）：以前这里什么入口都没有——桌面上没有 self，
+  // 召回胶囊也不出现，右键菜单/农场窗全都没有锚点。现在胶囊带着合同号。
+  const contractId = '55555555-5555-4555-8555-555555555555'
+  const working = controlsFromSnapshot(snapshotWith({
+    self: {
+      ...snapshotWith().self,
+      work: {
+        contractId,
+        employerDeviceId: visitorId,
+        employerNickname: '柯基',
+        startedAt: 1,
+        endsAt: 2,
+        guard: 0.5,
+        lastSeen: 1
+      }
+    }
+  }))
+  assert.equal(working.visit.enabled, false)
+  assert.match(working.visit.reason, /在外打工/)
+  assert.deepEqual(working.recall, {
+    enabled: true,
+    mode: 'working',
+    text: '在「柯基」家打工',
+    title: '小蓝在「柯基」家打工',
+    contractId
+  })
+
+  // 合同号不是 UUID 就不给按钮留一个假 target：渲染端会把它置灰并说明原因。
+  const badContract = controlsFromSnapshot(snapshotWith({
+    self: {
+      ...snapshotWith().self,
+      work: {
+        contractId: 'not-a-uuid',
+        employerDeviceId: visitorId,
+        employerNickname: '柯基',
+        startedAt: 1,
+        endsAt: 2,
+        guard: 0.5,
+        lastSeen: 1
+      }
+    }
+  }))
+  assert.equal(badContract.recall.contractId, null)
 
   // 坏输入：坏 deviceId 不出现；空快照给空控件。
   const broken = controlsFromSnapshot(snapshotWith({
