@@ -5,6 +5,21 @@ import { join, resolve } from 'node:path'
 
 import shared from '../desktop/shared.js'
 import { createBackpackStore } from './backpack.js'
+import {
+  artFileName,
+  buildCatalog,
+  catalogEntries,
+  catalogHash,
+  chunkCatalog,
+  cropDefHash,
+  cropSignature,
+  MAX_CROPS,
+  isArtFileName,
+  readLocalCrops,
+  readRemoteCatalog,
+  writeCropArt,
+  writeRemoteCatalog
+} from './crop-catalog.js'
 import { createContractStore } from './contracts.js'
 import {
   MAX_CONTRACTS_PER_SIDE,
@@ -36,6 +51,7 @@ import {
 import {
   CROPS,
   CROP_IDS,
+  applyCropCatalog,
   WORKER_GUARD,
   guardValue,
   isCropId,
@@ -90,7 +106,10 @@ import {
   PLOT_ID_RE,
   normalizeCaps,
   createRateLimiter,
+  encodeCropCatalog,
+  encodeCropCatalogRequest,
   encodeFarmAction,
+  MAX_CATALOG_ENTRIES_PER_PACKET,
   encodeFarmActionResult,
   encodeMarketDigest,
   normalizeSkinId,
@@ -122,6 +141,11 @@ import { visitReasonText } from './visit-copy.js'
 import { createVisitStore } from './visits.js'
 
 export const ROUTE_PREFIX = '/dsh-zoo'
+/**
+ * 票 59：多久看一眼本机作物文件。纯轮询而不是 `fs.watch`——Windows 上 watch 目录
+ * 在"整目录替换"时会漏事件，而这里只是一次 mtime 比较，2 秒的延迟对"加一种作物"够快了。
+ */
+export const CROP_POLL_MS = 2000
 export const NEIGHBOR_TICK_MS = 1000
 /** 串门请求发三次（首次 + 两次重试），间隔约 600ms；拿不到 ack 就明确超时。 */
 export const VISIT_REQUEST_ATTEMPTS = 3
@@ -368,6 +392,267 @@ export function createService (ctx, options = {}) {
    * 工资从活跃合同派生。**不参与记账**：作物已经进仓库、硬币已经扣/入账。
    */
   const carriedCrops = { visitId: null, items: [] }
+  /**
+   * 票 59：运行时作物的图。`<dataDir>/crops/<id>.svg|png` 按内容哈希落到
+   * `<dataDir>/crop-art/<hash>.<ext>`，窗口用 `dshzoo://crops/<hash>.<ext>` 读。
+   * 内置六种的图在包里，不走这条。
+   */
+  let cropArtUrls = new Map()
+  /** 本机作物文件的指纹；变了就重读（票 59 热加载）。 */
+  let cropSignatureValue = ''
+  let cropTimer = null
+  let cropChecking = false
+  /** 0 = 关掉热加载（测试用）；默认 2 秒看一眼文件有没有动。 */
+  const cropPollMs = positiveOption(options.cropPollMs, CROP_POLL_MS, 0)
+
+  /** 局域网收到过的作物定义（含图引用），和手写的 `crops.json` 分开存。 */
+  let remoteCrops = []
+  let remoteSeenFrom = new Map()
+  /** 当前生效的目录（定义 + 图引用）：beacon 指纹、目录报文、窗口 payload 都用它。 */
+  let mergedCrops = []
+  /** id → `{ hash, ext, bytes }`，图按内容哈希寻址。 */
+  let cropArtRefs = new Map()
+  /** 整份目录的指纹（16 位），beacon 里只带它。 */
+  let cropCatalogHash = ''
+  /** 每邻居 30 秒最多问一次目录，别把 UDP 变成心跳风暴。 */
+  const catalogAskedAt = new Map()
+  /** 正在拼的分片：`deviceId:catalogHash` → { total, parts, at }。 */
+  const catalogChunks = new Map()
+  const CATALOG_PEER_COOLDOWN_MS = 30 * 1000
+  const CATALOG_CHUNK_TTL_MS = 60 * 1000
+  /** 图走 HTTP：单张 ≤256 KB、5 秒超时，失败就当没有图（窗口退 🌱）。 */
+  const MAX_CROP_ART_FETCH_BYTES = 256 * 1024
+  const fetchImpl = typeof options.fetch === 'function' ? options.fetch : globalThis.fetch
+
+  /**
+   * 读本机作物目录并应用（启动一次，热加载再调用）。
+   *
+   * 只增不删：`crops.json` 里删掉的条目继续留在表里——地里还种着它的时候把定义抹掉，
+   * 那一株会变成空地。删作物不在这一票的范围里（ADR-0019「只增不减」）。
+   */
+  async function loadCropCatalogFromDisk () {
+    const local = await readLocalCrops({ dir })
+    for (const line of local.warnings) warn(ctx, line)
+
+    // 本机图的引用（哈希/扩展名/字节数）：wire 上只传这三个数，图本身走 HTTP。
+    const localArtRefs = new Map()
+    if (local.art.size > 0) {
+      for (const [id, art] of local.art) {
+        const file = artFileName(art.bytes, art.ext)
+        localArtRefs.set(id, { hash: file.hash, ext: art.ext, bytes: art.bytes.length })
+      }
+      cropArtUrls = await writeCropArt({ dir, art: local.art })
+    }
+    const localEntries = local.entries.map((def) => ({
+      ...def,
+      ...(localArtRefs.has(def.id) ? { art: localArtRefs.get(def.id) } : {})
+    }))
+
+    const merged = buildCatalog({ remote: remoteCrops, local: localEntries })
+    const entries = catalogEntries(merged.defs)
+
+    // 图引用单独维护：`buildCatalog` 只比数值/名字，不认识 art。
+    const refs = new Map()
+    for (const def of [...remoteCrops, ...localEntries]) {
+      if (def.art !== undefined) refs.set(def.id, def.art)
+    }
+    cropArtRefs = refs
+    mergedCrops = entries.map((def) => ({
+      ...def,
+      ...(refs.has(def.id) ? { art: refs.get(def.id) } : {})
+    }))
+    cropCatalogHash = catalogHash(mergedCrops)
+    const added = applyCropCatalog(entries)
+    return { added }
+  }
+
+  /** beacon 里那三个数；目录还没算出来时先不带。 */
+  function catalogAnnounce () {
+    if (cropCatalogHash === '') return null
+    return { v: 1, hash: cropCatalogHash, count: CROP_IDS.length }
+  }
+
+  /**
+   * 邻居的目录指纹和自己不一样就问一次（票 59）。
+   * 走 `sendDirect`：作物同步不看放行（用户选的"任何发现的邻居都能同步"），
+   * 但仍有每来源 4 次 / 5 秒的反射放大保护。
+   */
+  function noteCatalogFingerprint (packet) {
+    const announce = packet?.crops
+    if (announce === null || typeof announce !== 'object') return
+    if (!Array.isArray(packet.caps) || !packet.caps.includes('crops')) return
+    if (announce.hash === cropCatalogHash) return
+    if (discovery === null) return
+    const nowMs = Date.now()
+    const last = catalogAskedAt.get(packet.deviceId) ?? 0
+    if (nowMs - last < CATALOG_PEER_COOLDOWN_MS) return
+    catalogAskedAt.set(packet.deviceId, nowMs)
+    if (catalogAskedAt.size > 256) {
+      const [oldest] = catalogAskedAt.keys()
+      catalogAskedAt.delete(oldest)
+    }
+    try {
+      discovery.sendDirect(packet.deviceId, encodeCropCatalogRequest({
+        deviceId: identity.deviceId,
+        hash: cropCatalogHash
+      }))
+    } catch {
+      // 编码失败只说明本次没问成，下一拍 beacon 还会再遇到。
+    }
+  }
+
+  /** 对方来要目录：切成 ≤8 条一片发过去（同样限频，避免被当成放大器）。 */
+  function answerCatalogRequest (packet) {
+    if (packet.hash === cropCatalogHash) return
+    if (discovery === null || mergedCrops.length === 0) return
+    const nowMs = Date.now()
+    const last = catalogAskedAt.get('sent:' + packet.deviceId) ?? 0
+    if (nowMs - last < CATALOG_PEER_COOLDOWN_MS) return
+    catalogAskedAt.set('sent:' + packet.deviceId, nowMs)
+    if (catalogAskedAt.size > 256) {
+      const [oldest] = catalogAskedAt.keys()
+      catalogAskedAt.delete(oldest)
+    }
+    const chunks = chunkCatalog(mergedCrops, MAX_CATALOG_ENTRIES_PER_PACKET)
+    for (let chunk = 0; chunk < chunks.length; chunk += 1) {
+      try {
+        discovery.sendDirect(packet.deviceId, encodeCropCatalog({
+          deviceId: identity.deviceId,
+          catalogHash: cropCatalogHash,
+          chunk,
+          total: chunks.length,
+          entries: chunks[chunk]
+        }))
+      } catch {
+        return
+      }
+    }
+  }
+
+  /**
+   * 合并"收到过的目录"：同一个 id 只留一条，冲突按定义哈希字典序小者胜——
+   * 和 `buildCatalog` 的规则一致，不然反复同步会把同一个 id 攒成一堆重复条目。
+   */
+  function mergeRemoteCrops (existing, incoming) {
+    const byId = new Map()
+    for (const def of Array.isArray(existing) ? existing : []) {
+      if (def !== null && typeof def === 'object' && typeof def.id === 'string') byId.set(def.id, def)
+    }
+    for (const def of Array.isArray(incoming) ? incoming : []) {
+      if (def === null || typeof def !== 'object' || typeof def.id !== 'string') continue
+      const current = byId.get(def.id)
+      if (current === undefined) {
+        byId.set(def.id, def)
+        continue
+      }
+      const currentHash = cropDefHash(current)
+      const nextHash = cropDefHash(def)
+      if (nextHash !== null && (currentHash === null || nextHash < currentHash)) byId.set(def.id, def)
+    }
+    return [...byId.values()].slice(0, MAX_CROPS)
+  }
+
+  /** 收分片；收齐了合并、落盘、重推窗口（票 59）。 */
+  async function acceptCatalogChunk (packet) {
+    const key = packet.deviceId + ':' + packet.catalogHash
+    const nowMs = Date.now()
+    for (const [oldKey, entry] of catalogChunks) {
+      if (nowMs - entry.at > CATALOG_CHUNK_TTL_MS) catalogChunks.delete(oldKey)
+    }
+    let entry = catalogChunks.get(key)
+    if (entry === undefined) {
+      entry = { total: packet.total, parts: new Map(), at: nowMs }
+      catalogChunks.set(key, entry)
+    }
+    if (entry.total !== packet.total) {
+      catalogChunks.delete(key)
+      return
+    }
+    entry.parts.set(packet.chunk, packet.entries)
+    if (entry.parts.size < entry.total) return
+    catalogChunks.delete(key)
+
+    const incoming = []
+    for (const chunk of [...entry.parts.keys()].sort((left, right) => left - right)) {
+      incoming.push(...entry.parts.get(chunk))
+    }
+    for (const def of incoming) {
+      if (!remoteSeenFrom.has(def.id)) remoteSeenFrom.set(def.id, packet.deviceId)
+    }
+    remoteCrops = mergeRemoteCrops(remoteCrops, incoming)
+    await writeRemoteCatalog({ dir, entries: remoteCrops, seenFrom: remoteSeenFrom })
+    const { added } = await loadCropCatalogFromDisk()
+    await fetchMissingCropArt(packet.deviceId, incoming)
+    if (added.length > 0) {
+      write(ctx, 'info', '从邻居收到 ' + added.length + ' 种新作物：' + added.join(', '))
+    }
+    refreshFarmWindow()
+  }
+
+  /**
+   * 邻居说了有图、本机还没有的，走局域网 HTTP 取回来：
+   * `http://<邻居>:<skinPort>/dsh-zoo-crops/<hash>.<ext>`。
+   * 只接受和对方声明一致的字节数，超过 256 KB 或超时都当没有——窗口退 🌱，不影响玩法。
+   */
+  async function fetchMissingCropArt (deviceId, defs) {
+    const wanted = defs.filter((def) => def.art !== undefined && !cropArtUrls.has(def.id))
+    if (wanted.length === 0 || discovery === null) return
+    const port = freshPeerLanPort(deviceId)
+    const endpoint = discovery.addressOf(deviceId)
+    if (port === null || endpoint === null || typeof fetchImpl !== 'function') return
+    const fetched = new Map()
+    for (const def of wanted) {
+      const name = def.art.hash + '.' + def.art.ext
+      try {
+        const response = await fetchImpl('http://' + endpoint.address + ':' + port + '/dsh-zoo-crops/' + name, {
+          signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(5000) : undefined
+        })
+        if (response === null || typeof response !== 'object' || response.ok !== true) continue
+        const bytes = Buffer.from(await response.arrayBuffer())
+        if (bytes.length === 0 || bytes.length > MAX_CROP_ART_FETCH_BYTES) continue
+        if (Number.isInteger(def.art.bytes) && bytes.length !== def.art.bytes) continue
+        fetched.set(def.id, { bytes, ext: def.art.ext })
+      } catch {
+        // 取不到就退 emoji
+      }
+    }
+    if (fetched.size === 0) return
+    const urls = await writeCropArt({ dir, art: fetched })
+    for (const [id, value] of urls) cropArtUrls.set(id, value)
+    write(ctx, 'info', '取回 ' + urls.size + ' 张邻居作物图')
+  }
+
+  function startCropWatcher () {
+    if (cropPollMs <= 0 || cropTimer !== null) return
+    cropTimer = setInterval(() => {
+      if (disposed) return
+      void checkCropFiles()
+    }, cropPollMs)
+    cropTimer.unref?.()
+  }
+
+  /** 文件指纹变了才重读；重读完把已经开着的农场窗口推一份新的。 */
+  async function checkCropFiles () {
+    if (cropChecking || disposed) return
+    cropChecking = true
+    try {
+      const next = await cropSignature({ dir })
+      if (next === cropSignatureValue) return
+      cropSignatureValue = next
+      const { added } = await loadCropCatalogFromDisk()
+      if (added.length > 0) {
+        write(ctx, 'info', '作物目录已更新，新增 ' + added.length + ' 种：' + added.join(', '))
+      } else {
+        write(ctx, 'info', '作物目录已更新（数值或图有变化）')
+      }
+      // 种子列表、行情页、地块卡都在这一包里，推完不用用户重开窗。
+      refreshFarmWindow()
+    } catch (error) {
+      warn(ctx, '作物目录重读失败，继续用上一份：' + message(error))
+    } finally {
+      cropChecking = false
+    }
+  }
   /** 票 53：一趟偷亮多久再回家（桌面和窗口要靠它看见那只宠物）。 */
   const raidVisibleMs = positiveOption(options.raidVisibleMs, 8000, 0)
   /** 票 54：本机广告哪些能力。测试可以把它调空来演"老版本"。 */
@@ -956,6 +1241,9 @@ export function createService (ctx, options = {}) {
       gifts: recentGifts(),
       // 本机交易所（ticket 41）：prices/index/history；history 最近 50 笔。
       market: marketStateView(),
+      // 票 59：运行时作物目录的指纹（不加内容）。跨机验收时拿它和邻居 beacon 里的
+      // `crops.hash` 比：一致就说明目录同步完了。
+      crops: { hash: cropCatalogHash, count: CROP_IDS.length },
       // 雇佣合同（ticket 44）：store 没起来也给完整空形状，绝不 undefined。
       contracts: contractsView()
     }
@@ -1285,7 +1573,7 @@ export function createService (ctx, options = {}) {
     // ticket 46：再点一次「农场」= 关窗。返回 action 仍是 farm-open，窗口字段说明发生了什么。
     if (farmWindowOpenNow()) return closeFarmWindow('farm-open')
     const plotId = typeof rawPlotId === 'string' ? rawPlotId : null
-    const out = room.outboundVisit()
+    const out = outboundVisitForWindow()
     const visit = out === null ? null : loadingVisitView(out)
     if (out === null) {
       farmWindowVisitId = null
@@ -1345,9 +1633,31 @@ export function createService (ctx, options = {}) {
     return { ok: true, action, window: 'closed' }
   }
 
+  /**
+   * 票 59：窗口只认宿主下发的作物目录。数值一律以宿主为准（窗口只画），
+   * 目录里有什么，窗口的种子列表/行情页就有什么。
+   */
+  function cropCatalogView () {
+    return CROP_IDS.map((id) => {
+      const crop = CROPS[id]
+      const art = cropArtUrls.get(id)
+      return {
+        id,
+        name: crop.name,
+        growMs: crop.growMs,
+        yield: crop.yield,
+        seedPrice: crop.seedPrice,
+        base: crop.base,
+        // 只有自定义作物带 `art`（`dshzoo://crops/<hash>.<ext>`）；内置六种没这一项，
+        // 窗口按 id 回落到包里的 `crops/<id>.svg`。
+        ...(art === undefined ? {} : { art: art.url })
+      }
+    })
+  }
+
   /** `farm-window` 命令的公共载荷：owner 数据 + 交易所 + 可选访客块。 */
   function farmWindowPayload ({ open, plotId = null, mode = null, visit = null, look = null } = {}) {
-    const out = room.outboundVisit()
+    const out = outboundVisitForWindow()
     const effectiveMode = mode ?? (out === null ? 'owner' : 'visitor')
     const effectiveVisit = visit ?? (out !== null && farmWindowVisitId === out.visitId
       ? farmWindowVisitView
@@ -1355,6 +1665,7 @@ export function createService (ctx, options = {}) {
     return {
       open: open === true,
       mode: effectiveMode,
+      crops: cropCatalogView(),
       farm: farmWindowView(),
       // 票 55：窗口里那排邻居小圆片——只给"能看田"的邻居（广告过 `look`），
       // 老版本连进来点了也只会说"版本太老"，不如不列。
@@ -2745,11 +3056,26 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 「农场小窗按访客模式打开」的那次出门（ticket 43），去偷不算。
+   *
+   * 票 53 的偷也写 `self.out`（它是真的出门了），但偷不是串门：窗口仍应是我家的农场
+   * （owner）。否则宠物在外偷菜时一开窗就对着要偷的那家画成访客页——自家的种/收/雇工
+   * 全不见，和“出门后什么都不能操作”是同一个问题（ticket 57）。
+   */
+  function outboundVisitForWindow () {
+    const out = room.outboundVisit()
+    if (out === null || out.purpose === 'steal') return null
+    return out
+  }
+
+  /**
    * 拉主人的快照并推给窗口。路由 404 = 串门结束；没有端口/超时 = error。
    * 只在开窗/动作成功之后调用，不做 500ms 轮询（快照是网络，场景巡检不该打它）。
    */
   async function loadVisitFarm (out) {
     if (disposed) return null
+    // 兜底：去偷的那趟永远不该拉“主人家的农场快照”来当访客页。
+    if (out !== null && out !== undefined && out.purpose === 'steal') return null
     const current = room.outboundVisit()
     if (current === null || current.visitId !== out.visitId) {
       pushVisitEnded()
@@ -3094,6 +3420,26 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 票 59 / ADR-0019：运行时作物目录。必须在交易所和农场读盘之前应用——
+      // 两个 store 都按 CROP_IDS 校验并补默认价，晚一步新作物就会被当成坏数据丢掉。
+      // 目录坏了只降级成内置六种，不挡启动。
+      try {
+        // 票 59：先把上次从局域网收到的目录读回来（发布者关机了也不能丢），再合并本机文件。
+        const saved = await readRemoteCatalog({ dir })
+        for (const line of saved.warnings) warn(ctx, line)
+        remoteCrops = saved.entries
+        remoteSeenFrom = saved.seenFrom
+        cropSignatureValue = await cropSignature({ dir })
+        const { added } = await loadCropCatalogFromDisk()
+        if (added.length > 0) {
+          write(ctx, 'info', '本机作物目录新增 ' + added.length + ' 种：' + added.join(', '))
+        }
+      } catch (error) {
+        warn(ctx, '作物目录读取失败，本次只用内置六种：' + message(error))
+      }
+      if (disposed) return
+      startCropWatcher()
+
       // 交易所（ticket 41）先于农场读：农场 store 需要它在同一个串行段里完成买卖。
       // 坏文件只降级成初始价格，不挡启动；`marketNow`/`farmNow` 只给测试注入。
       try {
@@ -3189,6 +3535,8 @@ export function createService (ctx, options = {}) {
           beaconIntervalMs: options.beaconIntervalMs,
           // 素材源端口可能晚起/没起：每次现取，取不到就不带。
           skin: () => skinRef,
+          // 票 59：beacon 只带目录指纹（三个数），完整目录按需单播拉。
+          crops: () => catalogAnnounce(),
           // 出站单播（心跳/串门）在发现层里也只走这一个门控。
           mayTalkTo: (deviceId) => room.mayTalkTo(deviceId),
           onPeer (packet) {
@@ -3239,6 +3587,12 @@ export function createService (ctx, options = {}) {
               // 礼物的送达回执（ticket 26）。**必须有这个分支**：落到下面的 else 会被
               // 当成 beacon 静默吞掉——不报错，只是礼物永远删不掉。
               handleGiftReceived(packet)
+            } else if (packet.type === 'crop-catalog-request') {
+              // 票 59：邻居的目录和我不一样，他要一份。
+              answerCatalogRequest(packet)
+            } else if (packet.type === 'crop-catalog') {
+              // 目录可能好几片：拼装/合并/落盘都要落盘等待，不能冒到 socket 循环。
+              void acceptCatalogChunk(packet)
             } else if (packet.type === 'market-digest') {
               // 行情 gossip（ticket 42）。**不能落到 else**：那会当成 beacon 刷新邻居灯，
               // 看起来没坏，但价格永远进不了 index。
@@ -3267,6 +3621,8 @@ export function createService (ctx, options = {}) {
               void handleWorkSettleAck(packet)
             } else {
               room.observeBeacon(packet)
+              // 票 59：beacon 里带着邻居的作物目录指纹，不一致就问一次。
+              noteCatalogFingerprint(packet)
             }
             flushRoomEffects()
           },
@@ -3478,12 +3834,26 @@ export function createService (ctx, options = {}) {
       skinServer = await startLanServer({
         sources: skinSources,
         port: requested,
-        host: '0.0.0.0',
+        // 默认对外（邻居要能取素材/礼物/作物图）；单测可以把素材源只绑回环。
+        host: typeof options.lanHost === 'string' && options.lanHost !== '' ? options.lanHost : '0.0.0.0',
         log,
         // 串门模块与服务器之间只通过这张表耦合：路由拿不到任何报文里的路径。
         lookupGift: lookupArmedGift,
         // 农场快照（ticket 43）：每次现查 room 的活跃访客 + 本地农场，没有第二张 armed 表。
         lookupFarm: lookupFarmView,
+        // 票 59：作物图只服务 crop-art 目录里真实存在的、名字合法的文件。
+        lookupCropArt: async (name) => {
+          if (!isArtFileName(name)) return null
+          try {
+            const bytes = await readFile(join(dir, 'crop-art', name))
+            return {
+              bytes,
+              contentType: name.endsWith('.png') ? 'image/png' : 'image/svg+xml'
+            }
+          } catch {
+            return null
+          }
+        },
         // 公开只读视图（票 52）：不看访客、不看放行——谁问都能看（ADR-0018）。
         lookupOpenFarm: openFarmLookup
       })
@@ -3678,6 +4048,8 @@ export function createService (ctx, options = {}) {
         cacheRoot: join(dir, 'skin-cache'),
         // 缩略图只读这个根；helper 不认任何别的路径（ticket 25）。
         giftsRoot: join(dir, 'gifts'),
+        // 票 59：作物图只读这个根；helper 只认 <hash>.<svg|png>，不接受别的路径。
+        cropArtRoot: join(dir, 'crop-art'),
         onEvent (event) {
           if (disposed || desktop === null) return
           if (event?.type === 'ready') {
@@ -5430,6 +5802,10 @@ export function createService (ctx, options = {}) {
       if (contractTimer !== null) {
         clearInterval(contractTimer)
         contractTimer = null
+      }
+      if (cropTimer !== null) {
+        clearInterval(cropTimer)
+        cropTimer = null
       }
       // ticket 44：先把 active 合同落成 ended（尽力而为；写盘失败也只告警一次），
       // 再放开 store。钱的标记保持不变，下一次启动按对账规则收尾。

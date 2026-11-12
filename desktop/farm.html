@@ -14,7 +14,7 @@
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dshzoo:"
     />
     <title>农场</title>
     <style>
@@ -605,6 +605,16 @@
         gap: 7px;
         min-width: 0;
       }
+      /* 票 58：作物外观是包内自带的 SVG（`crops/<id>.svg`），不是 emoji。
+         图跟着外层盒子的字号缩放，所以种子行（19px）、交易所（19px）和地块卡（21px）
+         共用一套规则；没图时外层 span 里还是那个 emoji，布局一模一样。 */
+      .crop-art-img {
+        width: 1.2em;
+        height: 1.2em;
+        display: inline-block;
+        vertical-align: -0.18em;
+        object-fit: contain;
+      }
       .crop-emoji {
         width: 34px;
         height: 34px;
@@ -615,6 +625,10 @@
         background: rgba(255, 255, 255, 0.72);
         font-size: 21px;
         line-height: 1;
+      }
+      .crop-emoji .crop-art-img {
+        width: 26px;
+        height: 26px;
       }
       .plot-card[data-stage='empty'] .crop-emoji {
         border: 2px dashed #dcd2c4;
@@ -779,9 +793,13 @@
         font-size: 9px;
         font-weight: 800;
       }
+      /* 票 58：作物由三种变成六种以后，六颗小圆片塞不进 420px 的一行（量过：370 > 325）。
+         改成换行而不是横向滚动——滚动条是隐藏的，右下角那颗会被当成画错；
+         换行最多多出一行，袋子里的东西一眼全见。 */
       .bag-chips {
         display: flex;
-        gap: 4px;
+        flex-wrap: wrap;
+        gap: 3px;
         min-width: 0;
         overflow-x: auto;
         scrollbar-width: none;

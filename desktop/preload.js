@@ -67,7 +67,9 @@ contextBridge.exposeInMainWorld('dshZooDesktop', {
       giftId: payload.giftId,
       // 农场（ticket 40）：开窗可带 plotId，四个地块动作必须带；形状由 shared 归一化。
       plotId: payload.plotId,
-      cropId: payload.cropId
+      cropId: payload.cropId,
+      // 合同的「叫它回家」（ticket 57）：只带合同号；钱与结算全在宿主。
+      contractId: payload.contractId
     })
   },
   /**

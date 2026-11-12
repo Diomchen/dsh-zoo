@@ -9,10 +9,17 @@ export const MINUTE_MS = 60 * 1000
 export const HOUR_MS = 60 * MINUTE_MS
 
 /**
- * 三种作物（SPEC v5「农场与作物」）。
+ * 内置的六种作物（SPEC v5「农场与作物」，票 58 加三种）。
+ * 票 59 起这张表只是**打底**：`CROPS` 是可填充的运行时目录，
+ * service 启动时会用 `<dataDir>/crops.json` 和网络目录把它撑大（ADR-0019）。
  * `growMs` 生长时长、`seedPrice` 种子价、`yield` 产量、`base` 交易所底价。
+ *
+ * 顺序按生长时长排，窗口里种子列表与行情就按这个顺序画。三档新的沿用了老三条的
+ * 经济形状：越久越长的那一档**每小时毛收更低**，但点一次管更久、种子更贵——
+ * 短作物刷得勤，长作物适合睡前种。小番茄仍是最便宜的种子（6），
+ * `PLOT_UNLOCK_RESERVE` 因此不变。
  */
-export const CROPS = Object.freeze({
+export const BUILTIN_CROPS = Object.freeze({
   tomato: Object.freeze({
     id: 'tomato',
     name: '小番茄',
@@ -20,6 +27,14 @@ export const CROPS = Object.freeze({
     seedPrice: 6,
     yield: 3,
     base: 5
+  }),
+  strawberry: Object.freeze({
+    id: 'strawberry',
+    name: '草莓',
+    growMs: 45 * MINUTE_MS,
+    seedPrice: 9,
+    yield: 4,
+    base: 7
   }),
   carrot: Object.freeze({
     id: 'carrot',
@@ -29,6 +44,14 @@ export const CROPS = Object.freeze({
     yield: 5,
     base: 6
   }),
+  corn: Object.freeze({
+    id: 'corn',
+    name: '玉米',
+    growMs: 4 * HOUR_MS,
+    seedPrice: 22,
+    yield: 6,
+    base: 9
+  }),
   pumpkin: Object.freeze({
     id: 'pumpkin',
     name: '南瓜',
@@ -36,10 +59,79 @@ export const CROPS = Object.freeze({
     seedPrice: 36,
     yield: 3,
     base: 30
+  }),
+  grape: Object.freeze({
+    id: 'grape',
+    name: '葡萄',
+    growMs: 12 * HOUR_MS,
+    seedPrice: 52,
+    yield: 5,
+    base: 24
   })
 })
 
-export const CROP_IDS = Object.freeze(Object.keys(CROPS))
+/**
+ * 运行时的作物表（票 59）。
+ *
+ * 为什么是可变的：20 多处 `for (const id of CROP_IDS)` 都是**调用时**读数组内容，
+ * 所以只要原地改这张表，结算、行情、协议校验、窗口白名单就一起跟着走，不用改调用点。
+ * 只往里加、不删：删掉一个已经种下的作物，会让别人地里的那一株变成空地。
+ *
+ * 只在 service 启动/重载目录时调用 `applyCropCatalog()`；测试用 `resetCropCatalog()`。
+ */
+export const CROPS = {}
+export const CROP_IDS = []
+
+function fillBuiltins () {
+  for (const id of Object.keys(BUILTIN_CROPS)) CROPS[id] = BUILTIN_CROPS[id]
+  CROP_IDS.length = 0
+  CROP_IDS.push(...Object.keys(BUILTIN_CROPS))
+}
+
+fillBuiltins()
+
+/** 按生长时长排（窗口的种子列表/行情页就是这个顺序），同长按 id；原地改，保住数组身份。 */
+function sortCropIds () {
+  CROP_IDS.sort((left, right) => {
+    const a = CROPS[left]
+    const b = CROPS[right]
+    if (a.growMs !== b.growMs) return a.growMs - b.growMs
+    return left < right ? -1 : left > right ? 1 : 0
+  })
+}
+
+/**
+ * 把一份目录里的定义合进运行时表（票 59）。
+ * 已经存在的 id 会被覆盖（本机文件优先由 crop-catalog 决定，这里只负责应用）；
+ * 不在表里的 id 追加。返回真正新增的 id，方便调用方记日志。
+ */
+export function applyCropCatalog (entries) {
+  const added = []
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    if (entry === null || typeof entry !== 'object') continue
+    const id = typeof entry.id === 'string' ? entry.id : ''
+    if (id === '') continue
+    const def = Object.freeze({
+      id,
+      name: entry.name,
+      growMs: entry.growMs,
+      seedPrice: entry.seedPrice,
+      yield: entry.yield,
+      base: entry.base
+    })
+    if (!Object.prototype.hasOwnProperty.call(CROPS, id)) added.push(id)
+    CROPS[id] = def
+    if (!CROP_IDS.includes(id)) CROP_IDS.push(id)
+  }
+  sortCropIds()
+  return added
+}
+
+/** 测试用：回到只有内置六种的状态。 */
+export function resetCropCatalog () {
+  for (const id of Object.keys(CROPS)) delete CROPS[id]
+  fillBuiltins()
+}
 
 /**
  * 地块解锁（ticket 48 / ADR-0017）：4 块起步、50 块封顶、只能按顺序买。

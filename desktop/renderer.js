@@ -14,8 +14,11 @@
  * window blur/页面隐藏/2.5s 无移动都会释放。宠物落后于光标时，租约 + 一条跟随光标的
  * `ui:drag` 命中矩形一起保持窗口可交互，pointermove/pointerup 才不会断。
  *
- * 控件（ticket 11）：
- *   - 悬停/点击自己的宠物 → 弹层（串门；出门时桌面上没有 self，用常驻「召回」胶囊代替）；
+ * 控件（ticket 11 / 57）：
+ *   - 悬停/点击自己的宠物 → 弹层（串门 / 改名）；
+ *   - 自己不在家（串门 / 去偷 / 在外打工）时桌面上没有 self：用常驻胶囊代替，
+ *     点开是「不在家」面板（农场 / 邻居 / 带派 / 改名 / 召回或叫它回家 / 更多），
+ *     右键胶囊直接开完整菜单。没有这个入口，宠物一出门整张桌面就什么都点不到；
  *   - 点击访客 → 弹层（送客）；放行卡由场景里的 controls.prompt 驱动；
  *   - 弹层**不持有输入租约**：它和宠物之间的 8px 间隙由 overlay 的桥接矩形盖住，
  *     光标离开宠物与弹层后窗口立刻回到穿透——点桌面别处不会被弹层吃掉；
@@ -79,6 +82,8 @@
   let lastRectsAt = 0
   let lastFrameAt = 0
   let drag = null
+  /** 胶囊的拖动（ticket 57 现场反馈：常驻胶囊挡住视线时必须能挪开）。null = 没在拖。 */
+  let chipDrag = null
   /** 调试脚本派发的拖拽期间，忽略真实光标的转发事件（冒烟没法移动用户鼠标）。 */
   let syntheticDrag = false
   /** 调试脚本完全接管输入时，连悬停/焦点事件也不看真实环境（冒烟可复现）。 */
@@ -96,7 +101,13 @@
     prompt: null, // { key, deviceId, nickname, el }
     // ticket 23：giftId → { el, deviceId, giftId, status, titleEl, bodyEl, statusEl, signature }
     gifts: new Map(),
-    recall: null, // { el }
+    // ticket 11/57：「宠物不在家」的常驻胶囊（自己出门串门、去偷、在外打工都算）。
+    recall: null, // { el, mainEl }
+    // ticket 57：胶囊点开的面板（农场 / 邻居 / 带派 / 改名 / 召回 / 更多）。
+    awayPanel: null, // { el, signature, openedAt, lastActiveAt }
+    // ticket 57 现场反馈：胶囊挡住视线时用户会把它拖走。用户拖过之后就不再跟着
+    // 宠物最后出现的位置（null = 还没拖过，照旧锚在 promptAnchor）；只在本次运行内记住。
+    awayChipPos: null, // { x, y } 窗口局部 DIP
     notice: null, // { text, at, el, timer }
     hiddenPromptKey: null,
     hoverSuppressed: false,
@@ -211,9 +222,9 @@
     }
   }
 
-  /** 唯一需要输入租约的是拖拽：宠物落后于光标时位置判定必须让位。 */
+  /** 唯一需要输入租约的是拖拽：宠物落后于光标时位置判定必须让位；胶囊拖动同理。 */
   function updateLease () {
-    setBusy(drag !== null)
+    setBusy(drag !== null || chipDrag !== null)
   }
 
   function stopHoverHeartbeat () {
@@ -337,6 +348,33 @@
     }
 
     if (ui.recall !== null) add('ui:recall-chip', ui.recall.el)
+
+    // 胶囊拖动（ticket 57 现场反馈）：和宠物拖拽同一个理由——快速拖动时命中矩形
+    // 必须跟着光标走，否则主进程按 900ms 过期把窗口翻回穿透，pointermove/up 就断了。
+    if (chipDrag !== null && chipDrag.point !== null) {
+      const around = {
+        x: chipDrag.point.x - DRAG_HIT_RADIUS,
+        y: chipDrag.point.y - DRAG_HIT_RADIUS,
+        width: DRAG_HIT_RADIUS * 2,
+        height: DRAG_HIT_RADIUS * 2
+      }
+      const chipRect = ui.recall === null ? null : elementRect(ui.recall.el)
+      const union = shared.unionRect(chipRect === null ? [around] : [chipRect, around])
+      if (union !== null) rects.push({ id: 'ui:chip-drag', ...union })
+    }
+
+    // 「不在家」面板（ticket 57）：和弹层同一条规矩——面板、按钮各自上报，
+    // 再加一条「胶囊 ↔ 面板」的桥接矩形，光标横穿间隙时窗口不会先翻回穿透。
+    const awayRect = ui.awayPanel === null ? null : rectOf('ui:away-panel', ui.awayPanel.el)
+    if (awayRect !== null) {
+      const chipRect = ui.recall === null ? null : elementRect(ui.recall.el)
+      const bridge = shared.unionRect([awayRect, chipRect ?? promptAnchor()])
+      if (bridge !== null) rects.push({ id: 'ui:bridge:away', ...bridge })
+      rects.push(awayRect)
+      for (const button of ui.awayPanel.el.querySelectorAll('[data-lp-action]')) {
+        add('ui:away:' + button.dataset.lpAction, button)
+      }
+    }
     return rects
   }
 
@@ -675,6 +713,10 @@
     button.textContent = label
     button.dataset.lpAction = action
     if (typeof options.deviceId === 'string' && options.deviceId !== '') button.dataset.lpDevice = options.deviceId
+    // 「叫它回家」要带合同号（recall-worker）；按钮自己不知道合同，只在宿主给了时才挂上。
+    if (typeof options.contractId === 'string' && options.contractId !== '') {
+      button.dataset.lpContract = options.contractId
+    }
     // 礼物按钮必须带 giftId：矩形 id 与 action 都要能落回具体那一张卡（两张卡不撞名）。
     if (typeof options.giftId === 'string' && options.giftId !== '') button.dataset.lpGift = options.giftId
     if (options.disabled === true) {
@@ -765,6 +807,7 @@
       if (ui.popover !== null) closePopover('timeout')
       if (ui.street !== null) closeStreet('timeout')
       if (ui.menu !== null) closeMenu('timeout')
+      if (ui.awayPanel !== null) hideAwayPanel('timeout')
     }, UI_MAX_OPEN_MS)
   }
 
@@ -854,10 +897,15 @@
     openMenu(pet, event.clientX, event.clientY)
   }
 
+  /**
+   * 打开菜单。`pet` 通常是自己的宠物；宠物不在家时（ticket 57）传 null，
+   * 锚点换成胶囊/「更多」按钮：菜单内容与宿主下发的那棵树完全一样，只是没有可停住的宠物。
+   */
   function openMenu (pet, x, y) {
     closeMenu('replace')
     closePopover('menu', { suppress: false })
     closeStreet('menu')
+    hideAwayPanel('menu')
     const root = document.createElement('div')
     root.className = 'lp-menu'
     root.setAttribute('role', 'menu')
@@ -865,7 +913,7 @@
     root.addEventListener('click', onMenuClick)
     uiLayer.appendChild(root)
     ui.menu = {
-      petId: pet.id,
+      petId: pet === null ? null : pet.id,
       root,
       panels: [],
       // 一级的两个分支共用 1/2 级面板：branch 决定 1 级画分类还是画「外观」（ticket 32）。
@@ -877,7 +925,9 @@
       leaveTimer: null
     }
     // 停住：菜单悬停期间它不飞、不漫游（dsh-pet 的 stopThrow/stopMove 同一个意思）。
-    pet.body = shared.confineBodyToBand({ ...pet.body, vx: 0, vy: 0 }, area, bandOf(pet.body))
+    if (pet !== null) {
+      pet.body = shared.confineBodyToBand({ ...pet.body, vx: 0, vy: 0 }, area, bandOf(pet.body))
+    }
     openMenuPanel(0, { x, y, width: 0, height: 0 })
     resetOpenTimer()
     reportOverlayRects(true)
@@ -979,6 +1029,9 @@
     panel.setAttribute('role', 'menu')
     if (level === 0) {
       for (const tool of menu.tools) {
+        // 「回到初始位置」只在宠物真的在桌面上时才有意思（ticket 57：不在家时菜单
+        // 从胶囊打开，点了什么也不会发生——宁可少一项，不给假入口）。
+        if (tool.id === 'home' && !pets.has('self')) continue
         panel.appendChild(menuRow(tool.label, { kind: 'tool', id: tool.id, hint: tool.hint }))
       }
       if (menu.groups.length > 0) {
@@ -1275,8 +1328,8 @@
     const street = ui.street
     if (street === null) return
     const rows = Array.isArray(scene.controls.street) ? scene.controls.street : []
-    const away = scene.controls.recall.enabled === true
-    const awayName = scene.controls.recall.nickname
+    const recall = scene.controls.recall
+    const away = recall.enabled === true
 
     street.el.dataset.away = away ? 'true' : 'false'
     street.head.textContent = ''
@@ -1284,9 +1337,11 @@
     title.className = 'lp-street-title'
     const visitable = rows.filter((row) => row.canVisit === true)
     if (away) {
-      title.textContent = '宠物正在「' + (awayName === null ? '邻居' : awayName) + '」家'
+      // 抬头说清它在哪、在干什么（宿主算好的人话）；按钮跟着 mode 走：
+      // 串门/偷菜是召回，打工是叫它回家（ticket 57）。
+      title.textContent = recall.title ?? recall.text ?? '宠物不在家'
       street.head.appendChild(title)
-      street.head.appendChild(makeButton('召回', 'recall'))
+      street.head.appendChild(awayPrimaryButton(recall))
     } else {
       title.textContent = '邻居'
       const sub = document.createElement('span')
@@ -1423,6 +1478,7 @@
   function updateUiHover () {
     updateStreetHover()
     updateMenuHover()
+    updateAwayHover()
     if (ui.popover === null || pointer === null) return
     const current = ui.popover
     const pet = pets.get(current.petId)
@@ -1779,10 +1835,137 @@
   }
 
   // -------------------------------------------------------------------------
-  // 召回胶囊（自己出门时桌面没有 self）
+  // 「宠物不在家」胶囊 + 面板（ticket 11 / 57）
+  //
+  // 自己出门串门、去偷、在外打工时桌面上都没有 self：右键菜单、悬停弹层、农场入口
+  // 全靠 self 做锚点，于是整个桌面一下变得什么都点不到（用户报的“所有操作都消失了”）。
+  // 这里用一个常驻胶囊接住它：点开是面板（农场 / 邻居 / 带派 / 改名 / 召回或叫它回家 /
+  // 更多），右键直接开完整菜单。胶囊与面板都是宿主权威——它们只发申请。
   // -------------------------------------------------------------------------
 
-  function hideRecallChip () {
+  function awayActive () {
+    return scene.controls.recall.enabled === true && pets.get('self') === undefined
+  }
+
+  /** 光标下的胶囊（不在家时桌面上唯一可抓的东西）。调试脚本与自己都用这一份判断。 */
+  function chipElementAt (point) {
+    if (point === null || ui.recall === null) return null
+    return pointInElement(point, ui.recall.el) ? ui.recall.el : null
+  }
+
+  /** 把胶囊钉在用户放手的位置；越界夹回工作区（窗口再小也能点到）。 */
+  function placeAwayChip (pos) {
+    if (ui.recall === null) return null
+    const el = ui.recall.el
+    const width = Math.max(1, el.offsetWidth || 120)
+    const height = Math.max(1, el.offsetHeight || 30)
+    const margin = 4
+    const x = Math.min(
+      Math.max(margin, Number(pos?.x) || 0),
+      Math.max(margin, window.innerWidth - width - margin)
+    )
+    const y = Math.min(
+      Math.max(margin, Number(pos?.y) || 0),
+      Math.max(margin, window.innerHeight - height - margin)
+    )
+    el.style.left = x.toFixed(1) + 'px'
+    el.style.top = y.toFixed(1) + 'px'
+    ui.awayChipPos = { x, y }
+    return { x, y, width, height }
+  }
+
+  /**
+   * 按住胶囊 = 拖动（ticket 57 现场反馈：它常驻在宠物最后出现的位置，挡住视线时挪不开）。
+   *
+   * 位置归渲染端（ADR-0003），宿主不知道也不该知道；拖过之后本次运行一直记住，
+   * 不再跟着 promptAnchor 跑。没拖动（位移 < CLICK_MAX_MOVE）= 一次点击，仍然开面板。
+   * 拖动期间和宠物拖拽一样持输入租约 + 一条跟随光标的命中矩形：窗口不能在拖到一半时
+   * 翻回穿透，否则 pointermove/pointerup 全断。
+   */
+  function startChipDrag (event) {
+    if (inputLocked && event.isTrusted) return
+    if (event.button !== 0 || ui.recall === null) return
+    const rect = elementRect(ui.recall.el)
+    if (rect === null) return
+    event.preventDefault()
+    event.stopPropagation()
+    // 面板先收：拖的是胶囊，留着面板会盖住要拖去的地方。
+    hideAwayPanel('chip-drag')
+    const now = performance.now()
+    chipDrag = {
+      pointerId: Number.isInteger(event.pointerId) ? event.pointerId : null,
+      offsetX: event.clientX - rect.x,
+      offsetY: event.clientY - rect.y,
+      startX: event.clientX,
+      startY: event.clientY,
+      point: { x: event.clientX, y: event.clientY },
+      moved: 0,
+      startedAt: now,
+      lastAt: now
+    }
+    ui.recall.el.dataset.dragging = 'true'
+    if (chipDrag.pointerId !== null) {
+      try {
+        ui.recall.el.setPointerCapture(chipDrag.pointerId)
+      } catch {
+        // 合成输入没有真实指针：window 级监听照样收得到
+      }
+    }
+    pointer = { x: event.clientX, y: event.clientY }
+    updateLease()
+    reportOverlayRects(true)
+  }
+
+  function moveChipDrag (x, y) {
+    if (chipDrag === null) return
+    const now = performance.now()
+    chipDrag.lastAt = now
+    chipDrag.point = { x, y }
+    chipDrag.moved = Math.max(chipDrag.moved, Math.hypot(x - chipDrag.startX, y - chipDrag.startY))
+    placeAwayChip({ x: x - chipDrag.offsetX, y: y - chipDrag.offsetY })
+    // 命中矩形跟指针走（33ms 一报，和宠物拖拽同一个节拍）：拖得快也不会掉出命中区。
+    if (now - ui.lastDragRectAt >= RECT_REPORT_MS) {
+      ui.lastDragRectAt = now
+      reportOverlayRects(false)
+    }
+  }
+
+  function finishChipDrag (x, y) {
+    if (chipDrag === null) return
+    const current = chipDrag
+    chipDrag = null
+    const el = ui.recall === null ? null : ui.recall.el
+    if (el !== null) delete el.dataset.dragging
+    const hasPoint = Number.isFinite(x) && Number.isFinite(y)
+    if (hasPoint) {
+      placeAwayChip({ x: x - current.offsetX, y: y - current.offsetY })
+      pointer = { x, y }
+    }
+    updateLease()
+    const duration = performance.now() - current.startedAt
+    const isClick = current.moved <= CLICK_MAX_MOVE && duration <= CLICK_MAX_MS
+    if (hasPoint) evaluate(pointer, true)
+    reportOverlayRects(true)
+    // 点一下（几乎没动）= 开面板；真拖动过就只改位置，不弹。
+    if (isClick) toggleAwayPanel()
+  }
+
+  function abortChipDrag () {
+    if (chipDrag === null) return
+    chipDrag = null
+    if (ui.recall !== null) delete ui.recall.el.dataset.dragging
+    updateLease()
+    reportOverlayRects(true)
+  }
+
+  /** 胶囊上那句话：宿主算好的人话（away-text.js），渲染端不猜 mode。 */
+  function awayChipText () {
+    const recall = scene.controls.recall
+    const text = typeof recall.text === 'string' && recall.text !== '' ? recall.text : null
+    return text ?? (recall.mode === 'working' ? '在外打工' : recall.mode === 'raiding' ? '去偷菜了' : '不在家')
+  }
+
+  function hideAwayChip () {
     if (ui.recall === null) return
     try {
       ui.recall.el.remove()
@@ -1793,36 +1976,167 @@
     reportOverlayRects(true)
   }
 
-  function syncRecallChip () {
-    const recall = scene.controls.recall
-    const away = pets.get('self') === undefined
-    const need = recall.enabled === true && away
+  function syncAwayChip () {
+    const need = awayActive()
     if (!need) {
-      hideRecallChip()
+      hideAwayPanel('not-away')
+      hideAwayChip()
       return
     }
     if (ui.recall !== null) {
-      const sub = ui.recall.el.querySelector('.lp-chip-sub')
-      const expected = recall.nickname === null ? '' : '在「' + recall.nickname + '」家'
-      if (sub !== null && sub.textContent !== expected) sub.textContent = expected
+      const expected = awayChipText()
+      if (ui.recall.mainEl !== null && ui.recall.mainEl.textContent !== expected) {
+        ui.recall.mainEl.textContent = expected
+        ui.recall.el.setAttribute('aria-label', '我的宠物不在家：' + expected)
+      }
       return
     }
     const el = document.createElement('button')
     el.type = 'button'
     el.className = 'lp-recall-chip'
-    el.dataset.lpAction = 'recall'
-    el.appendChild(document.createTextNode('召回'))
-    if (recall.nickname !== null) {
-      const sub = document.createElement('span')
-      sub.className = 'lp-chip-sub'
-      sub.textContent = '在「' + recall.nickname + '」家'
-      el.appendChild(sub)
-    }
-    el.addEventListener('pointerdown', (event) => event.stopPropagation())
+    el.dataset.lpAway = 'chip'
+    el.setAttribute('aria-label', '我的宠物不在家：' + awayChipText())
+    el.title = '点开是它在哪、能做什么；拖走可以挪开；右键打开菜单'
+    const main = document.createElement('span')
+    main.className = 'lp-chip-main'
+    main.textContent = awayChipText()
+    el.appendChild(main)
+    const caret = document.createElement('span')
+    caret.className = 'lp-chip-caret'
+    caret.setAttribute('aria-hidden', 'true')
+    caret.textContent = '▾'
+    el.appendChild(caret)
+    el.addEventListener('pointerdown', startChipDrag)
+    el.addEventListener('contextmenu', (event) => {
+      // 右键胶囊 = 完整菜单（和右键自己那只宠物同一棵树）。
+      event.preventDefault()
+      event.stopPropagation()
+      const box = elementRect(el)
+      hideAwayPanel('menu')
+      openMenu(null, box === null ? 0 : box.x + box.width, box === null ? 0 : box.y)
+    })
     uiLayer.appendChild(el)
-    ui.recall = { el }
+    ui.recall = { el, mainEl: main }
     reportOverlayRects(true)
     layoutUi(true)
+  }
+
+  function awayPanelSignature () {
+    return JSON.stringify(scene.controls.recall)
+  }
+
+  function hideAwayPanel (reason) {
+    if (ui.awayPanel === null) return
+    const current = ui.awayPanel
+    ui.awayPanel = null
+    try {
+      current.el.remove()
+    } catch {
+      // 已经没了
+    }
+    void reason
+    reportOverlayRects(true)
+    layoutUi(true)
+  }
+
+  function toggleAwayPanel () {
+    if (ui.awayPanel !== null) {
+      hideAwayPanel('toggle')
+      return
+    }
+    openAwayPanel()
+  }
+
+  function openAwayPanel () {
+    if (!awayActive()) return
+    hideAwayPanel('replace')
+    const el = buildAwayPanel()
+    el.addEventListener('pointerdown', (event) => event.stopPropagation())
+    uiLayer.appendChild(el)
+    ui.awayPanel = {
+      el,
+      signature: awayPanelSignature(),
+      openedAt: performance.now(),
+      lastActiveAt: performance.now()
+    }
+    closeMenu('away-panel')
+    closeStreet('away-panel')
+    reportOverlayRects(true)
+    layoutUi(true)
+    resetOpenTimer()
+  }
+
+  /** 「不在家」时的主按钮：串门/偷菜是召回；打工是叫它回家（recall-worker + contractId）。 */
+  function awayPrimaryButton (recall) {
+    if (recall.mode === 'working') {
+      const contractId = typeof recall.contractId === 'string' ? recall.contractId : ''
+      return makeButton('叫它回家', 'recall-worker', {
+        contractId,
+        disabled: contractId === '',
+        reason: '这份合同还没落到本机，等一会儿再试。'
+      })
+    }
+    return makeButton('召回', 'recall')
+  }
+
+  function buildAwayPanel () {
+    const recall = scene.controls.recall
+    const el = document.createElement('div')
+    el.className = 'lp-popover lp-away-panel'
+    el.setAttribute('role', 'dialog')
+    el.setAttribute('aria-label', recall.title ?? '宠物不在家')
+
+    const title = document.createElement('div')
+    title.className = 'lp-popover-title'
+    title.textContent = recall.title ?? awayChipText()
+    el.appendChild(title)
+
+    // 打工要能说清“我还能不能把它叫回来”：合同是两小时的，召回是提前结束、按实际时长结算。
+    const status = document.createElement('div')
+    status.className = 'lp-away-status'
+    status.textContent = recall.mode === 'working'
+      ? '在别人家看家，到点会自己回来；叫它回家会提前结束合同。'
+      : recall.mode === 'raiding'
+        ? '这一趟偷完就自己回家，也可以现在召回。'
+        : '到点会自己回来，也可以现在召回。'
+    el.appendChild(status)
+
+    // 只有「召回 / 叫它回家」是主按钮：一次点击就改变宠物在哪，其余都是开窗/看东西。
+    el.appendChild(makeButton('农场', 'farm-open', { tone: 'quiet' }))
+    el.appendChild(makeButton('邻居', 'street-open', { tone: 'quiet' }))
+    el.appendChild(makeButton('带派', 'bring', { tone: 'quiet' }))
+    el.appendChild(makeButton('改名', 'rename', { tone: 'quiet' }))
+    el.appendChild(awayPrimaryButton(recall))
+    el.appendChild(makeButton('更多', 'away-more', { tone: 'quiet' }))
+    return el
+  }
+
+  /** 面板一直开着时，宿主状态变了（换了个地方/合同结束）就收起来，别画一份旧状态。 */
+  function syncAwayPanel () {
+    if (ui.awayPanel === null) return
+    if (!awayActive() || ui.awayPanel.signature !== awayPanelSignature()) {
+      hideAwayPanel('controls-changed')
+      return
+    }
+    ui.awayPanel.lastActiveAt = performance.now()
+  }
+
+  /** 光标离开胶囊与面板后的宽限关闭（和弹层同一套手感）。 */
+  function updateAwayHover () {
+    if (ui.awayPanel === null || pointer === null) return
+    const insidePanel = pointInElement(pointer, ui.awayPanel.el)
+    const insideChip = ui.recall !== null && pointInElement(pointer, ui.recall.el)
+    if (insidePanel || insideChip) {
+      ui.awayPanel.lastActiveAt = performance.now()
+      cancelLeaveTimer()
+      resetOpenTimer()
+      return
+    }
+    if (ui.leaveTimer !== null) return
+    ui.leaveTimer = setTimeout(() => {
+      ui.leaveTimer = null
+      if (ui.awayPanel !== null) hideAwayPanel('leave')
+    }, UI_LEAVE_GRACE_MS)
   }
 
   // -------------------------------------------------------------------------
@@ -1935,10 +2249,24 @@
     }
 
     if (ui.recall !== null) {
-      positionFloating(ui.recall.el, promptAnchor(), {
+      // 用户拖过就钉在他放下的地方；没拖过才跟着宠物最后出现的位置。
+      const rect = ui.awayChipPos === null
+        ? positionFloating(ui.recall.el, promptAnchor(), {
+          avoid: petRects.concat(occupied),
+          gap: UI_GAP
+        })
+        : placeAwayChip(ui.awayChipPos)
+      if (rect !== null) occupied.push(rect)
+    }
+
+    if (ui.awayPanel !== null) {
+      // 面板跟着胶囊走；胶囊万一不在（场景刚换），退回宠物最后出现的位置。
+      const chipRect = ui.recall === null ? null : elementRect(ui.recall.el)
+      const rect = positionFloating(ui.awayPanel.el, chipRect ?? promptAnchor(), {
         avoid: petRects.concat(occupied),
         gap: UI_GAP
       })
+      if (rect !== null) occupied.push(rect)
     }
 
     if (ui.notice !== null) {
@@ -1955,6 +2283,7 @@
   function syncControls (reset) {
     if (reset === true) closePopover('scene-reset')
     if (reset === true) closeStreet('scene-reset')
+    if (reset === true) hideAwayPanel('scene-reset')
     if (ui.popover !== null) {
       if (!pets.has(ui.popover.petId)) closePopover('scene-gone')
       else if (ui.popover.signature !== popoverSignature()) closePopover('controls-changed')
@@ -1962,7 +2291,8 @@
     syncPrompt()
     syncGifts()
     syncStreet()
-    syncRecallChip()
+    syncAwayChip()
+    syncAwayPanel()
     syncNotice()
     layoutUi(true)
   }
@@ -2041,6 +2371,8 @@
       skinId: typeof options.skinId === 'string' && options.skinId !== '' ? options.skinId : undefined,
       // 礼物动作只带 giftId；路径与磁盘操作全在宿主那边，渲染端连字符串都拿不到。
       giftId: typeof options.giftId === 'string' && options.giftId !== '' ? options.giftId : undefined,
+      // 合同的「叫它回家」（ticket 57）：只带合同号，钱与结算全在宿主。
+      contractId: typeof options.contractId === 'string' && options.contractId !== '' ? options.contractId : undefined,
       // 失败时的本机兜底（点播不可达 → 本机播一次）。只能影响本地表现，绝不能改状态。
       fallback: typeof options.fallback === 'function' ? options.fallback : null,
       prompt: options.prompt === true,
@@ -2071,7 +2403,8 @@
         deviceId: pending.deviceId,
         name: pending.name,
         skinId: pending.skinId,
-        giftId: pending.giftId
+        giftId: pending.giftId,
+        contractId: pending.contractId
       })
     } catch {
       settleAction(id, { ok: false, notice: ACTION_FAILED_NOTICE })
@@ -2108,6 +2441,21 @@
       openStreet('self')
       return
     }
+    if (action === 'street-open') {
+      // ticket 57：不在家时也能看邻居（看田是只读的，不需要先串门）。街道本身会说明
+      // 「宠物正在谁家」，并给出召回/叫它回家。
+      hideAwayPanel('action')
+      openStreet(null)
+      return
+    }
+    if (action === 'away-more') {
+      // 「更多」= 完整的右键菜单（农场/带派/重载/扫描外观/外观/动作）。菜单由宿主下发，
+      // 这里只是换个锚点；宠物不在家时没有「回到初始位置」那一项。
+      const chipRect = ui.recall === null ? null : elementRect(ui.recall.el)
+      hideAwayPanel('action')
+      if (chipRect !== null) openMenu(null, chipRect.x + chipRect.width, chipRect.y)
+      return
+    }
     if (action === 'street-more') {
       if (ui.street !== null) {
         ui.street.showBlocked = ui.street.showBlocked !== true
@@ -2119,12 +2467,25 @@
       // 弹层/面板点击后立刻关掉并撤掉命中矩形；失败会以气泡出现，不靠控件赖着。
       closePopover('action')
       closeStreet('action')
+      hideAwayPanel('action')
       requestAction(action, deviceId)
+      return
+    }
+    if (action === 'recall-worker') {
+      // 打工的「叫它回家」= recall-worker + 合同号（合同号由宿主随 controls 下发）。
+      const contractId = typeof button.dataset.lpContract === 'string' ? button.dataset.lpContract : ''
+      hideAwayPanel('action')
+      if (contractId === '') {
+        showNotice('这份合同还没落到本机，等一会儿再试。')
+        return
+      }
+      requestAction('recall-worker', undefined, { contractId })
       return
     }
     if (action === 'rename') {
       // 输入要靠另一扇可聚焦的小窗：主窗 focusable:false，永远收不到键盘。
       closePopover('action')
+      hideAwayPanel('action')
       if (!api || typeof api.openRename !== 'function') {
         showNotice('这扇桌面窗口开不了改名框，改用 POST /dsh-zoo/action。')
         return
@@ -2134,6 +2495,12 @@
       } catch {
         showNotice(ACTION_FAILED_NOTICE)
       }
+      return
+    }
+    if (action === 'farm-open' || action === 'bring') {
+      // ticket 57：不在家面板上的「农场」「带派」与右键菜单里的同名项走同一条申请。
+      hideAwayPanel('action')
+      requestAction(action)
       return
     }
     if (action === 'dismiss') {
@@ -2564,6 +2931,11 @@
 
   function trackPointer (x, y) {
     pointer = { x, y }
+    if (chipDrag !== null) {
+      moveChipDrag(x, y)
+      updateUiHover()
+      return
+    }
     if (drag !== null) {
       moveDrag(x, y)
       updateUiHover()
@@ -2590,6 +2962,10 @@
 
   window.addEventListener('pointerup', (event) => {
     if (inputLocked && event.isTrusted) return
+    if (chipDrag !== null) {
+      finishChipDrag(event.clientX, event.clientY)
+      return
+    }
     if (drag === null) return
     finishDrag(event.clientX, event.clientY)
   })
@@ -2610,9 +2986,16 @@
   window.addEventListener('pointerdown', onTrustedPointer, { capture: true, passive: true })
   window.addEventListener('pointerup', onTrustedPointer, { capture: true, passive: true })
 
-  window.addEventListener('pointercancel', () => abortDrag())
+  window.addEventListener('pointercancel', () => {
+    abortDrag()
+    abortChipDrag()
+  })
   window.addEventListener('mouseup', (event) => {
     if (inputLocked && event.isTrusted) return
+    if (chipDrag !== null) {
+      finishChipDrag(event.clientX, event.clientY)
+      return
+    }
     if (drag === null) return
     finishDrag(event.clientX, event.clientY)
   })
@@ -2620,14 +3003,18 @@
   window.addEventListener('blur', () => {
     if (inputLocked) return
     abortDrag()
+    abortChipDrag()
     closePopover('blur')
+    hideAwayPanel('blur')
     setBusy(false)
     releaseHover()
   })
   document.addEventListener('visibilitychange', () => {
     if (inputLocked || !document.hidden) return
     abortDrag()
+    abortChipDrag()
     closePopover('hidden')
+    hideAwayPanel('hidden')
     setBusy(false)
     releaseHover()
   })
@@ -2646,7 +3033,9 @@
       applyTransform(pet)
     }
     if (drag !== null) abortDrag()
+    abortChipDrag()
     closePopover('resize')
+    hideAwayPanel('resize')
     closeMenu('resize')
     layoutUi(true)
     evaluate(pointer, true)
@@ -2654,13 +3043,18 @@
   })
 
   window.addEventListener('pointerdown', (event) => {
-    if (ui.popover === null) return
     const target = event.target
     if (!(target instanceof Element)) return
-    // 点在弹层或宠物身上由它们自己处理；点桌面空白处 = 关掉弹层。
-    if (ui.popover.el.contains(target)) return
-    if (target.closest('.lp-pet') !== null) return
-    closePopover('outside')
+    if (ui.popover !== null) {
+      // 点在弹层或宠物身上由它们自己处理；点桌面空白处 = 关掉弹层。
+      if (!ui.popover.el.contains(target) && target.closest('.lp-pet') === null) closePopover('outside')
+    }
+    if (ui.awayPanel !== null) {
+      // 面板同理：点面板外（包括胶囊本身）就收起来，胶囊的 click 再决定是开还是合。
+      if (!ui.awayPanel.el.contains(target) && (ui.recall === null || !ui.recall.el.contains(target))) {
+        hideAwayPanel('outside')
+      }
+    }
   }, true)
 
   uiLayer.addEventListener('pointerdown', (event) => {
@@ -2689,6 +3083,7 @@
     lastFrameAt = now
 
     if (drag !== null && now - drag.lastAt > DRAG_TIMEOUT_MS) abortDrag()
+    if (chipDrag !== null && now - chipDrag.lastAt > DRAG_TIMEOUT_MS) abortChipDrag()
 
     const frozenId = ui.menu === null ? null : ui.menu.petId
     for (const pet of pets.values()) {
@@ -2714,12 +3109,12 @@
     // 窗口翻回穿透——菜单画着，点击却落到后面的 app 上（用户报的"点了没反应、穿透"）。
     // reportOverlayRects 自己按 300ms 节流，逐帧调用不会刷屏。
     if (ui.popover !== null || ui.prompt !== null || ui.recall !== null || ui.notice !== null ||
-      ui.menu !== null || ui.street !== null || ui.gifts.size > 0) {
+      ui.menu !== null || ui.street !== null || ui.gifts.size > 0 || ui.awayPanel !== null) {
       layoutUi(false)
       reportOverlayRects(false)
     }
     // 拖拽时 ui:drag 必须紧跟光标：租约只有在“光标压在活矩形上”时才生效。
-    if (drag !== null && now - ui.lastDragRectAt >= RECT_REPORT_MS) {
+    if ((drag !== null || chipDrag !== null) && now - ui.lastDragRectAt >= RECT_REPORT_MS) {
       ui.lastDragRectAt = now
       reportOverlayRects(false)
     }
@@ -2772,9 +3167,10 @@
         pointer = point
         if (phase === 'down') {
           const pet = petAt(point)
-          if (pet === null) return false
+          const target = pet !== null ? pet.el : chipElementAt(point)
+          if (target === null) return false
           syntheticDrag = true
-          pet.el.dispatchEvent(new PointerEvent('pointerdown', {
+          target.dispatchEvent(new PointerEvent('pointerdown', {
             bubbles: true,
             cancelable: true,
             clientX: x,
@@ -2801,7 +3197,7 @@
             isPrimary: true,
             buttons: 1
           }))
-          return drag !== null
+          return drag !== null || chipDrag !== null
         }
         if (phase === 'blur') {
           syntheticDrag = false
@@ -2826,7 +3222,7 @@
           return true
         }
         if (phase === 'up') {
-          const hadDrag = drag !== null
+          const hadDrag = drag !== null || chipDrag !== null
           window.dispatchEvent(new PointerEvent('pointerup', {
             bubbles: true,
             clientX: x,
@@ -2857,6 +3253,39 @@
           const button = element.closest('[data-lp-action]')
           if (button !== null) {
             button.click()
+            return true
+          }
+          // 「不在家」胶囊不是动作按钮（点开的是面板），冒烟也要能像真实鼠标一样点它：
+          // 走 pointerdown + pointerup，点击/拖动的判定和用户一致。
+          const awayChip = element.closest('[data-lp-away]')
+          if (awayChip !== null) {
+            syntheticDrag = true
+            awayChip.dispatchEvent(new PointerEvent('pointerdown', {
+              bubbles: true,
+              cancelable: true,
+              clientX: x,
+              clientY: y,
+              screenX: x,
+              screenY: y,
+              pointerId: 77,
+              pointerType: 'mouse',
+              isPrimary: true,
+              button: 0,
+              buttons: 1
+            }))
+            window.dispatchEvent(new PointerEvent('pointerup', {
+              bubbles: true,
+              clientX: x,
+              clientY: y,
+              screenX: x,
+              screenY: y,
+              pointerId: 77,
+              pointerType: 'mouse',
+              isPrimary: true,
+              button: 0,
+              buttons: 0
+            }))
+            syntheticDrag = false
             return true
           }
           const petEl = element.closest('.lp-pet')
@@ -2948,7 +3377,20 @@
           }),
           streetOpen: ui.street !== null,
           streetShowBlocked: ui.street === null ? false : ui.street.showBlocked,
-          recallChip: ui.recall === null ? null : { nickname: scene.controls.recall.nickname },
+          recallChip: ui.recall === null
+            ? null
+            : {
+                text: awayChipText(),
+                mode: scene.controls.recall.mode,
+                title: scene.controls.recall.title
+              },
+          awayPanel: ui.awayPanel === null
+            ? null
+            : {
+                title: scene.controls.recall.title,
+                buttons: [...ui.awayPanel.el.querySelectorAll('[data-lp-action]')]
+                  .map((button) => button.dataset.lpAction)
+              },
           notice: ui.notice === null ? null : { text: ui.notice.text, at: ui.notice.at },
           pending: [...ui.pending.values()].map((pending) => ({
             id: pending.id,

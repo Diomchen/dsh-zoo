@@ -116,3 +116,18 @@ test('desktop/shared.js 的常量与宿主一致（含守卫 0.8 与底价表）
   const reasons = reasonsMatch[1].split(',').map((part) => part.trim().replace(/^'|'$/g, ''))
   assert.deepEqual(reasons, HIRE_REASONS)
 })
+
+test('票 58：每种作物都有包内自带的 SVG，路径与 id 一一对应', async () => {
+  for (const cropId of Object.keys(CROPS)) {
+    const meta = farmView.CROP_META[cropId]
+    assert.equal(meta.art, 'crops/' + cropId + '.svg', cropId + ' 的图路径')
+    assert.equal(typeof meta.emoji, 'string', cropId + ' 要留 emoji 兜底')
+    assert.ok(meta.emoji.length > 0, cropId + ' 的 emoji 不能是空串')
+
+    // 文件必须真在包里：`desktop/` 整个目录随 npm 包发布，图不能指向打包外的绝对路径。
+    const svg = await readFile(new URL('../desktop/' + meta.art, import.meta.url), 'utf8')
+    assert.match(svg, /^<svg[\s>]/, cropId + ' 不是 SVG')
+    assert.match(svg, /viewBox="0 0 100 100"/, cropId + ' 的 viewBox 要统一成 100×100')
+    assert.equal(svg.includes('<script'), false, cropId + ' 的图里不该有脚本')
+  }
+})

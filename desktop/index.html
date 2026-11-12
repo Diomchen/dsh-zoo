@@ -685,14 +685,36 @@
         font-size: 12px;
         font-weight: 700;
         line-height: 1.2;
-        cursor: pointer;
+        /* 能拖走（ticket 57）：抓取手势让“可以挪开”这件事自己说出来。 */
+        cursor: grab;
         box-shadow: 0 8px 22px rgba(0, 0, 0, 0.32);
         pointer-events: auto;
+        user-select: none;
       }
-      .lp-recall-chip .lp-chip-sub {
-        font-size: 10.5px;
+      .lp-recall-chip[data-dragging="true"] {
+        cursor: grabbing;
+      }
+      .lp-recall-chip .lp-chip-main {
+        max-width: 168px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .lp-recall-chip .lp-chip-caret {
+        font-size: 10px;
+        line-height: 1;
+        color: rgba(244, 248, 255, 0.6);
+      }
+      /* ticket 57：「不在家」面板里那句“下一步会怎样”。比按钮淡，但必须能读。 */
+      .lp-away-panel .lp-away-status {
+        padding: 0 2px 2px;
+        font-size: 11px;
         font-weight: 500;
-        color: rgba(244, 248, 255, 0.66);
+        line-height: 1.45;
+        color: rgba(244, 248, 255, 0.7);
+      }
+      .lp-away-panel .lp-popover-title {
+        white-space: normal;
       }
       .lp-notice {
         max-width: 246px;

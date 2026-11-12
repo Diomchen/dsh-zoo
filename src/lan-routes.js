@@ -12,6 +12,11 @@ export const SKIN_ROUTE = '/dsh-zoo-skin'
 export const GIFT_ROUTE = '/dsh-zoo-gift'
 /** 农场快照（ticket 43）：只有新路径；改名前的邻居没有农场，不需要旧名字。 */
 export const FARM_ROUTE = '/dsh-zoo-farm'
+/**
+ * 作物图（票 59）：`/dsh-zoo-crops/<16 位内容哈希>.<svg|png>`。
+ * 只有新路径：改名前的邻居没有运行时作物目录，不需要旧名字。
+ */
+export const CROP_ART_ROUTE = '/dsh-zoo-crops'
 /** 公开只读视图（票 52）：`/dsh-zoo-farm/open/<viewerDeviceId>`，不需要串门。 */
 export const FARM_OPEN_SEGMENT = 'open'
 
@@ -23,6 +28,7 @@ export const LEGACY_GIFT_ROUTE = '/local-pet-gift'
 export const SKIN_ROUTES = Object.freeze([SKIN_ROUTE, LEGACY_SKIN_ROUTE])
 export const GIFT_ROUTES = Object.freeze([GIFT_ROUTE, LEGACY_GIFT_ROUTE])
 export const FARM_ROUTES = Object.freeze([FARM_ROUTE])
+export const CROP_ART_ROUTES = Object.freeze([CROP_ART_ROUTE])
 
 /**
  * pathname 命中哪条路由。

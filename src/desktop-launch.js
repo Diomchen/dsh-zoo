@@ -104,6 +104,8 @@ export function resolveElectronBinary ({ env = process.env, platform = process.p
  * file://，拿不到 DSH 的 HTTP 路由，所以它要注册 dshzoo:// 协议，根目录只能从 argv 拿。
  * `cacheRoot` 是远端素材的本地缓存目录（helper 只读，不联网）。
  * `giftsRoot` 是收到的礼物根目录（`<dataDir>/gifts`）：helper 只读它，给缩略图用（ticket 25）。
+ * `cropArtRoot` 是作物图目录（`<dataDir>/crop-art`，票 59）：helper 只读它，
+ * 按内容哈希给 `dshzoo://crops/<hash>.<svg|png>` 服务，不认任何别的路径。
  */
 export function buildHelperArgs ({
   helperPath,
@@ -111,7 +113,8 @@ export function buildHelperArgs ({
   debug = false,
   assetRoots = [],
   cacheRoot = null,
-  giftsRoot = null
+  giftsRoot = null,
+  cropArtRoot = null
 } = {}) {
   const args = [String(helperPath)]
   if (Number.isInteger(hostPid) && hostPid > 0) {
@@ -131,6 +134,12 @@ export function buildHelperArgs ({
     const dir = giftsRoot.trim()
     if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {
       args.push('--dsh-zoo-gifts', dir)
+    }
+  }
+  if (typeof cropArtRoot === 'string') {
+    const dir = cropArtRoot.trim()
+    if (dir !== '' && !dir.includes('\u0000') && isAbsolute(dir)) {
+      args.push('--dsh-zoo-crops', dir)
     }
   }
   const seen = new Set()

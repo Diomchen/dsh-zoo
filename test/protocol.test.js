@@ -300,6 +300,29 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'crop-catalog-request') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        hash: '0123456789abcdef',
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type === 'crop-catalog') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        catalogHash: '0123456789abcdef',
+        chunk: 0,
+        total: 1,
+        entries: [{ id: 'kiwi', name: '猕猴桃', growMs: 7200000, seedPrice: 20, yield: 5, base: 12 }],
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
     } else if (type.startsWith('work-')) {
       raw = { ...workPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('visit-')) {
@@ -342,8 +365,12 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
                   ? ['v', 'type', 'deviceId', 'visitId', 'requestId', 'action', 'plotId']
                   : type === 'farm-action-result'
                     ? ['v', 'type', 'deviceId', 'requestId', 'ok', 'crop', 'qty']
-                    : type.startsWith('work-')
-                      ? workKeys(type)
+                    : type === 'crop-catalog-request'
+                      ? ['v', 'type', 'deviceId', 'hash']
+                      : type === 'crop-catalog'
+                        ? ['v', 'type', 'deviceId', 'catalogHash', 'chunk', 'total', 'entries']
+                        : type.startsWith('work-')
+                          ? workKeys(type)
                       : type.startsWith('visit-')
                         ? ['v', 'type', 'deviceId', 'visitId']
                         : ['v', 'type', 'deviceId', 'nickname', 'port']
@@ -637,6 +664,9 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'visit-recall-ack',
     'gift-received',
     'market-digest',
+    // 票 59：运行时作物目录（跟着行情后面，都是"局域网情报"这一类）
+    'crop-catalog-request',
+    'crop-catalog',
     'farm-action',
     'farm-action-result',
     'work-request',

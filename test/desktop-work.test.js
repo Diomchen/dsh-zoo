@@ -71,7 +71,8 @@ test('petsFromSnapshot：worker 在 self 之后、visitors 之前，带 role/bad
   assert.equal('farm' in controlsFromSnapshot(snapshot), false)
 })
 
-test('self.work：本机宠物在外打工时 self 从桌面消失；controls 给出「不能串门」', () => {
+test('self.work：本机宠物在外打工时 self 从桌面消失；controls 给出「不能串门」和叫它回家', () => {
+  const contractId = randomUUID()
   const snapshot = snapshotWith({
     self: {
       deviceId: randomUUID(),
@@ -80,7 +81,7 @@ test('self.work：本机宠物在外打工时 self 从桌面消失；controls �
       bridge: { ok: true, reason: null },
       out: null,
       work: {
-        contractId: randomUUID(),
+        contractId,
         employerDeviceId: EMPLOYER,
         employerNickname: '柯基',
         startedAt: 1,
@@ -96,7 +97,12 @@ test('self.work：本机宠物在外打工时 self 从桌面消失；controls �
   const controls = controlsFromSnapshot(snapshot)
   assert.equal(controls.visit.enabled, false)
   assert.match(controls.visit.reason, /在外打工/)
-  assert.equal(controls.recall.enabled, false, '召回只服务串门，雇工合同在农场窗里召回')
+  // ticket 57：打工也是「不在家」，桌面上必须有入口；召回按钮换成「叫它回家」，
+  // 合同号一起下发——否则宠物在别人家 2–8 小时，整张桌面什么都点不到。
+  assert.equal(controls.recall.enabled, true, '不在家胶囊要出现')
+  assert.equal(controls.recall.mode, 'working')
+  assert.equal(controls.recall.text, '在「柯基」家打工')
+  assert.equal(controls.recall.contractId, contractId)
 })
 
 test('helper 四层：PET_ROLES 含 worker，normalizeItem/petScene 保留 badge，非法 badge 丢弃', () => {

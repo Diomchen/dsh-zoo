@@ -14,6 +14,7 @@
  */
 
 import shared from '../desktop/shared.js'
+import { awayText } from './away-text.js'
 import { isGiftStatus, giftStatusText, giftTitleText } from './gift-text.js'
 import { isDeviceId, isVisitId, sanitizeGiftName } from './protocol.js'
 import { MAX_STREET, isBlockedReason } from './street.js'
@@ -273,9 +274,26 @@ export function controlsFromSnapshot (snapshot, options = {}) {
       : 'no-admitted'
     controls.visit.reason = visitReasonText(blocked, null)
   }
-  // 召回只服务串门；雇工合同在农场窗里召回（recall-worker）。
-  controls.recall.enabled = away
-  controls.recall.nickname = awayNickname
+  // ticket 57：桌子上的「不在家」胶囊。三种不在家都要有入口——否则宠物去打工/去偷时
+  // 桌面上一只 self 都没有，右键菜单与农场窗就全失去了锚点（用户报的“所有操作都消失了”）。
+  // 召回仍然只对串门/偷菜有用；雇工合同要走 recall-worker（带 contractId），文案与按钮
+  // 由 mode 一起决定，渲染端不猜。
+  const awayMode = working ? 'working' : away ? (out.purpose === 'steal' ? 'raiding' : 'visiting') : null
+  if (awayMode !== null) {
+    const petName = shared.normalizeLabel(self?.pet?.name, '') || shared.normalizeLabel(self?.nickname, '')
+    const copy = awayText(
+      awayMode,
+      working ? work.employerNickname : awayNickname,
+      petName === '' ? null : petName
+    )
+    controls.recall = {
+      enabled: true,
+      mode: awayMode,
+      text: copy.text,
+      title: copy.title,
+      contractId: working ? deviceIdOf(work.contractId) : null
+    }
+  }
 
   const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
   for (const visitor of visitors) {

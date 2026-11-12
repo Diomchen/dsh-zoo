@@ -52,6 +52,8 @@ const { app, BrowserWindow, clipboard, dialog, ipcMain, protocol, screen, shell 
 const shared = require('./shared.js')
 // `dshzoo://gifts/...` 的路径白名单（ticket 25）：纯函数，单独一份、可单测。
 const giftPath = require('./gift-path.js')
+// `dshzoo://crops/<hash>.<ext>` 的白名单（票 59）：同样是一份纯函数、单独可单测。
+const cropPath = require('./crop-path.js')
 
 const APP_NAME = 'dsh-zoo-desktop'
 const HOST_STALE_MS = 30000
@@ -63,8 +65,12 @@ const ASSET_HOST = 'asset'
 const CACHE_HOST = 'cache'
 /** 礼物缩略图主机：与 asset/cache 同一套注册好的 dshzoo:// scheme，只多一个 host。 */
 const GIFT_HOST = 'gifts'
+/** 作物图主机（票 59）：`dshzoo://crops/<内容哈希>.<svg|png>`。 */
+const CROP_HOST = 'crops'
 const MAX_ASSET_BYTES = 8 * 1024 * 1024
 const MAX_ASSET_NAME = 200
+/** 作物图上限：宿主侧按 256 KB 收，这里放宽一档只做兜底，防止把整份大文件读进内存。 */
+const MAX_CROP_ART_BYTES = 1024 * 1024
 
 // 必须先定名：直接用 `electron main.js` 启动时 Electron 取不到 app 名会回落成 "Electron"，
 // userData 就落到所有脚本共用的目录里。
@@ -97,6 +103,13 @@ const cacheRoot = typeof options.cache === 'string' && options.cache !== '' && p
  */
 const giftsRoot = typeof options.gifts === 'string' && options.gifts !== '' && path.isAbsolute(options.gifts)
   ? options.gifts
+  : null
+/**
+ * 作物图根目录（票 59）：宿主把 `<dataDir>/crop-art` 传进来；helper 只读它，
+ * 只为 `dshzoo://crops/<hash>.<ext>` 服务。没传 = 不注册这条读路径（所有 crops URL 404）。
+ */
+const cropsRoot = typeof options.crops === 'string' && options.crops !== '' && path.isAbsolute(options.crops)
+  ? options.crops
   : null
 if (isShotMode && !path.isAbsolute(options.shot)) {
   process.stderr.write('[dsh-zoo helper] --dsh-zoo-shot 需要绝对路径：' + options.shot + '\n')
@@ -150,6 +163,8 @@ let giftSeq = 0
 let farmWin = null
 /** 宿主交下来的完整 farm view（地块/种子/作物/硬币/露水/日志），窗口打开或刷新时原样转发。 */
 let farmState = null
+/** 票 59：作物目录随每一包下发；窗口按它画种子列表/行情/地块。 */
+let farmCrops = null
 /** 交易所页 / `farm-window` 里随农场一起下发的 market view（价目/历史/index）。 */
 let farmMarket = null
 /** 雇工页（ticket 44）：合同/邻居挂牌/在飞状态，和 farm 一起下发、一起缓存。 */
@@ -177,6 +192,13 @@ let farmSeq = 0
 let workArea = null
 let scene = shared.emptyScene()
 let sceneAt = 0
+/**
+ * 这只宠物最后一次被看见时叫什么（ticket 57）。
+ *
+ * 改名小窗预填的是「当前名字」。宠物出门/打工时桌面上没有 `self`，只看 scene 会得到一个
+ * 空输入框——而「不在家」面板里就有改名入口（ticket 57），空着会被当成坏了。
+ */
+let lastSelfLabel = ''
 /** 渲染端上报的当前素材与失败集合；只用于诊断（宿主 /dsh-zoo/desktop 能读到）。 */
 let lastMedia = null
 const mediaHistory = []
@@ -466,6 +488,7 @@ async function handleAssetRequest (request) {
     if (url.protocol !== ASSET_SCHEME + ':') return textResponse(404, 'unknown asset')
     // 礼物缩略图（ticket 25）：host=gifts，路径恰好两段；守卫与夹取都在 gift-path.js 里。
     if (url.hostname === GIFT_HOST) return handleGiftRequest(url)
+    if (url.hostname === CROP_HOST) return handleCropRequest(url)
     if (url.hostname !== ASSET_HOST && url.hostname !== CACHE_HOST) {
       return textResponse(404, 'unknown asset')
     }
@@ -517,6 +540,48 @@ async function handleAssetRequest (request) {
 
 function textResponse (status, body) {
   return new Response(body, { status, headers: { 'content-type': 'text/plain; charset=utf-8' } })
+}
+
+/**
+ * `dshzoo://crops/<内容哈希>.<svg|png>`（票 59）。
+ * 名字只认 16 位十六进制哈希 + 两种扩展名，文件必须落在 crop-art 根目录里；
+ * 读不到一律 404（不区分"没这张图"和"名字不合法"）。
+ * 内容寻址，所以可以缓存：同一张图换个作物 id 不会换 URL。
+ */
+async function handleCropRequest (url) {
+  try {
+    if (cropsRoot === null) return textResponse(404, 'crop art not found')
+    let name
+    try {
+      name = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+    } catch {
+      return textResponse(400, 'bad crop art name')
+    }
+    const contentType = cropPath.cropArtContentType(name)
+    if (contentType === null) return textResponse(404, 'crop art not found')
+    const file = resolveCropArtFile(name)
+    if (file === null) return textResponse(404, 'crop art not found')
+    let info
+    try {
+      info = await fsp.stat(file)
+    } catch {
+      return textResponse(404, 'crop art not found')
+    }
+    if (!info.isFile() || info.size <= 0 || info.size > MAX_CROP_ART_BYTES) {
+      return textResponse(404, 'crop art not found')
+    }
+    const data = await fsp.readFile(file)
+    return new Response(new Uint8Array(data), {
+      headers: {
+        'content-type': contentType,
+        'content-length': String(data.length),
+        // 内容寻址：同名即同图，可以放心让 Chromium 缓存。
+        'cache-control': 'public, max-age=300'
+      }
+    })
+  } catch {
+    return textResponse(404, 'crop art not found')
+  }
 }
 
 /**
@@ -592,6 +657,25 @@ function resolveAssetFile (name) {
 
 function isSafeCacheName (name) {
   return typeof name === 'string' && /^[0-9a-f]{64}\.webm$/.test(name)
+}
+
+function resolveCropArtFile (name) {
+  if (cropsRoot === null || !cropPath.isCropArtName(name)) return null
+  let base
+  try {
+    base = path.resolve(cropsRoot)
+  } catch {
+    return null
+  }
+  const candidate = path.resolve(base, name)
+  if (candidate === base || !candidate.startsWith(base + path.sep)) return null
+  try {
+    const stat = fs.statSync(candidate)
+    if (stat.isFile() && stat.size > 0 && stat.size <= MAX_CROP_ART_BYTES) return candidate
+  } catch {
+    return null
+  }
+  return null
 }
 
 function resolveCacheFile (name) {
@@ -1226,7 +1310,9 @@ function renameBounds () {
 
 function currentName () {
   const self = scene.items.find((item) => item.id === 'self')
-  return typeof self?.label === 'string' ? self.label : ''
+  if (typeof self?.label === 'string' && self.label !== '') return self.label
+  // 不在家：用最后一次见到的名字预填，别给一个空输入框。
+  return lastSelfLabel
 }
 
 function openRenameWindow () {
@@ -1651,6 +1737,7 @@ function sendFarmState () {
     farmWin.webContents.send('dsh-zoo:farm-state', {
       farm: farmState,
       market: farmMarket,
+      crops: farmCrops,
       contracts: farmContracts,
       mode: farmMode,
       visit: farmVisit,
@@ -1784,6 +1871,11 @@ function applyCommand (command) {
     case 'update': {
       scene = command.scene
       sceneAt = Date.now()
+      // 记下最后一次见到的名字：宠物出门后桌面上没有 self，改名小窗也要能预填（ticket 57）。
+      const selfItem = scene.items.find((item) => item.id === 'self')
+      if (selfItem !== undefined && typeof selfItem.label === 'string' && selfItem.label !== '') {
+        lastSelfLabel = selfItem.label
+      }
       // ticket 33：换皮之后素材目录跟着场景走。空数组 = 这次没说，沿用启动参数
       // （旧宿主不会带这个字段，helper 不能因此把根目录清空）。
       if (Array.isArray(scene.assetRoots) && scene.assetRoots.length > 0) {
@@ -1891,6 +1983,7 @@ function applyCommand (command) {
       }
       farmState = command.farm
       farmMarket = command.market
+      farmCrops = Array.isArray(command.crops) ? command.crops : null
       farmContracts = command.contracts ?? null
       farmMode = command.mode === 'look' ? 'look' : command.mode === 'visitor' ? 'visitor' : 'owner'
       farmVisit = command.visit ?? null
@@ -2705,7 +2798,8 @@ function parseArgs (argv) {
     debug: false,
     assets: [],
     cache: null,
-    gifts: null
+    gifts: null,
+    crops: null
   }
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
@@ -2734,6 +2828,11 @@ function parseArgs (argv) {
       index += 1
     } else if (arg.startsWith('--dsh-zoo-cache=')) {
       parsed.cache = arg.slice('--dsh-zoo-cache='.length)
+    } else if (arg === '--dsh-zoo-crops') {
+      parsed.crops = argv[index + 1] ?? null
+      index += 1
+    } else if (arg.startsWith('--dsh-zoo-crops=')) {
+      parsed.crops = arg.slice('--dsh-zoo-crops='.length)
     } else if (arg === '--dsh-zoo-gifts') {
       if (typeof argv[index + 1] === 'string') parsed.gifts = argv[index + 1]
       index += 1

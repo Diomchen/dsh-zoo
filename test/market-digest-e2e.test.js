@@ -339,7 +339,8 @@ test('假 peer：放行才收得到 digest；同一 peer 限速 1 条/窗口；�
   const first = digests(peer)[0].parsed.packet
   assert.deepEqual(Object.keys(first), ['v', 'type', 'deviceId', 'at', 'prices', 'hire'])
   assert.equal(first.deviceId, service.snapshot().self.deviceId)
-  assert.deepEqual(Object.keys(first.prices).sort(), ['carrot', 'pumpkin', 'tomato'])
+  assert.deepEqual(Object.keys(first.prices).sort(),
+    ['carrot', 'corn', 'grape', 'pumpkin', 'strawberry', 'tomato'])
   // 挂牌发 farm.json 的值 + 雇工贡献的 0.5；available/reason 来自真实在家状态。
   assert.deepEqual(first.hire, {
     enabled: true,
