@@ -18,16 +18,14 @@
   ],
   "scripts": {
     "test": "node scripts/run-tests.mjs",
-    "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --check desktop/farm-view.js && node --check desktop/farm.js && node --check desktop/farm-preload.js && node --check desktop/crop-path.js && node --check scripts/lib/pet.mjs && node --check scripts/two-pets.mjs && node --check scripts/run-tests.mjs && node --check scripts/test-groups.mjs && node --check scripts/peer-probe.mjs && node --check scripts/verify-catalog-sync.mjs && npm test",
+    "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --check desktop/farm-view.js && node --check desktop/farm.js && node --check desktop/farm-preload.js && node --check desktop/crop-path.js && node --check scripts/lib/pet.mjs && node --check scripts/two-pets.mjs && node --check scripts/run-tests.mjs && node --check scripts/peer-probe.mjs && node --check scripts/verify-catalog-sync.mjs && npm test",
     "install:profile": "node scripts/install.mjs",
     "uninstall:profile": "node scripts/uninstall.mjs",
     "stop-helper": "node scripts/stop-helper.mjs",
     "fake-peer": "node scripts/fake-peer.mjs",
     "two-pets": "node scripts/two-pets.mjs",
     "smoke:desktop": "node scripts/desktop-smoke.mjs",
-    "pack:release": "npm pack",
-    "test:net": "node scripts/run-tests.mjs --network",
-    "test:all": "node scripts/run-tests.mjs --all"
+    "pack:release": "npm pack"
   },
   "engines": {
     "node": ">=22.12.0"

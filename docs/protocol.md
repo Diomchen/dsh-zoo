@@ -104,7 +104,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working`（旧版本可能给 `null`）；`available` 只在这只宠物真的能被雇时为 true；坏形状整包丢 |
 | `contractId` | `work-ack`、`work-recall`、`work-end`、`work-settle` | 合同 UUID；`work-end` 在取消一笔还没 ack 的请求时可改用 `requestId` |
 | `hours` / `wagePerHour` / `fee` | `work-request` | 时长 2–8 小时、时薪 1–100 的整数；`fee` 是 1..40 的整数，必须等于 `ceil(时薪 × 时长 × 5%)`（最低 1） |
-| `startedAt` / `endsAt` | `work-ack` | 正整数毫秒；`endsAt > startedAt` 且差值 ≤8 小时 |
+| `startedAt` / `endsAt` | `work-ack` | 正整数毫秒；`endsAt > startedAt` 且差值 ≤8 小时。这是**雇工那台机器的时钟**：雇主只用它核对时长，自己的合同锚点用本机 ack 时刻 + `hours`，两台的时钟差不会漏进倒计时或到期时刻（ticket 61） |
 | `guard` | `work-ack`、`market-digest.hire` | 0..0.8 的有限数；`work-ack` 是雇工贡献的 0.5，`market-digest.hire` 同样是**雇工贡献的 0.5**，不是 `farmGuard()` 的合成值（0.3/0.5/0.8） |
 | `servedMs` / `earned` | `work-settle` | 服务毫秒 0..8 小时；工钱 0..800 的整数；`work-settle-ack` 回的 `earned` 同一范围 |
 
@@ -775,7 +775,10 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    `work-request`。首次 + 两次重发（约 500ms），1.8 秒没 ack 就取消并全额退款。
 3. **确认**：雇工主人再校验一遍在线/在家/挂牌/时段/时薪/手续费；落 `incoming` 合同、
    进 `working`、创建 `contractId` 后回 `work-ack`。雇主收到 ack 才把合同置 active，
-   `ackedAt` 用雇主本地时钟。
+   `ackedAt` / `startedAt` / `endsAt` **都用雇主本地时钟**（`startedAt = ackedAt`，
+   `endsAt = ackedAt + hours`）。ack 里的 `startedAt` / `endsAt` 是雇工那台机器的时间，
+   只用来核对时长：直接拿来当自己的到期时刻，倒计时就会带着两台的时钟差
+   （对方快 30 分钟 →「还剩 2 小时 30 分」，慢 2 小时 → 一成交就快到期）。
 4. **`working`**：雇工不出现在自己家（`self.work`），出现在雇主农场（`worker` 镜像 +
    `role:'worker'`/`badge:'work'`），雇主守卫 +0.5。合同期内它不能再串门、不能再被雇；
    v1 一个农场最多一位雇工，不能雇自己（D2 允许同一位宠物既当雇主又当雇工）。
@@ -783,9 +786,11 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    到期 `expired`；任一方离线按最后心跳 `offline`。结束写 `ended` / `endReason`，
    然后双方走 `work-settle` / `work-settle-ack`。
 6. **结算**：`earned = floor(wage × servedMs / contractMs)`；`servedMs` 只取**雇主本地时钟**
-   从收到 ack 到结束的差值，跨机只用 `endsAt − startedAt` 这个差值。雇工主人用自己的
-   合同重算并夹在 0..wage，给 `earned` 入账一次并回 ack；雇主拿回 `wage − earned`，
-   手续费不退。`requestId`/`contractId` 重发只回放、不重复加钱。
+   从收到 ack 到结束的差值。两边各有一份 `contractMs`，但都等于 `hours` 换算的毫秒数
+   （雇主取自己 pending 记录里的 `hours`，雇工取 `endsAt − startedAt`），所以跨机只剩
+   这个时长，不带任何时钟差。雇工主人用自己的合同重算并夹在 0..wage，给 `earned` 入账
+   一次并回 ack；雇主拿回 `wage − earned`，手续费不退。`requestId`/`contractId` 重发只
+   回放、不重复加钱。
 7. **离线/重启**：合同的一方在最后心跳后判离线，按最后心跳结算；重连后按 `contractId`
    幂等补发。`work-*` ack 缓存最近 **200** 条 / 10 分钟；结算/召回重试 1 秒起步、
    指数退避封顶 30 秒。

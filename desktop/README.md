@@ -372,6 +372,14 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   的时刻 + `peerLostMs` 算（默认 120 秒 = 4 个 30 秒广播），不是邻居的墙上时钟。
   窗口每秒自己比一次：到点把「可雇」变「行情过期」并收起雇佣控件，不用等下一次 push；
   `stale` 保留作老宿主兜底。
+- **倒计时按真实时间走（ticket 47.1 / 61）**：地块和合同的「还剩 …」都按
+  「收到快照那一刻的剩余 − `Date.now()` 之后的差值」算，**不是**每个 `setInterval` 拍减
+  1 秒。Electron 的 interval 会被后台节流、长任务延迟，逐拍递减会累积误差（阻塞 5 秒只
+  减 1 秒）；更糟的是重画：`renderHire()` / `renderFarmSurface()` 每次都从快照重建，剩余
+  时间若存在 DOM 条目上，切个页签就被拽回快照值——看起来就是时间倒流。基线因此记在数据
+  对象上（`baseRemainingMs` / `baseAt`，见 `primeCountdowns` / `primeContractCountdowns`），
+  只在 `onState` 里刷新。走到 0 也不本地改状态：窗口只把文本停在「马上就好 / 马上结束」，
+  再请宿主重推一份 `farm-refresh`；熟没熟、合同结没结只认宿主的 `stage` / `status`。
 - **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
   浇水/施肥；成熟轻微弹跳并给收获/施肥。动作 id 仍是 `farm-plant` / `farm-harvest` /
   `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。

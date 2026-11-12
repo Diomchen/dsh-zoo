@@ -110,16 +110,16 @@ function optionsFor (dir, port, targetPort, overrides = {}) {
   }
 }
 
-async function connectedPair (t) {
+async function connectedPair (t, overrides = {}) {
   const dirA = await tempDir(t)
   const dirB = await tempDir(t)
   // port:0 = 让内核挑端口，避免多个测试进程的 free-port 竞态；
   // A 主动向 B 广播，B 用 discovery 的 beacon-ack 回给来源地址。
-  const b = makeService(t, optionsFor(dirB, 0, 0))
+  const b = makeService(t, optionsFor(dirB, 0, 0, overrides.b))
   await b.ready
   const bPort = b.localPort()
   assert.ok(bPort > 0)
-  const a = makeService(t, optionsFor(dirA, 0, bPort))
+  const a = makeService(t, optionsFor(dirA, 0, bPort, overrides.a))
   await a.ready
   await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
   const aId = a.snapshot().self.deviceId
@@ -299,4 +299,31 @@ test('校验：不能雇自己、没挂牌/不在家时明确失败；重复点�
   assert.equal(again.body.error, 'already-hired')
   assert.equal(a.snapshot().farm.coins, 9)
   assert.equal(a.snapshot().contracts.outgoing.length, 1)
+})
+
+/**
+ * 票 61：合同的时间锚点必须落在**本机**时钟上。
+ *
+ * work-ack 里的 startedAt/endsAt 是雇工那台机器的绝对时间。雇主如果直接拿来当自己的
+ * 到期时刻，倒计时就带着两台的时钟差：雇工时钟快 30 分钟，2 小时的合同在雇主这边显示
+ * 「还剩 2 小时 30 分」，到期也比合同晚半小时（反过来则一成交就快到期）。
+ * 时长只认自己那份 pending 记录里的 hours。
+ */
+test('雇工那台机器时钟快 30 分钟：雇主看到的合同时长仍是 2 小时', async (t) => {
+  const SKEW_MS = 30 * 60 * 1000
+  const { a, b, bId } = await connectedPair(t, { b: { contractNow: () => Date.now() + SKEW_MS } })
+  await listOn(b)
+  const beforeHireAt = Date.now()
+  await hireFrom(a, b, bId)
+  await delay(50)
+
+  const outgoing = a.snapshot().contracts.outgoing[0]
+  assert.equal(outgoing.status, 'active')
+  // 雇主这边的锚点应该是自己的钟：ack 那一刻 ± 几秒，而不是雇工那台机器的 +30 分钟。
+  assert.ok(Math.abs(outgoing.startedAt - beforeHireAt) < 10_000,
+    '雇主应该用本机时钟当时刻，实际差 ' + (outgoing.startedAt - beforeHireAt) + 'ms')
+  assert.equal(outgoing.endsAt - outgoing.startedAt, 2 * 60 * 60 * 1000, '合同时长就是雇的 2 小时')
+  const remainingMin = outgoing.remainingMs / 60000
+  assert.ok(remainingMin > 118 && remainingMin <= 120,
+    '雇主窗口「还剩」应该 ≈120 分钟，实际 ' + remainingMin.toFixed(1) + ' 分钟')
 })

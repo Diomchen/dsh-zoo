@@ -248,6 +248,25 @@
     }
   }
 
+  /**
+   * 倒计时（地块与合同共用）：快照那一刻的剩余 − **真实经过**的时间。
+   *
+   * 宿主只在事件上推快照（窗口收不到每秒推送），所以时间只能从收到快照那一刻往后推。
+   * 不能「每拍减 1 秒」：Electron 的 interval 会被后台节流/长任务延迟，减出来的秒数
+   * 会比真实时间少（ticket 47.1 的地块、ticket 61 的合同都踩过这一条）。
+   * 时钟被调到过去时也只会停在原值，不让倒计时涨回去。
+   */
+  function remainingAt (baseRemainingMs, baseAt, now, fallbackMs = 0) {
+    const base = Number(baseRemainingMs)
+    const at = Number(baseAt)
+    const current = Number(now)
+    if (Number.isFinite(base) && Number.isFinite(at) && Number.isFinite(current)) {
+      return Math.max(0, base - Math.max(0, current - at))
+    }
+    const fallback = Number(fallbackMs)
+    return Number.isFinite(fallback) ? Math.max(0, fallback) : 0
+  }
+
   /** 进度条 = 已生长 / 总生长。剩余时间是宿主算的权威值，这里只做显示。 */
   function progressOf (plot) {
     if (plot === null || typeof plot !== 'object') return 0
@@ -665,6 +684,7 @@
     headerStats,
     neighborSwitch,
     progressOf,
+    remainingAt,
     tradeView,
     listingIsStale,
     plotCards,

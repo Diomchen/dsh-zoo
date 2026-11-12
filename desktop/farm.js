@@ -1058,13 +1058,20 @@ function renderMarket () {
   }
 }
 
-/** 合同剩余时间：窗口本地每秒递减（宿主只给那一刻的 remainingMs）。 */
-function contractRemainingText (contract) {
-  const remaining = Math.max(0, Number(contract.remainingMs) || 0)
+/** 合同此刻还剩多少：快照那一刻的 remainingMs 减去真实经过的时间（宿主只在事件上推快照）。 */
+function contractRemaining (contract, now = Date.now()) {
+  return view.remainingAt(contract?.baseRemainingMs, contract?.baseAt, now, contract?.remainingMs)
+}
+
+/** 合同剩余时间：从基线按 Date.now() 推，不逐拍递减（否则切页/节流后会倒流）。 */
+function contractRemainingText (contract, now = Date.now()) {
   if (contract.status === 'pending') return '正在联系雇主…'
   if (contract.status !== 'active') {
     return contract.settled === true ? '已结算' : contract.status === 'cancelled' ? '已取消' : '已结束'
   }
+  const remaining = contractRemaining(contract, now)
+  // 到期与否只有宿主知道：本地到 0 就停在「马上结束」，等宿主重推 state 再改状态。
+  if (remaining === 0) return '马上结束'
   return '还剩 ' + formatRemaining(remaining)
 }
 
@@ -1215,7 +1222,7 @@ function contractRow (contract, side) {
   const money = side === 'outgoing'
     ? '托管 ' + contract.wage + ' · 手续费 ' + contract.fee
     : '已挣 ' + (contract.earned || 0) + '/' + contract.wage
-  meta.textContent = contractRemainingText(contract) + ' · ' + money
+  meta.textContent = contractRemainingText(contract, Date.now()) + ' · ' + money
   grow.appendChild(name)
   grow.appendChild(meta)
   head.appendChild(avatar)
@@ -1237,7 +1244,7 @@ function contractRow (contract, side) {
     head.appendChild(btn)
     contractCountdowns.set(contract.id, {
       node: meta,
-      remaining: Math.max(0, Number(contract.remainingMs) || 0),
+      contract,
       text: money
     })
   } else {
@@ -1441,22 +1448,30 @@ function listingStaleSignature (now = Date.now()) {
     .join('|')
 }
 
-/** 雇工页的倒计时只改文本：每 1 秒一次；合同归零或挂牌跨过 expiresAt 时重画一次。 */
+/**
+ * 雇工页的倒计时：从收到快照那一刻的基线按 Date.now() 推，只改文本；
+ * 挂牌跨过 expiresAt 时重画一次。到 0 请宿主确认，不自己宣布结束。
+ *
+ * 不能「每拍 remaining -= 1000」：interval 被后台节流/长任务延迟时秒数就不够了，
+ * 而 renderHire() 每重画一次又会用快照值覆盖回来——时间看起来会倒流（ticket 61）。
+ */
 function tickContracts () {
   if (contracts === null) return false
   let needsRender = false
-  const key = listingStaleSignature(Date.now())
+  const now = Date.now()
+  const key = listingStaleSignature(now)
   if (key !== listingStaleKey) {
     listingStaleKey = key
     needsRender = true
   }
-  for (const [id, entry] of contractCountdowns) {
-    entry.remaining = Math.max(0, entry.remaining - 1000)
-    if (entry.remaining === 0) {
-      needsRender = true
+  for (const [, entry] of contractCountdowns) {
+    const remaining = contractRemaining(entry.contract, now)
+    if (remaining === 0) {
+      entry.node.textContent = '马上结束 · ' + entry.text
+      requestFarmRefresh()
       continue
     }
-    entry.node.textContent = '还剩 ' + formatRemaining(entry.remaining) + ' · ' + entry.text
+    entry.node.textContent = '还剩 ' + formatRemaining(remaining) + ' · ' + entry.text
   }
   if (needsRender) renderHire()
   return needsRender
@@ -1612,6 +1627,22 @@ function primeCountdowns (plots) {
     const remaining = Number(plot.remainingMs)
     plot.baseRemainingMs = Number.isFinite(remaining) ? remaining : 0
     plot.baseAt = at
+  }
+}
+
+/**
+ * 合同倒计时同理（ticket 61）：每次宿主 state 都是新的基线。
+ * 基线记在合同对象上而不是 DOM 条目上——renderHire() 会重画整页，
+ * 条目上的剩余时间一旦被快照值覆盖，倒计时就会往回跳。
+ */
+function primeContractCountdowns (list) {
+  if (!Array.isArray(list)) return
+  const at = Date.now()
+  for (const contract of list) {
+    if (contract === null || typeof contract !== 'object' || contract.status !== 'active') continue
+    const remaining = Number(contract.remainingMs)
+    contract.baseRemainingMs = Number.isFinite(remaining) ? remaining : 0
+    contract.baseAt = at
   }
 }
 
@@ -2017,6 +2048,9 @@ api?.onState((payload) => {
   // ticket 47.1：每次宿主 state 都是新的倒计时基线；重置“到点确认”的在飞标记。
   primeCountdowns(farm?.plots)
   primeCountdowns(visit?.plots)
+  // ticket 61：合同倒计时也走同一条纪律（地块修过一次，雇佣这边漏了）。
+  primeContractCountdowns(contracts?.outgoing)
+  primeContractCountdowns(contracts?.incoming)
   refreshPending = false
   if (mode !== 'owner') {
     // 访客模式没有一键种满/收割，也没有播种/解锁弹窗；正在跑的批量队列立刻停。

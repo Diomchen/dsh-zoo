@@ -7,7 +7,8 @@
 
 **Blocked by:** 无
 
-**Status:** done（2026-11-12）
+**Status:** done（2026-11-12）→ **被[票 62](62-drop-lan-test-tier.md)取代**（2026-11-12）：
+网络档整档删除，`npm test` 只剩一档。
 
 - [x] `scripts/test-groups.mjs`：显式 `NETWORK_TESTS` 清单（21 个）+ 开 socket 的源码特征
 - [x] `scripts/run-tests.mjs`：`--network` / `--all` / `--list`，默认核心档；
