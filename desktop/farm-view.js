@@ -29,14 +29,14 @@
    * `file://` 加载，CSP 里放行了 `img-src 'self'`。
    */
   const BUILTIN_META = Object.freeze({
-    pea: { name: '豌豆', emoji: '🫛', art: 'crops/pea.svg', seedPrice: 6, base: 4, growMs: 25 * MINUTE_MS, yield: 3, season: 'spring' },
+    pea: { name: '豌豆', emoji: '🫛', art: 'crops/pea.svg', seedPrice: 6, base: 6, growMs: 25 * MINUTE_MS, yield: 3, season: 'spring' },
     tomato: { name: '小番茄', emoji: '🍅', art: 'crops/tomato.svg', seedPrice: 6, base: 5, growMs: 30 * MINUTE_MS, yield: 3 },
     strawberry: { name: '草莓', emoji: '🍓', art: 'crops/strawberry.svg', seedPrice: 9, base: 7, growMs: 45 * MINUTE_MS, yield: 4 },
-    radish: { name: '白萝卜', emoji: '🥬', art: 'crops/radish.svg', seedPrice: 10, base: 4, growMs: 90 * MINUTE_MS, yield: 6, season: 'winter' },
+    radish: { name: '白萝卜', emoji: '🥬', art: 'crops/radish.svg', seedPrice: 10, base: 8, growMs: 90 * MINUTE_MS, yield: 6, season: 'winter' },
     carrot: { name: '胡萝卜', emoji: '🥕', art: 'crops/carrot.svg', seedPrice: 14, base: 6, growMs: 2 * HOUR_MS, yield: 5 },
-    rice: { name: '稻米', emoji: '🌾', art: 'crops/rice.svg', seedPrice: 18, base: 4, growMs: 3 * HOUR_MS, yield: 10, season: 'autumn' },
+    rice: { name: '稻米', emoji: '🌾', art: 'crops/rice.svg', seedPrice: 18, base: 10, growMs: 3 * HOUR_MS, yield: 10, season: 'autumn' },
     corn: { name: '玉米', emoji: '🌽', art: 'crops/corn.svg', seedPrice: 22, base: 9, growMs: 4 * HOUR_MS, yield: 6 },
-    watermelon: { name: '西瓜', emoji: '🍉', art: 'crops/watermelon.svg', seedPrice: 30, base: 10, growMs: 6 * HOUR_MS, yield: 8, season: 'summer' },
+    watermelon: { name: '西瓜', emoji: '🍉', art: 'crops/watermelon.svg', seedPrice: 30, base: 24, growMs: 6 * HOUR_MS, yield: 8, season: 'summer' },
     pumpkin: { name: '南瓜', emoji: '🎃', art: 'crops/pumpkin.svg', seedPrice: 36, base: 30, growMs: 8 * HOUR_MS, yield: 3 },
     grape: { name: '葡萄', emoji: '🍇', art: 'crops/grape.svg', seedPrice: 52, base: 24, growMs: 12 * HOUR_MS, yield: 5 }
   })

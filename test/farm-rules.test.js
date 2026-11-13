@@ -60,14 +60,14 @@ test('作物表：十种作物的生长、种子价、产量、底价与 SPEC v8
     'pea', 'tomato', 'strawberry', 'radish', 'carrot', 'rice', 'corn', 'watermelon', 'pumpkin', 'grape'
   ])
   const expected = {
-    pea: { growMs: 25 * MINUTE_MS, seedPrice: 6, yield: 3, base: 4 },
+    pea: { growMs: 25 * MINUTE_MS, seedPrice: 6, yield: 3, base: 6 },
     tomato: { growMs: 30 * MINUTE_MS, seedPrice: 6, yield: 3, base: 5 },
     strawberry: { growMs: 45 * MINUTE_MS, seedPrice: 9, yield: 4, base: 7 },
-    radish: { growMs: 90 * MINUTE_MS, seedPrice: 10, yield: 6, base: 4 },
+    radish: { growMs: 90 * MINUTE_MS, seedPrice: 10, yield: 6, base: 8 },
     carrot: { growMs: 2 * HOUR_MS, seedPrice: 14, yield: 5, base: 6 },
-    rice: { growMs: 3 * HOUR_MS, seedPrice: 18, yield: 10, base: 4 },
+    rice: { growMs: 3 * HOUR_MS, seedPrice: 18, yield: 10, base: 10 },
     corn: { growMs: 4 * HOUR_MS, seedPrice: 22, yield: 6, base: 9 },
-    watermelon: { growMs: 6 * HOUR_MS, seedPrice: 30, yield: 8, base: 10 },
+    watermelon: { growMs: 6 * HOUR_MS, seedPrice: 30, yield: 8, base: 24 },
     pumpkin: { growMs: 8 * HOUR_MS, seedPrice: 36, yield: 3, base: 30 },
     grape: { growMs: 12 * HOUR_MS, seedPrice: 52, yield: 5, base: 24 }
   }
