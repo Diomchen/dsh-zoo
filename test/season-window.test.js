@@ -12,9 +12,11 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { createService } from '../src/service.js'
-import { seasonAt } from '../src/season-rules.js'
+import { HOUR_MS, seasonAt } from '../src/season-rules.js'
+import { freshOmen } from '../src/season-omens.js'
 
-const AUTUMN = new Date(2026, 10, 17, 12, 0, 0).getTime()
+const AUTUMN_DAY = new Date(2026, 10, 17, 12, 0, 0).getTime()
+const AUTUMN = freshOmen(seasonAt(AUTUMN_DAY)).start + HOUR_MS
 const WINTER = new Date(2026, 10, 18, 12, 0, 0).getTime()
 
 function fakeCtx () {
@@ -98,7 +100,9 @@ test('state.farm.season：冬天没有熊獾，节日换成围炉节', async (t)
   const state = await getState(service)
   const season = state.farm.season
   assert.equal(season.id, 'winter')
-  assert.equal(season.omen, null)
+  // 窗口外的来客不会下发；窗口内则一定是冬夜巨鹿，不可能是熊獾。
+  assert.notEqual(season.omen?.id, 'autumn-bearger')
+  if (season.omen !== null) assert.equal(season.omen.id, 'winter-deerclops')
   assert.equal(season.event.id, 'winter-hearth')
   assert.equal(season.calendar.find((cell) => cell.today).id, 'winter')
 })

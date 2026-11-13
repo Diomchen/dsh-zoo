@@ -935,6 +935,15 @@ class FarmStore {
     return this.#enqueue(() => this.#takeCrops(qty, options))
   }
 
+  /**
+   * 票 74：来客失败时让地块枯萎。优先动正在长的地，再动成熟的地；
+   * `matureOnly` 用于野火（只烧已经能收的）。没有可动的地就返回 qty 0，
+   * 由 service 决定是否改扣仓库作物。
+   */
+  witherPlots (qty = 1, options = {}) {
+    return this.#enqueue(() => this.#witherPlots(qty, options))
+  }
+
   /** 票 67：来客结果只写一条日志，钱/作物由 service 按结果结算。 */
   noteOmen (result) {
     return this.#enqueue(() => this.#noteOmen(result))
@@ -1539,6 +1548,35 @@ class FarmStore {
     }
   }
 
+  async #witherPlots (rawQty, options = {}) {
+    const qty = positiveInt(rawQty, MAX_PLOTS)
+    if (qty === null) return farmError('bad-qty')
+    const matureOnly = options?.matureOnly === true
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const candidates = []
+    this.#state.plots.forEach((plot, index) => {
+      if (plot === null || typeof plot !== 'object' || plot.withered === true) return
+      if (!isCropId(plot.crop)) return
+      if (matureOnly && !isMature(plot)) return
+      candidates.push({ index, plot, mature: isMature(plot) ? 1 : 0 })
+    })
+    // 幼苗先倒霉；同类按地块顺序，避免随机数让结果不可复现。
+    candidates.sort((a, b) => a.mature - b.mature || a.index - b.index)
+    const chosen = candidates.slice(0, qty)
+    for (const { plot } of chosen) plot.withered = true
+    if (chosen.length > 0) this.#appendLog({ at: now, kind: 'wither', qty: chosen.length })
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'wither-plots',
+      qty: chosen.length,
+      plots: chosen.map(({ plot }) => plot.id),
+      persisted
+    }
+  }
+
   async #noteOmen (raw) {
     const now = this.#nowMs()
     this.#advance(now)
@@ -1549,7 +1587,8 @@ class FarmStore {
         ? raw.choice
         : 'guard',
       success: raw?.success === true,
-      qty: Math.max(0, Math.min(MAX_STACK, Math.trunc(Number(raw?.loss) || 0)))
+      qty: Math.max(0, Math.min(MAX_STACK, Math.trunc(Number(raw?.loss) || 0))),
+      wither: Math.max(0, Math.min(MAX_PLOTS, Math.trunc(Number(raw?.wither) || 0)))
     }
     if (typeof raw?.who === 'string' && raw.who.trim() !== '') entry.who = raw.who.trim().slice(0, 32)
     this.#appendLog(entry)

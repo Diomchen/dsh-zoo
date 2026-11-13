@@ -758,6 +758,7 @@
     const dew = Number(raw.dew)
     const choice = raw.choice === 'guard' || raw.choice === 'feed' || raw.choice === 'ignore' ? raw.choice : null
     const name = normalizeText(raw.name, '', 24)
+    const wither = Number(raw.wither)
     return {
       at: Math.floor(at),
       kind: raw.kind,
@@ -773,6 +774,7 @@
       ...(Number.isFinite(earned) ? { earned: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(earned))) } : {}),
       ...(Number.isFinite(hours) ? { hours: Math.min(HIRE_HOURS_MAX, Math.max(0, Math.floor(hours))) } : {}),
       ...(Number.isFinite(cost) ? { cost: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(cost))) } : {}),
+      ...(Number.isFinite(wither) ? { wither: Math.min(MAX_FARM_PLOTS, Math.max(0, Math.floor(wither))) } : {}),
       ...(Number.isFinite(plot) ? { plot: Math.min(MAX_FARM_PLOTS, Math.max(1, Math.floor(plot))) } : {})
     }
   }
@@ -865,6 +867,18 @@
     }
   }
 
+  function normalizeSeasonCost (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { crops: 0, dew: 0, coins: 0 }
+    const number = (value, max) => Number.isFinite(Number(value))
+      ? Math.min(max, Math.max(0, Math.floor(Number(value))))
+      : 0
+    return {
+      crops: number(raw.crops, MAX_FARM_STACK),
+      dew: number(raw.dew, MAX_FARM_DEW),
+      coins: number(raw.coins, MAX_FARM_COINS)
+    }
+  }
+
   function normalizeSeasonOmen (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const stakes = raw.stakes !== null && typeof raw.stakes === 'object' ? raw.stakes : {}
@@ -874,19 +888,50 @@
       ? Math.min(max, Math.max(0, Math.floor(Number(value))))
       : 0
     const choice = raw.choice === 'guard' || raw.choice === 'feed' ? raw.choice : null
+    const choices = []
+    if (Array.isArray(raw.choices)) {
+      for (const candidate of raw.choices.slice(0, 2)) {
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+        if (candidate.id !== 'guard' && candidate.id !== 'feed') continue
+        choices.push({
+          id: candidate.id,
+          label: normalizeText(candidate.label, candidate.id === 'guard' ? '守卫' : '安抚', 8),
+          detail: normalizeText(candidate.detail, '', 120),
+          cost: normalizeSeasonCost(candidate.cost),
+          affordable: candidate.affordable !== false,
+          ...(typeof candidate.reason === 'string' && candidate.reason !== ''
+            ? { reason: normalizeText(candidate.reason, '', 60) }
+            : {})
+        })
+      }
+    }
+    const start = Number(raw.start)
+    const end = Number(raw.end)
+    const day = Number(raw.day)
+    const remaining = Number(raw.remainingMs)
     return {
       id: typeof raw.id === 'string' ? raw.id.slice(0, 32) : '',
       name: normalizeText(raw.name, '来客', 16),
       emoji: typeof raw.emoji === 'string' ? Array.from(raw.emoji).slice(0, 2).join('') : '🐻',
+      tag: normalizeText(raw.tag, '季候来客', 12),
+      season: SEASON_IDS.includes(raw.season) ? raw.season : null,
+      start: Number.isFinite(start) ? Math.max(0, Math.floor(start)) : 0,
+      end: Number.isFinite(end) ? Math.max(0, Math.floor(end)) : 0,
+      day: Number.isFinite(day) ? Math.max(0, Math.floor(day)) : 0,
+      remainingMs: Number.isFinite(remaining) ? Math.max(0, Math.floor(remaining)) : 0,
+      active: raw.active === true,
       resolved: raw.resolved === true,
       choice,
+      choices,
       canFeed: raw.canFeed === true,
       stakes: {
         guardReward,
         failLoss: number(stakes.failLoss, MAX_FARM_STACK),
-        feedCost: number(stakes.feedCost, MAX_FARM_STACK),
+        failWither: number(stakes.failWither, MAX_FARM_PLOTS),
+        failMatureOnly: stakes.failMatureOnly === true,
+        feedCost: normalizeSeasonCost(stakes.feedCost),
         feedReward,
-        ignoreLoss: number(stakes.ignoreLoss, MAX_FARM_STACK)
+        ignoreLoss: normalizeSeasonCost(stakes.ignoreLoss)
       }
     }
   }

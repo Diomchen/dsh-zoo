@@ -11,10 +11,14 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { createFarmStore } from '../src/farm.js'
-import { seasonAt } from '../src/season-rules.js'
+import { HOUR_MS, seasonAt } from '../src/season-rules.js'
+import { freshOmen } from '../src/season-omens.js'
 import { createService } from '../src/service.js'
 
-const AUTUMN = new Date(2026, 10, 17, 12, 0, 0).getTime()
+const AUTUMN_DAY = new Date(2026, 10, 17, 12, 0, 0).getTime()
+const AUTUMN_OMEN = freshOmen(seasonAt(AUTUMN_DAY))
+// 来客窗口是随机的；集成测试统一把时钟拨到窗口内，才能结算。
+const AUTUMN = AUTUMN_OMEN.start + HOUR_MS
 
 function fakeCtx () {
   const routes = []
@@ -88,7 +92,7 @@ function state (service) {
   return call(service, '/dsh-zoo/state')
 }
 
-async function seedFarm (dir, now, { crops = {}, coins = 30 } = {}) {
+async function seedFarm (dir, now, { crops = {}, seeds = {}, coins = 30, dew = 0 } = {}) {
   const store = await createFarmStore(dir, {
     now: () => now,
     market: {
@@ -98,7 +102,9 @@ async function seedFarm (dir, now, { crops = {}, coins = 30 } = {}) {
     }
   })
   if (coins > 30) await store.addCoins(coins - 30)
+  for (const [cropId, qty] of Object.entries(seeds)) await store.addSeed(cropId, qty)
   for (const [cropId, qty] of Object.entries(crops)) await store.addCrop(cropId, qty)
+  if (dew > 0) await store.refundDew(dew)
 }
 
 async function seedSeason (dir, now, { progress = 0, omen = null } = {}) {
@@ -311,6 +317,62 @@ test('omen：旧 start 拒绝、坏选择拒绝，且都不写 season.json', asy
   const after = await readFile(join(dir, 'season.json'), 'utf8')
   assert.equal(after, before)
   assert.equal((await state(service)).body.farm.season.omen.resolved, false)
+})
+
+test('蛙雨：守夜失败会踩坏一块正在长的地，不是只扣仓库', async (t) => {
+  const day = new Date(2026, 10, 15, 12, 0, 0).getTime()
+  const at = freshOmen(seasonAt(day)).start + HOUR_MS
+  const dir = await tempDir(t)
+  await seedFarm(dir, at, { seeds: { pea: 1 } })
+  const service = makeService(t, dir, { farmNow: () => at, farmRandom: () => 0.9 })
+  await service.ready
+
+  const before = (await state(service)).body.farm.season
+  assert.equal(before.omen.id, 'spring-frog-rain')
+  const planted = await action(service, { action: 'farm-plant', plotId: 'p1', cropId: 'pea' })
+  assert.equal(planted.body.ok, true)
+
+  const failed = await action(service, {
+    action: 'farm-omen-resolve',
+    choice: 'guard',
+    expectedStart: before.start
+  })
+  assert.equal(failed.body.ok, true)
+  assert.equal(failed.body.outcome.success, false)
+  assert.equal(failed.body.outcome.loss, 0)
+  assert.equal(failed.body.outcome.wither, 1)
+
+  const after = (await state(service)).body.farm
+  assert.equal(after.plots[0].withered, true)
+  assert.equal(after.season.omen.resolved, true)
+})
+
+test('巨鹿：生火要扣 2 露水 + 10 硬币，稳过且不损作物', async (t) => {
+  const day = new Date(2026, 10, 18, 12, 0, 0).getTime()
+  const at = freshOmen(seasonAt(day)).start + HOUR_MS
+  const dir = await tempDir(t)
+  await seedFarm(dir, at, { dew: 2, crops: { tomato: 4 } })
+  const service = makeService(t, dir, { farmNow: () => at })
+  await service.ready
+
+  const before = (await state(service)).body.farm
+  assert.equal(before.season.omen.id, 'winter-deerclops')
+  assert.equal(before.season.omen.canFeed, true)
+  const fed = await action(service, {
+    action: 'farm-omen-resolve',
+    choice: 'feed',
+    expectedStart: before.season.start
+  })
+  assert.equal(fed.body.ok, true)
+  assert.equal(fed.body.outcome.success, true)
+  assert.equal(fed.body.outcome.loss, 0)
+  assert.equal(fed.body.outcome.wither, 0)
+
+  const after = (await state(service)).body.farm
+  assert.equal(after.coins, 20)
+  assert.equal(after.dew, 0)
+  assert.deepEqual(after.crops, { tomato: 4 })
+  assert.equal(after.season.omen.resolved, true)
 })
 
 test('重启后 season.json 不重复领奖', async (t) => {
