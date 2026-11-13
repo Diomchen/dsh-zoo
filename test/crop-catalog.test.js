@@ -146,9 +146,9 @@ test('目录排序：按生长时长，同长按 id；应用进 farm-rules 以�
   assert.equal(CROPS.blueberry.name, '蓝莓')
   assert.equal(CROP_IDS.includes('blueberry'), true)
   assert.deepEqual(
-    CROP_IDS.filter((id) => CROP_IDS.indexOf(id) !== -1).slice(0, 3),
-    ['tomato', 'strawberry', 'blueberry'],
-    '90 分钟的蓝莓排在 45 分钟的草莓和 2 小时的胡萝卜之间'
+    CROP_IDS.slice(CROP_IDS.indexOf('strawberry'), CROP_IDS.indexOf('strawberry') + 3),
+    ['strawberry', 'blueberry', 'radish'],
+    '90 分钟的蓝莓排在 45 分钟的草莓和 90 分钟的白萝卜之间'
   )
   // 再应用一次是覆盖，不是重复追加。
   applyCropCatalog([def({ base: 21 })])

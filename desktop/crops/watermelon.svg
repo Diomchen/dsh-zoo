@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-hidden="true">
+  <defs>
+    <linearGradient id="melon-skin" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#6fbf68"/>
+      <stop offset="1" stop-color="#347f42"/>
+    </linearGradient>
+    <linearGradient id="melon-flesh" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff7a68"/>
+      <stop offset=".6" stop-color="#ef4d47"/>
+      <stop offset="1" stop-color="#d9363a"/>
+    </linearGradient>
+    <linearGradient id="melon-rind" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#eaf7c8"/>
+      <stop offset="1" stop-color="#b9df8e"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="50" cy="89" rx="35" ry="5" fill="#000" opacity=".10"/>
+
+  <path d="M12 55c0 20 17 34 38 34s38-14 38-34c-11 5-24 8-38 8s-27-3-38-8z" fill="#2c6c3a"/>
+  <path d="M15 55c1 17 16 29 35 29s34-12 35-29c-10 4-22 6-35 6s-25-2-35-6z" fill="url(#melon-skin)"/>
+
+  <path d="M20 55c2 14 14 24 30 24s28-10 30-24c-9 3-19 5-30 5s-21-2-30-5z" fill="url(#melon-rind)"/>
+  <path d="M19 57c2 12 14 21 31 21s29-9 31-21c-9 2-20 4-31 4s-22-2-31-4z" fill="url(#melon-flesh)"/>
+
+  <path d="M24 72c8 8 16 11 26 11s18-3 26-11" stroke="#2c6c3a" stroke-width="3.2" fill="none" stroke-linecap="round" opacity=".75"/>
+  <path d="M31 79c5 4 12 6 19 6s14-2 19-6" stroke="#2c6c3a" stroke-width="2.4" fill="none" stroke-linecap="round" opacity=".55"/>
+
+  <path d="M30 61c1 4 3 8 6 11" stroke="#ffe1c4" stroke-width="2" fill="none" stroke-linecap="round" opacity=".55"/>
+  <ellipse cx="40" cy="59" rx="8" ry="4" fill="#fff" opacity=".22" transform="rotate(-18 40 59)"/>
+
+  <g fill="#3b2a24">
+    <path d="M36 62c2-1 4 1 3 3-1 3-4 4-5 2-1-2 0-4 2-5z"/>
+    <path d="M52 65c2-1 4 1 3 3-1 3-4 4-5 2-1-2 0-4 2-5z"/>
+    <path d="M66 61c2-1 4 1 3 3-1 3-4 4-5 2-1-2 0-4 2-5z"/>
+    <path d="M44 73c2-1 4 1 3 3-1 2-3 3-4 1-1-1 0-3 1-4z"/>
+    <path d="M60 72c2-1 4 1 3 3-1 2-3 3-4 1-1-1 0-3 1-4z"/>
+  </g>
+  <g fill="#fff" opacity=".45">
+    <circle cx="37" cy="63" r=".8"/>
+    <circle cx="53" cy="66" r=".8"/>
+    <circle cx="67" cy="62" r=".8"/>
+  </g>
+</svg>

@@ -216,14 +216,16 @@ test('~ 展开到 home', async (t) => {
     sources: [{ id: 'home', dir: '~/skins/a' }]
   }), 'utf8')
 
+  const home = join('/home/tester')
+  const expected = join(home, 'skins', 'a')
   const result = await loadSkinSources({
     dataDir: dir,
-    home: '/home/tester',
+    home,
     resolveDshPetDirs: () => [],
-    readdir: fakeReaddir({ '/home/tester/skins/a': ['idle.webm'] })
+    readdir: fakeReaddir({ [expected]: ['idle.webm'] })
   })
 
-  assert.equal(result.sources[0].dirs[0], '/home/tester/skins/a')
+  assert.equal(result.sources[0].dirs[0], expected)
 })
 
 test('待机池过滤掉点击回应/拖拽/事件/文字类，只留日常动作', async () => {

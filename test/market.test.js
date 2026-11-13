@@ -171,7 +171,7 @@ test('normalizeMarketFile：缺 prices/history/index 不崩，补成完整形状
   const normalized = normalizeMarketFile({ version: MARKET_VERSION })
   assert.equal(normalized.corrupt, false)
   assert.deepEqual(Object.keys(normalized.market.prices).sort(),
-    ['carrot', 'corn', 'grape', 'pumpkin', 'strawberry', 'tomato'])
+    ['carrot', 'corn', 'grape', 'pea', 'pumpkin', 'radish', 'rice', 'strawberry', 'tomato', 'watermelon'])
   assert.deepEqual(normalized.market.history, [])
   assert.deepEqual(normalized.market.index, {})
 
@@ -346,14 +346,13 @@ test('形状不对：坏价格/坏历史/坏指数只修不崩，且只告警一
   assert.equal(store.snapshot().prices.carrot.price, 12, '999 夹到 base×2')
   assert.equal(store.snapshot().prices.pumpkin.price, 15, '-1 夹到 base×0.5')
   assert.equal(store.snapshot().history.length, 1)
-  assert.deepEqual(store.snapshot().index, {
-    tomato: { price: 5, at: NOON, samples: 1 },
-    strawberry: { price: 7, at: NOON, samples: 0 },
-    carrot: { price: 12, at: NOON, samples: 0 },
-    corn: { price: 9, at: NOON, samples: 0 },
-    pumpkin: { price: 15, at: NOON, samples: 0 },
-    grape: { price: 24, at: NOON, samples: 0 }
-  })
+  const expectedIndex = Object.fromEntries(
+    Object.keys(CROPS).map((cropId) => [cropId, { price: CROPS[cropId].base, at: NOON, samples: 0 }])
+  )
+  expectedIndex.tomato = { price: 5, at: NOON, samples: 1 }
+  expectedIndex.carrot.price = 12
+  expectedIndex.pumpkin.price = 15
+  assert.deepEqual(store.snapshot().index, expectedIndex)
 })
 
 test('重启：价格与成交历史都还在，均值回归锚点从重启这一刻重新计时', async (t) => {

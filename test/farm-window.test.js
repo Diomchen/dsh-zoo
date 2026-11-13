@@ -18,7 +18,7 @@ import test from 'node:test'
 
 import shared from '../desktop/shared.js'
 import { FARM_FILE, FARM_VERSION, initialFarmState } from '../src/farm.js'
-import { MINUTE_MS, resetCropCatalog } from '../src/farm-rules.js'
+import { CROPS, MINUTE_MS, resetCropCatalog } from '../src/farm-rules.js'
 import { MARKET_FILE, MARKET_VERSION } from '../src/market.js'
 import { createService } from '../src/service.js'
 
@@ -203,10 +203,10 @@ test('farm-open：窗口拿完整农场；场景没有 controls.farm；再点一
     fertilized: false
   })
   assert.deepEqual(window.farm.seeds, {
-    tomato: 2, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+    pea: 0, tomato: 2, strawberry: 0, radish: 0, carrot: 0, rice: 0, corn: 0, watermelon: 0, pumpkin: 0, grape: 0
   })
   assert.deepEqual(window.farm.crops, {
-    tomato: 0, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+    pea: 0, tomato: 0, strawberry: 0, radish: 0, carrot: 0, rice: 0, corn: 0, watermelon: 0, pumpkin: 0, grape: 0
   })
   assert.equal(window.farm.coins, 30)
   assert.equal(window.farm.dew, 0)
@@ -394,14 +394,12 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   })
   assert.deepEqual(window.market.history, [])
   // 没有 peer：指数仍是完整形状，但每条都是「本机价 / samples 0」。
-  assert.deepEqual(window.market.index, {
-    tomato: { price: 5, at: NOON, samples: 0, stale: false },
-    strawberry: { price: 7, at: NOON, samples: 0, stale: false },
-    carrot: { price: 6, at: NOON, samples: 0, stale: false },
-    corn: { price: 9, at: NOON, samples: 0, stale: false },
-    pumpkin: { price: 30, at: NOON, samples: 0, stale: false },
-    grape: { price: 24, at: NOON, samples: 0, stale: false }
-  })
+  assert.deepEqual(window.market.index, Object.fromEntries(
+    Object.keys(CROPS).map((cropId) => [
+      cropId,
+      { price: CROPS[cropId].base, at: NOON, samples: 0, stale: false }
+    ])
+  ))
   assert.equal('farm' in desktop.calls.scenes.at(-1).controls, false)
 
   // 窗口提交买 2 颗番茄种子：宿主回人话，并推一份新的完整窗口状态（open:false）。
@@ -415,7 +413,7 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   const refreshed = desktop.calls.windows.at(-1)
   assert.equal(refreshed.farm.coins, 18)
   assert.deepEqual(refreshed.farm.seeds, {
-    tomato: 4, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+    pea: 0, tomato: 4, strawberry: 0, radish: 0, carrot: 0, rice: 0, corn: 0, watermelon: 0, pumpkin: 0, grape: 0
   })
   assert.equal(refreshed.market.prices.tomato.volume24h, 2)
   assert.equal(refreshed.market.history[0].side, 'buy')
@@ -440,7 +438,7 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   const soldWindow = desktop.calls.windows.at(-1)
   assert.equal(soldWindow.farm.coins, 33)
   assert.deepEqual(soldWindow.farm.crops, {
-    tomato: 0, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0
+    pea: 0, tomato: 0, strawberry: 0, radish: 0, carrot: 0, rice: 0, corn: 0, watermelon: 0, pumpkin: 0, grape: 0
   })
   assert.equal(soldWindow.market.history[0].side, 'sell')
   assert.equal(soldWindow.market.history[0].price, 5)
@@ -793,7 +791,7 @@ test('20 块地的 farm-window：标题按 plots.length、渲染 20 张卡，不
 
   // 网格按数量自适应；标签/计数没有 PLOT_LABEL 这种写死 1–4 的表。
   const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
-  assert.match(html, /grid-template-columns: repeat\(auto-fill, minmax\(150px, 1fr\)\)/)
+  assert.match(html, /grid-template-columns: repeat\(auto-fill, minmax\(200px, 1fr\)\)/)
   assert.match(html, /<script src="farm-view\.js"><\/script>/)
   const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
   assert.equal(renderer.includes('PLOT_LABEL'), false)
@@ -1018,9 +1016,26 @@ test('播种弹窗与批量条：三份种子库存/生长/产量、0 禁用、�
   assert.match(renderer, /batch\.queue\.shift\(\)/)
 })
 
+test('图钉：默认不置顶，用户可从窗口自己切换，偏好落盘', async () => {
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  assert.match(main, /let farmPinned = false/)
+  assert.match(main, /alwaysOnTop: farmPinned/)
+  assert.match(main, /ipcMain\.on\('dsh-zoo:farm-pin'/)
+  assert.match(main, /win\.setAlwaysOnTop\(farmPinned/)
+  assert.match(main, /farm-window\.json/)
+  const renderer = await readFile(new URL('../desktop/farm.js', import.meta.url), 'utf8')
+  assert.match(renderer, /pinButton\.addEventListener\('click'/)
+  assert.match(renderer, /api\.setPinned\(pinned\)/)
+  assert.match(renderer, /pinButton\.textContent = pinned \? '📍' : '📌'/)
+  assert.match(renderer, /api\?\.onPinned\?\./)
+  const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
+  assert.match(preload, /ipcRenderer\.send\('dsh-zoo:farm-pin'/)
+  assert.match(preload, /ipcRenderer\.on\('dsh-zoo:farm-pinned'/)
+})
+
 test('新外壳与配色：header/tabs/可滚动页/footer/toast/系统字体，没有远程资源', async () => {
   const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
-  for (const token of ['id="farm-title"', 'id="planted-count"', 'id="coin-value"', 'id="dew-value"', 'id="close"']) {
+  for (const token of ['id="farm-title"', 'id="planted-count"', 'id="coin-value"', 'id="dew-value"', 'id="pin"', 'id="close"']) {
     assert.ok(html.includes(token), '新外壳应该有 ' + token)
   }
   assert.equal((html.match(/data-tab="/g) ?? []).length, 4)
@@ -1039,10 +1054,12 @@ test('新外壳与配色：header/tabs/可滚动页/footer/toast/系统字体，
   assert.equal(html.includes('fonts.googleapis'), false)
   assert.equal(html.includes('cdn.tailwindcss'), false)
   assert.equal(html.includes('lucide'), false)
-  // 窗宽仍是 420×560，外壳靠 flex + 滚动适配，不改窗口尺寸。
+  // SPEC v8 后放宽到 520×700，保证季节条 + 10 种作物下中段仍有两列宽地块。
   const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
-  assert.match(main, /const FARM_WIDTH = 420/)
-  assert.match(main, /const FARM_HEIGHT = 560/)
+  assert.match(main, /const FARM_WIDTH = 520/)
+  assert.match(main, /const FARM_HEIGHT = 700/)
+  assert.match(main, /let farmPinned = false/)
+  assert.match(main, /alwaysOnTop: farmPinned/)
 })
 
 test('farm-open：两个地块时倒计时从当前时刻算，不用上一次 tick 的旧快照', async (t) => {
@@ -1203,7 +1220,7 @@ test('作物图：有 art 就给 <img>，没 art 才退回 emoji', () => {
   assert.equal(unknown.textContent, '')
 })
 
-test('地块卡模型：认识六种作物，每种都带图路径', () => {
+test('地块卡模型：认识十种作物，每种都带图路径', () => {
   const plots = Object.keys(farmView.CROP_META).map((cropId, index) => ({
     id: 'p' + (index + 1),
     crop: cropId,
@@ -1253,7 +1270,7 @@ test('crops.json 里的作物：窗口拿到目录，地块卡画名字而不是
   const catalog = window.crops
   assert.ok(Array.isArray(catalog), '窗口必须收到作物目录')
   assert.deepEqual(catalog.map((entry) => entry.id).sort(),
-    ['blueberry', 'carrot', 'corn', 'grape', 'pumpkin', 'strawberry', 'tomato'])
+    ['blueberry', 'carrot', 'corn', 'grape', 'pea', 'pumpkin', 'radish', 'rice', 'strawberry', 'tomato', 'watermelon'])
   assert.deepEqual(catalog.find((entry) => entry.id === 'blueberry'),
     { id: 'blueberry', name: '蓝莓', growMs: 90 * MINUTE_MS, yield: 4, seedPrice: 30, base: 18 })
   // 仓库里也有这个键（不然窗口会把它当成未知作物）。

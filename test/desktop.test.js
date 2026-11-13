@@ -545,37 +545,41 @@ test('桌面判定：只有 Electron 里的 Node 算桌面宿主；候选路径�
   assert.equal(isDesktopHost({ electron: '' }), false)
   assert.equal(isDesktopHost(undefined), false)
 
-  const candidates = candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home', DSH_ZOO_ELECTRON: '/opt/e' }, platform: 'darwin' })
+  const dshHome = '/tmp/dsh-home'
+  const macElectron = join(dshHome, 'electron', 'Electron.app', 'Contents', 'MacOS', 'Electron')
+  const winElectron = join(dshHome, 'electron', 'electron.exe')
+  const candidates = candidateElectronPaths({ env: { DSH_HOME: dshHome, DSH_ZOO_ELECTRON: '/opt/e' }, platform: 'darwin' })
   assert.deepEqual(candidates, [
     '/opt/e',
-    '/tmp/dsh-home/electron/Electron.app/Contents/MacOS/Electron'
+    macElectron
   ])
-  assert.deepEqual(candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home' }, platform: 'linux' }), [])
+  assert.deepEqual(candidateElectronPaths({ env: { DSH_HOME: dshHome }, platform: 'linux' }), [])
   // Windows：dsh-pet 把 Electron 落在同一个 $DSH_HOME/electron，只是可执行文件叫 electron.exe。
-  assert.deepEqual(candidateElectronPaths({ env: { DSH_HOME: '/tmp/dsh-home' }, platform: 'win32' }), [
-    '/tmp/dsh-home/electron/electron.exe'
+  assert.deepEqual(candidateElectronPaths({ env: { DSH_HOME: dshHome }, platform: 'win32' }), [
+    winElectron
   ])
   assert.deepEqual(
     candidateElectronPaths({
-      env: { DSH_HOME: '/tmp/dsh-home', DSH_ZOO_ELECTRON: 'C:\\electron\\electron.exe' },
+      env: { DSH_HOME: dshHome, DSH_ZOO_ELECTRON: 'C:\\electron\\electron.exe' },
       platform: 'win32'
     }),
-    ['C:\\electron\\electron.exe', '/tmp/dsh-home/electron/electron.exe']
+    ['C:\\electron\\electron.exe', winElectron]
   )
 })
 
 test('Electron 解析：平台不符/文件缺失都降级，存在时取第一个候选', () => {
   const env = { DSH_HOME: '/tmp/dsh-home' }
+  const winElectron = join(env.DSH_HOME, 'electron', 'electron.exe')
   assert.equal(resolveElectronBinary({ env, platform: 'linux' }).reason, 'unsupported-platform')
   assert.equal(resolveElectronBinary({ env, platform: 'darwin', exists: () => false }).reason, 'electron-missing')
   // Windows 和 macOS 一样可用：候选是 $DSH_HOME/electron/electron.exe。
   const onWindows = resolveElectronBinary({
     env,
     platform: 'win32',
-    exists: (candidate) => candidate === '/tmp/dsh-home/electron/electron.exe'
+    exists: (candidate) => candidate === winElectron
   })
   assert.equal(onWindows.ok, true)
-  assert.equal(onWindows.path, '/tmp/dsh-home/electron/electron.exe')
+  assert.equal(onWindows.path, winElectron)
   assert.equal(resolveElectronBinary({ env, platform: 'win32', exists: () => false }).reason, 'electron-missing')
   const resolved = resolveElectronBinary({
     env: { ...env, DSH_ZOO_ELECTRON: '/opt/custom-electron' },
@@ -718,7 +722,7 @@ test('manager：Windows 宿主照样起 helper（不再被 darwin-only 的闸门
     desktopHost: true,
     platform: 'win32',
     env: { DSH_HOME: '/tmp/dsh-home' },
-    exists: (candidate) => candidate === '/tmp/dsh-home/electron/electron.exe',
+    exists: (candidate) => candidate === join('/tmp/dsh-home', 'electron', 'electron.exe'),
     spawn: (command, args, options) => {
       spawnCalls.push({ command, args, options })
       return fakeChild(2000)
@@ -729,7 +733,7 @@ test('manager：Windows 宿主照样起 helper（不再被 darwin-only 的闸门
   const started = manager.start()
   assert.equal(started.ok, true)
   assert.equal(spawnCalls.length, 1)
-  assert.equal(spawnCalls[0].command, '/tmp/dsh-home/electron/electron.exe')
+  assert.equal(spawnCalls[0].command, join('/tmp/dsh-home', 'electron', 'electron.exe'))
   assert.equal(warns.length, 0)
   manager.dispose()
 })
@@ -740,7 +744,7 @@ test('manager：helper 的 cwd 在包外——包被占着也不耽误下次安�
     desktopHost: true,
     platform: 'win32',
     env: { DSH_HOME: '/tmp/dsh-home' },
-    exists: (candidate) => candidate === '/tmp/dsh-home/electron/electron.exe',
+    exists: (candidate) => candidate === join('/tmp/dsh-home', 'electron', 'electron.exe'),
     spawn: (command, args, options) => {
       spawnCalls.push({ command, args, options })
       return fakeChild(2002)
@@ -2264,8 +2268,8 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
 
   const farm = {
     plots: [{ id: 'p1', crop: 'tomato', stage: 'growing', mature: false, remainingMs: 1000, waterings: 0, fertilized: false }],
-    seeds: { tomato: 2, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0 },
-    crops: { tomato: 0, strawberry: 0, carrot: 0, corn: 0, pumpkin: 0, grape: 0 },
+    seeds: { pea: 0, tomato: 2, strawberry: 0, radish: 0, carrot: 0, rice: 0, corn: 0, watermelon: 0, pumpkin: 0, grape: 0 },
+    crops: { pea: 0, tomato: 0, strawberry: 0, radish: 0, carrot: 0, rice: 0, corn: 0, watermelon: 0, pumpkin: 0, grape: 0 },
     coins: 30,
     dew: 1,
     worker: null,

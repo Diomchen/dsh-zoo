@@ -1055,6 +1055,17 @@ ipcMain.on('dsh-zoo:action', (event, payload) => {
     if (!hireWritten) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接。', error: 'host-unavailable' })
     return
   }
+  // 节日领奖 / 秋天来客（票 70）：带 expectedStart 的乐观锁与二选一，走同一道窄口。
+  if (shared.FARM_EVENT_ACTIONS.includes(action) || shared.FARM_OMEN_ACTIONS.includes(action)) {
+    const normalized = shared.normalizeFarmAction({ ...payload, action })
+    if (normalized === null) {
+      sendActionResult({ id, ok: false, notice: '节日/来客的状态已经变了，刷新后再试。', error: 'bad-farm-action' })
+      return
+    }
+    const seasonWritten = writeEvent({ type: 'action', id, ...normalized })
+    if (!seasonWritten) sendActionResult({ id, ok: false, notice: '桌面宿主没有连接。', error: 'host-unavailable' })
+    return
+  }
   // 渲染端只能**申请**：这一行交给宿主，真正改状态的是宿主的 room/service。
   const written = writeEvent({
     type: 'action',
@@ -1201,7 +1212,17 @@ function isGiftSender (event) {
 
 ipcMain.on('dsh-zoo:farm-ready', (event) => {
   if (!isFarmSender(event)) return
+  sendFarmPinned()
   sendFarmState()
+})
+
+ipcMain.on('dsh-zoo:farm-pin', (event, pinned) => {
+  if (!isFarmSender(event)) return
+  farmPinned = pinned === true
+  farmPinnedLoaded = true
+  saveFarmPinned()
+  applyFarmPinned(farmWin)
+  sendFarmPinned()
 })
 
 ipcMain.on('dsh-zoo:farm-close', (event) => {
@@ -1267,11 +1288,66 @@ const GIFT_HEIGHT = 480
 const GIFT_TIMEOUT_MS = 10000
 /**
  * 农场小窗（ticket 40）：比带派再大一圈，要放下 4 块地、库存行与记录。
+ * SPEC v8 加了季节条、节日卡和 10 种作物后，420×560 的中段只剩两行地块；
+ * 放宽到 520×700，地块用两列宽卡，并多出一行可视高度。窗口仍靠 flex + 滚动适配。
  * 10 秒是**一次动作**等宿主回执的上限；窗口本身不因时间关闭（41/44 的页签要久留）。
  */
-const FARM_WIDTH = 420
-const FARM_HEIGHT = 560
+const FARM_WIDTH = 520
+const FARM_HEIGHT = 700
 const FARM_TIMEOUT_MS = 10000
+/**
+ * 农场窗默认不置顶；用户可在窗口右上角自己切换，选择记在 userData 下，
+ * 下次开窗沿用。桌面宠物本体的置顶是另一扇窗，不受这里影响。
+ */
+let farmPinned = false
+let farmPinnedLoaded = false
+
+function farmPinFile () {
+  return path.join(app.getPath('userData'), 'farm-window.json')
+}
+
+function loadFarmPinned () {
+  if (farmPinnedLoaded) return
+  farmPinnedLoaded = true
+  try {
+    const data = JSON.parse(fs.readFileSync(farmPinFile(), 'utf8'))
+    farmPinned = data?.pinned === true
+  } catch {
+    farmPinned = false
+  }
+}
+
+function saveFarmPinned () {
+  try {
+    const file = farmPinFile()
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+    fs.writeFileSync(file, JSON.stringify({ pinned: farmPinned }, null, 2) + '\n')
+  } catch {
+    // 偏好写不进去只影响下次开窗，不影响这一次的置顶开关。
+  }
+}
+
+function applyFarmPinned (win) {
+  if (win === null || win.isDestroyed()) return
+  try {
+    win.setAlwaysOnTop(farmPinned, process.platform === 'darwin' ? 'floating' : 'screen-saver')
+  } catch {
+    try {
+      win.setAlwaysOnTop(farmPinned)
+    } catch {
+      // 老版本/受限环境没有这个开关：构造参数已经是当前值。
+    }
+  }
+}
+
+function sendFarmPinned () {
+  if (farmWin === null || farmWin.isDestroyed()) return
+  try {
+    farmWin.webContents.send('dsh-zoo:farm-pinned', farmPinned)
+  } catch {
+    // 窗口正在销毁时忽略。
+  }
+}
 
 /** 自己那只宠物最近的命中矩形（窗口局部 DIP）；`normalizeRects` 输出的是扁平矩形。 */
 function selfPetRect () {
@@ -1639,6 +1715,7 @@ function openFarmWindow () {
     return true
   }
   if (win === null || win.isDestroyed()) return false
+  loadFarmPinned()
   const created = new BrowserWindow({
     ...farmBounds(),
     width: FARM_WIDTH,
@@ -1647,7 +1724,7 @@ function openFarmWindow () {
     frame: false,
     transparent: true,
     backgroundColor: '#00000000',
-    alwaysOnTop: true,
+    alwaysOnTop: farmPinned,
     skipTaskbar: true,
     hasShadow: true,
     focusable: true,
@@ -1673,11 +1750,9 @@ function openFarmWindow () {
   farmPending = null
   clearFarmTimer()
   notifyFarmWindowState()
-  try {
-    created.setAlwaysOnTop(true, process.platform === 'darwin' ? 'floating' : 'screen-saver')
-  } catch {
-    // 置顶已由构造参数保证
-  }
+  // 默认不置顶，但用户上次若选了置顶，就沿用；窗口里的图钉按钮随时可切。
+  applyFarmPinned(created)
+  created.webContents.once('did-finish-load', sendFarmPinned)
   created.webContents.on('context-menu', (event) => event.preventDefault())
   // **不要**在 blur 时关窗：macOS 上打中文时输入法候选窗会抢走键盘焦点，这扇窗也会 blur。
   // 农场窗没有输入框也一样——41/44 的页签迟早会加输入。关窗只由 Esc / × / 宿主 close:true /

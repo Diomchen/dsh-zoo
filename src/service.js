@@ -63,8 +63,11 @@ import {
   plotUnlockCost,
   stealSucceeds
 } from './farm-rules.js'
+import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
+import { createSeasonStore } from './season-store.js'
 import { createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
 import { openFarmView } from './farm-open.js'
+import { OMEN_IGNORE_LOSS } from './season-omens.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
@@ -263,6 +266,8 @@ export function createService (ctx, options = {}) {
   // 农场（ticket 39）：tick 节拍与测试时钟都可注入；生产默认 60 秒 / Date.now。
   const farmTickMs = positiveOption(options.farmTickMs, FARM_TICK_MS, 10)
   const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
+  // 季节与节日跟农场共用测试时钟；生产就是 Date.now。
+  const seasonNow = farmNow ?? (() => Date.now())
   // 偷菜守卫的随机源（ticket 43）：只给测试注入「必被抓」；生产是 Math.random。
   const farmRandom = typeof options.farmRandom === 'function' ? options.farmRandom : Math.random
   // 访客动作的重试/超时（ticket 43）：测试可以调快，生产固定 3×500ms / 1.8s。
@@ -313,6 +318,8 @@ export function createService (ctx, options = {}) {
   let backpack = null
   // 农场（ticket 39）：读不出来 = 本次运行按初始农场玩，串门照常。
   let farm = null
+  // 季节/节日/来客（票 65/67）：读不出来 = 没有节日，季节仍按日期算。
+  let season = null
   // 本机交易所（ticket 41）：读不出来 = 本次运行按初始价交易，串门照常。
   let market = null
   // 雇佣合同账本（ticket 44）：读不出来 = 本次运行不能雇/被雇，串门与农场照常。
@@ -954,8 +961,14 @@ export function createService (ctx, options = {}) {
       const result = kind === 'plant'
         ? await farm.plant(body?.plotId, body?.cropId)
         : await farm[kind](body?.plotId)
-      // 开着的窗口不能停在旧地块：种/收/浇/施肥成功后都推一份新的完整视图。
-      if (result?.ok === true) refreshFarmWindow()
+      if (result?.ok === true) {
+        // 票 68：节日进度只在动作成功后记账；收获按实际产量，浇水按次数。
+        if (kind === 'plant') await season?.note('plant', 1)
+        else if (kind === 'harvest') await season?.note('harvest', result.qty ?? 0)
+        else if (kind === 'water') await season?.note('water', 1)
+        // 开着的窗口不能停在旧地块：种/收/浇/施肥成功后都推一份新的完整视图。
+        refreshFarmWindow()
+      }
       return result
     }
 
@@ -979,6 +992,10 @@ export function createService (ctx, options = {}) {
       // 成交后价目/硬币/仓库都变了：开着的交易所页要立刻看到新一份；
       // 价格也是邻居的指数样本，不等下一拍 tick 就补发一轮 digest。
       if (result?.ok === true) {
+        // 票 68：卖出的数量计入当天夜市任务；买入不算。
+        if (action === 'sell-crop' || action === 'farm-sell-crop') {
+          await season?.note('sell', result.qty ?? 0)
+        }
         refreshFarmWindow()
         sendMarketDigest()
       }
@@ -991,6 +1008,11 @@ export function createService (ctx, options = {}) {
     if (action === 'recall-worker') return recallWorker(body?.contractId)
     if (action === 'end-contract') return endContract(body?.contractId)
     if (action === 'hire-listing') return setHireListing(body)
+
+    // 票 68：今日节日领奖 / 秋天来客二选一。两者都只认当前这一天的 start，
+    // 防止窗口停了一夜后拿旧卡片领新一天的奖励。
+    if (action === 'farm-event-claim') return claimFarmEvent(body)
+    if (action === 'farm-omen-resolve') return resolveFarmOmen(body)
 
     // 农场小窗（ticket 40/46）：菜单「农场」是对开/关的同一入口；`farm-close` 给 HTTP/脚本。
     // 数据由宿主算好（窗口是 file:// 页面，读不到 /state），失败必须回人话。
@@ -1352,6 +1374,129 @@ export function createService (ctx, options = {}) {
     if (carriedCrops.items.length > 8) carriedCrops.items.length = 8
   }
 
+  /** 票 68：节日/来客失败的统一出口（错误码 + 人话）。 */
+  function seasonActionError (code) {
+    return { ok: false, error: code, notice: farmErrorText(code) }
+  }
+
+  async function claimFarmEvent (body) {
+    if (farm === null || season === null) return seasonActionError('starting')
+    const now = seasonNow()
+    const current = season.view(now)
+    if (current?.event === null || current?.event === undefined) {
+      return seasonActionError('event-inactive')
+    }
+    if (body?.expectedStart !== undefined && body?.expectedStart !== null &&
+      String(body.expectedStart) !== String(current.start)) {
+      return seasonActionError('stale-season')
+    }
+
+    const result = await season.claim(now)
+    if (!result.ok) return seasonActionError(result.code)
+
+    const coins = Math.max(0, Number(result.reward?.coins) || 0)
+    const dew = Math.max(0, Number(result.reward?.dew) || 0)
+    if (coins > 0) await farm.addCoins(coins)
+    if (dew > 0) await farm.refundDew(dew)
+    await farm.noteMilestone({ kind: 'event', id: result.event.id, name: result.event.name, coins, dew })
+    refreshFarmWindow()
+    return {
+      ok: true,
+      action: 'farm-event-claim',
+      event: season.view(now).event,
+      reward: { coins, dew },
+      notice: '节日完成：' + result.event.name + '，+' + coins + ' 硬币 +' + dew + ' 露水。'
+    }
+  }
+
+  async function restoreTaken (taken) {
+    if (taken?.ok !== true) return
+    for (const [cropId, qty] of Object.entries(taken.removed ?? {})) {
+      if (qty > 0) await farm.addCrop(cropId, qty)
+    }
+  }
+
+  async function resolveFarmOmen (body) {
+    if (farm === null || season === null) return seasonActionError('starting')
+    const now = seasonNow()
+    const current = season.view(now)
+    const omen = current?.omen ?? null
+    if (omen === null) return seasonActionError('omen-resolved')
+    if (omen.resolved === true) return seasonActionError('omen-resolved')
+    if (body?.expectedStart !== undefined && body?.expectedStart !== null &&
+      String(body.expectedStart) !== String(current.start)) {
+      return seasonActionError('stale-season')
+    }
+
+    const choice = body?.choice
+    if (choice !== 'guard' && choice !== 'feed') return seasonActionError('bad-choice')
+
+    // 投喂先扣 3 个；库存不够就明确拒绝，不动 season.json。
+    let taken = null
+    if (choice === 'feed') {
+      taken = await farm.takeCrops(omen.stakes.feedCost)
+      if (!taken.ok) return seasonActionError(taken.error)
+    }
+
+    const resolved = await season.resolveOmen(choice, {
+      guard: farmGuard().guard,
+      random: farmRandom,
+      now
+    })
+    if (!resolved.ok) {
+      await restoreTaken(taken)
+      return seasonActionError(resolved.code)
+    }
+
+    const outcome = resolved.outcome
+    let lost = 0
+    if (outcome.loss > 0) {
+      // 中惩罚：最多搬走 3 个；仓库不够就搬现有的，不挡结算。
+      const loss = await farm.takeCrops(outcome.loss, { allowPartial: true })
+      if (loss.ok) lost = loss.qty
+    }
+    if (outcome.reward.coins > 0) await farm.addCoins(outcome.reward.coins)
+    if (outcome.reward.dew > 0) await farm.refundDew(outcome.reward.dew)
+    for (const [cropId, qty] of Object.entries(outcome.reward.seeds ?? {})) {
+      if (qty > 0) await farm.addSeed(cropId, qty)
+    }
+    await farm.noteOmen({ choice, success: outcome.success, loss: lost, who: '熊獾' })
+    refreshFarmWindow()
+
+    const notice = choice === 'feed'
+      ? '熊獾吃饱走了：+1 稻种 +2 露水。'
+      : outcome.success
+        ? '熊獾被守夜赶走了：+40 硬币 +3 露水。'
+        : '熊獾闯进来了：被搬走 ' + lost + ' 个作物。'
+    return {
+      ok: true,
+      action: 'farm-omen-resolve',
+      omen: season.view(now).omen,
+      outcome: { ...outcome, loss: lost },
+      notice
+    }
+  }
+
+  /**
+   * 票 68：季节 + 今日节日 + 秋天来客的唯一出口。
+   * season.json 起不来时仍返回纯日期季节（event/omen 为 null），窗口不会整块空掉。
+   */
+  function seasonView (crops = null) {
+    const now = seasonNow()
+    const computed = seasonAt(now)
+    if (computed === null) return null
+
+    let view = season?.view(now) ?? null
+    if (view === null) {
+      view = { ...computed, calendar: calendarFor(computed.id), event: null, omen: null }
+    }
+    if (view.omen !== null && view.omen !== undefined) {
+      const total = Object.values(crops ?? {}).reduce((sum, qty) => sum + Math.max(0, Number(qty) || 0), 0)
+      view = { ...view, omen: { ...view.omen, canFeed: total >= view.omen.stakes.feedCost } }
+    }
+    return view
+  }
+
   /**
    * `/state` 的农场出口（SPEC v5「状态出口与动作」）：
    * `{ plots, coins, seeds, crops, dew, dewEarned, guard, worker, hire, log }`，log 最近 20 条。
@@ -1376,6 +1521,7 @@ export function createService (ctx, options = {}) {
       guard: farmGuard().guard,
       worker: workerOf(),
       hire: view.hire,
+      season: seasonView(view.crops),
       log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
     }
   }
@@ -1550,6 +1696,7 @@ export function createService (ctx, options = {}) {
         : Math.min(MAX_CONTRACTS_PER_SIDE, contracts.outgoing().length + contracts.incoming().length),
       hire: { ...view.hire },
       guard: farmGuard().guard,
+      season: seasonView(view.crops),
       // 记录页要完整的一份（≤100）；`/state.farm.log` 仍按 SPEC 只给 20。
       log: view.log.slice(0, FARM_LOG_WINDOW_LIMIT),
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
@@ -1641,6 +1788,7 @@ export function createService (ctx, options = {}) {
     return CROP_IDS.map((id) => {
       const crop = CROPS[id]
       const art = cropArtUrls.get(id)
+      const season = cropSeason(id)
       return {
         id,
         name: crop.name,
@@ -1648,6 +1796,8 @@ export function createService (ctx, options = {}) {
         yield: crop.yield,
         seedPrice: crop.seedPrice,
         base: crop.base,
+        // 票 64：四季作物带 `season`，窗口据此显示"当季/下季"；旧六种没有这一项。
+        ...(season === null ? {} : { season }),
         // 只有自定义作物带 `art`（`dshzoo://crops/<hash>.<ext>`）；内置六种没这一项，
         // 窗口按 id 回落到包里的 `crops/<id>.svg`。
         ...(art === undefined ? {} : { art: art.url })
@@ -3476,6 +3626,16 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 季节/节日/来客（票 65/67）：只写 season.json；坏文件降级成「没有节日」，
+      // 但季节本身仍由纯规则按本地日期算，农场照常运行。
+      try {
+        season = await createSeasonStore(dir, { log, now: seasonNow })
+      } catch (error) {
+        season = null
+        warn(ctx, '季节存档初始化失败，本次按无节日运行：' + message(error))
+      }
+      if (disposed) return
+
       // 雇佣合同（ticket 44）：坏文件只降级成空账本，不挡启动；`contractNow` 只给测试注入。
       try {
         contracts = await createContractStore(dir, {
@@ -4223,6 +4383,10 @@ export function createService (ctx, options = {}) {
         qty: event.qty ?? undefined,
         // 票 53：派它去偷时带的地块列表（`farm-raid` 才用；白名单在 shared 已经过一遍）。
         plots: Array.isArray(event.plots) ? event.plots : undefined,
+        // 票 70：节日/来客带窗口看到的季节起点，来客再带 guard/feed。
+        // 少拷这两处，来客会在宿主被判成 bad-choice——错误文案只说“应对方式不成立”。
+        expectedStart: event.expectedStart ?? undefined,
+        choice: event.choice ?? undefined,
         // 雇佣（ticket 44）：只接这些窄字段；硬币/总价/服务时长窗口一概不传。
         hours: event.hours ?? undefined,
         contractId: event.contractId ?? undefined,
@@ -4942,6 +5106,25 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 票 68：换日结算。节日进度由 season.settle 重置；上一秋没处理的熊獾
+   * 在这里补一次「没管它」的代价（中惩罚：最多 1 个仓库作物）。
+   * 只影响这一拍，异常由 tick 的 catch 统一记日志。
+   */
+  async function settleSeasonTick (now) {
+    if (season === null) return
+    const result = await season.settle(now)
+    if (result.unresolvedOmen === null) return
+    let lost = 0
+    if (farm !== null) {
+      const taken = await farm.takeCrops(OMEN_IGNORE_LOSS, { allowPartial: true })
+      if (taken.ok) lost = taken.qty
+      await farm.noteOmen({ choice: 'ignore', success: false, loss: lost, who: '熊獾' })
+    }
+    log?.info?.('熊獾没被处理，换季后搬走了 ' + lost + ' 个作物')
+    refreshFarmWindow()
+  }
+
+  /**
    * 农场 tick（ticket 39）：每 60 秒推进生长、露水与 lastTickAt；
    * 交易所 tick（ticket 41）也搭这班车：到 10 分钟就把价格往 base 拉一次。
    * 落盘节流在 store 里（农场有变化且距上次写 ≥30 秒）。失败只影响这一拍。
@@ -4953,6 +5136,7 @@ export function createService (ctx, options = {}) {
       try {
         ticks.push(['农场', farm?.tick()])
         if (market !== null) ticks.push(['交易所', market.tick()])
+        ticks.push(['季节', settleSeasonTick(seasonNow())])
       } catch (error) {
         warnOnce('farm-tick', '农场 tick 失败：' + message(error))
         return
@@ -5840,6 +6024,7 @@ export function createService (ctx, options = {}) {
       contractAttempts.clear()
       contracts = null
       farm = null
+      season = null
       market = null
       digestLimiter.clear()
       peerDigests.clear()

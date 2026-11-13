@@ -25,6 +25,7 @@ import {
   visitLimitsFor,
   waterPlot
 } from './farm-rules.js'
+import { cropSeason, seasonAt, seasonGrowthFactor, seasonSegments } from './season-rules.js'
 import {
   MAX_CONTRACT_HOURS,
   MAX_CONTRACT_WAGE,
@@ -120,7 +121,7 @@ export const MAX_PLOT_VISITORS = 50
 /** 每日访客计数最多记多少位访客；超出的按最旧丢（内存/文件都有界）。 */
 export const MAX_VISIT_STATS_VISITORS = 64
 
-const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock'])
+const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'season', 'event', 'omen'])
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const WHO_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
 
@@ -205,6 +206,15 @@ function copyPlot (plot) {
     stolenBy: Array.isArray(plot.stolenBy) ? [...plot.stolenBy] : [],
     helpedBy: Array.isArray(plot.helpedBy) ? [...plot.helpedBy] : []
   }
+}
+
+/** 按季节分段推进一块地：当季四季作物每段 1.1，其余 1；成熟后自动停。 */
+function advancePlotBySeasons (plot, segments) {
+  let next = plot
+  for (const segment of segments) {
+    next = advanceGrowth(next, segment.ms, seasonGrowthFactor(next.crop, segment.season))
+  }
+  return next
 }
 
 function copyLogEntry (entry) {
@@ -497,6 +507,13 @@ function normalizePlot (value) {
     else repaired += 1
   }
 
+  // 票 66：老存档没有 withered；只有显式 true 才写回，false/缺失都不新增字段。
+  let withered = false
+  if (value.withered !== undefined) {
+    if (typeof value.withered === 'boolean') withered = value.withered
+    else repaired += 1
+  }
+
   const stolen = normalizeIdList(value.stolenBy)
   const helped = normalizeIdList(value.helpedBy)
   repaired += stolen.repaired + helped.repaired
@@ -510,6 +527,7 @@ function normalizePlot (value) {
       growMs,
       waterings,
       fertilized,
+      ...(withered ? { withered: true } : {}),
       stolenBy: stolen.ids,
       helpedBy: helped.ids
     },
@@ -795,12 +813,15 @@ class FarmStore {
     const last = this.#state.lastTickAt
     const elapsed = offline ? offlineElapsed(last, now) : 0
     if (elapsed > 0) {
+      const segments = seasonSegments(now - elapsed, now)
       this.#state.plots = this.#state.plots.map((plot) => {
-        const next = advanceGrowth(plot, elapsed)
+        const next = advancePlotBySeasons(plot, segments)
         if (next !== plot) changed = true
         return next
       })
     }
+    // 票 66：离线跨过换季也要枯萎；用原来的 lastTickAt 判断，避免只看"现在这一季"。
+    if (this.#witherSeasonal(now, Number.isFinite(last) ? last : now) > 0) changed = true
 
     const day = localDayKey(now)
     const dayReset = day !== null && (
@@ -901,6 +922,29 @@ class FarmStore {
     return this.#enqueue(() => this.#addCrop(cropId, qty))
   }
 
+  /** 票 67：来客奖励/补偿用，直接往种子袋加 n 颗（不经过交易所、不扣硬币）。 */
+  addSeed (cropId, qty = 1) {
+    return this.#enqueue(() => this.#addSeed(cropId, qty))
+  }
+
+  /**
+   * 票 67：从仓库拿走 n 个作物，先拿底价低的（对玩家更温和）。
+   * 库存不够时整笔拒绝，绝不出现「拿走一半再报错」。
+   */
+  takeCrops (qty = 1, options = {}) {
+    return this.#enqueue(() => this.#takeCrops(qty, options))
+  }
+
+  /** 票 67：来客结果只写一条日志，钱/作物由 service 按结果结算。 */
+  noteOmen (result) {
+    return this.#enqueue(() => this.#noteOmen(result))
+  }
+
+  /** 票 68：换季/节日只写一条里程碑日志，奖励由 service 先结算。 */
+  noteMilestone (entry) {
+    return this.#enqueue(() => this.#noteMilestone(entry))
+  }
+
   /** 访客硬币 +n（帮忙成功）；上限 1,000,000。 */
   addCoins (qty = 1) {
     return this.#enqueue(() => this.#addCoins(qty))
@@ -985,6 +1029,37 @@ class FarmStore {
   }
 
   /**
+   * 票 66：把已经跨季、还没熟的四季作物标成枯萎。
+   * `since` 是上一次 tick 的时间；用分段而不是只看当前季，跨几天也能枯。
+   * 成熟作物和旧六种/自定义作物永不枯萎。每次最多写一条 wither 日志。
+   */
+  #witherSeasonal (now, since) {
+    const current = seasonAt(now)?.id ?? null
+    if (current === null) return 0
+    const sinceMs = Number.isFinite(Number(since)) ? Number(since) : now
+    let count = 0
+    this.#state.plots = this.#state.plots.map((plot) => {
+      if (plot === null || typeof plot !== 'object' || plot.withered === true) return plot
+      if (!isCropId(plot.crop) || isMature(plot)) return plot
+      const required = cropSeason(plot.crop)
+      if (required === null) return plot
+
+      const plantedAt = Number(plot.plantedAt)
+      const from = Math.max(sinceMs, Number.isFinite(plantedAt) ? plantedAt : sinceMs)
+      const segments = from < now ? seasonSegments(from, now) : []
+      const crossed = segments.length > 0
+        ? segments.some((segment) => segment.season !== required)
+        : current !== required
+      if (!crossed) return plot
+
+      count += 1
+      return { ...plot, withered: true }
+    })
+    if (count > 0) this.#appendLog({ at: now, kind: 'wither', qty: count })
+    return count
+  }
+
+  /**
    * 运行中的时间推进：生长按真实时间走（不设上限），露水按 10 分钟/点攒。
    * 所有 action 进来也先走一遍，这样「到点了但 tick 还没跑」也不会少长一秒。
    */
@@ -995,12 +1070,15 @@ class FarmStore {
     const base = Number.isFinite(state.lastTickAt) ? state.lastTickAt : now
     const elapsed = Math.max(0, now - base)
     if (elapsed > 0) {
+      const segments = seasonSegments(base, now)
       state.plots = state.plots.map((plot) => {
-        const next = advanceGrowth(plot, elapsed)
+        const next = advancePlotBySeasons(plot, segments)
         if (next !== plot) changed = true
         return next
       })
     }
+    // 票 66：换季枯萎必须在 lastTickAt 推到 now 之前判断。
+    if (this.#witherSeasonal(now, base) > 0) changed = true
 
     const dew = advanceDew({
       dew: state.dew,
@@ -1068,7 +1146,17 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
-    if (plot === undefined || plot.crop !== null) return farmError('plot-occupied')
+    // 票 66：枯萎的地可以直接重种（旧作物没收成，也不退种子）。
+    if (plot === undefined || (plot.crop !== null && plot.withered !== true)) {
+      return farmError('plot-occupied')
+    }
+
+    // 票 64：四季作物只能在当季种；旧六种与运行时自定义作物没有季节限制。
+    const seasonId = seasonAt(now)?.id ?? null
+    const requiredSeason = cropSeason(cropId)
+    if (requiredSeason !== null && requiredSeason !== seasonId) {
+      return farmError('out-of-season', farmErrorText('out-of-season'))
+    }
 
     const seeds = this.#state.seeds[cropId] ?? 0
     if (seeds <= 0) return farmError('no-seed')
@@ -1117,6 +1205,7 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
+    if (plot?.withered === true) return farmError('withered')
     if (plot === undefined || !isCropId(plot.crop) || !isMature(plot)) {
       return farmError('not-mature')
     }
@@ -1156,6 +1245,7 @@ class FarmStore {
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
     // 空地/成熟地没有可浇的生长；不把露水浪费在一个不会发生的变化上。
+    if (plot?.withered === true) return farmError('withered')
     if (plot === undefined || !isCropId(plot.crop) || isMature(plot)) return farmError('bad-plot')
     if (Number(plot.waterings) >= 1) return farmError('already-watered')
     if (this.#state.dew < WATER_COST) return farmError('no-dew')
@@ -1191,6 +1281,7 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
+    if (plot?.withered === true) return farmError('withered')
     if (plot === undefined || !isCropId(plot.crop)) return farmError('bad-plot')
     if (plot.fertilized === true) return farmError('already-fertilized')
     if (this.#state.dew < FERTILIZE_COST) return farmError('no-dew')
@@ -1238,6 +1329,12 @@ class FarmStore {
 
     const crop = CROPS[cropId]
     if (kind === 'buy-seed') {
+      // 票 64：四季种子只在当季卖；卖作物不受季节限制。
+      const requiredSeason = cropSeason(cropId)
+      const seasonId = seasonAt(now)?.id ?? null
+      if (requiredSeason !== null && requiredSeason !== seasonId) {
+        return farmError('out-of-season', farmErrorText('out-of-season'))
+      }
       const total = crop.seedPrice * qty
       if (this.#state.coins < total) return farmError('no-coin')
       const held = this.#state.seeds[cropId] ?? 0
@@ -1377,8 +1474,105 @@ class FarmStore {
     }
   }
 
-  async #addCoins (rawQty) {
-    const qty = positiveInt(rawQty, MAX_COINS)
+  async #addSeed (rawCropId, rawQty) {
+    const cropId = normalizeCropId(rawCropId)
+    if (cropId === null) return farmError('bad-crop')
+    const qty = positiveInt(rawQty, MAX_STACK)
+    if (qty === null) return farmError('bad-qty')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+    const before = this.#state.seeds[cropId] ?? 0
+    const after = addStack(this.#state.seeds, cropId, qty)
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'add-seed',
+      crop: cropId,
+      qty: Math.max(0, after - before),
+      seeds: { ...this.#state.seeds },
+      persisted
+    }
+  }
+
+  async #takeCrops (rawQty, options = {}) {
+    const qty = positiveInt(rawQty, MAX_STACK)
+    if (qty === null) return farmError('bad-qty')
+    const allowPartial = options?.allowPartial === true
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    // 先按底价从低到高算一笔计划；默认库存不够就整笔拒绝。
+    // 来客失败只要求「最多拿 3 个」，service 用 allowPartial 取走现有的部分。
+    const order = [...CROP_IDS].sort((a, b) => {
+      const diff = Number(CROPS[a].base) - Number(CROPS[b].base)
+      return diff !== 0 ? diff : a.localeCompare(b)
+    })
+    let remaining = qty
+    const plan = []
+    for (const cropId of order) {
+      if (remaining <= 0) break
+      const have = Number(this.#state.crops[cropId]) || 0
+      if (have <= 0) continue
+      const take = Math.min(have, remaining)
+      plan.push({ cropId, take })
+      remaining -= take
+    }
+    if (remaining > 0 && !allowPartial) return farmError('not-enough-crops')
+
+    const removed = {}
+    for (const { cropId, take } of plan) {
+      const left = (Number(this.#state.crops[cropId]) || 0) - take
+      if (left > 0) this.#state.crops[cropId] = left
+      else delete this.#state.crops[cropId]
+      removed[cropId] = take
+    }
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'take-crops',
+      qty: qty - remaining,
+      shortfall: remaining,
+      removed,
+      crops: { ...this.#state.crops },
+      persisted
+    }
+  }
+
+  async #noteOmen (raw) {
+    const now = this.#nowMs()
+    this.#advance(now)
+    const entry = {
+      at: now,
+      kind: 'omen',
+      choice: raw?.choice === 'feed' || raw?.choice === 'ignore'
+        ? raw.choice
+        : 'guard',
+      success: raw?.success === true,
+      qty: Math.max(0, Math.min(MAX_STACK, Math.trunc(Number(raw?.loss) || 0)))
+    }
+    if (typeof raw?.who === 'string' && raw.who.trim() !== '') entry.who = raw.who.trim().slice(0, 32)
+    this.#appendLog(entry)
+    const persisted = await this.#persist(true)
+    return { ok: true, action: 'note-omen', persisted }
+  }
+
+  async #noteMilestone (raw) {
+    const kind = raw?.kind === 'season' || raw?.kind === 'event' ? raw.kind : null
+    if (kind === null) return farmError('bad-action')
+    const now = this.#nowMs()
+    this.#advance(now)
+    const entry = { at: now, kind }
+    if (typeof raw?.id === 'string' && raw.id !== '') entry.id = raw.id.slice(0, 40)
+    if (typeof raw?.name === 'string' && raw.name !== '') entry.name = raw.name.slice(0, 40)
+    if (Number.isFinite(Number(raw?.coins))) entry.coins = Math.max(0, Math.trunc(Number(raw.coins)))
+    if (Number.isFinite(Number(raw?.dew))) entry.dew = Math.max(0, Math.trunc(Number(raw.dew)))
+    this.#appendLog(entry)
+    const persisted = await this.#persist(true)
+    return { ok: true, action: 'note-' + kind, persisted }
+  }
+
+  async #addCoins (rawQty) {    const qty = positiveInt(rawQty, MAX_COINS)
     if (qty === null) return farmError('bad-qty')
     const now = this.#nowMs()
     this.#advance(now)

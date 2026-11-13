@@ -355,7 +355,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `unbring` 成功后宿主再发一条 `bring-window {open:false}` 刷新列表，窗口不关。
 - 只有这扇窗自己的 `webContents` 能发 `dsh-zoo:gift-*`（`isGiftSender`），与改名窗同一个模型。
 
-## 农场小窗（ticket 40 / 43 / 44 / 46 / 47）
+## 农场小窗（ticket 40 / 43 / 44 / 46 / 47 / 63–71）
 
 农场小窗和改名/带派同一种模型：**宿主算数据，helper 只画和收输入**。窗口是 `file://`
 页面，没有 Node、没有网络、读不到 `/state`；地块、种子、作物、交易所、合同和访客快照
@@ -364,9 +364,13 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 - **新外壳（ticket 47）**：奶白 `#FAF8F5` 底 + 祖母绿/琥珀/天空蓝，16–24px 圆角卡片、
   软阴影、胶囊、进度条、成熟轻微弹跳、细滚动条；系统字体 + 内联 SVG，CSP 是
   `default-src 'none'` + `img-src 'self'`（只放行包内作物图，见下条），不加载任何
-  CDN/远程字体/图标库。窗口仍是 420×560
-  （`FARM_WIDTH` / `FARM_HEIGHT` 未改），内容区自己滚动。
-  header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / ×」，下面是 4 段页签、农场页专属的
+  CDN/远程字体/图标库。窗口是 520×700
+  （`FARM_WIDTH` / `FARM_HEIGHT`；SPEC v8 把 420×560 放宽，给季节条和 10 种作物留出两列宽地块），
+  内容区自己滚动。农场窗**默认不置顶**（右上角图钉可切换；选择记在
+  `userData/farm-window.json`，下次开窗沿用）。桌面宠物本体仍保持置顶。
+  header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / 📌 / ×」，header 下面是四季日历
+  （`#season-bar` / `#season-calendar`）和当天的节日卡（`#event-card`；秋天还会多一张
+  主人专属的熊獾卡 `#omen-card`）。再下面是 4 段页签、农场页专属的
   「一键种满 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
 - **雇工挂牌（ticket 44）**：`contracts.listings[]` 带 `expiresAt`——宿主按**本机收到行情**
   的时刻 + `peerLostMs` 算（默认 120 秒 = 4 个 30 秒广播），不是邻居的墙上时钟。
@@ -381,23 +385,26 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   只在 `onState` 里刷新。走到 0 也不本地改状态：窗口只把文本停在「马上就好 / 马上结束」，
   再请宿主重推一份 `farm-refresh`；熟没熟、合同结没结只认宿主的 `stage` / `status`。
 - **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
-  浇水/施肥；成熟轻微弹跳并给收获/施肥。动作 id 仍是 `farm-plant` / `farm-harvest` /
+  浇水/施肥；成熟轻微弹跳并给收获/施肥。枯萎卡 `data-stage="withered"`，角标「枯萎」，
+  详情「换季了，这株没来得及熟，重种一株吧」，操作只留「＋ 重种」（发 `farm-plant`）。
+  动作 id 仍是 `farm-plant` / `farm-harvest` /
   `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。
-- **播种弹窗**：六种种子的库存、生长时长、产量；库存 0 禁用；「去交易所买种」只切页签，
+- **播种弹窗**：十种种子的库存、生长时长、产量；库存 0 禁用，错季四季种子也禁用并写
+  「下季才有」；「去交易所买种」只切页签，
   没有随机买种。批量：一键种满 = 按空地与种子库存逐块种下（种子用完即停）；一键收割 = 所有成熟
   地块按顺序逐条发 `farm-harvest`，busy 守卫 + 逐条 toast，不新增宿主动作。
-- **作物外观（ticket 58）**：不再用 emoji，改成包内自带的 `desktop/crops/<id>.svg`
-  （六个：小番茄/草莓/胡萝卜/玉米/南瓜/葡萄）。`desktop/farm-view.js` 的 `CROP_META`
+- **作物外观（ticket 58 / 64）**：不再用 emoji，改成包内自带的 `desktop/crops/<id>.svg`
+  （十个：六种常驻 + 豌豆/西瓜/稻米/白萝卜；四季四种是占位图）。`desktop/farm-view.js` 的 `CROP_META`
   同时带 `art` 和 `emoji`：有图渲染 `<img class="crop-art-img">`，没图（空地、旧邻居
   传来的未知作物、将来漏放的作物）退回 emoji。图外面仍套 `.crop-emoji` / `.seed-emoji`
   那个盒子，所以字号、阶段滤镜和布局都不用改；尺寸按 `1.2em` 走，只有地块卡单独钉 26px。
   `farm.html` 是 `file://` 页面，`default-src 'none'` 会把 `<img>` 全拦掉（实测
   `naturalWidth = 0`），所以 CSP 必须放行 `img-src 'self'`。
-- **目录随包下发（票 59）**：宿主每一包都带 `crops`（内置六种 + `<dataDir>/crops.json`），
+- **目录随包下发（票 59 / 64）**：宿主每一包都带 `crops`（内置十种 + `<dataDir>/crops.json`），
   `farm.js` 在 `onState` 开头调 `view.setCrops(payload.crops)`，`shared.normalizeFarmWindow`
-  也按这份目录校验种子/作物/行情（`applyCropCatalog`）。所以窗口不再自己写死六种：
+  也按这份目录校验种子/作物/行情（`applyCropCatalog`）。所以窗口不再自己写死十种：
   宿主加一种，种子列表、行情行、地块卡一起多一行。窗口认识但包里没图的条目退成 🌱。
-  六颗小圆片塞不进 footer
+  十颗小圆片塞不进 footer
   一行（370 > 325，实测），`.bag-chips` 因此改成换行——横向滚动条本来是隐藏的，
   右下角那颗会被当成画错。加一种作物 = 宿主
   `src/farm-rules.js` + 窗口 `CROP_META` + 一个 SVG 文件，`test/farm-constants-drift.test.js`
@@ -416,11 +423,20 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   偷/帮卡与次数/守卫提示，隐藏一键种满/收割、播种弹窗与解锁卡。
 - 页签：农场 / 交易所 / 雇工 / 记录。记录页自己滚动，最多 100 条；窗口顶部的「驮包」
   只显示偷来的作物与在途工资（宿主算好下发，窗口不记账）。
+- **季节 UI（ticket 63–71）**：`farm-window` 顶层带 `season`（`id/name/emoji/start/end/
+  remainingMs/calendar/event/omen`）。`#season-bar` 平时隐藏，收到合法 `season` 才显示；
+  四格 `#season-calendar` 用 `calendar[]` 的 `today/past` 上色，最后一格旁边写
+  「距入冬 8 小时 12 分」，最后 4 小时加 `is-almost` 并提示未熟四季作物会枯萎。
+  `#event-card` 每个季节都有，显示目标/进度/奖励/领取；`#omen-card` 只在 `mode === 'owner'`
+  且有 `season.omen` 时画，访客/看田强制隐藏。`body[data-season]` 只换强调色和背景渐变，
+  不重排布局。换季时宿主会在下一帧推新 `season`，窗口重画并 toast「秋天到了 · 丰收祭」。
 - 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
   （只带 `plotId`，种地再带 `cropId`）；解锁 `farm-unlock`（只带可选的
   `expectedUnlocked`，4–50 的乐观锁，价格由宿主算）；交易所 `farm-buy-seed` /
   `farm-sell-crop`（只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
-  `recall-worker` / `end-contract` / `hire-listing`；访客偷/帮 `farm-steal` / `farm-help`。
+  `recall-worker` / `end-contract` / `hire-listing`；访客偷/帮 `farm-steal` / `farm-help`；
+  节日 `farm-event-claim`（只带 `expectedStart`）；来客 `farm-omen-resolve`
+  （只带 `choice: 'guard'|'feed'` + `expectedStart`）。
   `shared.normalizeFarmAction` 与 `main.js` 的 `farmPending` 双重防串 id；一次只能有
   一个在飞动作，宿主回 `action-result` 后窗口才解锁。
 - 成功不关窗：种/收/买卖/挂牌/雇佣都只 toast 并刷新数据；失败留在窗里显示 `notice`。

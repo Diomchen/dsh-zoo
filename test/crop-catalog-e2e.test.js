@@ -139,7 +139,7 @@ test('crops.json 里的作物：启动后进行情、能买种、能种、能收
   assert.ok(final.body.market.prices.blueberry.price < 18)
 })
 
-test('crops.json 写坏了：只用内置六种照常启动，日志留一条', async (t) => {
+test('crops.json 写坏了：只用内置十种照常启动，日志留一条', async (t) => {
   const dir = await tempDir(t)
   await writeFile(join(dir, 'crops.json'), '{ 不是 json')
   const service = makeService(t, {
@@ -150,7 +150,7 @@ test('crops.json 写坏了：只用内置六种照常启动，日志留一条', 
   const state = await call(service, '/dsh-zoo/state')
   assert.equal('blueberry' in state.body.market.prices, false)
   assert.deepEqual(Object.keys(state.body.market.prices).sort(),
-    ['carrot', 'corn', 'grape', 'pumpkin', 'strawberry', 'tomato'])
+    ['carrot', 'corn', 'grape', 'pea', 'pumpkin', 'radish', 'rice', 'strawberry', 'tomato', 'watermelon'])
   assert.ok(service.logs.some((line) => line.includes('crops.json')))
 
   // 内置作物照常能种。

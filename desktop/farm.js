@@ -17,6 +17,15 @@ const CROP_IDS = view.CROP_IDS
 
 const plotsEl = document.getElementById('plots')
 const visitorBannerEl = document.getElementById('visitor-banner')
+const seasonBarEl = document.getElementById('season-bar')
+const seasonEmojiEl = document.getElementById('season-emoji')
+const seasonNameEl = document.getElementById('season-name')
+const seasonRemainEl = document.getElementById('season-remain')
+const seasonWarnEl = document.getElementById('season-warn')
+const seasonCalendarEl = document.getElementById('season-calendar')
+const seasonCardsEl = document.getElementById('season-cards')
+const eventCardEl = document.getElementById('event-card')
+const omenCardEl = document.getElementById('omen-card')
 const seedBagEl = document.getElementById('seed-bag')
 const cropWarehouseEl = document.getElementById('crop-warehouse')
 const logEl = document.getElementById('log')
@@ -68,6 +77,7 @@ const unlockBodyEl = document.getElementById('unlock-body')
 const unlockConfirmEl = document.getElementById('unlock-confirm')
 const unlockCloseEl = document.getElementById('unlock-modal-close')
 const closeButton = document.getElementById('close')
+const pinButton = document.getElementById('pin')
 
 /** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
 const HIRE_WAGE_MIN = 1
@@ -100,6 +110,15 @@ const RESULT_CODE_TEXT = {
   'max-plots': '已经到 50 块地了，没有可解锁的地块。',
   reserve: '解锁后至少要留一点种子钱，先卖点作物吧。',
   stale: '农场刚刚变过，刷新后再试。',
+  'out-of-season': '这个季节种不了它，下季再来吧。',
+  withered: '换季了，这株没来得及熟，重种一株吧。',
+  'stale-season': '节日/来客已经换了一天，刷新后再试。',
+  'event-inactive': '今天没有可领的节日。',
+  'event-not-ready': '节日任务还没完成，再忙一会儿。',
+  'event-claimed': '今天的节日奖励已经领过了。',
+  'omen-resolved': '这位来客已经处理过了。',
+  'bad-choice': '这个选择不对，再试一次。',
+  'not-enough-crops': '仓库里的作物不够。',
   // 雇佣（ticket 44）
   'own-pet': '不能雇自己的宠物。',
   'worker-unavailable': '这只宠物现在不能来打工。',
@@ -120,7 +139,11 @@ const LOG_TEXT = {
   help: '帮忙',
   hire: '雇工',
   settle: '结算',
-  unlock: '解锁'
+  unlock: '解锁',
+  season: '换季',
+  event: '节日',
+  wither: '枯萎',
+  omen: '来客'
 }
 const MARKET_SIDE_TEXT = { buy: '买种', sell: '卖出' }
 /** 访客模式的固定错误码 → 窗口兜底文案（宿主 notice 优先，这里是拿不到 notice 时）。 */
@@ -146,6 +169,8 @@ let contracts = null
 let hireDirty = false
 /** 访客模式（ticket 43）：宿主决定模式；窗口只画 visit 块，不自己联网。 */
 let mode = 'owner'
+/** 农场窗是否置顶；由主进程推来，用户点图钉时先乐观翻转再交给主进程落盘。 */
+let pinned = false
 let visit = null
 /** 票 52：只读查看邻居农场时的视图（`mode:'look'`）。 */
 let look = null
@@ -314,6 +339,175 @@ function renderHeader () {
   }
   if (coinValueEl !== null) coinValueEl.textContent = String(Number(farm?.coins) || 0)
   if (dewValueEl !== null) dewValueEl.textContent = String(Number(farm?.dew) || 0)
+  renderPin()
+}
+
+/** 图钉不是数据状态：只改 aria/提示，真正的窗口层级在主进程。 */
+function renderPin () {
+  if (pinButton === null) return
+  pinButton.setAttribute('aria-pressed', pinned ? 'true' : 'false')
+  pinButton.textContent = pinned ? '📍' : '📌'
+  const label = pinned ? '取消置顶' : '置顶窗口'
+  pinButton.setAttribute('aria-label', label)
+  pinButton.title = label
+}
+
+/** 票 70：季节条只属于主人视角；访客/只读查看邻居时不画自己的日历和节日。 */
+function currentSeason () {
+  return mode === 'owner' && farm !== null && farm.season !== null && typeof farm.season === 'object'
+    ? farm.season
+    : null
+}
+
+function seasonRemainText (season, remainingMs) {
+  const left = Math.max(0, Number(remainingMs) || 0)
+  if (left <= 0) return '今日 · 马上换季'
+  return '今日 · 距入' + (season?.next?.name ?? '下一季') + ' ' + formatRemaining(left)
+}
+
+function renderSeason () {
+  const season = currentSeason()
+  if (seasonBarEl === null) return
+  const calendar = view.seasonCalendar(season)
+  if (mode !== 'owner' || season === null) {
+    seasonBarEl.hidden = true
+    if (seasonCardsEl !== null) seasonCardsEl.hidden = true
+    if (document.body != null) delete document.body.dataset.season
+    return
+  }
+  seasonBarEl.hidden = false
+  if (document.body != null) document.body.dataset.season = season.id
+  if (seasonEmojiEl !== null) seasonEmojiEl.textContent = calendar.emoji || '🌱'
+  if (seasonNameEl !== null) seasonNameEl.textContent = calendar.name || '四季'
+  if (seasonRemainEl !== null) seasonRemainEl.textContent = seasonRemainText(calendar, calendar.remainingMs)
+  if (seasonWarnEl !== null) {
+    seasonWarnEl.hidden = !calendar.almost
+    seasonWarnEl.textContent = calendar.almost ? '今晚 24:00 换季，未熟四季作物会枯萎' : ''
+  }
+  if (seasonCalendarEl !== null) {
+    seasonCalendarEl.replaceChildren()
+    for (const cell of calendar.cells) {
+      const item = document.createElement('li')
+      item.className = 'season-cell'
+      item.dataset.today = cell.today ? 'true' : 'false'
+      item.dataset.past = cell.past ? 'true' : 'false'
+      const emoji = document.createElement('span')
+      emoji.className = 'cell-emoji'
+      emoji.setAttribute('aria-hidden', 'true')
+      emoji.textContent = cell.emoji
+      const name = document.createElement('span')
+      name.textContent = cell.name
+      item.append(emoji, name)
+      if (cell.festival !== '') {
+        const festival = document.createElement('span')
+        festival.className = 'cell-festival'
+        festival.textContent = cell.festival
+        item.append(festival)
+      }
+      seasonCalendarEl.append(item)
+    }
+  }
+}
+
+/** 节日卡与来客卡共用的标题行。 */
+function seasonCardHead (card, tag) {
+  const head = document.createElement('div')
+  head.className = 'season-card-head'
+  const title = document.createElement('strong')
+  title.textContent = card.emoji === undefined ? card.name : card.emoji + ' ' + card.name
+  const label = document.createElement('span')
+  label.className = 'season-card-tag'
+  label.textContent = tag
+  head.append(title, label)
+  return head
+}
+
+/** 测试里的假 DOM 没有 replaceChildren；真实窗口有。 */
+function replaceContent (element, ...nodes) {
+  if (typeof element.replaceChildren === 'function') {
+    element.replaceChildren(...nodes)
+    return
+  }
+  element.textContent = ''
+  for (const node of nodes) element.append(node)
+}
+
+function renderEventCard (season) {
+  if (eventCardEl === null) return
+  const card = view.eventCard(season?.event)
+  if (card === null || mode !== 'owner') {
+    eventCardEl.hidden = true
+    replaceContent(eventCardEl)
+    return
+  }
+  eventCardEl.hidden = false
+  eventCardEl.title = card.rewardText + '；' + card.statusText
+  const head = seasonCardHead(card, '今日节日')
+  const detail = document.createElement('p')
+  detail.textContent = card.rewardText + '。' + card.statusText
+  const progress = document.createElement('div')
+  progress.className = 'season-progress'
+  const bar = document.createElement('span')
+  bar.className = 'season-progress-bar'
+  const fill = document.createElement('i')
+  fill.className = 'season-progress-fill'
+  const pct = card.qty > 0 ? Math.min(100, Math.round(card.progress / card.qty * 100)) : 0
+  fill.style.width = pct + '%'
+  bar.append(fill)
+  const text = document.createElement('span')
+  text.textContent = card.progressText
+  progress.append(bar, text)
+  const actions = document.createElement('div')
+  actions.className = 'season-actions'
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'season-btn primary'
+  button.dataset.seasonAction = 'claim'
+  button.textContent = card.claimed ? '今天已领' : card.ready ? '领取奖励' : '还没完成'
+  button.title = card.rewardText
+  button.disabled = !card.canClaim || busy
+  actions.append(button)
+  replaceContent(eventCardEl, head, detail, progress, actions)
+}
+
+function renderOmenCard (season) {
+  if (omenCardEl === null) return
+  const card = view.omenCard(season?.omen)
+  if (card === null || mode !== 'owner') {
+    omenCardEl.hidden = true
+    replaceContent(omenCardEl)
+    return
+  }
+  omenCardEl.hidden = false
+  omenCardEl.title = [card.detail, card.guardText, card.feedText].filter(Boolean).join('\n')
+  const head = seasonCardHead(card, '秋天来客')
+  const detail = document.createElement('p')
+  detail.textContent = card.detail
+  const guard = document.createElement('p')
+  guard.textContent = card.guardText
+  const feed = document.createElement('p')
+  feed.textContent = card.feedText
+  const actions = document.createElement('div')
+  actions.className = 'season-actions'
+  for (const action of card.actions) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'season-btn' + (action.id === 'guard' ? ' primary' : '')
+    button.dataset.seasonAction = 'omen-' + action.id
+    button.textContent = action.label
+    button.disabled = action.disabled === true || busy
+    if (action.reason) button.title = action.reason
+    actions.append(button)
+  }
+  replaceContent(omenCardEl, head, detail, guard, feed, actions)
+}
+
+function renderSeasonCards (season) {
+  if (seasonCardsEl === null) return
+  renderEventCard(season)
+  renderOmenCard(season)
+  seasonCardsEl.hidden = eventCardEl?.hidden === true && omenCardEl?.hidden === true
+  seasonCardsEl.dataset.layout = eventCardEl?.hidden === true || omenCardEl?.hidden === true ? 'single' : 'pair'
 }
 
 function renderBatchBar () {
@@ -639,7 +833,7 @@ function stackChip (meta, count, kind, cropId) {
   return chip
 }
 
-/** 常驻 footer：种子背包 / 收获仓库，跨页签都看得到；空库存也保留位置。 */
+/** 常驻 footer：种子背包 / 收获仓库，跨页签都看得到。只列有库存的格子，避免十种作物的 0 把窗口撑高。 */
 function renderInventory () {
   if (seedBagEl === null || cropWarehouseEl === null) return
   seedBagEl.textContent = ''
@@ -655,8 +849,17 @@ function renderInventory () {
   }
   for (const cropId of CROP_IDS) {
     const meta = CROP_META[cropId]
-    seedBagEl.appendChild(stackChip(meta, Number(farm.seeds?.[cropId]) || 0, 'seed', cropId))
-    cropWarehouseEl.appendChild(stackChip(meta, Number(farm.crops?.[cropId]) || 0, 'crop', cropId))
+    const seeds = Number(farm.seeds?.[cropId]) || 0
+    const crops = Number(farm.crops?.[cropId]) || 0
+    if (seeds > 0) seedBagEl.appendChild(stackChip(meta, seeds, 'seed', cropId))
+    if (crops > 0) cropWarehouseEl.appendChild(stackChip(meta, crops, 'crop', cropId))
+  }
+  for (const holder of [seedBagEl, cropWarehouseEl]) {
+    if (holder.childElementCount > 0) continue
+    const empty = document.createElement('span')
+    empty.className = 'stack-chip muted'
+    empty.textContent = '空'
+    holder.appendChild(empty)
   }
 }
 
@@ -692,6 +895,23 @@ function renderLog () {
       const plot = Number(entry.plot) || Number(entry.qty)
       text.textContent = '解锁了第 ' + (plot || '?') + ' 块地' +
         (Number.isFinite(cost) && cost > 0 ? ' · ' + cost + ' 硬币' : '')
+    } else if (entry.kind === 'season') {
+      text.textContent = '换季 · 入' + (typeof entry.name === 'string' ? entry.name : '下一季')
+    } else if (entry.kind === 'event') {
+      const coins = Number(entry.coins)
+      const dew = Number(entry.dew)
+      text.textContent = (typeof entry.name === 'string' ? entry.name : '节日') + '完成' +
+        (Number.isFinite(coins) && coins > 0 ? ' · +' + coins + ' 硬币' : '') +
+        (Number.isFinite(dew) && dew > 0 ? ' · +' + dew + ' 露水' : '')
+    } else if (entry.kind === 'wither') {
+      text.textContent = '换季枯萎了 ' + (Number(entry.qty) || 1) + ' 株四季作物'
+    } else if (entry.kind === 'omen') {
+      const lost = Number(entry.qty) || 0
+      const choice = entry.choice === 'feed'
+        ? '投喂了来客'
+        : entry.choice === 'guard' ? '守夜' : '没来得及处理来客'
+      text.textContent = who + choice +
+        (entry.success === true ? '，平安过关' : lost > 0 ? '，被搬走 ' + lost + ' 个作物' : '，没有损失')
     } else if (entry.kind === 'steal' && Number(entry.qty) === 0) {
       text.textContent = who === '' ? '被抓住了' : who + '被抓住了'
     } else if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
@@ -1486,7 +1706,7 @@ function renderPlantModal () {
   }
   const index = farm.plots.findIndex((plot) => plot.id === plantTarget)
   const plot = index >= 0 ? farm.plots[index] : null
-  if (plot === null || plot.stage !== 'empty') {
+  if (plot === null || (plot.stage !== 'empty' && plot.stage !== 'withered')) {
     plantTarget = null
     plantModalEl.hidden = true
     return
@@ -1497,15 +1717,17 @@ function renderPlantModal () {
   for (const cropId of CROP_IDS) {
     const meta = CROP_META[cropId]
     const count = Number(farm.seeds?.[cropId]) || 0
+    const availability = view.seedAvailability(cropId, farm?.season?.id)
     const row = document.createElement('button')
     row.type = 'button'
     row.className = 'seed-row'
     row.dataset.plotAction = 'plant'
     row.dataset.plotId = plantTarget
     row.dataset.cropId = cropId
-    row.disabled = busy || count <= 0
-    if (count <= 0) row.title = '没有这种种子了'
-    row.setAttribute('aria-label', meta.name + '，库存 ' + count)
+    row.disabled = busy || count <= 0 || availability.plantable !== true
+    if (availability.plantable !== true) row.title = availability.reason
+    else if (count <= 0) row.title = '没有这种种子了'
+    row.setAttribute('aria-label', meta.name + '，库存 ' + count + (availability.reason ? '，' + availability.reason : ''))
     const emoji = view.cropEmblem(document, meta, 'seed-emoji')
     const info = document.createElement('span')
     info.className = 'seed-info'
@@ -1513,7 +1735,8 @@ function renderPlantModal () {
     name.textContent = meta.name
     const detail = document.createElement('span')
     detail.className = 'seed-meta'
-    detail.textContent = '生长 ' + view.formatGrowTime(meta.growMs) + ' · 收获 ' + meta.yield + ' 个'
+    detail.textContent = '生长 ' + view.formatGrowTime(meta.growMs) + ' · 收获 ' + meta.yield + ' 个' +
+      (availability.plantable !== true ? ' · ' + availability.reason : '')
     info.appendChild(name)
     info.appendChild(detail)
     const stock = document.createElement('span')
@@ -1604,6 +1827,8 @@ function confirmUnlock () {
 /** 只重画农场页/常驻外壳：tick 让作物成熟时不能顺手重建雇工页（合同倒计时会跳回去）。 */
 function renderFarmSurface () {
   renderHeader()
+  renderSeason()
+  renderSeasonCards(currentSeason())
   renderBatchBar()
   renderPlots()
   renderInventory()
@@ -1700,9 +1925,26 @@ function tickPlots () {
   }
 }
 
+function tickSeason () {
+  const season = currentSeason()
+  if (season === null || seasonBarEl === null) return
+  const end = Number(season.end)
+  const left = Number.isFinite(end) ? Math.max(0, end - Date.now()) : Math.max(0, Number(season.remainingMs) || 0)
+  if (seasonRemainEl !== null) {
+    seasonRemainEl.textContent = seasonRemainText(view.seasonCalendar(season), left)
+  }
+  if (seasonWarnEl !== null) {
+    const almost = left > 0 && left <= 4 * 60 * 60 * 1000
+    seasonWarnEl.hidden = !almost
+    seasonWarnEl.textContent = almost ? '今晚 24:00 换季，未熟四季作物会枯萎' : ''
+  }
+  if (left <= 0) requestFarmRefresh()
+}
+
 function tick () {
   if (activeTab === 'hire') tickContracts()
   tickPlots()
+  tickSeason()
 }
 
 /** 真正把一次申请交给主进程；批量队列在两条申请之间复用这条窄口。 */
@@ -1780,6 +2022,27 @@ function startBatchHarvest () {
   }
   sendNextBatch()
 }
+
+seasonCardsEl?.addEventListener('click', (event) => {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  const button = target.closest('button[data-season-action]')
+  if (button === null || button.disabled) return
+  const season = currentSeason()
+  if (season === null) return
+  const action = button.dataset.seasonAction
+  if (action === 'claim') {
+    submit({ action: 'farm-event-claim', expectedStart: season.start })
+    return
+  }
+  if (action === 'omen-guard' || action === 'omen-feed') {
+    submit({
+      action: 'farm-omen-resolve',
+      choice: action === 'omen-guard' ? 'guard' : 'feed',
+      expectedStart: season.start
+    })
+  }
+})
 
 plotsEl.addEventListener('click', (event) => {
   const target = event.target
@@ -2008,6 +2271,18 @@ hirePageEl?.addEventListener('click', (event) => {
 
 closeButton.addEventListener('click', () => api?.close())
 
+if (pinButton !== null) {
+  pinButton.addEventListener('click', () => {
+    if (typeof api?.setPinned !== 'function') {
+      showToast('这个窗口还是旧版本，关掉农场窗再打开就能置顶。', 'error')
+      return
+    }
+    pinned = !pinned
+    renderPin()
+    api.setPinned(pinned)
+  })
+}
+
 document.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return
   event.preventDefault()
@@ -2020,6 +2295,11 @@ document.addEventListener('keydown', (event) => {
     return
   }
   api?.close()
+})
+
+api?.onPinned?.((value) => {
+  pinned = value === true
+  renderPin()
 })
 
 api?.onState((payload) => {

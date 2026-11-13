@@ -22,6 +22,15 @@ const FARM_ERROR_TEXT = Object.freeze({
   // 农场规则（SPEC v5「状态出口与动作」的错误码）
   'bad-plot': '这块地不在了，刷新后再试。',
   'bad-crop': '这种作物种不了，换一种吧。',
+  'out-of-season': '这个季节种不了它，下季再来吧。',
+  withered: '换季了，这株没来得及熟，重种一株吧。',
+  'not-enough-crops': '仓库里的作物不够。',
+  'omen-resolved': '这位来客已经打发走了。',
+  'bad-choice': '这个应对方式不成立。',
+  'stale-season': '节日/来客已经换了一天，刷新后再试。',
+  'event-inactive': '今天没有可领的节日。',
+  'event-not-ready': '节日任务还没完成，再忙一会儿。',
+  'event-claimed': '今天的节日奖励已经领过了。',
   'plot-occupied': '这块地已经种上了，先收掉再种。',
   'not-mature': '还没熟呢，再等一会儿。',
   'no-seed': '没有这种种子了，先去交易所买。',
@@ -91,7 +100,18 @@ const VISIT_ERROR_TEXT = Object.freeze({
   gone: '这次串门已经结束了。'
 })
 
-const CROP_NAMES = Object.freeze({ tomato: '小番茄', carrot: '胡萝卜', pumpkin: '南瓜' })
+const CROP_NAMES = Object.freeze({
+  pea: '豌豆',
+  tomato: '小番茄',
+  strawberry: '草莓',
+  radish: '白萝卜',
+  carrot: '胡萝卜',
+  rice: '稻米',
+  corn: '玉米',
+  watermelon: '西瓜',
+  pumpkin: '南瓜',
+  grape: '葡萄'
+})
 
 export function farmActionResultText ({ action, ok, error, crop } = {}) {
   if (ok === true) {

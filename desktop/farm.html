@@ -195,6 +195,29 @@
       .close:hover {
         background: #e7e1d8;
       }
+      .pin {
+        appearance: none;
+        width: 24px;
+        height: 24px;
+        flex: none;
+        padding: 0;
+        border: 0;
+        border-radius: 999px;
+        background: #f1ede6;
+        color: var(--ink-soft);
+        font: inherit;
+        font-size: 12px;
+        line-height: 24px;
+        text-align: center;
+        cursor: pointer;
+      }
+      .pin:hover {
+        background: #e7e1d8;
+      }
+      .pin[aria-pressed='true'] {
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
 
       /* 2. 分段页签 */
       /* 票 55：农场窗头部的邻居切换器（我的农场 / 各邻居）。 */
@@ -471,7 +494,7 @@
 
       .plots {
         display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+        grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
         gap: 8px;
         align-content: start;
       }
@@ -518,6 +541,232 @@
         background: linear-gradient(180deg, #fff9ec, #fdefd4);
         box-shadow: 0 6px 16px rgba(222, 148, 39, 0.16);
       }
+      /* 票 70：换季枯萎。仍然可以点开重种，所以保留 open-plant 的指针和 hover。 */
+      .plot-card[data-stage='withered'] {
+        border-color: #d8d0c4;
+        background: linear-gradient(180deg, #f7f3ec, #efe8dd);
+      }
+      .plot-card[data-stage='withered'] .plot-badge {
+        background: #e8e1d6;
+        color: #7a7165;
+      }
+      .plot-card[data-stage='withered'] .crop-emoji img {
+        filter: grayscale(1);
+        opacity: 0.55;
+      }
+      .plot-card[data-stage='withered'] .plot-progress-fill {
+        background: #b9b0a1;
+      }
+
+      /* 票 70：顶部季节条 + 四格日历。 */
+      .season-bar {
+        flex: none;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin: 7px 12px 0;
+        padding: 7px 9px;
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.7);
+      }
+      .season-bar[hidden] {
+        display: none !important;
+      }
+      /* 四季主题只换一层很淡的底和边，不动布局。 */
+      body[data-season='spring'] .season-bar {
+        background: linear-gradient(180deg, #f4fbf4, rgba(255, 255, 255, 0.7));
+        border-color: #d8ead9;
+      }
+      body[data-season='summer'] .season-bar {
+        background: linear-gradient(180deg, #fffaf0, rgba(255, 255, 255, 0.7));
+        border-color: #f0dfb8;
+      }
+      body[data-season='autumn'] .season-bar {
+        background: linear-gradient(180deg, #fff7ef, rgba(255, 255, 255, 0.7));
+        border-color: #efd6bd;
+      }
+      body[data-season='winter'] .season-bar {
+        background: linear-gradient(180deg, #f5faff, rgba(255, 255, 255, 0.7));
+        border-color: #d6e4ee;
+      }
+      .season-now {
+        display: flex;
+        align-items: center;
+        gap: 7px;
+        min-width: 0;
+      }
+      .season-now .season-emoji {
+        font-size: 19px;
+        line-height: 1;
+      }
+      .season-now .season-copy {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        gap: 1px;
+      }
+      .season-now strong {
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .season-now .season-remain {
+        color: var(--muted);
+        font-size: 9px;
+        line-height: 1.3;
+      }
+      .season-now .season-warn {
+        margin-left: auto;
+        flex: none;
+        max-width: 150px;
+        color: var(--rose-ink);
+        font-size: 8.5px;
+        font-weight: 700;
+        line-height: 1.25;
+        text-align: right;
+      }
+      .season-calendar {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 4px;
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .season-cell {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 1px;
+        padding: 4px 2px;
+        border: 1px solid transparent;
+        border-radius: 9px;
+        background: #f6f2ea;
+        color: var(--muted);
+        font-size: 8.5px;
+        font-weight: 700;
+      }
+      .season-cell .cell-emoji {
+        font-size: 13px;
+        line-height: 1.1;
+      }
+      .season-cell[data-today='true'] {
+        border-color: #b9dfca;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+        box-shadow: inset 0 0 0 1px rgba(46, 158, 107, 0.12);
+      }
+      .season-cell[data-past='true'] {
+        opacity: 0.55;
+      }
+      .season-cell .cell-festival {
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--amber-ink);
+        font-size: 7.5px;
+        font-weight: 600;
+      }
+
+      /* 票 70：农场页顶部的今日节日 / 秋天来客卡。 */
+      .season-cards {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        align-items: start;
+        gap: 7px;
+      }
+      .season-cards[data-layout='single'] .season-card {
+        grid-column: 1 / -1;
+      }
+      .season-card {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+        padding: 8px 10px;
+        border: 1px solid #f0d49a;
+        border-radius: 14px;
+        background: linear-gradient(180deg, #fffaf0, #fdf2dc);
+        box-shadow: var(--shadow-soft);
+      }
+      .season-card[data-kind='omen'] {
+        border-color: #e0c4bd;
+        background: linear-gradient(180deg, #fff7f4, #fbeae5);
+      }
+      .season-card[hidden] {
+        display: none !important;
+      }
+      .season-card-head {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+      }
+      .season-card-head strong {
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .season-card-head .season-card-tag {
+        margin-left: auto;
+        color: var(--amber-ink);
+        font-size: 8.5px;
+        font-weight: 700;
+      }
+      .season-card p {
+        display: none;
+        margin: 0;
+        color: var(--ink-soft);
+        font-size: 9px;
+        line-height: 1.45;
+      }
+      .season-card .season-progress {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        color: var(--ink-soft);
+        font-size: 8.5px;
+        font-weight: 700;
+      }
+      .season-card .season-progress-bar {
+        flex: 1 1 auto;
+        height: 5px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #eadfc9;
+      }
+      .season-card .season-progress-fill {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: var(--amber);
+      }
+      .season-card .season-actions {
+        display: flex;
+        gap: 6px;
+      }
+      .season-card .season-btn {
+        appearance: none;
+        flex: 1 1 0;
+        height: 27px;
+        padding: 0 8px;
+        border: 0;
+        border-radius: 9px;
+        background: var(--amber);
+        color: #4a3208;
+        font: inherit;
+        font-size: 9.5px;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      .season-card .season-btn.primary {
+        background: var(--emerald-btn);
+        color: #fff;
+      }
+      .season-card .season-btn:disabled {
+        background: var(--disabled-bg);
+        color: var(--disabled-ink);
+        cursor: default;
+      }
+
       /* 锁定卡（ticket 49）：只显示「下一块」，到 50 块自动消失。 */
       .plot-card.locked {
         border-style: dashed;
@@ -1842,9 +2091,23 @@
           <span class="pill dew" title="露水">
             <span class="emoji" aria-hidden="true">💧</span><b id="dew-value">0</b>
           </span>
+          <button class="pin" id="pin" type="button" aria-label="置顶窗口" aria-pressed="false" title="置顶窗口">📌</button>
           <button class="close" id="close" type="button" aria-label="关闭农场">×</button>
         </div>
       </header>
+
+      <!-- 票 70：季节条。四格日历由 renderer 按宿主下发的 calendar 画。 -->
+      <section class="season-bar" id="season-bar" aria-label="季节" hidden>
+        <div class="season-now">
+          <span class="season-emoji" id="season-emoji" aria-hidden="true">🍂</span>
+          <div class="season-copy">
+            <strong id="season-name">秋</strong>
+            <span class="season-remain" id="season-remain">今日 · 距入冬</span>
+          </div>
+          <span class="season-warn" id="season-warn" hidden></span>
+        </div>
+        <ol class="season-calendar" id="season-calendar"></ol>
+      </section>
 
       <nav class="tabs" role="tablist" aria-label="农场页">
         <button class="tab active" type="button" role="tab" data-tab="farm" aria-selected="true">
@@ -1874,6 +2137,10 @@
 
       <main class="body">
         <section class="page" id="page-farm" role="tabpanel" aria-label="农场">
+          <div class="season-cards" id="season-cards">
+            <article class="season-card" id="event-card" data-kind="event" hidden></article>
+            <article class="season-card" id="omen-card" data-kind="omen" hidden></article>
+          </div>
           <section class="visitor-banner" id="visitor-banner" data-state="loading" hidden></section>
           <section class="plots" id="plots" aria-label="地块"></section>
         </section>

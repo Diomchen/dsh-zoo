@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import { discoverPetPacks } from '../src/dsh-pet-pets.js'
@@ -24,8 +25,9 @@ function fakeFs ({ files = {}, dirs = [], clips = {}, listings = {} } = {}) {
   return { readdir, readFile, isDirectory }
 }
 
-const PET_DIR = '/home/u/.dsh/dsh-pet/pet'
-const CAT_DIR = PET_DIR + '/maodie-animation'
+const PET_DIR = join('/home/u/.dsh/dsh-pet/pet')
+const CAT_DIR = join(PET_DIR, 'maodie-animation')
+const petFile = (...parts) => join(PET_DIR, ...parts)
 
 function config (overrides = {}) {
   return JSON.stringify({
@@ -36,7 +38,7 @@ function config (overrides = {}) {
 
 test('扫描宠物包：config 给 id / size / idle，目录给 dirs', async () => {
   const fs = fakeFs({
-    files: { [PET_DIR + '/maodie-config.json']: config() },
+    files: { [petFile('maodie-config.json')]: config() },
     listings: { [PET_DIR]: ['maodie-config.json', 'maodie-animation'] },
     dirs: [CAT_DIR],
     clips: { [CAT_DIR]: ['待机.webm', '踩奶.webm'] }
@@ -56,7 +58,7 @@ test('扫描宠物包：config 给 id / size / idle，目录给 dirs', async () 
 
 test('扫描宠物包：主人把它关掉了（display:none）就不该被拽回来', async () => {
   const fs = fakeFs({
-    files: { [PET_DIR + '/maodie-config.json']: config({ display: 'none' }) },
+    files: { [petFile('maodie-config.json')]: config({ display: 'none' }) },
     listings: { [PET_DIR]: ['maodie-config.json', 'maodie-animation'] },
     dirs: [CAT_DIR],
     clips: { [CAT_DIR]: ['待机.webm'] }
@@ -70,16 +72,16 @@ test('扫描宠物包：主人把它关掉了（display:none）就不该被拽�
 test('扫描宠物包：坏配置、缺动画目录、空目录都只跳过自己', async () => {
   const fs = fakeFs({
     files: {
-      [PET_DIR + '/broken-config.json']: '{ not json',
-      [PET_DIR + '/nodir-config.json']: config({ id: 'nodir' }),
-      [PET_DIR + '/empty-config.json']: config({ id: 'empty' })
+      [petFile('broken-config.json')]: '{ not json',
+      [petFile('nodir-config.json')]: config({ id: 'nodir' }),
+      [petFile('empty-config.json')]: config({ id: 'empty' })
     },
     listings: {
       [PET_DIR]: ['broken-config.json', 'nodir-config.json', 'empty-config.json'],
-      [PET_DIR + '/empty-animation']: ['readme.txt']
+      [petFile('empty-animation')]: ['readme.txt']
     },
-    dirs: [PET_DIR + '/empty-animation'],
-    clips: { [PET_DIR + '/empty-animation']: ['readme.txt'] }
+    dirs: [petFile('empty-animation')],
+    clips: { [petFile('empty-animation')]: ['readme.txt'] }
   })
 
   const result = await discoverPetPacks({ petDir: PET_DIR, ...fs })
@@ -90,10 +92,10 @@ test('扫描宠物包：坏配置、缺动画目录、空目录都只跳过自�
 })
 
 test('扫描宠物包：jsonc 带注释也认；id 不合法就退回目录前缀', async () => {
-  const dir = PET_DIR + '/weird-animation'
+  const dir = petFile('weird-animation')
   const fs = fakeFs({
     files: {
-      [PET_DIR + '/weird-config.jsonc']: '{\n  // 猫\n  "pets": [{ "id": "../etc", "size": 300 }],\n  "animations": { "idle": ["待机"] }\n}'
+      [petFile('weird-config.jsonc')]: '{\n  // 猫\n  "pets": [{ "id": "../etc", "size": 300 }],\n  "animations": { "idle": ["待机"] }\n}'
     },
     listings: { [PET_DIR]: ['weird-config.jsonc'] },
     dirs: [dir],
@@ -115,7 +117,7 @@ test('扫描宠物包：目录不存在不算错误', async () => {
 
 test('扫描宠物包：BOM 也要读得出来（Windows 的编辑器会写）', async () => {
   const fs = fakeFs({
-    files: { [PET_DIR + '/maodie-config.json']: '\uFEFF' + config() },
+    files: { [petFile('maodie-config.json')]: '\uFEFF' + config() },
     listings: { [PET_DIR]: ['maodie-config.json'] },
     dirs: [CAT_DIR],
     clips: { [CAT_DIR]: ['待机.webm'] }

@@ -6,6 +6,7 @@
  *   - submit(action)：把「种/收/浇/施肥/买种/卖作物/解锁」当**申请**交上去，
  *     只带 action/plotId/cropId/qty/expectedUnlocked，单价与总价一概不传，全部由宿主算；
  *   - close()：显式关窗（Esc / 右上角 ×）；
+ *   - setPinned()/onPinned：右上角图钉的置顶开关，只发一个布尔值，窗口层级由主进程改；
  *   - onResult：宿主的 action-result；成功不关窗（toast 一下，继续种/继续买）。
  *
  * 和主窗/带派窗的 preload 是三份文件：这扇窗能收键盘，但同样**不能**自己改状态。
@@ -37,6 +38,9 @@ contextBridge.exposeInMainWorld('dshZooFarm', {
       deviceId: action.deviceId,
       // 票 53：派它去偷时要去哪几块；数组里的每个值主进程还会再白名单一遍。
       plots: Array.isArray(action.plots) ? action.plots.slice(0, 50) : undefined,
+      // 票 70：节日/来客的乐观锁和二选一也要过桥，否则会被当成缺地块的普通动作。
+      expectedStart: action.expectedStart,
+      choice: action.choice,
       hours: action.hours,
       contractId: action.contractId,
       wagePerHour: action.wagePerHour,
@@ -47,6 +51,22 @@ contextBridge.exposeInMainWorld('dshZooFarm', {
   },
   close () {
     ipcRenderer.send('dsh-zoo:farm-close')
+  },
+  /** 窗口置顶开关：主进程负责真正 setAlwaysOnTop，并记住这次选择。 */
+  setPinned (pinned) {
+    ipcRenderer.send('dsh-zoo:farm-pin', pinned === true)
+  },
+  onPinned (handler) {
+    if (typeof handler !== 'function') return () => {}
+    const listener = (_event, pinned) => {
+      try {
+        handler(pinned === true)
+      } catch {
+        // 同 onState：坏处理器不能把窗口带崩
+      }
+    }
+    ipcRenderer.on('dsh-zoo:farm-pinned', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:farm-pinned', listener)
   },
   onState (handler) {
     if (typeof handler !== 'function') return () => {}
