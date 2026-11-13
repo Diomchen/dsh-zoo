@@ -77,14 +77,14 @@ test('omenView：窗口前/窗口内/窗口后，remainingMs 与 active 正确',
   assert.equal(omenView(null), null)
 })
 
-test('守夜：低于守卫值成功，奖励硬币/露水；高于则失败搬 5 个作物', () => {
+test('守夜：低于守卫值成功，奖励 70 硬币 + 5 露水；高于则失败搬 5 个作物', () => {
   const omen = freshOmen(AUTUMN)
   const now = omen.start + HOUR_MS
   const success = resolveOmen('guard', { guard: 0.3, random: () => 0.1, now, omen })
   assert.equal(success.ok, true)
   assert.equal(success.success, true)
   assert.deepEqual(success.loss, { crops: 0, witherPlots: 0, freezePlots: 0, matureOnly: false })
-  assert.deepEqual(success.reward, { coins: 40, dew: 3, seeds: {} })
+  assert.deepEqual(success.reward, { coins: 70, dew: 5, seeds: {} })
 
   const fail = resolveOmen('guard', { guard: 0.3, random: () => 0.9, now, omen })
   assert.equal(fail.ok, true)
