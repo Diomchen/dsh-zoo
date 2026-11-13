@@ -14,8 +14,8 @@
   `omenView(omen, now)` 带 `active/remainingMs`；`resolveOmen` 返回
   `{ok,choice,success,loss:{crops,witherPlots,freezePlots,matureOnly},consume,reward}`，
   窗口外 `omen-inactive`。
-- 数值：蛙雨守卫成功 25+2/失败枯萎 2；野火 30+3/失败烧 2 块成熟；熊獾 40+3/失败 5 作物；
-  巨鹿 35+4/失败冻 3 块。安抚代价见 README 表。
+- 数值：蛙雨守卫成功 45+3/失败枯萎 2；野火 55+4/失败烧 2 块成熟；熊獾 70+5/失败 5 作物；
+  巨鹿 65+6/失败冻 3 块。安抚代价见 README 表。
 - `season.json.omen`：`{day,season,id,start,end,resolved,choice,result}`。
 - `season-store.settle`：窗口结束或换日时只结算一次；同一天过期写
   `resolved:true, choice:null, result:{success:false,ignored:true}`，防止每 tick 重复扣。

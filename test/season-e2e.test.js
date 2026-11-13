@@ -217,7 +217,7 @@ test('omen：投喂扣 3 个仓库作物，换 1 颗稻种 + 2 露水；只能�
   assert.equal(again.body.error, 'omen-resolved')
 })
 
-test('omen：守夜失败最多搬 5 个；成功给 40 硬币 + 3 露水', async (t) => {
+test('omen：守夜失败最多搬 5 个；成功给 70 硬币 + 5 露水', async (t) => {
   const failDir = await tempDir(t)
   await seedFarm(failDir, AUTUMN, { crops: { tomato: 5 } })
   const fail = makeService(t, failDir, { farmNow: () => AUTUMN, farmRandom: () => 0.9 })
@@ -246,8 +246,8 @@ test('omen：守夜失败最多搬 5 个；成功给 40 硬币 + 3 露水', asyn
   assert.equal(won.body.ok, true)
   assert.equal(won.body.outcome.success, true)
   const after = (await state(win)).body.farm
-  assert.equal(after.coins, 70)
-  assert.equal(after.dew, 3)
+  assert.equal(after.coins, 100)
+  assert.equal(after.dew, 5)
 })
 
 test('season.json 落盘：领奖后 claimed=true，且 farm.json 版本不变', async (t) => {
