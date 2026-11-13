@@ -557,6 +557,28 @@
       .plot-card[data-stage='withered'] .plot-progress-fill {
         background: #b9b0a1;
       }
+      /* 票 75：冻住。作物还在，但按钮变成「生火解冻」，不能收获/浇水/施肥。 */
+      .plot-card[data-stage='frozen'] {
+        border-color: #a9c9dd;
+        background: linear-gradient(180deg, #f2fafd, #e2f1f8);
+        box-shadow: inset 0 0 0 1px rgba(120, 178, 208, 0.18);
+      }
+      .plot-card[data-stage='frozen'] .plot-badge {
+        background: #d9edf6;
+        color: #2c6f8e;
+      }
+      .plot-card[data-stage='frozen'] .crop-emoji img {
+        filter: saturate(0.45) brightness(1.08) hue-rotate(155deg);
+        opacity: 0.8;
+      }
+      .plot-card[data-stage='frozen'] .plot-progress-fill {
+        background: #8fc4dd;
+      }
+      .plot-card[data-stage='frozen'] .chip-btn.thaw {
+        border-color: #a9c9dd;
+        background: #e6f4fa;
+        color: #2c6f8e;
+      }
 
       /* 票 70：顶部季节条 + 四格日历。 */
       .season-bar {

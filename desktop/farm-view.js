@@ -109,9 +109,11 @@
 
   const WATER_COST = 1
   const FERTILIZE_COST = 5
+  // 票 75：生火解冻的固定成本，必须和宿主 THAW_COST 一致。
+  const THAW_COST = Object.freeze({ dew: 2, coins: 5 })
   /** 解锁后至少留一颗最便宜种子的钱；与宿主 PLOT_UNLOCK_RESERVE 同源（drift 测试会读）。 */
   const UNLOCK_RESERVE = 6
-  const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割', withered: '枯萎了' }
+  const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割', withered: '枯萎了', frozen: '冻住了' }
 
   function cropMeta (cropId) {
     return Object.prototype.hasOwnProperty.call(CROP_META, cropId) ? CROP_META[cropId] : null
@@ -278,7 +280,7 @@
   /** 进度条 = 已生长 / 总生长。剩余时间是宿主算的权威值，这里只做显示。 */
   function progressOf (plot) {
     if (plot === null || typeof plot !== 'object') return 0
-    if (plot.stage === 'empty' || plot.stage === 'withered') return 0
+    if (plot.stage === 'empty' || plot.stage === 'withered' || plot.stage === 'frozen') return 0
     if (plot.stage === 'mature' || plot.mature === true) return 1
     const meta = cropMeta(plot.crop)
     if (meta === null) return 0
@@ -393,12 +395,14 @@
       const parts = []
       if (Number(stakes.failLoss) > 0) parts.push(Number(stakes.failLoss) + ' 个仓库作物')
       if (Number(stakes.failWither) > 0) parts.push(Number(stakes.failWither) + ' 块' + (stakes.failMatureOnly === true ? '成熟' : '') + '地')
+      if (Number(stakes.failFreeze) > 0) parts.push(Number(stakes.failFreeze) + ' 块地冻住')
       return parts.length === 0 ? '没有额外损失' : parts.join(' + ')
     })()
     const ignore = stakes.ignoreLoss ?? {}
     const ignoreParts = []
     if (Number(ignore.crops) > 0) ignoreParts.push(Number(ignore.crops) + ' 个作物')
     if (Number(ignore.witherPlots) > 0) ignoreParts.push(Number(ignore.witherPlots) + ' 块地')
+    if (Number(ignore.freezePlots) > 0) ignoreParts.push(Number(ignore.freezePlots) + ' 块地冻住')
     const cost = costText(stakes.feedCost)
     const feedReward = rewardText(stakes.feedReward)
     const guardReward = rewardText(stakes.guardReward)
@@ -564,6 +568,7 @@
     const opts = options !== null && typeof options === 'object' ? options : {}
     const plots = farm !== null && typeof farm === 'object' && Array.isArray(farm.plots) ? farm.plots : []
     const dew = Number.isFinite(Number(opts.dew)) ? Number(opts.dew) : Number(farm?.dew) || 0
+    const coins = Number.isFinite(Number(farm?.coins)) ? Math.max(0, Number(farm.coins)) : 0
     const busy = opts.busy === true
     const selected = typeof opts.selectedPlot === 'string' ? opts.selectedPlot : null
     return plots.map((plot, index) => {
@@ -571,16 +576,21 @@
         ? plot.stage
         : 'empty'
       const meta = cropMeta(plot?.crop)
+      const frozen = stage === 'frozen'
       const withered = stage === 'withered'
       const mature = stage === 'mature'
       const growing = stage === 'growing'
-      const displayStage = withered ? 'withered' : mature ? 'mature' : growing ? 'growing' : 'empty'
+      const displayStage = frozen
+        ? 'frozen'
+        : withered ? 'withered' : mature ? 'mature' : growing ? 'growing' : 'empty'
       const card = {
         plotId: typeof plot?.id === 'string' ? plot.id : '',
         label: plotLabel(plot, index),
         stage: displayStage,
         crop: meta === null ? null : plot.crop,
-        cropName: meta === null ? '空地' : withered ? meta.name + '（枯萎）' : meta.name,
+        cropName: meta === null
+          ? '空地'
+          : frozen ? meta.name + '（冻住）' : withered ? meta.name + '（枯萎）' : meta.name,
         emoji: meta === null ? '＋' : meta.emoji,
         art: meta === null ? '' : meta.art,
         badge: STAGE_TEXT[displayStage],
@@ -592,7 +602,20 @@
         selected: selected !== null && plot?.id === selected,
         actions: []
       }
-      if (card.openPlant) {
+      if (frozen) {
+        const affordable = dew >= THAW_COST.dew && coins >= THAW_COST.coins
+        card.detailText = '生火解冻：' + THAW_COST.dew + ' 露水 + ' + THAW_COST.coins + ' 硬币'
+        card.actions.push(action({
+          action: 'thaw',
+          plotId: card.plotId,
+          label: '生火解冻',
+          className: 'thaw',
+          disabled: busy || !affordable,
+          ...(affordable
+            ? {}
+            : { reason: dew < THAW_COST.dew ? '露水不够（需要 ' + THAW_COST.dew + '）' : '硬币不够（需要 ' + THAW_COST.coins + '）' })
+        }))
+      } else if (card.openPlant) {
         card.detailText = withered ? '换季枯了，点一下重种' : '点一下选种子'
       } else if (mature) {
         card.detailText = plot?.fertilized === true ? '已施肥 · 可以收了' : '已经成熟，可以收了'
@@ -843,6 +866,7 @@
     setCrops,
     WATER_COST,
     FERTILIZE_COST,
+    THAW_COST,
     UNLOCK_RESERVE,
     MIN_TRADE_QTY,
     MAX_TRADE_QTY,

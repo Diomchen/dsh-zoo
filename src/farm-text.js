@@ -24,6 +24,8 @@ const FARM_ERROR_TEXT = Object.freeze({
   'bad-crop': '这种作物种不了，换一种吧。',
   'out-of-season': '这个季节种不了它，下季再来吧。',
   withered: '换季了，这株没来得及熟，重种一株吧。',
+  frozen: '这块地冻住了，先生火解冻。',
+  'not-frozen': '这块地没有冻住。',
   'not-enough-crops': '仓库里的作物不够。',
   'omen-resolved': '这位来客已经打发走了。',
   'omen-inactive': '这位来客已经走了，下次来早点。',

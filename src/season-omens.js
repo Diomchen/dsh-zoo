@@ -23,9 +23,9 @@ const DEFS = Object.freeze({
     tag: '春夜来客',
     guard: Object.freeze({
       label: '赶走',
-      detail: '带人把蛙群赶回田外；失败会踩坏一块正在长的地。'
+      detail: '带人把蛙群赶回田外；失败会踩坏两块正在长的地。'
     }),
-    fail: Object.freeze({ witherPlots: 1 }),
+    fail: Object.freeze({ witherPlots: 2 }),
     reward: Object.freeze({ coins: 25, dew: 2 }),
     feed: Object.freeze({
       label: '引水',
@@ -43,9 +43,9 @@ const DEFS = Object.freeze({
     tag: '夏夜来客',
     guard: Object.freeze({
       label: '隔离',
-      detail: '抢在火势蔓延前清出隔离带；失败会烧掉一块成熟作物。'
+      detail: '抢在火势蔓延前清出隔离带；失败会烧掉两块成熟作物。'
     }),
-    fail: Object.freeze({ witherPlots: 1, matureOnly: true }),
+    fail: Object.freeze({ witherPlots: 2, matureOnly: true }),
     reward: Object.freeze({ coins: 30, dew: 3 }),
     feed: Object.freeze({
       label: '浇水',
@@ -63,9 +63,9 @@ const DEFS = Object.freeze({
     tag: '秋夜来客',
     guard: Object.freeze({
       label: '守夜',
-      detail: '按守卫成功率赌一把；失败会被搬走 3 个仓库作物。'
+      detail: '按守卫成功率赌一把；失败会被搬走 5 个仓库作物。'
     }),
-    fail: Object.freeze({ crops: 3 }),
+    fail: Object.freeze({ crops: 5 }),
     reward: Object.freeze({ coins: 40, dew: 3 }),
     feed: Object.freeze({
       label: '投喂',
@@ -73,7 +73,7 @@ const DEFS = Object.freeze({
       cost: Object.freeze({ crops: 3 }),
       reward: Object.freeze({ dew: 2, seeds: Object.freeze({ rice: 1 }) })
     }),
-    ignore: Object.freeze({ crops: 1 })
+    ignore: Object.freeze({ crops: 2 })
   }),
   winter: Object.freeze({
     id: 'winter-deerclops',
@@ -83,9 +83,9 @@ const DEFS = Object.freeze({
     tag: '冬夜来客',
     guard: Object.freeze({
       label: '硬扛',
-      detail: '把巨鹿挡在田外；失败会冻枯两块地。'
+      detail: '把巨鹿挡在田外；失败会冻住三块地，换季前不解冻就会冻死。'
     }),
-    fail: Object.freeze({ witherPlots: 2 }),
+    fail: Object.freeze({ freezePlots: 3 }),
     reward: Object.freeze({ coins: 35, dew: 4 }),
     feed: Object.freeze({
       label: '生火',
@@ -93,7 +93,7 @@ const DEFS = Object.freeze({
       cost: Object.freeze({ dew: 2, coins: 10 }),
       reward: Object.freeze({})
     }),
-    ignore: Object.freeze({ witherPlots: 1 })
+    ignore: Object.freeze({ freezePlots: 2 })
   })
 })
 
@@ -121,6 +121,7 @@ function cloneLoss (loss = {}) {
   return {
     crops: Math.max(0, Math.floor(Number(loss.crops) || 0)),
     witherPlots: Math.max(0, Math.floor(Number(loss.witherPlots) || 0)),
+    freezePlots: Math.max(0, Math.floor(Number(loss.freezePlots) || 0)),
     matureOnly: loss.matureOnly === true
   }
 }
@@ -130,6 +131,7 @@ function stakesOf (def) {
     guardReward: cloneReward(def.reward),
     failLoss: Math.max(0, Math.floor(Number(def.fail?.crops) || 0)),
     failWither: Math.max(0, Math.floor(Number(def.fail?.witherPlots) || 0)),
+    failFreeze: Math.max(0, Math.floor(Number(def.fail?.freezePlots) || 0)),
     failMatureOnly: def.fail?.matureOnly === true,
     feedCost: cloneCost(def.feed?.cost),
     feedReward: cloneReward(def.feed?.reward),
@@ -287,6 +289,7 @@ export function resolveOmen (choice, { guard = 0, random = Math.random, now = nu
       : cloneLoss({
           crops: stakes.failLoss,
           witherPlots: stakes.failWither,
+          freezePlots: stakes.failFreeze,
           matureOnly: stakes.failMatureOnly
         }),
     consume: cloneCost({}),
@@ -302,6 +305,6 @@ export const OMEN_EMOJI = DEFS.autumn.emoji
 export const OMEN_GUARD_REWARD = Object.freeze({ coins: 40, dew: 3 })
 export const OMEN_FEED_COST = 3
 export const OMEN_FEED_REWARD = Object.freeze({ coins: 0, dew: 2, seeds: Object.freeze({ rice: 1 }) })
-export const OMEN_FAIL_LOSS = 3
-export const OMEN_IGNORE_LOSS = 1
+export const OMEN_FAIL_LOSS = 5
+export const OMEN_IGNORE_LOSS = 2
 export const OMEN_CHOICES = Object.freeze(choicesOf(DEFS.autumn))
