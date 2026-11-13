@@ -248,6 +248,7 @@ test('omen：守夜失败最多搬 5 个；成功给 70 硬币 + 5 露水', asyn
   const after = (await state(win)).body.farm
   assert.equal(after.coins, 100)
   assert.equal(after.dew, 5)
+  assert.equal(after.seeds.rice, 1)
 })
 
 test('season.json 落盘：领奖后 claimed=true，且 farm.json 版本不变', async (t) => {

@@ -27,7 +27,7 @@ const DEFS = Object.freeze({
       detail: '带人把蛙群赶回田外；失败会踩坏两块正在长的地。'
     }),
     fail: Object.freeze({ witherPlots: 2 }),
-    reward: Object.freeze({ coins: 45, dew: 3 }),
+    reward: Object.freeze({ coins: 45, dew: 3, seeds: Object.freeze({ pea: 1 }) }),
     feed: Object.freeze({
       label: '引水',
       detail: '花 1 露水挖一条引水沟，把蛙群引去别处，稳过。',
@@ -48,7 +48,7 @@ const DEFS = Object.freeze({
       detail: '抢在火势蔓延前清出隔离带；失败会烧掉两块成熟作物。'
     }),
     fail: Object.freeze({ witherPlots: 2, matureOnly: true }),
-    reward: Object.freeze({ coins: 55, dew: 4 }),
+    reward: Object.freeze({ coins: 55, dew: 4, seeds: Object.freeze({ watermelon: 1 }) }),
     feed: Object.freeze({
       label: '浇水',
       detail: '花 2 露水把火头浇灭，稳过。',
@@ -69,7 +69,7 @@ const DEFS = Object.freeze({
       detail: '按守卫成功率赌一把；失败会被搬走 5 个仓库作物。'
     }),
     fail: Object.freeze({ crops: 5 }),
-    reward: Object.freeze({ coins: 70, dew: 5 }),
+    reward: Object.freeze({ coins: 70, dew: 5, seeds: Object.freeze({ rice: 1 }) }),
     feed: Object.freeze({
       label: '投喂',
       detail: '交出 3 个仓库作物，换 1 颗稻种 + 2 露水，稳过。',
@@ -90,7 +90,7 @@ const DEFS = Object.freeze({
       detail: '把巨鹿挡在田外；失败会冻住三块地，换季前不解冻就会冻死。'
     }),
     fail: Object.freeze({ freezePlots: 3 }),
-    reward: Object.freeze({ coins: 65, dew: 6 }),
+    reward: Object.freeze({ coins: 65, dew: 6, seeds: Object.freeze({ radish: 1 }) }),
     feed: Object.freeze({
       label: '生火',
       detail: '花 2 露水 + 10 硬币点起大火堆，把它引走，稳过。',
@@ -314,7 +314,7 @@ export const OMEN_ID = DEFS.autumn.id
 export const OMEN_SEASON = DEFS.autumn.season
 export const OMEN_NAME = DEFS.autumn.name
 export const OMEN_EMOJI = DEFS.autumn.emoji
-export const OMEN_GUARD_REWARD = Object.freeze({ coins: 70, dew: 5 })
+export const OMEN_GUARD_REWARD = Object.freeze({ coins: 70, dew: 5, seeds: Object.freeze({ rice: 1 }) })
 export const OMEN_FEED_COST = 3
 export const OMEN_FEED_REWARD = Object.freeze({ coins: 0, dew: 2, seeds: Object.freeze({ rice: 1 }) })
 export const OMEN_FAIL_LOSS = 5
