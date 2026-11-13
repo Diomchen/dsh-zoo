@@ -18,6 +18,10 @@ export const HOUR_MS = 60 * MINUTE_MS
  * 经济形状：越久越长的那一档**每小时毛收更低**，但点一次管更久、种子更贵——
  * 短作物刷得勤，长作物适合睡前种。四季作物的季节归属在 `season-rules.js`，
  * 这里只管数值；旧六种一个字段都没动。
+ *
+ * 四季作物的底价故意高于同档常驻作物：它们只能在当季种，若净收益还输给
+ * 草莓/番茄，“当季”就只剩限制、没有优势。底价改动要同步 `desktop/shared.js`
+ * 的 `CROP_BASE_PRICE`、`desktop/farm-view.js` 的 `BUILTIN_META` 和 README 表。
  */
 export const BUILTIN_CROPS = Object.freeze({
   pea: Object.freeze({
@@ -26,7 +30,7 @@ export const BUILTIN_CROPS = Object.freeze({
     growMs: 25 * MINUTE_MS,
     seedPrice: 6,
     yield: 3,
-    base: 4
+    base: 6
   }),
   tomato: Object.freeze({
     id: 'tomato',
@@ -50,7 +54,7 @@ export const BUILTIN_CROPS = Object.freeze({
     growMs: 90 * MINUTE_MS,
     seedPrice: 10,
     yield: 6,
-    base: 4
+    base: 8
   }),
   carrot: Object.freeze({
     id: 'carrot',
@@ -66,7 +70,7 @@ export const BUILTIN_CROPS = Object.freeze({
     growMs: 3 * HOUR_MS,
     seedPrice: 18,
     yield: 10,
-    base: 4
+    base: 10
   }),
   corn: Object.freeze({
     id: 'corn',
@@ -82,7 +86,7 @@ export const BUILTIN_CROPS = Object.freeze({
     growMs: 6 * HOUR_MS,
     seedPrice: 30,
     yield: 8,
-    base: 10
+    base: 24
   }),
   pumpkin: Object.freeze({
     id: 'pumpkin',

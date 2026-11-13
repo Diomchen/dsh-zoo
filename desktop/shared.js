@@ -306,7 +306,7 @@
    * 交易所（ticket 41）的窄口：底价表与 `src/farm-rules.js` 同源；
    * 价格夹在 [base×0.5, base×2]，成交历史最多 50 条进窗口。
    */
-  const CROP_BASE_PRICE = { pea: 4, tomato: 5, strawberry: 7, radish: 4, carrot: 6, rice: 4, corn: 9, watermelon: 10, pumpkin: 30, grape: 24 }
+  const CROP_BASE_PRICE = { pea: 6, tomato: 5, strawberry: 7, radish: 8, carrot: 6, rice: 10, corn: 9, watermelon: 24, pumpkin: 30, grape: 24 }
   /** 目录上限：与 `src/crop-catalog.js` 的 MAX_CROPS 同源（drift 测试会读）。 */
   const MAX_FARM_CROPS = 64
   const MAX_CROP_NAME = 16
