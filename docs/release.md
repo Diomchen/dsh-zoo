@@ -1,5 +1,16 @@
 # 发布与上架 dsh-market
 
+## 1.6.0 版本记录
+
+GitHub Release 用的简版文案：[`releases/1.6.0.md`](releases/1.6.0.md)。
+
+**四季来客 + 冻住/解冻**
+
+- 春蛙雨、夏野火、秋熊獾、冬巨鹿全部上线；每位来客随机出现 3 小时，窗口外不显示。
+- 破坏力提高：蛙雨/野火枯萎 2 块，熊獾失败 5 个作物，巨鹿失败冻 3 块；忽略按表减半。
+- 冬季冻住地块可花 2 露水 + 5 硬币解冻；换季未解冻转枯萎。
+- 新增 `farm-thaw` 动作、`frozen` 阶段、`freeze/thaw` 日志、ADR-0023；README/CONTEXT 更新。
+
 ## 1.5.1 版本记录
 
 GitHub Release 用的简版文案：[`releases/1.5.1.md`](releases/1.5.1.md)。

@@ -77,19 +77,19 @@ test('omenView：窗口前/窗口内/窗口后，remainingMs 与 active 正确',
   assert.equal(omenView(null), null)
 })
 
-test('守夜：低于守卫值成功，奖励硬币/露水；高于则失败搬 3 个作物', () => {
+test('守夜：低于守卫值成功，奖励硬币/露水；高于则失败搬 5 个作物', () => {
   const omen = freshOmen(AUTUMN)
   const now = omen.start + HOUR_MS
   const success = resolveOmen('guard', { guard: 0.3, random: () => 0.1, now, omen })
   assert.equal(success.ok, true)
   assert.equal(success.success, true)
-  assert.deepEqual(success.loss, { crops: 0, witherPlots: 0, matureOnly: false })
+  assert.deepEqual(success.loss, { crops: 0, witherPlots: 0, freezePlots: 0, matureOnly: false })
   assert.deepEqual(success.reward, { coins: 40, dew: 3, seeds: {} })
 
   const fail = resolveOmen('guard', { guard: 0.3, random: () => 0.9, now, omen })
   assert.equal(fail.ok, true)
   assert.equal(fail.success, false)
-  assert.deepEqual(fail.loss, { crops: 3, witherPlots: 0, matureOnly: false })
+  assert.deepEqual(fail.loss, { crops: 5, witherPlots: 0, freezePlots: 0, matureOnly: false })
   assert.equal(fail.reward.coins, 0)
   assert.equal(fail.reward.dew, 0)
 })
@@ -99,7 +99,7 @@ test('投喂：稳过，扣 3 个仓库作物，换 1 颗稻种 + 2 露水', () 
   const result = resolveOmen('feed', { now: omen.start + 1, omen })
   assert.equal(result.ok, true)
   assert.equal(result.success, true)
-  assert.deepEqual(result.loss, { crops: 0, witherPlots: 0, matureOnly: false })
+  assert.deepEqual(result.loss, { crops: 0, witherPlots: 0, freezePlots: 0, matureOnly: false })
   assert.deepEqual(result.consume, { crops: 3, dew: 0, coins: 0 })
   assert.equal(result.reward.dew, 2)
   assert.equal(result.reward.seeds.rice, 1)
@@ -121,15 +121,16 @@ test('窗口外不能结算；坏选择被拒绝', () => {
 test('四季赌注：蛙雨引水、野火只烧成熟、巨鹿生火要露水+硬币', () => {
   const spring = omenFor('spring')
   assert.deepEqual(spring.stakes.feedCost, { crops: 0, dew: 1, coins: 0 })
-  assert.deepEqual(spring.stakes.ignoreLoss, { crops: 0, witherPlots: 1, matureOnly: false })
+  assert.deepEqual(spring.stakes.ignoreLoss, { crops: 0, witherPlots: 1, freezePlots: 0, matureOnly: false })
   assert.equal(spring.choices.find((choice) => choice.id === 'guard').label, '赶走')
 
   const summer = omenFor('summer')
-  assert.equal(summer.stakes.failWither, 1)
+  assert.equal(summer.stakes.failWither, 2)
   assert.equal(summer.stakes.failMatureOnly, true)
 
   const winter = omenFor('winter')
   assert.deepEqual(winter.stakes.feedCost, { crops: 0, dew: 2, coins: 10 })
-  assert.equal(winter.stakes.failWither, 2)
+  assert.equal(winter.stakes.failWither, 0)
+  assert.equal(winter.stakes.failFreeze, 3)
   assert.equal(winter.choices.find((choice) => choice.id === 'feed').label, '生火')
 })

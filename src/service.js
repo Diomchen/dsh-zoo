@@ -1012,6 +1012,7 @@ export function createService (ctx, options = {}) {
     // 防止窗口停了一夜后拿旧卡片领新一天的奖励。
     if (action === 'farm-event-claim') return claimFarmEvent(body)
     if (action === 'farm-omen-resolve') return resolveFarmOmen(body)
+    if (action === 'farm-thaw') return thawFarmPlot(body?.plotId)
 
     // 农场小窗（ticket 40/46）：菜单「农场」是对开/关的同一入口；`farm-close` 给 HTTP/脚本。
     // 数据由宿主算好（窗口是 file:// 页面，读不到 /state），失败必须回人话。
@@ -1415,6 +1416,19 @@ export function createService (ctx, options = {}) {
     }
   }
 
+  async function thawFarmPlot (rawPlotId) {
+    if (farm === null) return seasonActionError('starting')
+    const result = await farm.thaw(rawPlotId)
+    if (result?.ok === true) {
+      refreshFarmWindow()
+      return {
+        ...result,
+        notice: '火堆烤了一会儿，这块地化开了；作物还在，继续长。'
+      }
+    }
+    return seasonActionError(result?.error ?? 'bad-plot')
+  }
+
   async function resolveFarmOmen (body) {
     if (farm === null || season === null) return seasonActionError('starting')
     const now = seasonNow()
@@ -1473,6 +1487,7 @@ export function createService (ctx, options = {}) {
     const outcome = resolved.outcome
     let lost = 0
     let withered = 0
+    let frozen = 0
     const loss = outcome.loss ?? {}
     if (loss.crops > 0) {
       const crops = await farm.takeCrops(loss.crops, { allowPartial: true })
@@ -1482,9 +1497,14 @@ export function createService (ctx, options = {}) {
       const plots = await farm.witherPlots(loss.witherPlots, { matureOnly: loss.matureOnly === true })
       if (plots.ok) withered = plots.qty
     }
-    // 没有可枯萎的地（或野火没烧到成熟作物）时，保底扣 1 个仓库作物，
+    if (loss.freezePlots > 0) {
+      const plots = await farm.freezePlots(loss.freezePlots, { matureOnly: loss.matureOnly === true })
+      if (plots.ok) frozen = plots.qty
+    }
+    // 没有可枯萎/冻住的地（或野火没烧到成熟作物）时，保底扣 1 个仓库作物，
     // 避免四季来客失败变成“什么都没发生”。
-    if (lost === 0 && withered === 0 && (outcome.loss?.crops > 0 || outcome.loss?.witherPlots > 0)) {
+    if (lost === 0 && withered === 0 && frozen === 0 &&
+      (outcome.loss?.crops > 0 || outcome.loss?.witherPlots > 0 || outcome.loss?.freezePlots > 0)) {
       const fallback = await farm.takeCrops(1, { allowPartial: true })
       if (fallback.ok) lost = fallback.qty
     }
@@ -1498,12 +1518,13 @@ export function createService (ctx, options = {}) {
       success: outcome.success,
       loss: lost,
       wither: withered,
+      freeze: frozen,
       who: omen.name
     })
     refreshFarmWindow()
 
     const rewardText = omenRewardText(outcome.reward)
-    const lossText = omenLossText(lost, withered)
+    const lossText = omenLossText(lost, withered, frozen)
     const notice = choice === 'feed'
       ? omen.name + '离开了' + (rewardText === '' ? '。' : '：' + rewardText + '。')
       : outcome.success
@@ -1513,7 +1534,7 @@ export function createService (ctx, options = {}) {
       ok: true,
       action: 'farm-omen-resolve',
       omen: season.view(now).omen,
-      outcome: { ...outcome, loss: lost, wither: withered },
+      outcome: { ...outcome, loss: lost, wither: withered, freeze: frozen },
       notice
     }
   }
@@ -1528,10 +1549,11 @@ export function createService (ctx, options = {}) {
     return parts.join(' ')
   }
 
-  function omenLossText (lost, withered) {
+  function omenLossText (lost, withered, frozen = 0) {
     const parts = []
     if (lost > 0) parts.push('被拿走 ' + lost + ' 个作物')
     if (withered > 0) parts.push(withered + ' 块地枯萎')
+    if (frozen > 0) parts.push(frozen + ' 块地冻住')
     return parts.join('，')
   }
 
@@ -1776,7 +1798,8 @@ export function createService (ctx, options = {}) {
         mature: isMature(plot),
         remainingMs: plotRemainingMs(plot),
         waterings: Number(plot.waterings) >= 1 ? 1 : 0,
-        fertilized: plot.fertilized === true
+        fertilized: plot.fertilized === true,
+        ...(plot.frozen === true ? { frozen: true } : {})
       })),
       seeds: stacks(view.seeds),
       crops: stacks(view.crops),
@@ -5209,9 +5232,10 @@ export function createService (ctx, options = {}) {
     const unresolved = result.unresolvedOmen
     if (unresolved === null) return
     const name = unresolved.meta?.name ?? '来客'
-    const loss = unresolved.meta?.stakes?.ignoreLoss ?? { crops: 1, witherPlots: 0 }
+    const loss = unresolved.meta?.stakes?.ignoreLoss ?? { crops: 1, witherPlots: 0, freezePlots: 0 }
     let lost = 0
     let withered = 0
+    let frozen = 0
     if (farm !== null) {
       if (loss.crops > 0) {
         const taken = await farm.takeCrops(loss.crops, { allowPartial: true })
@@ -5221,13 +5245,17 @@ export function createService (ctx, options = {}) {
         const plots = await farm.witherPlots(loss.witherPlots)
         if (plots.ok) withered = plots.qty
       }
-      if (lost === 0 && withered === 0) {
+      if (loss.freezePlots > 0) {
+        const plots = await farm.freezePlots(loss.freezePlots)
+        if (plots.ok) frozen = plots.qty
+      }
+      if (lost === 0 && withered === 0 && frozen === 0) {
         const fallback = await farm.takeCrops(1, { allowPartial: true })
         if (fallback.ok) lost = fallback.qty
       }
-      await farm.noteOmen({ choice: 'ignore', success: false, loss: lost, wither: withered, who: name })
+      await farm.noteOmen({ choice: 'ignore', success: false, loss: lost, wither: withered, freeze: frozen, who: name })
     }
-    log?.info?.(name + '没被处理，离开了（作物 -' + lost + '，地块枯萎 ' + withered + '）')
+    log?.info?.(name + '没被处理，离开了（作物 -' + lost + '，地块枯萎 ' + withered + '，地块冻住 ' + frozen + '）')
     refreshFarmWindow()
   }
 

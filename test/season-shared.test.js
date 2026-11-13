@@ -89,6 +89,22 @@ test('normalizeFarmPlot：枯萎只认布尔或 stage，并且不再有成熟/�
   assert.equal(normal.withered, undefined)
 })
 
+test('normalizeFarmPlot：冻住只认布尔或 stage，不再有成熟/倒计时', () => {
+  const byStage = shared.normalizeFarmPlot({ id: 'p1', crop: 'radish', stage: 'frozen' })
+  assert.equal(byStage.stage, 'frozen')
+  assert.equal(byStage.frozen, true)
+  assert.equal(byStage.mature, false)
+  assert.equal(byStage.remainingMs, 0)
+
+  const byFlag = shared.normalizeFarmPlot({ id: 'p2', crop: 'radish', stage: 'growing', frozen: true, remainingMs: 5000 })
+  assert.equal(byFlag.stage, 'frozen')
+  assert.equal(byFlag.frozen, true)
+
+  const normal = shared.normalizeFarmPlot({ id: 'p3', crop: 'tomato', stage: 'growing', grownMs: 0, growMs: 1000, remainingMs: 1000 })
+  assert.equal(normal.stage, 'growing')
+  assert.equal(normal.frozen, undefined)
+})
+
 test('normalizeFarm 带上 season，且日志里的 omen 字段不被削掉', () => {
   const farm = shared.normalizeFarm({
     plots: [{ id: 'p1', crop: null, stage: 'empty' }],
@@ -132,15 +148,22 @@ test('normalizeHelperEvent：helper 回宿主的 action 不能把 choice/expecte
   assert.equal(omen.ok, true)
   assert.equal(omen.event.choice, 'guard')
   assert.equal(omen.event.expectedStart, 1000)
+
+  const thaw = shared.normalizeHelperEvent({
+    type: 'action', id: 'farm-3-3', action: 'farm-thaw', plotId: 'p2'
+  })
+  assert.equal(thaw.ok, true)
+  assert.equal(thaw.event.plotId, 'p2')
 })
 
 test('白名单/阶段/日志种类把季节新增项都收进来', () => {
-  for (const action of ['farm-event-claim', 'farm-omen-resolve']) {
+  for (const action of ['farm-event-claim', 'farm-omen-resolve', 'farm-thaw']) {
     assert.equal(shared.FARM_ACTIONS.includes(action), true, action)
     assert.equal(shared.DESKTOP_ACTIONS.includes(action), true, action)
   }
   assert.equal(shared.FARM_STAGES.includes('withered'), true)
-  for (const kind of ['season', 'event', 'wither', 'omen']) {
+  assert.equal(shared.FARM_STAGES.includes('frozen'), true)
+  for (const kind of ['season', 'event', 'wither', 'freeze', 'thaw', 'omen']) {
     assert.equal(shared.FARM_LOG_KINDS.includes(kind), true, kind)
   }
 })

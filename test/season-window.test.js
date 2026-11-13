@@ -91,7 +91,7 @@ test('state.farm.season：秋天有日历、节日和熊獾，形状与 SPEC v8 
   assert.deepEqual(season.event.reward, { coins: 50, dew: 4 })
   assert.equal(season.omen.id, 'autumn-bearger')
   assert.equal(season.omen.resolved, false)
-  assert.equal(season.omen.stakes.failLoss, 3)
+  assert.equal(season.omen.stakes.failLoss, 5)
   assert.equal(season.omen.canFeed, false)
 })
 
@@ -107,12 +107,14 @@ test('state.farm.season：冬天没有熊獾，节日换成围炉节', async (t)
   assert.equal(season.calendar.find((cell) => cell.today).id, 'winter')
 })
 
-test('窗口骨架：季节条、日历、节日卡、来客卡、枯萎卡都在', async () => {
+test('窗口骨架：季节条、日历、节日卡、来客卡、枯萎卡/冻住卡都在', async () => {
   const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
   for (const id of ['season-bar', 'season-calendar', 'season-cards', 'event-card', 'omen-card']) {
     assert.match(html, new RegExp(`id="${id}"`), `farm.html 应该有 #${id}`)
   }
   assert.match(html, /data-stage='withered'/, 'farm.html 应该有枯萎卡样式')
+  assert.match(html, /data-stage='frozen'/, 'farm.html 应该有冻住卡样式')
+  assert.match(html, /chip-btn\.thaw/, 'farm.html 应该有解冻按钮样式')
   assert.match(html, /body\[data-season=/, 'farm.html 应该有季节主题选择器')
   for (const season of ['spring', 'summer', 'autumn', 'winter']) {
     assert.match(html, new RegExp(`body\\[data-season='${season}'\\] \\.season-bar`), `缺少 ${season} 季节主题`)
@@ -126,6 +128,7 @@ test('窗口渲染：季节/来客只在主人模式画，动作窄口只发两�
   assert.match(js, /seasonBarEl\.hidden = false/)
   assert.match(js, /farm-event-claim/)
   assert.match(js, /farm-omen-resolve/)
+  assert.match(js, /'farm-' \+ action/)
   assert.match(js, /choice: action === 'omen-guard' \? 'guard' : 'feed'/)
   assert.match(js, /expectedStart: season\.start/)
 })

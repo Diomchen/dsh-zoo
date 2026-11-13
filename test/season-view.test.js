@@ -119,6 +119,30 @@ test('plotCards：枯萎地显示枯萎、可点重种，没有收获/浇水按�
   assert.deepEqual(card.actions, [])
 })
 
+test('plotCards：冻住的地显示解冻按钮，不能点开重种；资源不够时按钮禁用', () => {
+  const [card] = view.plotCards({
+    dew: 10,
+    coins: 20,
+    plots: [{ id: 'p1', crop: 'radish', stage: 'frozen', mature: false, remainingMs: 0, frozen: true }]
+  }, {})
+  assert.equal(card.stage, 'frozen')
+  assert.equal(card.badge, '冻住了')
+  assert.equal(card.cropName, '白萝卜（冻住）')
+  assert.equal(card.openPlant, false)
+  assert.equal(card.detailText, '生火解冻：2 露水 + 5 硬币')
+  assert.equal(card.actions.length, 1)
+  assert.equal(card.actions[0].action, 'thaw')
+  assert.equal(card.actions[0].disabled, false)
+
+  const [poor] = view.plotCards({
+    dew: 0,
+    coins: 20,
+    plots: [{ id: 'p1', crop: 'radish', stage: 'frozen', mature: false, remainingMs: 0, frozen: true }]
+  }, {})
+  assert.equal(poor.actions[0].disabled, true)
+  assert.match(poor.actions[0].reason, /露水不够/)
+})
+
 test('batchPlantTargets：枯萎地和空地都能补种，但错季四季种子不排进队列', () => {
   const spring = view.batchPlantTargets({
     season: { id: 'spring' },

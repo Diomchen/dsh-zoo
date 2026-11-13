@@ -10,6 +10,7 @@ import {
   MAX_PLOTS,
   PLOT_UNLOCK_RESERVE,
   START_PLOTS,
+  THAW_COST,
   WATER_COST,
   advanceDew,
   advanceGrowth,
@@ -121,7 +122,7 @@ export const MAX_PLOT_VISITORS = 50
 /** 每日访客计数最多记多少位访客；超出的按最旧丢（内存/文件都有界）。 */
 export const MAX_VISIT_STATS_VISITORS = 64
 
-const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'season', 'event', 'omen'])
+const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'freeze', 'thaw', 'season', 'event', 'omen'])
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const WHO_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
 
@@ -514,6 +515,14 @@ function normalizePlot (value) {
     else repaired += 1
   }
 
+  // 票 75：冻住的地保留作物，但要生火解冻；解冻前不能收/浇/施肥/重种。
+  let frozen = false
+  if (value.frozen !== undefined) {
+    if (typeof value.frozen === 'boolean') frozen = value.frozen
+    else repaired += 1
+  }
+  const frozenAt = frozen ? (normalizeTimestamp(value.frozenAt) ?? 0) : null
+
   const stolen = normalizeIdList(value.stolenBy)
   const helped = normalizeIdList(value.helpedBy)
   repaired += stolen.repaired + helped.repaired
@@ -528,6 +537,7 @@ function normalizePlot (value) {
       waterings,
       fertilized,
       ...(withered ? { withered: true } : {}),
+      ...(frozen ? { frozen: true, frozenAt: frozenAt ?? 0 } : {}),
       stolenBy: stolen.ids,
       helpedBy: helped.ids
     },
@@ -581,6 +591,8 @@ function normalizeLogEntry (value) {
   // ticket 48：unlock 日志带 plot（第 n 块地）与 cost（花了多少硬币）；只保留能显示的数字。
   const cost = finiteNumber(value.cost)
   const plot = finiteNumber(value.plot)
+  const wither = finiteNumber(value.wither)
+  const freeze = finiteNumber(value.freeze)
   return {
     at,
     kind: value.kind,
@@ -591,7 +603,9 @@ function normalizeLogEntry (value) {
     ...(wage === null ? {} : { wage: Math.min(MAX_COINS, Math.max(0, Math.floor(wage))) }),
     ...(earned === null ? {} : { earned: Math.min(MAX_COINS, Math.max(0, Math.floor(earned))) }),
     ...(cost === null ? {} : { cost: Math.min(MAX_COINS, Math.max(0, Math.floor(cost))) }),
-    ...(plot === null ? {} : { plot: Math.min(MAX_PLOTS, Math.max(1, Math.floor(plot))) })
+    ...(plot === null ? {} : { plot: Math.min(MAX_PLOTS, Math.max(1, Math.floor(plot))) }),
+    ...(wither === null ? {} : { wither: Math.min(MAX_PLOTS, Math.max(0, Math.floor(wither))) }),
+    ...(freeze === null ? {} : { freeze: Math.min(MAX_PLOTS, Math.max(0, Math.floor(freeze))) })
   }
 }
 
@@ -944,6 +958,19 @@ class FarmStore {
     return this.#enqueue(() => this.#witherPlots(qty, options))
   }
 
+  /**
+   * 票 75：冬季巨鹿把地块冻住。作物还在，但停止生长，必须先解冻；
+   * 到换季还没解冻就会冻死成枯萎。优先冻正在长的地，再冻成熟的地。
+   */
+  freezePlots (qty = 1, options = {}) {
+    return this.#enqueue(() => this.#freezePlots(qty, options))
+  }
+
+  /** 票 75：生火解冻一块地，扣露水 + 硬币；作物保留，继续长。 */
+  thaw (plotId) {
+    return this.#enqueue(() => this.#thaw(plotId))
+  }
+
   /** 票 67：来客结果只写一条日志，钱/作物由 service 按结果结算。 */
   noteOmen (result) {
     return this.#enqueue(() => this.#noteOmen(result))
@@ -1048,7 +1075,18 @@ class FarmStore {
     const sinceMs = Number.isFinite(Number(since)) ? Number(since) : now
     let count = 0
     this.#state.plots = this.#state.plots.map((plot) => {
-      if (plot === null || typeof plot !== 'object' || plot.withered === true) return plot
+      if (plot === null || typeof plot !== 'object') return plot
+      if (plot.frozen === true) {
+        const frozenAt = Number(plot.frozenAt)
+        const frozenSeason = Number.isFinite(frozenAt) ? seasonAt(frozenAt)?.id ?? null : null
+        if (frozenSeason !== null && frozenSeason !== current) {
+          count += 1
+          const { frozen, frozenAt: _frozenAt, ...rest } = plot
+          return { ...rest, withered: true }
+        }
+        return plot
+      }
+      if (plot.withered === true) return plot
       if (!isCropId(plot.crop) || isMature(plot)) return plot
       const required = cropSeason(plot.crop)
       if (required === null) return plot
@@ -1155,7 +1193,8 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
-    // 票 66：枯萎的地可以直接重种（旧作物没收成，也不退种子）。
+    // 票 75：冻住的地先解冻；枯萎的地可以直接重种（旧作物没收成，也不退种子）。
+    if (plot?.frozen === true) return farmError('frozen')
     if (plot === undefined || (plot.crop !== null && plot.withered !== true)) {
       return farmError('plot-occupied')
     }
@@ -1214,6 +1253,7 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
+    if (plot?.frozen === true) return farmError('frozen')
     if (plot?.withered === true) return farmError('withered')
     if (plot === undefined || !isCropId(plot.crop) || !isMature(plot)) {
       return farmError('not-mature')
@@ -1253,7 +1293,8 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
-    // 空地/成熟地没有可浇的生长；不把露水浪费在一个不会发生的变化上。
+    // 空地/成熟地没有可浇的生长；冻住的地要先解冻。
+    if (plot?.frozen === true) return farmError('frozen')
     if (plot?.withered === true) return farmError('withered')
     if (plot === undefined || !isCropId(plot.crop) || isMature(plot)) return farmError('bad-plot')
     if (Number(plot.waterings) >= 1) return farmError('already-watered')
@@ -1290,6 +1331,7 @@ class FarmStore {
     const index = this.#plotIndex(plotId)
     if (index < 0) return farmError('bad-plot')
     const plot = this.#state.plots[index]
+    if (plot?.frozen === true) return farmError('frozen')
     if (plot?.withered === true) return farmError('withered')
     if (plot === undefined || !isCropId(plot.crop)) return farmError('bad-plot')
     if (plot.fertilized === true) return farmError('already-fertilized')
@@ -1577,6 +1619,73 @@ class FarmStore {
     }
   }
 
+  async #freezePlots (rawQty, options = {}) {
+    const qty = positiveInt(rawQty, MAX_PLOTS)
+    if (qty === null) return farmError('bad-qty')
+    const matureOnly = options?.matureOnly === true
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const candidates = []
+    this.#state.plots.forEach((plot, index) => {
+      if (plot === null || typeof plot !== 'object') return
+      if (plot.withered === true || plot.frozen === true) return
+      if (!isCropId(plot.crop)) return
+      if (matureOnly && !isMature(plot)) return
+      candidates.push({ index, plot, mature: isMature(plot) ? 1 : 0 })
+    })
+    candidates.sort((a, b) => a.mature - b.mature || a.index - b.index)
+    const chosen = candidates.slice(0, qty)
+    for (const { plot } of chosen) {
+      plot.frozen = true
+      plot.frozenAt = now
+    }
+    if (chosen.length > 0) this.#appendLog({ at: now, kind: 'freeze', qty: chosen.length })
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'freeze-plots',
+      qty: chosen.length,
+      plots: chosen.map(({ plot }) => plot.id),
+      persisted
+    }
+  }
+
+  async #thaw (rawPlotId) {
+    const plotId = normalizePlotId(rawPlotId)
+    if (plotId === null) return farmError('bad-plot')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
+    const plot = this.#state.plots[index]
+    if (plot?.frozen !== true) return farmError('not-frozen')
+    if (this.#state.dew < THAW_COST.dew) return farmError('no-dew')
+    if (this.#state.coins < THAW_COST.coins) return farmError('no-coins')
+
+    const { frozen, frozenAt: _frozenAt, ...thawed } = plot
+    this.#state.plots[index] = thawed
+    this.#state.dew -= THAW_COST.dew
+    this.#state.coins -= THAW_COST.coins
+    this.#appendLog({ at: now, kind: 'thaw', qty: 1 })
+    this.#resetIdle(now)
+
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'thaw',
+      plotId,
+      plot: copyPlot(thawed),
+      cost: { ...THAW_COST },
+      coins: this.#state.coins,
+      dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
+      persisted
+    }
+  }
+
   async #noteOmen (raw) {
     const now = this.#nowMs()
     this.#advance(now)
@@ -1588,7 +1697,8 @@ class FarmStore {
         : 'guard',
       success: raw?.success === true,
       qty: Math.max(0, Math.min(MAX_STACK, Math.trunc(Number(raw?.loss) || 0))),
-      wither: Math.max(0, Math.min(MAX_PLOTS, Math.trunc(Number(raw?.wither) || 0)))
+      wither: Math.max(0, Math.min(MAX_PLOTS, Math.trunc(Number(raw?.wither) || 0))),
+      freeze: Math.max(0, Math.min(MAX_PLOTS, Math.trunc(Number(raw?.freeze) || 0)))
     }
     if (typeof raw?.who === 'string' && raw.who.trim() !== '') entry.who = raw.who.trim().slice(0, 32)
     this.#appendLog(entry)

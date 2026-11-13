@@ -369,8 +369,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   内容区自己滚动。农场窗**默认不置顶**（右上角图钉可切换；选择记在
   `userData/farm-window.json`，下次开窗沿用）。桌面宠物本体仍保持置顶。
   header 是「我的农场 / X/Y 已种植 / 🪙·💧 胶囊 / 📌 / ×」，header 下面是四季日历
-  （`#season-bar` / `#season-calendar`）和当天的节日卡（`#event-card`；秋天还会多一张
-  主人专属的熊獾卡 `#omen-card`）。再下面是 4 段页签、农场页专属的
+  （`#season-bar` / `#season-calendar`）和当天的节日卡（`#event-card`；来客窗口内还会多一张
+  主人专属的来客卡 `#omen-card`）。再下面是 4 段页签、农场页专属的
   「一键种满 · 一键收割」行、可滚动内容区和常驻 footer（种子背包 / 收获仓库）。
 - **雇工挂牌（ticket 44）**：`contracts.listings[]` 带 `expiresAt`——宿主按**本机收到行情**
   的时刻 + `peerLostMs` 算（默认 120 秒 = 4 个 30 秒广播），不是邻居的墙上时钟。
@@ -387,14 +387,16 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 - **地块卡**：空地显示「＋ 种植」，整张卡点开播种底部弹窗；生长中显示倒计时、进度条和
   浇水/施肥；成熟轻微弹跳并给收获/施肥。枯萎卡 `data-stage="withered"`，角标「枯萎」，
   详情「换季了，这株没来得及熟，重种一株吧」，操作只留「＋ 重种」（发 `farm-plant`）。
+  冻住卡 `data-stage="frozen"`，角标「冻住了」，详情「生火解冻：2 露水 + 5 硬币」，
+  操作只留「解冻」（发 `farm-thaw`，带 `plotId`）。
   动作 id 仍是 `farm-plant` / `farm-harvest` /
-  `farm-water` / `farm-fertilize`，`plotId` / `cropId` 的窄口不变。
+  `farm-water` / `farm-fertilize` / `farm-thaw`，`plotId` / `cropId` 的窄口不变。
 - **播种弹窗**：十种种子的库存、生长时长、产量；库存 0 禁用，错季四季种子也禁用并写
   「下季才有」；「去交易所买种」只切页签，
   没有随机买种。批量：一键种满 = 按空地与种子库存逐块种下（种子用完即停）；一键收割 = 所有成熟
   地块按顺序逐条发 `farm-harvest`，busy 守卫 + 逐条 toast，不新增宿主动作。
 - **作物外观（ticket 58 / 64）**：不再用 emoji，改成包内自带的 `desktop/crops/<id>.svg`
-  （十个：六种常驻 + 豌豆/西瓜/稻米/白萝卜；四季四种是占位图）。`desktop/farm-view.js` 的 `CROP_META`
+  （十个：六种常驻 + 豌豆/西瓜/稻米/白萝卜，四季四种是手绘扁平矢量）。`desktop/farm-view.js` 的 `CROP_META`
   同时带 `art` 和 `emoji`：有图渲染 `<img class="crop-art-img">`，没图（空地、旧邻居
   传来的未知作物、将来漏放的作物）退回 emoji。图外面仍套 `.crop-emoji` / `.seed-emoji`
   那个盒子，所以字号、阶段滤镜和布局都不用改；尺寸按 `1.2em` 走，只有地块卡单独钉 26px。
@@ -428,9 +430,12 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   四格 `#season-calendar` 用 `calendar[]` 的 `today/past` 上色，最后一格旁边写
   「距入冬 8 小时 12 分」，最后 4 小时加 `is-almost` 并提示未熟四季作物会枯萎。
   `#event-card` 每个季节都有，显示目标/进度/奖励/领取；`#omen-card` 只在 `mode === 'owner'`
-  且有 `season.omen` 时画，访客/看田强制隐藏。`body[data-season]` 只换强调色和背景渐变，
+  且来客窗口 `active === true` 时画，访客/看田强制隐藏。来客卡显示随机窗口剩余时间、
+  守卫/安抚两个选择的代价与失败损失；窗口外宿主把 `season.omen` 置空。
+  `body[data-season]` 只换强调色和背景渐变，
   不重排布局。换季时宿主会在下一帧推新 `season`，窗口重画并 toast「秋天到了 · 丰收祭」。
-- 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize`
+- 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize` /
+  `farm-thaw`
   （只带 `plotId`，种地再带 `cropId`）；解锁 `farm-unlock`（只带可选的
   `expectedUnlocked`，4–50 的乐观锁，价格由宿主算）；交易所 `farm-buy-seed` /
   `farm-sell-crop`（只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /

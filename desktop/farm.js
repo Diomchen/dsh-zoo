@@ -112,6 +112,9 @@ const RESULT_CODE_TEXT = {
   stale: '农场刚刚变过，刷新后再试。',
   'out-of-season': '这个季节种不了它，下季再来吧。',
   withered: '换季了，这株没来得及熟，重种一株吧。',
+  frozen: '这块地冻住了，先生火解冻。',
+  'not-frozen': '这块地没有冻住。',
+  'omen-inactive': '这位来客已经走了，下次来早点。',
   'stale-season': '节日/来客已经换了一天，刷新后再试。',
   'event-inactive': '今天没有可领的节日。',
   'event-not-ready': '节日任务还没完成，再忙一会儿。',
@@ -143,6 +146,8 @@ const LOG_TEXT = {
   season: '换季',
   event: '节日',
   wither: '枯萎',
+  freeze: '冻住',
+  thaw: '解冻',
   omen: '来客'
 }
 const MARKET_SIDE_TEXT = { buy: '买种', sell: '卖出' }
@@ -906,9 +911,14 @@ function renderLog () {
         (Number.isFinite(dew) && dew > 0 ? ' · +' + dew + ' 露水' : '')
     } else if (entry.kind === 'wither') {
       text.textContent = '换季枯萎了 ' + (Number(entry.qty) || 1) + ' 株四季作物'
+    } else if (entry.kind === 'freeze') {
+      text.textContent = '冻住了 ' + (Number(entry.qty) || 1) + ' 块地，要生火解冻'
+    } else if (entry.kind === 'thaw') {
+      text.textContent = '生火解冻了一块地'
     } else if (entry.kind === 'omen') {
       const lost = Number(entry.qty) || 0
       const wither = Number(entry.wither) || 0
+      const freeze = Number(entry.freeze) || 0
       const name = who === '' ? '来客' : who
       const choice = entry.choice === 'feed'
         ? '安抚了' + name
@@ -916,6 +926,7 @@ function renderLog () {
       const damage = []
       if (lost > 0) damage.push('被拿走 ' + lost + ' 个作物')
       if (wither > 0) damage.push(wither + ' 块地枯萎')
+      if (freeze > 0) damage.push(freeze + ' 块地冻住')
       text.textContent = choice +
         (entry.success === true ? '，平安过关' : damage.length > 0 ? '，' + damage.join('，') : '，没有损失')
     } else if (entry.kind === 'steal' && Number(entry.qty) === 0) {
