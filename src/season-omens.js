@@ -3,7 +3,8 @@
  *
  * 不碰存档、不碰窗口：只回答「这个选择成不成、扣多少、给什么」。
  * 概率复用农场的守卫值（主人在家 0.3、雇工 0.5、封顶 0.8），
- * 但来客不是偷菜：守卫成功 = 偷菜判定失败。
+ * 来客窗口里还可以临时雇 1～2 名守卫：每名 +0.5，最高 1.0。
+ * 来客不是偷菜：守卫成功 = 偷菜判定失败。
  *
  * 票 74 起四季各有一位来客；蛙雨/野火在当天随机一个整分钟出现，熊獾/巨鹿固定在
  * 本地 15:00 出现，二者都持续 3 小时。这样重启、换窗口、多开都不会让来客时间漂移；
@@ -13,6 +14,9 @@ import { HOUR_MS, MINUTE_MS } from './season-rules.js'
 import { stealSucceeds } from './farm-rules.js'
 
 export const OMEN_WINDOW_MS = 3 * HOUR_MS
+export const GUARD_HIRE_COST = 20
+export const GUARD_HIRE_STEP = 0.5
+export const MAX_TEMP_GUARDS = 2
 
 const DEFS = Object.freeze({
   spring: Object.freeze({
@@ -160,6 +164,7 @@ export function omenFor (seasonId) {
     season: def.season,
     tag: def.tag,
     window: def.window,
+    guardHire: { cost: GUARD_HIRE_COST, step: GUARD_HIRE_STEP, max: MAX_TEMP_GUARDS },
     windowMs: OMEN_WINDOW_MS,
     choices: choicesOf(def),
     stakes: stakesOf(def)
@@ -291,7 +296,7 @@ export function resolveOmen (choice, { guard = 0, random = Math.random, now = nu
     }
   }
 
-  const success = !stealSucceeds(guard, random)
+  const success = !stealSucceeds(guard, random, 1)
   return {
     ok: true,
     choice,

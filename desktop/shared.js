@@ -943,6 +943,15 @@
       choice,
       choices,
       canFeed: raw.canFeed === true,
+      guardBase: Number.isFinite(Number(raw.guardBase)) ? Math.min(1, Math.max(0, Number(raw.guardBase))) : 0,
+      guardOptions: Array.isArray(raw.guardOptions)
+        ? raw.guardOptions.slice(0, 3).map((option) => ({
+          guards: Number.isInteger(Number(option?.guards)) ? Math.min(2, Math.max(0, Number(option.guards))) : 0,
+          chance: Number.isFinite(Number(option?.chance)) ? Math.min(1, Math.max(0, Number(option.chance))) : 0,
+          cost: Number.isFinite(Number(option?.cost)) ? Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(Number(option.cost)))) : 0,
+          affordable: option?.affordable === true
+        }))
+        : [],
       stakes: {
         guardReward,
         failLoss: number(stakes.failLoss, MAX_FARM_STACK),
@@ -1467,7 +1476,10 @@
       if (action === 'farm-event-claim') return { action, expectedStart: Math.floor(expectedStart) }
       const choice = raw.choice === 'guard' || raw.choice === 'feed' ? raw.choice : null
       if (choice === null) return null
-      return { action, choice, expectedStart: Math.floor(expectedStart) }
+      const guards = raw.guards === undefined || raw.guards === null ? 0 : Number(raw.guards)
+      if (!Number.isInteger(guards) || guards < 0 || guards > 2) return null
+      if (choice === 'feed' && guards !== 0) return null
+      return { action, choice, guards, expectedStart: Math.floor(expectedStart) }
     }
     if (FARM_MARKET_ACTIONS.includes(action)) {
       const cropId = normalizeCropId(raw.cropId)

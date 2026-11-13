@@ -23,10 +23,13 @@
   `{crops,dew,coins}` 代价、作物/枯萎/冻住损失和回滚。
 - 桌面 `shared.normalizeSeasonOmen` 校验通用 `choices/stakes`；`farm-view.omenCard`
   动态生成文案和禁用态；`farm.js` 只在 `active` 时画卡。
+- 临时守卫：`omen.guardOptions` 提供 0～2 名选项（每名 20 硬币、+0.5，基础 + 临时封顶 1.0）；
+  `farm-omen-resolve` 可带 `guards`，`feed` 不允许带；费用结算时先扣，失败不退。
 
 ## 验收
 
 - 四位来客在各自季节出现；同一季节重启/重开窗口，窗口起点不变。
 - 窗口外 `season.omen === null`；强行结算返回 `omen-inactive`。
 - 3 小时结束未处理只扣一次忽略损失，日志一条。
+- 临时守卫：无雇工 0/1/2 名为 30/80/100%；雇 2 名扣 40 硬币，100% 时骰子再高也成功；`guards:3` 或 `feed+guards` 被拒。
 - `npm run check` 全绿；`test/season-omens`、`season-store`、`season-e2e` 覆盖。

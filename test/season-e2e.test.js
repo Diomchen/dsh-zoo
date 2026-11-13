@@ -251,6 +251,33 @@ test('omen：守夜失败最多搬 5 个；成功给 70 硬币 + 5 露水', asyn
   assert.equal(after.seeds.rice, 1)
 })
 
+test('临时守卫：雇 2 名花 40 硬币，守卫率 100%，胜利奖励照发', async (t) => {
+  const omen = freshOmen(seasonAt(AUTUMN))
+  const at = omen.start + HOUR_MS
+  const dir = await tempDir(t)
+  await seedFarm(dir, at, { coins: 100 })
+  const service = makeService(t, dir, { farmNow: () => at, farmRandom: () => 0.99 })
+  await service.ready
+
+  const bad = await action(service, {
+    action: 'farm-omen-resolve', choice: 'guard', guards: 3, expectedStart: omen.day
+  })
+  assert.equal(bad.body.ok, false)
+  assert.equal(bad.body.error, 'bad-guards')
+
+  const won = await action(service, {
+    action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: omen.day
+  })
+  assert.equal(won.body.ok, true)
+  assert.equal(won.body.guards, 2)
+  assert.equal(won.body.guardChance, 1)
+  assert.equal(won.body.outcome.success, true)
+  const after = (await state(service)).body.farm
+  assert.equal(after.coins, 130)
+  assert.equal(after.dew, 5)
+  assert.equal(after.seeds.rice, 1)
+})
+
 test('season.json 落盘：领奖后 claimed=true，且 farm.json 版本不变', async (t) => {
   const dir = await tempDir(t)
   const season = seasonAt(AUTUMN)

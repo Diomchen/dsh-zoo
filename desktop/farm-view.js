@@ -407,6 +407,19 @@
     const feedReward = rewardText(stakes.feedReward)
     const guardReward = rewardText(stakes.guardReward)
     const remaining = Number(omen.remainingMs)
+    const guardOptions = (Array.isArray(omen.guardOptions) ? omen.guardOptions : []).map((option) => {
+      const guards = Math.max(0, Math.min(2, Math.floor(Number(option?.guards) || 0)))
+      const chance = Math.min(1, Math.max(0, Number(option?.chance) || 0))
+      const cost = Math.max(0, Math.floor(Number(option?.cost) || 0))
+      return {
+        guards,
+        chance,
+        cost,
+        affordable: option?.affordable !== false,
+        label: (guards === 0 ? '不另雇' : '雇 ' + guards + ' 名') + ' · ' +
+          Math.round(chance * 100) + '%' + (cost > 0 ? ' · ' + cost + ' 硬币' : '')
+      }
+    })
     return {
       id: typeof omen.id === 'string' ? omen.id : '',
       name: typeof omen.name === 'string' ? omen.name : '来客',
@@ -421,6 +434,8 @@
         : active ? '马上就走' : '窗口已关',
       detail: active ? (omen.name + '在田边出现了。') : '它已经离开了。',
       guardText: guardReward === '' ? '守卫成功没有奖励；失败损失 ' + failText + '。' : '守卫成功 ' + guardReward + '；失败损失 ' + failText + '。',
+      guardOptions,
+      guardBase: Number.isFinite(Number(omen.guardBase)) ? Math.min(1, Math.max(0, Number(omen.guardBase))) : 0,
       feedText: cost === '' ? feedChoice.label + '不花资源，稳过。' : feedChoice.label + ' ' + cost + (feedReward === '' ? '，稳过。' : '，换 ' + feedReward + '。'),
       ignoreText: ignoreParts.length === 0 ? '' : '不管它：' + ignoreParts.join(' + ') + '。',
       actions: [
