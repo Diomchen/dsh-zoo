@@ -66,6 +66,9 @@ async function tempDir (t) {
 function makeService (t, options = {}) {
   const { ctx, routes } = fakeCtx()
   const service = createService(ctx, {
+    // 窗口用例不需要 UDP：默认关网，避免临时身份把 beacon 发到正式端 45871，
+    // 在真实街景里留下“inateck-arthur”测试邻居。需要组网的用例显式传 network:true。
+    network: false,
     petBridge: false,
     skinServer: false,
     ...options
