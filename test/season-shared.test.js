@@ -126,8 +126,19 @@ test('normalizeFarmAction：节日/来客必须带 expectedStart，来客还必�
     action: 'farm-event-claim', expectedStart: 1000
   })
   assert.deepEqual(shared.normalizeFarmAction({ action: 'farm-omen-resolve', choice: 'feed', expectedStart: 1000 }), {
-    action: 'farm-omen-resolve', choice: 'feed', expectedStart: 1000
+    action: 'farm-omen-resolve', choice: 'feed', guards: 0, expectedStart: 1000
   })
+  assert.deepEqual(shared.normalizeFarmAction({
+    action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 1000
+  }), {
+    action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 1000
+  })
+  assert.equal(shared.normalizeFarmAction({
+    action: 'farm-omen-resolve', choice: 'guard', guards: 3, expectedStart: 1000
+  }), null)
+  assert.equal(shared.normalizeFarmAction({
+    action: 'farm-omen-resolve', choice: 'feed', guards: 1, expectedStart: 1000
+  }), null)
   assert.equal(shared.normalizeFarmAction({ action: 'farm-event-claim' }), null)
   assert.equal(shared.normalizeFarmAction({ action: 'farm-event-claim', expectedStart: 0 }), null)
   assert.equal(shared.normalizeFarmAction({ action: 'farm-omen-resolve', expectedStart: 1000 }), null)
@@ -143,10 +154,11 @@ test('normalizeHelperEvent：helper 回宿主的 action 不能把 choice/expecte
   assert.equal(claim.event.choice, undefined)
 
   const omen = shared.normalizeHelperEvent({
-    type: 'action', id: 'farm-2-2', action: 'farm-omen-resolve', choice: 'guard', expectedStart: 1000
+    type: 'action', id: 'farm-2-2', action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 1000
   })
   assert.equal(omen.ok, true)
   assert.equal(omen.event.choice, 'guard')
+  assert.equal(omen.event.guards, 2)
   assert.equal(omen.event.expectedStart, 1000)
 
   const thaw = shared.normalizeHelperEvent({
@@ -166,4 +178,20 @@ test('白名单/阶段/日志种类把季节新增项都收进来', () => {
   for (const kind of ['season', 'event', 'wither', 'freeze', 'thaw', 'omen']) {
     assert.equal(shared.FARM_LOG_KINDS.includes(kind), true, kind)
   }
+})
+
+test('normalizeSeason：临时守卫的 base 与 0～2 人选项不被削掉', () => {
+  const raw = validSeason()
+  raw.omen.active = true
+  raw.omen.guardBase = 0.3
+  raw.omen.guardOptions = [
+    { guards: 0, chance: 0.3, cost: 0, affordable: true },
+    { guards: 1, chance: 0.8, cost: 20, affordable: true },
+    { guards: 2, chance: 1, cost: 40, affordable: false }
+  ]
+  const season = shared.normalizeSeason(raw)
+  assert.equal(season.omen.guardBase, 0.3)
+  assert.deepEqual(season.omen.guardOptions.map((option) => option.guards), [0, 1, 2])
+  assert.equal(season.omen.guardOptions[2].chance, 1)
+  assert.equal(season.omen.guardOptions[2].affordable, false)
 })

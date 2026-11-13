@@ -127,6 +127,15 @@ test('投喂：稳过，扣 3 个仓库作物，换 1 颗稻种 + 2 露水', () 
   assert.equal(result.reward.seeds.rice, 1)
 })
 
+test('临时守卫可以把守卫率推到 1.0，骰子再高也成功', () => {
+  const omen = freshOmen(AUTUMN)
+  const now = omen.start + HOUR_MS
+  const result = resolveOmen('guard', { guard: 1, random: () => 0.99, now, omen })
+  assert.equal(result.ok, true)
+  assert.equal(result.success, true)
+  assert.deepEqual(result.loss, { crops: 0, witherPlots: 0, freezePlots: 0, matureOnly: false })
+})
+
 test('窗口外不能结算；坏选择被拒绝', () => {
   const omen = freshOmen(AUTUMN)
   assert.deepEqual(resolveOmen('run', { omen }), { ok: false, code: 'bad-choice' })

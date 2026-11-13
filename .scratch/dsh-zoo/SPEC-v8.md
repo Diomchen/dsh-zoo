@@ -15,7 +15,9 @@
   巨鹿冻 3 块/忽略 2 块）；安抚代价与奖励见 ADR-0022。
 - **新阶段 `frozen`**：作物保留、停止生长、不能收/浇/肥/重种；`farm-thaw` 花 2 露水 + 5
   硬币解冻；换季未解冻转 `withered`。阶段优先级 `frozen → withered → empty → mature → growing`。
-- **动作**：新增 `farm-thaw { plotId }`；`farm-omen-resolve` 仍是 `{ choice, expectedStart }`。
+- **临时守卫**：来客卡可另雇 0～2 名，每名 20 硬币、+0.5 成功率；与常驻守卫相加后封顶 1.0。
+  费用结算时先扣，失败不退；只作用于这一次来客结算，不进入合同/雇工位。
+- **动作**：新增 `farm-thaw { plotId }`；`farm-omen-resolve` 为 `{ choice, guards?, expectedStart }`。
 - **窗口**：`season.omen` 只在该来客窗口内非空，字段为 `{ id, name, emoji, tag, season,
   day, start, end, remainingMs, active, resolved, choices, stakes }`；`choices[]` 带
   `cost/affordable/reason`。

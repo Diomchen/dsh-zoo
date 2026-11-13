@@ -30,6 +30,7 @@ const FARM_ERROR_TEXT = Object.freeze({
   'omen-resolved': '这位来客已经打发走了。',
   'omen-inactive': '这位来客已经走了，下次来早点。',
   'bad-choice': '这个应对方式不成立。',
+  'bad-guards': '守卫人数只能是 0～2 人。',
   'stale-season': '节日/来客已经换了一天，刷新后再试。',
   'event-inactive': '今天没有可领的节日。',
   'event-not-ready': '节日任务还没完成，再忙一会儿。',

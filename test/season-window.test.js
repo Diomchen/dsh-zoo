@@ -130,6 +130,8 @@ test('窗口渲染：季节/来客只在主人模式画，动作窄口只发两�
   assert.match(js, /farm-omen-resolve/)
   assert.match(js, /'farm-' \+ action/)
   assert.match(js, /choice: action === 'omen-guard' \? 'guard' : 'feed'/)
+  assert.match(js, /guards: Number\(select\?\.value/)
+  assert.match(js, /select\.id = 'omen-guard-count'/)
   assert.match(js, /expectedStart: season\.start/)
 })
 
@@ -137,9 +139,11 @@ test('窗口桥：节日/来客的乐观锁和二选一必须过 preload', async
   const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
   assert.match(preload, /expectedStart: action\.expectedStart/, 'preload 必须把节日/来客的 expectedStart 带下去')
   assert.match(preload, /choice: action\.choice/, 'preload 必须把来客的 guard/feed 带下去')
+  assert.match(preload, /guards: action\.guards/, 'preload 必须把临时守卫人数带下去')
   const service = await readFile(new URL('../src/service.js', import.meta.url), 'utf8')
   assert.match(service, /expectedStart: event\.expectedStart/, '桌面动作入口必须把 expectedStart 交给宿主')
   assert.match(service, /choice: event\.choice/, '桌面动作入口必须把 guard/feed 交给宿主')
+  assert.match(service, /guards: event\.guards/, '桌面动作入口必须把临时守卫人数交给宿主')
 })
 
 test('共享白名单：event/omen 动作在 FARM_ACTIONS 里，且只接受窄参数', async () => {
@@ -154,6 +158,10 @@ test('共享白名单：event/omen 动作在 FARM_ACTIONS 里，且只接受窄�
   )
   assert.deepEqual(
     shared.normalizeFarmAction({ action: 'farm-omen-resolve', choice: 'feed', expectedStart: 123 }),
-    { action: 'farm-omen-resolve', choice: 'feed', expectedStart: 123 }
+    { action: 'farm-omen-resolve', choice: 'feed', guards: 0, expectedStart: 123 }
+  )
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 123 }),
+    { action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 123 }
   )
 })

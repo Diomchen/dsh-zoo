@@ -500,9 +500,10 @@ export function guardValue ({ ownerHome = false, worker = false } = {}) {
  * 偷菜判定（纯函数，随机源可注入）：成功率 = 1 − 守卫。
  * `random` 返回 [0,1)，落在守卫区间内就是被抓住；返回 true 表示这次偷到了。
  */
-export function stealSucceeds (guard, random = Math.random) {
+export function stealSucceeds (guard, random = Math.random, maxGuard = MAX_GUARD) {
   const value = Number(guard)
-  const safeGuard = Number.isFinite(value) ? Math.min(MAX_GUARD, Math.max(0, value)) : 0
+  const cap = Number.isFinite(Number(maxGuard)) ? Math.min(1, Math.max(0, Number(maxGuard))) : MAX_GUARD
+  const safeGuard = Number.isFinite(value) ? Math.min(cap, Math.max(0, value)) : 0
   const roll = typeof random === 'function' ? Number(random()) : Number.NaN
   // 随机源坏了也不能回落到全局 Math.random()（那不是注入的判定）：按 0 处理＝必被抓住。
   const dice = Number.isFinite(roll) ? Math.min(1, Math.max(0, roll)) : 0

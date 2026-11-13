@@ -430,8 +430,9 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   四格 `#season-calendar` 用 `calendar[]` 的 `today/past` 上色，最后一格旁边写
   「距入冬 8 小时 12 分」，最后 4 小时加 `is-almost` 并提示未熟四季作物会枯萎。
   `#event-card` 每个季节都有，显示目标/进度/奖励/领取；`#omen-card` 只在 `mode === 'owner'`
-  且来客窗口 `active === true` 时画，访客/看田强制隐藏。来客卡显示随机窗口剩余时间、
-  守卫/安抚两个选择的代价与失败损失；窗口外宿主把 `season.omen` 置空。
+  且来客窗口 `active === true` 时画，访客/看田强制隐藏。来客卡显示窗口剩余时间、
+  守卫/安抚两个选择的代价与失败损失，以及 0～2 名临时守卫的下拉（每名 20 硬币、+0.5）；
+  窗口外宿主把 `season.omen` 置空。
   `body[data-season]` 只换强调色和背景渐变，
   不重排布局。换季时宿主会在下一帧推新 `season`，窗口重画并 toast「秋天到了 · 丰收祭」。
 - 动作窄口：农场 `farm-plant` / `farm-harvest` / `farm-water` / `farm-fertilize` /
@@ -441,7 +442,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `farm-sell-crop`（只带 `cropId` + 1–99 的 `qty`，单价/总价由宿主算）；雇工 `hire` /
   `recall-worker` / `end-contract` / `hire-listing`；访客偷/帮 `farm-steal` / `farm-help`；
   节日 `farm-event-claim`（只带 `expectedStart`）；来客 `farm-omen-resolve`
-  （只带 `choice: 'guard'|'feed'` + `expectedStart`）。
+  （`choice: 'guard'|'feed'`、`guards?: 0..2`、`expectedStart`；`feed` 不能带守卫）。
   `shared.normalizeFarmAction` 与 `main.js` 的 `farmPending` 双重防串 id；一次只能有
   一个在飞动作，宿主回 `action-result` 后窗口才解锁。
 - 成功不关窗：种/收/买卖/挂牌/雇佣都只 toast 并刷新数据；失败留在窗里显示 `notice`。

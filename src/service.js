@@ -65,6 +65,7 @@ import {
 } from './farm-rules.js'
 import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
+import { GUARD_HIRE_COST, GUARD_HIRE_STEP, MAX_TEMP_GUARDS } from './season-omens.js'
 import { createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
 import { openFarmView } from './farm-open.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
@@ -1444,10 +1445,17 @@ export function createService (ctx, options = {}) {
 
     const choice = body?.choice
     if (choice !== 'guard' && choice !== 'feed') return seasonActionError('bad-choice')
+    const guards = body?.guards === undefined || body?.guards === null ? 0 : Number(body.guards)
+    if (!Number.isInteger(guards) || guards < 0 || guards > MAX_TEMP_GUARDS) {
+      return seasonActionError('bad-guards')
+    }
+    if (choice === 'feed' && guards > 0) return seasonActionError('bad-guards')
     const stakes = omen.stakes ?? {}
     const cost = choice === 'feed'
       ? { crops: 0, dew: 0, coins: 0, ...(stakes.feedCost ?? {}) }
       : { crops: 0, dew: 0, coins: 0 }
+    // 轻量守卫：只影响这一次来客结算，不占长期雇工位；失败也不退雇佣费。
+    if (choice === 'guard') cost.coins += guards * GUARD_HIRE_COST
 
     // 票 74：四季来客都可能收露水/硬币/作物。先扣成本，任何一步不够就原样退回。
     const paid = { crops: 0, dew: 0, coins: 0 }
@@ -1474,8 +1482,9 @@ export function createService (ctx, options = {}) {
       paid.coins = cost.coins
     }
 
+    const guardChance = Math.min(1, farmGuard().guard + guards * GUARD_HIRE_STEP)
     const resolved = await season.resolveOmen(choice, {
-      guard: farmGuard().guard,
+      guard: guardChance,
       random: farmRandom,
       now
     })
@@ -1534,6 +1543,9 @@ export function createService (ctx, options = {}) {
       ok: true,
       action: 'farm-omen-resolve',
       omen: season.view(now).omen,
+      guards,
+      guardChance,
+      paid,
       outcome: { ...outcome, loss: lost, wither: withered, freeze: frozen },
       notice
     }
@@ -1600,12 +1612,26 @@ export function createService (ctx, options = {}) {
         }
       })
       const feed = choices.find((choice) => choice.id === 'feed')
+      const baseGuard = farmGuard().guard
+      const hire = view.omen.guardHire ?? { cost: GUARD_HIRE_COST, step: GUARD_HIRE_STEP, max: MAX_TEMP_GUARDS }
+      const guardOptions = []
+      for (let guards = 0; guards <= hire.max; guards += 1) {
+        const price = guards * hire.cost
+        guardOptions.push({
+          guards,
+          chance: Math.min(1, baseGuard + guards * hire.step),
+          cost: price,
+          affordable: coins >= price
+        })
+      }
       view = {
         ...view,
         omen: {
           ...view.omen,
           choices,
-          canFeed: feed?.affordable !== false
+          canFeed: feed?.affordable !== false,
+          guardBase: baseGuard,
+          guardOptions
         }
       }
     }
@@ -4503,6 +4529,7 @@ export function createService (ctx, options = {}) {
         // 少拷这两处，来客会在宿主被判成 bad-choice——错误文案只说“应对方式不成立”。
         expectedStart: event.expectedStart ?? undefined,
         choice: event.choice ?? undefined,
+        guards: event.guards ?? undefined,
         // 雇佣（ticket 44）：只接这些窄字段；硬币/总价/服务时长窗口一概不传。
         hours: event.hours ?? undefined,
         contractId: event.contractId ?? undefined,

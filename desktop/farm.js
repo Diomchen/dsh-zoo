@@ -121,6 +121,7 @@ const RESULT_CODE_TEXT = {
   'event-claimed': '今天的节日奖励已经领过了。',
   'omen-resolved': '这位来客已经处理过了。',
   'bad-choice': '这个选择不对，再试一次。',
+  'bad-guards': '守卫人数只能是 0～2 人。',
   'not-enough-crops': '仓库里的作物不够。',
   // 雇佣（ticket 44）
   'own-pet': '不能雇自己的宠物。',
@@ -194,6 +195,8 @@ let plantTarget = null
 let unlockTarget = null
 /** 一键收割的串行队列：一次只发一个 farm-harvest，等回执再发下一条。 */
 let batch = null
+/** 来客卡上临时雇的守卫人数（0～2）；只影响下一次守夜结算。 */
+let omenGuardCount = 0
 /** 每种作物上一次输入的数量；宿主刷新价目时不把用户刚填的数字吞掉。 */
 const marketQty = { tomato: 1, carrot: 1, pumpkin: 1 }
 /** plotId → 倒计时节点；tick 只改文本，不重建按钮（重建会打断用户点击）。 */
@@ -495,6 +498,26 @@ function renderOmenCard (season) {
   feed.textContent = card.feedText
   const actions = document.createElement('div')
   actions.className = 'season-actions'
+  let guardPicker = null
+  if (Array.isArray(card.guardOptions) && card.guardOptions.length > 0) {
+    const affordable = card.guardOptions.filter((option) => option.affordable !== false)
+    if (!affordable.some((option) => option.guards === omenGuardCount)) omenGuardCount = 0
+    guardPicker = document.createElement('label')
+    guardPicker.className = 'omen-guard'
+    const caption = document.createElement('span')
+    caption.textContent = '守卫'
+    const select = document.createElement('select')
+    select.id = 'omen-guard-count'
+    for (const option of card.guardOptions) {
+      const item = document.createElement('option')
+      item.value = String(option.guards)
+      item.textContent = option.label
+      item.disabled = option.affordable === false
+      item.selected = option.guards === omenGuardCount
+      select.append(item)
+    }
+    guardPicker.append(caption, select)
+  }
   for (const action of card.actions) {
     const button = document.createElement('button')
     button.type = 'button'
@@ -505,7 +528,7 @@ function renderOmenCard (season) {
     if (action.reason) button.title = action.reason
     actions.append(button)
   }
-  replaceContent(omenCardEl, head, detail, guard, feed, actions)
+  replaceContent(omenCardEl, head, detail, guard, feed, ...(guardPicker === null ? [] : [guardPicker]), actions)
 }
 
 function renderSeasonCards (season) {
@@ -2053,13 +2076,22 @@ seasonCardsEl?.addEventListener('click', (event) => {
     return
   }
   if (action === 'omen-guard' || action === 'omen-feed') {
+    const select = omenCardEl?.querySelector('#omen-guard-count')
     submit({
       action: 'farm-omen-resolve',
       choice: action === 'omen-guard' ? 'guard' : 'feed',
+      ...(action === 'omen-guard' ? { guards: Number(select?.value ?? omenGuardCount) || 0 } : {}),
       expectedStart: season.start
     })
     return
   }
+})
+
+seasonCardsEl?.addEventListener('change', (event) => {
+  const target = event.target
+  if (!(target instanceof Element) || target.id !== 'omen-guard-count') return
+  const count = Number(target.value)
+  omenGuardCount = Number.isInteger(count) && count >= 0 && count <= 2 ? count : 0
 })
 
 plotsEl.addEventListener('click', (event) => {
