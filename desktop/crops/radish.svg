@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-hidden="true">
+  <defs>
+    <linearGradient id="radish-body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff8ef"/>
+      <stop offset=".35" stop-color="#f6ead8"/>
+      <stop offset="1" stop-color="#e2d4bd"/>
+    </linearGradient>
+    <linearGradient id="radish-pink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ef9a9a"/>
+      <stop offset="1" stop-color="#e4747c"/>
+    </linearGradient>
+    <linearGradient id="radish-leaf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8cc56b"/>
+      <stop offset="1" stop-color="#4f8f43"/>
+    </linearGradient>
+  </defs>
+  <ellipse cx="50" cy="89" rx="25" ry="5" fill="#000" opacity=".10"/>
+
+  <path d="M50 32c-7-10-15-16-25-18 3 10 10 19 21 25z" fill="url(#radish-leaf)"/>
+  <path d="M50 31c7-11 16-17 26-18-4 10-11 18-22 24z" fill="url(#radish-leaf)"/>
+  <path d="M50 30c-3-12 0-21 4-27 4 8 4 19 0 29z" fill="#5ca35a"/>
+  <path d="M50 33c-9-5-18-5-27-1 6 6 15 8 27 7z" fill="#6cb568"/>
+  <path d="M50 33c9-5 18-5 27-1-6 6-15 8-27 7z" fill="#6cb568"/>
+
+  <path d="M50 82c-11 0-19-8-19-19 0-14 9-27 19-36 10 9 19 22 19 36 0 11-8 19-19 19z" fill="url(#radish-body)"/>
+  <path d="M50 30c8 7 14 17 16 27-5-3-10-4-16-4s-11 1-16 4c2-10 8-20 16-27z" fill="url(#radish-pink)" opacity=".92"/>
+  <path d="M50 78c-8 0-15-5-17-13 4 5 10 8 17 8s13-3 17-8c-2 8-9 13-17 13z" fill="#d8c9b1" opacity=".65"/>
+
+  <path d="M42 45c-2 10-1 19 3 28M58 45c2 10 1 19-3 28" stroke="#d6c6ad" stroke-width="1.8" fill="none" stroke-linecap="round" opacity=".8"/>
+  <path d="M51 80c-1 2-2 4-1 6 2 0 3-2 3-4" stroke="#cdbb9f" stroke-width="2" fill="none" stroke-linecap="round"/>
+
+  <ellipse cx="41" cy="50" rx="5" ry="3" fill="#fff" opacity=".6" transform="rotate(-20 41 50)"/>
+  <ellipse cx="59" cy="58" rx="3" ry="2" fill="#fff" opacity=".35" transform="rotate(18 59 58)"/>
+  <circle cx="46" cy="34" r="1.2" fill="#fff" opacity=".55"/>
+  <circle cx="55" cy="37" r="1" fill="#fff" opacity=".45"/>
+
+  <path d="M50 30c-2-8-5-15-10-21" stroke="#3f8440" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+  <path d="M50 31c1-9 4-16 8-22" stroke="#3f8440" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+</svg>

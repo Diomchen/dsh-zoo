@@ -9,17 +9,25 @@ export const MINUTE_MS = 60 * 1000
 export const HOUR_MS = 60 * MINUTE_MS
 
 /**
- * 内置的六种作物（SPEC v5「农场与作物」，票 58 加三种）。
+ * 内置的十种作物（SPEC v5「农场与作物」，票 58 加三种，票 64 加四种四季作物）。
  * 票 59 起这张表只是**打底**：`CROPS` 是可填充的运行时目录，
  * service 启动时会用 `<dataDir>/crops.json` 和网络目录把它撑大（ADR-0019）。
  * `growMs` 生长时长、`seedPrice` 种子价、`yield` 产量、`base` 交易所底价。
  *
  * 顺序按生长时长排，窗口里种子列表与行情就按这个顺序画。三档新的沿用了老三条的
  * 经济形状：越久越长的那一档**每小时毛收更低**，但点一次管更久、种子更贵——
- * 短作物刷得勤，长作物适合睡前种。小番茄仍是最便宜的种子（6），
- * `PLOT_UNLOCK_RESERVE` 因此不变。
+ * 短作物刷得勤，长作物适合睡前种。四季作物的季节归属在 `season-rules.js`，
+ * 这里只管数值；旧六种一个字段都没动。
  */
 export const BUILTIN_CROPS = Object.freeze({
+  pea: Object.freeze({
+    id: 'pea',
+    name: '豌豆',
+    growMs: 25 * MINUTE_MS,
+    seedPrice: 6,
+    yield: 3,
+    base: 4
+  }),
   tomato: Object.freeze({
     id: 'tomato',
     name: '小番茄',
@@ -36,6 +44,14 @@ export const BUILTIN_CROPS = Object.freeze({
     yield: 4,
     base: 7
   }),
+  radish: Object.freeze({
+    id: 'radish',
+    name: '白萝卜',
+    growMs: 90 * MINUTE_MS,
+    seedPrice: 10,
+    yield: 6,
+    base: 4
+  }),
   carrot: Object.freeze({
     id: 'carrot',
     name: '胡萝卜',
@@ -44,6 +60,14 @@ export const BUILTIN_CROPS = Object.freeze({
     yield: 5,
     base: 6
   }),
+  rice: Object.freeze({
+    id: 'rice',
+    name: '稻米',
+    growMs: 3 * HOUR_MS,
+    seedPrice: 18,
+    yield: 10,
+    base: 4
+  }),
   corn: Object.freeze({
     id: 'corn',
     name: '玉米',
@@ -51,6 +75,14 @@ export const BUILTIN_CROPS = Object.freeze({
     seedPrice: 22,
     yield: 6,
     base: 9
+  }),
+  watermelon: Object.freeze({
+    id: 'watermelon',
+    name: '西瓜',
+    growMs: 6 * HOUR_MS,
+    seedPrice: 30,
+    yield: 8,
+    base: 10
   }),
   pumpkin: Object.freeze({
     id: 'pumpkin',
@@ -211,6 +243,7 @@ export function growMsOf (value) {
 
 /** 地块成熟：`grownMs >= growMs`；空地永远不成熟。成熟后停止生长，也不枯萎。 */
 export function isMature (plot) {
+  if (plot?.withered === true) return false
   if (!isCropId(plot?.crop)) return false
   const growMs = Number(plot.growMs)
   const grownMs = Number(plot.grownMs)
@@ -218,14 +251,19 @@ export function isMature (plot) {
   return Number.isFinite(grownMs) && grownMs >= growMs
 }
 
-/** UI 用的阶段：empty / growing / mature（ticket 40 的农场小窗与状态出口共用）。 */
+/**
+ * UI 用的阶段：withered / empty / growing / mature（票 66 加枯萎）。
+ * 枯萎优先于一切：地已经不能收、不能浇，只能重种。
+ */
 export function plotStage (plot) {
+  if (plot?.withered === true) return 'withered'
   if (!isCropId(plot?.crop)) return 'empty'
   return isMature(plot) ? 'mature' : 'growing'
 }
 
-/** 还差多少毫秒成熟；空地/成熟都是 0。 */
+/** 还差多少毫秒成熟；空地/成熟/枯萎都是 0。 */
 export function plotRemainingMs (plot) {
+  if (plot?.withered === true) return 0
   if (!isCropId(plot?.crop) || isMature(plot)) return 0
   return Math.max(0, Number(plot.growMs) - Number(plot.grownMs))
 }
@@ -233,18 +271,21 @@ export function plotRemainingMs (plot) {
 /**
  * 推进一块地的生长：纯函数，返回新对象；没变化时返回原对象（调用方据此判断脏）。
  * 到 `growMs` 就停住——成熟后不再生长，也不会枯萎/掉产量。
+ * 票 66：第三参是本段季节的生长系数（当季四季作物 1.1，其余 1）。
  */
-export function advanceGrowth (plot, elapsedMs) {
-  if (!isCropId(plot?.crop) || isMature(plot)) return plot
+export function advanceGrowth (plot, elapsedMs, factor = 1) {
+  if (plot?.withered === true || !isCropId(plot?.crop) || isMature(plot)) return plot
   const elapsed = Number(elapsedMs)
   if (!Number.isFinite(elapsed) || elapsed <= 0) return plot
-  const grownMs = Math.min(Number(plot.growMs), Math.max(0, Number(plot.grownMs) || 0) + elapsed)
+  const rate = Number.isFinite(factor) && factor > 0 ? factor : 1
+  const grownMs = Math.min(Number(plot.growMs), Math.max(0, Number(plot.grownMs) || 0) + elapsed * rate)
   if (grownMs === plot.grownMs) return plot
   return { ...plot, grownMs }
 }
 
-/** 还能浇水吗：有作物、没成熟、这一株还没浇过。 */
+/** 还能浇水吗：有作物、没成熟、这一株还没浇过；枯萎不可浇。 */
 export function canWater (plot) {
+  if (plot?.withered === true) return false
   if (!isCropId(plot?.crop) || isMature(plot)) return false
   return Number(plot.waterings) < 1
 }
@@ -269,15 +310,15 @@ export function waterPlot (plot) {
  * 空地/成熟地没有可帮的生长，返回 null。
  */
 export function helpPlot (plot) {
-  if (!isCropId(plot?.crop) || isMature(plot)) return null
+  if (plot?.withered === true || !isCropId(plot?.crop) || isMature(plot)) return null
   const bonus = Math.max(1, Math.floor(Number(plot.growMs) * 0.1))
   const grownMs = Math.min(Number(plot.growMs), Number(plot.grownMs) + bonus)
   return { ...plot, grownMs }
 }
 
-/** 还能施肥吗：有作物、这一株还没施过。成熟后仍可施（收获前最后一个加成）。 */
+/** 还能施肥吗：有作物、这一株还没施过；枯萎不可施。成熟后仍可施（收获前最后一个加成）。 */
 export function canFertilize (plot) {
-  return isCropId(plot?.crop) && plot.fertilized !== true
+  return plot?.withered !== true && isCropId(plot?.crop) && plot.fertilized !== true
 }
 
 /** 施肥：把 `fertilized` 置真，收获时 +1 产量；不可施时返回 null。 */
@@ -291,6 +332,7 @@ export function fertilizePlot (plot) {
  * `stolenBy` 按去重后的访客数算（每块地每轮每位访客只偷 1 个）。
  */
 export function harvestYield (plot) {
+  if (plot?.withered === true) return 0
   const crop = cropOf(plot?.crop)
   if (crop === null) return 0
   const stolen = Array.isArray(plot.stolenBy) ? plot.stolenBy.length : 0

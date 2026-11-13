@@ -6,7 +6,7 @@
  * 这里按默认导出 import。
  */
 import assert from 'node:assert/strict'
-import { join } from 'node:path'
+import { resolve, sep } from 'node:path'
 import test from 'node:test'
 
 import giftPath from '../desktop/gift-path.js'
@@ -17,11 +17,11 @@ const BASE = '/tmp/dsh-zoo/gifts'
 test('resolveGiftFile：只认两段合法名字，解析出的绝对路径必须在 gifts 根下面', () => {
   assert.equal(
     giftPath.resolveGiftFile(BASE, DIR, 'thumb.png'),
-    join(BASE, DIR, 'thumb.png')
+    resolve(BASE, DIR, 'thumb.png')
   )
   assert.equal(
     giftPath.resolveGiftFile(BASE, DIR, '报价 单.JPG'),
-    join(BASE, DIR, '报价 单.JPG')
+    resolve(BASE, DIR, '报价 单.JPG')
   )
   // 目录名必须是 store 生成的形状。
   for (const dir of ['', '.', '..', '../etc', '20261103-153245-zzzzzzzz', '2026-11-03-ab12cd12', DIR + '/x']) {
@@ -47,7 +47,7 @@ test('resolveGiftFile：即使名字绕过白名单，resolve/startsWith 也会�
   assert.equal(up, null)
   // 合法情况下解析结果一定以 base + sep 开头。
   const ok = giftPath.resolveGiftFile(BASE, DIR, 'a.png')
-  assert.equal(ok.startsWith(BASE + '/'), true)
+  assert.equal(ok.startsWith(resolve(BASE) + sep), true)
 })
 
 test('contentTypeOf：只给四种图片类型；别的返回 null', () => {

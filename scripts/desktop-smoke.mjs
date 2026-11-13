@@ -2589,7 +2589,35 @@ async function verifyFarmWindow () {
     ],
     carried: [
       { kind: 'crop', crop: 'tomato', qty: 1, at: Date.now(), until: Date.now() + 1800000 }
-    ]
+    ],
+    season: (() => {
+      const start = new Date(); start.setHours(0, 0, 0, 0)
+      const end = new Date(start); end.setDate(end.getDate() + 1)
+      return {
+        id: 'autumn', name: '秋', emoji: '🍂',
+        start: start.getTime(), end: end.getTime(),
+        remainingMs: Math.max(0, end.getTime() - Date.now()),
+        calendar: [
+          { id: 'spring', name: '春', emoji: '🌱', today: false, past: true, festival: '播种节' },
+          { id: 'summer', name: '夏', emoji: '☀️', today: false, past: true, festival: '夜市' },
+          { id: 'autumn', name: '秋', emoji: '🍂', today: true, past: false, festival: '丰收祭' },
+          { id: 'winter', name: '冬', emoji: '❄️', today: false, past: false, festival: '围炉节' }
+        ],
+        event: {
+          id: 'autumn-harvest', name: '丰收祭',
+          requirement: { kind: 'harvest', qty: 15 }, progress: 7,
+          ready: false, claimed: false, reward: { coins: 50, dew: 4 }
+        },
+        omen: {
+          id: 'autumn-bearger', name: '熊獾', emoji: '🐻',
+          resolved: false, choice: null, canFeed: true,
+          stakes: {
+            guardReward: { coins: 40, dew: 3 }, failLoss: 3, feedCost: 3,
+            feedReward: { coins: 0, dew: 2, seeds: { rice: 1 } }, ignoreLoss: 1
+          }
+        }
+      }
+    })()
   }
   // 交易所页（票 41/45）：价格、bid、局域网指数和最近成交都要有值，截图才不是空表。
   const marketAt = Date.now()

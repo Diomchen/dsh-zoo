@@ -237,3 +237,44 @@ _Avoid_: 能量, 体力, energy, water
 **离线生长 (Offline Growth)**：
 关掉 DSH 后作物仍按真实时间生长，但有累计上限；回来不会少收，只是不会无限长。
 _Avoid_: 离线收益, 挂机收益, offline earnings
+
+**季节 (Season)**：
+按本机日历算出来的春/夏/秋/冬，一天一季、四天一轮，本地午夜换季；它不写进存档，只由时间推导。
+四季作物、节日和季候来客都挂在季节上（[ADR-0020](docs/adr/0020-season-clock.md)）。
+_Avoid_: 天气, 月份, weather, month
+
+**季相 (Season Phase)**：
+一个季节里农场呈现出的整体样子：能种哪些四季作物、今天哪个节日、有没有来客。它由季节推导，
+不是另存的状态。
+_Avoid_: 季节状态, 阶段, phase, stage
+
+**四季作物 (Seasonal Crop)**：
+只在某一个季节能买、能种的作物；当季生长快 10%，跨季没熟会枯萎。六种常驻作物不属于四季作物。
+_Avoid_: 季节作物, 限定作物, seasonal plant
+
+**当季 (In Season)**：
+当前季节正好是某种四季作物所属的季节；只有当季能买/种，并且生长快 10%。
+_Avoid_: 应季, 本季, current season
+
+**枯萎 (Withered)**：
+四季作物换季时没熟而进入的状态：不能收、不能浇水/施肥，但可以重种；常驻作物不会枯萎
+（[ADR-0021](docs/adr/0021-seasonal-crops-and-withering.md)）。
+_Avoid_: 死亡, 烂掉, dead, rotten
+
+**节日 (Festival)**：
+每个季节一个、全天可做的目标（播种/卖出/收获/浇水），完成后领一次硬币和露水；换季作废。
+宿主和协议里叫 `event`。
+_Avoid_: 活动, 任务, activity, quest
+
+**季候来客 (Omen)**：
+秋天来一次的熊獾，用一张二选一卡处理（守夜/投喂），失败或忽略只损失仓库作物，不打架、不毁存档
+（[ADR-0022](docs/adr/0022-seasonal-omen.md)）。
+_Avoid_: Boss, 怪物, 战斗, monster, combat
+
+**守夜 (Guard the Night)**：
+熊獾来客的一个选择：按当前守卫值掷骰；成功拿硬币/露水，失败从仓库搬走最多 3 个作物。
+_Avoid_: 防守, 战斗, fight, defend
+
+**投喂 (Feed)**：
+熊獾来客的另一个选择：仓库至少有 3 个作物时，扣 3 个换 1 颗稻种 + 2 露水，稳过。
+_Avoid_: 喂食, 贿赂, bribe, sacrifice

@@ -177,6 +177,12 @@
    */
   const FARM_LOOK_ACTIONS = ['farm-look', 'farm-raid']
   /**
+   * 票 70/71：今日节日领奖与秋天来客结算。两条都带 `expectedStart`（窗口看到的
+   * 当日 0 点），宿主拿它挡「过了午夜还在点昨天的按钮」；来客再加一个二选一。
+   */
+  const FARM_EVENT_ACTIONS = ['farm-event-claim']
+  const FARM_OMEN_ACTIONS = ['farm-omen-resolve']
+  /**
    * **必须带对象**的动作：没有 `deviceId` 这条申请就没有意义，宁可整条拒掉。
    *
    * 只写一份、两边都用（`desktop/main.js` 的 IPC 窄口 + 这里的 helper 事件窄口）。
@@ -194,7 +200,9 @@
     FARM_HIRE_ACTIONS,
     FARM_REFRESH_ACTIONS,
     FARM_LAND_ACTIONS,
-    FARM_LOOK_ACTIONS
+    FARM_LOOK_ACTIONS,
+    FARM_EVENT_ACTIONS,
+    FARM_OMEN_ACTIONS
   )
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
@@ -286,9 +294,9 @@
    * 这两份是可变的默认值：内置六种打底，`applyCropCatalog()` 原地换内容，
    * 所有 `for (const id of CROP_IDS)` 在调用时读到的是最新那份。
    */
-  const CROP_IDS = ['tomato', 'strawberry', 'carrot', 'corn', 'pumpkin', 'grape']
-  const FARM_STAGES = ['empty', 'growing', 'mature']
-  const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock']
+  const CROP_IDS = ['pea', 'tomato', 'strawberry', 'radish', 'carrot', 'rice', 'corn', 'watermelon', 'pumpkin', 'grape']
+  const FARM_STAGES = ['empty', 'growing', 'mature', 'withered']
+  const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock', 'season', 'event', 'wither', 'omen']
   const MAX_FARM_COINS = 1000000
   const MAX_FARM_STACK = 999
   const MAX_FARM_DEW = 48
@@ -298,7 +306,7 @@
    * 交易所（ticket 41）的窄口：底价表与 `src/farm-rules.js` 同源；
    * 价格夹在 [base×0.5, base×2]，成交历史最多 50 条进窗口。
    */
-  const CROP_BASE_PRICE = { tomato: 5, strawberry: 7, carrot: 6, corn: 9, pumpkin: 30, grape: 24 }
+  const CROP_BASE_PRICE = { pea: 4, tomato: 5, strawberry: 7, radish: 4, carrot: 6, rice: 4, corn: 9, watermelon: 10, pumpkin: 30, grape: 24 }
   /** 目录上限：与 `src/crop-catalog.js` 的 MAX_CROPS 同源（drift 测试会读）。 */
   const MAX_FARM_CROPS = 64
   const MAX_CROP_NAME = 16
@@ -688,6 +696,19 @@
     if (crop === null) {
       return { id, crop: null, stage: 'empty', mature: false, remainingMs: 0, waterings: 0, fertilized: false }
     }
+    const withered = raw.withered === true || raw.stage === 'withered'
+    if (withered) {
+      return {
+        id,
+        crop,
+        stage: 'withered',
+        mature: false,
+        remainingMs: 0,
+        waterings: 0,
+        fertilized: raw.fertilized === true,
+        withered: true
+      }
+    }
 
     const growMs = Number(raw.growMs)
     const grownMs = Number(raw.grownMs)
@@ -733,12 +754,21 @@
     // ticket 48：unlock 日志带 plot（第几块地）与 cost（解锁花了多少硬币）。
     const cost = Number(raw.cost)
     const plot = Number(raw.plot)
+    const coins = Number(raw.coins)
+    const dew = Number(raw.dew)
+    const choice = raw.choice === 'guard' || raw.choice === 'feed' || raw.choice === 'ignore' ? raw.choice : null
+    const name = normalizeText(raw.name, '', 24)
     return {
       at: Math.floor(at),
       kind: raw.kind,
       ...(crop === null ? {} : { crop }),
       qty,
       ...(who === null ? {} : { who }),
+      ...(name === '' ? {} : { name }),
+      ...(choice === null ? {} : { choice }),
+      ...(typeof raw.success === 'boolean' ? { success: raw.success } : {}),
+      ...(Number.isFinite(coins) ? { coins: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(coins))) } : {}),
+      ...(Number.isFinite(dew) ? { dew: Math.min(MAX_FARM_DEW, Math.max(0, Math.floor(dew))) } : {}),
       ...(Number.isFinite(wage) ? { wage: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(wage))) } : {}),
       ...(Number.isFinite(earned) ? { earned: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(earned))) } : {}),
       ...(Number.isFinite(hours) ? { hours: Math.min(HIRE_HOURS_MAX, Math.max(0, Math.floor(hours))) } : {}),
@@ -794,6 +824,113 @@
    * 桌面场景里没有农场摘要（ticket 46：地块条已删）：`controls` 是每帧比较的契约，
    * 日志/仓库只会让签名狂变；农场数据只走 `farm-window`，窗口不读 `/state`。
    */
+  const SEASON_IDS = ['spring', 'summer', 'autumn', 'winter']
+  const SEASON_EVENT_KINDS = ['plant', 'harvest', 'sell', 'water']
+
+  function normalizeSeasonReward (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const coins = Number(raw.coins)
+    const dew = Number(raw.dew)
+    const seeds = {}
+    if (raw.seeds !== null && typeof raw.seeds === 'object' && !Array.isArray(raw.seeds)) {
+      for (const [crop, qty] of Object.entries(raw.seeds)) {
+        const cropId = normalizeCropId(crop)
+        const count = Number(qty)
+        if (cropId === null || !Number.isFinite(count) || count <= 0) continue
+        seeds[cropId] = Math.min(MAX_FARM_STACK, Math.floor(count))
+      }
+    }
+    return {
+      coins: Number.isFinite(coins) ? Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(coins))) : 0,
+      dew: Number.isFinite(dew) ? Math.min(MAX_FARM_DEW, Math.max(0, Math.floor(dew))) : 0,
+      ...(Object.keys(seeds).length === 0 ? {} : { seeds })
+    }
+  }
+
+  function normalizeSeasonEvent (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const requirement = raw.requirement !== null && typeof raw.requirement === 'object' ? raw.requirement : {}
+    const kind = SEASON_EVENT_KINDS.includes(requirement.kind) ? requirement.kind : null
+    if (kind === null) return null
+    const qty = Math.min(999, Math.max(1, Math.floor(Number(requirement.qty) || 1)))
+    const progress = Math.min(qty, Math.max(0, Math.floor(Number(raw.progress) || 0)))
+    return {
+      id: typeof raw.id === 'string' ? raw.id.slice(0, 32) : '',
+      name: normalizeText(raw.name, '今日节日', 16),
+      requirement: { kind, qty },
+      progress,
+      ready: progress >= qty,
+      claimed: raw.claimed === true,
+      reward: normalizeSeasonReward(raw.reward) ?? { coins: 0, dew: 0 }
+    }
+  }
+
+  function normalizeSeasonOmen (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const stakes = raw.stakes !== null && typeof raw.stakes === 'object' ? raw.stakes : {}
+    const guardReward = normalizeSeasonReward(stakes.guardReward) ?? { coins: 0, dew: 0 }
+    const feedReward = normalizeSeasonReward(stakes.feedReward) ?? { coins: 0, dew: 0 }
+    const number = (value, max) => Number.isFinite(Number(value))
+      ? Math.min(max, Math.max(0, Math.floor(Number(value))))
+      : 0
+    const choice = raw.choice === 'guard' || raw.choice === 'feed' ? raw.choice : null
+    return {
+      id: typeof raw.id === 'string' ? raw.id.slice(0, 32) : '',
+      name: normalizeText(raw.name, '来客', 16),
+      emoji: typeof raw.emoji === 'string' ? Array.from(raw.emoji).slice(0, 2).join('') : '🐻',
+      resolved: raw.resolved === true,
+      choice,
+      canFeed: raw.canFeed === true,
+      stakes: {
+        guardReward,
+        failLoss: number(stakes.failLoss, MAX_FARM_STACK),
+        feedCost: number(stakes.feedCost, MAX_FARM_STACK),
+        feedReward,
+        ignoreLoss: number(stakes.ignoreLoss, MAX_FARM_STACK)
+      }
+    }
+  }
+
+  /** 票 70/71：季节块只收宿主算好的展示值；日历最多 4 格，节日/来客形状不对就丢。 */
+  function normalizeSeason (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    if (!SEASON_IDS.includes(raw.id)) return null
+    const start = Number(raw.start)
+    const end = Number(raw.end)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start <= 0 || end <= start) return null
+    const calendar = []
+    if (Array.isArray(raw.calendar)) {
+      for (const candidate of raw.calendar.slice(0, 4)) {
+        if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+        if (!SEASON_IDS.includes(candidate.id)) continue
+        calendar.push({
+          id: candidate.id,
+          name: normalizeText(candidate.name, '', 4),
+          emoji: typeof candidate.emoji === 'string' ? Array.from(candidate.emoji).slice(0, 2).join('') : '',
+          today: candidate.today === true,
+          past: candidate.past === true,
+          festival: normalizeText(candidate.festival, '', 8)
+        })
+      }
+    }
+    const remaining = Number(raw.remainingMs)
+    const event = normalizeSeasonEvent(raw.event)
+    const omen = normalizeSeasonOmen(raw.omen)
+    return {
+      id: raw.id,
+      name: normalizeText(raw.name, '', 8),
+      emoji: typeof raw.emoji === 'string' ? Array.from(raw.emoji).slice(0, 2).join('') : '',
+      start: Math.floor(start),
+      end: Math.floor(end),
+      remainingMs: Number.isFinite(remaining)
+        ? Math.min(24 * 60 * 60 * 1000, Math.max(0, Math.floor(remaining)))
+        : Math.max(0, Math.floor(end - Date.now())),
+      calendar,
+      event,
+      omen
+    }
+  }
+
   function normalizeFarm (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const plots = []
@@ -829,6 +966,7 @@
       }
     }
     const hire = normalizeFarmHire(raw.hire)
+    const season = normalizeSeason(raw.season)
     const guard = Number(raw.guard)
     const unlocked = typeof raw.unlocked === 'number' && Number.isFinite(raw.unlocked)
       ? Math.min(MAX_FARM_PLOTS, Math.max(MIN_FARM_PLOTS, Math.floor(raw.unlocked)))
@@ -854,6 +992,7 @@
       ...(unlockLadder.length === 0 ? {} : { unlockLadder }),
       seeds: normalizeFarmStacks(raw.seeds),
       crops: normalizeFarmStacks(raw.crops),
+      ...(season === null ? {} : { season }),
       ...(hire === null ? {} : { hire }),
       ...(Number.isFinite(guard) ? { guard: Math.min(MAX_FARM_GUARD, Math.max(0, guard)) } : {}),
       log,
@@ -1257,6 +1396,14 @@
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
     if (!FARM_ACTIONS.includes(action)) return null
+    if (FARM_EVENT_ACTIONS.includes(action) || FARM_OMEN_ACTIONS.includes(action)) {
+      const expectedStart = Number(raw.expectedStart)
+      if (!Number.isFinite(expectedStart) || expectedStart <= 0) return null
+      if (action === 'farm-event-claim') return { action, expectedStart: Math.floor(expectedStart) }
+      const choice = raw.choice === 'guard' || raw.choice === 'feed' ? raw.choice : null
+      if (choice === null) return null
+      return { action, choice, expectedStart: Math.floor(expectedStart) }
+    }
     if (FARM_MARKET_ACTIONS.includes(action)) {
       const cropId = normalizeCropId(raw.cropId)
       const qty = normalizeTradeQty(raw.qty)
@@ -2733,6 +2880,22 @@
             }
           }
         }
+        // 节日领奖 / 秋天来客（票 70）：helper 回到宿主的这一跳也要保留
+        // expectedStart 和 choice。这里曾按普通农场动作落到下面的窄口，
+        // 两个字段被整条丢掉，宿主只剩一句 bad-choice。
+        if (FARM_EVENT_ACTIONS.includes(action) || FARM_OMEN_ACTIONS.includes(action)) {
+          const normalized = normalizeFarmAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-farm-action' }
+          return {
+            ok: true,
+            event: {
+              type,
+              id,
+              ...normalized,
+              nickname
+            }
+          }
+        }
         // 农场（ticket 40）：`farm-open` 可带 plotId（点某块地开窗），四个地块动作必须带；
         // 种地还必须有 cropId。这里少一条，到了 store 就只剩一句 bad-plot，没有线索。
         // 交易所（ticket 41）：不碰地块，只带 cropId + qty（1–99）。
@@ -3198,6 +3361,8 @@
     FARM_MARKET_ACTIONS,
     FARM_LAND_ACTIONS,
     FARM_LOOK_ACTIONS,
+    FARM_EVENT_ACTIONS,
+    FARM_OMEN_ACTIONS,
     DEVICE_ACTIONS,
     normalizeFarmLook,
     normalizeNeighborChips,
@@ -3219,6 +3384,8 @@
     MIN_FARM_PLOTS,
     CROP_IDS,
     CROP_BASE_PRICE,
+    FARM_STAGES,
+    FARM_LOG_KINDS,
     MAX_FARM_COINS,
     MAX_FARM_STACK,
     MAX_FARM_DEW,
@@ -3229,7 +3396,10 @@
     MARKET_MIN_QTY,
     MARKET_MAX_QTY,
     normalizeFarm,
+    normalizeFarmPlot,
+    normalizeFarmLogEntry,
     normalizeFarmWindow,
+    normalizeSeason,
     applyCropCatalog,
     normalizeFarmAction,
     normalizeFarmHire,

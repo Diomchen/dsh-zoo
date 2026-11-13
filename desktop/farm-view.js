@@ -29,10 +29,14 @@
    * `file://` 加载，CSP 里放行了 `img-src 'self'`。
    */
   const BUILTIN_META = Object.freeze({
+    pea: { name: '豌豆', emoji: '🫛', art: 'crops/pea.svg', seedPrice: 6, base: 4, growMs: 25 * MINUTE_MS, yield: 3, season: 'spring' },
     tomato: { name: '小番茄', emoji: '🍅', art: 'crops/tomato.svg', seedPrice: 6, base: 5, growMs: 30 * MINUTE_MS, yield: 3 },
     strawberry: { name: '草莓', emoji: '🍓', art: 'crops/strawberry.svg', seedPrice: 9, base: 7, growMs: 45 * MINUTE_MS, yield: 4 },
+    radish: { name: '白萝卜', emoji: '🥬', art: 'crops/radish.svg', seedPrice: 10, base: 4, growMs: 90 * MINUTE_MS, yield: 6, season: 'winter' },
     carrot: { name: '胡萝卜', emoji: '🥕', art: 'crops/carrot.svg', seedPrice: 14, base: 6, growMs: 2 * HOUR_MS, yield: 5 },
+    rice: { name: '稻米', emoji: '🌾', art: 'crops/rice.svg', seedPrice: 18, base: 4, growMs: 3 * HOUR_MS, yield: 10, season: 'autumn' },
     corn: { name: '玉米', emoji: '🌽', art: 'crops/corn.svg', seedPrice: 22, base: 9, growMs: 4 * HOUR_MS, yield: 6 },
+    watermelon: { name: '西瓜', emoji: '🍉', art: 'crops/watermelon.svg', seedPrice: 30, base: 10, growMs: 6 * HOUR_MS, yield: 8, season: 'summer' },
     pumpkin: { name: '南瓜', emoji: '🎃', art: 'crops/pumpkin.svg', seedPrice: 36, base: 30, growMs: 8 * HOUR_MS, yield: 3 },
     grape: { name: '葡萄', emoji: '🍇', art: 'crops/grape.svg', seedPrice: 52, base: 24, growMs: 12 * HOUR_MS, yield: 5 }
   })
@@ -76,7 +80,11 @@
         seedPrice: Number(entry.seedPrice) || 0,
         base: Number(entry.base) || 0,
         growMs: Number(entry.growMs) || 0,
-        yield: Number(entry.yield) || 0
+        yield: Number(entry.yield) || 0,
+        // 票 64：宿主给四季作物带 season；旧六种和自定义作物没有。
+        season: typeof entry.season === 'string' && entry.season !== ''
+          ? entry.season
+          : builtin === null ? null : (builtin.season ?? null)
       }
       CROP_IDS.push(id)
     }
@@ -103,7 +111,7 @@
   const FERTILIZE_COST = 5
   /** 解锁后至少留一颗最便宜种子的钱；与宿主 PLOT_UNLOCK_RESERVE 同源（drift 测试会读）。 */
   const UNLOCK_RESERVE = 6
-  const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割' }
+  const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割', withered: '枯萎了' }
 
   function cropMeta (cropId) {
     return Object.prototype.hasOwnProperty.call(CROP_META, cropId) ? CROP_META[cropId] : null
@@ -270,13 +278,116 @@
   /** 进度条 = 已生长 / 总生长。剩余时间是宿主算的权威值，这里只做显示。 */
   function progressOf (plot) {
     if (plot === null || typeof plot !== 'object') return 0
-    if (plot.stage === 'empty') return 0
+    if (plot.stage === 'empty' || plot.stage === 'withered') return 0
     if (plot.stage === 'mature' || plot.mature === true) return 1
     const meta = cropMeta(plot.crop)
     if (meta === null) return 0
     const remaining = Number(plot.remainingMs)
     if (!Number.isFinite(remaining)) return 0
     return clamp(1 - remaining / meta.growMs, 0, 1)
+  }
+
+  /**
+   * 票 69：四季作物的买/种可用性。旧六种和自定义作物永远可用；
+   * 四季作物只在当季可用，其他季节给一句「下季才有」。
+   */
+  function seedAvailability (cropId, seasonId) {
+    const meta = cropMeta(cropId)
+    if (meta === null) return { season: null, plantable: false, buyable: false, reason: '这种作物不在了' }
+    const required = typeof meta.season === 'string' && meta.season !== '' ? meta.season : null
+    if (required === null) return { season: null, plantable: true, buyable: true, reason: '' }
+    // 票 69：宿主没给季节时不能默认「能种」——否则跨季/旧快照会把四季种子放出去。
+    if (typeof seasonId !== 'string' || seasonId === '') {
+      return { season: required, plantable: false, buyable: false, reason: '季节未知' }
+    }
+    if (required === seasonId) return { season: required, plantable: true, buyable: true, reason: '' }
+    return { season: required, plantable: false, buyable: false, reason: '下季才有' }
+  }
+
+  /**
+   * 票 69：四格季节条。`calendar` 由宿主按本地日期算好；这里只补
+   * 「还剩多久」「是不是最后 4 小时」和节日的显示名。
+   */
+  function seasonCalendar (season) {
+    const source = season !== null && typeof season === 'object' ? season : {}
+    const cells = Array.isArray(source.calendar)
+      ? source.calendar.map((cell) => ({
+        id: typeof cell?.id === 'string' ? cell.id : '',
+        name: typeof cell?.name === 'string' ? cell.name : '',
+        emoji: typeof cell?.emoji === 'string' ? cell.emoji : '',
+        today: cell?.today === true,
+        past: cell?.past === true,
+        festival: typeof cell?.festival === 'string' ? cell.festival : ''
+      }))
+      : []
+    const remainingMs = Math.max(0, Number(source.remainingMs) || 0)
+    return {
+      id: typeof source.id === 'string' ? source.id : '',
+      name: typeof source.name === 'string' ? source.name : '',
+      emoji: typeof source.emoji === 'string' ? source.emoji : '',
+      cells,
+      remainingMs,
+      remainingText: formatRemaining(remainingMs),
+      almost: remainingMs > 0 && remainingMs <= 4 * HOUR_MS,
+      next: cells.find((cell) => cell.today !== true && cell.past !== true) ?? null
+    }
+  }
+
+  /** 票 69：节日卡。进度/是否可领都由宿主算，这里只拼文案。 */
+  function eventCard (event) {
+    if (event === null || typeof event !== 'object') return null
+    const requirement = event.requirement ?? {}
+    const qty = Math.max(1, Math.floor(Number(requirement.qty) || 1))
+    const progress = Math.max(0, Math.floor(Number(event.progress) || 0))
+    const claimed = event.claimed === true
+    const ready = event.ready === true || progress >= qty
+    const kindText = requirement.kind === 'plant'
+      ? '种下'
+      : requirement.kind === 'harvest'
+        ? '收获'
+        : requirement.kind === 'sell'
+          ? '卖出'
+          : requirement.kind === 'water' ? '浇水' : '完成'
+    const reward = event.reward ?? {}
+    return {
+      id: typeof event.id === 'string' ? event.id : '',
+      name: typeof event.name === 'string' ? event.name : '今日节日',
+      kind: typeof requirement.kind === 'string' ? requirement.kind : '',
+      qty,
+      progress: Math.min(progress, qty),
+      ready,
+      claimed,
+      canClaim: ready && !claimed,
+      progressText: kindText + ' ' + Math.min(progress, qty) + '/' + qty,
+      rewardText: '+' + (Number(reward.coins) || 0) + ' 硬币 +' + (Number(reward.dew) || 0) + ' 露水',
+      statusText: claimed ? '今天已经领过了' : ready ? '完成了，可以领奖' : '还差 ' + Math.max(0, qty - progress)
+    }
+  }
+
+  /** 票 69：秋天来客卡。选择与代价来自宿主，窗口不自己算概率。 */
+  function omenCard (omen) {
+    if (omen === null || typeof omen !== 'object') return null
+    const stakes = omen.stakes ?? {}
+    const resolved = omen.resolved === true
+    const canFeed = omen.canFeed !== false
+    return {
+      id: typeof omen.id === 'string' ? omen.id : '',
+      name: typeof omen.name === 'string' ? omen.name : '来客',
+      emoji: typeof omen.emoji === 'string' ? omen.emoji : '🐻',
+      resolved,
+      choice: typeof omen.choice === 'string' ? omen.choice : null,
+      canFeed,
+      detail: '秋夜来了位不速之客。守夜可能失败；投喂 3 个仓库作物稳过。',
+      guardText: '守夜成功 +' + (Number(stakes.guardReward?.coins) || 0) + ' 硬币 +' +
+        (Number(stakes.guardReward?.dew) || 0) + ' 露水；失败被搬走最多 ' + (Number(stakes.failLoss) || 0) + ' 个作物。',
+      feedText: '投喂 ' + (Number(stakes.feedCost) || 0) + ' 个仓库作物，换 ' +
+        (Number(stakes.feedReward?.seeds?.rice) || 0) + ' 颗稻种 +' +
+        (Number(stakes.feedReward?.dew) || 0) + ' 露水。',
+      actions: [
+        { id: 'guard', label: '守夜', disabled: resolved },
+        { id: 'feed', label: '投喂', disabled: resolved || !canFeed, reason: !canFeed ? '仓库作物不够 3 个' : '' }
+      ]
+    }
   }
 
   function action (spec) {
@@ -318,9 +429,11 @@
    * 看起来就是「交易所坏了」。现在按钮下面永远有一行解释（buyHint / sellHint），
    * 空串才表示可以点。
    */
-  function tradeView (farm, market, cropId, rawQty) {
+  function tradeView (farm, market, cropId, rawQty, seasonId = null) {
     const meta = cropMeta(cropId)
     if (meta === null) return null
+    const season = seasonId ?? farm?.season?.id ?? null
+    const availability = seedAvailability(cropId, season)
     const qty = Number(rawQty)
     const valid = Number.isInteger(qty) && qty >= MIN_TRADE_QTY && qty <= MAX_TRADE_QTY
     const coins = Math.max(0, Math.floor(Number(farm?.coins) || 0))
@@ -338,15 +451,17 @@
     const seedTotal = meta.seedPrice * count
     const sellTotal = bid * count
     const stackLeft = Math.max(0, MAX_SEED_STACK - seeds)
-    const canBuy = valid && coins >= seedTotal && qty <= stackLeft
+    const canBuy = availability.buyable === true && valid && coins >= seedTotal && qty <= stackLeft
     const canSell = valid && crops >= qty
-    const buyHint = !valid
-      ? '数量要在 ' + MIN_TRADE_QTY + '–' + MAX_TRADE_QTY + ' 之间'
-      : coins < seedTotal
-        ? '硬币还差 ' + (seedTotal - coins) + '（需要 ' + seedTotal + '）'
-        : qty > stackLeft
-          ? '种子最多 ' + MAX_SEED_STACK + ' 颗（已有 ' + seeds + '）'
-          : ''
+    const buyHint = availability.buyable !== true
+      ? availability.reason
+      : !valid
+        ? '数量要在 ' + MIN_TRADE_QTY + '–' + MAX_TRADE_QTY + ' 之间'
+        : coins < seedTotal
+          ? '硬币还差 ' + (seedTotal - coins) + '（需要 ' + seedTotal + '）'
+          : qty > stackLeft
+            ? '种子最多 ' + MAX_SEED_STACK + ' 颗（已有 ' + seeds + '）'
+            : ''
     const sellHint = !valid
       ? '数量要在 ' + MIN_TRADE_QTY + '–' + MAX_TRADE_QTY + ' 之间'
       : crops === 0
@@ -355,11 +470,13 @@
           ? '仓库只有 ' + crops + ' 个' + meta.name
           : ''
     // 按钮自己的短标签：按钮在折叠线附近时，原因也必须在按钮上看得见。
-    const buyShort = !valid
-      ? '数量 1–99'
-      : coins < seedTotal
-        ? '差 ' + (seedTotal - coins) + ' 硬币'
-        : qty > stackLeft ? '种子已满' : ''
+    const buyShort = availability.buyable !== true
+      ? availability.reason
+      : !valid
+        ? '数量 1–99'
+        : coins < seedTotal
+          ? '差 ' + (seedTotal - coins) + ' 硬币'
+          : qty > stackLeft ? '种子已满' : ''
     const sellShort = !valid
       ? '数量 1–99'
       : crops === 0 ? '没有可卖的' : crops < qty ? '只有 ' + crops + ' 个' : ''
@@ -368,6 +485,9 @@
       name: meta.name,
       emoji: meta.emoji,
       art: meta.art,
+      season: availability.season,
+      plantable: availability.plantable,
+      buyable: availability.buyable,
       seedPrice: meta.seedPrice,
       qty: count,
       valid,
@@ -383,7 +503,9 @@
       sellHint,
       buyShort,
       sellShort,
-      maxBuy: Math.max(0, Math.min(MAX_TRADE_QTY, Math.floor(coins / meta.seedPrice), stackLeft)),
+      maxBuy: availability.buyable === true
+        ? Math.max(0, Math.min(MAX_TRADE_QTY, Math.floor(coins / meta.seedPrice), stackLeft))
+        : 0,
       maxSell: Math.max(0, Math.min(MAX_TRADE_QTY, crops))
     }
   }
@@ -403,27 +525,29 @@
         ? plot.stage
         : 'empty'
       const meta = cropMeta(plot?.crop)
+      const withered = stage === 'withered'
       const mature = stage === 'mature'
       const growing = stage === 'growing'
+      const displayStage = withered ? 'withered' : mature ? 'mature' : growing ? 'growing' : 'empty'
       const card = {
         plotId: typeof plot?.id === 'string' ? plot.id : '',
         label: plotLabel(plot, index),
-        stage: mature ? 'mature' : growing ? 'growing' : 'empty',
+        stage: displayStage,
         crop: meta === null ? null : plot.crop,
-        cropName: meta === null ? '空地' : meta.name,
+        cropName: meta === null ? '空地' : withered ? meta.name + '（枯萎）' : meta.name,
         emoji: meta === null ? '＋' : meta.emoji,
         art: meta === null ? '' : meta.art,
-        badge: STAGE_TEXT[mature ? 'mature' : growing ? 'growing' : 'empty'],
+        badge: STAGE_TEXT[displayStage],
         mature,
         progress: progressOf(plot),
         detailText: '',
         countdownText: growing ? formatRemaining(plot.remainingMs) : '',
-        openPlant: stage === 'empty' || (!mature && !growing),
+        openPlant: displayStage === 'empty' || withered,
         selected: selected !== null && plot?.id === selected,
         actions: []
       }
       if (card.openPlant) {
-        card.detailText = '点一下选种子'
+        card.detailText = withered ? '换季枯了，点一下重种' : '点一下选种子'
       } else if (mature) {
         card.detailText = plot?.fertilized === true ? '已施肥 · 可以收了' : '已经成熟，可以收了'
         card.actions.push(action({
@@ -474,12 +598,14 @@
   function batchPlantTargets (farm) {
     const plots = farm !== null && typeof farm === 'object' && Array.isArray(farm.plots) ? farm.plots : []
     const source = farm.seeds !== null && typeof farm.seeds === 'object' ? farm.seeds : {}
+    const season = farm?.season?.id ?? null
     const seeds = {}
     for (const id of CROP_IDS) seeds[id] = Math.max(0, Math.floor(Number(source[id]) || 0))
     const targets = []
     for (const plot of plots) {
-      if (plot === null || typeof plot !== 'object' || plot.stage !== 'empty') continue
-      const cropId = CROP_IDS.find((id) => seeds[id] > 0)
+      if (plot === null || typeof plot !== 'object') continue
+      if (plot.stage !== 'empty' && plot.stage !== 'withered') continue
+      const cropId = CROP_IDS.find((id) => seeds[id] > 0 && seedAvailability(id, season).plantable === true)
       if (cropId === undefined) break
       seeds[cropId] -= 1
       targets.push({ plotId: plot.id, cropId })
@@ -685,6 +811,10 @@
     neighborSwitch,
     progressOf,
     remainingAt,
+    seedAvailability,
+    seasonCalendar,
+    eventCard,
+    omenCard,
     tradeView,
     listingIsStale,
     plotCards,

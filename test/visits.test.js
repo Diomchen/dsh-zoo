@@ -177,6 +177,10 @@ test('文件写不进去：内存里仍有记录，只告警一次，后续追�
     t.skip('以 root 运行时 chmod 不可靠')
     return
   }
+  if (process.platform === 'win32') {
+    t.skip('Windows 的 chmod 不阻止写入')
+    return
+  }
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-visits-ro-'))
   t.after(async () => {
     await chmod(dir, 0o700)

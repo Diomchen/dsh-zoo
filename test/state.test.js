@@ -181,7 +181,7 @@ test('ticket 45：/state 的 farm / market / contracts 形状与 docs/protocol.m
   assert.equal(state.status, 200)
   assert.deepEqual(Object.keys(state.body.farm).sort(), [
     'coins', 'crops', 'dew', 'dewEarned', 'guard', 'hire', 'log', 'maxPlots', 'nextCost',
-    'plots', 'seeds', 'unlocked', 'worker'
+    'plots', 'season', 'seeds', 'unlocked', 'worker'
   ])
   assert.deepEqual(Object.keys(state.body.farm.plots[0]).sort(), [
     'crop', 'fertilized', 'growMs', 'grownMs', 'helpedBy', 'id', 'plantedAt', 'stolenBy', 'waterings'
