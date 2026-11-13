@@ -5,9 +5,9 @@
  * 概率复用农场的守卫值（主人在家 0.3、雇工 0.5、封顶 0.8），
  * 但来客不是偷菜：守卫成功 = 偷菜判定失败。
  *
- * 票 74 起四季各有一位来客；出现时间由 `omenWindowFor` 按「当天 + 来客 id」
- * 稳定地算出来，落在当天 00:00～21:00 之间，持续 3 小时。这样重启、换窗口、
- * 多开都不会让来客的时间漂移；同一天同一季的玩家看到的是同一个窗口。
+ * 票 74 起四季各有一位来客；蛙雨/野火在当天随机一个整分钟出现，熊獾/巨鹿固定在
+ * 本地 15:00 出现，二者都持续 3 小时。这样重启、换窗口、多开都不会让来客时间漂移；
+ * 同一天同一季的玩家看到的是同一个窗口。
  */
 import { HOUR_MS, MINUTE_MS } from './season-rules.js'
 import { stealSucceeds } from './farm-rules.js'
@@ -21,6 +21,7 @@ const DEFS = Object.freeze({
     emoji: '🐸',
     season: 'spring',
     tag: '春夜来客',
+    window: Object.freeze({ mode: 'random' }),
     guard: Object.freeze({
       label: '赶走',
       detail: '带人把蛙群赶回田外；失败会踩坏两块正在长的地。'
@@ -41,6 +42,7 @@ const DEFS = Object.freeze({
     emoji: '🔥',
     season: 'summer',
     tag: '夏夜来客',
+    window: Object.freeze({ mode: 'random' }),
     guard: Object.freeze({
       label: '隔离',
       detail: '抢在火势蔓延前清出隔离带；失败会烧掉两块成熟作物。'
@@ -61,6 +63,7 @@ const DEFS = Object.freeze({
     emoji: '🐻',
     season: 'autumn',
     tag: '秋夜来客',
+    window: Object.freeze({ mode: 'fixed', hour: 15 }),
     guard: Object.freeze({
       label: '守夜',
       detail: '按守卫成功率赌一把；失败会被搬走 5 个仓库作物。'
@@ -81,6 +84,7 @@ const DEFS = Object.freeze({
     emoji: '🦌',
     season: 'winter',
     tag: '冬夜来客',
+    window: Object.freeze({ mode: 'fixed', hour: 15 }),
     guard: Object.freeze({
       label: '硬扛',
       detail: '把巨鹿挡在田外；失败会冻住三块地，换季前不解冻就会冻死。'
@@ -155,6 +159,7 @@ export function omenFor (seasonId) {
     emoji: def.emoji,
     season: def.season,
     tag: def.tag,
+    window: def.window,
     windowMs: OMEN_WINDOW_MS,
     choices: choicesOf(def),
     stakes: stakesOf(def)
@@ -176,13 +181,20 @@ function hash32 (text) {
 }
 
 /**
- * 来客的出现窗口：当天 00:00～21:00 之间的某个整分钟，持续 3 小时。
- * 用「当天 start + 来客 id」做稳定散列，避免 Math.random 在重启后换时间。
+ * 蛙雨/野火：当天 00:00～21:00 之间的某个整分钟，持续 3 小时；用「当天 start + 来客 id」
+ * 做稳定散列，避免 Math.random 在重启后换时间。
+ * 熊獾/巨鹿：固定本地 15:00 开始，持续 3 小时。
  */
 export function omenWindowFor (season, meta = omenFor(season?.id)) {
   const start = Math.max(0, Math.floor(Number(season?.start) || 0))
   const end = Math.max(start, Math.floor(Number(season?.end) || start))
   if (meta === null || end <= start) return { start, end }
+  if (meta.window?.mode === 'fixed') {
+    const fixed = new Date(start)
+    fixed.setHours(Number(meta.window.hour) || 15, 0, 0, 0)
+    const from = Math.min(Math.max(start, fixed.getTime()), Math.max(start, end - OMEN_WINDOW_MS))
+    return { start: from, end: Math.min(end, from + OMEN_WINDOW_MS) }
+  }
   const room = Math.max(0, end - start - OMEN_WINDOW_MS)
   const slots = Math.floor(room / MINUTE_MS)
   const offset = slots > 0
