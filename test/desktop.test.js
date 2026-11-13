@@ -2298,6 +2298,15 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   assert.deepEqual(lookCommand.contracts?.outgoing, [])
   assert.deepEqual(lookCommand.contracts?.incoming, [])
 
+  // 票 59：运行时作物目录同样要过白名单——漏了 `crops` 时，`crops.json` 里手写的作物
+  //（2026-11-13 的「浆果」）在窗口里根本不出现，只有 HTTP 侧能买到。
+  const catalog = [{ id: 'berry', name: '浆果', growMs: 3600000, seedPrice: 12, yield: 4, base: 10, art: 'crops/berry.png' }]
+  assert.equal(manager.farmWindow({ open: true, farm, crops: catalog }), true)
+  assert.deepEqual(children[0].parsedLines().at(-1).crops, catalog)
+  // 没传就没有这个键（helper 会回落到内置表），不能变成 undefined 让 helper 判错。
+  assert.equal(manager.farmWindow({ open: true, farm }), true)
+  assert.equal('crops' in children[0].parsedLines().at(-1), false)
+
   assert.equal(manager.farmWindow({ open: false, farm }), true)
   assert.equal(children[0].parsedLines().at(-1).open, false)
   assert.equal('plotId' in children[0].parsedLines().at(-1), false)
