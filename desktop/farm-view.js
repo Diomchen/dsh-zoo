@@ -364,28 +364,74 @@
     }
   }
 
-  /** 票 69：秋天来客卡。选择与代价来自宿主，窗口不自己算概率。 */
+  /** 票 69/74：来客卡。四季共用同一张卡，文案/成本/代价全部由宿主给。 */
   function omenCard (omen) {
     if (omen === null || typeof omen !== 'object') return null
     const stakes = omen.stakes ?? {}
     const resolved = omen.resolved === true
-    const canFeed = omen.canFeed !== false
+    const active = omen.active === true
+    const choices = Array.isArray(omen.choices) ? omen.choices : []
+    const guardChoice = choices.find((choice) => choice.id === 'guard') ?? { id: 'guard', label: '守卫' }
+    const feedChoice = choices.find((choice) => choice.id === 'feed') ?? { id: 'feed', label: '安抚' }
+    const costText = (cost) => {
+      const parts = []
+      if (Number(cost?.crops) > 0) parts.push(Number(cost.crops) + ' 个仓库作物')
+      if (Number(cost?.dew) > 0) parts.push(Number(cost.dew) + ' 露水')
+      if (Number(cost?.coins) > 0) parts.push(Number(cost.coins) + ' 硬币')
+      return parts.join(' + ')
+    }
+    const rewardText = (reward) => {
+      const parts = []
+      if (Number(reward?.coins) > 0) parts.push('+' + Number(reward.coins) + ' 硬币')
+      if (Number(reward?.dew) > 0) parts.push('+' + Number(reward.dew) + ' 露水')
+      for (const [crop, qty] of Object.entries(reward?.seeds ?? {})) {
+        if (Number(qty) > 0) parts.push('+' + Number(qty) + ' 颗' + (cropMeta(crop)?.name ?? crop) + '种子')
+      }
+      return parts.join(' ')
+    }
+    const failText = (() => {
+      const parts = []
+      if (Number(stakes.failLoss) > 0) parts.push(Number(stakes.failLoss) + ' 个仓库作物')
+      if (Number(stakes.failWither) > 0) parts.push(Number(stakes.failWither) + ' 块' + (stakes.failMatureOnly === true ? '成熟' : '') + '地')
+      return parts.length === 0 ? '没有额外损失' : parts.join(' + ')
+    })()
+    const ignore = stakes.ignoreLoss ?? {}
+    const ignoreParts = []
+    if (Number(ignore.crops) > 0) ignoreParts.push(Number(ignore.crops) + ' 个作物')
+    if (Number(ignore.witherPlots) > 0) ignoreParts.push(Number(ignore.witherPlots) + ' 块地')
+    const cost = costText(stakes.feedCost)
+    const feedReward = rewardText(stakes.feedReward)
+    const guardReward = rewardText(stakes.guardReward)
+    const remaining = Number(omen.remainingMs)
     return {
       id: typeof omen.id === 'string' ? omen.id : '',
       name: typeof omen.name === 'string' ? omen.name : '来客',
       emoji: typeof omen.emoji === 'string' ? omen.emoji : '🐻',
+      tag: typeof omen.tag === 'string' ? omen.tag : '季候来客',
+      active,
       resolved,
       choice: typeof omen.choice === 'string' ? omen.choice : null,
-      canFeed,
-      detail: '秋夜来了位不速之客。守夜可能失败；投喂 3 个仓库作物稳过。',
-      guardText: '守夜成功 +' + (Number(stakes.guardReward?.coins) || 0) + ' 硬币 +' +
-        (Number(stakes.guardReward?.dew) || 0) + ' 露水；失败被搬走最多 ' + (Number(stakes.failLoss) || 0) + ' 个作物。',
-      feedText: '投喂 ' + (Number(stakes.feedCost) || 0) + ' 个仓库作物，换 ' +
-        (Number(stakes.feedReward?.seeds?.rice) || 0) + ' 颗稻种 +' +
-        (Number(stakes.feedReward?.dew) || 0) + ' 露水。',
+      canFeed: omen.canFeed !== false,
+      remainingText: active && Number.isFinite(remaining) && remaining > 0
+        ? '还剩 ' + formatRemaining(remaining)
+        : active ? '马上就走' : '窗口已关',
+      detail: active ? (omen.name + '在田边出现了。') : '它已经离开了。',
+      guardText: guardReward === '' ? '守卫成功没有奖励；失败损失 ' + failText + '。' : '守卫成功 ' + guardReward + '；失败损失 ' + failText + '。',
+      feedText: cost === '' ? feedChoice.label + '不花资源，稳过。' : feedChoice.label + ' ' + cost + (feedReward === '' ? '，稳过。' : '，换 ' + feedReward + '。'),
+      ignoreText: ignoreParts.length === 0 ? '' : '不管它：' + ignoreParts.join(' + ') + '。',
       actions: [
-        { id: 'guard', label: '守夜', disabled: resolved },
-        { id: 'feed', label: '投喂', disabled: resolved || !canFeed, reason: !canFeed ? '仓库作物不够 3 个' : '' }
+        {
+          id: 'guard',
+          label: guardChoice.label,
+          disabled: !active || resolved || guardChoice.affordable === false,
+          reason: guardChoice.reason ?? ''
+        },
+        {
+          id: 'feed',
+          label: feedChoice.label,
+          disabled: !active || resolved || feedChoice.affordable === false,
+          reason: feedChoice.reason ?? ''
+        }
       ]
     }
   }

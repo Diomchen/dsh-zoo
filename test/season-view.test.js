@@ -79,24 +79,29 @@ test('omenCard：仓库不够时投喂不可点，已结算时两个选择都不
     id: 'autumn-bearger',
     name: '熊獾',
     emoji: '🐻',
+    active: true,
     resolved: false,
     canFeed: false,
+    choices: [
+      { id: 'guard', label: '守夜', affordable: true, reason: '' },
+      { id: 'feed', label: '投喂', affordable: false, reason: '仓库作物不够 3 个' }
+    ],
     stakes: {
       guardReward: { coins: 40, dew: 3 },
       failLoss: 3,
-      feedCost: 3,
+      feedCost: { crops: 3, dew: 0, coins: 0 },
       feedReward: { coins: 0, dew: 2, seeds: { rice: 1 } },
-      ignoreLoss: 1
+      ignoreLoss: { crops: 1, witherPlots: 0 }
     }
   })
   assert.equal(card.actions[0].disabled, false)
   assert.equal(card.actions[1].disabled, true)
   assert.equal(card.actions[1].reason, '仓库作物不够 3 个')
   assert.match(card.guardText, /40 硬币/)
-  assert.match(card.feedText, /1 颗稻种/)
+  assert.match(card.feedText, /1 颗稻米种子/)
 
   const done = view.omenCard({
-    id: 'autumn-bearger', name: '熊獾', resolved: true, choice: 'guard', canFeed: true, stakes: {}
+    id: 'autumn-bearger', name: '熊獾', active: true, resolved: true, choice: 'guard', canFeed: true, stakes: {}
   })
   assert.equal(done.actions.every((entry) => entry.disabled), true)
 })

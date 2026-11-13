@@ -473,16 +473,17 @@ function renderEventCard (season) {
 function renderOmenCard (season) {
   if (omenCardEl === null) return
   const card = view.omenCard(season?.omen)
-  if (card === null || mode !== 'owner') {
+  if (card === null || card.active !== true || mode !== 'owner') {
     omenCardEl.hidden = true
     replaceContent(omenCardEl)
     return
   }
   omenCardEl.hidden = false
-  omenCardEl.title = [card.detail, card.guardText, card.feedText].filter(Boolean).join('\n')
-  const head = seasonCardHead(card, '秋天来客')
+  omenCardEl.title = [card.detail, card.guardText, card.feedText, card.ignoreText, card.remainingText]
+    .filter(Boolean).join('\n')
+  const head = seasonCardHead(card, card.tag || '季候来客')
   const detail = document.createElement('p')
-  detail.textContent = card.detail
+  detail.textContent = card.detail + ' ' + card.remainingText
   const guard = document.createElement('p')
   guard.textContent = card.guardText
   const feed = document.createElement('p')
@@ -907,11 +908,16 @@ function renderLog () {
       text.textContent = '换季枯萎了 ' + (Number(entry.qty) || 1) + ' 株四季作物'
     } else if (entry.kind === 'omen') {
       const lost = Number(entry.qty) || 0
+      const wither = Number(entry.wither) || 0
+      const name = who === '' ? '来客' : who
       const choice = entry.choice === 'feed'
-        ? '投喂了来客'
-        : entry.choice === 'guard' ? '守夜' : '没来得及处理来客'
-      text.textContent = who + choice +
-        (entry.success === true ? '，平安过关' : lost > 0 ? '，被搬走 ' + lost + ' 个作物' : '，没有损失')
+        ? '安抚了' + name
+        : entry.choice === 'guard' ? '赶走了' + name : name + '没被处理'
+      const damage = []
+      if (lost > 0) damage.push('被拿走 ' + lost + ' 个作物')
+      if (wither > 0) damage.push(wither + ' 块地枯萎')
+      text.textContent = choice +
+        (entry.success === true ? '，平安过关' : damage.length > 0 ? '，' + damage.join('，') : '，没有损失')
     } else if (entry.kind === 'steal' && Number(entry.qty) === 0) {
       text.textContent = who === '' ? '被抓住了' : who + '被抓住了'
     } else if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
@@ -2041,6 +2047,7 @@ seasonCardsEl?.addEventListener('click', (event) => {
       choice: action === 'omen-guard' ? 'guard' : 'feed',
       expectedStart: season.start
     })
+    return
   }
 })
 

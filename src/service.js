@@ -67,7 +67,6 @@ import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
 import { createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
 import { openFarmView } from './farm-open.js'
-import { OMEN_IGNORE_LOSS } from './season-omens.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
@@ -1421,8 +1420,9 @@ export function createService (ctx, options = {}) {
     const now = seasonNow()
     const current = season.view(now)
     const omen = current?.omen ?? null
-    if (omen === null) return seasonActionError('omen-resolved')
+    if (omen === null) return seasonActionError('omen-inactive')
     if (omen.resolved === true) return seasonActionError('omen-resolved')
+    if (omen.active !== true) return seasonActionError('omen-inactive')
     if (body?.expectedStart !== undefined && body?.expectedStart !== null &&
       String(body.expectedStart) !== String(current.start)) {
       return seasonActionError('stale-season')
@@ -1430,12 +1430,34 @@ export function createService (ctx, options = {}) {
 
     const choice = body?.choice
     if (choice !== 'guard' && choice !== 'feed') return seasonActionError('bad-choice')
+    const stakes = omen.stakes ?? {}
+    const cost = choice === 'feed'
+      ? { crops: 0, dew: 0, coins: 0, ...(stakes.feedCost ?? {}) }
+      : { crops: 0, dew: 0, coins: 0 }
 
-    // 投喂先扣 3 个；库存不够就明确拒绝，不动 season.json。
+    // 票 74：四季来客都可能收露水/硬币/作物。先扣成本，任何一步不够就原样退回。
+    const paid = { crops: 0, dew: 0, coins: 0 }
     let taken = null
-    if (choice === 'feed') {
-      taken = await farm.takeCrops(omen.stakes.feedCost)
+    if (cost.crops > 0) {
+      taken = await farm.takeCrops(cost.crops)
       if (!taken.ok) return seasonActionError(taken.error)
+      paid.crops = taken.qty
+    }
+    if (cost.dew > 0) {
+      const spent = await farm.spendDew(cost.dew)
+      if (!spent.ok) {
+        await restoreOmenCost(paid, taken)
+        return seasonActionError(spent.error)
+      }
+      paid.dew = cost.dew
+    }
+    if (cost.coins > 0) {
+      const spent = await farm.spendCoins(cost.coins)
+      if (!spent.ok) {
+        await restoreOmenCost(paid, taken)
+        return seasonActionError(spent.error)
+      }
+      paid.coins = cost.coins
     }
 
     const resolved = await season.resolveOmen(choice, {
@@ -1444,44 +1466,87 @@ export function createService (ctx, options = {}) {
       now
     })
     if (!resolved.ok) {
-      await restoreTaken(taken)
+      await restoreOmenCost(paid, taken)
       return seasonActionError(resolved.code)
     }
 
     const outcome = resolved.outcome
     let lost = 0
-    if (outcome.loss > 0) {
-      // 中惩罚：最多搬走 3 个；仓库不够就搬现有的，不挡结算。
-      const loss = await farm.takeCrops(outcome.loss, { allowPartial: true })
-      if (loss.ok) lost = loss.qty
+    let withered = 0
+    const loss = outcome.loss ?? {}
+    if (loss.crops > 0) {
+      const crops = await farm.takeCrops(loss.crops, { allowPartial: true })
+      if (crops.ok) lost = crops.qty
+    }
+    if (loss.witherPlots > 0) {
+      const plots = await farm.witherPlots(loss.witherPlots, { matureOnly: loss.matureOnly === true })
+      if (plots.ok) withered = plots.qty
+    }
+    // 没有可枯萎的地（或野火没烧到成熟作物）时，保底扣 1 个仓库作物，
+    // 避免四季来客失败变成“什么都没发生”。
+    if (lost === 0 && withered === 0 && (outcome.loss?.crops > 0 || outcome.loss?.witherPlots > 0)) {
+      const fallback = await farm.takeCrops(1, { allowPartial: true })
+      if (fallback.ok) lost = fallback.qty
     }
     if (outcome.reward.coins > 0) await farm.addCoins(outcome.reward.coins)
     if (outcome.reward.dew > 0) await farm.refundDew(outcome.reward.dew)
     for (const [cropId, qty] of Object.entries(outcome.reward.seeds ?? {})) {
       if (qty > 0) await farm.addSeed(cropId, qty)
     }
-    await farm.noteOmen({ choice, success: outcome.success, loss: lost, who: '熊獾' })
+    await farm.noteOmen({
+      choice,
+      success: outcome.success,
+      loss: lost,
+      wither: withered,
+      who: omen.name
+    })
     refreshFarmWindow()
 
+    const rewardText = omenRewardText(outcome.reward)
+    const lossText = omenLossText(lost, withered)
     const notice = choice === 'feed'
-      ? '熊獾吃饱走了：+1 稻种 +2 露水。'
+      ? omen.name + '离开了' + (rewardText === '' ? '。' : '：' + rewardText + '。')
       : outcome.success
-        ? '熊獾被守夜赶走了：+40 硬币 +3 露水。'
-        : '熊獾闯进来了：被搬走 ' + lost + ' 个作物。'
+        ? omen.name + '被赶走了' + (rewardText === '' ? '。' : '：' + rewardText + '。')
+        : omen.name + '闯进来了' + (lossText === '' ? '。' : '：' + lossText + '。')
     return {
       ok: true,
       action: 'farm-omen-resolve',
       omen: season.view(now).omen,
-      outcome: { ...outcome, loss: lost },
+      outcome: { ...outcome, loss: lost, wither: withered },
       notice
     }
   }
 
+  function omenRewardText (reward) {
+    const parts = []
+    if (reward.coins > 0) parts.push('+' + reward.coins + ' 硬币')
+    if (reward.dew > 0) parts.push('+' + reward.dew + ' 露水')
+    for (const [cropId, qty] of Object.entries(reward.seeds ?? {})) {
+      if (qty > 0) parts.push('+' + qty + ' 颗' + cropId + '种子')
+    }
+    return parts.join(' ')
+  }
+
+  function omenLossText (lost, withered) {
+    const parts = []
+    if (lost > 0) parts.push('被拿走 ' + lost + ' 个作物')
+    if (withered > 0) parts.push(withered + ' 块地枯萎')
+    return parts.join('，')
+  }
+
+  async function restoreOmenCost (paid, taken) {
+    if (paid.crops > 0) await restoreTaken(taken)
+    if (paid.dew > 0) await farm.refundDew(paid.dew)
+    if (paid.coins > 0) await farm.addCoins(paid.coins)
+  }
+
   /**
-   * 票 68：季节 + 今日节日 + 秋天来客的唯一出口。
+   * 票 68/74：季节 + 今日节日 + 当季来客的唯一出口。
    * season.json 起不来时仍返回纯日期季节（event/omen 为 null），窗口不会整块空掉。
+   * `farmView` 可传农场快照，用来算来客选项是否付得起。
    */
-  function seasonView (crops = null) {
+  function seasonView (farmView = null) {
     const now = seasonNow()
     const computed = seasonAt(now)
     if (computed === null) return null
@@ -1490,9 +1555,37 @@ export function createService (ctx, options = {}) {
     if (view === null) {
       view = { ...computed, calendar: calendarFor(computed.id), event: null, omen: null }
     }
+    // 来客是限时窗口：窗口外不把卡片下发给界面，也不能结算。
+    if (view.omen && view.omen.active !== true) view = { ...view, omen: null }
     if (view.omen !== null && view.omen !== undefined) {
-      const total = Object.values(crops ?? {}).reduce((sum, qty) => sum + Math.max(0, Number(qty) || 0), 0)
-      view = { ...view, omen: { ...view.omen, canFeed: total >= view.omen.stakes.feedCost } }
+      const crops = farmView?.crops ?? {}
+      const total = Object.values(crops).reduce((sum, qty) => sum + Math.max(0, Number(qty) || 0), 0)
+      const coins = Math.max(0, Number(farmView?.coins) || 0)
+      const dew = Math.max(0, Number(farmView?.dew) || 0)
+      const choices = (view.omen.choices ?? []).map((choice) => {
+        const cost = choice.id === 'feed'
+          ? { crops: 0, dew: 0, coins: 0, ...(view.omen.stakes?.feedCost ?? {}) }
+          : { crops: 0, dew: 0, coins: 0 }
+        const missing = []
+        if (cost.crops > total) missing.push('仓库作物不够 ' + cost.crops + ' 个')
+        if (cost.dew > dew) missing.push('露水不够 ' + cost.dew + ' 点')
+        if (cost.coins > coins) missing.push('硬币不够 ' + cost.coins + ' 枚')
+        return {
+          ...choice,
+          cost,
+          affordable: missing.length === 0,
+          reason: missing.join('，')
+        }
+      })
+      const feed = choices.find((choice) => choice.id === 'feed')
+      view = {
+        ...view,
+        omen: {
+          ...view.omen,
+          choices,
+          canFeed: feed?.affordable !== false
+        }
+      }
     }
     return view
   }
@@ -1521,7 +1614,7 @@ export function createService (ctx, options = {}) {
       guard: farmGuard().guard,
       worker: workerOf(),
       hire: view.hire,
-      season: seasonView(view.crops),
+      season: seasonView(view),
       log: view.log.slice(0, FARM_LOG_VIEW_LIMIT)
     }
   }
@@ -1696,7 +1789,7 @@ export function createService (ctx, options = {}) {
         : Math.min(MAX_CONTRACTS_PER_SIDE, contracts.outgoing().length + contracts.incoming().length),
       hire: { ...view.hire },
       guard: farmGuard().guard,
-      season: seasonView(view.crops),
+      season: seasonView(view),
       // 记录页要完整的一份（≤100）；`/state.farm.log` 仍按 SPEC 只给 20。
       log: view.log.slice(0, FARM_LOG_WINDOW_LIMIT),
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
@@ -5106,21 +5199,35 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 票 68：换日结算。节日进度由 season.settle 重置；上一秋没处理的熊獾
-   * 在这里补一次「没管它」的代价（中惩罚：最多 1 个仓库作物）。
+   * 票 68/74：换日/来客到期结算。节日进度由 season.settle 重置；
+   * 错过窗口的来客在这里补一次「没管它」的代价（作物或地块枯萎）。
    * 只影响这一拍，异常由 tick 的 catch 统一记日志。
    */
   async function settleSeasonTick (now) {
     if (season === null) return
     const result = await season.settle(now)
-    if (result.unresolvedOmen === null) return
+    const unresolved = result.unresolvedOmen
+    if (unresolved === null) return
+    const name = unresolved.meta?.name ?? '来客'
+    const loss = unresolved.meta?.stakes?.ignoreLoss ?? { crops: 1, witherPlots: 0 }
     let lost = 0
+    let withered = 0
     if (farm !== null) {
-      const taken = await farm.takeCrops(OMEN_IGNORE_LOSS, { allowPartial: true })
-      if (taken.ok) lost = taken.qty
-      await farm.noteOmen({ choice: 'ignore', success: false, loss: lost, who: '熊獾' })
+      if (loss.crops > 0) {
+        const taken = await farm.takeCrops(loss.crops, { allowPartial: true })
+        if (taken.ok) lost = taken.qty
+      }
+      if (loss.witherPlots > 0) {
+        const plots = await farm.witherPlots(loss.witherPlots)
+        if (plots.ok) withered = plots.qty
+      }
+      if (lost === 0 && withered === 0) {
+        const fallback = await farm.takeCrops(1, { allowPartial: true })
+        if (fallback.ok) lost = fallback.qty
+      }
+      await farm.noteOmen({ choice: 'ignore', success: false, loss: lost, wither: withered, who: name })
     }
-    log?.info?.('熊獾没被处理，换季后搬走了 ' + lost + ' 个作物')
+    log?.info?.(name + '没被处理，离开了（作物 -' + lost + '，地块枯萎 ' + withered + '）')
     refreshFarmWindow()
   }
 

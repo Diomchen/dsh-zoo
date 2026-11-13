@@ -17,6 +17,7 @@ import {
 import {
   freshOmen,
   normalizeOmen,
+  omenFor,
   omenView as buildOmenView,
   resolveOmen as resolveOmenRule
 } from './season-omens.js'
@@ -188,7 +189,7 @@ class SeasonStore {
       ...season,
       calendar: calendarFor(season.id),
       event: eventView(this.#state, season),
-      omen: this.#omenView(season)
+      omen: this.#omenView(season, now)
     }
   }
 
@@ -220,8 +221,9 @@ class SeasonStore {
   }
 
   /**
-   * 换日结算：重置节日，并报告上一季没处理的来客。
+   * 换日/来客到期结算：重置节日，并报告已经错过窗口的来客。
    * 返回 `{ changed, eventReset, unresolvedOmen }`，由 service 决定发什么日志/扣多少。
+   * 票 74 起来客只持续 3 小时，所以同一个季节内也会到期。
    */
   async settle (now = this.#now()) {
     const before = this.#state.event.start
@@ -229,26 +231,42 @@ class SeasonStore {
     this.#ensure(now)
     const changed = this.#state.event.start !== before
     const season = seasonAt(now)
-    const unresolved = beforeOmen !== null &&
-      beforeOmen.resolved !== true &&
-      (season?.id !== 'autumn' || season.start !== beforeOmen.start)
-      ? { ...beforeOmen }
-      : null
+    let unresolved = null
+    if (beforeOmen !== null && beforeOmen.resolved !== true) {
+      const meta = omenFor(beforeOmen.season) ?? omenFor(season?.id)
+      const wrongDay = season === null || beforeOmen.day !== season.start
+      const expired = now >= beforeOmen.end
+      if (meta !== null && (wrongDay || expired)) {
+        unresolved = { ...beforeOmen, meta }
+        // 换季时 #ensure 已经放进新一季的来客；不要把新来客一起清掉。
+        // 同一天窗口结束时则标记为已错过：不能清成 null，否则下一次 view
+        // 会重新生成同一个（已经过期的）来客，settle 会每 tick 重复扣罚。
+        if (this.#state.omen?.day === beforeOmen.day) {
+          this.#state.omen = {
+            ...beforeOmen,
+            resolved: true,
+            choice: null,
+            result: { success: false, ignored: true }
+          }
+        }
+      }
+    }
     if (changed || unresolved !== null) await this.#persist(true, now)
     return { changed, eventReset: changed, unresolvedOmen: unresolved }
   }
 
   /**
-   * 票 67：结算熊獾。调用方负责先扣投喂成本、后发奖励；
-   * 这里只把 choice/result 落到 season.json，保证同一天只能处理一次。
+   * 票 67/74：结算一位来客。调用方负责先扣成本、后发奖励；
+   * 这里只把 choice/result 落到 season.json，保证同一个窗口只能处理一次。
    */
   async resolveOmen (choice, { guard = 0, random = Math.random, now = this.#now() } = {}) {
     this.#ensure(now)
     const omen = this.#state.omen
     if (omen === null) return { ok: false, code: 'omen-resolved' }
     if (omen.resolved === true) return { ok: false, code: 'omen-resolved' }
+    if (buildOmenView(omen, now)?.active !== true) return { ok: false, code: 'omen-inactive' }
 
-    const outcome = resolveOmenRule(choice, { guard, random })
+    const outcome = resolveOmenRule(choice, { guard, random, now, omen })
     if (!outcome.ok) return outcome
 
     this.#state.omen = {
@@ -269,10 +287,10 @@ class SeasonStore {
     return { ok: true, omen: this.#omenView(seasonAt(now)), outcome }
   }
 
-  /** 票 67：熊獾卡片；service 再补 `canFeed`。 */
-  #omenView (season) {
-    if (season?.id !== 'autumn') return null
-    return buildOmenView(this.#state.omen)
+  /** 票 67/74：来客卡片；service 再补 `canFeed`/选择是否付得起。 */
+  #omenView (season, now) {
+    if (omenFor(season?.id) === null) return null
+    return buildOmenView(this.#state.omen, now)
   }
 
   #ensure (now) {
@@ -283,9 +301,12 @@ class SeasonStore {
     if (event.start !== season.start || event.id !== (expectedEvent?.id ?? null)) {
       this.#state.event = freshEvent(season, now)
     }
-    if (season.id !== 'autumn') {
+    const expectedOmen = omenFor(season.id)
+    if (expectedOmen === null) {
       this.#state.omen = null
-    } else if (this.#state.omen === null || this.#state.omen.start !== season.start) {
+    } else if (this.#state.omen === null ||
+      this.#state.omen.day !== season.start ||
+      this.#state.omen.id !== expectedOmen.id) {
       this.#state.omen = freshOmen(season)
     }
   }
