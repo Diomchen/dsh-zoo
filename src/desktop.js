@@ -625,6 +625,11 @@ export function createDesktop (options = {}) {
       farm: payload?.farm ?? null,
       market: payload?.market ?? null,
       contracts: payload?.contracts ?? null,
+      // 票 59：运行时作物目录。以前这条白名单只放 owner/visitor/farm/market/visit（后来补了
+      // look/neighbors），`crops` 一直没放进来 —— 于是 `farmWindowPayload()` 里明明算好了
+      // 目录，窗口收到的永远是内置六种，自定义作物（crops.json 里手写的）在界面上根本不出现，
+      // 只能在 HTTP 侧买到。2026-11-13 加「浆果」时踩到。
+      crops: Array.isArray(payload?.crops) ? payload.crops : null,
       visit: payload?.visit ?? null,
       look: payload?.look ?? null,
       neighbors: Array.isArray(payload?.neighbors) ? payload.neighbors : [],
