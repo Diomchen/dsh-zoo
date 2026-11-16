@@ -603,6 +603,211 @@ test('票 84：周期页签的 DOM 接线（容器/键盘顺序/提示行）在�
   assert.doesNotMatch(script, /api\.submit\(\{[^}]*timeframe/)
 })
 
+test('票 87：价格轴 4–5 档、时间轴 3–5 个刻度，格式按周期走（15 分/1 时/1 日/1 周）', () => {
+  const full = tfPayload()
+  const expectedTimeShape = {
+    // 15 分写一根的起–止（工单示例 11:30–11:45），1 时只写起点，1 日/1 周写日期。
+    '15m': /^\d{2}:\d{2}–\d{2}:\d{2}$/,
+    '1h': /^\d{2}:\d{2}$/,
+    '1d': /^\d{1,2}月\d{1,2}日$/,
+    '1w': /^\d{1,2}月\d{1,2}日$/
+  }
+  for (const timeframe of ['15m', '1h', '1d', '1w']) {
+    const chart = view.chartView(full, { crop: 'tomato', timeframe })
+    const geometry = chart.geometry
+    assert.equal(geometry.width, view.CHART_WIDTH, timeframe + ' 图宽')
+    assert.equal(geometry.height, view.CHART_HEIGHT, timeframe + ' 图高')
+    // 价格轴：4–5 档，落在定义域里，文案与 formatPrice 同一口径。
+    assert.ok(geometry.priceTicks.length >= 4 && geometry.priceTicks.length <= 5, timeframe)
+    for (const tick of geometry.priceTicks) {
+      assert.equal(tick.text, view.formatPrice(tick.value))
+      assert.ok(tick.value >= geometry.domain.min && tick.value <= geometry.domain.max)
+      assert.ok(tick.y >= geometry.plot.top && tick.y <= geometry.plot.top + geometry.plot.height)
+    }
+    // 时间轴：3–5 个，x 在绘图区里，首尾贴边不越界。
+    assert.ok(geometry.timeTicks.length >= 3 && geometry.timeTicks.length <= 5, timeframe)
+    for (const tick of geometry.timeTicks) {
+      assert.match(tick.text, expectedTimeShape[timeframe], timeframe + ' 的刻度文案')
+      assert.ok(tick.x >= geometry.plot.left && tick.x <= geometry.plot.left + geometry.plot.width)
+    }
+    assert.equal(geometry.timeTicks[0].anchor, 'start')
+    assert.equal(geometry.timeTicks.at(-1).anchor, 'end')
+    // chartAxes 是公开入口：DOM 只读，不在窗口里重算一遍。
+    assert.deepEqual(view.chartAxes(geometry, timeframe).price, geometry.priceTicks)
+  }
+  // 固定日期（本地时区）的标签与工单示例一致。
+  assert.equal(view.timeTickLabelOf('1h', TF_START['1h'], TF_START['1h'] + HOUR_MS), '14:00')
+  assert.equal(view.timeTickLabelOf('1d', TF_START['1d'], TF_START['1d'] + TF_SPAN['1d']), '11月16日')
+  assert.equal(view.timeTickLabelOf('1w', TF_START['1w'], TF_START['1w'] + TF_SPAN['1w']), '11月10日')
+  assert.equal(view.timeTickLabelOf('15m', TF_START['1h'], TF_START['1h'] + SLOT_MS), '14:00–14:15')
+})
+
+test('票 87：蜡烛几何有圆角实体/圆头影线/确定性笔触，实体不重叠且都在绘图区里', () => {
+  const geometry = view.chartView(tfPayload(), { crop: 'tomato' }).geometry
+  const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
+  assert.equal(candles.length, 25)
+  const wickWidths = new Set()
+  const radii = new Set()
+  const tilts = new Set()
+  for (let index = 0; index < candles.length; index += 1) {
+    const candle = candles[index]
+    assert.ok(candle.x >= geometry.plot.left, index + ' 左边界')
+    assert.ok(candle.x + candle.width <= geometry.plot.left + geometry.plot.width, index + ' 右边界')
+    // 圆角实体 + 圆头影线：DOM 直接吃这些字段，不再自己夹范围。
+    assert.ok(candle.sketch.bodyRadius >= 2 && candle.sketch.bodyRadius <= 3)
+    assert.ok(candle.sketch.wickWidth >= 1.2 && candle.sketch.wickWidth <= 2)
+    assert.ok(candle.sketch.bodyStrokeWidth >= 0.6 && candle.sketch.bodyStrokeWidth <= 1.2)
+    assert.ok(candle.sketch.tilt >= -1 && candle.sketch.tilt <= 1)
+    assert.equal(geometry.sketch.lineCap, 'round')
+    assert.ok(candle.bodyHeight >= 1)
+    wickWidths.add(candle.sketch.wickWidth)
+    radii.add(candle.sketch.bodyRadius)
+    tilts.add(candle.sketch.tilt)
+    if (index > 0) {
+      const previous = candles[index - 1]
+      assert.ok(candle.x > previous.x + previous.width, '相邻实体不能重叠')
+    }
+    // 同一根重算两次必须完全一致（截图/测试才可复现）。
+    assert.deepEqual(
+      view.candleSketchOf(candle.index, candle.slot),
+      candle.sketch
+    )
+  }
+  // 有粗有细、有正有歪，才像一支笔画出来的；但范围固定。
+  assert.ok(wickWidths.size > 1, '影线粗细要有变化')
+  assert.ok(radii.size > 1, '圆角要有变化')
+  assert.ok(tilts.size > 1, '倾斜要有变化')
+  // 滤镜参数固定、只引用一次 `url(#sketch-ink)`（DOM 层断言在下面）。
+  assert.equal(geometry.sketch.filterId, 'sketch-ink')
+  assert.ok(geometry.sketch.scale >= 1.2 && geometry.sketch.scale <= 1.8)
+  assert.ok(Number.isInteger(geometry.sketch.seed))
+  assert.equal(geometry.sketch.filter, 'url(#sketch-ink)')
+  assert.equal(geometry.priceTicks.length, 5)
+})
+
+test('票 87：现价胶囊跟随最后一根，引线从蜡烛指到轴槽里的贴纸', () => {
+  const withForming = view.chartView(tfPayload(), { crop: 'tomato' }).geometry
+  const tag = withForming.priceTag
+  assert.equal(tag.text, view.formatPrice(withForming.forming.price))
+  assert.equal(tag.value, withForming.forming.price)
+  assert.equal(tag.tone, withForming.forming.up ? 'up' : 'down')
+  // 贴纸留在画布内、贴着右侧价格轴；引线从最后一根出发。
+  assert.ok(tag.x >= withForming.plot.left + withForming.plot.width)
+  assert.ok(tag.x + tag.width <= withForming.width)
+  assert.ok(tag.y >= withForming.plot.top)
+  assert.ok(tag.y + tag.height <= withForming.plot.top + withForming.plot.height)
+  assert.equal(tag.leader.x1, withForming.forming.centerX)
+  assert.ok(tag.leader.y1 >= withForming.forming.wickTop)
+  assert.ok(tag.leader.y1 <= withForming.forming.wickBottom)
+  assert.equal(tag.leader.x2, tag.x)
+  // 没有 forming（契约收盘后那一瞬）仍跟最后一根的收盘价。
+  const closed = view.chartGeometry({
+    base: 5,
+    bars: [
+      { slot: 1, start: 0, end: SLOT_MS, open: 5, high: 5.2, low: 4.9, close: 5.1 },
+      { slot: 2, start: SLOT_MS, end: 2 * SLOT_MS, open: 5.1, high: 5.3, low: 5, close: 5.25 }
+    ]
+  }, { padding: view.CHART_AXIS_PADDING })
+  assert.equal(closed.priceTag.value, 5.25)
+  assert.equal(closed.priceTag.text, '5.25')
+  assert.equal(view.priceTagOf(view.chartGeometry({ base: 5, bars: [] })), null)
+})
+
+test('票 87：十字线吸附最近一根、便签写时间与开高低收，坐标夹在绘图区里', () => {
+  const geometry = view.chartView(tfPayload(), { crop: 'tomato' }).geometry
+  const target = geometry.bars[5]
+  const hit = view.crosshairAt(geometry, target.centerX + 2, geometry.plot.top + 40)
+  assert.ok(hit)
+  assert.equal(hit.index, 5)
+  assert.equal(hit.x, target.centerX)
+  assert.equal(hit.y, geometry.plot.top + 40)
+  assert.equal(hit.timeText, view.timeLabelOf('15m', target.start, target.end))
+  assert.match(hit.text, /开 5\.00/)
+  assert.match(hit.text, /高 5\.20/)
+  assert.match(hit.text, /低 4\.90/)
+  assert.match(hit.text, /收 5\.10/)
+  assert.ok(hit.text.includes(hit.timeText), '便签文案必须带这一根的时间')
+  assert.deepEqual(hit.rows.map((row) => row.label), ['开', '高', '低', '收'])
+  assert.deepEqual(hit.rows.map((row) => row.text), ['5.00', '5.20', '4.90', '5.10'])
+  // 便签整体夹在绘图区里：靠右翻到左边，靠上翻到下面，最后再夹一次。
+  for (const x of [geometry.plot.left, target.centerX, geometry.plot.left + geometry.plot.width - 1]) {
+    for (const y of [geometry.plot.top, geometry.plot.top + geometry.plot.height / 2,
+      geometry.plot.top + geometry.plot.height - 1]) {
+      const at = view.crosshairAt(geometry, x, y)
+      assert.ok(at.card.left >= geometry.plot.left)
+      assert.ok(at.card.left + at.card.width <= geometry.plot.left + geometry.plot.width)
+      assert.ok(at.card.top >= geometry.plot.top)
+      assert.ok(at.card.top + at.card.height <= geometry.plot.top + geometry.plot.height)
+    }
+  }
+  // 绘图区外（价格轴/时间轴/画布外）不画十字线。
+  assert.equal(view.crosshairAt(geometry, geometry.plot.left - 1, 100), null)
+  assert.equal(view.crosshairAt(geometry, geometry.plot.left + geometry.plot.width + 1, 100), null)
+  assert.equal(view.crosshairAt(geometry, NaN, 100), null)
+  assert.equal(view.crosshairAt(null, 100), null)
+  // 最后一根是形成中：便签收价用现价，标题标「进行中」。
+  const forming = view.crosshairAt(geometry, geometry.plot.left + geometry.plot.width - 2, 100)
+  assert.equal(forming.forming, true)
+  assert.equal(forming.rows[3].text, view.formatPrice(geometry.forming.price))
+  assert.match(forming.title, /进行中/)
+  assert.ok(forming.highlight.width >= target.width)
+})
+
+test('票 87：版面常量就是「上图下两列」，图 720×280，老 payload 也能画', async () => {
+  assert.equal(view.BOARD_WIDTH, 760)
+  assert.equal(view.BOARD_HEIGHT, 700)
+  assert.equal(view.CHART_WIDTH, 720)
+  assert.equal(view.CHART_HEIGHT, 280)
+  assert.deepEqual(view.LAYOUT.columns.left, ['positions', 'history'])
+  assert.deepEqual(view.LAYOUT.columns.right, ['order', 'league'])
+  assert.equal(view.LAYOUT.chart.fullWidth, true)
+
+  const board = view.boardView(tfPayload(), { crop: 'tomato', now: SLOT_EDGE })
+  assert.equal(board.chart.geometry.width, 720)
+  assert.equal(board.chart.geometry.height, 280)
+  assert.ok(board.chart.geometry.timeTicks.length >= 3)
+  // 老 payload（只有 charts，没有 timeframes/start/end）不抛：图照画，时间轴没数据就留空。
+  const legacy = view.boardView(payload(), { crop: 'tomato', now: SLOT_EDGE })
+  assert.equal(legacy.chart.hasChart, true)
+  assert.equal(legacy.chart.timeframe, '15m')
+  assert.doesNotMatch(legacy.chart.slotText, /第 \d+ 根/)
+  const legacyGeometry = legacy.chart.geometry
+  assert.ok(legacyGeometry.priceTicks.length >= 3)
+  // 坏包：没有图就是空态，几何为 null，不造 NaN 坐标。
+  assert.equal(view.boardView(payload({ charts: undefined }), { now: SLOT_EDGE }).chart.geometry, null)
+
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  // 图独占整行：grid 区域两列都叫 chart；旧的三块拼图布局不许回来。
+  assert.match(html, /grid-template-areas:\s*\n\s*'chart chart'/)
+  assert.doesNotMatch(html, /grid-template-areas:[\s\S]{0,80}'chart order'/)
+  assert.match(html, /class="card chart-card"/)
+  assert.match(html, /viewBox="0 0 720 280"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 280px/)
+  // 页面本身不滚（内层列表可以滚），窗口内容 760×700 内收住。
+  assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)
+  // 下单主按钮固定在卡片底部：滚动区只放控件，开仓按钮永远可见。
+  assert.match(html, /class="order-scroll"/)
+  assert.match(html, /class="order-actions"/)
+  assert.match(html, /id="submit"/)
+  // 手绘滤镜只引用一次；文字在独立清晰层，不套滤镜。
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /feTurbulence/)
+  assert.match(script, /feDisplacementMap/)
+  assert.equal((script.match(/filter: geometry\.sketch\.filter/g) ?? []).length, 1)
+  assert.match(script, /class: 'chart-crisp'/)
+  assert.match(script, /class: 'chart-ink'/)
+  // 轴、价格胶囊、参考线标签和十字线都有接线。
+  assert.match(script, /geometry\.priceTicks/)
+  assert.match(script, /geometry\.timeTicks/)
+  assert.match(script, /price-tag/)
+  assert.match(script, /ref-label/)
+  assert.match(script, /view\.crosshairAt/)
+  assert.match(script, /addEventListener\('pointermove'/)
+  assert.match(script, /addEventListener\('pointerleave'/)
+  assert.doesNotMatch(script, /console\.log/)
+})
+
+
 test('票 81：作物页签有三个、切换后价格/风向/图例都跟着换', () => {
   const board = view.boardView(payload(), { now: SLOT_EDGE + 5 * 60 * 1000 })
   assert.deepEqual(board.crops.map((crop) => crop.id), ['tomato', 'carrot', 'pumpkin'])
