@@ -503,8 +503,9 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   落到宿主的 `trading-*` 动作；结果走 `action-result`，成功不关窗，失败冒人话。
 - `dsh-zoo:board-ready` / `dsh-zoo:board-close` / `dsh-zoo:board-state` / `dsh-zoo:board-result`
   与农场窗同款；重画由宿主每分钟一拍 + 动作后的刷新推送，窗口自己只递减倒计时。
-- 键盘：Tab 顺序 = DOM 顺序（作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 →
-  挂单 → 开一手 → 撤单 → 持仓卡的止损/平仓），Enter/Space 是按钮原生行为，Esc 关窗。
+- 键盘：Tab 顺序由 `trading-view.js` 的纯函数 `focusOrder(payload)` 定义，`board.js` 按它
+  写真实 tabindex（× → 作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 → 挂单 →
+  开一手 → 撤单 → 持仓卡的止损/平仓）；Enter/Space 是按钮原生行为，Esc 关窗。
   **失焦不关窗**（macOS 中文输入法候选窗会抢焦点，和农场窗同一条取舍）。
 - ×、Esc 走窗口自己的 `dsh-zoo:board-close`；宿主只负责打开/刷新/显式 `close:true`。
   关窗后 host 继续每分钟撮合/结算，窗口不会因此停摆。

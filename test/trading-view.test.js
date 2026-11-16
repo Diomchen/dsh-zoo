@@ -581,6 +581,52 @@ test('票 82：真人周榜画分数/收益率/持仓摘要；收益率是比率
   assert.deepEqual(board.league.sentiment, { long: 2, short: 1, text: '多 2 · 空 1', tone: 'long' })
 })
 
+test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区 → 撤单 → 持仓卡', () => {
+  const order = {
+    id: ORDER_ID,
+    crop: 'tomato',
+    side: 'long',
+    target: 5.5,
+    margin: 50,
+    leverage: 5,
+    placedAt: SLOT_EDGE,
+    slot: SLOT,
+    remainingMs: 1
+  }
+  const position = {
+    id: 'p1',
+    crop: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 5,
+    entry: 5,
+    mark: 5,
+    pnl: 0,
+    liquidation: 4,
+    stopLoss: 0
+  }
+  const keys = view.focusOrder(payload({ orders: [order], positions: [position] }))
+  assert.deepEqual(keys, [
+    'close-button',
+    'crop:tomato', 'crop:carrot', 'crop:pumpkin',
+    'side:long', 'side:short',
+    'margin:50', 'margin:100', 'margin:250', 'margin:all-in',
+    'leverage:1', 'leverage:5', 'leverage:20',
+    'limit-toggle', 'limit-input', 'limit-place', 'submit',
+    'cancel:' + ORDER_ID,
+    'stop:p1', 'close:p1'
+  ])
+  // tabindex 只能给一个元素：顺序表里每个键唯一。
+  assert.equal(new Set(keys).size, keys.length)
+  // 老/坏 payload 退回兜底白名单，不抛；每一步都是窗口认得的键。
+  for (const bad of [null, undefined, 42, 'x', []]) {
+    const fallback = view.focusOrder(bad)
+    assert.equal(fallback[0], 'close-button')
+    assert.deepEqual(fallback.slice(-4), ['limit-toggle', 'limit-input', 'limit-place', 'submit'])
+    assert.equal(new Set(fallback).size, fallback.length)
+  }
+})
+
 test('术语 US19：邻居持仓 chips——最多 3 条 + 「+N」，空仓仍是观望', () => {
   const crowded = view.leagueView(payload({
     league: league({
@@ -883,6 +929,9 @@ test('User Story 30：盘口窗上写明「没有手续费、没有资金费、�
   // US19：榜行把 view 给的 chips 画出来（不是只画「多 N · 空 M」计数）。
   assert.match(script, /league-chips/)
   assert.match(script, /chipOverflowText/)
+  // 票 81 的键盘验收：Tab 顺序由纯函数给，窗口把它落到真实 tabindex。
+  assert.match(script, /view\.focusOrder\(payload\)/)
+  assert.match(script, /tabIndex = index/)
 })
 
 test('评审 P2：窗口兜底错误文案与 trading-text.js 同码同文（drift）', async () => {

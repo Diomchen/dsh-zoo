@@ -495,6 +495,8 @@ function focusKeyOf (element) {
   const data = element.dataset ?? {}
   if (data.crop !== undefined) return 'crop:' + data.crop
   if (data.side !== undefined) return 'side:' + data.side
+  // 「全下」的金额每包都变，用语义键记住焦点，别和同金额的预设按钮撞车。
+  if (data.allIn === 'true') return 'margin:all-in'
   if (data.margin !== undefined) return 'margin:' + data.margin
   if (data.leverage !== undefined) return 'leverage:' + data.leverage
   if (data.stop !== undefined) return 'stop:' + data.stop
@@ -514,20 +516,45 @@ const FOCUS_ROOTS = {
   cancel: ordersEl
 }
 
-function focusByKey (key) {
-  if (key === null) return
-  if (key === 'submit') return submitEl.focus({ preventScroll: true })
-  if (key === 'close-button') return closeButton.focus({ preventScroll: true })
-  if (key === 'limit-toggle') return limitToggleEl.focus({ preventScroll: true })
-  if (key === 'limit-input') return limitInputEl.focus({ preventScroll: true })
-  if (key === 'limit-place') return limitPlaceEl.focus({ preventScroll: true })
+/**
+ * 焦点键 → 真实控件（重画后按「身份」找回同一个按钮；找不到就 null）。
+ * `margin:all-in` 是语义键：金额每包都变，不能拿金额去找。
+ */
+function focusElementOf (key) {
+  if (key === null || key === undefined) return null
+  if (key === 'submit') return submitEl
+  if (key === 'close-button') return closeButton
+  if (key === 'limit-toggle') return limitToggleEl
+  if (key === 'limit-input') return limitInputEl
+  if (key === 'limit-place') return limitPlaceEl
+  if (key === 'margin:all-in') return marginRowEl.querySelector('[data-all-in="true"]')
   const separator = key.indexOf(':')
+  if (separator <= 0) return null
   const kind = key.slice(0, separator)
   const value = key.slice(separator + 1)
   const root = FOCUS_ROOTS[kind]
-  if (root === undefined) return
-  const target = root.querySelector('[data-' + kind + '="' + value + '"]')
-  if (target !== null) target.focus({ preventScroll: true })
+  if (root === undefined) return null
+  return root.querySelector('[data-' + kind + '="' + value + '"]')
+}
+
+function focusByKey (key) {
+  const element = focusElementOf(key)
+  if (element !== null) element.focus({ preventScroll: true })
+}
+
+/**
+ * 把 `view.focusOrder()` 的次序落到真实 DOM（评审 P2）：Tab 顺序不再只靠
+ * 「HTML 谁先写谁先被 tab」，纯函数在 Node 里能断言，窗口重画后也照同一份走。
+ * 顺序表覆盖了窗口里所有可聚焦控件；找不到的键（老包/列表为空）跳过。
+ */
+function applyTabOrder (payload) {
+  let index = 0
+  for (const key of view.focusOrder(payload)) {
+    const element = focusElementOf(key)
+    if (element === null) continue
+    index += 1
+    element.tabIndex = index
+  }
 }
 
 function render () {
@@ -555,6 +582,8 @@ function render () {
   leverage = board.order.leverage
   allIn = board.order.allIn
   crop = board.chart.crop
+  // Tab 顺序按纯视图给的逻辑顺序落到 tabindex（DOM 已全部建好）。
+  applyTabOrder(payload)
   if (!focusedOnce && payload !== null) {
     focusedOnce = true
     const first = cropTabsEl.querySelector('[data-crop]')
