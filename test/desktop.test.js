@@ -1925,16 +1925,32 @@ test('manager：bringWindow 把背包快照写进管道，路径不在命令里'
   const id = '88888888-8888-4888-8888-888888888888'
   assert.equal(manager.bringWindow({
     open: true,
-    items: [{ id, kind: 'text', text: '一条字条', state: 'idle' }]
+    items: [{ id, kind: 'text', text: '一条字条', state: 'idle' }],
+    packet: {
+      limits: { maxCoins: 200, maxPerCrop: 20, maxKinds: 5, maxNoteChars: 60 },
+      left: 3,
+      coins: 88,
+      crops: [{ id: 'tomato', name: '小番茄', have: 4 }],
+      seeds: [{ id: 'rice', name: '稻米', have: 2 }]
+    }
   }), true)
   const command = children[0].parsedLines().at(-1)
   assert.equal(command.type, 'bring-window')
   assert.equal(command.open, true)
   assert.deepEqual(command.items, [{ id, kind: 'text', text: '一条字条', state: 'idle' }])
   assert.equal(command.maxItems, shared.MAX_BACKPACK_ITEMS)
+  // 票 79：红包底数必须过这道白名单，否则窗口里作物/种子永远是空的
+  assert.deepEqual(command.packet, {
+    limits: { maxCoins: 200, maxPerCrop: 20, maxKinds: 5, maxNoteChars: 60 },
+    left: 3,
+    coins: 88,
+    crops: [{ id: 'tomato', name: '小番茄', have: 4 }],
+    seeds: [{ id: 'rice', name: '稻米', have: 2 }]
+  })
 
   assert.equal(manager.bringWindow({ open: false, items: [] }), true)
   assert.equal(children[0].parsedLines().at(-1).open, false)
+  assert.equal(children[0].parsedLines().at(-1).packet, undefined)
 })
 
 // ---------------------------------------------------------------------------
