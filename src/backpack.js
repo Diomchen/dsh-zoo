@@ -6,7 +6,9 @@ import { join } from 'node:path'
 
 import {
   MAX_GIFT_BYTES,
+  PACKET_LIMITS,
   isVisitId,
+  normalizePacketContents,
   sanitizeGiftName,
   sanitizeNote
 } from './protocol.js'
@@ -63,6 +65,17 @@ export function giftNameFromPath (filePath) {
 }
 
 /**
+ * 红包里的祝福语：可以没有；有就必须是清洗后的短句（与协议层同一个上限）。
+ * 返回 `''`（没写）或字符串；写了却放不下返回 null。
+ */
+export function normalizePacketNote (value) {
+  if (value === undefined || value === null) return ''
+  const text = sanitizeNote(value)
+  if (text === null) return null
+  return [...text].length > PACKET_LIMITS.maxNoteChars ? null : text
+}
+
+/**
  * 读回来的单件白名单。形状不对返回 null（跳过这一件），绝不把坏字段带进内存。
  * `at` 是 FIFO 的唯一依据，所以必须是正数；缺失/非法就丢掉这一件。
  */
@@ -87,6 +100,13 @@ export function normalizeBackpackItem (value) {
     if (path === null) return null
     const name = sanitizeGiftName(value.name) ?? giftNameFromPath(path)
     return { id, kind: 'file', path, name, at: Math.floor(at), state }
+  }
+  if (value.kind === 'packet') {
+    const packet = normalizePacketContents(value.packet)
+    if (packet === null) return null
+    const note = normalizePacketNote(value.note)
+    if (note === null) return null
+    return { id, kind: 'packet', packet, ...(note === '' ? {} : { note }), at: Math.floor(at), state }
   }
   return null
 }
@@ -148,6 +168,13 @@ export function normalizeBringInput (value) {
     if (path === null) return { ok: false, error: 'bad-gift' }
     return { ok: true, item: { kind: 'file', path } }
   }
+  if (value.kind === 'packet') {
+    const packet = normalizePacketContents(value.packet)
+    if (packet === null) return { ok: false, error: 'bad-gift' }
+    const note = normalizePacketNote(value.note)
+    if (note === null) return { ok: false, error: 'bad-gift' }
+    return { ok: true, item: { kind: 'packet', packet, ...(note === '' ? {} : { note }) } }
+  }
   return { ok: false, error: 'bad-gift' }
 }
 
@@ -176,9 +203,25 @@ function compareItems (left, right) {
 }
 
 function copyItem (item) {
-  return item.kind === 'file'
-    ? { id: item.id, kind: 'file', path: item.path, name: item.name, at: item.at, state: item.state }
-    : { id: item.id, kind: 'text', text: item.text, at: item.at, state: item.state }
+  if (item.kind === 'file') {
+    return { id: item.id, kind: 'file', path: item.path, name: item.name, at: item.at, state: item.state }
+  }
+  if (item.kind === 'packet') {
+    const copy = {
+      id: item.id,
+      kind: 'packet',
+      packet: {
+        coins: item.packet.coins,
+        crops: { ...item.packet.crops },
+        seeds: { ...item.packet.seeds }
+      },
+      at: item.at,
+      state: item.state
+    }
+    if (item.note !== undefined) copy.note = item.note
+    return copy
+  }
+  return { id: item.id, kind: 'text', text: item.text, at: item.at, state: item.state }
 }
 
 function errorName (error) {
@@ -278,7 +321,16 @@ class BackpackStore {
 
     const at = nextItemAt(this.#items)
     let item
-    if (clean.item.kind === 'text') {
+    if (clean.item.kind === 'packet') {
+      item = {
+        id: randomUUID(),
+        kind: 'packet',
+        packet: clean.item.packet,
+        ...(clean.item.note === undefined ? {} : { note: clean.item.note }),
+        at,
+        state: 'idle'
+      }
+    } else if (clean.item.kind === 'text') {
       item = {
         id: randomUUID(),
         kind: 'text',
@@ -436,6 +488,16 @@ class BackpackStore {
       return {
         ok: true,
         gift: { id: item.id, kind: 'text', text }
+      }
+    }
+    if (item.kind === 'packet') {
+      const packet = normalizePacketContents(item.packet)
+      if (packet === null) return { ok: false, error: 'bad-gift' }
+      const note = normalizePacketNote(item.note)
+      if (note === null) return { ok: false, error: 'bad-gift' }
+      return {
+        ok: true,
+        gift: { id: item.id, kind: 'packet', packet, ...(note === '' ? {} : { note }) }
       }
     }
     if (item.kind !== 'file' || typeof item.path !== 'string') {

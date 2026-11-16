@@ -11,6 +11,14 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.6.4 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.4.md`](releases/1.6.4.md)。
+
+带派新增**红包**：寄农场里的硬币/作物/种子，收件人点「拆开」才到账，24 小时没拆自动退回。
+协议多 `packet-return` / `packet-returned` 两个包类型，`farm.json` / `season.json` / `market.json`
+格式都没变；旧版本收到红包会当未知礼物退回，不会丢东西。
+
 ## 1.6.3 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.3.md`](releases/1.6.3.md)。
