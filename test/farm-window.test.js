@@ -397,7 +397,7 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   assert.deepEqual(window.market.index, Object.fromEntries(
     Object.keys(CROPS).map((cropId) => [
       cropId,
-      { price: CROPS[cropId].base, at: NOON, samples: 0, stale: false }
+      { price: CROPS[cropId].base, at: NOON, samples: 0, weight: 0, momentum: 0, stale: false }
     ])
   ))
   assert.equal('farm' in desktop.calls.scenes.at(-1).controls, false)
@@ -487,9 +487,14 @@ test('交易所页的局域网指数：新鲜时混进 bid，过期后标 stale 
 
   assert.equal((await callAction(service, { action: 'farm-open' })).body.ok, true)
   const fresh = desktop.calls.windows.at(-1).market
-  assert.deepEqual(fresh.index.tomato, { price: 5, at: NOON, samples: 3, stale: false })
-  // (0.85×10 + 0.15×5) × 0.9 = 7.7625 → 8
-  assert.equal(fresh.prices.tomato.bid, 8)
+  assert.equal(fresh.index.tomato.price, 5)
+  assert.equal(fresh.index.tomato.at, NOON)
+  assert.equal(fresh.index.tomato.samples, 3)
+  assert.equal(fresh.index.tomato.momentum, 0)
+  assert.equal(fresh.index.tomato.stale, false)
+  assert.ok(Math.abs(fresh.index.tomato.weight - 0.6) < 1e-12)
+  // 3 家邻居、番茄 beta 0.8 → 权重 0.6；(0.4×10 + 0.6×5) × 0.9 = 6.3 → 6
+  assert.equal(fresh.prices.tomato.bid, 6)
 
   // 2 分钟后：指数不再参与 bid，窗口拿到 stale:true 画灰。
   // 重新开窗拿一份新数据（ticket 46：再点一次「农场」是关窗，不会刷新）。
