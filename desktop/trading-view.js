@@ -373,7 +373,8 @@
       toNumber(bar.low) !== null && toNumber(bar.close) !== null
   }
 
-  function isCurrentLike (current) {
+  /** 当前这一根是「形成中」的 K 线：有开高低和现价（没有 close，收盘价要等结算）。 */
+  function isFormingBarLike (current) {
     if (current === null || typeof current !== 'object') return false
     return toNumber(current.open) !== null && toNumber(current.high) !== null &&
       toNumber(current.low) !== null && toNumber(current.price) !== null
@@ -389,7 +390,7 @@
   function chartGeometry (chart, options = {}) {
     if (chart === null || typeof chart !== 'object') return null
     const bars = (Array.isArray(chart.bars) ? chart.bars : []).filter(isBarLike)
-    const current = isCurrentLike(chart.current) ? chart.current : null
+    const current = isFormingBarLike(chart.current) ? chart.current : null
     const base = toNumber(chart.base)
     if (bars.length === 0 && current === null) return null
     const width = Math.max(80, toNumber(options.width) ?? CHART_WIDTH)
@@ -544,7 +545,7 @@
   function chartView (payload, { crop = null, width = CHART_WIDTH, height = CHART_HEIGHT } = {}) {
     const selected = pickCrop(payload, crop)
     const chart = chartOf(payload, selected)
-    const current = chart !== null && isCurrentLike(chart.current) ? chart.current : null
+    const current = chart !== null && isFormingBarLike(chart.current) ? chart.current : null
     const references = chartReferences(payload, selected)
     const tick = current === null ? null : toNumber(current.tick)
     const geometry = chart === null
@@ -662,7 +663,7 @@
 
     // 目标价：输入框空着时用当前现价当默认值；只在「到价」打开时才显示。
     const chart = chartOf(payload, chosenCrop)
-    const price = chart !== null && isCurrentLike(chart.current)
+    const price = chart !== null && isFormingBarLike(chart.current)
       ? toNumber(chart.current.price)
       : null
     const base = chart === null ? null : toNumber(chart.base)
