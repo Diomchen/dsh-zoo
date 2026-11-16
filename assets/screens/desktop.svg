@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="600" viewBox="0 0 1000 600" role="img" aria-label="桌面上的两只宠物、悬停弹层和新邻居放行卡">
+<defs>
+  <linearGradient id="wall" x1="0" y1="0" x2="0.2" y2="1"><stop offset="0" stop-color="#dbe7d9"/><stop offset="0.62" stop-color="#eef2e6"/><stop offset="1" stop-color="#f5efe3"/></linearGradient>
+  <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fff9e8" stop-opacity="0.95"/><stop offset="1" stop-color="#fff9e8" stop-opacity="0"/></radialGradient>
+  <radialGradient id="vignette" cx="0.5" cy="0.45" r="0.78"><stop offset="0.58" stop-color="#1b261d" stop-opacity="0"/><stop offset="1" stop-color="#1b261d" stop-opacity="0.14"/></radialGradient>
+  <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#7d8a75" opacity="0.16"/></pattern>
+  </defs>
+  <rect width="1000" height="600" fill="url(#wall)"/>
+  <rect width="1000" height="600" fill="url(#dots)"/>
+  <ellipse cx="160" cy="72" rx="300" ry="240" fill="url(#sun)"/>
+  <circle cx="820" cy="108" r="96" fill="#ffffff" opacity="0.22"/>
+  <circle cx="900" cy="156" r="54" fill="#ffffff" opacity="0.18"/>
+  <rect x="0" y="452" width="1000" height="148" fill="#e7ddca" opacity="0.72"/>
+  <path d="M0 452H1000" stroke="#cabfa9" stroke-width="1.4" opacity="0.7"/>
+  <rect width="1000" height="600" fill="url(#vignette)"/><ellipse cx="500" cy="520" rx="330" ry="34" fill="#b9ad97" opacity="0.18"/><g transform="translate(232 512) scale(1.02)">
+    <ellipse cx="0" cy="2" rx="40" ry="7" fill="#3f3f49" opacity="0.12"/>
+    <path d="M32 -50c24-9 33 15 16 22 15 4 16-17-2-24" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <ellipse cx="0" cy="-40" rx="40" ry="35" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4"/>
+    <ellipse cx="0" cy="-31" rx="25" ry="24" fill="#fdf3e2"/>
+    <ellipse cx="-22" cy="-4" rx="12" ry="7" fill="#fdf3e2" stroke="#4a4a55" stroke-width="2.2"/>
+    <ellipse cx="22" cy="-4" rx="12" ry="7" fill="#fdf3e2" stroke="#4a4a55" stroke-width="2.2"/>
+    <path d="M-30-116l-9-33c-1-4 3-6 6-3l23 19z" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M30-116l9-33c1-4-3-6-6-3l-23 19z" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M-27-121l-5-21 15 13z" fill="#f7c9a8"/>
+    <path d="M27-121l5-21-15 13z" fill="#f7c9a8"/>
+    <circle cx="0" cy="-95" r="36" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4"/>
+    <path d="M0-121c7 0 12 3 12 3l-4 10-8-4-8 4-4-10s5-3 12-3z" fill="#c98a45" opacity="0.55"/>
+    <ellipse cx="0" cy="-81" rx="23" ry="16" fill="#fdf3e2"/>
+    <ellipse cx="0" cy="-88" rx="5.6" ry="4.4" fill="#4a3a33"/>
+    <circle cx="-14" cy="-100" r="3.4" fill="#3f3f49"/>
+    <circle cx="14" cy="-100" r="3.4" fill="#3f3f49"/>
+    <circle cx="-15" cy="-101" r="1.2" fill="#fff"/>
+    <circle cx="13" cy="-101" r="1.2" fill="#fff"/>
+    <ellipse cx="-23" cy="-83" rx="7" ry="4.6" fill="#f08c86" opacity="0.36"/>
+    <ellipse cx="23" cy="-83" rx="7" ry="4.6" fill="#f08c86" opacity="0.36"/>
+    <path d="M-6-81c2 3 10 3 12 0" stroke="#4a4a55" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+  </g><rect x="210.5" y="518" width="43" height="19" rx="9.5" fill="rgba(47,95,168,0.9)"/><text x="232" y="531.5" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="10.5" font-weight="700" fill="#f4f8ff" text-anchor="middle">小满</text><rect x="178" y="240" width="148" height="88" rx="13" fill="rgba(15,21,29,0.92)"/><rect x="178" y="240" width="148" height="88" rx="13" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1"/><text x="190" y="260" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="10.5" font-weight="700" fill="rgba(244,248,255,0.68)" text-anchor="start">小满</text><rect x="188" y="270" width="128" height="26" rx="8" fill="rgba(59,116,216,0.94)"/><text x="252" y="287" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="700" fill="#f4f8ff" text-anchor="middle">串门</text><rect x="188" y="301" width="128" height="22" rx="8" fill="rgba(255,255,255,0.13)"/><text x="252" y="316.5" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="11" font-weight="600" fill="rgba(244,248,255,0.9)" text-anchor="middle">改名</text><g transform="translate(668 516) scale(1)">
+    <ellipse cx="0" cy="2" rx="39" ry="7" fill="#3f3f49" opacity="0.12"/>
+    <path d="M-28-45c-24-6-32 12-20 22" fill="none" stroke="#4a4a55" stroke-width="14" stroke-linecap="round"/>
+    <path d="M-28-45c-24-6-32 12-20 22" fill="none" stroke="#eba75f" stroke-width="9" stroke-linecap="round"/>
+    <ellipse cx="0" cy="-40" rx="39" ry="34" fill="#eba75f" stroke="#4a4a55" stroke-width="2.4"/>
+    <ellipse cx="0" cy="-30" rx="23" ry="23" fill="#fdf1dc"/>
+    <ellipse cx="-21" cy="-4" rx="11" ry="7" fill="#fdf1dc" stroke="#4a4a55" stroke-width="2.2"/>
+    <ellipse cx="21" cy="-4" rx="11" ry="7" fill="#fdf1dc" stroke="#4a4a55" stroke-width="2.2"/>
+    <path d="M-31-112l-5-28c-1-4 3-6 6-3l20 18z" fill="#eba75f" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M31-112l5-28c1-4-3-6-6-3l-20 18z" fill="#eba75f" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M-28-116l-3-18 13 12z" fill="#f4b8ad"/>
+    <path d="M28-116l3-18-13 12z" fill="#f4b8ad"/>
+    <circle cx="0" cy="-92" r="35" fill="#eba75f" stroke="#4a4a55" stroke-width="2.4"/>
+    <path d="M-9-124v-9M0-126v-10M9-124v-9" stroke="#c9853d" stroke-width="3" stroke-linecap="round"/>
+    <path d="M-29-98h-9M-30-92h-10M-29-86h-9M29-98h9M30-92h10M29-86h9" stroke="#b99a74" stroke-width="1.4" stroke-linecap="round"/>
+    <ellipse cx="0" cy="-78" rx="20" ry="14" fill="#fdf1dc"/>
+    <path d="M-4-84h8l-4 5z" fill="#e8837c"/>
+    <path d="M0-79v3M0-76c-2 3-7 3-8 0M0-76c2 3 7 3 8 0" stroke="#4a4a55" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+    <circle cx="-13" cy="-97" r="3.4" fill="#3f3f49"/>
+    <circle cx="13" cy="-97" r="3.4" fill="#3f3f49"/>
+    <circle cx="-14" cy="-98" r="1.2" fill="#fff"/>
+    <circle cx="12" cy="-98" r="1.2" fill="#fff"/>
+    <ellipse cx="-23" cy="-82" rx="6.5" ry="4.2" fill="#f08c86" opacity="0.34"/>
+    <ellipse cx="23" cy="-82" rx="6.5" ry="4.2" fill="#f08c86" opacity="0.34"/>
+  </g><rect x="646.5" y="522" width="43" height="19" rx="9.5" fill="rgba(47,143,91,0.88)"/><text x="668" y="535.5" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="10.5" font-weight="700" fill="#f4f8ff" text-anchor="middle">阿橘</text><rect x="662" y="92" width="286" height="152" rx="15" fill="rgba(15,21,29,0.93)"/><rect x="662" y="92" width="286" height="152" rx="15" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="1"/><text x="680" y="118" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="13" font-weight="800" fill="#f4f8ff" text-anchor="start">新邻居「豆豆」</text><text x="928" y="116" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="13" font-weight="600" fill="rgba(244,248,255,0.55)" text-anchor="middle">×</text><text x="680" y="148" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="11" font-weight="500" fill="rgba(244,248,255,0.68)" text-anchor="start">接受后，你们才能互相串门。</text><rect x="676" y="168" width="128" height="30" rx="8" fill="rgba(59,116,216,0.94)"/><text x="740" y="188" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="700" fill="#f4f8ff" text-anchor="middle">接受</text><rect x="812" y="168" width="122" height="30" rx="8" fill="rgba(255,255,255,0.13)"/><text x="873" y="188" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="600" fill="rgba(244,248,255,0.9)" text-anchor="middle">拒绝</text>
+</svg>

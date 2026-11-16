@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="560" viewBox="0 0 760 560" role="img" aria-label="宠物右键菜单：打开软件、带派、农场、盘口、动作与外观">
+<defs>
+  <linearGradient id="wall" x1="0" y1="0" x2="0.2" y2="1"><stop offset="0" stop-color="#dbe7d9"/><stop offset="0.62" stop-color="#eef2e6"/><stop offset="1" stop-color="#f5efe3"/></linearGradient>
+  <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5"><stop offset="0" stop-color="#fff9e8" stop-opacity="0.95"/><stop offset="1" stop-color="#fff9e8" stop-opacity="0"/></radialGradient>
+  <radialGradient id="vignette" cx="0.5" cy="0.45" r="0.78"><stop offset="0.58" stop-color="#1b261d" stop-opacity="0"/><stop offset="1" stop-color="#1b261d" stop-opacity="0.14"/></radialGradient>
+  <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#7d8a75" opacity="0.16"/></pattern>
+  </defs>
+  <rect width="760" height="560" fill="url(#wall)"/>
+  <rect width="760" height="560" fill="url(#dots)"/>
+  <ellipse cx="122" cy="67" rx="228" ry="224" fill="url(#sun)"/>
+  <circle cx="623" cy="101" r="90" fill="#ffffff" opacity="0.22"/>
+  <circle cx="684" cy="146" r="50" fill="#ffffff" opacity="0.18"/>
+  <rect x="0" y="430" width="760" height="130" fill="#e7ddca" opacity="0.72"/>
+  <path d="M0 430H760" stroke="#cabfa9" stroke-width="1.4" opacity="0.7"/>
+  <rect width="760" height="560" fill="url(#vignette)"/><g transform="translate(150 500) scale(1)">
+    <ellipse cx="0" cy="2" rx="40" ry="7" fill="#3f3f49" opacity="0.12"/>
+    <path d="M32 -50c24-9 33 15 16 22 15 4 16-17-2-24" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <ellipse cx="0" cy="-40" rx="40" ry="35" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4"/>
+    <ellipse cx="0" cy="-31" rx="25" ry="24" fill="#fdf3e2"/>
+    <ellipse cx="-22" cy="-4" rx="12" ry="7" fill="#fdf3e2" stroke="#4a4a55" stroke-width="2.2"/>
+    <ellipse cx="22" cy="-4" rx="12" ry="7" fill="#fdf3e2" stroke="#4a4a55" stroke-width="2.2"/>
+    <path d="M-30-116l-9-33c-1-4 3-6 6-3l23 19z" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M30-116l9-33c1-4-3-6-6-3l-23 19z" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4" stroke-linejoin="round"/>
+    <path d="M-27-121l-5-21 15 13z" fill="#f7c9a8"/>
+    <path d="M27-121l5-21-15 13z" fill="#f7c9a8"/>
+    <circle cx="0" cy="-95" r="36" fill="#e0a45e" stroke="#4a4a55" stroke-width="2.4"/>
+    <path d="M0-121c7 0 12 3 12 3l-4 10-8-4-8 4-4-10s5-3 12-3z" fill="#c98a45" opacity="0.55"/>
+    <ellipse cx="0" cy="-81" rx="23" ry="16" fill="#fdf3e2"/>
+    <ellipse cx="0" cy="-88" rx="5.6" ry="4.4" fill="#4a3a33"/>
+    <circle cx="-14" cy="-100" r="3.4" fill="#3f3f49"/>
+    <circle cx="14" cy="-100" r="3.4" fill="#3f3f49"/>
+    <circle cx="-15" cy="-101" r="1.2" fill="#fff"/>
+    <circle cx="13" cy="-101" r="1.2" fill="#fff"/>
+    <ellipse cx="-23" cy="-83" rx="7" ry="4.6" fill="#f08c86" opacity="0.36"/>
+    <ellipse cx="23" cy="-83" rx="7" ry="4.6" fill="#f08c86" opacity="0.36"/>
+    <path d="M-6-81c2 3 10 3 12 0" stroke="#4a4a55" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+  </g><rect x="128.5" y="506" width="43" height="19" rx="9.5" fill="rgba(47,95,168,0.9)"/><text x="150" y="519.5" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="10.5" font-weight="700" fill="#f4f8ff" text-anchor="middle">小满</text><rect x="252" y="136" width="172" height="318" rx="12" fill="#1b261d" opacity="0.16"/><rect x="248" y="128" width="172" height="318" rx="11" fill="rgba(15,21,29,0.95)"/><rect x="248" y="128" width="172" height="318" rx="11" fill="none" stroke="rgba(255,255,255,0.09)" stroke-width="1"/><text x="263" y="153" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">打开软件</text><text x="263" y="182" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">带派</text><text x="263" y="211" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">农场</text><text x="263" y="240" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">盘口</text><path d="M256 253L412 253" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-linecap="round"/><text x="263" y="276" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">回到初始位置</text><text x="263" y="305" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">重载配置</text><text x="263" y="334" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">扫描外观</text><path d="M256 347L412 347" stroke="rgba(255,255,255,0.12)" stroke-width="1" stroke-linecap="round"/><rect x="252" y="351" width="164" height="29" rx="6" fill="rgba(59,116,216,0.34)"/><text x="263" y="370" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">动作</text><text x="404" y="370" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="rgba(244,248,255,0.55)" text-anchor="end">›</text><text x="263" y="399" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">外观</text><text x="404" y="399" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="rgba(244,248,255,0.55)" text-anchor="end">›</text><rect x="430" y="360" width="156" height="178" rx="12" fill="#1b261d" opacity="0.16"/><rect x="426" y="352" width="156" height="178" rx="11" fill="rgba(15,21,29,0.95)"/><rect x="426" y="352" width="156" height="178" rx="11" fill="none" stroke="rgba(255,255,255,0.09)" stroke-width="1"/><rect x="430" y="358" width="148" height="29" rx="6" fill="rgba(59,116,216,0.34)"/><text x="441" y="377" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">待机</text><text x="441" y="409" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">转向</text><text x="441" y="441" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">拖拽</text><text x="441" y="473" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">点击回应</text><text x="441" y="505" font-family="'PingFang SC','Hiragino Sans GB','Microsoft YaHei','Segoe UI',system-ui,sans-serif" font-size="12" font-weight="500" fill="#f4f8ff" text-anchor="start">移动</text>
+</svg>
