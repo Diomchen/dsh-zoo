@@ -66,6 +66,15 @@ test('farm-raid 的窄口：deviceId 必填，plots 可选且只认 pN', () => {
   )
 })
 
+test('窗口的两条自重画动作：farm-refresh 与 farm-own 都不带字段', () => {
+  // 票 52 回归：这两条语义必须分开——一条是"到点确认（留在当前视图）"，
+  // 一条是"切回我的农场"。挤成一条时，邻居的作物一熟就把看田窗口踢回自己农场。
+  assert.deepEqual(shared.normalizeFarmAction({ action: 'farm-refresh' }), { action: 'farm-refresh' })
+  assert.deepEqual(shared.normalizeFarmAction({ action: 'farm-own' }), { action: 'farm-own' })
+  assert.ok(shared.FARM_ACTIONS.includes('farm-own'))
+  assert.ok(shared.DESKTOP_ACTIONS.includes('farm-own'), 'helper → 宿主那一道也要认它')
+})
+
 test('邻居切换器：只认 uuid + 昵称，重复与坏条目丢掉，最多 8 个', () => {
   const view = shared.normalizeFarmWindow({
     open: true,

@@ -164,10 +164,15 @@
    */
   const FARM_HIRE_ACTIONS = ['hire', 'recall-worker', 'end-contract', 'hire-listing']
   /**
-   * 窗口端倒计时到 0 时请宿主确认成熟（ticket 47.1）。窗口不自己标 mature：
-   * 本地时钟可能比宿主早/晚几毫秒，标早了收获会被宿主回 not-mature。
+   * 窗口自己的两条「重画」动作，语义必须分开：
+   *   - `farm-refresh`（ticket 47.1）：倒计时到 0 时请宿主确认成熟。窗口不自己标 mature
+   *     （本地时钟可能比宿主早/晚几毫秒，标早了收获会被宿主回 not-mature）。它**保持当前模式**：
+   *     看田期间宿主会重新拉一份邻居的公开视图，绝不把窗口打回主人视图。
+   *   - `farm-own`：点「我的农场」那颗圆片，显式离开只读视图。这是切回自己农场的唯一出口。
+   *     以前它挤在 `farm-refresh` 里，于是「到点确认」和「切回我家」共用一条申请——
+   *     邻居的作物一熟（或自家作物一熟），看田窗口就被踢回自己农场。
    */
-  const FARM_REFRESH_ACTIONS = ['farm-refresh']
+  const FARM_REFRESH_ACTIONS = ['farm-refresh', 'farm-own']
   /**
    * 地块解锁（ticket 48）：只带可选的 `expectedUnlocked`（窗口看到的已解锁数）。
    * 价格与下一块地在哪全由宿主算；窗口不传钱、不传地块 id。
@@ -1517,8 +1522,8 @@
       if (plots === false) return null
       return plots === null ? { action, deviceId } : { action, deviceId, plots }
     }
-    // 到点确认没有地块字段：只请宿主重推一份当前 farm-window。
-    if (action === 'farm-refresh') return { action }
+    // 重推当前视图 / 切回我的农场：不带其它字段，宿主按自己记得的模式重画。
+    if (action === 'farm-refresh' || action === 'farm-own') return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
     if (action === 'farm-unlock') {
       if (raw.expectedUnlocked === undefined || raw.expectedUnlocked === null) return { action }
