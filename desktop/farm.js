@@ -483,14 +483,22 @@ function renderEventCard (season) {
   progress.append(bar, text)
   const actions = document.createElement('div')
   actions.className = 'season-actions'
-  const button = document.createElement('button')
-  button.type = 'button'
-  button.className = 'season-btn primary'
-  button.dataset.seasonAction = 'claim'
-  button.textContent = card.claimed ? '今天已领' : card.ready ? '领取奖励' : '还没完成'
-  button.title = card.rewardText
-  button.disabled = !card.canClaim || busy
-  actions.append(button)
+  if (card.claimed) {
+    // 领过奖就只留一句状态：再摆一个灰按钮，看起来像“还能再点”。
+    const done = document.createElement('span')
+    done.className = 'season-done'
+    done.textContent = '已领取今天奖励'
+    actions.append(done)
+  } else {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'season-btn primary'
+    button.dataset.seasonAction = 'claim'
+    button.textContent = card.ready ? '领取奖励' : '还没完成'
+    button.title = card.rewardText
+    button.disabled = !card.canClaim || busy
+    actions.append(button)
+  }
   replaceContent(eventCardEl, head, detail, progress, actions)
 }
 
@@ -503,9 +511,18 @@ function renderOmenCard (season) {
     return
   }
   omenCardEl.hidden = false
+  const head = seasonCardHead(card, card.tag || '季候来客')
+  if (card.finished === true) {
+    // 处理过的来客只留结论：下拉框和按钮都不该再出现，免得让人以为还能再点一次。
+    omenCardEl.title = card.resultText || card.detail
+    const done = document.createElement('p')
+    done.className = 'season-done'
+    done.textContent = card.resultText || '已处理。'
+    replaceContent(omenCardEl, head, done)
+    return
+  }
   omenCardEl.title = [card.detail, card.guardText, card.feedText, card.ignoreText, card.remainingText]
     .filter(Boolean).join('\n')
-  const head = seasonCardHead(card, card.tag || '季候来客')
   const detail = document.createElement('p')
   detail.textContent = card.detail + ' ' + card.remainingText
   const guard = document.createElement('p')

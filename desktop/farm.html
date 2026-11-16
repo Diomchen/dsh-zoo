@@ -761,6 +761,15 @@
         border-radius: inherit;
         background: var(--amber);
       }
+      /* 处理过的来客只显示这句结论：通用 .season-card p 是隐藏的，这里要显式放开。 */
+      .season-card .season-done {
+        display: block;
+        margin: 0;
+        color: var(--emerald-deep);
+        font-size: 10px;
+        font-weight: 700;
+        line-height: 1.45;
+      }
       .season-card .season-actions {
         display: flex;
         gap: 6px;
