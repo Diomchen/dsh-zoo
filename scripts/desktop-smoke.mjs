@@ -2632,7 +2632,12 @@ async function verifyFarmWindow () {
       carrot: { price: 6.1, at: marketAt, samples: 2, stale: false }
     },
     history: [
-      { crop: 'tomato', side: 'sell', qty: 3, price: 5, at: marketAt },
+      { crop: 'tomato', side: 'sell', qty: 3, price: 5.2, at: marketAt - 30 * 60 * 1000 },
+      { crop: 'tomato', side: 'buy', qty: 1, price: 4.8, at: marketAt - 2 * 60 * 60 * 1000 },
+      { crop: 'tomato', side: 'sell', qty: 2, price: 5.4, at: marketAt - 4 * 60 * 60 * 1000 },
+      { crop: 'tomato', side: 'sell', qty: 2, price: 5, at: marketAt - 8 * 60 * 60 * 1000 },
+      { crop: 'tomato', side: 'buy', qty: 1, price: 4.5, at: marketAt - 13 * 60 * 60 * 1000 },
+      { crop: 'tomato', side: 'sell', qty: 4, price: 4, at: marketAt - 20 * 60 * 60 * 1000 },
       { crop: 'carrot', side: 'buy', qty: 2, price: 6, at: marketAt - 60000 }
     ]
   }

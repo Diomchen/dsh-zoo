@@ -430,6 +430,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `指数 52% · 2 家 ↑3.0%`——52% 是本机算出的有效权重，`2 家` 是新鲜邻居数，
   箭头是邻居最近一轮的动量。样本过期时写「指数 过期 …」并把整行画灰；没有邻居时写
   「本机行情」。权重/动量只影响卖价，买种子始终按固定种子价。
+  每行卖价下面还有一条 24 小时成交价折线（`view.marketSpark`）：最近 50 笔里该作物的
+  成交价 + 当前卖价；没有成交时画虚线并写「24h · 暂无成交」。
 - **季节 UI（ticket 63–71）**：`farm-window` 顶层带 `season`（`id/name/emoji/start/end/
   remainingMs/calendar/event/omen`）。`#season-bar` 平时隐藏，收到合法 `season` 才显示；
   四格 `#season-calendar` 用 `calendar[]` 的 `today/past` 上色，最后一格旁边写
