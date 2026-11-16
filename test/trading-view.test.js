@@ -455,6 +455,11 @@ test('票 79：空态与坏输入都不抛——没有盘口数据时也能画�
     // 邻居位先占住，票 82 才填数据。
     assert.match(board.hints.neighbors, /还没有邻居上线/)
   }
+  // 老 payload 没有 limits.leverages：杠杆退回 1×（票 80 之后宿主会下发 [1,5,20]）。
+  const legacy = view.orderView({ coins: { available: 120 } })
+  assert.deepEqual(legacy.leverages.map((choice) => choice.leverage), [1])
+  assert.equal(legacy.leverage, 1)
+  assert.equal(view.boardView({ bar: { crop: 'tomato', open: 5, price: 5.1 } }).order.leverage, 1)
   // 认不出的作物先按 id 显示，别画空白。
   assert.equal(view.cropNameOf(payload(), 'corn'), 'corn')
   assert.equal(view.formatCoins(1234567), '1,234,567')
