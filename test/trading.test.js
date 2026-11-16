@@ -891,6 +891,34 @@ test('票 80：关掉止损后不再触发；离线几个小时回来只补一�
   assert.equal(offlineFarm.wallet.coins, coins)
 })
 
+test('票 80（评审 P2）：没有农场的 store 补结算时回 starting，不抛 TypeError', async (t) => {
+  const dir = await tempDir(t)
+  const entry = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: 5 })
+  // 1× 做多没有强平线、收盘价也高于 0：结算会有一笔 credit，正好走到 addCoins。
+  await writeTrading(dir, {
+    version: 1,
+    positions: [{
+      id: '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d',
+      crop: 'tomato',
+      side: 'long',
+      margin: 50,
+      leverage: 1,
+      entry,
+      openedAt: OPEN_80,
+      stopLoss: 0
+    }],
+    orders: [],
+    history: []
+  })
+  const clock = makeClock(OPEN_80 + 2 * SLOT_MS)
+  // load 就会尝试补结算这一手：没有农场时只能回 `starting`，不能让 TypeError 逃出来。
+  const store = await openStore(dir, { clock })
+  assert.equal(store.view().positions.length, 1, '仓位原样留着，等农场接上再结')
+  assert.equal(store.view().history.length, 0)
+  assert.equal(await store.tick(), false)
+  assert.equal(store.view().positions.length, 1)
+})
+
 test('票 80：结算原因枚举四项，文案表一项不缺', () => {
   assert.deepEqual(TRADING_CLOSE_REASONS, ['close', 'settle', 'liquidate', 'stop'])
   for (const reason of TRADING_CLOSE_REASONS) {
