@@ -1033,6 +1033,15 @@ function formatMarketPrice (value) {
   return String(Math.round(price * 10) / 10)
 }
 
+/** 指数动量：正数向上、负数向下；0 不画箭头。 */
+function formatMomentum (value) {
+  const momentum = Number(value)
+  if (!Number.isFinite(momentum) || momentum === 0) return ''
+  const percent = Math.abs(momentum * 100)
+  const digits = percent >= 10 ? 0 : 1
+  return (momentum > 0 ? '↑' : '↓') + percent.toFixed(digits) + '%'
+}
+
 /** 当前这笔申请是不是这个作物/这条边（买 or 卖）：给按钮画「成交中…」。 */
 function isTrading (side, cropId) {
   if (pending === null || pending.cropId !== cropId) return false
@@ -1203,19 +1212,31 @@ function renderMarket () {
       index.textContent = '本机行情'
     } else {
       index.classList.add(indexEntry.stale === true ? 'index-stale' : 'index-live')
+      const weight = Number(indexEntry.weight)
+      const momentumText = formatMomentum(indexEntry.momentum)
       const label = document.createElement('span')
-      label.textContent = indexEntry.stale === true ? '指数 过期 ' : '指数 '
+      label.textContent = indexEntry.stale === true
+        ? '指数 过期 '
+        : '指数 ' + (Number.isFinite(weight) && weight > 0 ? Math.round(weight * 100) + '% ' : '')
       const value = document.createElement('b')
       value.textContent = formatMarketPrice(indexEntry.price)
       const unit = document.createElement('span')
       unit.className = 'unit'
-      unit.textContent = ' · ' + Math.floor(samples) + ' 份'
+      unit.textContent = ' · ' + Math.floor(samples) + ' 家'
       index.appendChild(label)
       index.appendChild(value)
       index.appendChild(unit)
+      if (momentumText !== '') {
+        const trend = document.createElement('span')
+        trend.className = Number(indexEntry.momentum) > 0 ? 'index-up' : 'index-down'
+        trend.textContent = ' ' + momentumText
+        index.appendChild(trend)
+      }
       index.title = indexEntry.stale === true
         ? '局域网指数超过 2 分钟没更新，显示的是最后一次的中位数'
-        : '局域网里 ' + Math.floor(samples) + ' 份报价的中位数'
+        : '局域网 ' + Math.floor(samples) + ' 家报价的中位数；指数权重 '
+          + Math.round((Number.isFinite(weight) ? weight : 0) * 100) + '%'
+          + (momentumText === '' ? '' : '，最近一轮 ' + momentumText)
     }
     prices.appendChild(index)
     row.appendChild(prices)
