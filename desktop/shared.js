@@ -259,6 +259,12 @@
   const BOARD_MAX_BARS = 40
   const BOARD_MAX_TICK = 15
   /**
+   * 盘口 K 线周期（票 84）：与 `src/trading-rules.js` 的 `BOARD_TIMEFRAMES` 同源，
+   * `test/farm-constants-drift.test.js` 有 drift 断言盯着两边。
+   * 这一层只放行白名单里的四个 id（多一个都不认），所以「最多 4 个周期」是它的天然上限。
+   */
+  const BOARD_TIMEFRAME_IDS = ['15m', '1h', '1d', '1w']
+  /**
    * 票 82：真人周榜。一屏最多 32 行、每行最多 8 条持仓（与报文上限一致），
    * 情绪计数最多是「行 × 持仓」——这三个数只做形状夹取，不是产品规则。
    * 分数/收益率的范围与宿主 `src/protocol.js` 的 MAX_WEEK_PNL / MAX_WEEK_PNL_PCT 同源。
@@ -1850,10 +1856,21 @@
       if (id === null || crops.some((crop) => crop.id === id)) continue
       crops.push({ id, name: normalizeLabel(candidate.name, id) })
     }
+    // 票 84：周期页签的清单由宿主下发（`src/trading-rules.js` 是唯一来源），
+    // 窗口不硬编码。只认白名单里的 id，顺序跟着宿主走。
+    const timeframes = []
+    for (const candidate of Array.isArray(raw.timeframes) ? raw.timeframes : []) {
+      if (timeframes.length >= BOARD_TIMEFRAME_IDS.length) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const id = typeof candidate.id === 'string' ? candidate.id.trim() : ''
+      if (!BOARD_TIMEFRAME_IDS.includes(id) || timeframes.some((entry) => entry.id === id)) continue
+      timeframes.push({ id, label: normalizeLabel(candidate.label, id) })
+    }
     return {
       margins,
       leverages,
       crops,
+      timeframes,
       historyLimit: normalizeBoardInt(raw.historyLimit, 0, BOARD_MAX_HISTORY) ?? BOARD_MAX_HISTORY,
       // 票 83：宿主是否支持「全下」。旧宿主没有这个字段 → false（窗口不画那颗按钮）。
       allIn: raw.allIn === true,
@@ -1881,7 +1898,17 @@
     const low = normalizeBoardNumber(raw.low, 0, BOARD_MAX_PRICE)
     const close = normalizeBoardNumber(raw.close, 0, BOARD_MAX_PRICE)
     if (slot === null || open === null || high === null || low === null || close === null) return null
-    return { slot, open, high, low, close }
+    // 票 84：`start`/`end` 是这一根的真实毫秒边界（窗口的时间标签靠它）。
+    // 老宿主没有这两个字段时保留 null，不因为少一个标签就把整根丢掉。
+    return {
+      slot,
+      start: normalizeBoardInt(raw.start, 0, Number.MAX_SAFE_INTEGER),
+      end: normalizeBoardInt(raw.end, 0, Number.MAX_SAFE_INTEGER),
+      open,
+      high,
+      low,
+      close
+    }
   }
 
   /** 当前形成中的一根（票 81）：`price` 是现价，`tick` 是已经走了几分钟。 */
@@ -1895,11 +1922,14 @@
     if (slot === null || open === null || high === null || low === null || price === null) return null
     return {
       slot,
+      start: normalizeBoardInt(raw.start, 0, Number.MAX_SAFE_INTEGER),
+      end: normalizeBoardInt(raw.end, 0, Number.MAX_SAFE_INTEGER),
       open,
       high,
       low,
       price,
-      tick: normalizeBoardNumber(raw.tick, 0, BOARD_MAX_TICK) ?? 0,
+      // 票 84：粗周期没有「本根第几分钟」，宿主发 null 时必须原样留着（别被 ?? 0 改成 0）。
+      tick: raw.tick === null ? null : (normalizeBoardNumber(raw.tick, 0, BOARD_MAX_TICK) ?? 0),
       remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0
     }
   }
@@ -1932,6 +1962,24 @@
       count += 1
     }
     return charts
+  }
+
+  /**
+   * `timeframes: { '15m'|'1h'|'1d'|'1w': { tomato, carrot, pumpkin } }`（票 84）。
+   *
+   * 只按白名单顺序走四个 id：多余的周期、坏块直接丢，窗口退回 15 分画空态而不是崩。
+   * 每个周期内部复用 `normalizeBoardCharts()`——作物与根数上限跟 `charts` 同一把尺子，
+   * 不另写一套（§9.4 的老坑：宿主发了、白名单没放行，窗口永远收不到）。
+   */
+  function normalizeBoardTimeframes (raw) {
+    const timeframes = {}
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return timeframes
+    for (const id of BOARD_TIMEFRAME_IDS) {
+      const block = raw[id]
+      if (block === null || typeof block !== 'object' || Array.isArray(block)) continue
+      timeframes[id] = normalizeBoardCharts(block)
+    }
+    return timeframes
   }
 
   /** `hint: { tomato: { direction, confidence }, … }`：方向只有三种，置信度必须 0–1。 */
@@ -2089,6 +2137,12 @@
       charts: normalizeBoardCharts(
         raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
           ? raw.charts
+          : {}
+      ),
+      // 票 84：四个周期的 K 线。老宿主没有这一块时是空对象，窗口退回 `charts`（15 分）。
+      timeframes: normalizeBoardTimeframes(
+        raw.timeframes !== null && typeof raw.timeframes === 'object' && !Array.isArray(raw.timeframes)
+          ? raw.timeframes
           : {}
       ),
       hint: normalizeBoardHints(
@@ -4327,6 +4381,7 @@
     BOARD_SIDES,
     BOARD_STOP_LEVELS,
     BOARD_MAX_LEVERAGE,
+    BOARD_TIMEFRAME_IDS,
     normalizeBoardOrders,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,

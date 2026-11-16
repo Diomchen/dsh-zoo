@@ -24,6 +24,22 @@ const view = require('../desktop/trading-view.js')
 const SLOT_MS = 15 * 60 * 1000
 const SLOT = 1959232
 const SLOT_EDGE = SLOT * SLOT_MS
+const HOUR_MS = 60 * 60 * 1000
+/** 票 84：窗口吃的是宿主下发的周期清单（唯一来源在 src/trading-rules.js）。 */
+const TIMEFRAMES = [
+  { id: '15m', label: '15分' },
+  { id: '1h', label: '1时' },
+  { id: '1d', label: '1日' },
+  { id: '1w', label: '1周' }
+]
+/** 三个粗周期的桶起点：挑的是工单里的示例日期（本地时区）。 */
+const TF_START = {
+  '1h': new Date(2026, 10, 18, 14, 0, 0, 0).getTime(),
+  '1d': new Date(2026, 10, 16, 0, 0, 0, 0).getTime(),
+  '1w': new Date(2026, 10, 10, 0, 0, 0, 0).getTime()
+}
+const TF_SPAN = { '1h': HOUR_MS, '1d': 24 * HOUR_MS, '1w': 7 * 24 * HOUR_MS }
+
 const LIMITS = {
   margins: [50, 100, 250],
   leverages: [1, 5, 20],
@@ -39,7 +55,16 @@ const LIMITS = {
 const ORDER_ID = '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d'
 
 function bar (slot, overrides = {}) {
-  return { slot, open: 5, high: 5.2, low: 4.9, close: 5.1, ...overrides }
+  return {
+    slot,
+    start: slot * SLOT_MS,
+    end: (slot + 1) * SLOT_MS,
+    open: 5,
+    high: 5.2,
+    low: 4.9,
+    close: 5.1,
+    ...overrides
+  }
 }
 
 function bars (count = 24, start = SLOT - 24) {
@@ -52,7 +77,17 @@ function chart (overrides = {}) {
   return {
     base: 5,
     bars: bars(),
-    current: { slot: SLOT, open: 5, high: 5.2, low: 4.9, price: 5.06, tick: 5, remainingMs: 600000 },
+    current: {
+      slot: SLOT,
+      start: SLOT_EDGE,
+      end: SLOT_EDGE + SLOT_MS,
+      open: 5,
+      high: 5.2,
+      low: 4.9,
+      price: 5.06,
+      tick: 5,
+      remainingMs: 600000
+    },
     ...overrides
   }
 }
@@ -81,6 +116,61 @@ function payload (overrides = {}) {
     history: [],
     orders: [],
     ...overrides
+  }
+}
+
+/** 本地 `HH:MM` / `M月D日`：期望值和窗口用同一套 Date 本地格式化现算。 */
+function hhmm (ms) {
+  const date = new Date(ms)
+  return String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0')
+}
+
+function monthDay (ms) {
+  const date = new Date(ms)
+  return (date.getMonth() + 1) + '月' + date.getDate() + '日'
+}
+
+function timeframeChart (timeframe, overrides = {}) {
+  const start = TF_START[timeframe]
+  const end = start + TF_SPAN[timeframe]
+  return chart({
+    current: {
+      slot: Math.floor(start / SLOT_MS),
+      start,
+      end,
+      open: 5,
+      high: 5.2,
+      low: 4.9,
+      price: 5.06,
+      // 粗周期没有「本根第几分钟」：宿主发 null，窗口不许把它写成 0。
+      tick: null,
+      remainingMs: end - start
+    },
+    ...overrides
+  })
+}
+
+/** 票 84 的完整 payload：`charts`（15 分，旧字段）+ `timeframes`（四周期）+ 周期白名单。 */
+function tfPayload (overrides = {}) {
+  const base = payload(overrides)
+  // 三个作物底价不同（5 / 6 / 30）：粗周期的图也要带对底价，图例才和 15 分一致。
+  const baseOf = { tomato: 5, carrot: 6, pumpkin: 30 }
+  const period = (timeframe) => {
+    const block = {}
+    for (const crop of ['tomato', 'carrot', 'pumpkin']) {
+      block[crop] = timeframeChart(timeframe, { base: baseOf[crop] })
+    }
+    return block
+  }
+  return {
+    ...base,
+    timeframes: {
+      '15m': base.charts,
+      '1h': period('1h'),
+      '1d': period('1d'),
+      '1w': period('1w')
+    },
+    limits: { ...base.limits, timeframes: TIMEFRAMES }
   }
 }
 
@@ -357,7 +447,9 @@ test('票 81：图表卡片给出图例（底价/入场/强平）、第几根、
   assert.equal(chart.crop, 'tomato')
   assert.equal(chart.hasChart, true)
   assert.equal(chart.priceText, '5.06')
-  assert.equal(chart.slotText, '第 1959232 根 · 第 6/15 分钟')
+  // 票 84：不再打印绝对根号，改成这一根的真实时间范围（本地时区现算）。
+  assert.equal(chart.slotText, hhmm(SLOT_EDGE) + '–' + hhmm(SLOT_EDGE + SLOT_MS) + ' · 第 6/15 分钟')
+  assert.doesNotMatch(chart.slotText, /第 \d+ 根/)
   assert.equal(chart.baseText, '5.00')
   assert.deepEqual(chart.legend, [
     { key: 'base', label: '底价', text: '5.00', tone: 'base' },
@@ -387,6 +479,128 @@ test('票 81：图表卡片给出图例（底价/入场/强平）、第几根、
   assert.equal(missing.geometry, null)
   assert.match(missing.emptyText, /行情还在算/)
   assert.equal(missing.priceText, '—')
+})
+
+test('票 84：四个周期可切，时间标签按本地时区写（不再出现绝对根号）', () => {
+  const full = tfPayload()
+  const tabs = view.chartView(full, { crop: 'tomato' }).timeframes
+  assert.deepEqual(tabs.map((entry) => [entry.id, entry.label]), [
+    ['15m', '15分'], ['1h', '1时'], ['1d', '1日'], ['1w', '1周']
+  ])
+  assert.deepEqual(tabs.map((entry) => entry.active), [true, false, false, false])
+  assert.deepEqual(tabs.map((entry) => entry.disabled), [false, false, false, false])
+
+  const expected = {
+    '15m': hhmm(SLOT_EDGE) + '–' + hhmm(SLOT_EDGE + SLOT_MS) + ' · 第 6/15 分钟',
+    '1h': hhmm(TF_START['1h']) + '–' + hhmm(TF_START['1h'] + HOUR_MS),
+    '1d': monthDay(TF_START['1d']),
+    '1w': monthDay(TF_START['1w']) + '–' + monthDay(TF_START['1w'] + TF_SPAN['1w'] - 1)
+  }
+  for (const [timeframe, label] of Object.entries(expected)) {
+    const chart = view.chartView(full, { crop: 'tomato', timeframe })
+    assert.equal(chart.timeframe, timeframe)
+    assert.equal(chart.timeframeLabel, TIMEFRAMES.find((entry) => entry.id === timeframe).label)
+    assert.equal(chart.slotText, label, timeframe + ' 的时间标签')
+    // 绝对根号（自 1970 起的 slot 序号）不许再出现在任何周期上。
+    assert.doesNotMatch(chart.slotText, /第 \d+ 根/)
+    assert.doesNotMatch(chart.ariaLabel, /第 \d+ 根/)
+    // 选中态跟着当前周期走。
+    assert.deepEqual(chart.timeframes.map((entry) => entry.active),
+      TIMEFRAMES.map((entry) => entry.id === timeframe))
+  }
+  // 工单里的示例文案（固定日期，本地时区）：14:00–15:00 / 11月16日 / 11月10日–11月16日。
+  assert.equal(view.chartView(full, { timeframe: '1h' }).slotText, '14:00–15:00')
+  assert.equal(view.chartView(full, { timeframe: '1d' }).slotText, '11月16日')
+  assert.equal(view.chartView(full, { timeframe: '1w' }).slotText, '11月10日–11月16日')
+  // 15 分之外的周期没有「第 m/15 分钟」：tick 是 null。
+  for (const timeframe of ['1h', '1d', '1w']) {
+    assert.doesNotMatch(view.chartView(full, { timeframe }).slotText, /分钟/)
+  }
+})
+
+test('票 84：入场/强平线只在 15 分画；其它周期只画底价线并提示「仍按 15 分结算」', () => {
+  const position = {
+    id: 'p1',
+    crop: 'tomato',
+    side: 'long',
+    margin: 100,
+    leverage: 5,
+    entry: 5.12,
+    mark: 5.06,
+    pnl: -5.8,
+    liquidation: 4.1,
+    stopLoss: 0.5
+  }
+  const full = tfPayload({ positions: [position] })
+  const contract = view.chartView(full, { crop: 'tomato', timeframe: '15m' })
+  assert.equal(contract.entry, 5.12)
+  assert.equal(contract.liquidation, 4.1)
+  assert.deepEqual(contract.legend.map((entry) => entry.text), ['5.00', '5.12', '4.10'])
+  assert.equal(contract.geometry.lines.find((line) => line.key === 'base').visible, true)
+  assert.equal(contract.geometry.lines.find((line) => line.key === 'entry').visible, true)
+  // 15 分是合约本身：不显示那句「其它周期只看趋势」的提示。
+  assert.equal(contract.settleNote.visible, false)
+
+  for (const timeframe of ['1h', '1d', '1w']) {
+    const chart = view.chartView(full, { crop: 'tomato', timeframe })
+    assert.equal(chart.timeframe, timeframe)
+    // 入场/强平一律不给数、不画线；图例对应位置写「—」。
+    assert.equal(chart.entry, null)
+    assert.equal(chart.liquidation, null)
+    assert.equal(chart.reference, null)
+    assert.deepEqual(chart.legend.map((entry) => entry.text), ['5.00', '—', '—'])
+    assert.equal(chart.geometry.lines.find((line) => line.key === 'base').visible, true)
+    assert.equal(chart.geometry.lines.find((line) => line.key === 'entry').visible, false)
+    assert.equal(chart.geometry.lines.find((line) => line.key === 'liquidation').visible, false)
+    // 产品文案：看趋势可以，结算仍只认 15 分钟收盘。
+    assert.equal(chart.settleNote.visible, true)
+    assert.equal(chart.settleNote.text, '合约仍按 15 分钟收盘结算；其它周期只看趋势')
+  }
+})
+
+test('票 84：老 payload（只有 charts）退回 15 分；切周期不改顶部价格与下单预览', () => {
+  const legacy = payload()
+  const chart = view.chartView(legacy, { crop: 'tomato', timeframe: '1w' })
+  assert.equal(chart.timeframe, '15m')
+  assert.deepEqual(chart.timeframes, [{ id: '15m', label: '15分', active: true, disabled: false }])
+  assert.match(chart.slotText, /第 6\/15 分钟$/)
+  assert.equal(chart.settleNote.visible, false)
+
+  // 有 timeframes 的新包：1 周的图可以画，但顶部价格/订单区仍吃 15 分的合约数据。
+  const full = tfPayload()
+  const weekly = view.boardView(full, { now: SLOT_EDGE + 5 * 60 * 1000, timeframe: '1w' })
+  const contract = view.boardView(full, { now: SLOT_EDGE + 5 * 60 * 1000 })
+  assert.equal(weekly.chart.timeframe, '1w')
+  assert.equal(weekly.chart.timeframes.length, 4)
+  assert.deepEqual(weekly.header, contract.header)
+  assert.deepEqual(weekly.order, contract.order)
+  assert.deepEqual(weekly.week, contract.week)
+  // 认不出的周期退回 15 分，不白屏。
+  assert.equal(view.chartView(full, { timeframe: '5m' }).timeframe, '15m')
+
+  // 更老的宿主连 start/end 都没有：只写分钟进度，不拼出「— · 第 6/15 分钟」，
+  // 也绝不退回原来的绝对根号。
+  const noTimes = payload()
+  noTimes.charts.tomato.current = {
+    slot: SLOT, open: 5, high: 5.2, low: 4.9, price: 5.06, tick: 5, remainingMs: 600000
+  }
+  const bareChart = view.chartView(noTimes, { crop: 'tomato' })
+  assert.equal(bareChart.slotText, '第 6/15 分钟')
+  assert.doesNotMatch(bareChart.slotText, /第 1959232 根/)
+})
+
+test('票 84：周期页签的 DOM 接线（容器/键盘顺序/提示行）在页面和渲染端里', async () => {
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /id="timeframe-tabs"/)
+  assert.match(html, /id="chart-settle-hint"/)
+  assert.match(html, /aria-label="K 线周期"/)
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /timeframeTabsEl/)
+  assert.match(script, /data-timeframe/)
+  assert.match(script, /chartSettleHintEl/)
+  // 周期切换是本地重画，不发 IPC：渲染端不该出现「切周期 -> submit」这种接线。
+  assert.match(script, /timeframe = button\.dataset\.timeframe/)
+  assert.doesNotMatch(script, /api\.submit\(\{[^}]*timeframe/)
 })
 
 test('票 81：作物页签有三个、切换后价格/风向/图例都跟着换', () => {
@@ -609,6 +823,8 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
   assert.deepEqual(keys, [
     'close-button',
     'crop:tomato', 'crop:carrot', 'crop:pumpkin',
+    // 老 payload 只有 15 分一档，周期页签照样进 Tab 顺序（票 84）。
+    'timeframe:15m',
     'side:long', 'side:short',
     'margin:50', 'margin:100', 'margin:250', 'margin:all-in',
     'leverage:1', 'leverage:5', 'leverage:20',
@@ -625,6 +841,10 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
     assert.deepEqual(fallback.slice(-4), ['limit-toggle', 'limit-input', 'limit-place', 'submit'])
     assert.equal(new Set(fallback).size, fallback.length)
   }
+  // 票 84：四档周期都进 Tab 顺序，紧跟在作物页签后面，且不重复。
+  const four = view.focusOrder(tfPayload())
+  assert.deepEqual(four.slice(4, 8), ['timeframe:15m', 'timeframe:1h', 'timeframe:1d', 'timeframe:1w'])
+  assert.equal(new Set(four).size, four.length)
 })
 
 test('术语 US19：邻居持仓 chips——最多 3 条 + 「+N」，空仓仍是观望', () => {

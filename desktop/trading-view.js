@@ -15,6 +15,11 @@
  * `test/trading-view.test.js` 有 drift 断言），以及下单杠杆/保证金/作物白名单
  * （**不复制**，只吃 payload）。票 83 的到价目标价带（0.55–1.75× 底价）也只从
  * payload 的 `chart.base` 读，不在窗口里再写一遍 `PRICE_FLOOR_RATIO`。
+ *
+ * 票 84 的周期切换同样只吃 payload：`payload.timeframes[period]` 已经是宿主算好的
+ * 粗周期 K 线（1 时/1 日/1 周），窗口只负责选图、写时间标签（本地时区）与提示
+ * 「合约仍按 15 分钟收盘结算」。周期清单来自 `limits.timeframes`——窗口不硬编码
+ * 「15分/1时/1日/1周」，也不自己把粗周期的采样当成结算价。
  */
 (function (root, factory) {
   'use strict'
@@ -42,11 +47,20 @@
     margins: Object.freeze([50, 100, 250]),
     leverages: Object.freeze([1]),
     crops: Object.freeze([{ id: 'tomato', name: '小番茄' }]),
+    // 老宿主没有周期清单：只有 15 分一档（它的图就是 `payload.charts`）。
+    timeframes: Object.freeze([Object.freeze({ id: '15m', label: '15分' })]),
     historyLimit: 50,
     // 老宿主没有「全下」，也没有目标价带；窗口就不画这两样（照样能开仓）。
     allIn: false,
     targetRatio: null
   })
+  /**
+   * 合约本身的周期 id（票 84）：入场/强平线、`第 m/15 分钟`、收盘倒计时都只属于它。
+   * 其余周期是看趋势用的粗桶，结算口径不变。
+   */
+  const CONTRACT_TIMEFRAME = '15m'
+  /** 切到别的周期时的那句提示（产品文案：结算仍只认 15 分钟收盘）。 */
+  const SETTLE_NOTE_TEXT = '合约仍按 15 分钟收盘结算；其它周期只看趋势'
   const SIDE_LABELS = Object.freeze({ long: '做多', short: '做空' })
   const REASON_LABELS = Object.freeze({
     close: '手动平仓',
@@ -187,6 +201,9 @@
       crops: Array.isArray(limits.crops) && limits.crops.length > 0
         ? limits.crops
         : FALLBACK_LIMITS.crops,
+      // 票 84：周期页签的顺序与文案全由宿主下发（唯一来源在 `src/trading-rules.js`），
+      // 窗口不硬编码「15分/1时/1日/1周」；坏包退回只有 15 分一档。
+      timeframes: timeframeEntriesOf(limits.timeframes),
       historyLimit: Number.isInteger(limits.historyLimit) ? limits.historyLimit : FALLBACK_LIMITS.historyLimit,
       // 旧宿主没有这两个字段：不画「全下」、不显示目标价带（宿主照样会校验/拒绝）。
       allIn: limits.allIn === true,
@@ -194,6 +211,24 @@
         ? null
         : { floor, ceil }
     }
+  }
+
+  /** `limits.timeframes` 的形状夹取：`{id,label}`、id 不重复；没有就退回 15 分一档。 */
+  function timeframeEntriesOf (raw) {
+    if (!Array.isArray(raw)) return FALLBACK_LIMITS.timeframes
+    const entries = []
+    for (const candidate of raw) {
+      if (candidate === null || typeof candidate !== 'object') continue
+      if (typeof candidate.id !== 'string' || candidate.id === '') continue
+      if (entries.some((entry) => entry.id === candidate.id)) continue
+      entries.push({
+        id: candidate.id,
+        label: typeof candidate.label === 'string' && candidate.label !== ''
+          ? candidate.label
+          : candidate.id
+      })
+    }
+    return entries.length > 0 ? entries : FALLBACK_LIMITS.timeframes
   }
 
   function cropNameOf (payload, cropId) {
@@ -225,11 +260,52 @@
     return ids[0] ?? FALLBACK_LIMITS.crops[0].id
   }
 
-  function chartOf (payload, crop) {
-    const charts = payload !== null && typeof payload === 'object' ? payload.charts : null
-    if (charts === null || typeof charts !== 'object') return null
+  /**
+   * 某周期的 `{ crop: chart }` 块（票 84）：优先 `payload.timeframes[id]`；
+   * 没有 `timeframes` 的旧包（票 81 的 payload）只有 15 分，就退回 `payload.charts`。
+   * 认不出这个周期返回 null：页签画 disabled，切过去也是空态，不会白屏。
+   */
+  function timeframeChartsOf (payload, timeframe) {
+    if (payload === null || typeof payload !== 'object') return null
+    const timeframes = payload.timeframes
+    if (timeframes !== null && typeof timeframes === 'object') {
+      const block = timeframes[timeframe]
+      if (block !== null && typeof block === 'object') return block
+    }
+    if (timeframe === CONTRACT_TIMEFRAME) {
+      const charts = payload.charts
+      if (charts !== null && typeof charts === 'object') return charts
+    }
+    return null
+  }
+
+  /** 选中的周期：白名单里有、且宿主真的发了这个周期的图；否则退回第一个有图的周期。 */
+  function pickTimeframe (payload, timeframe) {
+    const entries = limitsOf(payload).timeframes
+    if (typeof timeframe === 'string' && entries.some((entry) => entry.id === timeframe) &&
+      timeframeChartsOf(payload, timeframe) !== null) {
+      return timeframe
+    }
+    const available = entries.find((entry) => timeframeChartsOf(payload, entry.id) !== null)
+    return available?.id ?? entries[0]?.id ?? CONTRACT_TIMEFRAME
+  }
+
+  function chartOf (payload, crop, timeframe = CONTRACT_TIMEFRAME) {
+    const charts = timeframeChartsOf(payload, timeframe)
+    if (charts === null) return null
     const chart = charts[crop]
     return chart !== null && typeof chart === 'object' ? chart : null
+  }
+
+  /** 周期页签：`active` = 当前这一档；`disabled` = 宿主根本没发这个周期的图（旧包只有 15 分）。 */
+  function timeframesView (payload, timeframe) {
+    const selected = pickTimeframe(payload, timeframe)
+    return limitsOf(payload).timeframes.map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+      active: entry.id === selected,
+      disabled: timeframeChartsOf(payload, entry.id) === null
+    }))
   }
 
   function coinsOf (payload) {
@@ -501,9 +577,14 @@
     }
   }
 
-  /** 参考线（底价/入场/强平）与图例：没有持仓时入场/强平显示「—」。 */
-  function chartReferences (payload, crop) {
-    const positions = payload !== null && typeof payload === 'object' && Array.isArray(payload.positions)
+  /**
+   * 参考线（底价/入场/强平）与图例：没有持仓时入场/强平显示「—」。
+   * 票 84：`withPosition:false`（非 15 分周期）时入场/强平一律不画也不给数——
+   * 仓位只活一根，粗周期图上的那条线没有意义；图例照旧写「—」。
+   */
+  function chartReferences (payload, crop, { withPosition = true, timeframe = CONTRACT_TIMEFRAME } = {}) {
+    const positions = withPosition && payload !== null && typeof payload === 'object' &&
+      Array.isArray(payload.positions)
       ? payload.positions
       : []
     let reference = null
@@ -520,7 +601,12 @@
       entry,
       liquidation,
       legend: [
-        { key: 'base', label: '底价', text: formatPrice(chartBaseOf(payload, crop)), tone: 'base' },
+        {
+          key: 'base',
+          label: '底价',
+          text: formatPrice(chartBaseOf(payload, crop, timeframe)),
+          tone: 'base'
+        },
         { key: 'entry', label: '入场', text: entry === null ? '—' : formatPrice(entry), tone: 'entry' },
         {
           key: 'liquidation',
@@ -533,21 +619,71 @@
     }
   }
 
-  function chartBaseOf (payload, crop) {
-    const chart = chartOf(payload, crop)
+  function chartBaseOf (payload, crop, timeframe = CONTRACT_TIMEFRAME) {
+    const chart = chartOf(payload, crop, timeframe)
     return chart === null ? null : toNumber(chart.base)
   }
 
+  function pad2 (value) {
+    return String(value).padStart(2, '0')
+  }
+
+  /** 本地 `HH:MM`：用 Date 的本地字段，不用 toLocaleString（它跟系统语言，测试会飘）。 */
+  function formatClock (ms) {
+    const date = new Date(ms)
+    return pad2(date.getHours()) + ':' + pad2(date.getMinutes())
+  }
+
+  /** 本地 `M月D日`。 */
+  function formatMonthDay (ms) {
+    const date = new Date(ms)
+    return (date.getMonth() + 1) + '月' + date.getDate() + '日'
+  }
+
   /**
-   * 一张图的全部内容：页签、价格、风向徽章、图例、slot 说明与几何。
-   * `hasChart:false` 时 `geometry:null` + 一句空态（老宿主/坏包不会白屏）。
+   * 一根的时间标签（票 84）：15 分/1 时是「起–止」，1 日是自然日，1 周是「周一起–周日」。
+   * 全部由宿主给的 `start`/`end` 毫秒按**本地时区**格式化，替掉原来那个
+   * `第 1994249 根`——那是自 1970 起的 slot 序号，只有确定性行情的内部实现认得。
+   * 老宿主没有 `start`/`end` 时画「—」，不再退回绝对根号。
    */
-  function chartView (payload, { crop = null, width = CHART_WIDTH, height = CHART_HEIGHT } = {}) {
+  function timeLabelOf (timeframe, start, end) {
+    const startMs = toNumber(start)
+    if (startMs === null) return '—'
+    const endMs = toNumber(end)
+    if (timeframe === '1d') return formatMonthDay(startMs)
+    if (timeframe === '1w') {
+      // 周桶的 end 是下周一 00:00：减 1 毫秒才是这一周的周日。
+      return formatMonthDay(startMs) + '–' + formatMonthDay((endMs ?? startMs) - 1)
+    }
+    if (endMs === null) return formatClock(startMs)
+    return formatClock(startMs) + '–' + formatClock(endMs)
+  }
+
+  /**
+   * 一张图的全部内容：作物/周期页签、价格、图例、时间标签与几何。
+   * `hasChart:false` 时 `geometry:null` + 一句空态（老宿主/坏包不会白屏）。
+   *
+   * 票 84：`timeframe` 选周期，没传就是合约的 15 分；没有 `payload.timeframes`
+   * 的旧包退回 `charts`（15 分）。入场/强平参考线只在 15 分画，其余周期只画底价线，
+   * 并给一句「合约仍按 15 分钟收盘结算」的提示——看图和结算是两件事。
+   */
+  function chartView (payload, {
+    crop = null,
+    timeframe = CONTRACT_TIMEFRAME,
+    width = CHART_WIDTH,
+    height = CHART_HEIGHT
+  } = {}) {
     const selected = pickCrop(payload, crop)
-    const chart = chartOf(payload, selected)
+    const period = pickTimeframe(payload, timeframe)
+    const onContractBar = period === CONTRACT_TIMEFRAME
+    const label = limitsOf(payload).timeframes.find((entry) => entry.id === period)?.label ?? period
+    const chart = chartOf(payload, selected, period)
     const current = chart !== null && isFormingBarLike(chart.current) ? chart.current : null
-    const references = chartReferences(payload, selected)
-    const tick = current === null ? null : toNumber(current.tick)
+    const references = chartReferences(payload, selected, {
+      withPosition: onContractBar,
+      timeframe: period
+    })
+    const tick = onContractBar && current !== null ? toNumber(current.tick) : null
     const geometry = chart === null
       ? null
       : chartGeometry(chart, {
@@ -557,20 +693,32 @@
         liquidation: references.liquidation
       })
     const minute = tick === null ? null : Math.min(15, Math.floor(tick) + 1)
+    const timeText = current === null ? '—' : timeLabelOf(period, current.start, current.end)
+    // 老宿主没有 start/end 时时间标签是「—」：宁可不写，也别拼出「— · 第 6/15 分钟」。
+    const parts = []
+    if (timeText !== '—') parts.push(timeText)
+    if (minute !== null) parts.push('第 ' + minute + '/15 分钟')
     return {
       crop: selected,
       cropName: cropNameOf(payload, selected),
+      timeframe: period,
+      timeframeLabel: label,
+      timeframes: timeframesView(payload, period),
       hasChart: geometry !== null,
       emptyText: '行情还在算，稍等一下。K 线一分钟才动一格。',
-      base: chartBaseOf(payload, selected),
-      baseText: formatPrice(chartBaseOf(payload, selected)),
+      base: chartBaseOf(payload, selected, period),
+      baseText: formatPrice(chartBaseOf(payload, selected, period)),
       priceText: formatPrice(current === null ? null : current.price),
       highText: formatPrice(current === null ? null : current.high),
       lowText: formatPrice(current === null ? null : current.low),
       slot: current === null ? null : toNumber(current.slot),
-      slotText: current === null
-        ? '第 — 根'
-        : '第 ' + current.slot + ' 根' + (minute === null ? '' : ' · 第 ' + minute + '/15 分钟'),
+      // 15 分才带「第 m/15 分钟」：粗周期没有「本根第几分钟」这件事。
+      slotText: parts.length === 0 ? '—' : parts.join(' · '),
+      settleNote: {
+        text: SETTLE_NOTE_TEXT,
+        visible: !onContractBar
+      },
+      ariaLabel: label + ' K 线：' + (onContractBar ? '底价、入场、强平参考线' : '只画底价线，看趋势'),
       reference: references.reference,
       entry: references.entry,
       liquidation: references.liquidation,
@@ -964,8 +1112,9 @@
   /**
    * Tab 顺序（票 81 / 评审 P2）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
    *
-   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物页签 → 方向 → 保证金（预设 + 全下）→
-   * 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单卡的撤单 → 持仓卡的止损/平仓。
+   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物页签 → 周期页签 → 方向 → 保证金
+   * （预设 + 全下）→ 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单卡的撤单 →
+   * 持仓卡的止损/平仓。
    * 每项都是 `board.js` 的 `focusKeyOf` 能认出的键，且**不重复**（tabindex 只能给一个元素）。
    * 纯函数：不碰 DOM，测试能直接断言；老/坏 payload 退回兜底白名单，不抛。
    */
@@ -977,6 +1126,8 @@
         order.push('crop:' + crop.id)
       }
     }
+    // 票 84：周期页签紧跟在作物页签后面（DOM 里也是这样），键盘能直接切周期。
+    for (const timeframe of limits.timeframes) order.push('timeframe:' + timeframe.id)
     for (const side of Object.keys(SIDE_LABELS)) order.push('side:' + side)
     for (const margin of limits.margins) order.push('margin:' + margin)
     // 「全下」按钮的金额每包变，用语义键 `margin:all-in`（focusKeyOf 认 data-all-in）。
@@ -1020,6 +1171,7 @@
     margin = 50,
     leverage = 1,
     crop = null,
+    timeframe = CONTRACT_TIMEFRAME,
     limitOpen = false,
     targetText = '',
     allIn = false,
@@ -1045,7 +1197,7 @@
       week: weekView(safe),
       hint: hintView(safe, selected),
       crops,
-      chart: chartView(safe, { crop: selected, width, height }),
+      chart: chartView(safe, { crop: selected, timeframe, width, height }),
       order,
       orders,
       ordersMetaText: listMetaText('挂单', orders.length, safe === null ? null : safe.ordersTotal),
