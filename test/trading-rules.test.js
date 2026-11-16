@@ -12,6 +12,7 @@ import {
   BOARD_BAR_COUNT,
   BOARD_CROPS,
   BOARD_SIDES,
+  BOARD_TIMEFRAMES,
   MAX_LEVERAGE,
   MAX_MARGIN,
   MAX_PATH_SCAN_MS,
@@ -27,6 +28,7 @@ import {
   TRADING_STOP_LEVELS,
   boardPrice,
   barsFor,
+  barsForTimeframe,
   hash32,
   hintOf,
   isBoardCrop,
@@ -56,6 +58,25 @@ import { CROPS } from '../src/farm-rules.js'
 const SLOT_EDGE = 1763308800000
 const SLOT = SLOT_EDGE / SLOT_MS
 const BASE = 5
+const HOUR_MS = 60 * 60 * 1000
+/** 票 84 的固定「现在」：本地 2026-11-18（周三）13:37:25，离任何桶边界都很远。 */
+const TF_NOW = new Date(2026, 10, 18, 13, 37, 25, 0).getTime()
+
+/** 本地日历 +days 天的 00:00（测试自己算期望值，不调被测函数）。 */
+function localDayStart (ms, days = 0) {
+  const date = new Date(ms)
+  date.setDate(date.getDate() + days)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
+/** 与 `barsForTimeframe()` 同一条采样口径的期望路径（只用来核对 OHLC）。 */
+function sampledPath (crop, start, limit, stepMs) {
+  const prices = []
+  for (let at = start; at < limit; at += stepMs) prices.push(markPrice({ crop, now: at }))
+  prices.push(markPrice({ crop, now: limit }))
+  return prices
+}
 
 test('票 79：一根 15 分钟、15 个 1 分钟 tick；slot 落在纪元边界上', () => {
   assert.equal(SLOT_MS, 15 * 60 * 1000)
@@ -523,6 +544,162 @@ test('票 81：当前一根按 1 分钟 tick 前进，收盘那一毫秒换成�
   assert.equal(next.current.slot, open.current.slot + 1)
   assert.equal(next.current.tick, 0)
   assert.equal(next.current.open, slotClosePrice('tomato', open.current.slot))
+})
+
+/**
+ * 票 84 的每条断言都从同一个固定 `now` 出发：粗周期只改「怎么分桶/怎么采样」，
+ * 不该改价格公式。15 分那一条直接对着 `barsFor()` 比，语义一个字都不许动。
+ */
+test('票 84：周期清单只有一份（15分/1时/1日/1周）；15 分仍走 barsFor，坏输入是 null', () => {
+  assert.deepEqual(
+    BOARD_TIMEFRAMES.map(({ id, label }) => [id, label]),
+    [['15m', '15分'], ['1h', '1时'], ['1d', '1日'], ['1w', '1周']]
+  )
+  assert.equal(Object.isFrozen(BOARD_TIMEFRAMES), true)
+  // 15 分不是「另算一遍」：同一份数据、同一个形状（多出来的 start/end 在 barsFor 里）。
+  assert.deepEqual(
+    barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '15m' }),
+    barsFor({ crop: 'tomato', now: TF_NOW })
+  )
+  assert.equal(barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '5m' }), null)
+  assert.equal(barsForTimeframe({ crop: 'nope', now: TF_NOW, timeframe: '1h' }), null)
+  assert.equal(barsForTimeframe({ crop: 'tomato', now: 'x', timeframe: '1h' }), null)
+  assert.equal(barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '1h', count: 'x' }).bars.length, 24)
+  assert.equal(barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '1h', count: 3 }).bars.length, 3)
+  assert.equal(barsForTimeframe(), null)
+})
+
+test('票 84：1时/1日/1周各 24 根 + 当前一根，桶首尾相接、各周期起点对齐', () => {
+  const boundsOf = {
+    // 1 时：纪元整点（全世界同一条线，和 slot 一样）。
+    '1h': Math.floor(TF_NOW / HOUR_MS) * HOUR_MS,
+    // 1 日：本地自然日 00:00。
+    '1d': new Date(2026, 10, 18).getTime(),
+    // 1 周：本地周一 00:00。
+    '1w': weekStartOf(TF_NOW)
+  }
+  for (const { id } of BOARD_TIMEFRAMES) {
+    if (id === '15m') continue
+    const chart = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: id })
+    assert.notEqual(chart, null, id + ' 应该有图')
+    assert.equal(chart.base, BASE)
+    assert.equal(chart.bars.length, 24, id + ' 是 24 根整根')
+    assert.equal(chart.current.start, boundsOf[id], id + ' 桶起点')
+    assert.ok(chart.current.start <= TF_NOW && TF_NOW < chart.current.end, id + ' 现在落在当前桶里')
+    assert.equal(chart.current.remainingMs, chart.current.end - TF_NOW)
+    assert.equal(chart.current.price, markPrice({ crop: 'tomato', now: TF_NOW }))
+    // 粗周期没有「本根第几分钟」：窗口据此不画 `第 m/15 分钟`。
+    assert.equal(chart.current.tick, null)
+    for (let index = 0; index < chart.bars.length; index += 1) {
+      const bar = chart.bars[index]
+      assert.ok(Number.isInteger(bar.start) && Number.isInteger(bar.end), id + ' 的 start/end 是整数毫秒')
+      assert.ok(bar.end > bar.start, id + ' 的 end 在 start 之后')
+      assert.ok(bar.high >= Math.max(bar.open, bar.close), id + ' 高点盖住开收：' + bar.start)
+      assert.ok(bar.low <= Math.min(bar.open, bar.close), id + ' 低点盖住开收：' + bar.start)
+      if (index > 0) {
+        // 桶首尾相接：上一根的收盘时刻就是下一根的开盘时刻（采样同一点，价格相同）。
+        assert.equal(bar.start, chart.bars[index - 1].end, id + ' 桶之间没有缝')
+        assert.equal(bar.open, chart.bars[index - 1].close, id + ' 收盘 = 下一根开盘')
+      }
+    }
+    assert.equal(chart.bars.at(-1).end, chart.current.start)
+    assert.equal(chart.bars.at(-1).close, chart.current.open)
+  }
+})
+
+test('票 84：1 日按本地自然日、1 周按本地周一 00:00 分桶', () => {
+  const day = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '1d' })
+  // 当前桶 = 本地 2026-11-18 00:00；24 天前同样落在本地 00:00（不是「减 24×N 小时」）。
+  assert.equal(day.current.start, new Date(2026, 10, 18).getTime())
+  assert.equal(day.current.end, new Date(2026, 10, 19).getTime())
+  assert.equal(day.bars[0].start, localDayStart(new Date(2026, 10, 18).getTime(), -24))
+  assert.equal(day.bars.at(-1).start, localDayStart(new Date(2026, 10, 18).getTime(), -1))
+
+  const week = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '1w' })
+  // 2026-11-16 是周一：周桶 = 本地 11-16 00:00 → 11-23 00:00。
+  assert.equal(week.current.start, weekStartOf(TF_NOW))
+  assert.equal(week.current.start, new Date(2026, 10, 16).getTime())
+  assert.equal(week.current.end, new Date(2026, 10, 23).getTime())
+  assert.equal(week.bars[0].start, localDayStart(new Date(2026, 10, 16).getTime(), -7 * 24))
+  // 周中任意时刻都归到同一个周桶：周三 13:37 与周日 23:59 是同一周。
+  assert.equal(
+    barsForTimeframe({ crop: 'tomato', now: new Date(2026, 10, 22, 23, 59).getTime(), timeframe: '1w' }).current.start,
+    week.current.start
+  )
+  // 下周一 00:00 就是新的一周。
+  assert.equal(
+    barsForTimeframe({ crop: 'tomato', now: new Date(2026, 10, 23).getTime(), timeframe: '1w' }).current.start,
+    new Date(2026, 10, 23).getTime()
+  )
+})
+
+test('票 84：OHLC 由 boardPrice()/markPrice() 采样聚合——1 时每 5 分、1 日每小时、1 周每 6 小时', () => {
+  const stepOf = { '1h': 5 * TICK_MS, '1d': HOUR_MS, '1w': 6 * HOUR_MS }
+  const countOf = { '1h': 13, '1d': 25, '1w': 29 }
+  for (const [timeframe, stepMs] of Object.entries(stepOf)) {
+    const chart = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe })
+    // 已收的一根：两端都算 → 1 时 13 针、1 日 25 针、1 周 29 针。
+    const closed = chart.bars[5]
+    const closedPath = sampledPath('tomato', closed.start, closed.end, stepMs)
+    assert.equal(closedPath.length, countOf[timeframe], timeframe + ' 的采样点数')
+    assert.equal(closed.open, closedPath[0])
+    assert.equal(closed.close, closedPath.at(-1))
+    assert.equal(closed.high, Math.max(...closedPath))
+    assert.equal(closed.low, Math.min(...closedPath))
+    // 形成中的一根只采到「现在」，高低点也只算已走完的路径。
+    const formingPath = sampledPath('tomato', chart.current.start, TF_NOW, stepMs)
+    assert.equal(chart.current.open, formingPath[0])
+    assert.equal(chart.current.price, formingPath.at(-1))
+    assert.equal(chart.current.high, Math.max(...formingPath))
+    assert.equal(chart.current.low, Math.min(...formingPath))
+  }
+  // 同一时刻算两次是同一张图（纯散列，无隐藏状态）。
+  for (const { id } of BOARD_TIMEFRAMES) {
+    assert.deepEqual(
+      barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: id }),
+      barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: id }),
+      id + ' 可复现'
+    )
+  }
+})
+
+test('票 84：切周期只换图——结算仍只认 15 分钟收盘，路径扫描也不受影响', () => {
+  const slot = slotIndexAt(TF_NOW)
+  const close = slotClosePrice('tomato', slot)
+  assert.equal(close, boardPrice({ crop: 'tomato', slot, tick: SLOT_TICKS }))
+  // 15 分那根才是合约：闭市价 = slotClosePrice（结算口径），粗周期一根都不参与。
+  const contract = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '15m' })
+  assert.equal(contract.current.slot, slot)
+  assert.equal(contract.bars.at(-1).close, slotClosePrice('tomato', slot - 1))
+  assert.equal(contract.current.open, slotClosePrice('tomato', slot - 1))
+
+  // 同一笔仓位，不管窗口正在看哪个周期，结算公式输入输出都一样。
+  const settled = settlementOf({ side: 'long', margin: 100, leverage: 5, entry: 5, mark: close })
+  for (const { id } of BOARD_TIMEFRAMES) {
+    const chart = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: id })
+    assert.notEqual(chart, null)
+    assert.deepEqual(
+      settlementOf({ side: 'long', margin: 100, leverage: 5, entry: 5, mark: slotClosePrice('tomato', slot) }),
+      settled,
+      id + ' 看什么图都不改变结算'
+    )
+  }
+  // 强平/止损走的还是 1 分钟格点：周期参数根本不在 pathScan 的入口上。
+  // 把粗周期都算一遍再扫，结果必须一模一样（纯函数、没有隐藏状态）。
+  const scanArgs = {
+    crop: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 20,
+    entry: 4,
+    from: TF_NOW,
+    to: TF_NOW + SLOT_MS
+  }
+  const scanBefore = pathScan(scanArgs)
+  for (const { id } of BOARD_TIMEFRAMES) {
+    barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: id })
+  }
+  assert.deepEqual(pathScan(scanArgs), scanBefore)
 })
 
 test('票 81：风向是确定性的 55–68% 弱信号，同一根内不变', () => {

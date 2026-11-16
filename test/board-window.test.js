@@ -23,6 +23,7 @@ import { createService } from '../src/service.js'
 import { TRADING_FILE } from '../src/trading.js'
 import {
   BOARD_CROPS,
+  BOARD_TIMEFRAMES,
   SLOT_MS,
   TICK_MS,
   PRICE_CEIL_RATIO,
@@ -31,7 +32,8 @@ import {
   TRADING_STOP_LEVELS,
   markPrice,
   settlementOf,
-  slotIndexAt
+  slotIndexAt,
+  weekStartOf
 } from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
@@ -218,6 +220,8 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
     // 杠杆与作物白名单都与纯规则同源：票 80 把杠杆换成 [1,5,20] 时这里不用改。
     leverages: TRADING_LEVERAGES.slice(),
     crops: BOARD_CROPS.map((id) => ({ id, name: boardView.cropNameOf(state, id) })),
+    // 票 84：周期清单同样只有 `src/trading-rules.js` 一份来源。
+    timeframes: BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })),
     historyLimit: 50,
     // 票 83：「全下」与目标价带都随包下发，窗口不抄宿主常量。
     allIn: true,
@@ -752,6 +756,150 @@ test('票 81：整份 payload 带三作物 K 线 + 风向，并能穿过 helper 
   assert.equal(board.chart.legend[0].text, state.charts.tomato.base.toFixed(2))
   assert.equal(board.hint.note, '不是保证')
   assert.equal(board.crops.length, 3)
+})
+
+test('票 84：payload 带四周期 × 三作物 K 线（含 start/end），穿过 helper 白名单不被削', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 4 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  const state = desktop.calls.board[0].state
+  const ids = BOARD_TIMEFRAMES.map(({ id }) => id)
+  assert.deepEqual(Object.keys(state.timeframes), ids)
+  for (const { id } of BOARD_TIMEFRAMES) {
+    assert.deepEqual(Object.keys(state.timeframes[id]), BOARD_CROPS, id + ' 有三个作物')
+    for (const crop of BOARD_CROPS) {
+      const chart = state.timeframes[id][crop]
+      assert.equal(chart.bars.length, 24, id + ' / ' + crop + ' 最近 24 根')
+      assert.ok(chart.current.start <= clock.value && clock.value < chart.current.end)
+      assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
+      for (const bar of chart.bars) {
+        // 票 84：每根都带真实的毫秒边界（窗口的时间标签靠它）。
+        assert.equal(Number.isInteger(bar.start), true)
+        assert.equal(Number.isInteger(bar.end), true)
+        assert.ok(bar.end > bar.start)
+      }
+      // 粗周期没有「本根第几分钟」：宿主发 null，白名单不许改成 0。
+      if (id === '15m') assert.equal(typeof chart.current.tick, 'number')
+      else assert.equal(chart.current.tick, null)
+    }
+  }
+  // 15 分就是旧字段 charts 的那一份（同一份数据，不重复算）。
+  assert.deepEqual(state.timeframes['15m'], state.charts)
+  // 桶对齐：1 时 = 纪元整点；1 日 = 本地 00:00；1 周 = 本地周一 00:00。
+  assert.equal(state.timeframes['1h'].tomato.current.start, Math.floor(clock.value / (60 * 60 * 1000)) * 60 * 60 * 1000)
+  const dayStart = new Date(clock.value)
+  dayStart.setHours(0, 0, 0, 0)
+  assert.equal(state.timeframes['1d'].tomato.current.start, dayStart.getTime())
+  assert.equal(state.timeframes['1w'].tomato.current.start, weekStartOf(clock.value))
+  assert.deepEqual(state.limits.timeframes, BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })))
+
+  // §9.4 的老坑：helper 白名单必须放行 timeframes、limits.timeframes 与每根的 start/end。
+  const hop = shared.normalizeHostCommand({ type: 'board-window', open: false, state })
+  assert.equal(hop.ok, true)
+  assert.deepEqual(Object.keys(hop.command.state.timeframes), ids)
+  assert.deepEqual(hop.command.state.limits.timeframes, state.limits.timeframes)
+  for (const id of ids) {
+    const before = state.timeframes[id].tomato
+    const after = hop.command.state.timeframes[id].tomato
+    assert.deepEqual(after.bars[0], before.bars[0], id + ' 的 bar 没被削字段')
+    assert.equal(after.current.start, before.current.start)
+    assert.equal(after.current.end, before.current.end)
+    assert.equal(after.current.tick, before.current.tick)
+  }
+  assert.equal(hop.command.state.timeframes['1w'].tomato.current.tick, null)
+
+  // 窗口纯视图：四个周期都画得出来；切周期只是本地换图。
+  for (const id of ids) {
+    const board = boardView.boardView(hop.command.state, { now: clock.value, timeframe: id })
+    assert.equal(board.chart.timeframe, id)
+    assert.equal(board.chart.hasChart, true)
+    assert.equal(board.chart.geometry.bars.length, 24)
+    assert.equal(board.chart.timeframes.length, 4)
+    assert.deepEqual(board.chart.timeframes.map((entry) => entry.active),
+      ids.map((candidate) => candidate === id))
+  }
+})
+
+test('票 84：timeframes 白名单——未知周期/坏数字/超量都不抛，start/end 原样放行', () => {
+  const sample = (index) => ({
+    slot: index,
+    start: index * SLOT_MS,
+    end: (index + 1) * SLOT_MS,
+    open: 5,
+    high: 5.1,
+    low: 4.9,
+    close: 5
+  })
+  const normalized = shared.normalizeBoardView({
+    timeframes: {
+      '15m': {
+        tomato: {
+          base: 5,
+          bars: Array.from({ length: 100 }, (_, index) => sample(index)),
+          current: null
+        }
+      },
+      '1h': '坏块',
+      '1d': { tomato: { base: 5, bars: [{ ...sample(0), start: 'x', end: {} }], current: null } },
+      '1w': {
+        tomato: {
+          base: 5,
+          bars: [sample(0)],
+          current: {
+            slot: 0,
+            start: 1,
+            end: 2,
+            open: 5,
+            high: 5,
+            low: 5,
+            price: 5,
+            tick: null,
+            remainingMs: 0
+          }
+        }
+      },
+      // 不在白名单里的周期（以及多出来的键）直接丢。
+      '5m': { tomato: { base: 5, bars: [sample(0)] } },
+      secret: 1
+    },
+    limits: {
+      timeframes: [
+        null,
+        'x',
+        { id: 'nope', label: '假' },
+        { id: '1h', label: '1时' },
+        { id: '1h', label: '重复' },
+        { id: '1d', label: '1日' }
+      ]
+    }
+  })
+  assert.deepEqual(Object.keys(normalized.timeframes), ['15m', '1d', '1w'])
+  // 每张图沿用 charts 的根数上限（宿主给 24，白名单留 40 的余量）。
+  assert.equal(normalized.timeframes['15m'].tomato.bars.length, 40)
+  // 坏的 start/end 变 null，不因为少一个标签丢掉整根。
+  assert.equal(normalized.timeframes['1d'].tomato.bars[0].start, null)
+  assert.equal(normalized.timeframes['1d'].tomato.bars[0].end, null)
+  assert.equal(normalized.timeframes['1w'].tomato.current.tick, null)
+  assert.deepEqual(normalized.limits.timeframes,
+    [{ id: '1h', label: '1时' }, { id: '1d', label: '1日' }])
+  // 坏到不成形状：空对象/空数组，绝不抛。
+  for (const bad of [null, undefined, 42, 'x', [], { timeframes: 42 }]) {
+    assert.doesNotThrow(() => shared.normalizeBoardView(bad))
+  }
+  assert.deepEqual(shared.normalizeBoardView({ timeframes: [] }).timeframes, {})
+  assert.deepEqual(shared.normalizeBoardView({ limits: { timeframes: 42 } }).limits.timeframes, [])
 })
 
 test('票 82：payload 带真人周榜（只有自己 → 观望），并能穿过 helper 白名单', async (t) => {

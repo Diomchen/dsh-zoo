@@ -33,7 +33,7 @@ import {
   HIRE_WAGE_MAX,
   HIRE_WAGE_MIN
 } from '../src/protocol.js'
-import { MAX_LEVERAGE, MAX_MARGIN, TRADING_STOP_LEVELS } from '../src/trading-rules.js'
+import { BOARD_TIMEFRAMES, MAX_LEVERAGE, MAX_MARGIN, TRADING_STOP_LEVELS } from '../src/trading-rules.js'
 import shared from '../desktop/shared.js'
 
 const FARM_JS = new URL('../desktop/farm.js', import.meta.url)
@@ -139,6 +139,13 @@ test('票 83：盘口单笔保证金上限与农场硬币上限同值', () => {
   // 「全下」把保证金从固定档位换成任意整数金额，上限必须和钱包同一把尺子：
   // 超过钱包的申请先被 no-coin 挡掉，这个数只防离谱输入（见 MAX_MARGIN 的注释）。
   assert.equal(MAX_MARGIN, MAX_COINS)
+})
+
+test('票 84：helper 的周期白名单与宿主的周期清单同源', () => {
+  // helper 是 CommonJS 小脚本，不能 import 宿主规则：靠这条断言防漂移。
+  // 加周期要同时改 `src/trading-rules.js` 的 BOARD_TIMEFRAMES 与
+  // `desktop/shared.js` 的 BOARD_TIMEFRAME_IDS，这条断言盯着两边。
+  assert.deepEqual(shared.BOARD_TIMEFRAME_IDS, BOARD_TIMEFRAMES.map(({ id }) => id))
 })
 
 test('票 81/评审 P2：helper 与窗口的盘口杠杆/止损档与宿主同源', () => {
