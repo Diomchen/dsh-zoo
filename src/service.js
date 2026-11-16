@@ -76,6 +76,7 @@ import {
   barsFor,
   barsForTimeframe,
   hintOf,
+  isBoardCrop,
   markPrice,
   slotBounds
 } from './trading-rules.js'
@@ -726,6 +727,15 @@ export function createService (ctx, options = {}) {
   let farmWindowOpened = false
   /** 宿主记住的盘口窗开关（票 79）：helper 报的真实状态优先，和农场窗同款。 */
   let tradingWindowOpened = false
+  /**
+   * 盘口窗正在看哪一种作物（票 90）。`null` = 还没人切过，按目录第一个算。
+   *
+   * 为什么必须有这一格：`/state.trading` 与每分钟的推送都只带「这一种」的四个周期图。
+   * 一次发全部作物时，15 种 × 4 周期 × 24 根的包归一化后约 308 KiB，超过 helper
+   * 单行 256 KiB 的 IPC 上限——现场表现是「盘口窗打不开，却说桌面层没在运行」。
+   * 切换由 `trading-charts { cropId }` 改，之后每一包都沿用这个选择。
+   */
+  let tradingBoardCrop = null
   let farmWindowVisitView = null
   /**
    * 农场窗此刻在看的邻居（票 52 的只读模式）：`{ deviceId, view }`，`null` = 没在看别人家。
@@ -1116,6 +1126,8 @@ export function createService (ctx, options = {}) {
     // `trading-close` 明确关窗，用 `trading-refresh` 请宿主结这一根并重推一拍。
     if (action === 'trading-open') return handleTradingOpen()
     if (action === 'trading-close') return closeTradingWindow('trading-close')
+    // 票 90：窗口切到没缓存的作物时按需拉这一种的四个周期（顺手记住选择）。
+    if (action === 'trading-charts') return handleTradingCharts(body?.cropId)
     if (action === 'trading-refresh') {
       if (trading === null) return { ok: false, error: 'starting' }
       await trading.tick()
@@ -2108,14 +2120,12 @@ export function createService (ctx, options = {}) {
   /**
    * 当前这一根：价格与倒计时。公式只有 `src/trading-rules.js` 一份——
    * 窗口、收盘结算、K 线（票 81）与强平（票 80）都调它。
-   * 这里是**目录里第一个作物**的那一根（`payload.bar`，票 79 的窗口认它）；
-   * 全部盘口作物各自的完整 OHLC 在 `payload.timeframes['15m']` 里。
-   * 目录一个可交易作物都没有时返回 null：宁可让窗口画空态，也不编一根没有底价的图。
+   * 票 90：传进来的就是**当前选中的作物**（`payload.bar` 和同一包里的图必须是同一种）；
+   * 一个可交易作物都没有时返回 null：宁可让窗口画空态，也不编一根没有底价的图。
    */
-  function tradingBarView (now, crops) {
+  function tradingBarView (now, crop) {
     const bounds = slotBounds(now)
-    if (bounds === null || crops.length === 0) return null
-    const crop = crops[0]
+    if (bounds === null || typeof crop !== 'string' || crop === '') return null
     return {
       crop,
       cropName: CROPS[crop]?.name ?? crop,
@@ -2127,6 +2137,15 @@ export function createService (ctx, options = {}) {
       open: boardPrice({ crop, slot: bounds.slot, tick: 0 }),
       price: markPrice({ crop, now })
     }
+  }
+
+  /**
+   * 这一包该带哪一种作物的图/风向（票 90）：默认目录第一个；选中的作物如果
+   * 已经不在目录里（目录重载把它删了/底价坏了），悄悄退回第一个。
+   */
+  function boardCropOf (crops) {
+    if (tradingBoardCrop !== null && crops.includes(tradingBoardCrop)) return tradingBoardCrop
+    return crops[0] ?? null
   }
 
   /**
@@ -2163,8 +2182,8 @@ export function createService (ctx, options = {}) {
    * 四个周期的 K 线（票 84）：`15m` 直接复用上面那份（精确到 1 分钟，
    * 也就是旧窗口认的 15 分图），`1h`/`1d`/`1w` 由同一条 `boardPrice()`
    * 曲线按粗桶采样。四个周期一次算齐，窗口切周期只是本地换图，不再找宿主。
-   * 票 88：不再把 15 分图额外塞进 `charts` 重复下发（同一份数据序列化两遍白占带宽）；
-   * 旧字段由 helper 的 `normalizeBoardView()` 从 `timeframes['15m']` 补回来。
+   * 票 90：`crops` 只传当前选中的那一种（`tradingWindowView`/`trading-charts` 都这样），
+   * 所以 `charts` 这个旧字段也不用再从 `timeframes['15m']` 复制一份。
    */
   function tradingTimeframesView (now, crops) {
     const timeframes = { '15m': tradingChartsView(now, crops) }
@@ -2189,6 +2208,34 @@ export function createService (ctx, options = {}) {
       if (hint !== null) hints[crop] = hint
     }
     return hints
+  }
+
+  /**
+   * 盘口窗切到另一种作物时的按需拉图（票 90）。
+   *
+   * 为什么单独一条动作：一份 payload 只装得下当前作物的四个周期；窗口切页签时
+   * 先看本地缓存，没有就发这一条。回执只带**请求的那一种**的图与风向，
+   * 同时把 `tradingBoardCrop` 记住——之后 `/state` 与每分钟的推送都沿用它，
+   * 不会把用户刚选的作物打回目录第一个。
+   *
+   * 只认 `boardCrops()` 里的 id（运行时目录）：未知/坏底价作物给稳定 `bad-crop`，
+   * 与下单、`trading-digest` 的白名单同一把尺子。
+   */
+  function handleTradingCharts (cropId) {
+    if (trading === null) return { ok: false, error: 'starting', notice: tradingErrorText('starting') }
+    const crop = typeof cropId === 'string' ? cropId.trim().toLowerCase() : ''
+    if (!isBoardCrop(crop)) {
+      return { ok: false, error: 'bad-crop', notice: tradingErrorText('bad-crop') }
+    }
+    tradingBoardCrop = crop
+    const now = tradingClock()
+    return {
+      ok: true,
+      action: 'trading-charts',
+      crop,
+      timeframes: tradingTimeframesView(now, [crop]),
+      hint: tradingHintView(now, [crop])
+    }
   }
 
   /**
@@ -2293,6 +2340,11 @@ export function createService (ctx, options = {}) {
    * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
    * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
    * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
+   *
+   * 票 90：图与风向只带**当前选中的那一种作物**。一次全发时 15 种作物 ×4 周期 ×24 根
+   * 归一化后约 308 KiB，超过 helper 单行 256 KiB 上限，`encodeMessage()` 返回 null，
+   * 窗口根本打不开（还误报成桌面层没在运行）。其余作物切过去时走 `trading-charts`
+   * 按需拉；`limits.crops` 仍然是完整目录，作物条/下单白名单不受影响。
    */
   function tradingWindowView () {
     const now = tradingClock()
@@ -2304,12 +2356,14 @@ export function createService (ctx, options = {}) {
     // 作物清单在**一份 payload 里只取一次**：四张图、风向、limits 用的是同一份目录快照，
     // 不会出现「limits 里有、图里没有」的半截包（票 88 / ADR-0031）。
     const crops = boardCrops()
+    const activeCrop = boardCropOf(crops)
+    const active = activeCrop === null ? [] : [activeCrop]
     return {
       coins: tradingCoinsView(view),
       week,
-      bar: tradingBarView(now, crops),
-      timeframes: tradingTimeframesView(now, crops),
-      hint: tradingHintView(now, crops),
+      bar: tradingBarView(now, activeCrop),
+      timeframes: tradingTimeframesView(now, active),
+      hint: tradingHintView(now, active),
       positions: newestFirst(view.positions, 'openedAt'),
       // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
       // 不会把 240 手假装成 200 手（评审 P1）。
@@ -2349,12 +2403,50 @@ export function createService (ctx, options = {}) {
     }
     if (tradingWindowOpenNow()) return closeTradingWindow('trading-open')
     const opened = desktop.boardWindow({ open: true, state: tradingWindowView() })
-    if (opened !== true) {
-      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
-    }
+    // 票 90：桌面层在（上面刚判过），只是命令发不出去——不能再翻译成「桌面层没在运行」。
+    if (opened !== true) return boardSendFailed('trading-open')
     tradingWindowOpened = true
     // 成功也带一句话：农场窗里点「盘口」时，toast 要能说清发生了什么。
     return { ok: true, action: 'trading-open', window: 'opened', notice: '盘口已打开。' }
+  }
+
+  /**
+   * 票 90：盘口窗命令没写进管道时的唯一出口。
+   *
+   * 「桌面层没在运行」只留给 `desktop === null` / 没有 `boardWindow` 那种真的没有桌面层；
+   * 走到这里说明 manager 明明在，只是包太大（`reason:'size'`）、白名单拒了或管道坏了。
+   * 顺手 `warnOnce` 一条带尺寸的诊断——现场要靠它一眼看出 308 KiB > 256 KiB。
+   */
+  function boardSendFailed (action) {
+    noteBoardSendFailure(action)
+    return { ok: false, error: 'board-send-failed', notice: tradingErrorText('board-send-failed') }
+  }
+
+  function noteBoardSendFailure (action) {
+    warnOnce('board-send', boardSendFailureLine(action, desktop === null ||
+      typeof desktop.lastCommandFailure !== 'function'
+      ? null
+      : desktop.lastCommandFailure()))
+  }
+
+  /** 诊断一句话：带得上就写「308 KiB > 256 KiB」，带不上就如实说拿不到原因。 */
+  function boardSendFailureLine (action, failure) {
+    const command = failure !== null && typeof failure === 'object' && typeof failure.type === 'string'
+      ? failure.type
+      : action
+    const prefix = '盘口窗指令发不出去（' + action + ' / ' + command + '）：'
+    if (failure === null || typeof failure !== 'object') return prefix + '命令被拒，拿不到原因'
+    const kib = (bytes) => Math.round((Number(bytes) || 0) / 1024)
+    if (failure.reason === 'size') {
+      return prefix + kib(failure.bytes) + ' KiB 超过单行上限 ' +
+        kib(failure.limit ?? shared.MAX_LINE_LENGTH) + ' KiB'
+    }
+    if (failure.reason === 'whitelist') {
+      return prefix + '命令没过白名单（' + (failure.detail ?? 'bad-command') + '）'
+    }
+    if (failure.reason === 'no-pipe') return prefix + '桌面 helper 的输入管道不可用'
+    if (failure.reason === 'write') return prefix + '写管道失败（' + (failure.detail ?? 'write') + '）'
+    return prefix + '原因未知（' + String(failure.reason ?? 'none') + '）'
   }
 
   /** 盘口窗此刻是否真的开着（helper 优先；测试替身/老 helper 退回宿主记录）。 */
@@ -2383,9 +2475,8 @@ export function createService (ctx, options = {}) {
       sent = false
     }
     tradingWindowOpened = false
-    if (sent !== true) {
-      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
-    }
+    // 票 90：桌面层在、命令却发不出去（关窗命令很小，多半是管道坏了）——照样说实话。
+    if (sent !== true) return boardSendFailed(action)
     return { ok: true, action, window: 'closed', notice: '盘口已经关了。' }
   }
 
@@ -2393,7 +2484,10 @@ export function createService (ctx, options = {}) {
   function pushTradingWindow () {
     if (desktop === null || typeof desktop.boardWindow !== 'function') return false
     try {
-      return desktop.boardWindow({ open: false, state: tradingWindowView() }) === true
+      const sent = desktop.boardWindow({ open: false, state: tradingWindowView() }) === true
+      // 刷新失败只影响这一帧；但诊断要留一条（warnOnce 兜住每分钟的重复推送）。
+      if (sent !== true) noteBoardSendFailure('trading-refresh')
+      return sent
     } catch {
       // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
       return false
@@ -5361,6 +5455,14 @@ export function createService (ctx, options = {}) {
         // 47.1：只有「到点确认」带 action；窗口用它静默处理，不弹 toast。
         // 其它动作的回执形状保持不变，老渲染端/测试不用跟着改。
         if (event.action === 'farm-refresh') reply.action = 'farm-refresh'
+        // 票 90：按需拉图的回执照样带 action，外加这一种作物的四个周期与风向；
+        // 窗口收到后并进本地 state 重画，不用等下一包推送。
+        if (event.action === 'trading-charts' && result?.ok === true) {
+          reply.action = 'trading-charts'
+          reply.crop = result.crop
+          reply.timeframes = result.timeframes
+          reply.hint = result.hint
+        }
         target.actionResult(event.id, reply)
       }
     } catch {

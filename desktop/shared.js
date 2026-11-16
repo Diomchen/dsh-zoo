@@ -220,6 +220,7 @@
    *   trading-place-order    { side, margin, leverage, cropId, target }（票 83：到价挂单）
    *   trading-cancel-order   { orderId }（票 83：撤单）
    *   trading-refresh        无字段（倒计时到 0 时请宿主结这一根并重推一拍）
+   *   trading-charts         { cropId }（票 90：切到没缓存的作物时按需拉这一种的四个周期）
    * 价格、硬币、盈亏、成交价全由宿主算，窗口一概不传。
    */
   const BOARD_SUBMIT_ACTIONS = [
@@ -228,7 +229,8 @@
     'trading-set-stop',
     'trading-place-order',
     'trading-cancel-order',
-    'trading-refresh'
+    'trading-refresh',
+    'trading-charts'
   ]
   const BOARD_SIDES = ['long', 'short']
   const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
@@ -2173,13 +2175,14 @@
       const entry = normalizeBoardHistory(candidate)
       if (entry !== null) history.push(entry)
     }
-    // 票 88：四个周期的图只归一化一次，下面 `charts` 的旧字段兜底也读这一份。
+    // 票 88：四个周期的图只归一化一次。
     const timeframes = normalizeBoardTimeframes(
       raw.timeframes !== null && typeof raw.timeframes === 'object' && !Array.isArray(raw.timeframes)
         ? raw.timeframes
         : {}
     )
-    const rawCharts = raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
+    // 老宿主（票 81 的包）仍可能直接发 `charts`；新宿主不再重复下发（票 90）。
+    const charts = raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
       ? normalizeBoardCharts(raw.charts)
       : {}
     return {
@@ -2198,10 +2201,11 @@
         total: normalizeBoardInt(weekRaw.total, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0
       },
       limits: normalizeBoardLimits(limitsRaw),
-      // 票 81/88：盘口作物各自的 K 线；缺了就画空态（老宿主/坏包都走这条路）。
-      // 新宿主不再重复下发 15 分图（`timeframes['15m']` 就是它），这里补回旧字段，
-      // 窗口视图仍然可以用 `payload.charts` 画 15 分，不感知传输层的变化。
-      charts: Object.keys(rawCharts).length > 0 ? rawCharts : (timeframes['15m'] ?? {}),
+      // 票 81：老宿主（票 81 的包）把 15 分图放在 `charts` 里，仍然照收。
+      // 票 90：新宿主只发 `timeframes`，这里**不再**把 `timeframes['15m']` 复制成
+      // `charts`——同一份图序列化两遍，正是 308 KiB 卡住 IPC 的那一半体积。
+      // 视图对没有 `timeframes` 的老包仍会回退读 `charts`（`timeframeChartsOf()`）。
+      charts,
       // 票 84：四个周期的 K 线。老宿主没有这一块时是空对象，窗口退回 `charts`（15 分）。
       timeframes,
       hint: normalizeBoardHints(
@@ -2251,6 +2255,11 @@
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
     if (!BOARD_SUBMIT_ACTIONS.includes(action)) return null
     if (action === 'trading-refresh') return { action }
+    // 按需拉图（票 90）：窗口只报要看哪一种作物；四个周期的图由宿主算好回执。
+    if (action === 'trading-charts') {
+      const cropId = normalizeBoardCropId(raw.cropId)
+      return cropId === null ? null : { action, cropId }
+    }
     if (action === 'trading-close-position') {
       const positionId = normalizeUuid(raw.positionId)
       return positionId === null ? null : { action, positionId }
@@ -3351,15 +3360,55 @@
 
   /** 编码一行；超长返回 null，调用方必须放弃发送（而不是把管道写坏）。 */
   function encodeMessage (message) {
-    if (message === null || typeof message !== 'object') return null
+    const encoded = encodeMessageDetail(message)
+    return encoded.ok === true ? encoded.line : null
+  }
+
+  /**
+   * 一行 JSON 的 UTF-8 字节数。渲染页里没有 `Buffer`，而诊断要说「多少 KiB」；
+   * 只在编码失败时算一次，不在每帧的热路径上。
+   */
+  function utf8ByteLength (text) {
+    let bytes = 0
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index)
+      if (code < 0x80) bytes += 1
+      else if (code < 0x800) bytes += 2
+      else if (code >= 0xd800 && code <= 0xdbff) {
+        // 代理对 = 4 字节；落单的代理只在坏字符串里出现，按 3 字节算，不抛。
+        bytes += 4
+        index += 1
+      } else bytes += 3
+    }
+    return bytes
+  }
+
+  /**
+   * 编码一行并说明结果（票 90）：宿主要能分清「数据太大」和「形状/白名单被拒」，
+   * 才能留一条带尺寸的诊断，而不是把健康的桌面层误报成没在运行。
+   *
+   * 成功 `{ ok:true, line, bytes }`；失败 `{ ok:false, reason, bytes, limit }`，
+   * reason 是 `not-object` / `bad-json` / `size`。`MAX_LINE_LENGTH` 仍按**字符数**判
+   * （老口径不改），`bytes` 只是给人看的 UTF-8 尺寸。
+   */
+  function encodeMessageDetail (message) {
+    if (message === null || typeof message !== 'object') {
+      return { ok: false, reason: 'not-object', bytes: 0, limit: MAX_LINE_LENGTH }
+    }
     let line
     try {
       line = JSON.stringify(message)
     } catch {
-      return null
+      return { ok: false, reason: 'bad-json', bytes: 0, limit: MAX_LINE_LENGTH }
     }
-    if (typeof line !== 'string' || line.length > MAX_LINE_LENGTH) return null
-    return line + '\n'
+    if (typeof line !== 'string') {
+      return { ok: false, reason: 'bad-json', bytes: 0, limit: MAX_LINE_LENGTH }
+    }
+    const bytes = utf8ByteLength(line + '\n')
+    if (line.length > MAX_LINE_LENGTH) {
+      return { ok: false, reason: 'size', bytes, limit: MAX_LINE_LENGTH }
+    }
+    return { ok: true, line: line + '\n', bytes }
   }
 
   function parseLine (line) {
@@ -3481,16 +3530,28 @@
         return { ok: true, command: { type, id, scene: normalizeScene(raw.scene) } }
       case 'action-result': {
         if (id === null || typeof raw.id !== 'string') return { ok: false, error: 'bad-id' }
-        return {
-          ok: true,
-          command: {
-            type,
-            id,
-            ok: raw.ok === true,
-            notice: normalizeText(raw.notice, null, MAX_NOTICE_LENGTH),
-            error: normalizeLabel(raw.error, null)
+        const command = {
+          type,
+          id,
+          ok: raw.ok === true,
+          notice: normalizeText(raw.notice, null, MAX_NOTICE_LENGTH),
+          error: normalizeLabel(raw.error, null)
+        }
+        // 票 90：盘口按需拉图的回执要带图（`trading-charts`）。只有动作名、作物与图
+        // 都过得了盘口白名单才带上——半截图会让窗口一直停在「加载中」。
+        const action = normalizeLabel(raw.action, null)
+        if (action !== null) command.action = action
+        if (action === 'trading-charts' && raw.ok === true) {
+          const crop = normalizeBoardCropId(raw.crop)
+          const timeframes = normalizeBoardTimeframes(raw.timeframes)
+          if (crop !== null && Object.keys(timeframes).length > 0) {
+            command.crop = crop
+            command.timeframes = timeframes
+            const hints = normalizeBoardHints(raw.hint)
+            if (Object.keys(hints).length > 0) command.hint = hints
           }
         }
+        return { ok: true, command }
       }
       case 'open-url': {
         const url = normalizeHttpUrl(raw.url)
@@ -4555,6 +4616,8 @@
     emptyControls,
     emptyMenu,
     encodeMessage,
+    encodeMessageDetail,
+    utf8ByteLength,
     parseLine,
     createLineParser,
     rectContains,
