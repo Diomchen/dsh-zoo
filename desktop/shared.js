@@ -370,9 +370,23 @@
   const MARKET_MAX_QTY = 99
   const MARKET_FLOOR_RATIO = 0.5
   const MARKET_CEIL_RATIO = 2
-  /** 局域网指数混价（ticket 42）：与宿主 src/market.js 同一组权重。 */
-  const MARKET_LOCAL_WEIGHT = 0.85
-  const MARKET_INDEX_WEIGHT = 0.15
+  /** 局域网指数权重（ticket 42 / 股市感）：与宿主 src/market.js 同一组档位。 */
+  const MARKET_INDEX_WEIGHT_TIERS = [0, 0.45, 0.65, 0.75]
+  const MARKET_INDEX_WEIGHT_MAX = 0.85
+  const MARKET_CROP_BETA = Object.freeze({
+    pea: 0.8,
+    tomato: 0.8,
+    strawberry: 0.8,
+    radish: 0.9,
+    carrot: 1,
+    rice: 1,
+    corn: 1.1,
+    pumpkin: 1.3,
+    watermelon: 1.4,
+    grape: 1.4
+  })
+  /** 指数涨跌幅上限 ±12%，和宿主同源。 */
+  const MARKET_MOMENTUM_MAX = 0.12
   /** `remainingMs` 只用来画倒计时；一行 JSON 推到几百年后没有意义。 */
   const MAX_FARM_REMAINING_MS = 30 * 24 * 60 * 60 * 1000
   /** 雇佣（ticket 44）：与 src/contracts-rules.js 同源，改的时候两边一起改。 */
@@ -1195,12 +1209,21 @@
     return num >= MARKET_MIN_QTY && num <= MARKET_MAX_QTY ? num : null
   }
 
+  /** 与宿主 host 的 marketIndexWeight 同源：新鲜邻居数分档 × 作物 beta，封顶 85%。 */
+  function marketIndexWeight (samples, cropId) {
+    const count = Number(samples)
+    const tier = Number.isFinite(count) ? Math.min(3, Math.max(0, Math.floor(count))) : 0
+    const beta = Number(MARKET_CROP_BETA[cropId])
+    const factor = Number.isFinite(beta) && beta > 0 ? beta : 1
+    return Math.min(MARKET_INDEX_WEIGHT_MAX, MARKET_INDEX_WEIGHT_TIERS[tier] * factor)
+  }
+
   /**
    * 交易所的一行价目。`indexPrice` 只在指数新鲜时传进来：
-   * bid 与宿主同一条公式 `round((0.85×price + 0.15×index) × 0.9)`，窗口画的就是成交价。
-   * 宿主多传的 `bid` 一律不信——helper 自己按白名单字段算。
+   * bid 与宿主同一条公式 `round(((1-w)×price + w×index)×0.9)`，
+   * `w` 由 `indexEntry.samples` 与作物 beta 决定。宿主多传的 `bid` 一律不信。
    */
-  function normalizeMarketPrice (raw, cropId, indexPrice = null) {
+  function normalizeMarketPrice (raw, cropId, indexPrice = null, indexSamples = 0) {
     const base = CROP_BASE_PRICE[cropId]
     const rawPrice = raw === null || typeof raw !== 'object' || Array.isArray(raw)
       ? Number.NaN
@@ -1215,8 +1238,9 @@
       ? Number.NaN
       : Number(raw.at)
     const remote = Number(indexPrice)
-    const effective = Number.isFinite(remote) && remote > 0
-      ? MARKET_LOCAL_WEIGHT * price + MARKET_INDEX_WEIGHT * remote
+    const weight = marketIndexWeight(indexSamples, cropId)
+    const effective = Number.isFinite(remote) && remote > 0 && weight > 0
+      ? (1 - weight) * price + weight * remote
       : price
     return {
       base,
@@ -1259,10 +1283,15 @@
         if (!Number.isFinite(price) || price < 0) continue
         if (!Number.isFinite(at) || at <= 0) continue
         const base = CROP_BASE_PRICE[cropId]
+        const rawMomentum = Number(entry.momentum)
         index[cropId] = {
           price: Math.min(base * MARKET_CEIL_RATIO, Math.max(base * MARKET_FLOOR_RATIO, price)),
           at: Math.floor(at),
           samples: Number.isFinite(samples) ? Math.max(0, Math.floor(samples)) : 0,
+          weight: marketIndexWeight(Number.isFinite(samples) ? samples : 0, cropId),
+          momentum: Number.isFinite(rawMomentum)
+            ? Math.min(MARKET_MOMENTUM_MAX, Math.max(-MARKET_MOMENTUM_MAX, rawMomentum))
+            : 0,
           stale: entry.stale === true
         }
       }
@@ -1273,7 +1302,8 @@
       prices[cropId] = normalizeMarketPrice(
         raw.prices?.[cropId],
         cropId,
-        indexEntry !== undefined && indexEntry.stale !== true ? indexEntry.price : null
+        indexEntry !== undefined && indexEntry.stale !== true ? indexEntry.price : null,
+        indexEntry?.samples ?? 0
       )
     }
     const history = []

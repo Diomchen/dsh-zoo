@@ -56,9 +56,28 @@ export const MEAN_REVERSION_RATE = 0.03
 export const PRICE_FLOOR_RATIO = 0.5
 export const PRICE_CEIL_RATIO = 2
 export const BID_RATIO = 0.9
-/** 局域网指数（ticket 42）：本机价与样本中位数的权重。 */
-export const MARKET_LOCAL_WEIGHT = 0.85
-export const MARKET_INDEX_WEIGHT = 0.15
+/**
+ * 局域网指数权重（ticket 42 / 股市感）：按**新鲜邻居数**分档，再乘作物 beta。
+ * 1 家 45%、2 家 65%、3 家以上 75%；高波动作物最多 85%。
+ * 单个邻居不能绑架本机价，邻居够多时才有明显的联机行情。
+ */
+export const MARKET_INDEX_WEIGHT_TIERS = Object.freeze([0, 0.45, 0.65, 0.75])
+export const MARKET_INDEX_WEIGHT_MAX = 0.85
+/** 作物波动系数：高价值、慢周期作物更像“股票”，快菜更稳。 */
+export const MARKET_CROP_BETA = Object.freeze({
+  pea: 0.8,
+  tomato: 0.8,
+  strawberry: 0.8,
+  radish: 0.9,
+  carrot: 1,
+  rice: 1,
+  corn: 1.1,
+  pumpkin: 1.3,
+  watermelon: 1.4,
+  grape: 1.4
+})
+/** 邻居整体涨跌幅对指数目标的额外影响，单轮最多 ±12%。 */
+export const MARKET_MOMENTUM_MAX = 0.12
 
 const SIDES = Object.freeze(['buy', 'sell'])
 const MAX_HISTORY_PRICE = 1_000_000_000
@@ -113,20 +132,34 @@ export function clampPrice (price, base) {
 }
 
 /**
- * 成交价：`effective = 0.85 × price + 0.15 × index`（SPEC v5「交易所与行情」）。
- * 没有新鲜指数时退化为本机价格——指数是锦上添花，不能把交易所拖停。
+ * 有效权重：新鲜邻居数分档 × 作物 beta，封顶 85%。
+ * 未知作物/自定义作物按 beta 1 处理；samples 坏值按 0。
  */
-export function effectivePrice (price, indexPrice = null) {
+export function marketIndexWeight (samples, cropId = null) {
+  const count = Number(samples)
+  const tier = Number.isFinite(count) ? Math.min(3, Math.max(0, Math.floor(count))) : 0
+  const beta = Number(MARKET_CROP_BETA[cropId])
+  const factor = Number.isFinite(beta) && beta > 0 ? beta : 1
+  return Math.min(MARKET_INDEX_WEIGHT_MAX, MARKET_INDEX_WEIGHT_TIERS[tier] * factor)
+}
+
+/**
+ * 成交价：`effective = (1 - w) × price + w × index`。
+ * `w` 由新鲜邻居数和作物 beta 决定；没有新鲜指数时退化为本机价格。
+ */
+export function effectivePrice (price, indexPrice = null, { samples = 0, cropId = null } = {}) {
   const value = Number(price)
   if (!Number.isFinite(value) || value <= 0) return 0
   const remote = Number(indexPrice)
   if (!Number.isFinite(remote) || remote <= 0) return value
-  return MARKET_LOCAL_WEIGHT * value + MARKET_INDEX_WEIGHT * remote
+  const weight = marketIndexWeight(samples, cropId)
+  if (weight <= 0) return value
+  return (1 - weight) * value + weight * remote
 }
 
 /** 交易所买价：`bid = round(effective × 0.9)`。 */
-export function bidPrice (price, indexPrice = null) {
-  return Math.round(effectivePrice(price, indexPrice) * BID_RATIO)
+export function bidPrice (price, indexPrice = null, options = {}) {
+  return Math.round(effectivePrice(price, indexPrice, options) * BID_RATIO)
 }
 
 /**
@@ -182,6 +215,7 @@ export function medianPrice (values) {
  * `samples` 是 `{ prices, at }[]`（服务层已按 deviceId 只留最近一条）。逐作物：
  *   - 只收 2 分钟内、已知作物、`[base×0.5, base×2]` 内的 peer 价格；
  *   - 指数 = peer 价格的中位数，`samples` = peer 样本数（不含本机）；
+ *   - 再叠加 peer 最近一轮涨跌幅的中位数（动量），单轮最多 ±12%；
  *   - 没有 peer 样本时退化为本机价格、`samples: 0`（`effective = 本机`）——
  *     交易所页把这一条画成「本机行情」，不是伪造一个有邻居的指数。
  * 坏条目只丢自己，绝不让一种作物拖垮另外两种。
@@ -196,12 +230,17 @@ export function computeMarketIndex ({ localPrices, samples, now = Date.now() } =
   for (const cropId of CROP_IDS) {
     const base = CROPS[cropId].base
     const values = []
+    const changes = []
     let newest = 0
     for (const sample of freshSamples) {
       const raw = Number(sample.prices?.[cropId])
       if (!Number.isFinite(raw)) continue
       if (raw < base * PRICE_FLOOR_RATIO || raw > base * PRICE_CEIL_RATIO) continue
       values.push(raw)
+      const previous = Number(sample.previous?.[cropId])
+      if (Number.isFinite(previous) && previous > 0) {
+        changes.push((raw - previous) / previous)
+      }
       const at = Number(sample.at)
       if (at > newest) newest = at
     }
@@ -209,14 +248,20 @@ export function computeMarketIndex ({ localPrices, samples, now = Date.now() } =
       // 没有邻居报价：指数就是本机价（0 个 peer 样本）。有效价仍等于本机价。
       const local = Number(localPrices?.[cropId]?.price)
       if (Number.isFinite(local) && local > 0) {
-        index[cropId] = { price: clampPrice(local, base), at: atFallback, samples: 0 }
+        index[cropId] = { price: clampPrice(local, base), at: atFallback, samples: 0, momentum: 0 }
       }
       continue
     }
+    const median = medianPrice(values)
+    const rawMomentum = medianPrice(changes)
+    const momentum = Number.isFinite(rawMomentum)
+      ? Math.min(MARKET_MOMENTUM_MAX, Math.max(-MARKET_MOMENTUM_MAX, rawMomentum))
+      : 0
     index[cropId] = {
-      price: medianPrice(values),
+      price: clampPrice(median * (1 + momentum), base),
       at: newest > 0 ? newest : atFallback,
-      samples: values.length
+      samples: values.length,
+      momentum
     }
   }
   return index
@@ -279,6 +324,8 @@ export function marketView (state, {
     const entry = source.prices?.[cropId]
     // bid 只在窗口视图里出现；它按新鲜指数混一次，和真正成交价同源。
     const indexPrice = withBid ? freshIndexPrice(source.index?.[cropId], now) : null
+    const indexSamples = Number(source.index?.[cropId]?.samples) || 0
+    const bidOptions = { samples: indexSamples, cropId }
     if (entry === undefined) {
       const base = CROPS[cropId].base
       prices[cropId] = {
@@ -286,7 +333,7 @@ export function marketView (state, {
         price: base,
         volume24h: 0,
         at: null,
-        ...(withBid ? { bid: bidPrice(base, indexPrice) } : {})
+        ...(withBid ? { bid: bidPrice(base, indexPrice, bidOptions) } : {})
       }
       continue
     }
@@ -295,19 +342,21 @@ export function marketView (state, {
       price: entry.price,
       volume24h: entry.volume24h,
       at: entry.at,
-      ...(withBid ? { bid: bidPrice(entry.price, indexPrice) } : {})
+      ...(withBid ? { bid: bidPrice(entry.price, indexPrice, bidOptions) } : {})
     }
   }
   const index = {}
   for (const cropId of CROP_IDS) {
     const entry = source.index?.[cropId]
     if (entry === undefined) continue
-    // `/state` 严格保持 `{price, at, samples}`；窗口多一个 `stale` 用来画灰。
+    // `/state` 严格保持 `{price, at, samples}`；窗口多出画 UI 用的权重/动量/stale。
     index[cropId] = withBid
       ? {
           price: entry.price,
           at: entry.at,
           samples: entry.samples,
+          weight: marketIndexWeight(entry.samples, cropId),
+          momentum: Number(entry.momentum) || 0,
           stale: !isFreshMarketSample(entry.at, now)
         }
       : { price: entry.price, at: entry.at, samples: entry.samples }
@@ -440,10 +489,15 @@ function normalizeIndexEntry (cropId, value) {
   const at = normalizeTimestamp(value.at)
   if (at === null) return null
   const samples = nonNegativeInt(value.samples, 1_000_000)
+  const rawMomentum = finiteNumber(value.momentum)
+  const momentum = rawMomentum === null
+    ? 0
+    : Math.min(MARKET_MOMENTUM_MAX, Math.max(-MARKET_MOMENTUM_MAX, rawMomentum))
   return {
     price: clampPrice(rawPrice, CROPS[cropId].base),
     at,
-    samples: samples === null ? 0 : samples
+    samples: samples === null ? 0 : samples,
+    momentum
   }
 }
 
@@ -638,7 +692,11 @@ class MarketStore {
       if (!Number.isFinite(value)) continue
       prices[cropId] = clampPrice(value, CROPS[cropId].base)
     }
-    this.#digests.set(deviceId, { prices, at })
+    const previous = this.#digests.get(deviceId)
+    const priorPrices = previous !== undefined && isFreshMarketSample(previous.at, now)
+      ? previous.prices
+      : null
+    this.#digests.set(deviceId, { prices, at, previous: priorPrices })
     this.#pruneDigests(now)
     const changed = this.#refreshIndex(now)
     return {
@@ -707,7 +765,11 @@ class MarketStore {
     if (side === 'sell') {
       // 这一笔按成交前的 bid 结算；数量冲击只影响下一笔（和现实做市商一样）。
       // 有新鲜局域网指数时 bid 用混合价，否则退化为本机价格。
-      unitPrice = bidPrice(priceBefore, freshIndexPrice(this.#state.index[cropId], stamp))
+      const indexEntry = this.#state.index[cropId]
+      unitPrice = bidPrice(priceBefore, freshIndexPrice(indexEntry, stamp), {
+        samples: Number(indexEntry?.samples) || 0,
+        cropId
+      })
       entry.price = sellImpactPrice(priceBefore, entry.base, count, depth)
       entry.at = stamp
     } else {
@@ -791,7 +853,8 @@ class MarketStore {
         ? { ...next, at: previous.at }
         : next
       if (previous !== undefined && previous.price === candidate.price &&
-        previous.at === candidate.at && previous.samples === candidate.samples) continue
+        previous.at === candidate.at && previous.samples === candidate.samples &&
+        previous.momentum === candidate.momentum) continue
       this.#state.index[cropId] = candidate
       changed = true
     }
