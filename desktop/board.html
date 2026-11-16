@@ -490,6 +490,14 @@
         line-height: 1.5;
         font-variant-numeric: tabular-nums;
       }
+      /* 下单前的强平价（SPEC v10 US7）：和预览句分两行，预览句的措辞是产品硬文案。 */
+      .liquidation {
+        margin: 0;
+        padding: 0 2px;
+        font-size: 11px;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
       .submit {
         width: 100%;
         padding: 11px 12px;
@@ -809,6 +817,30 @@
       .sentiment-value[data-tone='down'] {
         color: var(--rose-ink);
       }
+      /* US19：邻居的当前持仓画成小 chip（作物 + 多/空 + 杠杆），摘要仍保留多空计数。 */
+      .league-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 3px;
+      }
+      .league-chip {
+        padding: 1px 6px;
+        border-radius: 999px;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+        font-size: 10px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .league-chip[data-tone='short'] {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .league-chip.more {
+        background: rgba(47, 58, 52, 0.06);
+        color: var(--muted);
+      }
       /* 本机那一行一直高亮：榜上第一眼要找的是自己的名次，不是邻居。 */
       .league-row.me {
         margin: 0 -6px;
@@ -972,11 +1004,12 @@
             </div>
           </div>
           <p class="preview" id="preview"></p>
+          <p class="liquidation" id="order-liquidation"></p>
           <button class="submit" id="submit" type="button">开一手</button>
           <p class="hint" id="order-hint"></p>
           <div class="orders-head">
             <span>到价挂单</span>
-            <span id="orders-meta">0 张</span>
+            <span id="orders-meta">挂单 0</span>
           </div>
           <div class="scroll orders" id="orders"></div>
           <p class="empty" id="orders-empty">没有挂单。</p>
@@ -988,7 +1021,7 @@
         <section class="card positions-card" aria-labelledby="positions-title">
           <div class="card-head">
             <h2 id="positions-title">持仓</h2>
-            <span id="positions-meta">0 手</span>
+            <span id="positions-meta">持仓 0</span>
           </div>
           <div class="scroll" id="positions"></div>
           <p class="empty" id="positions-empty">还没有持仓。</p>

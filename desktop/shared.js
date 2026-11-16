@@ -90,6 +90,20 @@
   const MAX_MENU_ACTIONS = 256
   // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
   const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'home', 'reload', 'scan-skins']
+  /**
+   * 右键工具项 → 宿主动作申请（评审 P2）：渲染端以前用一条 `id === 'reload' || …` 的
+   * 手写链，多一个工具就要改两处。现在只有这一张表，`runMenuTool` 直接查它。
+   * `home` 不在这里：它只在本机把宠物挪回出生点，不发任何申请。
+   * 键集合 = `MENU_TOOL_IDS` 去掉 home，`test/desktop-menu.test.js` 盯着。
+   */
+  const MENU_TOOL_REQUESTS = Object.freeze({
+    'open-site': 'open-site',
+    bring: 'bring',
+    farm: 'farm-open',
+    trading: 'trading-open',
+    reload: 'reload',
+    'scan-skins': 'scan-skins'
+  })
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -219,16 +233,25 @@
   const BOARD_SIDES = ['long', 'short']
   const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
   /**
+   * 盘口杠杆的形状上限（票 81 / 评审 P2）：与 `src/trading-rules.js` 的 `MAX_LEVERAGE` 同值。
+   * 这一层只守形状（读盘/白名单），1×/5×/20× 的产品白名单由宿主按 `TRADING_LEVERAGES` 校验；
+   * `test/farm-constants-drift.test.js` 有 drift 断言盯着两个数相等。
+   */
+  const BOARD_MAX_LEVERAGE = 20
+  /**
    * 止损档位（票 81）：0 = 关，其余是「亏掉保证金的这个比例就平仓」。
    * 窗口的按钮循环「关 → −25% → −50% → −100% → 关」，宿主的 store（票 80）
    * 按同一组数校验；两边各留一份，靠 `test/board-window.test.js` 的 drift 断言对齐。
    */
   const BOARD_STOP_LEVELS = [0, 0.25, 0.5, 1]
-  /** 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。 */
+  /**
+   * 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。
+   * 持仓/挂单放到 200（评审 P1）：宿主按最新在前下发，200 条足够覆盖正常玩家的全部
+   * 未平仓位；真超了由 `positionsTotal`/`ordersTotal` 告诉窗口「显示最近 200」。
+   */
   const BOARD_MAX_PRICE = 1000000000
-  const BOARD_MAX_POSITIONS = 32
-  /** 挂单一屏最多画多少张：和持仓同一个数量级，多出来的不画（账本里还在）。 */
-  const BOARD_MAX_ORDERS = 32
+  const BOARD_MAX_POSITIONS = 200
+  const BOARD_MAX_ORDERS = 200
   const BOARD_MAX_HISTORY = 50
   const BOARD_MAX_LIMITS = 8
   const BOARD_MAX_CHARTS = 8
@@ -243,6 +266,8 @@
   const BOARD_MAX_LEAGUE_ROWS = 32
   const BOARD_MAX_LEAGUE_POSITIONS = 8
   const BOARD_MAX_LEAGUE_COUNT = BOARD_MAX_LEAGUE_ROWS * BOARD_MAX_LEAGUE_POSITIONS
+  /** 旧版本邻居的可见计数：与 `src/protocol.js` 的 MAX_NEIGHBORS（64）同量级，只做形状夹取。 */
+  const BOARD_MAX_WATCHERS = 64
   const BOARD_MAX_WEEK_PNL = 1000000
   const BOARD_MAX_WEEK_PNL_PCT = 1000
   /**
@@ -1609,7 +1634,7 @@
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     if (id === null || crop === null || side === null) return null
     const margin = normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS)
-    const leverage = normalizeBoardInt(raw.leverage, 1, 20)
+    const leverage = normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     const entry = normalizeBoardNumber(raw.entry, 0, BOARD_MAX_PRICE)
     if (margin === null || leverage === null || entry === null) return null
     return {
@@ -1652,7 +1677,7 @@
       crop,
       side,
       margin: normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS) ?? 0,
-      leverage: normalizeBoardInt(raw.leverage, 1, 20) ?? 1,
+      leverage: normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE) ?? 1,
       entry,
       exit,
       pnl,
@@ -1674,7 +1699,7 @@
     if (id === null || crop === null || side === null) return null
     const target = normalizeBoardNumber(raw.target, 0, BOARD_MAX_PRICE)
     const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
-    const leverage = normalizeBoardInt(raw.leverage, 1, 20)
+    const leverage = normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     const placedAt = normalizeBoardInt(raw.placedAt, 0, Number.MAX_SAFE_INTEGER)
     const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
     if (target === null || target <= 0 || margin === null || leverage === null ||
@@ -1714,7 +1739,7 @@
     const leverages = []
     for (const candidate of Array.isArray(raw.leverages) ? raw.leverages : []) {
       if (leverages.length >= BOARD_MAX_LIMITS) break
-      const leverage = strictBoardInt(candidate, 1, 20)
+      const leverage = strictBoardInt(candidate, 1, BOARD_MAX_LEVERAGE)
       if (leverage !== null && !leverages.includes(leverage)) leverages.push(leverage)
     }
     const crops = []
@@ -1835,7 +1860,7 @@
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const crop = normalizeCropId(raw.crop)
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
-    const leverage = strictBoardInt(raw.leverage, 1, 20)
+    const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     if (crop === null || side === null || leverage === null) return null
     return { crop, side, leverage }
   }
@@ -1890,6 +1915,12 @@
     const own = source.self !== null && typeof source.self === 'object' && !Array.isArray(source.self)
       ? source.self
       : {}
+    // 旧版本邻居（评审 P1）：有人在线、但一条周报都没发时，窗口要画「旧版本」而不是
+    // 「还没有邻居上线」。这两个数只是展示用的计数，坏了归零。
+    const watchers = source.watchers !== null && typeof source.watchers === 'object' &&
+      !Array.isArray(source.watchers)
+      ? source.watchers
+      : {}
     return {
       rows,
       sentiment: {
@@ -1902,6 +1933,10 @@
         weekPnlPct: own.weekPnlPct === null || own.weekPnlPct === undefined
           ? null
           : normalizeBoardNumber(own.weekPnlPct, -BOARD_MAX_WEEK_PNL_PCT, BOARD_MAX_WEEK_PNL_PCT)
+      },
+      watchers: {
+        online: normalizeBoardInt(watchers.online, 0, BOARD_MAX_WATCHERS) ?? 0,
+        reported: normalizeBoardInt(watchers.reported, 0, BOARD_MAX_WATCHERS) ?? 0
       }
     }
   }
@@ -1921,8 +1956,9 @@
     const barRaw = raw.bar !== null && typeof raw.bar === 'object' && !Array.isArray(raw.bar)
       ? raw.bar
       : null
+    const rawPositions = Array.isArray(raw.positions) ? raw.positions : []
     const positions = []
-    for (const candidate of Array.isArray(raw.positions) ? raw.positions : []) {
+    for (const candidate of rawPositions) {
       if (positions.length >= BOARD_MAX_POSITIONS) break
       const position = normalizeBoardPosition(candidate)
       if (position !== null) positions.push(position)
@@ -1972,10 +2008,16 @@
           price: normalizeBoardNumber(barRaw.price, 0, BOARD_MAX_PRICE)
         },
       positions,
+      // 总数是账本里的真实条数（评审 P1）：宿主没给就退回这次收到的条数；
+      // 窗口用「持仓 N · 显示最近 200」说明截断，而不是假装只有画出来的这些。
+      positionsTotal: normalizeBoardInt(raw.positionsTotal, 0, Number.MAX_SAFE_INTEGER) ??
+        rawPositions.length,
       history,
       // 票 83：到价挂单（宿主已经按形状校验过；这里再白名单一遍，防止窗口收到多余字段）。
       // §9.4 的老坑：这一行要是继续硬编码 []，宿主发了、窗口永远收不到。
       orders: normalizeBoardOrders(raw.orders),
+      ordersTotal: normalizeBoardInt(raw.ordersTotal, 0, Number.MAX_SAFE_INTEGER) ??
+        (Array.isArray(raw.orders) ? raw.orders.length : 0),
       // 票 82：真人周榜 + LAN 情绪。老宿主没有这一块时是空榜（窗口画「还没有邻居上线」）。
       league: normalizeBoardLeague(raw.league)
     }
@@ -2018,7 +2060,7 @@
     if (action === 'trading-place-order') {
       const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
       const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
-      const leverage = strictBoardInt(raw.leverage, 1, 20)
+      const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
       const cropId = normalizeCropId(raw.cropId)
       const target = Number(raw.target)
       if (side === null || margin === null || leverage === null || cropId === null) return null
@@ -2028,7 +2070,7 @@
     // 开仓：形状合法即可；保证金/杠杆白名单由宿主按 trading-rules 再判一次（并回人话）。
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
-    const leverage = strictBoardInt(raw.leverage, 1, 20)
+    const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     const cropId = normalizeCropId(raw.cropId)
     if (side === null || margin === null || leverage === null || cropId === null) return null
     return { action, side, margin, leverage, cropId }
@@ -4158,6 +4200,7 @@
     BOARD_SUBMIT_ACTIONS,
     BOARD_SIDES,
     BOARD_STOP_LEVELS,
+    BOARD_MAX_LEVERAGE,
     normalizeBoardOrders,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
@@ -4182,6 +4225,7 @@
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
+    MENU_TOOL_REQUESTS,
     MAX_FARM_PLOTS,
     MIN_FARM_PLOTS,
     CROP_IDS,

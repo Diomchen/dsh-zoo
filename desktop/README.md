@@ -495,18 +495,23 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 和农场窗同一条模型：**宿主算数据，helper 只画和收输入**。
 
 - 宿主用 `board-window { open, state }` 下发整份视图（硬币、本周盈亏、三作物 K 线、风向、
-  持仓、挂单、历史、真人周榜、`limits`）；窗口读不到 `/state`，也不自己算价/算钱。
+  持仓、挂单、历史、真人周榜、`limits`）；窗口读不到 `/state`，价格、硬币、盈亏入账与
+  「能不能下单/平仓」全由宿主算。窗口只用 payload 的现价算两处**展示用**数字：
+  下单预览（涨跌 1% 的盈亏与强平亏损）和强平价/到价目标带；两者都不改账本，
+  `test/trading-view.test.js` 有 drift 断言盯着它们和 `src/trading-rules.js` 一致。
 - 渲染端用 `dsh-zoo:board-submit` 发一次申请，字段经 `shared.normalizeBoardAction` 白名单后
   落到宿主的 `trading-*` 动作；结果走 `action-result`，成功不关窗，失败冒人话。
 - `dsh-zoo:board-ready` / `dsh-zoo:board-close` / `dsh-zoo:board-state` / `dsh-zoo:board-result`
   与农场窗同款；重画由宿主每分钟一拍 + 动作后的刷新推送，窗口自己只递减倒计时。
-- 键盘：Tab 顺序 = DOM 顺序（作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 →
-  挂单 → 开一手 → 撤单 → 持仓卡的止损/平仓），Enter/Space 是按钮原生行为，Esc 关窗。
+- 键盘：Tab 顺序由 `trading-view.js` 的纯函数 `focusOrder(payload)` 定义，`board.js` 按它
+  写真实 tabindex（× → 作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 → 挂单 →
+  开一手 → 撤单 → 持仓卡的止损/平仓）；Enter/Space 是按钮原生行为，Esc 关窗。
   **失焦不关窗**（macOS 中文输入法候选窗会抢焦点，和农场窗同一条取舍）。
 - ×、Esc 走窗口自己的 `dsh-zoo:board-close`；宿主只负责打开/刷新/显式 `close:true`。
   关窗后 host 继续每分钟撮合/结算，窗口不会因此停摆。
-- 截图：`shot` 的 `window:'board'` 抓这扇窗（`test/board-window.test.js` 覆盖命令/字段白名单，
-  真 Electron 冒烟目前只跑农场窗）。
+- 截图：`shot` 的 `window:'board'` 抓这扇窗，窗口没开时回 `not-ready`（辅助进程只报错、
+  不 crash）；`test/board-window.test.js` 覆盖命令/字段白名单与 `main.js` 的接线，
+  真 Electron 冒烟目前只跑农场窗。
 
 ## 多显示器 / 分辨率
 

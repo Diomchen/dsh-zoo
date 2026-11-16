@@ -465,12 +465,21 @@ class TradingStore {
   #state = initialTradingState(0, 0)
   #warned = new Set()
   /**
-   * 每手仓位「已经检查到哪一刻」（position.id → 毫秒）。**只在内存里**：
+   * 每手仓位「强平已经检查到哪一刻」（position.id → 毫秒）。**只在内存里**：
    *   - 重启后没有它 → 从 `openedAt` 重扫，离线期间撞过的强平/止损照样补出来；
    *   - 落了盘反而危险：存档里的一切都可能被人改，路径检查的起点不该由它决定。
    * 起点只影响「从哪一分钟开始算」，终点永远跟收盘对齐，所以结果依旧只由仓位与时间决定。
+   *
+   * 票 80 的止损另有自己的游标（`#stopFrom`），**绝不能共用这一个**：设止损是玩家在
+   * 某一刻做的选择，它只该决定「止损从哪一刻起生效」；如果顺手把强平的检查进度也推到
+   * 那一刻，设止损之前已经越过强平线的一段就被跳过了（评审 P0）。
    */
   #checked = new Map()
+  /**
+   * 每手仓位的止损生效时刻（position.id → 毫秒）。设止损/关止损都写在这里；
+   * 强平游标 `#checked` 不受影响。没写过 = 从开仓那一刻起（默认关，本来也不会触发）。
+   */
+  #stopFrom = new Map()
   /** 串行化：同一毫秒里的两笔开/平不能互相写掉对方的仓位。 */
   #chain = Promise.resolve()
   #lastWriteAt = Number.NEGATIVE_INFINITY
@@ -698,7 +707,8 @@ class TradingStore {
     position.stopLoss = level
     // 新档位从「设下的这一刻」开始生效：不翻旧账去按更早的 mark 平
     // （那会让「刚设的止损」按一个几分钟前的价成交，说不通）。
-    this.#checked.set(position.id, now)
+    // 只挪止损游标；强平游标 `#checked` 不动——设止损之前越过的强平线下一拍仍要补出来。
+    this.#stopFrom.set(position.id, now)
     const persisted = await this.#persist(true)
     return {
       ok: true,
@@ -804,7 +814,7 @@ class TradingStore {
       const horizon = Math.min(now, (position.slot + 1) * SLOT_MS)
       const trigger = this.#triggerOf(position, horizon)
       if (trigger !== null) {
-        this.#checked.delete(position.id)
+        this.#forgetCheck(position.id)
         const result = await this.#settle(position, trigger)
         if (result.ok === true) settled = true
         continue
@@ -919,17 +929,28 @@ class TradingStore {
   }
 
   /**
-   * 这个仓位在 `[上次检查到的时刻, horizon]` 这段路上撞过强平线或止损档没有。
+   * 这个仓位在 `[强平游标, horizon]` 这段路上撞过强平线或止损档没有。
    *
    * 为什么不能只看端点：快进时钟、关掉 DSH 几小时再回来、中间某一分钟插针又弹回去，
    * 端点可能完全安全，而仓位早就该平了。强平是系统规则，止损是玩家工具，都不许被跳过。
+   *
+   * 两个起点分开传（评审 P0）：强平从 `#checked`（上一次检查到的时刻）起算；
+   * 止损从 `#stopFrom`（玩家设下档位的那一刻）起算，不能拿强平的进度去补旧账，
+   * 也不能因为设了止损就少扫强平。
    *
    * 终点是「此刻与这一根收盘的较早者」：收盘之后由 `settle` 接管，扫过去只会把收盘价
    * 换成中间某一分钟，反而和图上最后一根对不上。仓位只活一根，所以这段路最长一根，
    * `pathScan` 的 3 天上限在账本里永远碰不到（它防的是别处传入的离谱区间）。
    */
   #triggerOf (position, horizon) {
-    const from = Math.max(position.openedAt, this.#checked.get(position.id) ?? position.openedAt)
+    const liquidationFrom = Math.max(
+      position.openedAt,
+      this.#checked.get(position.id) ?? position.openedAt
+    )
+    const stopFrom = Math.max(
+      position.openedAt,
+      this.#stopFrom.get(position.id) ?? position.openedAt
+    )
     return pathScan({
       crop: position.crop,
       side: position.side,
@@ -937,15 +958,22 @@ class TradingStore {
       leverage: position.leverage,
       entry: position.entry,
       stopLoss: position.stopLoss,
-      from,
-      to: horizon
+      from: liquidationFrom,
+      to: horizon,
+      stopFrom
     })
   }
 
-  /** 记住「这手仓位已经检查到这个时刻」；时钟往后退时不倒着走。 */
+  /** 记住「这手仓位的强平已经检查到这个时刻」；时钟往后退时不倒着走。 */
   #rememberCheck (position, horizon) {
     const previous = this.#checked.get(position.id) ?? position.openedAt
     if (horizon > previous) this.#checked.set(position.id, horizon)
+  }
+
+  /** 仓位结算/消失时把两个游标都清掉，别让内存表跟着历史一起长。 */
+  #forgetCheck (positionId) {
+    this.#checked.delete(positionId)
+    this.#stopFrom.delete(positionId)
   }
 
   /**
@@ -956,6 +984,10 @@ class TradingStore {
    * 第 2 步失败时仓位保持 `settling`：本次运行不会再动它，重启后只补后半段。
    */
   async #settle (position, { exit, reason, at }) {
+    // 没有农场就没有钱包可退：与 open/close/placeOrder 同一条守卫。启动补算
+    // （`#settleDue`）可能在 farm 注入之前就看到一笔该结的仓位；少了这一句，
+    // `credit > 0` 时会在 `this.#farm.addCoins` 上抛 TypeError（评审 P2 的 latent 路径）。
+    if (this.#farm === null) return tradingError('starting')
     const outcome = settlementOf({
       side: position.side,
       margin: position.margin,
@@ -995,7 +1027,7 @@ class TradingStore {
   #finishSettle (position, settling) {
     const index = this.#state.positions.indexOf(position)
     if (index >= 0) this.#state.positions.splice(index, 1)
-    this.#checked.delete(position.id)
+    this.#forgetCheck(position.id)
     const history = {
       id: randomUUID(),
       crop: position.crop,
