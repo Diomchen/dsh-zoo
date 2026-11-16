@@ -2999,6 +2999,17 @@ async function verifyFarmWindow () {
   assert(sparkHover.show === true, '悬停后气泡显示：' + sparkHover.tip)
   assert(/·\s*\d+\s*硬币/.test(sparkHover.tip), '气泡写的是这条记录的价格：' + sparkHover.tip)
   assert(sparkHover.near === true, '气泡出现在点的附近')
+  assert(sparkHover.inside === true, '气泡没有超出折线区域（贴边时也不裁字）')
+  // 最右边那个点：气泡要往左收，不能顶出卡片。
+  client.send({ type: 'debug-farm-spark', id: 'smoke-farm-spark-right', index: -1 })
+  const sparkRight = await client.waitFrom(
+    client.mark(),
+    (event) => event.id === 'smoke-farm-spark-right',
+    6000,
+    '成交价曲线最右点悬停'
+  )
+  assert(sparkRight.type === 'farm-spark' && sparkRight.show === true, '最右点悬停也有气泡')
+  assert(sparkRight.inside === true, '最右点的气泡收在折线区域内，没有被卡片裁掉')
   assert(sparkHover.note === '24h 卖价' || sparkHover.note === '24h · 暂无成交', '曲线右侧文字不随悬停变化：' + sparkHover.note)
   const sparkPath = join(OUT_DIR, '47-farm-spark-hover.png')
   await sleep(250)

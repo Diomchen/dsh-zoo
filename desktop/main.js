@@ -2392,20 +2392,27 @@ function applyCommand (command) {
         writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
         return
       }
+      // index = -1 表示挑这一行最右边（最后一个）的点，用来验贴边时气泡不被裁掉。
+      const index = command.index === -1 ? -1 : Math.max(0, Math.floor(Number(command.index) || 0))
       const script = '(() => {' +
         'const dots = Array.from(document.querySelectorAll(".market-spark-dot"));' +
         'if (dots.length === 0) return { dots: 0, tip: "", show: false, note: "" };' +
-        // 取第一个真正在视口里的点：列表可以滚动，最后一个点可能在屏幕外。
-        'const dot = dots.find((candidate) => {' +
+        // 只挑真正在视口里的点：列表可以滚动，屏幕外的点悬停没有意义。
+        'const visible = dots.filter((candidate) => {' +
         'const rect = candidate.getBoundingClientRect();' +
         'return rect.top > 0 && rect.bottom < window.innerHeight && rect.left >= 0 && rect.right <= window.innerWidth;' +
-        '}) || dots[0];' +
+        '});' +
+        'const pool = visible.length > 0 ? visible : dots;' +
+        'const dot = (' + index + ') === -1 ? pool[pool.length - 1] : (pool[' + index + '] || pool[0]);' +
         'dot.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));' +
         'const tip = dot.parentElement === null ? null : dot.parentElement.querySelector(".market-spark-tip");' +
         'const note = dot.parentElement === null ? null : dot.parentElement.parentElement.querySelector(".market-spark-note");' +
         'const dotRect = dot.getBoundingClientRect();' +
         'const tipRect = tip === null ? null : tip.getBoundingClientRect();' +
+        'const plotRect = tip !== null && tip.parentElement !== null ? tip.parentElement.getBoundingClientRect() : null;' +
         'const shown = tip !== null && tip.dataset.show === "true";' +
+        'const inside = tipRect !== null && plotRect !== null' +
+        ' && tipRect.left >= plotRect.left - 1 && tipRect.right <= plotRect.right + 1;' +
         'return {' +
         'dots: dots.length,' +
         'tips: document.querySelectorAll(".market-spark-tip").length,' +
@@ -2414,7 +2421,8 @@ function applyCommand (command) {
         'show: shown,' +
         'note: note === null ? "" : note.textContent,' +
         'near: tipRect !== null && Math.abs((tipRect.left + tipRect.width / 2) - (dotRect.left + dotRect.width / 2)) < 60' +
-        ' && tipRect.bottom <= dotRect.top + 12 && tipRect.bottom > dotRect.top - 48' +
+        ' && tipRect.bottom <= dotRect.top + 12 && tipRect.bottom > dotRect.top - 48,' +
+        'inside: inside' +
         '};' +
         '})()'
       void farmWin.webContents.executeJavaScript(script, true)
