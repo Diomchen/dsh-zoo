@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('dshZooFarm', {
       // 票 70：节日/来客的乐观锁和二选一也要过桥，否则会被当成缺地块的普通动作。
       expectedStart: action.expectedStart,
       choice: action.choice,
+      guards: action.guards,
       hours: action.hours,
       contractId: action.contractId,
       wagePerHour: action.wagePerHour,

@@ -112,12 +112,16 @@ const RESULT_CODE_TEXT = {
   stale: '农场刚刚变过，刷新后再试。',
   'out-of-season': '这个季节种不了它，下季再来吧。',
   withered: '换季了，这株没来得及熟，重种一株吧。',
+  frozen: '这块地冻住了，先生火解冻。',
+  'not-frozen': '这块地没有冻住。',
+  'omen-inactive': '这位来客已经走了，下次来早点。',
   'stale-season': '节日/来客已经换了一天，刷新后再试。',
   'event-inactive': '今天没有可领的节日。',
   'event-not-ready': '节日任务还没完成，再忙一会儿。',
   'event-claimed': '今天的节日奖励已经领过了。',
   'omen-resolved': '这位来客已经处理过了。',
   'bad-choice': '这个选择不对，再试一次。',
+  'bad-guards': '守卫人数只能是 0～2 人。',
   'not-enough-crops': '仓库里的作物不够。',
   // 雇佣（ticket 44）
   'own-pet': '不能雇自己的宠物。',
@@ -143,6 +147,8 @@ const LOG_TEXT = {
   season: '换季',
   event: '节日',
   wither: '枯萎',
+  freeze: '冻住',
+  thaw: '解冻',
   omen: '来客'
 }
 const MARKET_SIDE_TEXT = { buy: '买种', sell: '卖出' }
@@ -189,6 +195,8 @@ let plantTarget = null
 let unlockTarget = null
 /** 一键收割的串行队列：一次只发一个 farm-harvest，等回执再发下一条。 */
 let batch = null
+/** 来客卡上临时雇的守卫人数（0～2）；只影响下一次守夜结算。 */
+let omenGuardCount = 0
 /** 每种作物上一次输入的数量；宿主刷新价目时不把用户刚填的数字吞掉。 */
 const marketQty = { tomato: 1, carrot: 1, pumpkin: 1 }
 /** plotId → 倒计时节点；tick 只改文本，不重建按钮（重建会打断用户点击）。 */
@@ -473,22 +481,43 @@ function renderEventCard (season) {
 function renderOmenCard (season) {
   if (omenCardEl === null) return
   const card = view.omenCard(season?.omen)
-  if (card === null || mode !== 'owner') {
+  if (card === null || card.active !== true || mode !== 'owner') {
     omenCardEl.hidden = true
     replaceContent(omenCardEl)
     return
   }
   omenCardEl.hidden = false
-  omenCardEl.title = [card.detail, card.guardText, card.feedText].filter(Boolean).join('\n')
-  const head = seasonCardHead(card, '秋天来客')
+  omenCardEl.title = [card.detail, card.guardText, card.feedText, card.ignoreText, card.remainingText]
+    .filter(Boolean).join('\n')
+  const head = seasonCardHead(card, card.tag || '季候来客')
   const detail = document.createElement('p')
-  detail.textContent = card.detail
+  detail.textContent = card.detail + ' ' + card.remainingText
   const guard = document.createElement('p')
   guard.textContent = card.guardText
   const feed = document.createElement('p')
   feed.textContent = card.feedText
   const actions = document.createElement('div')
   actions.className = 'season-actions'
+  let guardPicker = null
+  if (Array.isArray(card.guardOptions) && card.guardOptions.length > 0) {
+    const affordable = card.guardOptions.filter((option) => option.affordable !== false)
+    if (!affordable.some((option) => option.guards === omenGuardCount)) omenGuardCount = 0
+    guardPicker = document.createElement('label')
+    guardPicker.className = 'omen-guard'
+    const caption = document.createElement('span')
+    caption.textContent = '守卫'
+    const select = document.createElement('select')
+    select.id = 'omen-guard-count'
+    for (const option of card.guardOptions) {
+      const item = document.createElement('option')
+      item.value = String(option.guards)
+      item.textContent = option.label
+      item.disabled = option.affordable === false
+      item.selected = option.guards === omenGuardCount
+      select.append(item)
+    }
+    guardPicker.append(caption, select)
+  }
   for (const action of card.actions) {
     const button = document.createElement('button')
     button.type = 'button'
@@ -499,7 +528,7 @@ function renderOmenCard (season) {
     if (action.reason) button.title = action.reason
     actions.append(button)
   }
-  replaceContent(omenCardEl, head, detail, guard, feed, actions)
+  replaceContent(omenCardEl, head, detail, guard, feed, ...(guardPicker === null ? [] : [guardPicker]), actions)
 }
 
 function renderSeasonCards (season) {
@@ -905,13 +934,24 @@ function renderLog () {
         (Number.isFinite(dew) && dew > 0 ? ' · +' + dew + ' 露水' : '')
     } else if (entry.kind === 'wither') {
       text.textContent = '换季枯萎了 ' + (Number(entry.qty) || 1) + ' 株四季作物'
+    } else if (entry.kind === 'freeze') {
+      text.textContent = '冻住了 ' + (Number(entry.qty) || 1) + ' 块地，要生火解冻'
+    } else if (entry.kind === 'thaw') {
+      text.textContent = '生火解冻了一块地'
     } else if (entry.kind === 'omen') {
       const lost = Number(entry.qty) || 0
+      const wither = Number(entry.wither) || 0
+      const freeze = Number(entry.freeze) || 0
+      const name = who === '' ? '来客' : who
       const choice = entry.choice === 'feed'
-        ? '投喂了来客'
-        : entry.choice === 'guard' ? '守夜' : '没来得及处理来客'
-      text.textContent = who + choice +
-        (entry.success === true ? '，平安过关' : lost > 0 ? '，被搬走 ' + lost + ' 个作物' : '，没有损失')
+        ? '安抚了' + name
+        : entry.choice === 'guard' ? '赶走了' + name : name + '没被处理'
+      const damage = []
+      if (lost > 0) damage.push('被拿走 ' + lost + ' 个作物')
+      if (wither > 0) damage.push(wither + ' 块地枯萎')
+      if (freeze > 0) damage.push(freeze + ' 块地冻住')
+      text.textContent = choice +
+        (entry.success === true ? '，平安过关' : damage.length > 0 ? '，' + damage.join('，') : '，没有损失')
     } else if (entry.kind === 'steal' && Number(entry.qty) === 0) {
       text.textContent = who === '' ? '被抓住了' : who + '被抓住了'
     } else if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
@@ -2036,12 +2076,22 @@ seasonCardsEl?.addEventListener('click', (event) => {
     return
   }
   if (action === 'omen-guard' || action === 'omen-feed') {
+    const select = omenCardEl?.querySelector('#omen-guard-count')
     submit({
       action: 'farm-omen-resolve',
       choice: action === 'omen-guard' ? 'guard' : 'feed',
+      ...(action === 'omen-guard' ? { guards: Number(select?.value ?? omenGuardCount) || 0 } : {}),
       expectedStart: season.start
     })
+    return
   }
+})
+
+seasonCardsEl?.addEventListener('change', (event) => {
+  const target = event.target
+  if (!(target instanceof Element) || target.id !== 'omen-guard-count') return
+  const count = Number(target.value)
+  omenGuardCount = Number.isInteger(count) && count >= 0 && count <= 2 ? count : 0
 })
 
 plotsEl.addEventListener('click', (event) => {

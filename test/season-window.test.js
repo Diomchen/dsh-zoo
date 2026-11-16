@@ -12,9 +12,11 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { createService } from '../src/service.js'
-import { seasonAt } from '../src/season-rules.js'
+import { HOUR_MS, seasonAt } from '../src/season-rules.js'
+import { freshOmen } from '../src/season-omens.js'
 
-const AUTUMN = new Date(2026, 10, 17, 12, 0, 0).getTime()
+const AUTUMN_DAY = new Date(2026, 10, 17, 12, 0, 0).getTime()
+const AUTUMN = freshOmen(seasonAt(AUTUMN_DAY)).start + HOUR_MS
 const WINTER = new Date(2026, 10, 18, 12, 0, 0).getTime()
 
 function fakeCtx () {
@@ -89,7 +91,7 @@ test('state.farm.season：秋天有日历、节日和熊獾，形状与 SPEC v8 
   assert.deepEqual(season.event.reward, { coins: 50, dew: 4 })
   assert.equal(season.omen.id, 'autumn-bearger')
   assert.equal(season.omen.resolved, false)
-  assert.equal(season.omen.stakes.failLoss, 3)
+  assert.equal(season.omen.stakes.failLoss, 5)
   assert.equal(season.omen.canFeed, false)
 })
 
@@ -98,17 +100,21 @@ test('state.farm.season：冬天没有熊獾，节日换成围炉节', async (t)
   const state = await getState(service)
   const season = state.farm.season
   assert.equal(season.id, 'winter')
-  assert.equal(season.omen, null)
+  // 窗口外的来客不会下发；窗口内则一定是冬夜巨鹿，不可能是熊獾。
+  assert.notEqual(season.omen?.id, 'autumn-bearger')
+  if (season.omen !== null) assert.equal(season.omen.id, 'winter-deerclops')
   assert.equal(season.event.id, 'winter-hearth')
   assert.equal(season.calendar.find((cell) => cell.today).id, 'winter')
 })
 
-test('窗口骨架：季节条、日历、节日卡、来客卡、枯萎卡都在', async () => {
+test('窗口骨架：季节条、日历、节日卡、来客卡、枯萎卡/冻住卡都在', async () => {
   const html = await readFile(new URL('../desktop/farm.html', import.meta.url), 'utf8')
   for (const id of ['season-bar', 'season-calendar', 'season-cards', 'event-card', 'omen-card']) {
     assert.match(html, new RegExp(`id="${id}"`), `farm.html 应该有 #${id}`)
   }
   assert.match(html, /data-stage='withered'/, 'farm.html 应该有枯萎卡样式')
+  assert.match(html, /data-stage='frozen'/, 'farm.html 应该有冻住卡样式')
+  assert.match(html, /chip-btn\.thaw/, 'farm.html 应该有解冻按钮样式')
   assert.match(html, /body\[data-season=/, 'farm.html 应该有季节主题选择器')
   for (const season of ['spring', 'summer', 'autumn', 'winter']) {
     assert.match(html, new RegExp(`body\\[data-season='${season}'\\] \\.season-bar`), `缺少 ${season} 季节主题`)
@@ -122,7 +128,10 @@ test('窗口渲染：季节/来客只在主人模式画，动作窄口只发两�
   assert.match(js, /seasonBarEl\.hidden = false/)
   assert.match(js, /farm-event-claim/)
   assert.match(js, /farm-omen-resolve/)
+  assert.match(js, /'farm-' \+ action/)
   assert.match(js, /choice: action === 'omen-guard' \? 'guard' : 'feed'/)
+  assert.match(js, /guards: Number\(select\?\.value/)
+  assert.match(js, /select\.id = 'omen-guard-count'/)
   assert.match(js, /expectedStart: season\.start/)
 })
 
@@ -130,9 +139,11 @@ test('窗口桥：节日/来客的乐观锁和二选一必须过 preload', async
   const preload = await readFile(new URL('../desktop/farm-preload.js', import.meta.url), 'utf8')
   assert.match(preload, /expectedStart: action\.expectedStart/, 'preload 必须把节日/来客的 expectedStart 带下去')
   assert.match(preload, /choice: action\.choice/, 'preload 必须把来客的 guard/feed 带下去')
+  assert.match(preload, /guards: action\.guards/, 'preload 必须把临时守卫人数带下去')
   const service = await readFile(new URL('../src/service.js', import.meta.url), 'utf8')
   assert.match(service, /expectedStart: event\.expectedStart/, '桌面动作入口必须把 expectedStart 交给宿主')
   assert.match(service, /choice: event\.choice/, '桌面动作入口必须把 guard/feed 交给宿主')
+  assert.match(service, /guards: event\.guards/, '桌面动作入口必须把临时守卫人数交给宿主')
 })
 
 test('共享白名单：event/omen 动作在 FARM_ACTIONS 里，且只接受窄参数', async () => {
@@ -147,6 +158,10 @@ test('共享白名单：event/omen 动作在 FARM_ACTIONS 里，且只接受窄�
   )
   assert.deepEqual(
     shared.normalizeFarmAction({ action: 'farm-omen-resolve', choice: 'feed', expectedStart: 123 }),
-    { action: 'farm-omen-resolve', choice: 'feed', expectedStart: 123 }
+    { action: 'farm-omen-resolve', choice: 'feed', guards: 0, expectedStart: 123 }
+  )
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 123 }),
+    { action: 'farm-omen-resolve', choice: 'guard', guards: 2, expectedStart: 123 }
   )
 })

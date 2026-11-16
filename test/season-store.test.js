@@ -131,8 +131,11 @@ test('跨本地 00:00：换节日、进度归零、claimed 归 false，settle �
 
 test('来客：秋天出现，只能结算一次；结算结果落盘', async (t) => {
   const dir = await tempDir(t)
-  const store = await createSeasonStore(dir, { now: () => AUTUMN_NOON })
-  assert.equal(store.view().omen.resolved, false)
+  const clock = clockAt(AUTUMN_NOON)
+  const store = await createSeasonStore(dir, { now: clock.now })
+  const omen = store.view().omen
+  assert.equal(omen.resolved, false)
+  clock.set(omen.start + 60_000)
 
   const resolved = await store.resolveOmen('feed', { random: () => 0 })
   assert.equal(resolved.ok, true)
@@ -146,7 +149,7 @@ test('来客：秋天出现，只能结算一次；结算结果落盘', async (t
   assert.equal(file.omen.choice, 'feed')
 })
 
-test('来客：换季未处理时 settle 报告，并把卡片清掉', async (t) => {
+test('来客：换季未处理时 settle 报告，并把旧卡片清掉', async (t) => {
   const dir = await tempDir(t)
   const clock = clockAt(AUTUMN_NOON)
   const store = await createSeasonStore(dir, { now: clock.now })
@@ -155,8 +158,27 @@ test('来客：换季未处理时 settle 报告，并把卡片清掉', async (t)
   clock.set(WINTER_START)
   const settled = await store.settle()
   assert.equal(settled.unresolvedOmen.id, 'autumn-bearger')
-  assert.equal(store.view().omen, null)
-  assert.equal(store.snapshot().omen, null)
+  // 新一天会生成新的冬夜来客；窗口还没到，所以 active=false，界面层会过滤掉。
+  assert.equal(store.view().omen.id, 'winter-deerclops')
+  assert.equal(store.view().omen.active, false)
+  assert.equal(store.snapshot().omen.id, 'winter-deerclops')
+})
+
+test('来客：3 小时窗口结束后只结算一次，不会每 tick 重复扣罚', async (t) => {
+  const dir = await tempDir(t)
+  const clock = clockAt(AUTUMN_NOON)
+  const store = await createSeasonStore(dir, { now: clock.now })
+  const omen = store.view().omen
+
+  clock.set(omen.end)
+  const first = await store.settle()
+  assert.equal(first.unresolvedOmen.id, 'autumn-bearger')
+  assert.equal(store.view().omen.resolved, true)
+  assert.equal(store.view().omen.active, false)
+
+  const second = await store.settle()
+  assert.equal(second.unresolvedOmen, null)
+  assert.equal(store.snapshot().omen.resolved, true)
 })
 
 test('坏 JSON / 缺字段：丢弃重建，不影响目录里的其它文件', async (t) => {
