@@ -1144,7 +1144,7 @@ test('窗口载荷永远带一份邻居切换器（没有邻居时是空数组�
   assert.deepEqual(payload.neighbors, [], '没有邻居时是空的，不是 undefined')
 })
 
-test('从"看田"切回「我的农场」：farm-refresh 推回 owner 模式，不带 look', async (t) => {
+test('「我的农场」：farm-own 推回 owner 模式，不带 look', async (t) => {
   const dir = await tempDir(t)
   const desktop = desktopDouble()
   const service = makeService(t, {
@@ -1160,9 +1160,11 @@ test('从"看田"切回「我的农场」：farm-refresh 推回 owner 模式，�
   await callAction(service, { action: 'farm-open' })
   assert.equal(desktop.isFarmOpen(), true)
 
-  // 窗口里点「我的农场」→ 只发一次 farm-refresh；宿主按 self.out 重算，没出门就是 owner。
-  const refreshed = await callAction(service, { action: 'farm-refresh' })
-  assert.equal(refreshed.body.ok, true)
+  // 窗口里点「我的农场」→ 发一次 farm-own；宿主丢掉"正在看谁家"，按 self.out 重算模式。
+  // 票 52 回归：切回来不能再用 farm-refresh——那条是"到点确认"，必须留在当前视图。
+  const own = await callAction(service, { action: 'farm-own' })
+  assert.equal(own.body.ok, true)
+  assert.equal(own.body.action, 'farm-own')
 
   const payload = desktop.calls.windows.at(-1)
   assert.equal(payload.mode, 'owner')
