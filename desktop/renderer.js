@@ -1723,9 +1723,23 @@
     const status = document.createElement('p')
     status.className = 'lp-gift-status'
 
+    // 红包卡（票 79）：内容只在这张卡上显示一次（拆开后宿主会换成“已拆开”的状态文字）。
+    const packetBox = document.createElement('div')
+    packetBox.className = 'lp-gift-packet'
+    packetBox.hidden = true
+    const packetText = document.createElement('p')
+    packetText.className = 'lp-gift-packet-text'
+    const packetNote = document.createElement('p')
+    packetNote.className = 'lp-gift-packet-note'
+    packetBox.appendChild(packetText)
+    packetBox.appendChild(packetNote)
+
     const actions = document.createElement('div')
     actions.className = 'lp-card-actions lp-gift-actions'
-    actions.appendChild(makeButton('打开', 'gift-open', { giftId: gift.giftId }))
+    const claimButton = makeButton('拆开', 'gift-claim', { giftId: gift.giftId })
+    actions.appendChild(claimButton)
+    const openButton = makeButton('打开', 'gift-open', { giftId: gift.giftId })
+    actions.appendChild(openButton)
     // 只有字条有正文可复制；文件卡的按钮在 update 里隐藏（不留一个点了没用的按钮）。
     const copyButton = makeButton('复制', 'gift-copy', { giftId: gift.giftId })
     actions.appendChild(copyButton)
@@ -1735,6 +1749,7 @@
     el.appendChild(head)
     el.appendChild(body)
     el.appendChild(fileBox)
+    el.appendChild(packetBox)
     el.appendChild(status)
     el.appendChild(actions)
     el.addEventListener('pointerdown', (event) => event.stopPropagation())
@@ -1754,6 +1769,11 @@
       thumbEl: thumb,
       fileNameEl: fileName,
       fileSizeEl: fileSize,
+      packetEl: packetBox,
+      packetTextEl: packetText,
+      packetNoteEl: packetNote,
+      claimButton,
+      openButton,
       copyButton,
       statusEl: status,
       signature: ''
@@ -1771,13 +1791,30 @@
     entry.size = gift.size ?? null
     if (entry.signature === signature) return
     entry.signature = signature
-    entry.el.dataset.kind = gift.kind === 'file' ? 'file' : 'text'
+    entry.el.dataset.kind = gift.kind === 'file' ? 'file' : gift.kind === 'packet' ? 'packet' : 'text'
     entry.titleEl.textContent = gift.title
     entry.el.setAttribute('aria-label', gift.title)
     const isFile = gift.kind === 'file'
-    entry.bodyEl.textContent = isFile ? '' : (gift.text ?? '')
-    entry.bodyEl.hidden = isFile || gift.text === undefined
+    const isPacket = gift.kind === 'packet'
+    entry.bodyEl.textContent = isFile || isPacket ? '' : (gift.text ?? '')
+    entry.bodyEl.hidden = isFile || isPacket || gift.text === undefined
     entry.fileEl.hidden = !isFile
+    entry.packetEl.hidden = !isPacket
+    if (isPacket) {
+      entry.packetTextEl.textContent = gift.text ?? '红包'
+      const note = typeof gift.note === 'string' ? gift.note : ''
+      entry.packetNoteEl.textContent = note
+      entry.packetNoteEl.hidden = note === ''
+    } else {
+      entry.packetTextEl.textContent = ''
+      entry.packetNoteEl.textContent = ''
+      entry.packetNoteEl.hidden = true
+    }
+    // 「拆开」只给红包；「打开 / 在文件夹里显示」只给收下的字条与文件。
+    entry.claimButton.hidden = !isPacket
+    entry.openButton.hidden = isPacket
+    const revealButton = entry.el.querySelector?.('[data-lp-action="gift-reveal"]')
+    if (revealButton !== null && revealButton !== undefined) revealButton.hidden = isPacket
     if (isFile) {
       entry.fileNameEl.textContent = gift.name ?? '文件'
       const sizeText = formatFileSize(gift.size)
@@ -1794,7 +1831,7 @@
       entry.thumbEl.hidden = true
       entry.thumbEl.removeAttribute('src')
     }
-    entry.copyButton.hidden = isFile
+    entry.copyButton.hidden = isFile || isPacket
     entry.statusEl.textContent = gift.statusText ?? ''
     entry.statusEl.hidden = gift.statusText === undefined
     setGiftButtonsEnabled(entry, gift.status === 'received')

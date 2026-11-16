@@ -335,6 +335,28 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'packet-return') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        giftId: visitId,
+        contents: { coins: 3, crops: { tomato: 1 }, seeds: {} },
+        note: '\u9000\u56DE',
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type === 'packet-returned') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        giftId: visitId,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
     } else if (type.startsWith('work-')) {
       raw = { ...workPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('visit-')) {
@@ -383,7 +405,11 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
                       ? ['v', 'type', 'deviceId', 'hash']
                       : type === 'crop-catalog'
                         ? ['v', 'type', 'deviceId', 'catalogHash', 'chunk', 'total', 'entries']
-                        : type.startsWith('work-')
+                        : type === 'packet-return'
+  ? ['v', 'type', 'deviceId', 'giftId', 'contents', 'note']
+  : type === 'packet-returned'
+    ? ['v', 'type', 'deviceId', 'giftId']
+  : type.startsWith('work-')
                           ? workKeys(type)
                       : type.startsWith('visit-')
                         ? ['v', 'type', 'deviceId', 'visitId']
@@ -677,6 +703,8 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'visit-recall',
     'visit-recall-ack',
     'gift-received',
+    'packet-return',
+    'packet-returned',
     'market-digest',
     // 票 82：盘口周报（本周盈亏 + 当前持仓），也是"局域网情报"这一类
     'trading-digest',

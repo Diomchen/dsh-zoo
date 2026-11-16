@@ -79,7 +79,7 @@ export const TRADING_DIGEST_INTERVAL_MS = 30 * 1000
 export const TRADING_DIGEST_FRESH_MS = 2 * MINUTE_MS
 /**
  * 一条周报最多带 8 条持仓（SPEC v10「真人榜与协议」）。这不是产品上的仓位上限
- * （ADR-0027 明确没有），只是报文的体积与展示上限：超出的部分不发，本机照常持仓。
+ * （ADR-0028 明确没有），只是报文的体积与展示上限：超出的部分不发，本机照常持仓。
  */
 export const MAX_TRADING_POSITIONS = 8
 /**
@@ -295,6 +295,10 @@ export const PACKET_TYPES = Object.freeze([
   'visit-recall',
   'visit-recall-ack',
   'gift-received',
+  // ticket 79：红包 24 小时没拆就退回寄件人。return 由收件方发、returned 是寄件方的回执；
+  // 两条都**故意不放进 VISIT_TYPES**（那条只重建四个字段，giftId/contents 会被吃掉）。
+  'packet-return',
+  'packet-returned',
   'market-digest',
   // 票 82：盘口周报（本周盈亏 + 当前持仓）。老版本按「未知类型」整包丢掉，不崩。
   'trading-digest',
@@ -503,8 +507,66 @@ export function sanitizeGiftName (value) {
 }
 
 /**
+ * 红包（ticket 79）的上限。数字写死在协议里而不是只写在 UI 上：
+ * 收到的报文一律按这里夹紧/拒绝，寄件人改了客户端也塞不进更多东西。
+ *
+ * 一个红包最多 5 种作物 + 5 种种子：再多种类串联起来会让 visit-request 逼近 4 KiB，
+ * 而红包是搭串门的车，不能把串门本身挤掉（见 encodeVisitRequestDetailed 的摘礼物逻辑）。
+ */
+export const PACKET_LIMITS = Object.freeze({
+  maxCoins: 200,
+  maxPerCrop: 20,
+  maxKinds: 5,
+  maxNoteChars: 60
+})
+
+/** 红包里的一摞东西：`{ coins, crops:{id:qty}, seeds:{id:qty} }`，空的返回 null。 */
+export function normalizePacketContents (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const coins = value.coins === undefined ? 0 : Number(value.coins)
+  if (!Number.isInteger(coins) || coins < 0 || coins > PACKET_LIMITS.maxCoins) return null
+  const stacks = (raw) => {
+    if (raw === undefined || raw === null) return {}
+    if (typeof raw !== 'object' || Array.isArray(raw)) return null
+    const out = {}
+    let kinds = 0
+    for (const cropId of CROP_IDS) {
+      if (!Object.prototype.hasOwnProperty.call(raw, cropId)) continue
+      const qty = Number(raw[cropId])
+      // 0 等于没装：静默丢掉，不因为它把整个红包判坏。
+      if (!Number.isInteger(qty) || qty < 0) return null
+      if (qty === 0) continue
+      if (qty > PACKET_LIMITS.maxPerCrop) return null
+      kinds += 1
+      if (kinds > PACKET_LIMITS.maxKinds) return null
+      out[cropId] = qty
+    }
+    return out
+  }
+  const crops = stacks(value.crops)
+  if (crops === null) return null
+  const seeds = stacks(value.seeds)
+  if (seeds === null) return null
+  if (coins === 0 && Object.keys(crops).length === 0 && Object.keys(seeds).length === 0) {
+    return null
+  }
+  return { coins, crops, seeds }
+}
+
+/** 祝福语：短文本，超长直接判坏（红包的祝福是点缀，不做静默截断）。 */
+function normalizePacketNote (value) {
+  if (value === undefined || value === null) return ''
+  const note = sanitizeNote(value)
+  if (note === null) return null
+  if (Array.from(note).length > PACKET_LIMITS.maxNoteChars) return null
+  return note
+}
+
+/**
  * 串门捎的礼物（ADR-0011）：`kind:'text'` 是内联字条，`kind:'file'` 只有元数据
  * （name/size/sha256），本体由接收方在访客抵达时向发起方拉取（ticket 25）。
+ * `kind:'packet'` 是红包（ticket 79）：金币/作物/种子直接写在报文里，
+ * 收下并不等于入账，要对方在串门记录里点「拆开」才结算（ADR-0027）。
  *
  * **校验不过返回 null，由调用方把整个 `gift` 字段丢掉，串门照常。**
  * 这与 `anim` 非法就整包丢是相反的策略：动画是这次串门的“外观”，坏了可以退回待机；
@@ -527,7 +589,14 @@ export function normalizeGift (value) {
     if (typeof value.sha256 !== 'string' || !GIFT_SHA256_RE.test(value.sha256)) return null
     return { id, kind: 'file', name, size, sha256: value.sha256 }
   }
-  // 认识的 kind 就这两种；别的值整条 gift 丢掉（旧端读到新 kind 也是这条路径）。
+  if (value.kind === 'packet') {
+    const contents = normalizePacketContents(value.packet)
+    if (contents === null) return null
+    const note = normalizePacketNote(value.note)
+    if (note === null) return null
+    return { id, kind: 'packet', packet: contents, ...(note === '' ? {} : { note }) }
+  }
+  // 认识的 kind 就这三种；别的值整条 gift 丢掉（旧端读到新 kind 也是这条路径）。
   return null
 }
 
@@ -685,6 +754,9 @@ function buildPacket ({
   visitId,
   reason,
   giftId,
+  // ticket 79：红包退回报文的内容与祝福语（`contents` 不叫 packet，避免与整包对象同名）
+  contents,
+  note,
   action,
   semantic,
   say,
@@ -768,6 +840,23 @@ function buildPacket ({
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
     packet = { ...base, visitId: visitId.toLowerCase(), giftId: giftId.toLowerCase() }
+  } else if (type === 'packet-return') {
+    // ticket 79：把没拆的红包原样送回寄件人。内容仍按 PACKET_LIMITS 再校验一次——
+    // 收件方没义务相信任何一端，寄件人自己也要防着被塞超量。
+    if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
+    const safeContents = normalizePacketContents(contents)
+    if (safeContents === null) throw new Error('protocol: invalid packet')
+    const safeNote = normalizePacketNote(note)
+    if (safeNote === null) throw new Error('protocol: invalid packet note')
+    packet = {
+      ...base,
+      giftId: giftId.toLowerCase(),
+      contents: safeContents,
+      ...(safeNote === '' ? {} : { note: safeNote })
+    }
+  } else if (type === 'packet-returned') {
+    if (!isVisitId(giftId)) throw new Error('protocol: invalid giftId')
+    packet = { ...base, giftId: giftId.toLowerCase() }
   } else if (type === 'market-digest') {
     // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，prices/hire 会在这里消失。
     const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
@@ -1098,6 +1187,19 @@ export function encodeGiftReceived ({ deviceId, visitId, giftId } = {}) {
 }
 
 /**
+ * 红包退回（ticket 79）：收件方 24 小时没拆，把内容原样送回寄件人。
+ * `giftId` 仍是原红包的 id——寄件人靠它认出是哪一包，也靠它去重（重发不会入账两次）。
+ */
+export function encodePacketReturn ({ deviceId, giftId, contents, note } = {}) {
+  return encodePacket({ type: 'packet-return', deviceId, giftId, contents, note })
+}
+
+/** 退回回执：收件方收到它才把本地那张卡标成「已退回」。 */
+export function encodePacketReturned ({ deviceId, giftId } = {}) {
+  return encodePacket({ type: 'packet-returned', deviceId, giftId })
+}
+
+/**
  * 行情 gossip（ticket 42）：本机每种作物的 price + 自己的雇工挂牌。
  * `at` 缺省用本地时钟；价格/挂牌由调用方从 store 取，坏条目在这里被丢弃。
  */
@@ -1316,6 +1418,41 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         type: raw.type,
         deviceId: raw.deviceId.toLowerCase(),
         visitId: raw.visitId.toLowerCase(),
+        giftId: raw.giftId.toLowerCase()
+      }
+    }
+  }
+
+  // 红包退回（ticket 79）：多 giftId + 内容，**不能**落进 VISIT_TYPES（那里只重建四个字段）。
+  // 内容按 PACKET_LIMITS 再校验；不合法就整包丢——宁可这一包退不回来，也不让坏内容入账。
+  if (raw.type === 'packet-return') {
+    if (!isVisitId(raw.giftId)) return fail('gift-id')
+    const contents = normalizePacketContents(raw.contents)
+    if (contents === null) return fail('packet')
+    const note = normalizePacketNote(raw.note)
+    if (note === null) return fail('note')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        giftId: raw.giftId.toLowerCase(),
+        contents,
+        ...(note === '' ? {} : { note })
+      }
+    }
+  }
+
+  // 退回回执：只有 giftId，别的字段一律丢弃。
+  if (raw.type === 'packet-returned') {
+    if (!isVisitId(raw.giftId)) return fail('gift-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
         giftId: raw.giftId.toLowerCase()
       }
     }

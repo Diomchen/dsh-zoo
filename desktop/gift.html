@@ -181,6 +181,105 @@
         flex-direction: column;
         gap: 4px;
       }
+      /* 票 79：字条 / 红包两个页签。文件仍然走下面那行「选文件…」，不占页签。 */
+      .modes {
+        display: flex;
+        gap: 6px;
+      }
+      .mode {
+        flex: 1;
+        padding: 5px 8px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: var(--card-soft);
+        color: var(--ink-soft);
+        font-size: 11px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .mode[aria-selected='true'] {
+        border-color: var(--seal);
+        background: #fdeceb;
+        color: var(--seal-deep);
+      }
+      .packet {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
+      .packet-coins {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+        color: var(--ink-soft);
+      }
+      .packet-coins input {
+        width: 74px;
+        padding: 4px 6px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fffdf8;
+        font: inherit;
+        font-variant-numeric: tabular-nums;
+      }
+      .packet-group {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .packet-rows {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        max-height: 116px;
+        overflow-y: auto;
+      }
+      .packet-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 11px;
+      }
+      .packet-row .packet-name {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .packet-row .packet-have {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .packet-row button {
+        width: 20px;
+        height: 20px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: var(--card-soft);
+        color: var(--ink);
+        font: inherit;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .packet-row .packet-qty {
+        width: 22px;
+        text-align: center;
+        font-variant-numeric: tabular-nums;
+      }
+      .packet-empty {
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .packet-note {
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fffdf8;
+        font: inherit;
+      }
       .field-head {
         display: flex;
         align-items: baseline;
@@ -566,7 +665,12 @@
 
       <div class="hint">出门时带上背包里先放的那一件。想换，就先撤掉。</div>
 
-      <div class="composer">
+      <div class="modes" role="tablist" aria-label="带什么">
+        <button type="button" class="mode" id="mode-text" data-mode="text" role="tab" aria-selected="true">字条</button>
+        <button type="button" class="mode" id="mode-packet" data-mode="packet" role="tab" aria-selected="false">红包</button>
+      </div>
+
+      <div id="text-panel" class="composer">
         <div class="field-head">
           <span class="field-label">写一张字条</span>
           <span id="counter" class="counter">0/500</span>
@@ -577,6 +681,33 @@
           placeholder="写一张小纸条…"
           spellcheck="false"
         ></textarea>
+      </div>
+
+      <!-- 红包（票 79）：硬币 + 作物 + 种子，寄出前就从农场扣掉；对方点「拆开」才进他的农场。 -->
+      <div id="packet-panel" class="packet" hidden>
+        <div class="field-head">
+          <span class="field-label">红包内容</span>
+          <span id="packet-left" class="counter"></span>
+        </div>
+        <label class="packet-coins">
+          <span>硬币</span>
+          <input id="packet-coins" type="number" min="0" step="1" value="0" inputmode="numeric">
+          <span id="packet-coins-hint" class="picked"></span>
+        </label>
+        <div class="packet-group">
+          <span class="field-label">作物</span>
+          <div id="packet-crops" class="packet-rows"></div>
+        </div>
+        <div class="packet-group">
+          <span class="field-label">种子</span>
+          <div id="packet-seeds" class="packet-rows"></div>
+        </div>
+        <div class="field-head">
+          <span class="field-label">祝福语</span>
+          <span id="packet-counter" class="counter">0/60</span>
+        </div>
+        <input id="packet-note" class="packet-note" type="text" maxlength="60" placeholder="写一句祝福…" autocomplete="off">
+        <div id="packet-summary" class="picked empty">还什么都没放</div>
       </div>
 
       <div class="file-row">
