@@ -423,6 +423,53 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   ]) {
     assert.equal(shared.normalizeBoardAction(bad), null, JSON.stringify(bad))
   }
+  // 票 82：真人周榜穿过 helper 白名单——嵌套的 rows/positions 一个字段都不能被削掉
+  // （§9.4 的老坑：宿主发了、窗口收不到，界面看起来只是「没有邻居」）。
+  const leagueDeviceId = positionId
+  const leaguePeerId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f2a3b4c5d'
+  const league = shared.normalizeBoardView({
+    league: {
+      rows: [
+        {
+          deviceId: leagueDeviceId,
+          nickname: '小米',
+          weekPnl: 12,
+          weekPnlPct: 0.035,
+          positions: [{ crop: 'tomato', side: 'long', leverage: 5, margin: 50, entry: 5, secret: 1 }],
+          me: true,
+          secret: 1
+        },
+        // 同一个 deviceId 只留第一行。
+        { deviceId: leagueDeviceId, nickname: '重影', weekPnl: 999, positions: [], me: false },
+        { deviceId: 'not-a-uuid', nickname: '假', weekPnl: 1, positions: [], me: false },
+        {
+          deviceId: leaguePeerId,
+          nickname: '邻居',
+          weekPnl: -3,
+          positions: [
+            { crop: 'nope', side: 'long', leverage: 5 },
+            { crop: 'tomato', side: 'up', leverage: 5 },
+            { crop: 'pumpkin', side: 'short', leverage: 20 }
+          ]
+        }
+      ],
+      sentiment: { long: 1, short: 1, flat: 0, secret: 1 },
+      self: { weekPnl: 12, weekPnlPct: 0.035, coins: 999, secret: 1 },
+      secret: 1
+    }
+  }).league
+  assert.deepEqual(Object.keys(league), ['rows', 'sentiment', 'self'])
+  assert.equal(league.rows.length, 2)
+  assert.deepEqual(league.rows.map((row) => row.nickname), ['小米', '邻居'])
+  assert.equal(league.rows[0].me, true)
+  assert.deepEqual(Object.keys(league.rows[0]),
+    ['deviceId', 'nickname', 'weekPnl', 'weekPnlPct', 'positions', 'me'])
+  assert.deepEqual(league.rows[0].positions, [{ crop: 'tomato', side: 'long', leverage: 5 }])
+  assert.deepEqual(league.rows[1].positions, [{ crop: 'pumpkin', side: 'short', leverage: 20 }])
+  assert.equal(league.rows[1].weekPnlPct, null, '邻居没报收益率就是 null（窗口画「—」）')
+  assert.deepEqual(league.sentiment, { long: 1, short: 1, flat: 0 })
+  assert.deepEqual(league.self, { weekPnl: 12, weekPnlPct: 0.035 })
+
   // 读盘归一化（窗口形状）也不认多余字段。
   assert.deepEqual(shared.normalizeBoardView(null), null)
 })
@@ -482,6 +529,64 @@ test('票 81：整份 payload 带三作物 K 线 + 风向，并能穿过 helper 
   assert.equal(board.chart.legend[0].text, state.charts.tomato.base.toFixed(2))
   assert.equal(board.hint.note, '不是保证')
   assert.equal(board.crops.length, 3)
+})
+
+test('票 82：payload 带真人周榜（只有自己 → 观望），并能穿过 helper 白名单', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 4 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  // 没有邻居：榜上只有自己一行；全场空仓 → 观望。
+  const state = desktop.calls.board[0].state
+  assert.equal(state.league.rows.length, 1)
+  assert.equal(state.league.rows[0].me, true)
+  assert.equal(typeof state.league.rows[0].nickname, 'string')
+  assert.ok(state.league.rows[0].nickname.length > 0)
+  assert.equal(state.league.rows[0].weekPnl, 0)
+  assert.deepEqual(state.league.rows[0].positions, [])
+  assert.deepEqual(state.league.sentiment, { long: 0, short: 0, flat: 1 })
+  assert.deepEqual(state.league.self, { weekPnl: 0, weekPnlPct: 0 })
+  // 行里没有硬币/保证金/入场价：榜只认分数和持仓。
+  assert.deepEqual(Object.keys(state.league.rows[0]),
+    ['deviceId', 'nickname', 'weekPnl', 'weekPnlPct', 'positions', 'me'])
+
+  // helper 白名单不能把 league 削掉（§9.4 的老坑），窗口的纯视图能直接画。
+  const hop = shared.normalizeHostCommand({ type: 'board-window', open: false, state })
+  assert.equal(hop.ok, true)
+  assert.deepEqual(hop.command.state.league.rows, state.league.rows)
+  assert.deepEqual(hop.command.state.league.sentiment, state.league.sentiment)
+  assert.deepEqual(hop.command.state.league.self, state.league.self)
+  const board = boardView.boardView(hop.command.state, { now: clock.value })
+  assert.equal(board.league.rows.length, 1)
+  assert.equal(board.league.rows[0].me, true)
+  assert.equal(board.league.rows[0].positionsText, '观望')
+  assert.equal(board.league.sentiment.text, '观望')
+  assert.equal(board.league.hasPeers, false)
+  assert.match(board.league.empty, /还没有邻居上线/)
+
+  // 开一手：下一包 payload 的榜自己那行就有一条多单，情绪变「多 1 · 空 0」。
+  const opened = await callAction(service, {
+    action: 'trading-open-position', side: 'long', margin: 50, leverage: 5, cropId: 'tomato'
+  })
+  assert.equal(opened.body.ok, true)
+  const after = await call(service, '/dsh-zoo/state')
+  assert.deepEqual(after.body.trading.league.rows[0].positions,
+    [{ crop: 'tomato', side: 'long', leverage: 5 }])
+  assert.deepEqual(after.body.trading.league.sentiment, { long: 1, short: 0, flat: 0 })
+  const rendered = boardView.boardView(after.body.trading, { now: clock.value })
+  assert.equal(rendered.league.rows[0].positionsText, '多 1 · 空 0')
+  assert.equal(rendered.league.sentiment.text, '多 1 · 空 0')
 })
 
 test('票 81：一分钟一拍会把新的成形 K 线推到窗口（不用重开窗）', async (t) => {

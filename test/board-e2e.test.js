@@ -455,6 +455,47 @@ test('票 81 e2e：周一 00:00 清零的是本周盈亏，不是硬币', async 
   assert.equal(week.pctText, '0.00%')
 })
 
+test('票 82 e2e：/state 带真人周榜；只有自己时「观望」，开仓后持仓跟着进榜', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: OPEN_AT }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+
+  // 没有邻居：榜上只有本机一行；空仓 = 观望（SPEC「没有仓位写观望」）。
+  const alone = await state(service)
+  const league = alone.body.trading.league
+  assert.equal(league.rows.length, 1)
+  assert.equal(league.rows[0].me, true)
+  assert.equal(league.rows[0].weekPnl, 0)
+  assert.equal(league.rows[0].weekPnlPct, 0, '本周还没做单：0 / 周起点硬币')
+  assert.deepEqual(league.rows[0].positions, [])
+  assert.deepEqual(league.sentiment, { long: 0, short: 0, flat: 1 })
+  assert.deepEqual(league.self, { weekPnl: 0, weekPnlPct: 0 })
+  const empty = boardView.boardView(alone.body.trading, { now: clock.value })
+  assert.equal(empty.league.sentiment.text, '观望')
+  assert.equal(empty.league.hasPeers, false)
+  assert.match(empty.league.empty, /还没有邻居上线/)
+
+  // 开一手 20× 空南瓜：榜里自己那行出现持仓，情绪变「多 0 · 空 1」。
+  const opened = await action(service, {
+    action: 'trading-open-position', side: 'short', margin: 100, leverage: 20, cropId: 'pumpkin'
+  })
+  assert.equal(opened.body.ok, true, JSON.stringify(opened.body))
+  const after = (await state(service)).body.trading
+  assert.deepEqual(after.league.rows[0].positions, [{ crop: 'pumpkin', side: 'short', leverage: 20 }])
+  // 行里只有三个公开字段：保证金/入场价不出本机。
+  assert.deepEqual(Object.keys(after.league.rows[0].positions[0]), ['crop', 'side', 'leverage'])
+  assert.deepEqual(after.league.sentiment, { long: 0, short: 1, flat: 0 })
+  // 分数与收益率跟顶部同一个口径：取整后的本周盈亏、total / base。
+  assert.equal(after.league.self.weekPnl, Math.round(after.week.total))
+  assert.equal(after.league.self.weekPnlPct, after.week.total / after.week.base)
+  const rendered = boardView.boardView(after, { now: clock.value })
+  assert.equal(rendered.league.rows[0].me, true)
+  assert.equal(rendered.league.rows[0].positionsText, '多 0 · 空 1')
+  assert.equal(rendered.league.sentiment.text, '多 0 · 空 1')
+})
+
 test('票 81 e2e：0 硬币时按钮写「去种地」，下单被拒绝且硬币不为负', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir, 0)

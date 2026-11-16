@@ -230,6 +230,16 @@
   const BOARD_MAX_BARS = 40
   const BOARD_MAX_TICK = 15
   /**
+   * 票 82：真人周榜。一屏最多 32 行、每行最多 8 条持仓（与报文上限一致），
+   * 情绪计数最多是「行 × 持仓」——这三个数只做形状夹取，不是产品规则。
+   * 分数/收益率的范围与宿主 `src/protocol.js` 的 MAX_WEEK_PNL / MAX_WEEK_PNL_PCT 同源。
+   */
+  const BOARD_MAX_LEAGUE_ROWS = 32
+  const BOARD_MAX_LEAGUE_POSITIONS = 8
+  const BOARD_MAX_LEAGUE_COUNT = BOARD_MAX_LEAGUE_ROWS * BOARD_MAX_LEAGUE_POSITIONS
+  const BOARD_MAX_WEEK_PNL = 1000000
+  const BOARD_MAX_WEEK_PNL_PCT = 1000
+  /**
    * 地块解锁（ticket 48）：只带可选的 `expectedUnlocked`（窗口看到的已解锁数）。
    * 价格与下一块地在哪全由宿主算；窗口不传钱、不传地块 id。
    */
@@ -1757,6 +1767,82 @@
     return hints
   }
 
+  /** 榜上一条持仓（票 82）：只有作物/方向/杠杆——保证金与入场价根本不在报文里。 */
+  function normalizeBoardLeaguePosition (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    const leverage = strictBoardInt(raw.leverage, 1, 20)
+    if (crop === null || side === null || leverage === null) return null
+    return { crop, side, leverage }
+  }
+
+  /**
+   * 榜上一行。`weekPnl` 是排序键（宿主已按它排好），`weekPnlPct` 是可选比率
+   * （0.035 = +3.5%），缺省就是 null（窗口画「—」）。`me` 是本机那一行，窗口高亮它。
+   */
+  function normalizeBoardLeagueRow (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const deviceId = normalizeUuid(raw.deviceId)
+    const weekPnl = normalizeBoardNumber(raw.weekPnl, -BOARD_MAX_WEEK_PNL, BOARD_MAX_WEEK_PNL)
+    if (deviceId === null || weekPnl === null) return null
+    const positions = []
+    for (const candidate of Array.isArray(raw.positions) ? raw.positions : []) {
+      if (positions.length >= BOARD_MAX_LEAGUE_POSITIONS) break
+      const position = normalizeBoardLeaguePosition(candidate)
+      if (position === null) continue
+      positions.push(position)
+    }
+    return {
+      deviceId,
+      nickname: normalizeLabel(raw.nickname, '邻居'),
+      weekPnl,
+      weekPnlPct: raw.weekPnlPct === null || raw.weekPnlPct === undefined
+        ? null
+        : normalizeBoardNumber(raw.weekPnlPct, -BOARD_MAX_WEEK_PNL_PCT, BOARD_MAX_WEEK_PNL_PCT),
+      positions,
+      me: raw.me === true
+    }
+  }
+
+  /**
+   * `league: { rows, sentiment, self }`（票 82）。坏行只丢自己、重复 deviceId 只留第一条；
+   * 整块缺失/坏形状就是空榜 → 窗口画「还没有邻居上线」。
+   */
+  function normalizeBoardLeague (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const rows = []
+    const seen = new Set()
+    for (const candidate of Array.isArray(source.rows) ? source.rows : []) {
+      if (rows.length >= BOARD_MAX_LEAGUE_ROWS) break
+      const row = normalizeBoardLeagueRow(candidate)
+      if (row === null || seen.has(row.deviceId)) continue
+      seen.add(row.deviceId)
+      rows.push(row)
+    }
+    const counts = source.sentiment !== null && typeof source.sentiment === 'object' &&
+      !Array.isArray(source.sentiment)
+      ? source.sentiment
+      : {}
+    const own = source.self !== null && typeof source.self === 'object' && !Array.isArray(source.self)
+      ? source.self
+      : {}
+    return {
+      rows,
+      sentiment: {
+        long: normalizeBoardInt(counts.long, 0, BOARD_MAX_LEAGUE_COUNT) ?? 0,
+        short: normalizeBoardInt(counts.short, 0, BOARD_MAX_LEAGUE_COUNT) ?? 0,
+        flat: normalizeBoardInt(counts.flat, 0, BOARD_MAX_LEAGUE_COUNT) ?? 0
+      },
+      self: {
+        weekPnl: normalizeBoardNumber(own.weekPnl, -BOARD_MAX_WEEK_PNL, BOARD_MAX_WEEK_PNL) ?? 0,
+        weekPnlPct: own.weekPnlPct === null || own.weekPnlPct === undefined
+          ? null
+          : normalizeBoardNumber(own.weekPnlPct, -BOARD_MAX_WEEK_PNL_PCT, BOARD_MAX_WEEK_PNL_PCT)
+      }
+    }
+  }
+
   /** 整份盘口视图；坏到不成形状就返回 null（窗口画空态，不崩）。 */
   function normalizeBoardView (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -1825,7 +1911,9 @@
       positions,
       history,
       // 票 83 之前挂单只有空形状；窗口已经认这个字段，省得下一票再改白名单。
-      orders: []
+      orders: [],
+      // 票 82：真人周榜 + LAN 情绪。老宿主没有这一块时是空榜（窗口画「还没有邻居上线」）。
+      league: normalizeBoardLeague(raw.league)
     }
   }
 
