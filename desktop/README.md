@@ -83,7 +83,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `open-url` | `url`（http/https） | 用系统浏览器/默认应用打开（菜单里的「打开软件」）。非 http(s) 在命令白名单处就被丢掉，helper 不执行。地址可能带 DSH 的 launch token：helper 只转交，不写日志、也不回传给渲染端 |
 | `bring-window` | `open`, `items[]`（`id`/`kind`/`text?`/`name?`/`state`） | 打开或刷新「带派」小窗（ticket 24）。**不带路径**：背包内容由宿主算好下发，`count`/限额由 helper 侧 `shared.normalizeBringWindow` 补齐 |
 | `farm-window` | `open`, `close?`, `farm`, `market`, `contracts`, `mode?:'owner'\|'visitor'\|'look'`, `visit?`, `look?`, `neighbors?`, `plotId?` | 打开/刷新/关闭农场小窗（ticket 40/41/43/44/46/52/55）。`close:true` 才关窗（再点一次「农场」或 `farm-close`），`open:false` 只刷新。数据全部由宿主算好；helper 只按 `shared.normalizeFarmWindow` 重建白名单字段，不读盘、不联网 |
-| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'\|'farm'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` / `window:'farm'` 抓对应小窗 |
+| `board-window` | `open`, `close?`, `state` | 打开/刷新/关闭盘口小窗（票 79–83）。`close:true` 才关窗（再点一次「盘口」），`open:false` 只刷新；`state` 由宿主按 `shared.normalizeBoardView` 白名单重建（硬币、K 线、持仓、挂单、历史、周榜、limits），helper 不读盘、不联网 |
+| `shot` | `id?`, `path`（绝对路径）, `window?:'bring'\|'farm'\|'board'` | `capturePage()` 写 PNG + `<path>.json`，回 `shot` 事件；`window:'bring'` / `window:'farm'` / `window:'board'` 抓对应小窗 |
 | `ping` | `id?` | 回 `pong`；宿主每 5s 一次，helper 30s 没收到任何行就自行退出 |
 | `status` | `id?` | 回 `status` 事件（诊断用） |
 | `quit` | — | 优雅退出 |
@@ -136,7 +137,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `ready` | `pid`, `workArea`, `displays`, `debug`, `shotMode` | 窗口显示后发；显示器变化时重发 |
 | `hit` | `inside`, `interactive`, `itemId`, `point`, `rect`, `reason` | **只在穿透状态翻转时发**；`point`/`rect` 是屏幕 DIP；`reason` 见下 |
 | `farm-window-state` | `open` | 农场小窗真的开了/关了（含用户点 ×/Esc）；宿主靠它把右键「农场」变成开/关切换 |
-| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?`, `plotId?`, `cropId?`, `qty?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`/`farm-*`/`hire`/`recall-worker`/`end-contract`/`hire-listing`/`farm-open`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），农场动作只带 `plotId`/`cropId`/`qty`，雇佣只带 `deviceId`/`hours`/`contractId`/挂牌四字段；helper 只校验形状，清洗交给宿主 |
+| `board-window-state` | `open` | 盘口小窗真的开了/关了（含用户点 ×/Esc）；宿主靠它把右键「盘口」变成开/关切换 |
+| `action` | `id`, `action`, `deviceId?`, `nickname?`, `name?`, `giftId?`, `gift?`, `plotId?`, `cropId?`, `qty?`, `hours?`, `contractId?`, `enabled?`, `wagePerHour?`, `minHours?`, `maxHours?`, `side?`, `margin?`, `leverage?`, `positionId?`, `level?`, `target?`, `orderId?` | 渲染端控件/菜单/小窗申请宿主动作（`visit`/`recall`/`end-visit`/`admit`/`reject`/`dismiss`/`rename`/`play-anim`/`reload`/`open-site`/`bring`/`unbring`/`gift-*`/`farm-*`/`hire`/`recall-worker`/`end-contract`/`hire-listing`/`farm-open`/`trading-*`）。宿主执行后用 `action-result` 回同一个 `id`；**渲染端不直接改状态**。`rename` 带 `nickname`、`play-anim` 带动画名 `name`（必须是安全动画名）、礼物卡动作带 `giftId`、`bring` 带 `gift:{kind,text\|path}`（右键菜单的 `bring` 不带，表示开窗），农场动作只带 `plotId`/`cropId`/`qty`，雇佣只带 `deviceId`/`hours`/`contractId`/挂牌四字段，盘口动作只带 `side`/`margin`/`leverage`/`cropId`/`positionId`/`level`/`target`/`orderId`；helper 只校验形状，清洗交给宿主 |
 | `shot` | `id?`, `path`, `width`, `height`, `bytes` | 像素尺寸是物理像素（Retina 上是 2×）；sidecar 里还带渲染端探针 |
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
@@ -487,6 +489,25 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `debug-farm-tab` / `debug-farm-plant-open` / `debug-farm-plant-close` /
   `debug-farm-batch` / `debug-farm-close` 只用于这一步。
 
+## 盘口小窗（票 79–83）
+
+盘口也是一扇独立的 `file://` 小窗（`board.html`，约 760×700，`focusable: true`），
+和农场窗同一条模型：**宿主算数据，helper 只画和收输入**。
+
+- 宿主用 `board-window { open, state }` 下发整份视图（硬币、本周盈亏、三作物 K 线、风向、
+  持仓、挂单、历史、真人周榜、`limits`）；窗口读不到 `/state`，也不自己算价/算钱。
+- 渲染端用 `dsh-zoo:board-submit` 发一次申请，字段经 `shared.normalizeBoardAction` 白名单后
+  落到宿主的 `trading-*` 动作；结果走 `action-result`，成功不关窗，失败冒人话。
+- `dsh-zoo:board-ready` / `dsh-zoo:board-close` / `dsh-zoo:board-state` / `dsh-zoo:board-result`
+  与农场窗同款；重画由宿主每分钟一拍 + 动作后的刷新推送，窗口自己只递减倒计时。
+- 键盘：Tab 顺序 = DOM 顺序（作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 →
+  挂单 → 开一手 → 撤单 → 持仓卡的止损/平仓），Enter/Space 是按钮原生行为，Esc 关窗。
+  **失焦不关窗**（macOS 中文输入法候选窗会抢焦点，和农场窗同一条取舍）。
+- ×、Esc 走窗口自己的 `dsh-zoo:board-close`；宿主只负责打开/刷新/显式 `close:true`。
+  关窗后 host 继续每分钟撮合/结算，窗口不会因此停摆。
+- 截图：`shot` 的 `window:'board'` 抓这扇窗（`test/board-window.test.js` 覆盖命令/字段白名单，
+  真 Electron 冒烟目前只跑农场窗）。
+
 ## 多显示器 / 分辨率
 
 **一扇窗铺满所有显示器工作区的并集**，宠物可以在任意一块屏上被看见、被拖动、被点击。
@@ -514,8 +535,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 ## 已知限制
 
 - `focusable: false`：没有键盘输入。所有控件（串门/召回/送客/改名/放行卡）都是鼠标点击，没有
-  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。唯一的例外是 **改名小窗**、
-  **带派小窗**与**农场小窗**（见上）。
+  Tab/Enter/Esc；放行卡的“稍后再说”是一个 × 按钮。例外是 **改名小窗**、
+  **带派小窗**、**农场小窗** 与 **盘口小窗**（见上；后两者是 focusable 的独立窗口）。
 - 悬停弹层依赖渲染端收到 `pointermove`；macOS 上 `forward: true` 失效时，主进程仍能靠 300ms
   兜底让弹层打开后的按钮可点，但“悬停即出现”本身可能延迟到兜底接管。
 - 控件位置每 100ms 跟一次宠物；宠物被快速拖动时弹层会有一点跟手延迟（不影响点击）。

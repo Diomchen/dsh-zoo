@@ -33,6 +33,7 @@ import {
   HIRE_WAGE_MAX,
   HIRE_WAGE_MIN
 } from '../src/protocol.js'
+import { MAX_MARGIN } from '../src/trading-rules.js'
 
 const FARM_JS = new URL('../desktop/farm.js', import.meta.url)
 const SHARED_JS = new URL('../desktop/shared.js', import.meta.url)
@@ -130,4 +131,10 @@ test('票 58：每种作物都有包内自带的 SVG，路径与 id 一一对应
     assert.match(svg, /viewBox="0 0 100 100"/, cropId + ' 的 viewBox 要统一成 100×100')
     assert.equal(svg.includes('<script'), false, cropId + ' 的图里不该有脚本')
   }
+})
+
+test('票 83：盘口单笔保证金上限与农场硬币上限同值', () => {
+  // 「全下」把保证金从固定档位换成任意整数金额，上限必须和钱包同一把尺子：
+  // 超过钱包的申请先被 no-coin 挡掉，这个数只防离谱输入（见 MAX_MARGIN 的注释）。
+  assert.equal(MAX_MARGIN, MAX_COINS)
 })

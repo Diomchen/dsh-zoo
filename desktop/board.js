@@ -40,6 +40,16 @@ const leverageRowEl = document.getElementById('leverage-row')
 const previewEl = document.getElementById('preview')
 const submitEl = document.getElementById('submit')
 const orderHintEl = document.getElementById('order-hint')
+const limitToggleEl = document.getElementById('limit-toggle')
+const limitNoteEl = document.getElementById('limit-note')
+const limitBoxEl = document.getElementById('limit-box')
+const limitInputEl = document.getElementById('limit-target')
+const limitBandEl = document.getElementById('limit-band')
+const limitHintEl = document.getElementById('limit-hint')
+const limitPlaceEl = document.getElementById('limit-place')
+const ordersEl = document.getElementById('orders')
+const ordersMetaEl = document.getElementById('orders-meta')
+const ordersEmptyEl = document.getElementById('orders-empty')
 const positionsEl = document.getElementById('positions')
 const positionsMetaEl = document.getElementById('positions-meta')
 const positionsEmptyEl = document.getElementById('positions-empty')
@@ -63,8 +73,10 @@ const RESULT_CODE_TEXT = {
   'bad-board-action': '这个操作缺少方向或保证金，再试一次。',
   'bad-crop': '这种作物暂时没有盘口。',
   'bad-side': '方向只有做多和做空。',
-  'bad-margin': '保证金只有 50 和 100 两档。',
+  'bad-margin': '保证金要是 1 到 1,000,000 之间的整数硬币。',
   'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20×）。',
+  'bad-target': '目标价超出这张图的价格范围，换一个价再挂。',
+  'no-order': '这张挂单已经成交或撤掉了。',
   'no-coin': '硬币不够，先去种地或卖点作物。',
   'no-position': '这个仓位已经平掉了。',
   settling: '这个仓位正在结算，等一下再看。',
@@ -78,6 +90,12 @@ let side = 'long'
 let margin = 50
 let leverage = 1
 let crop = null
+/** 票 83：保证金选的是不是「全下」（金额每包按可用硬币现算，所以只记这个布尔）。 */
+let allIn = false
+/** 到价面板开没开；关着时输入框和挂单按钮不出现（SPEC：下单区只在点开「到价」时出现）。 */
+let limitOpen = false
+/** 玩家在目标价输入框里打的原文；空 = 用现价当默认值。 */
+let targetText = ''
 /** 有申请在飞：连点不会串单（主进程也会挡，这里只是立刻反馈）。 */
 let pending = false
 /** 这一根的收盘时刻（本地倒计时基线，每次宿主推包都重置）。 */
@@ -214,6 +232,9 @@ function renderChart (board) {
   }
 }
 
+/** 最近一次渲染出来的 board view：点击挂单时拿 view 算好的 target/band，不再自己解析一遍。 */
+let lastBoard = null
+
 function renderOrder (board) {
   const order = board.order
   sideRowEl.textContent = ''
@@ -230,8 +251,10 @@ function renderOrder (board) {
   for (const choice of order.margins) {
     const button = document.createElement('button')
     button.type = 'button'
-    button.className = 'chip'
+    button.className = 'chip' + (choice.allIn ? ' all-in' : '')
+    // 全下的金额每包都会变（可用硬币），所以 data-margin 记金额、data-all-in 记语义。
     button.dataset.margin = String(choice.margin)
+    if (choice.allIn) button.dataset.allIn = 'true'
     button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
     button.disabled = choice.disabled
     button.textContent = choice.label
@@ -252,6 +275,63 @@ function renderOrder (board) {
   submitEl.dataset.side = order.side
   submitEl.disabled = pending || !order.canSubmit
   orderHintEl.textContent = order.hint
+
+  // 到价（票 83）：关着时只留一颗开关；点开后才出现目标价和挂单按钮。
+  const limit = order.limit
+  limitToggleEl.textContent = limit.toggleLabel
+  limitToggleEl.setAttribute('aria-pressed', limitOpen ? 'true' : 'false')
+  limitNoteEl.textContent = limitOpen ? '开：到价才成交，收盘没成交自动撤' : '关：直接按现价开仓'
+  limitBoxEl.hidden = !limitOpen
+  limitBandEl.textContent = limit.bandText === '' ? '' : '可挂 ' + limit.bandText
+  limitHintEl.textContent = limit.hint
+  limitPlaceEl.textContent = limit.placeLabel
+  limitPlaceEl.disabled = pending || !limit.canPlace
+  // 输入框正在打字时不要每包重设它的值（宿主每分钟会推一包，会吃掉半个数字）。
+  if (document.activeElement !== limitInputEl && limitInputEl.value !== limit.targetText) {
+    limitInputEl.value = limit.targetText
+  }
+
+  renderOrders(board)
+}
+
+/**
+ * 到价挂单列表（票 83）：方向/作物/杠杆、目标价、保证金、距收盘的剩余时间 + 撤单。
+ * 剩余时间每秒由 `tick()` 按 `data-until` 重算，重画整张列表会把焦点弄丢。
+ */
+function renderOrders (board) {
+  ordersEl.textContent = ''
+  for (const row of board.orders) {
+    const line = document.createElement('div')
+    line.className = 'order-row'
+
+    const main = document.createElement('div')
+    main.className = 'row-main'
+    const title = document.createElement('div')
+    title.className = 'row-title'
+    title.textContent = row.title
+    const meta = document.createElement('div')
+    meta.className = 'row-meta'
+    meta.textContent = '到价 ' + row.targetText + ' · 保证金 ' + row.marginText
+    const remaining = document.createElement('b')
+    remaining.className = 'order-remaining'
+    remaining.dataset.until = String((Number(row.remainingMs) || 0) + Date.now())
+    remaining.textContent = row.remainingText
+    main.append(title, meta, remaining)
+
+    const cancel = document.createElement('button')
+    cancel.type = 'button'
+    cancel.className = 'ghost order-cancel'
+    cancel.dataset.cancel = row.id
+    cancel.disabled = pending || !row.canCancel
+    cancel.textContent = row.cancelLabel
+    cancel.title = '撤掉这张挂单，保证金立刻退回硬币'
+
+    line.append(main, cancel)
+    ordersEl.append(line)
+  }
+  ordersMetaEl.textContent = board.orders.length + ' 张'
+  ordersEmptyEl.hidden = board.orders.length > 0
+  ordersEmptyEl.textContent = board.hints.orders
 }
 
 function renderPositions (board) {
@@ -387,6 +467,9 @@ function focusKeyOf (element) {
   if (element === null || element === undefined) return null
   if (element === submitEl) return 'submit'
   if (element === closeButton) return 'close-button'
+  if (element === limitToggleEl) return 'limit-toggle'
+  if (element === limitInputEl) return 'limit-input'
+  if (element === limitPlaceEl) return 'limit-place'
   const data = element.dataset ?? {}
   if (data.crop !== undefined) return 'crop:' + data.crop
   if (data.side !== undefined) return 'side:' + data.side
@@ -394,6 +477,7 @@ function focusKeyOf (element) {
   if (data.leverage !== undefined) return 'leverage:' + data.leverage
   if (data.stop !== undefined) return 'stop:' + data.stop
   if (data.close !== undefined) return 'close:' + data.close
+  if (data.cancel !== undefined) return 'cancel:' + data.cancel
   return null
 }
 
@@ -404,13 +488,17 @@ const FOCUS_ROOTS = {
   margin: marginRowEl,
   leverage: leverageRowEl,
   stop: positionsEl,
-  close: positionsEl
+  close: positionsEl,
+  cancel: ordersEl
 }
 
 function focusByKey (key) {
   if (key === null) return
   if (key === 'submit') return submitEl.focus({ preventScroll: true })
   if (key === 'close-button') return closeButton.focus({ preventScroll: true })
+  if (key === 'limit-toggle') return limitToggleEl.focus({ preventScroll: true })
+  if (key === 'limit-input') return limitInputEl.focus({ preventScroll: true })
+  if (key === 'limit-place') return limitPlaceEl.focus({ preventScroll: true })
   const separator = key.indexOf(':')
   const kind = key.slice(0, separator)
   const value = key.slice(separator + 1)
@@ -422,7 +510,17 @@ function focusByKey (key) {
 
 function render () {
   const focused = focusKeyOf(document.activeElement)
-  const board = view.boardView(payload, { now: Date.now(), side, margin, leverage, crop })
+  const board = view.boardView(payload, {
+    now: Date.now(),
+    side,
+    margin,
+    leverage,
+    crop,
+    limitOpen,
+    targetText,
+    allIn
+  })
+  lastBoard = board
   renderHeader(board)
   renderChart(board)
   renderOrder(board)
@@ -433,6 +531,7 @@ function render () {
   side = board.order.side
   margin = board.order.margin
   leverage = board.order.leverage
+  allIn = board.order.allIn
   crop = board.chart.crop
   if (!focusedOnce && payload !== null) {
     focusedOnce = true
@@ -445,8 +544,15 @@ function render () {
 
 function tick () {
   if (payload === null || barEnd <= 0) return
-  const remaining = Math.max(0, barEnd - Date.now())
+  const now = Date.now()
+  const remaining = Math.max(0, barEnd - now)
   countdownEl.textContent = view.formatCountdown(remaining)
+  // 挂单的剩余时间只改文本，不重画列表（重画会把「撤单」的焦点弄丢）。
+  for (const element of ordersEl.querySelectorAll('[data-until]')) {
+    const until = Number(element.dataset.until)
+    if (!Number.isFinite(until)) continue
+    element.textContent = '剩 ' + view.formatCountdown(Math.max(0, until - now))
+  }
   if (remaining > 0 || refreshAsked) return
   // 到点了：让宿主结这一根、重推一拍（窗口不自己算收盘价）。
   refreshAsked = true
@@ -493,8 +599,14 @@ sideRowEl.addEventListener('click', (event) => {
 marginRowEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-margin]')
   if (button === null || button.disabled) return
-  const chosen = Number(button.dataset.margin)
-  if (Number.isFinite(chosen)) margin = chosen
+  // 「全下」的金额每包按可用硬币现算，所以只记语义；预设记具体金额。
+  if (button.dataset.allIn === 'true') {
+    allIn = true
+  } else {
+    allIn = false
+    const chosen = Number(button.dataset.margin)
+    if (Number.isFinite(chosen)) margin = chosen
+  }
   render()
 })
 
@@ -506,9 +618,45 @@ leverageRowEl.addEventListener('click', (event) => {
   render()
 })
 
+limitToggleEl.addEventListener('click', () => {
+  limitOpen = !limitOpen
+  render()
+  // 点开就聚焦到目标价：键盘用户少按一次 Tab（输入框此前是 hidden，焦点本来也不在那儿）。
+  if (limitOpen) limitInputEl.focus({ preventScroll: true })
+})
+
+limitInputEl.addEventListener('input', () => {
+  // 原样保留输入（包括输入到一半的「5.」）；解析和能不能挂由 view 判。
+  targetText = limitInputEl.value
+  render()
+})
+
+limitPlaceEl.addEventListener('click', () => {
+  if (limitPlaceEl.disabled || lastBoard === null) return
+  const limit = lastBoard.order.limit
+  if (limit.target === null) {
+    showToast(limit.hint === '' ? '目标价要填一个大于 0 的数字。' : limit.hint, 'error')
+    return
+  }
+  submitAction({
+    action: 'trading-place-order',
+    side,
+    margin,
+    leverage,
+    cropId: crop,
+    target: limit.target
+  })
+})
+
 submitEl.addEventListener('click', () => {
   if (submitEl.disabled) return
   submitAction({ action: 'trading-open-position', side, margin, leverage, cropId: crop })
+})
+
+ordersEl.addEventListener('click', (event) => {
+  const cancel = event.target.closest('[data-cancel]')
+  if (cancel === null || cancel.disabled) return
+  submitAction({ action: 'trading-cancel-order', orderId: cancel.dataset.cancel })
 })
 
 positionsEl.addEventListener('click', (event) => {

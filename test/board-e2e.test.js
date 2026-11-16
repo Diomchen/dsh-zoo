@@ -137,7 +137,11 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
   assert.equal(before.body.trading.bar.end - before.body.trading.bar.start, SLOT_MS)
   assert.equal(before.body.trading.bar.remainingMs, SLOT_MS - 5 * TICK_MS)
   assert.ok(before.body.trading.bar.price > 0)
-  assert.deepEqual(before.body.trading.limits.margins, [50, 100])
+  // 票 83：三档预设 + 全下；目标价带随包下发（窗口不抄宿主比例）。
+  assert.deepEqual(before.body.trading.limits.margins, [50, 100, 250])
+  assert.equal(before.body.trading.limits.allIn, true)
+  assert.deepEqual(before.body.trading.limits.targetRatio, { floor: 0.55, ceil: 1.75 })
+  assert.deepEqual(before.body.trading.orders, [])
   // 杠杆白名单与纯规则同源：票 80 换成 [1,5,20] 时这里不用改。
   assert.deepEqual(before.body.trading.limits.leverages, TRADING_LEVERAGES.slice())
   assert.equal(before.body.trading.week.start, weekStartOf(OPEN_AT))
@@ -237,9 +241,10 @@ test('票 79 e2e：硬币不够（含 0 硬币）拒绝开仓，硬币不为负'
   assert.equal(refused.status, 409)
   assert.equal(refused.body.error, 'no-coin')
   assert.equal((await state(service)).body.farm.coins, 30)
-  // 方向/保证金不在白名单里也拒绝，且不碰硬币。
+  // 方向/保证金不合法也拒绝，且不碰硬币（票 83：250 是合法预设，坏值换成 0/小数）。
   assert.equal((await action(service, { action: 'trading-open-position', side: 'up', margin: 50 })).body.error, 'bad-side')
-  assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 250 })).body.error, 'bad-margin')
+  assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 0 })).body.error, 'bad-margin')
+  assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 50.5 })).body.error, 'bad-margin')
   assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 50, leverage: 2 })).body.error, 'bad-leverage')
   assert.equal((await action(service, { action: 'trading-close-position', positionId: 'nope' })).body.error, 'no-position')
   assert.equal((await state(service)).body.farm.coins, 30)
@@ -519,4 +524,69 @@ test('票 81 e2e：0 硬币时按钮写「去种地」，下单被拒绝且硬�
   assert.equal(refused.body.error, 'no-coin')
   assert.equal((await state(service)).body.farm.coins, 0)
   assert.deepEqual((await state(service)).body.trading.positions, [])
+})
+
+test('票 83 e2e：挂单锁币 → 到价成交（entry = 目标价）→ 撤单退回；/state 与存档对得上', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: SLOT_EDGE }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+
+  // 开盘挂一张做多：目标价取第 14 分钟的价（这一根一路跌，第 14 分钟第一次越价）。
+  const target = markPrice({ crop: 'tomato', now: SLOT_EDGE + 14 * TICK_MS })
+  const placed = await action(service, {
+    action: 'trading-place-order',
+    side: 'long',
+    margin: 100,
+    leverage: 5,
+    cropId: 'tomato',
+    target
+  })
+  assert.equal(placed.status, 200)
+  assert.equal(placed.body.ok, true, JSON.stringify(placed.body))
+  const afterPlace = await state(service)
+  assert.equal(afterPlace.body.farm.coins, 400, '挂单当场锁保证金')
+  assert.equal(afterPlace.body.trading.coins.locked, 100)
+  assert.equal(afterPlace.body.trading.orders.length, 1)
+  assert.equal(afterPlace.body.trading.orders[0].target, target)
+  const orderId = afterPlace.body.trading.orders[0].id
+  const file = await readTrading(dir)
+  assert.equal(file.orders.length, 1)
+  assert.equal(file.orders[0].id, orderId)
+
+  // 时钟推到成交那一分钟：trading-refresh 让宿主撮合；成交价是目标价。
+  clock.value = SLOT_EDGE + 14 * TICK_MS
+  assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
+  const afterFill = await state(service)
+  assert.deepEqual(afterFill.body.trading.orders, [])
+  assert.equal(afterFill.body.trading.positions.length, 1)
+  const position = afterFill.body.trading.positions[0]
+  assert.equal(position.entry, target)
+  assert.equal(position.margin, 100)
+  assert.equal(position.leverage, 5)
+  assert.equal(position.openedAt, SLOT_EDGE + 14 * TICK_MS)
+  assert.equal(afterFill.body.farm.coins, 400, '成交时不再动钱')
+  assert.equal((await readTrading(dir)).positions.length, 1)
+
+  // 再挂一张做空，然后手动撤单：硬币回到 400 + 50。
+  const second = await action(service, {
+    action: 'trading-place-order',
+    side: 'short',
+    margin: 50,
+    leverage: 1,
+    cropId: 'tomato',
+    target: target + 0.2
+  })
+  assert.equal(second.body.ok, true, JSON.stringify(second.body))
+  assert.equal((await state(service)).body.farm.coins, 350)
+  const cancelled = await action(service, {
+    action: 'trading-cancel-order',
+    orderId: second.body.order.id
+  })
+  assert.equal(cancelled.body.ok, true, JSON.stringify(cancelled.body))
+  const afterCancel = await state(service)
+  assert.equal(afterCancel.body.farm.coins, 400)
+  assert.deepEqual(afterCancel.body.trading.orders, [])
+  assert.equal(afterCancel.body.trading.history.length, 0, '撤单不进历史')
 })

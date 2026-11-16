@@ -19,8 +19,14 @@
 [SPEC v7](.scratch/dsh-zoo/SPEC-v7.md)；票 51–54 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
+「盘口 / 15 分钟合约 / 真人周榜」的决策见 [ADR-0027](docs/adr/0027-fifteen-minute-board.md)，
+规格见 [SPEC v10](.scratch/dsh-zoo/SPEC-v10.md)；票 79–83 在
+[`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
 农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
+
+盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
 
 ## Language
 
@@ -309,3 +315,73 @@ _Avoid_: 治疗, 修复, heal, repair
 把生长中或冻住的作物直接清空为草地；免费、不退种子、不产作物，用于换季前止损或清掉冻住的地。
 成熟要先收割，枯萎直接重种。宿主动作 `farm-clear`。
 _Avoid_: 删除, 拔掉, delete, remove
+
+## 盘口（15 分钟合约）
+
+**盘口 (Board)**：
+一层独立于现货交易所的 15 分钟合约市场：做多/做空，用农场硬币下注，收盘结算。
+它不是订单簿，也不交割作物；行情由确定性种子算出，没人交易也照走。
+窗口约 760×700，从桌面右键「盘口」或农场窗的「盘口」按钮打开。
+_Avoid_: 交易所, 市场, exchange, market, 订单簿
+
+**合约 (Contract)**：
+以作物为标的、15 分钟一根、现金结算的仓位；不做交割、不做组合/指数。
+合约价与现货 `market.json` 的 bid/price 是两张互不写入的图。
+_Avoid_: 期货, 现货, futures, spot
+
+**一根 (Bar)**：
+15 分钟一根的 K 线 = 1 个 slot；一根里有 15 个 1 分钟 **tick**。收盘价就是结算价，
+`slot + 作物 + 版本盐` 相同就在所有机器上得到同一张图。
+_Avoid_: 周期, 蜡烛, candle, period
+
+**保证金 (Margin)**：
+开仓/挂单时从农场硬币里当场扣掉、锁在这笔交易里的本金；亏损上限就是它，硬币不会变负。
+窗口的快捷键是 50 / 100 / 250 / 全下（全下 = 此刻的全部可用硬币），也可以自己填整数金额。
+_Avoid_: 本金, 押金, 仓位价值, deposit, stake
+
+**杠杆 (Leverage)**：
+保证金的放大倍数，只有 1× / 5× / 20×。盈亏 = 保证金 × 杠杆 × 价格变化；
+杠杆越高，强平线离入场价越近。
+_Avoid_: 倍数, 倍率, multiplier, x
+
+**强平 (Liquidation)**：
+保证金亏完时系统自动平仓：做多 `现价 ≤ 入场 × (1 − 1/杠杆)`，做空相反；1× 没有强平线。
+强平只亏保证金、不欠钱；20× 的插针可能一把清空硬币。
+_Avoid_: 爆仓, 清算, 平仓, margin call
+
+**止损 (Stop Loss)**：
+玩家自己在持仓卡上设的提前平仓线：关 / −25% / −50% / −100% 保证金，默认关。
+它是玩家工具，不是系统强加的风险控制；到线按当前价平，原因写「止损」。
+_Avoid_: 止盈, 风控, 保护, take profit
+
+**到价开仓 (Limit Order)**：
+可选的本地挂单（v1.5）：选方向/保证金/杠杆，再设一个目标价；价格碰到目标价就成交
+（成交价 = 目标价），最多活一根，收盘没成交自动撤并退回保证金，也可以手动撤。
+只在本机、不跨机，不做部分成交，也不会出现在历史里（历史只记平掉的仓位）。
+_Avoid_: 限价单, 委托单, 指令, stop order
+
+**本周交易盈亏 (Week PnL)**：
+周一 00:00（本地时间）清零的分数，等于本周已实现盈亏 + 当前未实现盈亏；硬币不跟着清零。
+它是真人周榜的排序键，收益率 = 本周盈亏 / 周起点硬币（分母为 0 时显示「—」）。
+_Avoid_: 周收益, 赛季分, 积分, weekly score
+
+**风向 (Trend Hint)**：
+慢趋势在本根的方向（偏多/偏空/横盘）+ 55–68% 的置信度。快噪声随时能把弱信号打反，
+所以 UI 必须写「不是保证」；它只是提示，不是预测。
+_Avoid_: 预测, 信号, 指标, signal, forecast
+
+**底价锚 (Base Anchor)**：
+盘口价围绕作物底价生成，夹在底价的 0.55–1.75 倍；K 线上的「底价」参考线就是它。
+到价挂单的目标价也必须落在这个带里，否则永远不会成交。
+_Avoid_: 基准价, 现价, base price (作为同义词时)
+
+**周榜 (Weekly Leaderboard)**：
+`trading-digest` 收来的真人（本机 + 已放行邻居）本周交易盈亏，按金币降序；没有 NPC。
+每台机器每 30 秒最多发一条，接收端只认 ≤2 分钟新鲜、最多 8 条持仓的报文；
+旧版本邻居不认这个报文，榜上就不会出现他们。
+_Avoid_: 排行榜, 天梯, 赛季榜, ranking, ladder
+
+**LAN 情绪 (LAN Sentiment)**：
+本机 + 邻居当前持仓的多空计数（多 N · 空 M）；一条仓位都没有时写「观望」。
+它只数大家报上来的方向，不做加权，也不影响行情。
+_Avoid_: 市场情绪, 多空比, 指数, market mood

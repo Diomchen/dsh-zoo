@@ -24,7 +24,8 @@ contextBridge.exposeInMainWorld('dshZooBoard', {
     if (action === null || typeof action !== 'object' || Array.isArray(action)) return
     // 字段由主进程按 shared.normalizeBoardAction 再白名单一遍；这里只挡明显不是对象的东西。
     // 字段按动作显式拷贝：开仓（side/margin/leverage/cropId）、平仓/止损（positionId）、
-    // 止损再带一档 level（0 / 0.25 / 0.5 / 1）。
+    // 止损再带一档 level（0 / 0.25 / 0.5 / 1）、到价挂单（target，合起来是
+    // action/side/margin/leverage/cropId/target）、撤单（orderId）。
     // 硬币、价格、盈亏、总价一概不传——全部由宿主算。
     ipcRenderer.send('dsh-zoo:board-submit', {
       action: action.action,
@@ -33,7 +34,9 @@ contextBridge.exposeInMainWorld('dshZooBoard', {
       leverage: action.leverage,
       cropId: action.cropId,
       positionId: action.positionId,
-      level: action.level
+      level: action.level,
+      target: action.target,
+      orderId: action.orderId
     })
   },
   close () {

@@ -2,7 +2,8 @@
 
 ## Status
 
-proposed（2026-11-16 按用户三条口径收口；等 SPEC v10 与票 79–83）
+accepted（2026-11-16）。用户三条口径：结算简单、不搞风险控制、真邻居 + 限价/止损可选。
+2026-11-16 实现完成（票 79–83，SPEC v10）。下面「未定」已按实现收口，见文末「实现」。
 
 > 编号说明：本线是**盘口**——ADR-0027 / SPEC v10 / 票 79–83。
 > SPEC v9 与 ADR-0024–0026 是同一天另三条线（露水 / 铲地 / 自适应行情），不要混。
@@ -72,10 +73,33 @@ LAN 只做同一张图和真人榜，不做对手盘。**
 - **盘口和现货互不影响**：现货交易所继续管种子的固定价、作物的 bid；盘口是另一张图，
   不改变 `farm.json` / `market.json` 的现货规则。
 
-## 未定
+## 未定（已收口）
 
-- 到价开仓放 v1 还是 v1.5（SPEC v10 默认 v1.5）。
-- 止损预设是 −25/−50/−100 还是别的档。
-- 周榜按盈亏还是收益率排序（SPEC v10 默认盈亏，收益率只展示）。
-- 盘口窗口的确切尺寸与入口（右键 / 农场窗页签）。
-- 快噪声的具体幅度与趋势换挡频率（1 小时 / 2 小时）。
+- **到价开仓**：按 SPEC v10 放 v1.5，票 83 已实现。本地限价单，目标价 + 方向/保证金/杠杆，
+  最多活一根，成交价 = 目标价，不做部分成交；保证金在下单那一刻就锁进农场硬币。
+- **止损预设**：−25% / −50% / −100% 保证金 + 关，共四档；默认关。
+- **周榜排序**：按本周盈亏（金币）降序；收益率只用 `weekPnlPct` / `weekPnl / weekBase`
+  展示，不参与排序。
+- **盘口窗口**：约 760×700 的独立 focusable 窗口（`desktop/board.{html,js,preload.js}`），
+  右键「盘口」与农场窗顶部按钮两个入口；关窗不影响 host 每分钟结算。
+- **行情参数**：慢趋势两条正弦叠加（周期约 9 / 11.4 根，幅度约 ±20%），快噪声 ±2.2%
+  （每个 slot 一个散列格点、tick 间 smoothstep），价格夹在 `[0.55, 1.75] × base`；
+  风向置信度 55–68%。参数集中在 `src/trading-rules.js`，改手感时一起改 `PRICE_SALT`。
+
+## 实现（2026-11-16，票 79–83）
+
+- **纯规则** `src/trading-rules.js`：确定性价格（`boardPrice` / `markPrice` / `slotClosePrice`）、
+  K 线与风向、盈亏/结算/强平/止损、逐分钟路径检查、到价成交扫描、本周起点与保证金/杠杆/作物白名单。
+- **账本** `src/trading.js`：`trading.json` v1（本周盈亏、持仓、挂单、历史）；硬币是 `farm.json`
+  的 coins，开仓/挂单当场扣、结算/撤单退回；`settling` / `refunding` 两段式意图保证重启幂等；
+  坏文件按空盘口运行、只告警一次。
+- **榜与协议** `src/trading-league.js` + `src/protocol.js`：`trading-digest` 每 30 秒/peer，
+  接收四道门（放行、2 分钟新鲜、30 秒限速、字段白名单）；榜只含本机 + 真人邻居。
+- **宿主接线** `src/service.js` 与 `src/trading-text.js`：动作分发、`/state.trading`、窗口推送、
+  tick 撮合/结算与中文错误文案。
+- **窗口** `desktop/trading-view.js`（纯视图）+ `desktop/board.{html,js,preload.js}`（DOM/IPC）+
+  `desktop/shared.js` 的白名单归一化；入口在 `src/service.js` 的 `handleTradingOpen`。
+- **测试**：`test/trading-rules.test.js`、`test/trading.test.js`、`test/trading-orders.test.js`、
+  `test/trading-view.test.js`、`test/trading-league.test.js`、`test/protocol-trading.test.js`、
+  `test/board-window.test.js`、`test/board-e2e.test.js`、`test/trading-e2e.test.js`、
+  `test/trading-final-e2e.test.js`（无网络、假时钟）。
