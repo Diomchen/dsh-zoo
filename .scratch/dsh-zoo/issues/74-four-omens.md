@@ -24,6 +24,7 @@
 - 桌面 `shared.normalizeSeasonOmen` 校验通用 `choices/stakes`；`farm-view.omenCard`
   动态生成文案和禁用态；`farm.js` 只在 `active` 时画卡。
 - 临时守卫：`omen.guardOptions` 提供 0～2 名选项（每名 20 硬币、+0.5，基础 + 临时封顶 1.0）；
+  只能从当前空闲的宠物里雇（在线、互相放行，且没在自家打工/串门），没有空闲宠物时只能自己守。
   `farm-omen-resolve` 可带 `guards`，`feed` 不允许带；费用结算时先扣，失败不退。
 
 ## 验收
