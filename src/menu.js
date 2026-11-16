@@ -38,6 +38,8 @@ export const MENU_TOOL_LABELS = Object.freeze({
   bring: '带派',
   // ticket 40：打开农场小窗。数据由宿主随 `farm-window` 命令下发。
   farm: '农场',
+  // 票 79：打开盘口小窗（15 分钟合约）。数据由宿主随 `board-window` 命令下发。
+  trading: '盘口',
   home: '回到初始位置',
   reload: '重载配置',
   // ticket 37：扫 dsh-pet 的宠物包目录，把没见过的素材加进 skin.json。
@@ -125,6 +127,8 @@ export function menuTools ({ hasOrigin = false } = {}) {
   tools.push({ id: 'bring', label: MENU_TOOL_LABELS.bring })
   // 「农场」（ticket 40）：和带派一样是本机能力，没有邻居也能种。
   tools.push({ id: 'farm', label: MENU_TOOL_LABELS.farm })
+  // 「盘口」（票 79）：同样不依赖邻居——做市商永远报价，一个人也能交易。
+  tools.push({ id: 'trading', label: MENU_TOOL_LABELS.trading })
   tools.push({ id: 'home', label: MENU_TOOL_LABELS.home })
   tools.push({ id: 'reload', label: MENU_TOOL_LABELS.reload })
   tools.push({ id: 'scan-skins', label: MENU_TOOL_LABELS['scan-skins'] })

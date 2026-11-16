@@ -1134,9 +1134,11 @@
     }
     // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
     // 「农场」（ticket 40/46）：同样是空申请；开/关由宿主按小窗的真实状态切换。
+    // 「盘口」（票 79）：同上——开/关与整份视图都在宿主，渲染端只发一个空申请。
     // 扫描外观（ticket 37）：和「重载配置」一样只是一次申请，扫与写全在宿主那边。
-    if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins' || id === 'farm') {
-      requestAction(id === 'farm' ? 'farm-open' : id)
+    if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins' ||
+      id === 'farm' || id === 'trading') {
+      requestAction(id === 'farm' ? 'farm-open' : id === 'trading' ? 'trading-open' : id)
     }
   }
 
