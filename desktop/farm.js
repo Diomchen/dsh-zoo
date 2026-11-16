@@ -1259,6 +1259,12 @@ function renderMarket () {
     const sparkNote = document.createElement('span')
     sparkNote.className = 'market-spark-note'
     sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h · 悬停看价'
+    const sparkPlot = document.createElement('div')
+    sparkPlot.className = 'market-spark-plot ' + spark.trend + (spark.empty ? ' empty' : '')
+    sparkPlot.setAttribute('role', 'img')
+    sparkPlot.setAttribute('aria-label', spark.empty
+      ? '最近 24 小时没有成交'
+      : '最近 24 小时成交价与当前卖价，共 ' + spark.marks.length + ' 个点')
     const sparkSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
     sparkSvg.setAttribute('class', 'market-spark ' + spark.trend + (spark.empty ? ' empty' : ''))
     sparkSvg.setAttribute('viewBox', '0 0 100 24')
@@ -1273,40 +1279,30 @@ function renderMarket () {
       sparkSvg.appendChild(sparkArea)
       sparkSvg.appendChild(sparkLine)
       for (const mark of spark.marks) {
-        const group = document.createElementNS('http://www.w3.org/2000/svg', 'g')
-        group.setAttribute('class', 'market-spark-point-group')
-        const sparkPoint = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
-        sparkPoint.setAttribute('class', 'market-spark-point' + (mark.current ? ' market-spark-end' : ''))
-        sparkPoint.setAttribute('cx', String(mark.x))
-        sparkPoint.setAttribute('cy', String(mark.y))
-        sparkPoint.setAttribute('r', mark.current ? '2.8' : '2.4')
-        const sparkHit = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
-        sparkHit.setAttribute('class', 'market-spark-hit')
-        sparkHit.setAttribute('cx', String(mark.x))
-        sparkHit.setAttribute('cy', String(mark.y))
-        sparkHit.setAttribute('r', '3')
-        const sparkTitle = document.createElementNS('http://www.w3.org/2000/svg', 'title')
-        sparkTitle.textContent = formatSparkTime(mark.at) + ' · '
-          + Math.round(mark.price) + ' 硬币' + (mark.current ? '（当前卖价）' : '')
-        sparkHit.appendChild(sparkTitle)
-        sparkHit.addEventListener('mouseenter', () => {
-          sparkNote.textContent = formatSparkTime(mark.at) + ' · ' + Math.round(mark.price) + ' 硬币'
+        const sparkDot = document.createElement('span')
+        sparkDot.className = 'market-spark-dot' + (mark.current ? ' is-current' : '')
+        sparkDot.style.left = mark.x + '%'
+        sparkDot.style.top = (mark.y / 24 * 100).toFixed(2) + '%'
+        sparkDot.setAttribute('role', 'img')
+        sparkDot.setAttribute('aria-label', formatSparkTime(mark.at) + ' · '
+          + Math.round(mark.price) + ' 硬币' + (mark.current ? '（当前卖价）' : ''))
+        sparkDot.addEventListener('mouseenter', () => {
+          sparkNote.textContent = formatSparkTime(mark.at) + ' · ' + Math.round(mark.price)
         })
-        sparkHit.addEventListener('mouseleave', () => {
+        sparkDot.addEventListener('mouseleave', () => {
           sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h · 悬停看价'
         })
-        group.appendChild(sparkPoint)
-        group.appendChild(sparkHit)
-        sparkSvg.appendChild(group)
+        sparkPlot.appendChild(sparkDot)
       }
     } else {
       sparkSvg.appendChild(sparkLine)
     }
-    sparkWrap.appendChild(sparkSvg)
+    sparkPlot.appendChild(sparkSvg)
+    sparkWrap.appendChild(sparkPlot)
     sparkWrap.appendChild(sparkNote)
-    sparkWrap.title = spark.empty
-      ? '最近 24 小时还没有这个作物的成交；卖出第一笔后这里会出现曲线'
-      : '最近 24 小时成交价与当前卖价，共 ' + spark.points.length + ' 个点；悬停每个点看时间和价格'
+    if (spark.empty) {
+      sparkWrap.title = '最近 24 小时还没有这个作物的成交；卖出第一笔后这里会出现曲线'
+    }
     row.appendChild(sparkWrap)
 
     const trade = document.createElement('div')
