@@ -1466,10 +1466,20 @@
         gap: 6px;
         min-height: 24px;
       }
-      .market-spark {
+      .market-spark-plot {
+        position: relative;
         flex: 1;
+        min-width: 0;
         height: 28px;
+      }
+      .market-spark {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
         overflow: visible;
+        pointer-events: none;
+        z-index: 0;
       }
       .market-spark polyline {
         fill: none;
@@ -1483,38 +1493,46 @@
         fill: var(--muted);
         opacity: 0.09;
       }
-      .market-spark .market-spark-end {
-        fill: var(--muted);
-      }
-      .market-spark .market-spark-point {
-        fill: var(--muted);
-        stroke: var(--card);
-        stroke-width: 1.2;
-        opacity: 0.9;
-        pointer-events: none;
-        vector-effect: non-scaling-stroke;
-      }
-      .market-spark .market-spark-hit {
-        fill: transparent;
-        pointer-events: all;
+      .market-spark-dot {
+        position: absolute;
+        width: 16px;
+        height: 16px;
+        margin: -8px 0 0 -8px;
         cursor: help;
+        z-index: 2;
       }
-      .market-spark-point-group:hover .market-spark-point {
-        opacity: 1;
+      .market-spark-dot::after {
+        content: '';
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 7px;
+        height: 7px;
+        margin: -3.5px 0 0 -3.5px;
+        border-radius: 50%;
+        background: var(--muted);
+        border: 1.5px solid var(--card);
+        box-sizing: border-box;
+        transition: transform 80ms ease;
       }
-      .market-spark.up .market-spark-point {
-        fill: var(--emerald);
+      .market-spark-plot.up .market-spark-dot::after {
+        background: var(--emerald);
       }
-      .market-spark.down .market-spark-point {
-        fill: var(--rose);
+      .market-spark-plot.down .market-spark-dot::after {
+        background: var(--rose);
+      }
+      .market-spark-dot.is-current::after {
+        width: 9px;
+        height: 9px;
+        margin: -4.5px 0 0 -4.5px;
+      }
+      .market-spark-dot:hover::after {
+        transform: scale(1.35);
       }
       .market-spark.up polyline {
         stroke: var(--emerald);
       }
       .market-spark.up .market-spark-area {
-        fill: var(--emerald);
-      }
-      .market-spark.up .market-spark-end {
         fill: var(--emerald);
       }
       .market-spark.down polyline {
@@ -1523,16 +1541,14 @@
       .market-spark.down .market-spark-area {
         fill: var(--rose);
       }
-      .market-spark.down .market-spark-end {
-        fill: var(--rose);
-      }
       .market-spark.empty polyline {
         stroke: var(--line-strong);
         stroke-dasharray: 4 4;
       }
       .market-spark-note {
         flex: none;
-        min-width: 76px;
+        width: 92px;
+        min-width: 92px;
         color: var(--muted);
         font-size: 9px;
         font-weight: 600;
