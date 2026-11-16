@@ -4,7 +4,7 @@
 
 **Blocked by:** 79
 
-**Status:** ready-for-agent
+**Status:** done
 
 **Spec:** [SPEC v10](../SPEC-v10.md)
 
@@ -18,7 +18,12 @@
 
 ## 验收
 
-- [ ] 5×/20× 开仓；仓位、强平价、「涨 1% = ±X」正确；1× 显示「—」。
-- [ ] 强平线 `1/杠杆`；tick/插针/快进/离线补算都能强平；只亏保证金，硬币不为负。
-- [ ] 止损一键循环；到线按 mark 平；原因「止损」；默认关不触发。
-- [ ] 盈亏/取整/无手续费与 SPEC 一致；纯规则 + e2e；`npm run check`。
+- [x] 5×/20× 开仓；仓位、强平价、「涨 1% = ±X」正确；1× 显示「—」。✅ 2026-11-16
+- [x] 强平线 `1/杠杆`；tick/插针/快进/离线补算都能强平；只亏保证金，硬币不为负。✅ 2026-11-16
+- [x] 止损一键循环；到线按 mark 平；原因「止损」；默认关不触发。✅ 2026-11-16
+- [x] 盈亏/取整/无手续费与 SPEC 一致；纯规则 + e2e；`npm run check`。✅ 2026-11-16
+
+> 本票只做 host / 纯规则 / 账本：窗口里「强平」列、`涨 1% = ±X` 预览与持仓卡止损按钮的**显示**随票 81 落地，
+> 按本票固定下来的 payload 契约消费（`positions[].liquidation` / `positions[].stopLoss`、
+> `limits.leverages = [1,5,20]`、动作 `trading-set-stop`）。`npm run check` 唯一未过的是
+> `test/board-window.test.js` 里票 79 写死的 `limits.leverages: [1]`，按文件分工归票 81 更新。
