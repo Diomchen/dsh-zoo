@@ -10,10 +10,11 @@
  * 为什么不能、K 线怎么画、一句话文案）必须能在 Node 里断言，不能只靠真 Electron 冒烟。
  * 数字口径全在这里统一：价格两位小数、盈亏一位小数、倒计时 mm:ss、图表用 viewBox 坐标。
  *
- * 三处「复制了宿主规则」的地方都有注释标出来：15 分钟一根（算倒数第二根的时间轴）、
- * 止损四档（按钮循环），以及下单杠杆/保证金/作物白名单（**不复制**，只吃 payload）。
- * 票 83 的到价目标价带（0.55–1.75× 底价）也只从 payload 的 `chart.base` 读，
- * 不在窗口里再写一遍 `PRICE_FLOOR_RATIO`。
+ * 复制了宿主规则的地方都有注释标出来：15 分钟一根（算倒数第二根的时间轴）、
+ * 止损四档（按钮循环）、下单前的强平价（与 `liquidationPriceOf` 同一条公式，只作展示，
+ * `test/trading-view.test.js` 有 drift 断言），以及下单杠杆/保证金/作物白名单
+ * （**不复制**，只吃 payload）。票 83 的到价目标价带（0.55–1.75× 底价）也只从
+ * payload 的 `chart.base` 读，不在窗口里再写一遍 `PRICE_FLOOR_RATIO`。
  */
 (function (root, factory) {
   'use strict'
@@ -669,6 +670,18 @@
     const band = base === null || ratio === null
       ? null
       : { min: base * ratio.floor, max: base * ratio.ceil }
+    // 强平价（SPEC v10 US7）：用 payload 的现价当入场价，下单前就告诉玩家会从哪里被平。
+    // 1× 没有强平线（价格有底价，跌不到 0），显示「—」。这是纯展示：公式与宿主
+    // `liquidationPriceOf()` 相同，`test/trading-view.test.js` 的 drift 断言盯着两边。
+    const liquidationPrice = price === null || chosenLeverage <= 1
+      ? null
+      : chosenSide === 'long'
+        ? price * (1 - 1 / chosenLeverage)
+        : price * (1 + 1 / chosenLeverage)
+    const liquidationText = liquidationPrice === null
+      ? '强平价 —'
+      : '强平价 ' + formatPrice(liquidationPrice) + ' · ' +
+        (chosenSide === 'long' ? '跌到就平' : '涨到就平')
     const defaultTargetText = price === null ? '' : formatPrice(price)
     const rawTarget = typeof targetText === 'string' ? targetText.trim() : ''
     const effectiveTargetText = rawTarget === '' ? defaultTargetText : rawTarget
@@ -712,6 +725,9 @@
       hint,
       preview: preview.text,
       previewParts: preview,
+      // 下单前的强平价（US7）：数字给 drift 测试，文案给窗口。
+      liquidationPrice,
+      liquidationText,
       // 0 硬币时按钮本身就是「去种地」——盘口不给救济，这是唯一的下一步。
       submitLabel: coins.available <= 0 ? '去种地' : '开一手',
       limit: {

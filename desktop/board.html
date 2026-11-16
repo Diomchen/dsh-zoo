@@ -490,6 +490,14 @@
         line-height: 1.5;
         font-variant-numeric: tabular-nums;
       }
+      /* 下单前的强平价（SPEC v10 US7）：和预览句分两行，预览句的措辞是产品硬文案。 */
+      .liquidation {
+        margin: 0;
+        padding: 0 2px;
+        font-size: 11px;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
       .submit {
         width: 100%;
         padding: 11px 12px;
@@ -972,6 +980,7 @@
             </div>
           </div>
           <p class="preview" id="preview"></p>
+          <p class="liquidation" id="order-liquidation"></p>
           <button class="submit" id="submit" type="button">开一手</button>
           <p class="hint" id="order-hint"></p>
           <div class="orders-head">
