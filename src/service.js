@@ -4,7 +4,7 @@ import { hostname } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import shared from '../desktop/shared.js'
-import { createBackpackStore } from './backpack.js'
+import { createBackpackStore, normalizePacketNote } from './backpack.js'
 import {
   artFileName,
   buildCatalog,
@@ -92,7 +92,7 @@ import {
   isFreshPeerDigest,
   marketView
 } from './market.js'
-import { backpackErrorText, giftPrepareFailedText } from './gift-text.js'
+import { backpackErrorText, giftPrepareFailedText, packetErrorText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
   GIFT_RATE_PER_DAY,
@@ -102,6 +102,7 @@ import {
 import {
   MAX_GIFT_COUNT,
   MAX_GIFT_TOTAL_BYTES,
+  PACKET_TTL_MS,
   createGiftStore
 } from './gifts.js'
 import { createIdentity, defaultNickname } from './identity.js'
@@ -141,6 +142,8 @@ import {
   VISIT_MAX_MS,
   encodeGiftReceived,
   encodeHeartbeat,
+  encodePacketReturn,
+  encodePacketReturned,
   encodeVisitAck,
   encodeVisitDeny,
   encodeVisitRecall,
@@ -158,6 +161,8 @@ import {
   isPort,
   isVisitId,
   normalizeNickname,
+  normalizePacketContents,
+  PACKET_LIMITS,
   resolvePort
 } from './protocol.js'
 import { createRoom } from './room.js'
@@ -994,7 +999,7 @@ export function createService (ctx, options = {}) {
     // 礼物卡上的四个动作（ticket 23）：只认本地页面/桌面控件；UDP 永远走不到这里。
     // giftId 是协议里的 UUID，路径由宿主从礼物 store 取，渲染端/请求体都拿不到路径。
     if (action === 'gift-open' || action === 'gift-reveal' ||
-      action === 'gift-copy' || action === 'gift-discard') {
+      action === 'gift-copy' || action === 'gift-discard' || action === 'gift-claim') {
       return handleGiftAction(action, body?.giftId)
     }
 
@@ -4003,6 +4008,23 @@ export function createService (ctx, options = {}) {
         view.name = record.name
         view.size = record.size
       }
+      if (record.kind === 'packet') {
+        view.packet = {
+          coins: record.packet.coins,
+          crops: { ...record.packet.crops },
+          seeds: { ...record.packet.seeds }
+        }
+        // 卡片上要显示「20 硬币 · 小番茄 ×3」：作物名只有宿主有，渲染端不猜。
+        view.text = packetSummary(record.packet)
+        if (record.note !== undefined) view.note = record.note
+        view.status = record.claimedAt > 0
+          ? 'claimed'
+          : record.returnedAt > 0 ? 'returned' : 'received'
+        view.claimedAt = record.claimedAt ?? 0
+        view.returnedAt = record.returnedAt ?? 0
+        view.expiresAt = (record.receivedAt ?? 0) + PACKET_TTL_MS
+        delete view.path
+      }
       return view
     })
   }
@@ -4050,6 +4072,24 @@ export function createService (ctx, options = {}) {
     // 打开/显示/复制都需要磁盘记录：路径与正文从 store 来，没有记录就是“这件东西不在了”。
     if (record === null) return { ok: false, error: 'gift-not-found' }
 
+    // 拆红包（票 79）：不需要 Electron、不需要路径——钱和东西直接记进农场。
+    if (action === 'gift-claim') {
+      if (record.kind !== 'packet') return { ok: false, error: 'not-a-packet', notice: packetErrorText('not-a-packet') }
+      if (farm === null) return { ok: false, error: 'starting', notice: packetErrorText('starting') }
+      const claimed = await gifts.claimPacket(giftId, async ({ packet }) => creditPacket(packet))
+      if (!claimed.ok) {
+        return { ok: false, error: claimed.error, notice: packetErrorText(claimed.error) }
+      }
+      refreshFarmWindow()
+      return {
+        ok: true,
+        action,
+        giftId,
+        packet: claimed.gift.packet,
+        notice: '拆开红包：' + packetSummary(claimed.gift.packet) + ' 已经放进农场。'
+      }
+    }
+
     // 打开/显示/复制都需要 Electron 主进程：宿主进程自己没有 shell 与剪贴板。
     if (desktop === null) return { ok: false, error: 'open-failed' }
 
@@ -4093,6 +4133,116 @@ export function createService (ctx, options = {}) {
     return { ok: false, error: 'not-implemented', action }
   }
 
+  /** 红包内容的可读摘要：`20 硬币 · 小番茄 ×3 · 稻米种子 ×1`。 */
+  function packetSummary (packet) {
+    if (packet === null || typeof packet !== 'object') return '空红包'
+    const parts = []
+    if (packet.coins > 0) parts.push(packet.coins + ' 硬币')
+    for (const [cropId, qty] of Object.entries(packet.crops ?? {})) {
+      parts.push((CROPS[cropId]?.name ?? cropId) + ' ×' + qty)
+    }
+    for (const [cropId, qty] of Object.entries(packet.seeds ?? {})) {
+      parts.push((CROPS[cropId]?.name ?? cropId) + '种子 ×' + qty)
+    }
+    return parts.length === 0 ? '空红包' : parts.join(' · ')
+  }
+
+  /** 红包每日限额：一天最多寄 3 只，本地午夜重置。 */
+  const PACKET_DAILY_LIMIT = 3
+  const packetQuota = { day: localDayKey(Date.now()), count: 0 }
+
+  function packetQuotaLeft (now = Date.now()) {
+    const day = localDayKey(now)
+    if (packetQuota.day !== day) {
+      packetQuota.day = day
+      packetQuota.count = 0
+    }
+    return Math.max(0, PACKET_DAILY_LIMIT - packetQuota.count)
+  }
+
+  /** 把红包内容记进农场（拆开/退回共用）。上限由 farm 自己夹取。 */
+  async function creditPacket (packet) {
+    if (farm === null) return { ok: false, error: 'starting' }
+    if (packet.coins > 0) await farm.addCoins(packet.coins)
+    for (const [cropId, qty] of Object.entries(packet.crops ?? {})) {
+      await farm.addCrop(cropId, qty)
+    }
+    for (const [cropId, qty] of Object.entries(packet.seeds ?? {})) {
+      await farm.addSeed(cropId, qty)
+    }
+    return { ok: true }
+  }
+
+  /**
+   * 寄出前先从农场扣掉：红包里的东西是真的交出去了。
+   * 任何一步不够都原样退回已经扣过的部分，绝不留下「扣了一半」的状态。
+   */
+  async function debitPacket (packet) {
+    if (farm === null) return { ok: false, error: 'starting' }
+    const taken = { coins: 0, crops: {}, seeds: {} }
+    const rollback = async () => {
+      if (taken.coins > 0) await farm.addCoins(taken.coins)
+      for (const [cropId, qty] of Object.entries(taken.crops)) await farm.addCrop(cropId, qty)
+      for (const [cropId, qty] of Object.entries(taken.seeds)) await farm.addSeed(cropId, qty)
+    }
+    if (packet.coins > 0) {
+      const paid = await farm.spendCoins(packet.coins)
+      if (!paid.ok) return { ok: false, error: paid.error }
+      taken.coins = packet.coins
+    }
+    for (const [cropId, qty] of Object.entries(packet.crops ?? {})) {
+      const result = await farm.takeCropOf(cropId, qty)
+      if (!result.ok) {
+        await rollback()
+        return { ok: false, error: result.error }
+      }
+      taken.crops[cropId] = qty
+    }
+    for (const [cropId, qty] of Object.entries(packet.seeds ?? {})) {
+      const result = await farm.takeSeedOf(cropId, qty)
+      if (!result.ok) {
+        await rollback()
+        return { ok: false, error: result.error }
+      }
+      taken.seeds[cropId] = qty
+    }
+    return { ok: true }
+  }
+
+  /** 红包入背包：先扣账，再放进背包；放不进去就把东西退回农场。 */
+  async function handleBringPacket (input) {
+    if (farm === null) return { ok: false, error: 'starting', notice: packetErrorText('starting') }
+    const packet = normalizePacketContents(input.packet)
+    if (packet === null) {
+      return { ok: false, error: 'bad-gift', notice: backpackErrorText('bad-gift') }
+    }
+    const note = normalizePacketNote(input.note)
+    if (note === null) {
+      return { ok: false, error: 'bad-gift', notice: '祝福语最多 60 个字。' }
+    }
+    if (packetQuotaLeft() <= 0) {
+      return { ok: false, error: 'packet-daily-limit', notice: packetErrorText('packet-daily-limit') }
+    }
+    const debited = await debitPacket(packet)
+    if (!debited.ok) {
+      return { ok: false, error: debited.error, notice: packetErrorText(debited.error) }
+    }
+    const added = await backpack.add({ kind: 'packet', packet, ...(note === '' ? {} : { note }) })
+    if (!added.ok) {
+      await creditPacket(packet)
+      return { ok: false, error: added.error, notice: backpackErrorText(added.error) }
+    }
+    packetQuota.count += 1
+    refreshBringWindow()
+    return {
+      ok: true,
+      action: 'bring',
+      giftId: added.item.id,
+      count: added.count,
+      notice: '红包装进背包了：' + packetSummary(packet) + '。'
+    }
+  }
+
   /**
    * 背包动作（ticket 24）。
    *
@@ -4119,13 +4269,25 @@ export function createService (ctx, options = {}) {
       return { ok: true, action: 'bring', window: 'opened', count: backpack.count() }
     }
 
-    const added = await backpack.add(input)
+    const added = input.kind === 'packet'
+      ? await handleBringPacket(input)
+      : await backpack.add(input)
     if (!added.ok) {
-      return { ok: false, error: added.error, notice: backpackErrorText(added.error) }
+      return {
+        ok: false,
+        error: added.error,
+        notice: added.notice ?? backpackErrorText(added.error)
+      }
     }
     // 小窗正开着（HTTP/脚本放进来的情况）就刷新列表；关着时这条命令只是更新 helper 内存。
     refreshBringWindow()
-    return { ok: true, action: 'bring', giftId: added.item.id, count: added.count }
+    return {
+      ok: true,
+      action: 'bring',
+      giftId: added.item.id,
+      count: added.count,
+      ...(added.notice === undefined ? {} : { notice: added.notice })
+    }
   }
 
   /** 从背包撤掉一件。只有 idle 能撤；`out` 中的东西可能已经在对方磁盘上了。 */
@@ -4136,6 +4298,18 @@ export function createService (ctx, options = {}) {
     const removed = await backpack.remove(body?.giftId)
     if (!removed.ok) {
       return { ok: false, error: removed.error, notice: backpackErrorText(removed.error) }
+    }
+    // 红包里的东西在寄出前就已经从农场扣掉了：撤回来必须原样退回。
+    if (removed.item.kind === 'packet') {
+      await creditPacket(removed.item.packet)
+      refreshBringWindow()
+      return {
+        ok: true,
+        action: 'unbring',
+        giftId: removed.item.id,
+        count: removed.count,
+        notice: '红包撤回来了：' + packetSummary(removed.item.packet) + ' 已经退回农场。'
+      }
     }
     refreshBringWindow()
     return { ok: true, action: 'unbring', giftId: removed.item.id, count: removed.count }
@@ -4158,13 +4332,43 @@ export function createService (ctx, options = {}) {
    * 交给 helper 的背包快照：只带 id/kind/显示文案/state，**绝不带文件路径**。
    * 路径只活在宿主；小窗删一件只发 giftId。
    */
+  /** 「红包」页要用的东西：上限、今天还能寄几只、仓库/种子袋里现有的作物。 */
+  function packetWindowPayload () {    if (farm === null) return null
+    const view = farm.snapshot()
+    const rows = (stacks) => CROP_IDS
+      .map((id) => ({ id, name: CROPS[id].name, have: Number(stacks?.[id] ?? 0) }))
+      .filter((row) => row.have > 0)
+    return {
+      limits: { ...PACKET_LIMITS },
+      left: packetQuotaLeft(Date.now()),
+      coins: Number(view.coins ?? 0),
+      crops: rows(view.crops),
+      seeds: rows(view.seeds)
+    }
+  }
+
   function bringWindowPayload ({ open = false } = {}) {
     const items = backpack?.items() ?? []
     return {
       open: open === true,
-      items: items.map((item) => item.kind === 'file'
-        ? { id: item.id, kind: 'file', name: item.name, state: item.state }
-        : { id: item.id, kind: 'text', text: item.text, state: item.state })
+      items: items.map((item) => {
+        if (item.kind === 'file') {
+          return { id: item.id, kind: 'file', name: item.name, state: item.state }
+        }
+        if (item.kind === 'packet') {
+          const view = {
+            id: item.id,
+            kind: 'packet',
+            packet: { coins: item.packet.coins, crops: { ...item.packet.crops }, seeds: { ...item.packet.seeds } },
+            text: '红包 · ' + packetSummary(item.packet),
+            state: item.state
+          }
+          if (item.note !== undefined) view.note = item.note
+          return view
+        }
+        return { id: item.id, kind: 'text', text: item.text, state: item.state }
+      }),
+      packet: packetWindowPayload()
     }
   }
 
@@ -4423,6 +4627,12 @@ export function createService (ctx, options = {}) {
               // 礼物的送达回执（ticket 26）。**必须有这个分支**：落到下面的 else 会被
               // 当成 beacon 静默吞掉——不报错，只是礼物永远删不掉。
               handleGiftReceived(packet)
+            } else if (packet.type === 'packet-return') {
+              // 票 79：对方手里的红包过期没拆，原路退回。落盘/记账要 await，不能冒到 socket 循环。
+              void handlePacketReturn(packet)
+            } else if (packet.type === 'packet-returned') {
+              // 退回成功的 ack：对方已经收下，不用再重发。
+              clearPacketReturn(packet)
             } else if (packet.type === 'crop-catalog-request') {
               // 票 59：邻居的目录和我不一样，他要一份。
               answerCatalogRequest(packet)
@@ -5928,6 +6138,8 @@ export function createService (ctx, options = {}) {
         ticks.push(['农场', farm?.tick()])
         if (market !== null) ticks.push(['交易所', market.tick()])
         ticks.push(['季节', settleSeasonTick(seasonNow())])
+        // 红包（主线 1.6.5）：过期未领取的红包在 tick 里退休。
+        ticks.push(['红包', expirePackets(Date.now())])
         // 盘口（票 79）搭同一班车：60 秒一拍正好是 1 个 tick；收盘/换周后把新盘面推给窗口。
         if (trading !== null) ticks.push(['盘口', trading.tick().then(() => refreshTradingWindow())])
       } catch (error) {
@@ -6317,6 +6529,39 @@ export function createService (ctx, options = {}) {
     }
     if (gift.kind === 'text') return receiveTextGift(packet)
     if (gift.kind === 'file') return receiveFileGift(packet)
+    if (gift.kind === 'packet') return receivePacketGift(packet)
+  }
+
+  /**
+   * 红包（票 79）：只落盘，东西等收件人点「拆开」才进农场。
+   * 回执照旧——「收到了一个红包」和「红包已经拆开」是两件事。
+   */
+  async function receivePacketGift (packet) {
+    const gift = packet.gift
+    const saved = gifts === null
+      ? { ok: false, error: 'starting' }
+      : await gifts.receivePacket({
+        id: gift.id,
+        from: { deviceId: packet.deviceId, nickname: packet.nickname },
+        packet: gift.packet,
+        note: gift.note,
+        receivedAt: Date.now()
+      })
+    if (disposed) return
+    setGiftStatus(packet, saved.ok ? 'received' : 'failed', saved.ok ? null : 'write')
+    if (!saved.ok) {
+      warn(ctx, '红包没写进 gifts（' + saved.error + '）：卡片会显示“没取到”')
+      return
+    }
+    sendGiftReceipt(packet.deviceId, packet.visitId, gift.id)
+    notifyPacketArrived(saved.gift)
+  }
+
+  /** 收到红包时在桌面场景里亮一张卡（卡片本身来自 /state 的 gifts）。 */
+  function notifyPacketArrived (gift) {
+    if (gift === null || typeof gift !== 'object') return
+    log.info('收到「' + gift.from.nickname + '」的红包：' + packetSummary(gift.packet) +
+      '（24 小时内不拆会退回）')
   }
 
   /** 卡片状态只在这里改：状态变一次就让桌面场景跟上（签名里含 controls.gifts）。 */
@@ -6574,6 +6819,136 @@ export function createService (ctx, options = {}) {
       recall.attempts += 1
       recall.nextAt += recallRetryMs
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // ticket 79：红包的 24 小时退回
+  // -------------------------------------------------------------------------
+
+  /** 已经退回过的红包 id（发送端幂等：同一只红包只退一次）。 */
+  const returnedPackets = new Set()
+  /** 退回报文的重发队列：giftId → {deviceId, contents, note, attempts, nextAt, deadline}。 */
+  const packetReturns = new Map()
+
+  /**
+   * 扫一遍收到的红包：超过 24 小时还没拆的，把内容原路退回寄件人。
+   * **发不出去就不标记退回**——对方离线时下一轮 tick 还会再试，东西不会凭空消失。
+   */
+  async function expirePackets (now = Date.now()) {
+    if (gifts === null || disposed) return false
+    let touched = false
+    for (const record of gifts.list()) {
+      if (record.kind !== 'packet') continue
+      if (record.claimedAt > 0 || record.returnedAt > 0) continue
+      if (now < record.receivedAt + PACKET_TTL_MS) continue
+      if (packetReturns.has(record.id)) continue
+      const sent = sendPacketReturn(record)
+      if (!sent) {
+        // 对方此刻不可达：留到下一轮，不标记退回。
+        continue
+      }
+      const marked = await gifts.markReturned(record.id, now)
+      if (marked.ok) {
+        touched = true
+        log.info('红包超过 24 小时没拆，已经退回给「' + record.from.nickname + '」')
+      }
+    }
+    runPacketReturnRetries(now)
+    return touched
+  }
+
+  function sendPacketReturn (record) {
+    if (disposed || discovery === null || identity === null) return false
+    const entry = {
+      giftId: record.id,
+      deviceId: record.from.deviceId,
+      contents: {
+        coins: record.packet.coins,
+        crops: { ...record.packet.crops },
+        seeds: { ...record.packet.seeds }
+      },
+      note: record.note ?? '',
+      attempts: 1,
+      nextAt: Date.now() + receiptRetryMs,
+      deadline: Date.now() + receiptTimeoutMs
+    }
+    if (!sendPacketReturnPacket(entry)) return false
+    packetReturns.set(record.id, entry)
+    return true
+  }
+
+  function sendPacketReturnPacket (entry) {
+    if (disposed || discovery === null || identity === null) return false
+    try {
+      return discovery.sendTo(entry.deviceId, encodePacketReturn({
+        deviceId: identity.deviceId,
+        giftId: entry.giftId ?? entry.id,
+        contents: entry.contents,
+        note: entry.note
+      }))
+    } catch {
+      return false
+    }
+  }
+
+  function runPacketReturnRetries (now = Date.now()) {
+    if (packetReturns.size === 0) return
+    for (const [giftId, entry] of packetReturns) {
+      if (entry.attempts >= receiptAttempts || now >= entry.deadline) {
+        packetReturns.delete(giftId)
+        continue
+      }
+      if (now < entry.nextAt) continue
+      entry.giftId = giftId
+      if (!sendPacketReturnPacket(entry)) {
+        packetReturns.delete(giftId)
+        continue
+      }
+      entry.attempts += 1
+      entry.nextAt += receiptRetryMs
+    }
+  }
+
+  /**
+   * 收到退回的红包：内容记回农场，回一条 ack（对方据此停止重发）。
+   * 幂等靠 `returnedPackets`——同一只红包重复到达不会翻倍给。
+   */
+  async function handlePacketReturn (packet) {
+    const giftId = typeof packet?.giftId === 'string' ? packet.giftId.trim().toLowerCase() : ''
+    const contents = normalizePacketContents(packet?.contents)
+    if (!isVisitId(giftId) || contents === null) return false
+    if (returnedPackets.has(giftId)) return false
+    const credited = await creditPacket(contents)
+    if (!credited.ok) return false
+    returnedPackets.add(giftId)
+    if (returnedPackets.size > 200) {
+      const oldest = returnedPackets.values().next().value
+      if (oldest !== undefined) returnedPackets.delete(oldest)
+    }
+    log.info('红包退回来了：' + packetSummary(contents))
+    sendPacketReturned(packet.deviceId, giftId)
+    refreshBringWindow()
+    return true
+  }
+
+  function sendPacketReturned (deviceId, giftId) {
+    if (disposed || discovery === null || identity === null) return false
+    if (!isDeviceId(deviceId) || !isVisitId(giftId)) return false
+    try {
+      return discovery.sendTo(deviceId, encodePacketReturned({
+        deviceId: identity.deviceId,
+        giftId
+      }))
+    } catch {
+      return false
+    }
+  }
+
+  /** 对方确认收下退回的红包：停止重发。 */
+  function clearPacketReturn (packet) {
+    const giftId = typeof packet?.giftId === 'string' ? packet.giftId.trim().toLowerCase() : ''
+    if (!isVisitId(giftId)) return false
+    return packetReturns.delete(giftId)
   }
 
   // -------------------------------------------------------------------------

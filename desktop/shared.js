@@ -328,6 +328,8 @@
     'gift-reveal',
     'gift-copy',
     'gift-discard',
+    // ticket 79：红包卡上只有一个动作——拆开。内容和记账全在宿主，渲染端只发 giftId。
+    'gift-claim',
     // ticket 24：右键「带派」只发一个空动作，由宿主开小窗；unbring 才带 giftId。
     'bring',
     'unbring',
@@ -335,7 +337,7 @@
     ...FARM_ACTIONS
   ]
   /** 这几个动作必须带 giftId；其余动作带了也会被丢掉。`bring` 例外：它带的是待放物品。 */
-  const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'unbring']
+  const GIFT_ACTIONS = ['gift-open', 'gift-reveal', 'gift-copy', 'gift-discard', 'gift-claim', 'unbring']
   /** 菜单项的动作（ticket 22 / 24 / 32 / 40）：点播 / 重载 / 打开软件 / 带派 / 换皮 / 农场。同样只是一次「申请」。 */
   const MENU_ACTION_IDS = [
     'play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins', 'farm-open',
@@ -380,6 +382,11 @@
   const MAX_GIFT_FILE_BYTES = 16 * 1024 * 1024
   /** 文件礼物名字上限（码点），与 `src/protocol.js` 的 `MAX_GIFT_NAME` 同一个数。 */
   const MAX_GIFT_NAME_LENGTH = 120
+  /** 红包上限（票 79），与 `src/protocol.js` 的 `PACKET_LIMITS` 同一套数。 */
+  const MAX_PACKET_COINS = 200
+  const MAX_PACKET_STACK = 20
+  const MAX_PACKET_KINDS = 5
+  const MAX_PACKET_NOTE = 60
   /** 一次场景最多几件礼物（≤ 访客数）；上限只为让一条消息有界，不表达产品限额。 */
   const MAX_GIFT_ITEMS = 64
   /** 礼物的状态词表，与 `src/gift-text.js` 的 `GIFT_STATUSES` 同源；认不出的整张卡丢弃。 */
@@ -714,6 +721,41 @@
    * 「带派」小窗提交的物品（ticket 24）：`{kind:'text',text}` 或 `{kind:'file',path}`。
    * 文件路径只来自主进程的 `dialog.showOpenDialog`；宿主还会再 stat 一次。
    */
+  /**
+   * 红包内容（票 79）：`{coins, crops, seeds}`。
+   *
+   * 这一层只守形状和上限，**不查农场余额**——有没有那么多硬币/作物是宿主的事，
+   * 这里多判一次只会让两边规则各漂一套。
+   */
+  function normalizePacketContents (value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+    const coins = Number.isInteger(value.coins) && value.coins >= 0 ? Math.min(value.coins, MAX_PACKET_COINS) : 0
+    const stacks = (raw, max) => {
+      const out = {}
+      if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return out
+      let kinds = 0
+      for (const [id, qty] of Object.entries(raw)) {
+        if (kinds >= max) break
+        if (!/^[a-z][a-z0-9_-]{1,23}$/.test(id)) continue
+        if (!Number.isInteger(qty) || qty <= 0 || qty > MAX_PACKET_STACK) continue
+        out[id] = qty
+        kinds += 1
+      }
+      return out
+    }
+    const crops = stacks(value.crops, MAX_PACKET_KINDS)
+    const seeds = stacks(value.seeds, MAX_PACKET_KINDS)
+    if (coins === 0 && Object.keys(crops).length === 0 && Object.keys(seeds).length === 0) return null
+    return { coins, crops, seeds }
+  }
+
+  /** 红包的祝福语：和字条共用清洗，但上限只有 60 个字。 */
+  function normalizePacketNote (value) {
+    if (value === undefined || value === null) return ''
+    const text = normalizeNoteText(value, MAX_PACKET_NOTE)
+    return text === null ? null : text
+  }
+
   function normalizeBringGift (value) {
     if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
     if (value.kind === 'text') {
@@ -723,6 +765,13 @@
     if (value.kind === 'file') {
       const path = normalizePath(value.path)
       return path === null ? null : { kind: 'file', path }
+    }
+    if (value.kind === 'packet') {
+      const packet = normalizePacketContents(value.packet)
+      if (packet === null) return null
+      const note = normalizePacketNote(value.note)
+      if (note === null) return null
+      return { kind: 'packet', packet, ...(note === '' ? {} : { note }) }
     }
     return null
   }
@@ -742,7 +791,54 @@
       const name = normalizeText(raw.name, 'file', MAX_GIFT_NAME_LENGTH)
       return { id, kind: 'file', name, state }
     }
+    if (raw.kind === 'packet') {
+      const packet = normalizePacketContents(raw.packet)
+      if (packet === null) return null
+      const note = normalizePacketNote(raw.note)
+      if (note === null) return null
+      // 显示文案由宿主算好（含作物名），这里只做长度兜底；缺了就按形状拼一句。
+      const text = normalizeText(raw.text, '红包', MAX_LABEL_LENGTH * 3)
+      return { id, kind: 'packet', packet, text, ...(note === '' ? {} : { note }), state }
+    }
     return null
+  }
+
+  /**
+   * 红包编辑页的底数（票 79）：上限、今天还能寄几只、仓库/种子袋里现有的作物。
+   * 上限一律用 shared 自己的常量——宿主发什么都不放大可寄数量。
+   */
+  function normalizePacketSetup (raw) {
+    const rows = (list) => {
+      const out = []
+      if (!Array.isArray(list)) return out
+      for (const row of list) {
+        if (out.length >= CROP_IDS.length) break
+        if (row === null || typeof row !== 'object') continue
+        if (!/^[a-z][a-z0-9_-]{1,23}$/.test(String(row.id ?? ''))) continue
+        const have = Number(row.have)
+        if (!Number.isInteger(have) || have <= 0) continue
+        out.push({
+          id: row.id,
+          name: normalizeText(row.name, row.id, MAX_LABEL_LENGTH),
+          have: Math.min(have, MAX_FARM_STACK)
+        })
+      }
+      return out
+    }
+    const coins = Number(raw.coins)
+    const left = Number(raw.left)
+    return {
+      limits: {
+        maxCoins: MAX_PACKET_COINS,
+        maxPerCrop: MAX_PACKET_STACK,
+        maxKinds: MAX_PACKET_KINDS,
+        maxNoteChars: MAX_PACKET_NOTE
+      },
+      left: Number.isInteger(left) ? clampNumber(left, 0, 3) : 0,
+      coins: Number.isInteger(coins) ? clampNumber(coins, 0, MAX_FARM_COINS) : 0,
+      crops: rows(raw.crops),
+      seeds: rows(raw.seeds)
+    }
   }
 
   /**
@@ -759,13 +855,17 @@
         if (item !== null) items.push(item)
       }
     }
+    const packet = raw.packet !== null && typeof raw.packet === 'object' && !Array.isArray(raw.packet)
+      ? normalizePacketSetup(raw.packet)
+      : null
     return {
       open: raw.open === true,
       items,
       count: items.length,
       maxItems: MAX_BACKPACK_ITEMS,
       maxTextLength: MAX_GIFT_TEXT_LENGTH,
-      maxFileBytes: MAX_GIFT_FILE_BYTES
+      maxFileBytes: MAX_GIFT_FILE_BYTES,
+      ...(packet === null ? {} : { packet })
     }
   }
 
@@ -2424,7 +2524,9 @@
         if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
         const deviceId = normalizeId(candidate.deviceId)
         const giftId = normalizeGiftId(candidate.giftId)
-        const kind = candidate.kind === 'text' || candidate.kind === 'file' ? candidate.kind : null
+        const kind = candidate.kind === 'text' || candidate.kind === 'file' || candidate.kind === 'packet'
+          ? candidate.kind
+          : null
         if (deviceId === null || giftId === null || kind === null) continue
         if (seenGifts.has(giftId)) continue
         const status = typeof candidate.status === 'string' && GIFT_STATUSES.includes(candidate.status)
@@ -2458,6 +2560,30 @@
           continue
         }
         seenGifts.add(giftId)
+        // 红包卡（票 79）：内容只在未拆时展示；状态文字由宿主给（已拆/已退回…）。
+        if (kind === 'packet') {
+          const packet = normalizePacketContents(candidate.packet)
+          if (packet === null) {
+            seenGifts.delete(giftId)
+            continue
+          }
+          const note = normalizePacketNote(candidate.note) ?? ''
+          const expiresAt = Number(candidate.expiresAt)
+          const text = normalizeText(candidate.text, '红包', MAX_LABEL_LENGTH * 3)
+          controls.gifts.push({
+            deviceId,
+            giftId,
+            kind: 'packet',
+            status,
+            title,
+            text,
+            packet,
+            ...(note === '' ? {} : { note }),
+            ...(Number.isFinite(expiresAt) && expiresAt > 0 ? { expiresAt } : {}),
+            ...(statusText === null ? {} : { statusText })
+          })
+          continue
+        }
         // 正文只在该收到时出现；别的状态下即便宿主误发也不画。
         const text = status === 'received' ? normalizeNoteText(candidate.text) : null
         controls.gifts.push({

@@ -11,6 +11,32 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.6.7 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.7.md`](releases/1.6.7.md)。
+
+补上 1.6.6 漏掉的那一跳：宿主 `src/desktop.js` 的 `bringWindow` 白名单没转发
+`packet`，所以窗口拿到的仍是没有红包底数的命令。现在 `packet` 原样随命令下发，
+真窗口里能按自己有的作物/种子加减。
+
+同一版还修了 `package.json` 被写出 UTF-8 BOM、导致插件加载器严格 `JSON.parse`
+失败的问题，并加了 `test/package-json.test.js` 守住这一点。
+
+## 1.6.6 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.6.md`](releases/1.6.6.md)。
+
+修 1.6.5 红包页看不到作物/种子：宿主下发的 `packet` 底数在 helper 主进程组装
+`giftState` 时被削掉了，现在原样转发；旧宿主不发时窗口仍退回「字条」页。
+
+## 1.6.5 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.5.md`](releases/1.6.5.md)。
+
+带派新增**红包**：寄农场里的硬币/作物/种子，收件人点「拆开」才到账，24 小时没拆自动退回。
+协议多 `packet-return` / `packet-returned` 两个包类型，`farm.json` / `season.json` / `market.json`
+格式都没变；旧版本收到红包会当未知礼物退回，不会丢东西。
+
 ## 1.6.4 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.4.md`](releases/1.6.4.md)。代码只动桌面 helper 的输入兜底。

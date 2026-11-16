@@ -607,7 +607,10 @@ export function createDesktop (options = {}) {
     return sendHostCommand({
       type: 'bring-window',
       open: payload?.open === true,
-      items: Array.isArray(payload?.items) ? payload.items : []
+      items: Array.isArray(payload?.items) ? payload.items : [],
+      // 票 79：红包底数（硬币/作物/种子/今日剩余）也是宿主算好、窗口只读的，
+      // 漏在白名单外时窗口只会显示「宿主还没把红包底数据过来」。
+      packet: payload?.packet ?? null
     })
   }
 

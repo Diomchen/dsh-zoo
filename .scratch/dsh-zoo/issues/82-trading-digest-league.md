@@ -59,4 +59,4 @@
   扩 `test/trading-view.test.js`、`test/board-window.test.js`、`test/board-e2e.test.js`；
   `test/protocol.test.js` 的 `PACKET_TYPES` 精确数组与「任何报文都不含坐标」的遍历各加一条（加新类型的必然改动）。
 - **没做（留给票 83）**：`docs/protocol.md` 的 `trading-digest` 节与限额表、README/CONTEXT 的周榜词条、
-  ADR-0027 转 accepted、release notes；限价单。
+  ADR-0028 转 accepted、release notes；限价单。

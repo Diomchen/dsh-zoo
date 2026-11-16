@@ -46,3 +46,19 @@
 - 互联网/跨局域网行情、全球市场。
 - 24 小时 sparkline、做空/期货/订单簿。
 - 改变买种子价格或作物底价。
+
+## v9.1 追加：带派红包（ticket 79）
+
+**Problem.** 带派只能捎字条/文件，农场里的硬币、作物、种子没有“我送你一点”的动作。
+
+**Solution.** 礼物多一种 `kind:'packet'`，装 `{coins,crops,seeds}` + ≤60 字祝福语；
+寄出即扣、进背包，收件人点「拆开」才到账，24 小时没拆自动退回（对方离线就排队补退）。
+
+**Implementation decisions.**
+- 额度：硬币 ≤200、每种作物/种子 ≤20、作物和种子各 ≤5 种、每天 3 只；宿主与 helper 各校验一次。
+- 拆开是一次性的：先写 `claimedAt` 再发货，失败回滚；重放返回 `packet-claimed`。
+- 退回：`receivedAt + 24h` 由宿主定时器标记 `returnedAt`，发 `packet-return`；
+  对方回 `packet-returned` 才清重试表；两个新包类型都不进 `VISIT_TYPES`。
+- 拆到的内容直接进农场（不占背包格）。
+
+**Out of scope.** 拼手气/随机金额、口令红包、群抢、独立的红包历史页。
