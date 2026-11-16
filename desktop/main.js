@@ -2451,9 +2451,11 @@ function applyCommand (command) {
       return
     }
     case 'shot':
-      // 冒烟可以点名抓「带派」/农场小窗；主窗没就绪不影响那扇窗的截图。
-      if (command.window === 'bring' || command.window === 'farm') {
-        const target = command.window === 'bring' ? giftWin : farmWin
+      // 冒烟可以点名抓「带派」/农场/盘口小窗；主窗没就绪不影响那扇窗的截图。
+      if (command.window === 'bring' || command.window === 'farm' || command.window === 'board') {
+        const target = command.window === 'bring'
+          ? giftWin
+          : command.window === 'farm' ? farmWin : boardWin
         if (target === null || target.isDestroyed()) {
           writeEvent({
             type: 'error',
@@ -3079,7 +3081,10 @@ function reportError (code, error) {
 
 async function captureTo (filePath, id, target = 'main') {
   // 冒烟可以点名抓小窗：主窗与它们各自 capturePage，别把两扇窗的坐标混在一起。
-  const window = target === 'bring' ? giftWin : target === 'farm' ? farmWin : win
+  // `board` 与农场窗同一条路（评审 P1）：盘口开着才能抓，关着由命令分支回 not-ready。
+  const window = target === 'bring'
+    ? giftWin
+    : target === 'farm' ? farmWin : target === 'board' ? boardWin : win
   const image = await capturePage(window)
   if (image === null) {
     writeEvent({ type: 'error', id, code: 'shot-failed', message: 'capturePage failed' })

@@ -505,8 +505,9 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   **失焦不关窗**（macOS 中文输入法候选窗会抢焦点，和农场窗同一条取舍）。
 - ×、Esc 走窗口自己的 `dsh-zoo:board-close`；宿主只负责打开/刷新/显式 `close:true`。
   关窗后 host 继续每分钟撮合/结算，窗口不会因此停摆。
-- 截图：`shot` 的 `window:'board'` 抓这扇窗（`test/board-window.test.js` 覆盖命令/字段白名单，
-  真 Electron 冒烟目前只跑农场窗）。
+- 截图：`shot` 的 `window:'board'` 抓这扇窗，窗口没开时回 `not-ready`（辅助进程只报错、
+  不 crash）；`test/board-window.test.js` 覆盖命令/字段白名单与 `main.js` 的接线，
+  真 Electron 冒烟目前只跑农场窗。
 
 ## 多显示器 / 分辨率
 
