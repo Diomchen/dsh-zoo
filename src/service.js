@@ -67,12 +67,14 @@ import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './
 import { buildLeague, watcherCounts } from './trading-league.js'
 import {
   BOARD_CROPS,
+  BOARD_TIMEFRAMES,
   PRICE_CEIL_RATIO,
   PRICE_FLOOR_RATIO,
   TRADING_LEVERAGES,
   TRADING_MARGINS,
   boardPrice,
   barsFor,
+  barsForTimeframe,
   hintOf,
   markPrice,
   slotBounds
@@ -2140,6 +2142,27 @@ export function createService (ctx, options = {}) {
     return charts
   }
 
+  /**
+   * 四个周期的 K 线（票 84）：`15m` 直接复用上面那份（精确到 1 分钟，
+   * 也是窗口旧字段 `charts` 的那一份），`1h`/`1d`/`1w` 由同一条 `boardPrice()`
+   * 曲线按粗桶采样。四个周期一次算齐，窗口切周期只是本地换图，不再找宿主。
+   * 一包的上限是 4 周期 × 3 作物 ×（24 根 + 当前一根），和 `desktop/shared.js` 的白名单对上。
+   */
+  function tradingTimeframesView (now, charts) {
+    const timeframes = { '15m': charts }
+    for (const { id } of BOARD_TIMEFRAMES) {
+      // 15m 已经在上面复用；其余周期各采一份，算不出来（作物目录坏了）就跳过。
+      if (id === '15m') continue
+      const period = {}
+      for (const crop of BOARD_CROPS) {
+        const chart = barsForTimeframe({ crop, now, timeframe: id })
+        if (chart !== null) period[crop] = chart
+      }
+      timeframes[id] = period
+    }
+    return timeframes
+  }
+
   /** 风向（票 81）：慢趋势方向 + 55–68% 置信度。窗口只展示，必须写「不是保证」。 */
   function tradingHintView (now) {
     const hints = {}
@@ -2260,11 +2283,15 @@ export function createService (ctx, options = {}) {
       : trading.view({ now, historyLimit: TRADING_VIEW_HISTORY })
     const week = tradingWeekView(view)
     const self = tradingSelfDigest(view, week, now)
+    // 15 分钟那份图既留在 `charts`（旧窗口/旧测试认它），也是 `timeframes['15m']`：
+    // 同一份数据，不重复算，也不会两边出现细微差别。
+    const charts = tradingChartsView(now)
     return {
       coins: tradingCoinsView(view),
       week,
       bar: tradingBarView(now),
-      charts: tradingChartsView(now),
+      charts,
+      timeframes: tradingTimeframesView(now, charts),
       hint: tradingHintView(now),
       positions: newestFirst(view.positions, 'openedAt'),
       // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
@@ -2279,6 +2306,9 @@ export function createService (ctx, options = {}) {
         margins: TRADING_MARGINS.slice(),
         leverages: TRADING_LEVERAGES.slice(),
         crops: BOARD_CROPS.map((id) => ({ id, name: CROPS[id]?.name ?? id })),
+        // 票 84：周期清单只从 `src/trading-rules.js` 下发，窗口不硬编码
+        // 「15分/1时/1日/1周」——加周期只改规则层一处。
+        timeframes: BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })),
         historyLimit: TRADING_VIEW_HISTORY,
         // 票 83：窗口在预设之外多画一颗「全下」（金额 = 当前可用硬币）。
         // 旧宿主没有这个字段 → 窗口不画；保证金本身的校验由 store 按任意金额放行。
