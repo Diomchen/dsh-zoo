@@ -50,9 +50,10 @@ const SLOT_EDGE = 1763308800000
  * 只为了让「盘口包会不会被作物数撑爆」可测——真实目录是运行时数据，
  * 现场已经长到 15 种，测试里直接造 15 / 40 种更快也更稳。
  */
-function addSyntheticCrops (extra) {
+function addSyntheticCrops (count, from = 0) {
   const entries = []
-  for (let index = 0; index < extra; index += 1) {
+  for (let offset = 0; offset < count; offset += 1) {
+    const index = from + offset
     entries.push({
       id: 'synth' + String(index).padStart(2, '0'),
       name: '合成作物' + index,
@@ -746,7 +747,7 @@ test('评审 P1：40 手持仓按最新在前下发，总数不丢，最新一�
   assert.equal(after.ordersTotal, 3)
 })
 
-test('票 81/88：整份 payload 带目录全部作物 K 线 + 风向，并能穿过 helper 的白名单', async (t) => {
+test('票 81/88/90：payload 只带当前作物的 K 线 + 风向，穿过 helper 白名单不被削', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir)
   const clock = { value: SLOT_EDGE + 4 * TICK_MS }
@@ -764,39 +765,38 @@ test('票 81/88：整份 payload 带目录全部作物 K 线 + 风向，并能�
 
   const state = desktop.calls.board[0].state
   const crops = boardCrops()
-  // 票 88：目录里十种作物各一张图：24 根整根 + 当前一根（1 分钟 tick）。
+  // 票 90：按需包只带当前选中的那一种作物（目录第一个）：24 根整根 + 当前一根。
   // 15 分图只下发在 `timeframes['15m']`；旧的 `charts` 字段不再重复一份（payload 体积）。
   assert.equal('charts' in state, false)
-  assert.deepEqual(Object.keys(state.timeframes['15m']), crops)
-  for (const crop of crops) {
-    const chart = state.timeframes['15m'][crop]
-    assert.equal(chart.bars.length, 24, crop + ' 应该有 24 根')
+  assert.deepEqual(Object.keys(state.timeframes['15m']), [crops[0]])
+  const only = crops[0]
+  {
+    const chart = state.timeframes['15m'][only]
+    assert.equal(chart.bars.length, 24, only + ' 应该有 24 根')
     // 票 88 的传输形：一根是 7 个数字的数组 [slot, start, end, open, high, low, close]。
-    assert.equal(chart.bars[0].length, 7, crop + ' 的 K 线是紧凑数组')
+    assert.equal(chart.bars[0].length, 7, only + ' 的 K 线是紧凑数组')
     assert.equal(chart.current.slot, state.bar.slot)
     assert.equal(chart.current.tick, 4)
-    assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
+    assert.equal(chart.current.price, markPrice({ crop: only, now: clock.value }))
     assert.ok(chart.base > 0)
   }
-  // 风向：目录里每一种作物各一份，置信度落在 55–68%。
-  assert.deepEqual(Object.keys(state.hint), crops)
-  for (const crop of crops) {
-    assert.ok(['up', 'down', 'flat'].includes(state.hint[crop].direction))
-    assert.ok(state.hint[crop].confidence >= 0.55 && state.hint[crop].confidence <= 0.68)
-  }
-  // 票 79 的窗口还认 `payload.bar`：它是目录第一个作物的当前一根（票 88：顺序同目录）。
-  assert.equal(state.bar.crop, crops[0])
-  assert.equal(state.bar.price, state.timeframes['15m'][crops[0]].current.price)
+  // 风向：只带当前这一种，置信度落在 55–68%。
+  assert.deepEqual(Object.keys(state.hint), [only])
+  assert.ok(['up', 'down', 'flat'].includes(state.hint[only].direction))
+  assert.ok(state.hint[only].confidence >= 0.55 && state.hint[only].confidence <= 0.68)
+  // 票 79 的窗口还认 `payload.bar`：它和同一包里的图必须是同一种作物。
+  assert.equal(state.bar.crop, only)
+  assert.equal(state.bar.price, state.timeframes['15m'][only].current.price)
 
-  // 窗口拿到的是 helper 白名单之后的形状：charts/hint 不能被削掉（§9.4 的老坑）。
+  // 窗口拿到的是 helper 白名单之后的形状：timeframes/hint 不能被削掉（§9.4 的老坑）。
   const hop = shared.normalizeHostCommand({ type: 'board-window', open: false, state })
   assert.equal(hop.ok, true)
-  // 旧字段从 `timeframes['15m']` 补回；十种作物一张不少（白名单不再是 8）。
-  assert.deepEqual(Object.keys(hop.command.state.charts), crops)
-  assert.equal(hop.command.state.charts.tomato.bars.length, 24)
+  // 票 90：helper 不再把 `timeframes['15m']` 复制成 `charts`（那正是 308 KiB 的一半）。
+  assert.deepEqual(hop.command.state.charts, {})
+  assert.deepEqual(Object.keys(hop.command.state.timeframes['15m']), [only])
   // 紧凑数组在 helper 里还原成对象：窗口视图只认对象形。
-  const rawBar = state.timeframes['15m'].tomato.bars[0]
-  assert.deepEqual(hop.command.state.charts.tomato.bars[0], {
+  const rawBar = state.timeframes['15m'][only].bars[0]
+  assert.deepEqual(hop.command.state.timeframes['15m'][only].bars[0], {
     slot: rawBar[0],
     start: rawBar[1],
     end: rawBar[2],
@@ -805,20 +805,21 @@ test('票 81/88：整份 payload 带目录全部作物 K 线 + 风向，并能�
     low: rawBar[5],
     close: rawBar[6]
   })
-  assert.equal(hop.command.state.hint.tomato.confidence, state.hint.tomato.confidence)
-  assert.equal(hop.command.state.charts.tomato.current.tick, 4)
+  assert.equal(hop.command.state.hint[only].confidence, state.hint[only].confidence)
+  assert.equal(hop.command.state.timeframes['15m'][only].current.tick, 4)
 
   // 窗口的纯视图能直接吃这一包：K 线、图例、风向都画得出来。
   const board = boardView.boardView(hop.command.state, { now: clock.value })
   assert.equal(board.chart.hasChart, true)
   assert.equal(board.chart.geometry.bars.length, 24)
   assert.equal(board.chart.geometry.forming.slot, state.bar.slot)
-  assert.equal(board.chart.legend[0].text, hop.command.state.charts[crops[0]].base.toFixed(2))
+  assert.equal(board.chart.legend[0].text, hop.command.state.timeframes['15m'][only].base.toFixed(2))
   assert.equal(board.hint.note, '不是保证')
+  // 作物条仍然是完整目录（按需只省图，不省白名单）。
   assert.equal(board.crops.length, crops.length)
 })
 
-test('票 84：payload 带四周期 × 目录全部作物 K 线（含 start/end），穿过 helper 白名单不被削', async (t) => {
+test('票 84/90：payload 带当前作物的四周期 K 线（含 start/end），穿过 helper 白名单不被削', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir)
   const clock = { value: SLOT_EDGE + 4 * TICK_MS }
@@ -832,23 +833,27 @@ test('票 84：payload 带四周期 × 目录全部作物 K 线（含 start/end�
   await service.ready
   desktop.ready()
   await waitFor(() => desktop.calls.scenes.length > 0)
+  // 票 90：先切到番茄，四周期断言就都落在这一种作物上（按需包只带它）。
+  assert.equal((await callAction(service, { action: 'trading-charts', cropId: 'tomato' })).body.ok, true)
   assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
 
   const state = desktop.calls.board[0].state
   const ids = BOARD_TIMEFRAMES.map(({ id }) => id)
   const crops = boardCrops()
+  const only = 'tomato'
+  assert.ok(crops.includes(only))
   assert.deepEqual(Object.keys(state.timeframes), ids)
   for (const { id } of BOARD_TIMEFRAMES) {
-    assert.deepEqual(Object.keys(state.timeframes[id]), crops, id + ' 带目录全部作物')
-    for (const crop of crops) {
-      const chart = state.timeframes[id][crop]
-      assert.equal(chart.bars.length, 24, id + ' / ' + crop + ' 最近 24 根')
+    assert.deepEqual(Object.keys(state.timeframes[id]), [only], id + ' 只带当前作物')
+    {
+      const chart = state.timeframes[id][only]
+      assert.equal(chart.bars.length, 24, id + ' / ' + only + ' 最近 24 根')
       assert.ok(chart.current.start <= clock.value && clock.value < chart.current.end)
-      assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
+      assert.equal(chart.current.price, markPrice({ crop: only, now: clock.value }))
       for (const bar of chart.bars) {
         // 票 88：紧凑数组 [slot, start, end, open, high, low, close]；
         // 每根仍带真实的毫秒边界（窗口的时间标签靠它）。
-        assert.equal(bar.length, 7, id + ' / ' + crop + ' 的 bar 是紧凑数组')
+        assert.equal(bar.length, 7, id + ' / ' + only + ' 的 bar 是紧凑数组')
         assert.equal(Number.isInteger(bar[1]), true)
         assert.equal(Number.isInteger(bar[2]), true)
         assert.ok(bar[2] > bar[1])
@@ -858,14 +863,14 @@ test('票 84：payload 带四周期 × 目录全部作物 K 线（含 start/end�
       else assert.equal(chart.current.tick, null)
     }
   }
-  // 票 88：15 分图不再重复下发到 `charts`（payload 体积），helper 会从 timeframes 补回。
+  // 票 88/90：15 分图不再重复下发到 `charts`（payload 体积），helper 也不再补回来。
   assert.equal('charts' in state, false)
   // 桶对齐：1 时 = 纪元整点；1 日 = 本地 00:00；1 周 = 本地周一 00:00。
-  assert.equal(state.timeframes['1h'].tomato.current.start, Math.floor(clock.value / (60 * 60 * 1000)) * 60 * 60 * 1000)
+  assert.equal(state.timeframes['1h'][only].current.start, Math.floor(clock.value / (60 * 60 * 1000)) * 60 * 60 * 1000)
   const dayStart = new Date(clock.value)
   dayStart.setHours(0, 0, 0, 0)
-  assert.equal(state.timeframes['1d'].tomato.current.start, dayStart.getTime())
-  assert.equal(state.timeframes['1w'].tomato.current.start, weekStartOf(clock.value))
+  assert.equal(state.timeframes['1d'][only].current.start, dayStart.getTime())
+  assert.equal(state.timeframes['1w'][only].current.start, weekStartOf(clock.value))
   assert.deepEqual(state.limits.timeframes, BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })))
 
   // §9.4 的老坑：helper 白名单必须放行 timeframes、limits.timeframes 与每根的 start/end。
@@ -874,8 +879,8 @@ test('票 84：payload 带四周期 × 目录全部作物 K 线（含 start/end�
   assert.deepEqual(Object.keys(hop.command.state.timeframes), ids)
   assert.deepEqual(hop.command.state.limits.timeframes, state.limits.timeframes)
   for (const id of ids) {
-    const before = state.timeframes[id].tomato
-    const after = hop.command.state.timeframes[id].tomato
+    const before = state.timeframes[id][only]
+    const after = hop.command.state.timeframes[id][only]
     // 紧凑数组被还原成对象；字段一个不少（§9.4 的老坑）。
     const rawBar = before.bars[0]
     assert.deepEqual(after.bars[0], {
@@ -891,7 +896,7 @@ test('票 84：payload 带四周期 × 目录全部作物 K 线（含 start/end�
     assert.equal(after.current.end, before.current.end)
     assert.equal(after.current.tick, before.current.tick)
   }
-  assert.equal(hop.command.state.timeframes['1w'].tomato.current.tick, null)
+  assert.equal(hop.command.state.timeframes['1w'][only].current.tick, null)
 
   // 窗口纯视图：四个周期都画得出来；切周期只是本地换图。
   for (const id of ids) {
@@ -1047,7 +1052,7 @@ test('票 90：15 / 40 种作物目录下盘口包仍能编成一行（远低于
   assert.ok(openedLine.bytes < 128 * 1024, '开窗命令 ' + openedLine.bytes + ' B')
 
   // 40 种合成作物：把「作物目录继续长」这件事钉死（只有当前选择的作物会进包）。
-  addSyntheticCrops(25)
+  addSyntheticCrops(25, 5)
   assert.equal(boardCrops().length, 40)
   const forty = boardLineOf(service.tradingWindow())
   assert.notEqual(forty, null, '40 种作物的盘口包必须编得出来')
@@ -1253,16 +1258,25 @@ test('票 88：运行时新增作物上盘口、可下单、可出图；坏底�
   const crops = boardCrops()
   assert.ok(crops.includes('blueberry'))
   assert.ok(!crops.includes('bad-base'))
-  // limits.crops 与每个周期图的键都同目录顺序（10 内置 + 蓝莓 = 11）。
+  // limits.crops 是完整目录（10 内置 + 蓝莓 = 11）；图只带当前选中的一种（票 90）。
   assert.deepEqual(state.limits.crops.map((entry) => entry.id), crops)
   for (const { id } of BOARD_TIMEFRAMES) {
-    assert.deepEqual(Object.keys(state.timeframes[id]), crops, id + ' 带新作物')
+    assert.deepEqual(Object.keys(state.timeframes[id]), [crops[0]], id + ' 只带当前作物')
   }
-  assert.ok(state.timeframes['15m'].blueberry.base > 0)
-  assert.ok(state.hint.blueberry !== undefined)
+  // 切到新作物：按需动作给出它的四个周期与风向。
+  const blueberry = await callAction(service, { action: 'trading-charts', cropId: 'blueberry' })
+  assert.equal(blueberry.body.ok, true)
+  for (const { id } of BOARD_TIMEFRAMES) {
+    assert.deepEqual(Object.keys(blueberry.body.timeframes[id]), ['blueberry'], id + ' 带新作物')
+  }
+  assert.ok(blueberry.body.timeframes['15m'].blueberry.base > 0)
+  assert.equal(blueberry.body.hint.blueberry.direction !== undefined, true)
   // 坏底价作物：一张空图都不给，风向也没有。
   assert.equal('bad-base' in state.timeframes['15m'], false)
   assert.equal('bad-base' in state.hint, false)
+  const badCharts = await callAction(service, { action: 'trading-charts', cropId: 'bad-base' })
+  assert.equal(badCharts.body.ok, false)
+  assert.equal(badCharts.body.error, 'bad-crop')
 
   // 可下单：显式指定新作物也走得通（不传作物时默认用目录第一个，票 88 起是 pea）。
   const opened = await callAction(service, {
@@ -1272,6 +1286,7 @@ test('票 88：运行时新增作物上盘口、可下单、可出图；坏底�
   assert.equal(opened.body.position.crop, 'blueberry')
   const after = (await call(service, '/dsh-zoo/state')).body.trading
   assert.equal(after.positions[0].crop, 'blueberry')
+  // 选中的还是蓝莓（上面切过），所以下发的是它的图。
   assert.ok(after.timeframes['15m'].blueberry)
   // 坏底价作物下单被拒（价格算不出来）。
   const refused = await callAction(service, {
@@ -1345,7 +1360,7 @@ test('票 88：10 作物最坏 payload < 200 KiB（紧凑 K 线 + 不重复 15 �
   const payload = service.tradingWindow()
   assert.equal(payload.positions.length, 200)
   assert.equal(payload.history.length, 50)
-  assert.equal(Object.keys(payload.timeframes['15m']).length, 10)
+  assert.equal(Object.keys(payload.timeframes['15m']).length, 1, '票 90：一包只带当前作物')
 
   // 32 行周榜（本机 + 31 位邻居，每行 8 条持仓、昵称顶格）：榜不随作物数长，
   // 但它也是「最坏一包」的一部分，用真实的 buildLeague() 造，形状和宿主发的一致。
@@ -1382,13 +1397,14 @@ test('票 88：10 作物最坏 payload < 200 KiB（紧凑 K 线 + 不重复 15 �
   const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8')
   assert.ok(bytes < BOARD_PAYLOAD_BUDGET_BYTES,
     '盘口 payload ' + bytes + ' B 超过 ' + BOARD_PAYLOAD_BUDGET_BYTES + ' B 上限')
-  // helper 的白名单要原样收下这一包（200/50/32/10 都不截）。
+  // helper 的白名单要原样收下这一包（200/50/32 都不截；图只带当前作物）。
   const view = shared.normalizeBoardView(payload)
   assert.equal(view.positions.length, 200)
   assert.equal(view.history.length, 50)
   assert.equal(view.league.rows.length, 32)
-  assert.equal(Object.keys(view.timeframes['15m']).length, 10)
+  assert.equal(Object.keys(view.timeframes['15m']).length, 1)
   assert.equal('charts' in payload, false, '15 分图不重复下发')
+  assert.deepEqual(view.charts, {}, '票 90：不再从 timeframes 复制一份 charts')
 })
 
 test('票 82：payload 带真人周榜（只有自己 → 观望），并能穿过 helper 白名单', async (t) => {
@@ -1465,20 +1481,22 @@ test('票 81：一分钟一拍会把新的成形 K 线推到窗口（不用重�
   desktop.ready()
   await waitFor(() => desktop.calls.scenes.length > 0)
   assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+  // 票 90：按需包只带当前选中作物（默认目录第一个，不是番茄）。
+  const only = boardCrops()[0]
   const before = desktop.calls.board.at(-1)
   assert.equal(before.open, true)
-  assert.equal(before.state.timeframes['15m'].tomato.current.tick, 2)
+  assert.equal(before.state.timeframes['15m'][only].current.tick, 2)
 
   // 过一分钟：宿主 tick 一次，把 tick=3 的成形 K 线推给已经开着的窗。
   clock.value += TICK_MS
   await waitFor(() => {
     const pushed = desktop.calls.board.at(-1)
-    return pushed.open === false && pushed.state?.timeframes?.['15m']?.tomato?.current?.tick === 3
+    return pushed.open === false && pushed.state?.timeframes?.['15m']?.[only]?.current?.tick === 3
   })
   const pushed = desktop.calls.board.at(-1)
   assert.equal('close' in pushed, false, '刷新不能关窗')
-  assert.equal(pushed.state.bar.price, markPrice({ crop: boardCrops()[0], now: clock.value }))
-  assert.equal(pushed.state.timeframes['15m'].tomato.current.remainingMs, SLOT_MS - 3 * TICK_MS)
+  assert.equal(pushed.state.bar.price, markPrice({ crop: only, now: clock.value }))
+  assert.equal(pushed.state.timeframes['15m'][only].current.remainingMs, SLOT_MS - 3 * TICK_MS)
 })
 
 test('票 81：trading-set-stop 过白名单并到宿主（成败由票 80 的 store 决定）', async (t) => {
@@ -1699,6 +1717,12 @@ test('票 87 / 票 89：盘口版面上图带 + 下两列，图 720×198，手�
   assert.match(script, /cropTabsEl\.addEventListener\('keydown'/)
   assert.match(script, /'data-hollow': candle\.hollow/)
   assert.match(script, /ordersWrapEl\.hidden/)
+  // 票 90：按需拉图的接线（缓存 → 加载态 → trading-charts → 回执合并）都在渲染端。
+  assert.match(script, /view\.createChartCache\(\)/)
+  assert.match(script, /view\.chartsFor\(payload, chartCache, crop\)/)
+  assert.match(script, /action: 'trading-charts'/)
+  assert.match(script, /chartsLoading/)
+  assert.match(script, /chartsPending/)
   assert.doesNotMatch(script, /console\.log/)
 
   // 纯视图的尺寸与列归属是公开常量，Node 测试和窗口吃同一份。

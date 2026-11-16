@@ -321,10 +321,14 @@
       .map((crop) => crop.id)
   }
 
-  /** 选中的作物：白名单里有就用它，否则退回第一张图 / 第一个作物。 */
+  /** 选中的作物：显式选择 > 推包里带图的那一种 > 白名单里第一张有图的 > 第一个作物。 */
   function pickCrop (payload, crop) {
     const ids = cropIdsOf(payload)
     if (typeof crop === 'string' && ids.includes(crop)) return crop
+    // 票 90：按需包只带当前那一种作物的图。没有显式选择时（窗口刚打开/重开）要跟着
+    // 推包走——否则会默认白名单第一种，再去为一张宿主根本没发的图发 trading-charts。
+    const carried = chartsCropOf(payload)
+    if (carried !== null && ids.includes(carried)) return carried
     const charts = payload !== null && typeof payload === 'object' ? payload.charts : null
     if (charts !== null && typeof charts === 'object') {
       for (const id of ids) {
@@ -369,6 +373,174 @@
     if (charts === null) return null
     const chart = charts[crop]
     return chart !== null && typeof chart === 'object' ? chart : null
+  }
+
+  // ---------------------------------------------------------------------------
+  // 票 90：盘口图按需拉取（切作物先看本地缓存，没有再向宿主请求）
+  // ---------------------------------------------------------------------------
+
+  /** 窗口本地最多缓存几位作物的图：切回来不再发 IPC，也不至于把整份盘口都搬进内存。 */
+  const CHART_CACHE_LIMIT = 4
+
+  /**
+   * 推包里带的是哪一种作物的图（票 90）。
+   *
+   * 新宿主按需只发当前选中的那一种 → 返回它；老宿主的全量包（每种都有）返回 null：
+   * 分不清「只有一种」和「只有这一种能画」，所以不猜，交给 `hasCropCharts()` 逐个判断。
+   */
+  function chartsCropOf (payload) {
+    const charts = timeframeChartsOf(payload, CONTRACT_TIMEFRAME)
+    if (charts === null) return null
+    const keys = Object.keys(charts)
+    return keys.length === 1 ? keys[0] : null
+  }
+
+  /**
+   * 推包里有没有这一种作物的图（票 90）：新宿主按需包只有一种，老宿主每种都有。
+   * 只看 15 分块——四个周期是同一次生成的；缺的周期由视图画空态，不必整块重拉。
+   */
+  function hasCropCharts (payload, crop) {
+    if (typeof crop !== 'string' || crop === '') return false
+    const charts = timeframeChartsOf(payload, CONTRACT_TIMEFRAME)
+    if (charts === null) return false
+    const chart = charts[crop]
+    return chart !== null && typeof chart === 'object'
+  }
+
+  /**
+   * 从推包里挑出某一种作物的四个周期与风向（票 90）：`{ timeframes, hint }`。
+   * 推包里没有它就返回 null——窗口据此决定要不要发 `trading-charts`。
+   * 老宿主只有 `charts`（15 分）时，这里只会得到 15 分一块，其它周期由视图画空态。
+   */
+  function chartsFromPayload (payload, crop) {
+    if (!hasCropCharts(payload, crop)) return null
+    const source = payload !== null && typeof payload === 'object' && payload.timeframes !== null &&
+      typeof payload.timeframes === 'object'
+      ? payload.timeframes
+      : {}
+    const ids = Object.keys(source)
+    if (ids.length === 0) ids.push(CONTRACT_TIMEFRAME)
+    const timeframes = {}
+    for (const id of ids) {
+      const block = timeframeChartsOf(payload, id)
+      const chart = block === null ? null : block[crop]
+      if (chart === null || typeof chart !== 'object') continue
+      timeframes[id] = { [crop]: chart }
+    }
+    if (Object.keys(timeframes).length === 0) return null
+    const hints = payload !== null && typeof payload === 'object' ? payload.hint : null
+    const hint = {}
+    if (hints !== null && typeof hints === 'object' && hints[crop] !== null &&
+      typeof hints[crop] === 'object') {
+      hint[crop] = hints[crop]
+    }
+    return { timeframes, hint }
+  }
+
+  /**
+   * 最近看过的作物图缓存（票 90）：LRU，最多 `CHART_CACHE_LIMIT` 种。
+   * 值是 `{ timeframes, hint }`（与 `chartsFromPayload()` 同形）；`get` 会把它挪到
+   * 最近使用，切回刚看过的作物不需要再发 IPC。
+   */
+  function createChartCache (options = {}) {
+    const entries = new Map()
+    const requested = toNumber(options.limit)
+    const limit = requested === null ? CHART_CACHE_LIMIT : Math.max(1, Math.floor(requested))
+    return {
+      get (crop) {
+        if (typeof crop !== 'string' || !entries.has(crop)) return null
+        const value = entries.get(crop)
+        entries.delete(crop)
+        entries.set(crop, value)
+        return value
+      },
+      has (crop) {
+        return typeof crop === 'string' && entries.has(crop)
+      },
+      set (crop, charts) {
+        if (typeof crop !== 'string' || crop === '') return null
+        const value = charts !== null && typeof charts === 'object' ? charts : {}
+        entries.delete(crop)
+        entries.set(crop, value)
+        while (entries.size > limit) {
+          const oldest = entries.keys().next().value
+          if (oldest === undefined) break
+          entries.delete(oldest)
+        }
+        return value
+      },
+      size () {
+        return entries.size
+      }
+    }
+  }
+
+  /**
+   * 这一屏当前这一种作物该用的图（票 90）：本地缓存优先，其次推包本身。
+   *
+   * 返回 `{ crop, timeframes, hint, from }`：
+   *   - `from:'cache'`/`'payload'` → 直接画；
+   *   - `from:null` → 窗口显示「正在加载」并提交 `trading-charts { cropId }`。
+   * 从推包取到时会顺手进缓存（同一包不重复搬），缓存命中后不会再发第二次请求。
+   */
+  function chartsFor (payload, cache, crop) {
+    if (typeof crop !== 'string' || crop === '') {
+      return { crop, timeframes: null, hint: null, from: null }
+    }
+    if (cache !== null && typeof cache === 'object' && typeof cache.get === 'function') {
+      const cached = cache.get(crop)
+      if (cached !== null && typeof cached === 'object' && cached.timeframes !== null &&
+        typeof cached.timeframes === 'object') {
+        return { crop, timeframes: cached.timeframes, hint: cached.hint ?? null, from: 'cache' }
+      }
+    }
+    const fromPayload = chartsFromPayload(payload, crop)
+    if (fromPayload === null) return { crop, timeframes: null, hint: null, from: null }
+    if (cache !== null && typeof cache === 'object' && typeof cache.set === 'function') {
+      cache.set(crop, fromPayload)
+    }
+    return { crop, timeframes: fromPayload.timeframes, hint: fromPayload.hint, from: 'payload' }
+  }
+
+  /**
+   * 把按需拉来的图并进本地 payload（票 90）：只加/替换这一种作物的
+   * `timeframes[*][crop]` 与 `hint[crop]`，钱、持仓、榜、别的作物一概不动。
+   *
+   * 不直接改 `payload`（宿主推来的那份还要当倒计时基线/下一包合并的底），
+   * 坏回执原样返回 payload——窗口宁可停在空态，也不拿半截图去画。
+   */
+  function withCropCharts (payload, charts) {
+    if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return null
+    if (charts === null || typeof charts !== 'object') return payload
+    const crop = typeof charts.crop === 'string' && charts.crop !== '' ? charts.crop : null
+    const blocks = charts.timeframes
+    if (crop === null || blocks === null || typeof blocks !== 'object') return payload
+    const timeframes = payload.timeframes !== null && typeof payload.timeframes === 'object'
+      ? { ...payload.timeframes }
+      : {}
+    let changed = false
+    for (const id of Object.keys(blocks)) {
+      const block = blocks[id]
+      if (block === null || typeof block !== 'object' || Array.isArray(block)) continue
+      const chart = block[crop]
+      if (chart === null || typeof chart !== 'object') continue
+      const target = timeframes[id] !== null && typeof timeframes[id] === 'object'
+        ? { ...timeframes[id] }
+        : {}
+      target[crop] = chart
+      timeframes[id] = target
+      changed = true
+    }
+    if (!changed) return payload
+    const next = { ...payload, timeframes }
+    const hintEntry = charts.hint !== null && typeof charts.hint === 'object' ? charts.hint[crop] : null
+    if (hintEntry !== null && typeof hintEntry === 'object') {
+      next.hint = {
+        ...(payload.hint !== null && typeof payload.hint === 'object' ? payload.hint : {}),
+        [crop]: hintEntry
+      }
+    }
+    return next
   }
 
   /** 周期页签：`active` = 当前这一档；`disabled` = 宿主根本没发这个周期的图（旧包只有 15 分）。 */
@@ -463,11 +635,15 @@
       ? payload.bar
       : null
     const coins = coinsOf(payload)
+    // 票 90：`bar` 只描述一种作物（新宿主的按需包里就是当前选择）。切到另一种、图还没到时
+    // 不能拿它的价格冒充——价格显示「—」；倒计时仍按同一根走（bar 的 end 是全局的）。
+    const barCrop = bar !== null && typeof bar.crop === 'string' ? bar.crop : null
+    const barPrice = bar !== null && (barCrop === null || barCrop === selected) ? bar : null
     const price = current === null
-      ? (bar === null ? null : toNumber(bar.price))
+      ? (barPrice === null ? null : toNumber(barPrice.price))
       : toNumber(current.price)
     const open = current === null
-      ? (bar === null ? null : toNumber(bar.open))
+      ? (barPrice === null ? null : toNumber(barPrice.open))
       : toNumber(current.open)
     const slot = current === null
       ? (bar === null ? null : toNumber(bar.slot))
@@ -1067,7 +1243,8 @@
     crop = null,
     timeframe = CONTRACT_TIMEFRAME,
     width = CHART_WIDTH,
-    height = CHART_HEIGHT
+    height = CHART_HEIGHT,
+    loading = false
   } = {}) {
     const selected = pickCrop(payload, crop)
     const period = pickTimeframe(payload, timeframe)
@@ -1104,8 +1281,10 @@
       timeframeLabel: label,
       timeframes: timeframesView(payload, period),
       hasChart: geometry !== null,
+      // 票 90：切到还没拉图的作物时画「正在加载」，和「宿主没发/坏了」区分开。
+      loading: loading === true && geometry === null,
       // 票 89：空态一行；「K 线一分钟才动一格」这类解释不再挂在窗口上。
-      emptyText: '行情还在算',
+      emptyText: loading === true && geometry === null ? '正在加载这张图…' : '行情还在算',
       base: chartBaseOf(payload, selected, period),
       baseText: formatPrice(chartBaseOf(payload, selected, period)),
       priceText: formatPrice(current === null ? null : current.price),
@@ -1584,6 +1763,7 @@
     limitOpen = false,
     targetText = '',
     allIn = false,
+    chartsLoading = false,
     width = CHART_WIDTH,
     height = CHART_HEIGHT
   } = {}) {
@@ -1608,7 +1788,7 @@
       hint: hintView(safe, selected),
       crops,
       cropStrip,
-      chart: chartView(safe, { crop: selected, timeframe, width, height }),
+      chart: chartView(safe, { crop: selected, timeframe, width, height, loading: chartsLoading === true }),
       order,
       orders,
       ordersMetaText: listMetaText('挂单', orders.length, safe === null ? null : safe.ordersTotal),
@@ -1627,6 +1807,7 @@
     CHART_HEIGHT,
     CHART_PADDING,
     CHART_AXIS_PADDING,
+    CHART_CACHE_LIMIT,
     CROP_STRIP_VISIBLE,
     LAYOUT,
     SKETCH,
@@ -1662,6 +1843,12 @@
     emptyHints,
     cropsView,
     cropStripView,
+    chartsCropOf,
+    hasCropCharts,
+    chartsFromPayload,
+    createChartCache,
+    chartsFor,
+    withCropCharts,
     boardView
   }
 })

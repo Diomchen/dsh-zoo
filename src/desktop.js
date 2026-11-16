@@ -135,6 +135,12 @@ export function createDesktop (options = {}) {
   let boardWindowOpen = false
   let lastError = null
   let helperErrors = 0
+  /**
+   * 最近一条命令为什么没写进管道（票 90）：`{ type, reason, bytes?, limit?, detail? }`。
+   * 宿主要靠它分清「包太大」和「白名单/形状坏了」——以前只拿到 false，
+   * 于是盘口把编码失败误报成「桌面层没在运行」。
+   */
+  let lastCommandFailure = null
   let restartTimer = null
   let pingTimer = null
   let watchdogTimer = null
@@ -409,14 +415,32 @@ export function createDesktop (options = {}) {
   // -------------------------------------------------------------------------
 
   function send (command) {
-    if (child === null || child.stdin === null || child.stdin === undefined) return false
-    if (child.stdin.destroyed === true) return false
-    const line = shared.encodeMessage(command)
-    if (line === null) return false
+    const type = typeof command?.type === 'string' ? command.type : null
+    if (child === null || child.stdin === null || child.stdin === undefined) {
+      lastCommandFailure = { type, reason: 'no-pipe' }
+      return false
+    }
+    if (child.stdin.destroyed === true) {
+      lastCommandFailure = { type, reason: 'no-pipe' }
+      return false
+    }
+    const encoded = shared.encodeMessageDetail(command)
+    if (encoded.ok !== true) {
+      // 尺寸/形状分开记：`size` 才值得提醒「盘口数据可能太大」。
+      lastCommandFailure = {
+        type,
+        reason: encoded.reason,
+        bytes: encoded.bytes,
+        limit: encoded.limit
+      }
+      return false
+    }
     try {
-      child.stdin.write(line)
+      child.stdin.write(encoded.line)
+      lastCommandFailure = null
       return true
-    } catch {
+    } catch (error) {
+      lastCommandFailure = { type, reason: 'write', detail: messageOf(error) }
       return false
     }
   }
@@ -570,12 +594,29 @@ export function createDesktop (options = {}) {
    */
   function sendHostCommand (command) {
     const normalized = shared.normalizeHostCommand(command, { debug })
-    if (normalized.ok !== true) return false
-    try {
-      return send(normalized.command)
-    } catch {
+    if (normalized.ok !== true) {
+      lastCommandFailure = {
+        type: typeof command?.type === 'string' ? command.type : null,
+        reason: 'whitelist',
+        detail: normalized.error
+      }
       return false
     }
+    try {
+      return send(normalized.command)
+    } catch (error) {
+      lastCommandFailure = {
+        type: typeof command?.type === 'string' ? command.type : null,
+        reason: 'write',
+        detail: messageOf(error)
+      }
+      return false
+    }
+  }
+
+  /** 最近一条命令被拒的原因（票 90）：`null` = 上一条成功写进管道。 */
+  function lastCommandFailureOf () {
+    return lastCommandFailure
   }
 
   /**
@@ -682,13 +723,22 @@ export function createDesktop (options = {}) {
   function actionResult (id, result = {}) {
     try {
       if (typeof id !== 'string' || id.trim() === '' || id.length > shared.MAX_ID_LENGTH) return false
-      return send({
+      const reply = {
         type: 'action-result',
         id,
         ok: result !== null && typeof result === 'object' && result.ok === true,
         notice: typeof result?.notice === 'string' ? result.notice : null,
         error: typeof result?.error === 'string' ? result.error : null
-      })
+      }
+      // 票 90：盘口窗按需拉图的回执把图一起带回去。形状由 helper 的
+      // `normalizeHostCommand(action-result)` 再白名单一遍，这里只负责原样递过去。
+      if (typeof result?.action === 'string') reply.action = result.action
+      if (typeof result?.crop === 'string') reply.crop = result.crop
+      if (result?.timeframes !== null && typeof result?.timeframes === 'object') {
+        reply.timeframes = result.timeframes
+      }
+      if (result?.hint !== null && typeof result?.hint === 'object') reply.hint = result.hint
+      return send(reply)
     } catch {
       return false
     }
@@ -849,6 +899,7 @@ export function createDesktop (options = {}) {
     farmWindow,
     boardWindow,
     actionResult,
+    lastCommandFailure: lastCommandFailureOf,
     shot,
     requestStatus,
     status,
