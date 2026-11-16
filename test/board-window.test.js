@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -963,4 +963,13 @@ test('票 83：到价挂单/撤单穿过 helper 白名单到宿主；payload 带
   })
   assert.equal(refused.status, 409)
   assert.equal(refused.body.error, 'bad-target')
+})
+
+test('评审 P1：shot 命令支持盘口窗（关着回 not-ready，不误拍主窗）', async () => {
+  // helper 需要 Electron 才能真跑，这里盯源码接线：`board` 必须落到 boardWin，
+  // 且命令分支把它和 bring/farm 放在同一组（关窗走统一的 not-ready）。
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  assert.match(main, /command\.window === 'board'/)
+  assert.match(main, /target === 'board' \? boardWin/)
+  assert.match(main, /command\.window === 'bring' \|\| command\.window === 'farm' \|\| command\.window === 'board'/)
 })
