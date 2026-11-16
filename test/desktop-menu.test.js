@@ -4,6 +4,7 @@
  * 渲染端只负责画——所有"能出现什么"的判断都在这里，所以这一层必须能单测。
  */
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
@@ -184,4 +185,22 @@ test('petScene：换皮时把当前那张皮的目录带下去', () => {
   const scene = shared.petScene([], { width: 800, height: 600 }, { assetRoots: ['/skins/cat'] })
   assert.deepEqual(scene.assetRoots, ['/skins/cat'])
   assert.equal(shared.petScene([], { width: 800, height: 600 }).assetRoots, null)
+})
+
+test('菜单：工具项申请表覆盖除 home 外的全部 id，动作都在白名单里', () => {
+  const ids = shared.MENU_TOOL_IDS.filter((id) => id !== 'home')
+  assert.deepEqual(Object.keys(shared.MENU_TOOL_REQUESTS), ids)
+  for (const [id, action] of Object.entries(shared.MENU_TOOL_REQUESTS)) {
+    assert.equal(shared.MENU_ACTION_IDS.includes(action), true, id + ' → ' + action)
+    assert.equal(shared.DESKTOP_ACTIONS.includes(action), true, id + ' → ' + action)
+  }
+  assert.equal(shared.MENU_TOOL_REQUESTS.trading, 'trading-open')
+  assert.equal(shared.MENU_TOOL_REQUESTS.farm, 'farm-open')
+  assert.equal('home' in shared.MENU_TOOL_REQUESTS, false, 'home 只在本机处理')
+})
+
+test('菜单：渲染端 runMenuTool 查同一张表，不再手写 id 链', async () => {
+  const source = await readFile(new URL('../desktop/renderer.js', import.meta.url), 'utf8')
+  assert.match(source, /shared\.MENU_TOOL_REQUESTS\[id\]/)
+  assert.doesNotMatch(source, /id === 'reload' \|\| id === 'open-site'/)
 })

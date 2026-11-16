@@ -1132,14 +1132,10 @@
       if (pet !== undefined) homePet(pet)
       return
     }
-    // 「带派」只发一个空动作（ticket 24）：开窗与背包内容全由宿主决定，渲染端不碰输入。
-    // 「农场」（ticket 40/46）：同样是空申请；开/关由宿主按小窗的真实状态切换。
-    // 「盘口」（票 79）：同上——开/关与整份视图都在宿主，渲染端只发一个空申请。
-    // 扫描外观（ticket 37）：和「重载配置」一样只是一次申请，扫与写全在宿主那边。
-    if (id === 'reload' || id === 'open-site' || id === 'bring' || id === 'scan-skins' ||
-      id === 'farm' || id === 'trading') {
-      requestAction(id === 'farm' ? 'farm-open' : id === 'trading' ? 'trading-open' : id)
-    }
+    // 工具项 → 宿主申请只有 shared.js 的那一张表（评审 P2）：带派/农场/盘口/扫描外观
+    // 都只是一次空申请，开窗、扫描与写入全在宿主那边；home 只走上面的本机分支。
+    const action = shared.MENU_TOOL_REQUESTS[id]
+    if (typeof action === 'string') requestAction(action)
   }
 
   /** 「回到初始位置」：只动这一只，回到它自己的出生点。不牵连访客，也不用全场景 reset。 */
