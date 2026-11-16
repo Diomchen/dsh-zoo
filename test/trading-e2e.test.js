@@ -292,8 +292,10 @@ test('票 82 e2e（评审 P0）：浮盈超出线上展示上限仍出现在邻�
           leverage: 20,
           // 入场价故意远离现价：真实浮盈约 2e9，远超协议上限。
           entry: 0.05,
-          openedAt: now,
-          slot: slotIndexAt(now),
+          // openedAt 放到一分钟后：即使用例刚好卡在 15 分钟边界，仓位也仍属于
+          // 「当前或下一根」，不会在 load 时被当成收盘仓位结掉（避免边界抖动）。
+          openedAt: now + 60 * 1000,
+          slot: slotIndexAt(now + 60 * 1000),
           stopLoss: 0
         }],
         orders: [],
