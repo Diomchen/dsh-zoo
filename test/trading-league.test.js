@@ -158,7 +158,7 @@ test('票 82：坏邻居行整行丢掉，不抛；重复 deviceId 只留一行'
       [],
       { ...peer(), weekPnl: 'lots' },
       { ...peer(), weekPnl: Number.NEGATIVE_INFINITY },
-      { ...peer(), positions: [{ crop: 'strawberry', side: 'long', leverage: 1 }] },
+      { ...peer(), positions: [{ crop: 'dragonfruit', side: 'long', leverage: 1 }] },
       { ...peer(), positions: 'none' },
       { ...peer(), positions: [{ crop: 'tomato', side: 'up', leverage: 1 }] },
       { ...peer(), deviceId: '' }

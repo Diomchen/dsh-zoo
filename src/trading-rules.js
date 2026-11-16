@@ -18,7 +18,7 @@
  * 曲线决定，不另算一套行情。
  */
 
-import { CROPS } from './farm-rules.js'
+import { CROP_IDS, CROPS } from './farm-rules.js'
 
 /** 一根 = 15 分钟 = 1 个 slot；一根里有 15 个 1 分钟 tick。 */
 export const SLOT_MS = 15 * 60 * 1000
@@ -46,13 +46,9 @@ export const PRICE_CEIL_RATIO = 1.75
  * 票 79 只做一个作物、两档保证金；票 80 补齐杠杆与止损档；票 83 加到三档 + 全下。
  * 这几个数组是**下单/设止损的白名单**，也是窗口按钮的唯一来源
  * （宿主随 payload 下发，窗口不复制一份，省掉 drift 测试）。
- * 票 80 加 5×/20×，票 81 加三个作物，票 83 加 250——只改这里。
- * 「全下」不在这张表里：金额 = 可用硬币，窗口多画一颗按钮，`isMarginAmount` 放行任意整数。
- *
- * 三作物的顺序就是窗口页签与 payload 的顺序（tomato 是第一根 `payload.bar` 的来源）；
- * 底价差得开（5 / 6 / 30），切页签时曲线形状一眼能分辨。
+ * 票 83 加 250；作物不在这张表里——票 88 起盘口清单跟随运行时目录（见 `boardCrops()`）。
+ * 「全下」也不在这张表里：金额 = 可用硬币，窗口多画一颗按钮，`isMarginAmount` 放行任意整数。
  */
-export const BOARD_CROPS = Object.freeze(['tomato', 'carrot', 'pumpkin'])
 export const TRADING_MARGINS = Object.freeze([50, 100, 250])
 /** 1× / 5× / 20×（SPEC v10「交易与结算」）；1× 没有强平。 */
 export const TRADING_LEVERAGES = Object.freeze([1, 5, 20])
@@ -200,6 +196,24 @@ function baseOf (crop) {
   if (typeof crop !== 'string') return null
   const base = finiteNumber(CROPS[crop]?.base)
   return base === null || base <= 0 ? null : base
+}
+
+/**
+ * 盘口作物 = 当前目录里有有效底价的全部作物，顺序**同目录**（票 88 / ADR-0031）。
+ *
+ * 为什么不再写死三个：`CROPS` 是运行时目录（`applyCropCatalog()` / LAN 同步都会原地改），
+ * 写死的清单会让新作物永远上不了盘口、下单与 `trading-digest` 也拒掉它。这里每次
+ * 按 `CROP_IDS` 现算，调用点不需要跟着改；底价坏掉的作物跳过——价格算不出来，
+ * 画到盘口上只会是一张空图（与 `baseOf()` 同一条口径）。
+ *
+ * 返回新数组（不是目录本身）：调用方可能切片/映射，别让人顺手改到 `CROP_IDS`。
+ */
+export function boardCrops () {
+  const crops = []
+  for (const id of CROP_IDS) {
+    if (baseOf(id) !== null) crops.push(id)
+  }
+  return crops
 }
 
 /**
@@ -537,8 +551,13 @@ export function hintOf ({ crop, now } = {}) {
   return { direction, confidence }
 }
 
+/**
+ * 盘口作物白名单（票 88）：只认 `boardCrops()` 里的 id——未知作物与坏底价作物
+ * 都返回 false。`trading-digest` 的 `positions[].crop` 与下单都用它：
+ * 清单只有一份（运行时目录），协议、store、窗口不会各认各的。
+ */
 export function isBoardCrop (value) {
-  return typeof value === 'string' && BOARD_CROPS.includes(value)
+  return typeof value === 'string' && boardCrops().includes(value)
 }
 
 export function isBoardSide (value) {
