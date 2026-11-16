@@ -66,6 +66,29 @@ test('encodeMessage/parseLine：只接受对象，超长拒发，坏 JSON 不抛
   assert.equal(shared.parseLine('not json').ok, false)
 })
 
+test('票 90：encodeMessageDetail 说明「为什么没编出来」——尺寸还是形状', () => {
+  const ok = shared.encodeMessageDetail({ type: 'ping' })
+  assert.equal(ok.ok, true)
+  assert.equal(ok.line, '{"type":"ping"}\n')
+  assert.equal(ok.bytes, Buffer.byteLength(ok.line, 'utf8'))
+
+  // 超长：报尺寸与上限，调用方才能留一条「308 KiB > 256 KiB」的诊断。
+  const big = shared.encodeMessageDetail({ type: 'x'.repeat(shared.MAX_LINE_LENGTH) })
+  assert.equal(big.ok, false)
+  assert.equal(big.reason, 'size')
+  assert.equal(big.limit, shared.MAX_LINE_LENGTH)
+  assert.ok(big.bytes > shared.MAX_LINE_LENGTH, 'bytes=' + big.bytes)
+
+  // 形状坏：不是尺寸问题，不能被诊断说成「数据太大」。
+  assert.equal(shared.encodeMessageDetail(null).reason, 'not-object')
+  assert.equal(shared.encodeMessageDetail(undefined).reason, 'not-object')
+  const cyclic = { type: 'ping' }
+  cyclic.self = cyclic
+  assert.equal(shared.encodeMessageDetail(cyclic).reason, 'bad-json')
+  // 老入口行为不变：编不出来就是 null。
+  assert.equal(shared.encodeMessage({ type: 'x'.repeat(shared.MAX_LINE_LENGTH) }), null)
+})
+
 // ---------------------------------------------------------------------------
 // 场景 / 协议归一化
 // ---------------------------------------------------------------------------
@@ -254,6 +277,51 @@ test('宿主命令 action-result：id 必填，notice 截断到可显示长度',
     notice: '坏'.repeat(shared.MAX_NOTICE_LENGTH + 50)
   })
   assert.equal(long.command.notice.length, shared.MAX_NOTICE_LENGTH)
+})
+
+test('票 90：action-result 放行按需拉图的回执（action/crop/timeframes/hint）', () => {
+  const bar = (slot) => [slot, slot * 900000, (slot + 1) * 900000, 5, 5.2, 4.9, 5.1]
+  const reply = shared.normalizeHostCommand({
+    type: 'action-result',
+    id: 'board-charts-1',
+    ok: true,
+    notice: '番茄的图来了。',
+    action: 'trading-charts',
+    crop: 'tomato',
+    timeframes: {
+      '15m': { tomato: { base: 5, bars: [bar(1)], current: null } },
+      '1h': { tomato: { base: 5, bars: [bar(1)], current: null } },
+      '1d': { tomato: { base: 5, bars: [bar(1)], current: null } },
+      '1w': { tomato: { base: 5, bars: [bar(1)], current: null } },
+      secret: { tomato: { base: 5, bars: [bar(1)], current: null } }
+    },
+    hint: { tomato: { direction: 'up', confidence: 0.62 } },
+    coin: 999
+  })
+  assert.equal(reply.ok, true)
+  assert.equal(reply.command.action, 'trading-charts')
+  assert.equal(reply.command.crop, 'tomato')
+  assert.deepEqual(Object.keys(reply.command.timeframes), ['15m', '1h', '1d', '1w'])
+  // 紧凑 bar 在 helper 里还原成对象（窗口只认对象形）。
+  assert.equal(reply.command.timeframes['15m'].tomato.bars[0].open, 5)
+  assert.equal(reply.command.hint.tomato.confidence, 0.62)
+  assert.equal('coin' in reply.command, false)
+  // 没有这些字段的普通回执保持原样（菜单/农场窗不受影响）。
+  const plain = shared.normalizeHostCommand({ type: 'action-result', id: 'act-9', ok: true })
+  assert.equal('timeframes' in plain.command, false)
+  assert.equal('action' in plain.command, false)
+  // 坏作物/坏图整块丢掉，而不是塞一份半截的给窗口。
+  const broken = shared.normalizeHostCommand({
+    type: 'action-result',
+    id: 'board-charts-2',
+    ok: true,
+    action: 'trading-charts',
+    crop: 'Not A Crop!',
+    timeframes: { '15m': { tomato: { base: 'x' } } }
+  })
+  assert.equal(broken.ok, true)
+  assert.equal('crop' in broken.command, false)
+  assert.equal('timeframes' in broken.command, false)
 })
 
 test('宿主命令：update/show/hide/quit/ping/shot/pointer 白名单，未知与坏字段拒绝', () => {
@@ -884,6 +952,57 @@ test('manager：控件 action 事件透传给宿主，actionResult 把 ok/notice
   assert.equal(result.ok, false)
   assert.equal(result.notice, '这位客人已经不在桌面上了。')
   assert.equal(manager.actionResult('', { ok: true }), false, '空 id 不写管道')
+})
+
+test('票 90：manager 记下命令被拒的原因（尺寸 / 白名单 / 管道），宿主据此留诊断', async (t) => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    exists: () => true,
+    spawn: () => {
+      const child = fakeChild(4000 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    onEvent: () => {},
+    pingMs: 100000
+  })
+  t.after(() => manager.dispose())
+  assert.equal(manager.lastCommandFailure(), null)
+  manager.start()
+  children[0].emitLine({ type: 'ready', pid: 4000, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  await new Promise((resolve) => setTimeout(resolve, 5))
+
+  // 白名单拒绝：坏 URL 在写管道之前就被丢掉，原因不是尺寸。
+  assert.equal(manager.openUrl('javascript:alert(1)'), false)
+  const refused = manager.lastCommandFailure()
+  assert.equal(refused.reason, 'whitelist')
+  assert.equal(refused.type, 'open-url')
+
+  // 尺寸拒绝：32 种作物 × 4 周期 × 40 根的盘口包（白名单内的上限）> 256 KiB。
+  const chart = { base: 5, bars: Array.from({ length: 40 }, (_, index) => [index, index, index + 1, 5, 5.2, 4.9, 5.1]), current: null }
+  const timeframes = {}
+  for (const id of ['15m', '1h', '1d', '1w']) {
+    timeframes[id] = {}
+    for (let index = 0; index < 32; index += 1) {
+      timeframes[id]['crop' + String(index).padStart(2, '0')] = chart
+    }
+  }
+  assert.equal(manager.boardWindow({ open: true, state: { timeframes } }), false)
+  const tooBig = manager.lastCommandFailure()
+  assert.equal(tooBig.type, 'board-window')
+  assert.equal(tooBig.reason, 'size')
+  assert.equal(tooBig.limit, shared.MAX_LINE_LENGTH)
+  assert.ok(tooBig.bytes > shared.MAX_LINE_LENGTH, 'bytes=' + tooBig.bytes)
+
+  // 成功写回一条小命令后，旧失败不再挂着（下一次可能是别的原因）。
+  assert.equal(manager.update(shared.petScene([], { x: 0, y: 0, width: 100, height: 100 })), true)
+  assert.equal(manager.lastCommandFailure(), null)
 })
 
 test('manager：崩溃退避重启、N 次后熔断、dispose 先 quit 再 kill', async (t) => {

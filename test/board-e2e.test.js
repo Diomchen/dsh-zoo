@@ -404,7 +404,7 @@ test('票 80 e2e：一键止损 → /state 反映档位 → 到线平，原因�
   assert.equal(settled.body.trading.coins.total, settled.body.farm.coins)
 })
 
-test('票 81/88 e2e：目录全部作物 K 线 + 风向随 /state 下发；成形那根随时钟前进', async (t) => {
+test('票 81/88/90 e2e：当前作物 K 线 + 风向随 /state 下发；成形那根随时钟前进', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir, 500)
   const clock = { value: OPEN_AT }
@@ -413,30 +413,31 @@ test('票 81/88 e2e：目录全部作物 K 线 + 风向随 /state 下发；成�
 
   const before = await state(service)
   const trading = before.body.trading
-  // 票 88：15 分图只下发在 `timeframes['15m']`；窗口视图读 helper 归一化后的对象形。
+  // 票 88/90：15 分图只下发在 `timeframes['15m']`，而且只带当前选中的那一种作物。
   const crops = boardCrops()
+  const only = crops[0]
   assert.equal('charts' in trading, false)
-  assert.deepEqual(Object.keys(trading.timeframes['15m']), crops)
+  assert.deepEqual(Object.keys(trading.timeframes['15m']), [only])
   const view = shared.normalizeBoardView(trading)
-  for (const crop of crops) {
-    const chart = view.timeframes['15m'][crop]
-    assert.equal(chart.bars.length, 24, crop + ' 最近 24 根')
+  {
+    const chart = view.timeframes['15m'][only]
+    assert.equal(chart.bars.length, 24, only + ' 最近 24 根')
     assert.equal(chart.current.slot, trading.bar.slot)
-    assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
+    assert.equal(chart.current.price, markPrice({ crop: only, now: clock.value }))
     // 每根的高低点都要夹住开收（图上的影线不能比实体短）。
     for (const bar of chart.bars) {
-      assert.ok(bar.high >= Math.max(bar.open, bar.close), crop + ' 高点越界：' + bar.slot)
-      assert.ok(bar.low <= Math.min(bar.open, bar.close), crop + ' 低点越界：' + bar.slot)
+      assert.ok(bar.high >= Math.max(bar.open, bar.close), only + ' 高点越界：' + bar.slot)
+      assert.ok(bar.low <= Math.min(bar.open, bar.close), only + ' 低点越界：' + bar.slot)
     }
-    assert.ok(trading.hint[crop].confidence >= 0.55 && trading.hint[crop].confidence <= 0.68)
+    assert.ok(trading.hint[only].confidence >= 0.55 && trading.hint[only].confidence <= 0.68)
   }
-  // `payload.bar` 还是目录第一个作物的当前一根（票 79 的窗口认它；票 88 起顺序同目录）。
-  assert.equal(trading.bar.crop, crops[0])
-  assert.equal(trading.bar.price, trading.timeframes['15m'][crops[0]].current.price)
-  // 窗口的纯视图吃得下这一包：图例、风向「不是保证」、十页签。
+  // `payload.bar` 是当前作物的当前一根（票 90：和同一包里的图同一种）。
+  assert.equal(trading.bar.crop, only)
+  assert.equal(trading.bar.price, trading.timeframes['15m'][only].current.price)
+  // 窗口的纯视图吃得下这一包：图例、风向「不是保证」、完整作物条。
   const board = boardView.boardView(view, { now: clock.value })
   assert.equal(board.chart.geometry.bars.length, 24)
-  assert.equal(board.chart.legend[0].text, view.charts[crops[0]].base.toFixed(2))
+  assert.equal(board.chart.legend[0].text, view.timeframes['15m'][only].base.toFixed(2))
   assert.equal(board.hint.note, '不是保证')
   assert.equal(board.crops.length, crops.length)
 
@@ -444,18 +445,18 @@ test('票 81/88 e2e：目录全部作物 K 线 + 风向随 /state 下发；成�
   clock.value = OPEN_AT + 2 * TICK_MS
   assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
   const after = await state(service)
-  for (const crop of crops) {
-    const current = after.body.trading.timeframes['15m'][crop].current
-    assert.equal(current.slot, before.body.trading.timeframes['15m'][crop].current.slot)
+  {
+    const current = after.body.trading.timeframes['15m'][only].current
+    assert.equal(current.slot, before.body.trading.timeframes['15m'][only].current.slot)
     assert.equal(current.tick, 7)
-    assert.equal(current.price, markPrice({ crop, now: clock.value }))
+    assert.equal(current.price, markPrice({ crop: only, now: clock.value }))
     assert.equal(current.remainingMs, SLOT_MS - 7 * TICK_MS)
   }
-  assert.notEqual(after.body.trading.timeframes['15m'].tomato.current.price,
-    before.body.trading.timeframes['15m'].tomato.current.price)
+  assert.notEqual(after.body.trading.timeframes['15m'][only].current.price,
+    before.body.trading.timeframes['15m'][only].current.price)
 })
 
-test('票 84 e2e：四周期随 /state 下发；切周期不改持仓/硬币/周盈亏，结算仍按 15 分', async (t) => {
+test('票 84/90 e2e：当前作物的四周期随 /state 下发；切周期不改持仓/硬币/周盈亏，结算仍按 15 分', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir, 500)
   const clock = { value: OPEN_AT }
@@ -467,16 +468,20 @@ test('票 84 e2e：四周期随 /state 下发；切周期不改持仓/硬币/周
     action: 'trading-open-position', side: 'long', margin: 50, leverage: 1, cropId: 'tomato'
   })
   assert.equal(opened.body.ok, true)
+  // 票 90：切到番茄再读 /state——按需包只带这一种作物的四个周期。
+  assert.equal((await action(service, { action: 'trading-charts', cropId: 'tomato' })).body.ok, true)
   const before = (await state(service)).body.trading
   const ids = BOARD_TIMEFRAMES.map(({ id }) => id)
   const crops = boardCrops()
+  const only = 'tomato'
+  assert.ok(crops.includes(only))
   assert.deepEqual(Object.keys(before.timeframes), ids)
   assert.deepEqual(before.limits.timeframes, BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })))
   for (const { id } of BOARD_TIMEFRAMES) {
-    assert.deepEqual(Object.keys(before.timeframes[id]), crops, id + ' 带目录全部作物')
-    for (const crop of crops) {
-      const chart = before.timeframes[id][crop]
-      assert.equal(chart.bars.length, 24, id + ' / ' + crop + ' 最近 24 根')
+    assert.deepEqual(Object.keys(before.timeframes[id]), [only], id + ' 只带当前作物')
+    {
+      const chart = before.timeframes[id][only]
+      assert.equal(chart.bars.length, 24, id + ' / ' + only + ' 最近 24 根')
       assert.ok(chart.current.start <= clock.value && clock.value < chart.current.end)
       assert.equal(chart.current.tick === null, id !== '15m', id + ' 的 tick 口径')
       // 票 88：紧凑数组 [slot, start, end, open, high, low, close]。
@@ -485,7 +490,8 @@ test('票 84 e2e：四周期随 /state 下发；切周期不改持仓/硬币/周
   }
   // 15 分就是 `timeframes['15m']`（旧 `charts` 不再重复下发）。
   assert.equal('charts' in before, false)
-  assert.equal(before.bar.price, before.timeframes['15m'][crops[0]].current.price)
+  assert.equal(before.bar.crop, only)
+  assert.equal(before.bar.price, before.timeframes['15m'][only].current.price)
 
   // 窗口切周期是纯视图换图：同一份 payload 里硬币/持仓/周盈亏一个字不动。
   const view = shared.normalizeBoardView(before)

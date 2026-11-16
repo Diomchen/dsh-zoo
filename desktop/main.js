@@ -2552,7 +2552,13 @@ function applyCommand (command) {
         sendBoardResult({
           ok: command.ok === true,
           notice: command.notice,
-          code: command.error
+          code: command.error,
+          // 票 90：按需拉图的回执把这一种作物的四个周期一起交给窗口
+          // （窗口并进本地 state 重画，不重开窗、也不靠下一包推送）。
+          action: command.action ?? null,
+          crop: command.crop ?? null,
+          timeframes: command.timeframes ?? null,
+          hint: command.hint ?? null
         })
         return
       }
