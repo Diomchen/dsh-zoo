@@ -21,6 +21,7 @@ import {
 } from '../src/trading.js'
 import {
   SLOT_MS,
+  SLOT_TICKS,
   TICK_MS,
   boardPrice,
   liquidationPriceOf,
@@ -38,22 +39,46 @@ const SLOT_EDGE = 1763308800000
 const SLOT = SLOT_EDGE / SLOT_MS
 const MONDAY = weekStartOf(SLOT_EDGE)
 /**
- * 票 80 用的那一根：`SLOT_EDGE + SLOT_MS`（下一根）开在 tick 5，之后一路跌到收盘。
- * 20× 做多在这一根里 tick 12 撞强平线（−5%），5× 做多 + −25% 止损也在 tick 12 撞线
- * （−5% 价格 = −25% 保证金），而收盘价离得更远——「按路径平」和「按收盘平」拿到的价不同。
+ * 票 80 用的那一根：tick 5 开仓，之后**第一次**跌穿 −5% 在 `TICK_80`（20× 的强平线，
+ * 也正好是 5× 的 −25% 止损线），收盘还在更下面，而且全程不碰 5× 的 −20% 强平线。
+ * 票 86 把价格盐升到 board-v2 之后行情全变，「一定撞线」的那一根要按新行情现找：
+ * 20× 需要单根 5% 的波动，不是每一根都有，所以从 SLOT 往后扫，而不是再写一个魔数。
  */
-const SLOT_80 = SLOT + 1
+function breachBar (fromSlot) {
+  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+    const prices = []
+    for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+      prices.push(boardPrice({ crop: 'tomato', slot, tick }))
+    }
+    const entry = prices[5]
+    let breachTick = -1
+    for (let tick = 6; tick <= 14; tick += 1) {
+      if (prices[tick] <= entry * 0.95) {
+        breachTick = tick
+        break
+      }
+    }
+    if (breachTick < 0) continue
+    if (prices[SLOT_TICKS] >= prices[breachTick]) continue
+    if (Math.min(...prices.slice(5)) <= entry * 0.8) continue
+    return { slot, breachTick }
+  }
+  throw new Error('找不到「tick 5 开仓、之后跌穿 −5%、收盘更低」的行情（行情规则改了？）')
+}
+const { slot: SLOT_80, breachTick: TICK_80 } = breachBar(SLOT + 1)
 const OPEN_80 = SLOT_80 * SLOT_MS + 5 * TICK_MS
-const TICK_80 = 12
 
 /**
  * 找一根「先跌破 −25% 止损档、随后又收回去」的行情（评审 P0 的回归用例）。
  * 20× 做多时 −25% 保证金 = −1.25% 价格：挑那根里一次都没碰到 −5% 强平线的，
  * 这样「旧插针补平」与「强平」不会被混在一起。返回开仓 tick、插针 tick 与
  * 可以安全设止损的 tick。找不到就抛——行情规则改了，用例要重新挑点。
+ *
+ * board-v2 的快噪声是半根一格，一根里只有一个回弯，「先插针再站回去」的根大约
+ * 千分之一（20000 根里 189 根），所以扫宽一点（6000 根 ≈ 62 天行情）。
  */
 function dipThenRecover (startSlot) {
-  for (let slot = startSlot; slot < startSlot + 600; slot += 1) {
+  for (let slot = startSlot; slot < startSlot + 6000; slot += 1) {
     const prices = []
     for (let tick = 0; tick <= 15; tick += 1) {
       prices.push(boardPrice({ crop: 'tomato', slot, tick }))
@@ -637,7 +662,9 @@ test('票 80：一键止损——档位循环落盘；坏档位拒绝；坏值�
     version: TRADING_VERSION,
     week: { start: MONDAY, pnl: 0, base: 500 },
     positions: [{
-      id: 'old', crop: 'tomato', side: 'long', margin: 50, leverage: 5, entry: 5,
+      id: 'old', crop: 'tomato', side: 'long', margin: 50, leverage: 5,
+      // 入场价取那一根的开盘价：写死 5 会在 board-v2 的行情里一载入就撞强平线。
+      entry: boardPrice({ crop: 'tomato', slot: SLOT, tick: 0 }),
       openedAt: SLOT_EDGE, slot: SLOT
     }],
     history: []
@@ -660,8 +687,8 @@ test('票 80：20× 强平——时钟跳过也按路径平，只亏保证金，
   const liquidation = opened.position.liquidation
   assert.equal(liquidation, liquidationPriceOf({ side: 'long', entry, leverage: 20 }))
 
-  // 时钟直接跳过这一根：强平线在 tick 12 就被跌穿，收盘价还在更下面。
-  clock.set(SLOT_EDGE + 2 * SLOT_MS + 1000)
+  // 时钟直接跳过这一根：强平线在 TICK_80 那一分钟就被跌穿，收盘价还在更下面。
+  clock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   assert.equal(await store.tick(), true, 'tick 应当认账（强平）')
   const view = store.view()
   assert.equal(view.positions.length, 0)
@@ -698,7 +725,7 @@ test('票 80：硬币本来就是 0 时强平也不为负（亏损上限是保�
   const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
   assert.equal(farm.wallet.coins, 0, '全部硬币押进去了')
 
-  clock.set(SLOT_EDGE + 2 * SLOT_MS + 1000)
+  clock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await store.tick()
   const row = store.view().history[0]
   assert.equal(row.reason, 'liquidate')
@@ -718,7 +745,7 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   const entry = opened.position.entry
   assert.equal((await store.setStopLoss(id, 0.25)).ok, true)
 
-  clock.set(SLOT_EDGE + 2 * SLOT_MS + 1000)
+  clock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   assert.equal(await store.tick(), true)
   const row = store.view().history[0]
   const exit = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 })
@@ -741,7 +768,7 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   const noStop = await openStore(other, { clock: otherClock, farm: otherFarm })
   const plain = await noStop.openPosition({ side: 'long', margin: 50, leverage: 5 })
   assert.equal(plain.position.stopLoss, 0, '默认关')
-  otherClock.set(SLOT_EDGE + 2 * SLOT_MS + 1000)
+  otherClock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await noStop.tick()
   const plainRow = noStop.view().history[0]
   assert.equal(plainRow.reason, 'settle')
@@ -756,7 +783,7 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   const doomed = await lastStore.setStopLoss(taken.position.id, 1)
   assert.equal(doomed.ok, true)
   assert.equal(doomed.position.stopLoss, 1)
-  lastClock.set(SLOT_EDGE + 2 * SLOT_MS + 1000)
+  lastClock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await lastStore.tick()
   const lastRow = lastStore.view().history[0]
   assert.equal(lastRow.reason, 'stop')
@@ -775,9 +802,9 @@ test('票 80（评审 P0）：设止损不跳过之前的强平路径，新止�
   const entry = opened.position.entry
   assert.ok(liquidationPriceOf({ side: 'long', entry, leverage: 20 }) < entry * 0.96)
 
-  // 时钟已经越过强平线（tick 12），但还没 tick：玩家偏偏在这时点了止损。
+  // 时钟已经越过强平线（TICK_80 那一分钟之后），但还没 tick：玩家偏偏在这时点了止损。
   // 之前的实现会把「检查进度」也推到此刻，下一拍直接按止损平掉——强平被跳过。
-  clock.set(SLOT_80 * SLOT_MS + 13 * TICK_MS + 1000)
+  clock.set(SLOT_80 * SLOT_MS + TICK_80 * TICK_MS + 30 * 1000)
   assert.equal((await store.setStopLoss(opened.position.id, 0.25)).ok, true)
 
   assert.equal(await store.tick(), true)
@@ -818,7 +845,7 @@ test('票 80（评审 P0）：设止损之前跌破档位的那一段不补平�
 })
 
 test('票 80（评审 P0）：快进跨多根仍按最早撞线那一刻平，不按收盘价敷衍', async (t) => {
-  // 强平：20× 做多，时钟一次跳过 6 根，路径上第一处触发仍在开仓那一根的 tick 12。
+  // 强平：20× 做多，时钟一次跳过 6 根，路径上第一处触发仍在开仓那一根的 TICK_80。
   const dir = await tempDir(t)
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
@@ -834,7 +861,7 @@ test('票 80（评审 P0）：快进跨多根仍按最早撞线那一刻平，�
   assert.ok(liquidated.exit > slotClosePrice('tomato', SLOT_80), '最早撞线价不是收盘价')
   assert.equal(liquidated.pnl, -50)
 
-  // 止损：5× 做多 + −25% 档，同样跳 6 根；最早触发那一刻（同一个 tick 12）优先于收盘。
+  // 止损：5× 做多 + −25% 档，同样跳 6 根；最早触发那一刻（同一个 TICK_80）优先于收盘。
   const stopDir = await tempDir(t)
   const stopClock = makeClock(OPEN_80)
   const stopFarm = fakeFarm(500)
@@ -861,7 +888,7 @@ test('票 80：关掉止损后不再触发；离线几个小时回来只补一�
   await store.setStopLoss(id, 0)
 
   // 关掉之后：按收盘价结（1× 都不触发，5× 也不会被止损抢）。
-  clock.set(SLOT_EDGE + 2 * SLOT_MS + 1000)
+  clock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await store.tick()
   assert.equal(store.view().history[0].reason, 'settle')
 
