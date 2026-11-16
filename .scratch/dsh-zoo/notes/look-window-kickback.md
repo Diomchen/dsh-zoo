@@ -51,10 +51,14 @@ function farmWindowPayload ({ mode = null, ... }) {
 
 ## 回归测试
 
-- `test/farm-look-refresh.test.js`：回环上两只**真**宠物 + 只记录窗口命令的桌面替身。
+- `test/farm-look-refresh.test.js`（宿主那一半）：回环上两只**真**宠物 + 只记录窗口命令的桌面替身。
   看田之后等 3.5 秒（邻居每 1 秒一轮行情摘要），断言**一条非 look 的窗口命令都没有**；
   再断言 `farm-refresh` 仍回 look、`farm-own` 才回 owner。
   这条用例在修之前是红的（`mode: 'owner'` 每 5 秒来一次）。
+- `test/farm-look-renderer.test.js`（窗口那一半）：真的 `desktop/farm.js` 跑在替身 DOM 里
+  （`test/fixtures/farm-renderer.js`，从票 61 的合同倒计时用例抽出来的）。三条断言：
+  自家作物到点**不发任何动作**、邻居家作物到点只发 `farm-refresh`、顶部圆片发 `farm-own`。
+  拿修之前的 `desktop/farm.js` 跑这三条是**三条全红**。
 - `test/farm-look-window.test.js`：`farm-refresh` / `farm-own` 两条白名单，且 `farm-own`
   必须同时在 `FARM_ACTIONS` 与 `DESKTOP_ACTIONS` 里（helper → 宿主那一道也要认）。
 
