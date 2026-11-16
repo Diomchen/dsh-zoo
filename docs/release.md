@@ -1,5 +1,12 @@
 # 发布与上架 dsh-market
 
+## 1.6.3 版本记录
+
+GitHub Release 用的简版文案：[`releases/1.6.3.md`](releases/1.6.3.md)。
+
+1.6.2 的 tag 打早了：那会儿还没有合并远端的「看田窗口」修复，所以 1.6.3 = 1.6.2 全部内容 +
+看田窗口修复。代码层面没有新功能，存档与协议都不变。
+
 ## 1.6.2 版本记录
 
 GitHub Release 用的简版文案：[`releases/1.6.2.md`](releases/1.6.2.md)。
