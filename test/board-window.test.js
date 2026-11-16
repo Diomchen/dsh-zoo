@@ -1698,6 +1698,8 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.match(html, /\.chart-svg \.line-dot \{/)
   assert.match(html, /body\[data-mono='1'\] \{/)
   assert.match(html, /body\[data-mono='1'\] \.chart-svg \.body\.up \{[\s\S]*?fill: var\(--ink\)/)
+  // emoji 品牌图标也不能漏出彩色。
+  assert.match(html, /body\[data-mono='1'\] \.brand-mark \{[\s\S]*?filter: grayscale\(1\)/)
   assert.match(html, /body\[data-mono='1'\] \.chart-svg \.body\.down,[\s\S]*?fill: var\(--card\)/)
   // 焦点环/禁用态/数字等宽：票 89 的三条硬规则还在。
   assert.match(html, /:focus-visible \{[\s\S]*?outline: 2px dashed var\(--ink\)/)
