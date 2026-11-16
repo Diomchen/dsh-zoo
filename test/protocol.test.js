@@ -274,6 +274,18 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'trading-digest') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        at: 1700000000000,
+        weekPnl: 12,
+        positions: [{ crop: 'tomato', side: 'long', leverage: 1 }],
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
     } else if (type === 'farm-action') {
       raw = {
         v: PROTOCOL_VERSION,
@@ -361,6 +373,8 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
               ? ['v', 'type', 'deviceId', 'visitId', 'giftId']
               : type === 'market-digest'
                 ? ['v', 'type', 'deviceId', 'at', 'prices', 'hire']
+                : type === 'trading-digest'
+                  ? ['v', 'type', 'deviceId', 'at', 'weekPnl', 'positions']
                 : type === 'farm-action'
                   ? ['v', 'type', 'deviceId', 'visitId', 'requestId', 'action', 'plotId']
                   : type === 'farm-action-result'
@@ -664,6 +678,8 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'visit-recall-ack',
     'gift-received',
     'market-digest',
+    // 票 82：盘口周报（本周盈亏 + 当前持仓），也是"局域网情报"这一类
+    'trading-digest',
     // 票 59：运行时作物目录（跟着行情后面，都是"局域网情报"这一类）
     'crop-catalog-request',
     'crop-catalog',

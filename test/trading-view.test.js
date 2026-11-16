@@ -452,7 +452,9 @@ test('票 79：空态与坏输入都不抛——没有盘口数据时也能画�
     assert.equal(board.chart.hasChart, false)
     assert.equal(board.week.pctText, '—')
     assert.match(board.hints.history, /还没有结算记录/)
-    // 邻居位先占住，票 82 才填数据。
+    // 票 82：没有 league 就画空榜，空态文案照旧。
+    assert.deepEqual(board.league.rows, [])
+    assert.equal(board.league.hasPeers, false)
     assert.match(board.hints.neighbors, /还没有邻居上线/)
   }
   // 老 payload 没有 limits.leverages：杠杆退回 1×（票 80 之后宿主会下发 [1,5,20]）。
@@ -466,4 +468,103 @@ test('票 79：空态与坏输入都不抛——没有盘口数据时也能画�
   assert.equal(view.formatTrim(5), '5')
   assert.equal(view.formatTrim(0.5), '0.5')
   assert.equal(view.formatTrim(0), '0')
+})
+
+/** 票 82：榜的数据形状（宿主 `buildLeague` 的输出）。 */
+function league (overrides = {}) {
+  return {
+    rows: [
+      {
+        deviceId: '00000000-0000-4000-8000-0000000000bb',
+        nickname: '阿赢',
+        weekPnl: 12,
+        weekPnlPct: 0.035,
+        positions: [{ crop: 'tomato', side: 'long', leverage: 5 }, { crop: 'carrot', side: 'long', leverage: 1 }],
+        me: false
+      },
+      {
+        deviceId: '00000000-0000-4000-8000-0000000000aa',
+        nickname: '小米',
+        weekPnl: -8,
+        weekPnlPct: null,
+        positions: [{ crop: 'pumpkin', side: 'short', leverage: 20 }],
+        me: true
+      }
+    ],
+    sentiment: { long: 2, short: 1, flat: 0 },
+    self: { weekPnl: -8, weekPnlPct: null },
+    ...overrides
+  }
+}
+
+test('票 82：真人周榜画分数/收益率/持仓摘要；收益率是比率、没报就是「—」', () => {
+  const board = view.boardView(payload({ league: league() }), { now: SLOT_EDGE })
+  assert.equal(board.league.rows.length, 2)
+  assert.equal(board.league.countText, '2 人')
+  assert.equal(board.league.hasPeers, true)
+  const [win, own] = board.league.rows
+  assert.equal(win.nickname, '阿赢')
+  assert.equal(win.me, false)
+  // 12 就是「+12」：榜上的分数按整数金币画（不是 +12.0）。
+  assert.equal(win.pnlText, '+12')
+  assert.equal(win.pnlTone, 'up')
+  // 0.035 是比率 → +3.50%；邻居没报就是「—」，不拿 0% 冒充。
+  assert.equal(win.pctText, '+3.50%')
+  assert.equal(win.positionsText, '多 2 · 空 0')
+  assert.equal(own.me, true)
+  assert.equal(own.pnlText, '-8')
+  assert.equal(own.pnlTone, 'down')
+  assert.equal(own.pctText, '—')
+  assert.equal(own.pctTone, 'flat')
+  assert.equal(own.positionsText, '多 0 · 空 1')
+  // LAN 情绪数的是仓位：2 多 + 1 空。
+  assert.deepEqual(board.league.sentiment, { long: 2, short: 1, text: '多 2 · 空 1', tone: 'long' })
+})
+
+test('票 82：只有自己时写「观望」，并保留「还没有邻居上线…行情照走」', () => {
+  const alone = view.boardView(payload({
+    league: league({
+      rows: [{
+        deviceId: '00000000-0000-4000-8000-0000000000aa',
+        nickname: '小米',
+        weekPnl: 0,
+        weekPnlPct: 0,
+        positions: [],
+        me: true
+      }],
+      sentiment: { long: 0, short: 0, flat: 1 },
+      self: { weekPnl: 0, weekPnlPct: 0 }
+    })
+  }), { now: SLOT_EDGE })
+  assert.equal(alone.league.rows.length, 1)
+  assert.equal(alone.league.rows[0].me, true)
+  assert.equal(alone.league.rows[0].positionsText, '观望')
+  assert.equal(alone.league.hasPeers, false)
+  assert.equal(alone.league.sentiment.text, '观望')
+  assert.equal(alone.league.sentiment.tone, 'flat')
+  assert.match(alone.league.empty, /还没有邻居上线/)
+  assert.match(alone.league.empty, /行情照走/)
+
+  // 有仓位的人写「多 2 · 空 1」；全场空仓的判定只看 long + short。
+  const both = view.leagueView({
+    league: league({ sentiment: { long: 0, short: 0, flat: 3 } })
+  })
+  assert.deepEqual(both.rows.map((row) => row.positionsText), ['多 2 · 空 0', '多 0 · 空 1'])
+  assert.equal(both.sentiment.text, '观望')
+})
+
+test('票 82：榜的坏输入不抛——缺行/坏行/缺情绪都退回空榜', () => {
+  for (const bad of [null, 42, 'x', [], { rows: 'x' }, { rows: [null, 42, { weekPnl: 'x' }] }]) {
+    const board = view.boardView(payload({ league: bad }), { now: SLOT_EDGE })
+    assert.deepEqual(board.league.rows, [])
+    assert.equal(board.league.sentiment.text, '观望')
+    assert.equal(board.league.hasPeers, false)
+  }
+  // 缺 sentiment 时按「没有仓位」画观望；昵称缺失用「邻居」兜底。
+  const nameless = view.leagueView({
+    league: { rows: [{ deviceId: 'x', weekPnl: 3, positions: [{ crop: 'tomato', side: 'long' }] }] }
+  })
+  assert.equal(nameless.rows[0].nickname, '邻居')
+  assert.equal(nameless.rows[0].positionsText, '多 1 · 空 0')
+  assert.equal(nameless.sentiment.text, '观望')
 })
