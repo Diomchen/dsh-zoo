@@ -1147,3 +1147,41 @@ test('票 85：盘口窗可拖动，位置记在 userData/board-window.json（�
   assert.equal((html.match(/-webkit-app-region:\s*drag/g) ?? []).length, 1, '拖动区只能有一处（标题栏）')
   assert.doesNotMatch(html, /\.(?:body|card|chart-card)[^{]*\{[^}]*-webkit-app-region:\s*drag/)
 })
+
+test('票 87：盘口版面上图下两列、图 720×280，手绘/十字线接线齐全', async () => {
+  // 版面是纯静态的：grid 把 chart 铺满整行，下面两列左持仓/结算、右下单/周榜。
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /grid-template-areas:[\s\S]*?'chart chart'[\s\S]*?'positions order'[\s\S]*?'history neighbor'/)
+  assert.match(html, /grid-template-columns: minmax\(0, 1fr\) 308px/)
+  // 图必须占满卡片宽度：viewBox 与 CSS 高度一致，由 board.js 按几何再写一次。
+  assert.match(html, /viewBox="0 0 720 280"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 280px/)
+  assert.doesNotMatch(html, /viewBox="0 0 384 188"/)
+  // 760×700 内不整页滚动：页面本身 overflow hidden，只有列表/控件内部滚。
+  assert.match(html, /overflow: hidden;/)
+  assert.match(html, /class="order-scroll"/)
+  assert.match(html, /class="order-actions"/)
+  // 票 84 的周期提示与页签没有在这次改版里丢。
+  assert.match(html, /id="timeframe-tabs"/)
+  assert.match(html, /id="chart-settle-hint"/)
+
+  // 手绘滤镜只定义/引用一次；文字在独立清晰层，指针事件画十字线。
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /feTurbulence/)
+  assert.match(script, /feDisplacementMap/)
+  assert.match(script, /filter: geometry\.sketch\.filter/)
+  assert.match(script, /class: 'chart-ink'/)
+  assert.match(script, /class: 'chart-crisp'/)
+  assert.match(script, /view\.crosshairAt/)
+  assert.match(script, /pointermove/)
+  assert.match(script, /pointerleave/)
+  assert.doesNotMatch(script, /console\.log/)
+
+  // 纯视图的尺寸与列归属是公开常量，Node 测试和窗口吃同一份。
+  assert.equal(boardView.BOARD_WIDTH, 760)
+  assert.equal(boardView.BOARD_HEIGHT, 700)
+  assert.equal(boardView.CHART_WIDTH, 720)
+  assert.equal(boardView.CHART_HEIGHT, 280)
+  assert.deepEqual(boardView.LAYOUT.columns.left, ['positions', 'history'])
+  assert.deepEqual(boardView.LAYOUT.columns.right, ['order', 'league'])
+})
