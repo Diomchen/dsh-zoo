@@ -13,7 +13,6 @@ import test from 'node:test'
 
 import {
   BOARD_BAR_COUNT,
-  BOARD_CROPS,
   BOARD_SIDES,
   BOARD_TIMEFRAMES,
   MAX_LEVERAGE,
@@ -30,6 +29,7 @@ import {
   TRADING_LEVERAGES,
   TRADING_MARGINS,
   TRADING_STOP_LEVELS,
+  boardCrops,
   boardPrice,
   barsFor,
   barsForTimeframe,
@@ -56,7 +56,7 @@ import {
   targetBandOf,
   weekStartOf
 } from '../src/trading-rules.js'
-import { CROPS } from '../src/farm-rules.js'
+import { CROP_IDS, CROPS, applyCropCatalog, resetCropCatalog } from '../src/farm-rules.js'
 
 /** 正好落在 slot 边界上的一刻（1763308800000 / 900000 是整数）。 */
 const SLOT_EDGE = 1763308800000
@@ -213,9 +213,10 @@ test('票 79：本周起点是本地周一 00:00（周一自己、周日深夜�
   assert.equal(weekStartOf('nope'), null)
 })
 
-test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、三个作物、多空；止损四档含 0=关', () => {
-  // 票 81 起盘口有三个作物：顺序就是窗口页签的顺序，tomato 是 payload.bar 的来源。
-  assert.deepEqual(BOARD_CROPS, ['tomato', 'carrot', 'pumpkin'])
+test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物、多空；止损四档含 0=关', () => {
+  // 票 88 起盘口的作物清单跟随运行时目录：顺序就是窗口页签的顺序，
+  // 目录里第一个（tomato 仍在首位）是 payload.bar 的来源。
+  assert.deepEqual(boardCrops(), CROP_IDS)
   // 票 83：三档预设 + 窗口的「全下」；保证金规则本身接受任意整数（见下一条）。
   assert.deepEqual(TRADING_MARGINS, [50, 100, 250])
   assert.deepEqual(TRADING_LEVERAGES, [1, 5, 20])
@@ -227,7 +228,9 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、三个作物
   assert.equal(isBoardCrop('tomato'), true)
   assert.equal(isBoardCrop('carrot'), true)
   assert.equal(isBoardCrop('pumpkin'), true)
-  assert.equal(isBoardCrop('corn'), false)
+  // 票 88：目录里的十种都上盘口（corn 不再被写死的三作物名单挡掉）。
+  assert.equal(isBoardCrop('corn'), true)
+  assert.equal(isBoardCrop('dragonfruit'), false)
   assert.equal(isBoardSide('long'), true)
   assert.equal(isBoardSide('up'), false)
   assert.equal(isMarginAmount(50), true)
@@ -253,6 +256,67 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、三个作物
   assert.equal(isStoredLeverage(20), true)
   assert.equal(isStoredLeverage(MAX_LEVERAGE + 1), false)
   assert.equal(isStoredLeverage(0), false)
+})
+
+/**
+ * 票 88 / ADR-0031：盘口作物清单跟随运行时目录，不再写死三个。
+ * 这里用**真实的十种内置作物**断言顺序与数量：新增作物只要目录里有，盘口自动跟上。
+ */
+test('票 88：盘口作物 = 目录里有底价的全部作物，十种全上榜、顺序同目录', () => {
+  assert.deepEqual(boardCrops(), CROP_IDS)
+  assert.deepEqual(boardCrops(), [
+    'pea', 'tomato', 'strawberry', 'radish', 'carrot',
+    'rice', 'corn', 'watermelon', 'pumpkin', 'grape'
+  ])
+  for (const crop of boardCrops()) {
+    assert.ok(CROPS[crop].base > 0, crop + ' 应该有正底价')
+    assert.equal(isBoardCrop(crop), true, crop + ' 应该可以下单')
+  }
+  // 目录里没有的 id 仍然不是盘口作物（协议整包丢就靠它）。
+  assert.equal(isBoardCrop('dragonfruit'), false)
+  assert.equal(isBoardCrop('tomato '), false)
+  assert.equal(isBoardCrop(5), false)
+})
+
+/**
+ * 票 88：运行时新增一种作物（`applyCropCatalog()`，也就是本机 crops.json 或 LAN 同步
+ * 走的那条路）后，不用改代码就能出现在盘口、出图、算风向；坏底价/缺底价的作物
+ * 在**所有**入口都被忽略。测完 `resetCropCatalog()` 还原，绝不把目录留给下一个用例。
+ */
+test('票 88：运行时新增作物立刻上盘口；坏底价/缺底价被忽略（测完还原）', (t) => {
+  t.after(() => resetCropCatalog())
+  const added = applyCropCatalog([
+    // 5 小时：正好落在 corn（4 小时）与 watermelon（6 小时）之间，用来核对顺序。
+    { id: 'blueberry', name: '蓝莓', growMs: 5 * HOUR_MS, seedPrice: 40, yield: 4, base: 12 },
+    { id: 'no-base', name: '没底价', growMs: 6 * HOUR_MS, seedPrice: 10, yield: 1 },
+    { id: 'bad-base', name: '坏底价', growMs: 6 * HOUR_MS, seedPrice: 10, yield: 1, base: 0 }
+  ])
+  assert.deepEqual(added, ['blueberry', 'no-base', 'bad-base'])
+  const crops = boardCrops()
+  // 盘口清单 = 目录顺序，但坏底价的两种被跳过（不是排在末尾、也不是画空图）。
+  assert.deepEqual(crops, CROP_IDS.filter((id) => id !== 'no-base' && id !== 'bad-base'))
+  assert.deepEqual(crops.slice(0, 8),
+    ['pea', 'tomato', 'strawberry', 'radish', 'carrot', 'rice', 'corn', 'blueberry'])
+  assert.equal(isBoardCrop('blueberry'), true)
+  assert.equal(isBoardCrop('no-base'), false)
+  assert.equal(isBoardCrop('bad-base'), false)
+
+  // 新作物的行情入口全部可用（盘口图、粗周期、风向、到价带）。
+  const chart = barsFor({ crop: 'blueberry', now: TF_NOW })
+  assert.equal(chart.base, 12)
+  assert.equal(chart.bars.length, BOARD_BAR_COUNT)
+  assert.equal(barsForTimeframe({ crop: 'blueberry', now: TF_NOW, timeframe: '1w' }).bars.length, BOARD_BAR_COUNT)
+  assert.ok(markPrice({ crop: 'blueberry', now: TF_NOW }) > 0)
+  assert.ok(hintOf({ crop: 'blueberry', now: TF_NOW }) !== null)
+  assert.deepEqual(targetBandOf({ crop: 'blueberry' }),
+    { min: 12 * PRICE_FLOOR_RATIO, max: 12 * PRICE_CEIL_RATIO })
+
+  // 坏底价/缺底价：同一个入口全部返回 null，盘口不会为它画一张假图。
+  assert.equal(markPrice({ crop: 'no-base', now: TF_NOW }), null)
+  assert.equal(barsFor({ crop: 'bad-base', now: TF_NOW }), null)
+  assert.equal(barsForTimeframe({ crop: 'no-base', now: TF_NOW, timeframe: '1h' }), null)
+  assert.equal(hintOf({ crop: 'bad-base', now: TF_NOW }), null)
+  assert.equal(targetBandOf({ crop: 'no-base' }), null)
 })
 
 test('票 80：强平价 = 1/杠杆；做多往下、做空往上；1× 没有强平线', () => {
@@ -786,7 +850,7 @@ function readabilityOf (chart) {
  * 三个作物 × 三个时刻一起断言，谁把长波幅度调小了都会在这里露出来。
  */
 test('票 86：多尺度慢波——1 日/1 周都读得出趋势，周线实体不是针', () => {
-  for (const crop of BOARD_CROPS) {
+  for (const crop of boardCrops()) {
     for (const now of READABILITY_NOWS) {
       const day = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1d' }))
       const dayTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 日'
@@ -806,11 +870,12 @@ test('票 86：多尺度慢波——1 日/1 周都读得出趋势，周线实体
 /**
  * 票 86：短波只是从「风」收成「呼吸」，没有把 15 分钟图做平，价格也不去撞夹子。
  * - 6 小时（24 根整根 + 当前一根）的最高最低差 ≥ 底价的 10%：实测 13–22%（旧模型 ≈38%）；
- * - 夹取 [0.55, 1.75] × 底价 是兜底，不是日常：一年 × 三个作物 × 每根 3 个 tick 扫下来，
- *   价格仍在 [0.58, 1.70] × 底价 之内（实测 0.61–1.66），没有一根是被夹出来的。
+ * - 夹取 [0.55, 1.75] × 底价 是兜底，不是日常：一年 × 全部盘口作物（票 88 起十种）
+ *   × 每根 3 个 tick 扫下来，价格仍在 [0.58, 1.71] × 底价 之内（实测 0.59–1.704），
+ *   没有一根是被夹出来的。
  */
 test('票 86：15 分钟仍有日内波动，价格离夹子有余量', () => {
-  for (const crop of BOARD_CROPS) {
+  for (const crop of boardCrops()) {
     const base = CROPS[crop].base
     const chart = barsFor({ crop, now: TF_NOW })
     const highs = chart.bars.map((bar) => bar.high).concat(chart.current.high)
@@ -822,7 +887,7 @@ test('票 86：15 分钟仍有日内波动，价格离夹子有余量', () => {
     )
   }
   // 逐 slot 扫一年：快噪声的格点就在整数 slot 上，取开盘/半根/收盘三针已经够密。
-  for (const crop of BOARD_CROPS) {
+  for (const crop of boardCrops()) {
     const base = CROPS[crop].base
     const firstSlot = slotIndexAt(TF_NOW)
     let lowest = Infinity
@@ -835,7 +900,8 @@ test('票 86：15 分钟仍有日内波动，价格离夹子有余量', () => {
       }
     }
     assert.ok(lowest >= 0.58, crop + ' 价格贴到夹取下沿：' + lowest.toFixed(3))
-    assert.ok(highest <= 1.7, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
+    // 十种作物里 pea 最高 1.7034（2026 年扫一年）；仍离 1.75 的夹子有余量。
+    assert.ok(highest <= 1.71, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
   }
 })
 
