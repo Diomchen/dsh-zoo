@@ -1,27 +1,42 @@
 /**
- * 盘口小窗的渲染端（票 79）。
+ * 盘口小窗的渲染端（票 79 / 票 81）。
  *
- * 它只做三件事：把宿主推来的盘口视图画成卡片；每秒本地递减倒计时（到 0 请宿主重推
- * 一拍）；把「开仓 / 平仓」当**申请**交给主进程。价格、硬币、盈亏、能不能下单全部
- * 由宿主算，成功与否也等宿主回执——窗口不自己改状态、不自己算钱。
+ * 它只做三件事：把宿主推来的盘口视图画成卡片（K 线、下单、持仓、历史、周盈亏）；
+ * 每秒本地递减收盘倒计时（到 0 请宿主结这一根并重推一拍）；
+ * 把「开仓 / 止损 / 平仓」当**申请**交给主进程。
+ * 价格、硬币、盈亏、能不能下单全部由宿主算，成功与否也等宿主回执——
+ * 窗口不自己改状态、不自己算钱，也不自己算价（K 线几何在 `trading-view.js` 里，
+ * 这里只把 view 给的坐标画成 SVG 元素）。
  *
- * 票 81 会在这里加 K 线、三作物切换与周榜；票 79 只做最小的一屏。
+ * 键盘：Tab 顺序就是 DOM 顺序（作物页签 → 方向 → 保证金 → 杠杆 → 开一手 → 每手仓位
+ * 的止损/平仓）；Enter/Space 是原生按钮行为；Esc 关窗。窗口失焦**不**关窗
+ * （macOS 中文输入法候选窗会抢焦点，农场窗踩过这个坑）。
  */
 'use strict'
 
 const api = window.dshZooBoard
 const view = window.dshZooBoardView
+const SVG_NS = 'http://www.w3.org/2000/svg'
 
 const titleEl = document.getElementById('board-title')
 const subtitleEl = document.getElementById('board-subtitle')
-const priceEl = document.getElementById('price')
-const changeEl = document.getElementById('change')
+const weekPnlEl = document.getElementById('week-pnl')
+const weekPctEl = document.getElementById('week-pct')
 const countdownEl = document.getElementById('countdown')
 const coinsAvailableEl = document.getElementById('coins-available')
 const coinsTotalEl = document.getElementById('coins-total')
+const cropTabsEl = document.getElementById('crop-tabs')
+const chartPriceEl = document.getElementById('chart-price')
+const chartChangeEl = document.getElementById('chart-change')
+const windEl = document.getElementById('wind')
+const chartEl = document.getElementById('chart')
+const chartEmptyEl = document.getElementById('chart-empty')
+const legendEl = document.getElementById('legend')
+const slotNoteEl = document.getElementById('slot-note')
 const orderCropEl = document.getElementById('order-crop')
 const sideRowEl = document.getElementById('side-row')
 const marginRowEl = document.getElementById('margin-row')
+const leverageRowEl = document.getElementById('leverage-row')
 const previewEl = document.getElementById('preview')
 const submitEl = document.getElementById('submit')
 const orderHintEl = document.getElementById('order-hint')
@@ -31,6 +46,7 @@ const positionsEmptyEl = document.getElementById('positions-empty')
 const historyEl = document.getElementById('history')
 const historyMetaEl = document.getElementById('history-meta')
 const historyEmptyEl = document.getElementById('history-empty')
+const neighborEmptyEl = document.getElementById('neighbor-empty')
 const closeButton = document.getElementById('close')
 const toastsEl = document.getElementById('toasts')
 
@@ -57,29 +73,142 @@ let payload = null
 /** 当前选择（只活在窗口里，开仓成功后保持不变，方便连做）。 */
 let side = 'long'
 let margin = 50
+let leverage = 1
+let crop = null
 /** 有申请在飞：连点不会串单（主进程也会挡，这里只是立刻反馈）。 */
 let pending = false
 /** 这一根的收盘时刻（本地倒计时基线，每次宿主推包都重置）。 */
 let barEnd = 0
 /** 这一根已经问过「到点了，重推一拍」没有；每根只问一次。 */
 let refreshAsked = false
+/** 第一次收到数据时把焦点放到第一个控件上（窗口刚弹出，键盘就能用）。 */
+let focusedOnce = false
 
 function setTone (element, tone) {
   element.dataset.tone = tone
+}
+
+function svgEl (tag, attrs = {}) {
+  const element = document.createElementNS(SVG_NS, tag)
+  for (const [key, value] of Object.entries(attrs)) element.setAttribute(key, String(value))
+  return element
 }
 
 function renderHeader (board) {
   const header = board.header
   titleEl.textContent = header.cropName === '—' ? '盘口' : '盘口 · ' + header.cropName
   subtitleEl.textContent = '15 分钟合约 · 收盘自动结算'
-  priceEl.textContent = header.priceText
-  setTone(priceEl, header.tone)
-  changeEl.textContent = header.changeText
-  setTone(changeEl, header.tone)
   countdownEl.textContent = header.countdownText
   coinsAvailableEl.textContent = header.coinsAvailableText
   coinsTotalEl.textContent = header.coinsTotalText
-  orderCropEl.textContent = header.cropName
+  weekPnlEl.textContent = board.week.pnlText
+  setTone(weekPnlEl, board.week.pnlTone)
+  weekPctEl.textContent = board.week.pctText
+  orderCropEl.textContent = board.order.cropName
+}
+
+function renderChart (board) {
+  const chart = board.chart
+  cropTabsEl.textContent = ''
+  for (const choice of board.crops) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'crop-tab'
+    button.dataset.crop = choice.id ?? ''
+    button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
+    button.textContent = choice.label
+    cropTabsEl.append(button)
+  }
+  const header = board.header
+  chartPriceEl.textContent = chart.priceText
+  setTone(chartPriceEl, header.tone)
+  chartChangeEl.textContent = header.changeText
+  const hint = board.hint
+  windEl.textContent = hint.direction === 'flat' && hint.label === '—'
+    ? '风向 —'
+    : '风向 ' + hint.label + ' ' + hint.confidenceText
+  const note = document.createElement('small')
+  note.textContent = hint.note
+  windEl.append(note)
+  // 视觉上「风向 偏多 62% 不是保证」；给读屏一句连起来的名字。
+  windEl.setAttribute('aria-label', '风向 ' + hint.label + ' ' + hint.confidenceText + '，' + hint.note)
+  setTone(windEl, hint.tone)
+  slotNoteEl.textContent = chart.slotText
+
+  legendEl.textContent = ''
+  for (const entry of chart.legend) {
+    const item = document.createElement('span')
+    const mark = document.createElement('i')
+    mark.className = entry.tone
+    const value = document.createElement('b')
+    value.textContent = entry.text
+    item.append(mark, document.createTextNode(entry.label + ' '), value)
+    legendEl.append(item)
+  }
+
+  // K 线：view 给的已经是 viewBox 坐标，这里只建元素，不做任何换算。
+  chartEl.textContent = ''
+  chartEmptyEl.hidden = chart.hasChart
+  chartEl.hidden = !chart.hasChart
+  const geometry = chart.geometry
+  if (geometry === null) {
+    chartEmptyEl.textContent = chart.emptyText
+    return
+  }
+  chartEl.setAttribute('viewBox', '0 0 ' + geometry.width + ' ' + geometry.height)
+  for (const y of geometry.grid) {
+    chartEl.append(svgEl('line', {
+      class: 'grid',
+      x1: geometry.plot.left,
+      x2: geometry.plot.left + geometry.plot.width,
+      y1: y,
+      y2: y,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+  }
+  for (const line of geometry.lines) {
+    if (line.visible !== true) continue
+    chartEl.append(svgEl('line', {
+      class: 'ref',
+      'data-key': line.key,
+      x1: geometry.plot.left,
+      x2: geometry.plot.left + geometry.plot.width,
+      y1: line.y,
+      y2: line.y,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+  }
+  if (geometry.priceLine !== null) {
+    chartEl.append(svgEl('line', {
+      class: 'price-line',
+      x1: geometry.plot.left,
+      x2: geometry.plot.left + geometry.plot.width,
+      y1: geometry.priceLine.y,
+      y2: geometry.priceLine.y,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+  }
+  const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
+  for (const candle of candles) {
+    const tone = candle.up ? 'up' : 'down'
+    chartEl.append(svgEl('line', {
+      class: 'wick ' + tone,
+      x1: candle.centerX,
+      x2: candle.centerX,
+      y1: candle.wickTop,
+      y2: candle.wickBottom,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+    const body = svgEl('rect', {
+      class: 'body ' + tone + (candle === geometry.forming ? ' forming' : ''),
+      x: candle.x,
+      y: candle.bodyTop,
+      width: candle.width,
+      height: candle.bodyHeight,
+      rx: 1
+    })
+    chartEl.append(body)
+  }
 }
 
 function renderOrder (board) {
@@ -105,6 +234,16 @@ function renderOrder (board) {
     button.textContent = choice.label
     marginRowEl.append(button)
   }
+  leverageRowEl.textContent = ''
+  for (const choice of order.leverages) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'chip'
+    button.dataset.leverage = String(choice.leverage)
+    button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
+    button.textContent = choice.label
+    leverageRowEl.append(button)
+  }
   previewEl.textContent = order.preview
   submitEl.textContent = pending ? '下单中…' : order.submitLabel
   submitEl.dataset.side = order.side
@@ -118,16 +257,11 @@ function renderPositions (board) {
     const row = document.createElement('div')
     row.className = 'position'
 
-    const main = document.createElement('div')
-    main.className = 'position-main'
+    const head = document.createElement('div')
+    head.className = 'position-head'
     const title = document.createElement('div')
     title.className = 'position-title'
     title.textContent = card.title
-    const meta = document.createElement('div')
-    meta.className = 'position-meta'
-    meta.textContent = '入场 ' + card.entryText + ' · 现价 ' + card.markText +
-      ' · 保证金 ' + card.marginText + ' · ' + card.statusText
-    main.append(title, meta)
 
     const right = document.createElement('div')
     right.className = 'position-side'
@@ -135,15 +269,32 @@ function renderPositions (board) {
     pnl.className = 'pnl'
     pnl.dataset.tone = card.pnlTone
     pnl.textContent = card.pnlText
+    const stop = document.createElement('button')
+    stop.type = 'button'
+    stop.className = 'ghost stop'
+    stop.dataset.stop = card.id
+    stop.dataset.nextStop = String(card.nextStopLevel)
+    stop.setAttribute('aria-pressed', card.stopLevel === 0 ? 'false' : 'true')
+    stop.disabled = !card.canStop
+    stop.textContent = card.stopTitle
+    stop.title = '点一下切到下一档：关 / −25% / −50% / −100% 保证金'
     const close = document.createElement('button')
     close.type = 'button'
     close.className = 'ghost'
     close.dataset.close = card.id
     close.disabled = !card.canClose
     close.textContent = card.closeLabel
-    right.append(pnl, close)
+    right.append(pnl, stop, close)
+    head.append(title, right)
 
-    row.append(main, right)
+    // 元信息单独占一行：入场 / 现价 / 强平 / 保证金都要看得到，塞进标题行会折行。
+    const meta = document.createElement('div')
+    meta.className = 'position-meta'
+    meta.textContent = '入场 ' + card.entryText + ' · 现价 ' + card.markText +
+      ' · 强平 ' + card.liqText + ' · 保证金 ' + card.marginText +
+      (card.settling ? ' · ' + card.statusText : '')
+
+    row.append(head, meta)
     positionsEl.append(row)
   }
   positionsMetaEl.textContent = board.positions.length + ' 手'
@@ -180,15 +331,69 @@ function renderHistory (board) {
   historyEmptyEl.textContent = board.hints.history
 }
 
+/**
+ * 重画会把按钮整个换掉，焦点跟着 DOM 一起没了：键盘用户切一档就掉回文档开头。
+ * 所以在重画前记下焦点是谁，画完按同一个「身份」放回去（找不到就算了）。
+ */
+function focusKeyOf (element) {
+  if (element === null || element === undefined) return null
+  if (element === submitEl) return 'submit'
+  if (element === closeButton) return 'close-button'
+  const data = element.dataset ?? {}
+  if (data.crop !== undefined) return 'crop:' + data.crop
+  if (data.side !== undefined) return 'side:' + data.side
+  if (data.margin !== undefined) return 'margin:' + data.margin
+  if (data.leverage !== undefined) return 'leverage:' + data.leverage
+  if (data.stop !== undefined) return 'stop:' + data.stop
+  if (data.close !== undefined) return 'close:' + data.close
+  return null
+}
+
+/** 焦点身份 → 回到哪个容器里找同名的按钮（`crop:tomato` → 页签组里的 tomato）。 */
+const FOCUS_ROOTS = {
+  crop: cropTabsEl,
+  side: sideRowEl,
+  margin: marginRowEl,
+  leverage: leverageRowEl,
+  stop: positionsEl,
+  close: positionsEl
+}
+
+function focusByKey (key) {
+  if (key === null) return
+  if (key === 'submit') return submitEl.focus({ preventScroll: true })
+  if (key === 'close-button') return closeButton.focus({ preventScroll: true })
+  const separator = key.indexOf(':')
+  const kind = key.slice(0, separator)
+  const value = key.slice(separator + 1)
+  const root = FOCUS_ROOTS[kind]
+  if (root === undefined) return
+  const target = root.querySelector('[data-' + kind + '="' + value + '"]')
+  if (target !== null) target.focus({ preventScroll: true })
+}
+
 function render () {
-  const board = view.boardView(payload, { now: Date.now(), side, margin })
+  const focused = focusKeyOf(document.activeElement)
+  const board = view.boardView(payload, { now: Date.now(), side, margin, leverage, crop })
   renderHeader(board)
+  renderChart(board)
   renderOrder(board)
   renderPositions(board)
   renderHistory(board)
-  // 选择的按钮可能被新一包换掉（白名单变了）：记住真实生效的值。
+  // 票 82 才有人榜数据：这里先画空态，免得那一行看起来像坏了。
+  neighborEmptyEl.textContent = board.hints.neighbors
+  // 选择可能被新一包换掉（白名单变了）：记住真实生效的值。
   side = board.order.side
   margin = board.order.margin
+  leverage = board.order.leverage
+  crop = board.chart.crop
+  if (!focusedOnce && payload !== null) {
+    focusedOnce = true
+    const first = cropTabsEl.querySelector('[data-crop]')
+    if (first !== null) first.focus({ preventScroll: true })
+    return
+  }
+  focusByKey(focused)
 }
 
 function tick () {
@@ -224,6 +429,13 @@ function submitAction (action) {
   api.submit(action)
 }
 
+cropTabsEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-crop]')
+  if (button === null || button.dataset.crop === '') return
+  crop = button.dataset.crop
+  render()
+})
+
 sideRowEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-side]')
   if (button === null || button.disabled) return
@@ -239,15 +451,30 @@ marginRowEl.addEventListener('click', (event) => {
   render()
 })
 
+leverageRowEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-leverage]')
+  if (button === null || button.disabled) return
+  const chosen = Number(button.dataset.leverage)
+  if (Number.isFinite(chosen)) leverage = chosen
+  render()
+})
+
 submitEl.addEventListener('click', () => {
   if (submitEl.disabled) return
-  submitAction({ action: 'trading-open-position', side, margin, leverage: 1, cropId: payload?.bar?.crop })
+  submitAction({ action: 'trading-open-position', side, margin, leverage, cropId: crop })
 })
 
 positionsEl.addEventListener('click', (event) => {
-  const button = event.target.closest('[data-close]')
-  if (button === null || button.disabled) return
-  submitAction({ action: 'trading-close-position', positionId: button.dataset.close })
+  const stop = event.target.closest('[data-stop]')
+  if (stop !== null && !stop.disabled) {
+    // 档位由 payload 的当前值算出来（view 的 nextStopLevel），窗口不自己数。
+    const level = Number(stop.dataset.nextStop)
+    submitAction({ action: 'trading-set-stop', positionId: stop.dataset.stop, level })
+    return
+  }
+  const close = event.target.closest('[data-close]')
+  if (close === null || close.disabled) return
+  submitAction({ action: 'trading-close-position', positionId: close.dataset.close })
 })
 
 closeButton.addEventListener('click', () => api?.close())
@@ -261,9 +488,6 @@ document.addEventListener('keydown', (event) => {
 api?.onState((next) => {
   if (next === null || typeof next !== 'object') return
   payload = next
-  const effective = view.orderView(next, { side, margin })
-  side = effective.side
-  margin = effective.margin
   // 倒计时基线：宿主给的是 epoch，窗口只减法算剩余；没有就退回 remainingMs。
   const end = Number(next.bar?.end)
   barEnd = Number.isFinite(end) && end > 0
