@@ -1,5 +1,28 @@
 # 发布与上架 dsh-market
 
+## 1.6.1 版本记录
+
+GitHub Release 用的简版文案：[`releases/1.6.1.md`](releases/1.6.1.md)。下面是实现细节。
+
+**修复：看田窗口被自动刷新踢回自己农场**
+
+- 现场：点邻居「看看农场」，几秒到半分钟就自己跳回自己农场，没点任何东西。
+- 宿主只记得访客视图、不记得“正在看谁家”：`refreshFarmWindow()` 只发 `{open:false}`，
+  模式按 `self.out` 重算成 `owner`、`look` 整块消失。触发它的是行情摘要（每 30 秒一轮）、
+  邻居来偷/帮忙、作物目录热加载、窗口倒计时到点。
+- 窗口那半份也在推波助澜：`tickPlots()` 在看田模式下取的还是自家 `farm.plots`，
+  于是自家作物一熟就发 `farm-refresh`——而 `farm-refresh` 同时被当成“切回我的农场”。
+- 修法：宿主记 `farmWindowLook`，看田期间不发主人视图；`farm-refresh` 保持当前视图
+  （看田时重拉邻居的公开视图，失败静默 60 秒）；新增 `farm-own` 作为切回自己农场的唯一出口；
+  窗口倒计时改走 `look.plots`；串门状态推不再覆盖只读视图。
+- 回归：`test/farm-look-refresh.test.js`（回环两只真宠物 + 录窗口命令）与
+  `test/farm-look-renderer.test.js`（真 `desktop/farm.js` 跑替身 DOM），两条都验证过修之前是红的。
+
+**没改什么**
+
+- 不改 LAN 协议、不加 UDP 报文；`farm.json` / `season.json` / `contracts.json` 都不升版本。
+- 回退到 1.6.0 即可，没有数据变更。
+
 ## 1.6.0 版本记录
 
 GitHub Release 用的简版文案：[`releases/1.6.0.md`](releases/1.6.0.md)。
