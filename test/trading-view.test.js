@@ -9,6 +9,7 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 
+import { TRADING_ERROR_CODES, tradingErrorText } from '../src/trading-text.js'
 import { liquidationPriceOf, pnlOf } from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
@@ -854,4 +855,25 @@ test('User Story 30：盘口窗上写明「没有手续费、没有资金费、�
   // US19：榜行把 view 给的 chips 画出来（不是只画「多 N · 空 M」计数）。
   assert.match(script, /league-chips/)
   assert.match(script, /chipOverflowText/)
+})
+
+test('评审 P2：窗口兜底错误文案与 trading-text.js 同码同文（drift）', async () => {
+  // 渲染端不是 ESM，抄一份可以；两边的同一错误码必须一个字都不差。
+  const source = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  const block = /const RESULT_CODE_TEXT = \{([\s\S]*?)\n\}/.exec(source)
+  assert.ok(block, 'board.js 应该有 RESULT_CODE_TEXT')
+  const table = {}
+  for (const match of block[1].matchAll(/(?:'([^']+)'|([A-Za-z-]+)):\s*'([^']+)'/g)) {
+    table[match[1] ?? match[2]] = match[3]
+  }
+  let shared = 0
+  for (const code of TRADING_ERROR_CODES) {
+    if (!(code in table)) continue
+    shared += 1
+    assert.equal(table[code], tradingErrorText(code), code + ' 的兜底文案漂了')
+  }
+  assert.ok(shared >= 11, '窗口的兜底表至少要覆盖 11 个宿主错误码（实际 ' + shared + '）')
+  // 这两条在评审里明确漂过：钉住它们，避免「两边一起改错」也能过。
+  assert.match(table['no-order'], /刷新一下就好/)
+  assert.match(table['no-position'], /刷新一下就好/)
 })
