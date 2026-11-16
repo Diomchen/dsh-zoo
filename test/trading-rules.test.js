@@ -3,7 +3,10 @@
  *
  * 只测外部行为——同一 seed 同一根的价格、slot/tick 边界、夹取范围、盈亏与结算取整、
  * 强平价与触线边界、止损档、逐 tick 路径检查（插针/跳 slot/离线补算的上限）、本周起点、
- * 到价挂单的目标价带与成交扫描。票 81 追加 K 线与风向。不碰磁盘、不碰时钟、不联网。
+ * 到价挂单的目标价带与成交扫描。票 81 追加 K 线与风向，票 84 追加周期分桶与采样。
+ * 票 86 追加**读得出来**的验收：日/周线收盘成段、总振幅远超单根振幅、周线实体不是针；
+ * 以及「采样细化只改显示」的回归（结算/路径扫描仍只认 15 分钟与逐分钟格点）。
+ * 不碰磁盘、不碰时钟、不联网；所有「现在」都是写死的本地时刻，行情是纯散列。
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -19,6 +22,7 @@ import {
   MAX_PATH_SCAN_SLOTS,
   PRICE_CEIL_RATIO,
   PRICE_FLOOR_RATIO,
+  PRICE_SALT,
   SLOT_MS,
   SLOT_TICKS,
   TICK_MS,
@@ -100,8 +104,9 @@ test('票 79：同一作物 + slot + tick 在任何机器上是同一个价（�
   // 中间插入别的计算不影响结果（没有隐藏的可变状态）。
   boardPrice({ crop: 'corn', slot: SLOT + 999, tick: 3 })
   assert.equal(boardPrice({ crop: 'tomato', slot: SLOT, tick: 0 }), first)
-  // 散列本身是固定的：种子/盐一改就会在这里报警。
-  assert.equal(hash32('board-v1:tomato:fast:0'), 3290775997)
+  // 散列本身是固定的：种子/盐一改就会在这里报警（票 86 把盐升到 v2，老图作废）。
+  assert.equal(PRICE_SALT, 'board-v2')
+  assert.equal(hash32('board-v2:tomato:fast:0'), 1142833372)
 })
 
 test('票 79：收盘价 = 下一根的开盘价，bar 之间连续', () => {
@@ -423,9 +428,12 @@ test('票 80：跳过多根也逐根扫；先撞到的那一处算（不是收�
  * 给「补算上限」造一组参数：前 3 天（窗口内）怎么走都碰不到强平线，
  * 第 4 天起才跌穿它。返回 `{ start, entry, from, to }`；找不到就抛——
  * 抛出来说明行情规则变了，用例该重新挑点，而不是悄悄放过。
+ *
+ * 起点按**一天**（96 根）跳着找，不是逐根：票 86 的慢波最长到 12 周，
+ * 连着 60 根只有 15 小时，几乎停在同一个相位上，找不到「窗口内安全、之后才跌」的一段。
  */
 function beyondCap (seed) {
-  for (let start = seed; start < seed + 60; start += 1) {
+  for (let start = seed; start < seed + 60 * 96; start += 96) {
     let floor = Infinity
     for (let slot = start; slot < start + MAX_PATH_SCAN_SLOTS; slot += 1) {
       floor = Math.min(floor, extremesOf(slot).low.price)
@@ -633,12 +641,13 @@ test('票 84：1 日按本地自然日、1 周按本地周一 00:00 分桶', () 
   )
 })
 
-test('票 84：OHLC 由 boardPrice()/markPrice() 采样聚合——1 时每 5 分、1 日每小时、1 周每 6 小时', () => {
-  const stepOf = { '1h': 5 * TICK_MS, '1d': HOUR_MS, '1w': 6 * HOUR_MS }
-  const countOf = { '1h': 13, '1d': 25, '1w': 29 }
+test('票 84/86：OHLC 由 boardPrice()/markPrice() 采样聚合——1 时每 5 分、1 日每小时、1 周每 3 小时', () => {
+  // 票 86 把 1 周从 6 小时加密到 3 小时：一根 57 针，周线的影线不再被粗抽样糊掉。
+  const stepOf = { '1h': 5 * TICK_MS, '1d': HOUR_MS, '1w': 3 * HOUR_MS }
+  const countOf = { '1h': 13, '1d': 25, '1w': 57 }
   for (const [timeframe, stepMs] of Object.entries(stepOf)) {
     const chart = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe })
-    // 已收的一根：两端都算 → 1 时 13 针、1 日 25 针、1 周 29 针。
+    // 已收的一根：两端都算 → 1 时 13 针、1 日 25 针、1 周 57 针。
     const closed = chart.bars[5]
     const closedPath = sampledPath('tomato', closed.start, closed.end, stepMs)
     assert.equal(closedPath.length, countOf[timeframe], timeframe + ' 的采样点数')
@@ -646,6 +655,13 @@ test('票 84：OHLC 由 boardPrice()/markPrice() 采样聚合——1 时每 5 �
     assert.equal(closed.close, closedPath.at(-1))
     assert.equal(closed.high, Math.max(...closedPath))
     assert.equal(closed.low, Math.min(...closedPath))
+    // 票 86 验收：首尾两针**正好落在桶边界上**——开 = 桶起点的现价、收 = 桶终点的现价，
+    // 与采样步长无关（步长只决定中间取几针，不决定开收盘价）。
+    assert.equal(closed.open, markPrice({ crop: 'tomato', now: closed.start }), timeframe + ' 开 = 桶起点价')
+    assert.equal(closed.close, markPrice({ crop: 'tomato', now: closed.end }), timeframe + ' 收 = 桶终点价')
+    // 桶起点/终点都落在 15 分钟格点上：那一针就是该 slot 的开盘（tick 0），不是收盘。
+    assert.equal(slotIndexAt(closed.start) * SLOT_MS, closed.start, timeframe + ' 桶起点对齐 slot')
+    assert.equal(slotIndexAt(closed.end) * SLOT_MS, closed.end, timeframe + ' 桶终点对齐 slot')
     // 形成中的一根只采到「现在」，高低点也只算已走完的路径。
     const formingPath = sampledPath('tomato', chart.current.start, TF_NOW, stepMs)
     assert.equal(chart.current.open, formingPath[0])
@@ -700,6 +716,187 @@ test('票 84：切周期只换图——结算仍只认 15 分钟收盘，路径�
     barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: id })
   }
   assert.deepEqual(pathScan(scanArgs), scanBefore)
+})
+
+/**
+ * 票 86 的验收要用到的读数（只服务用例，不进产品代码）。
+ * 三个固定「现在」跨过不同年份/季节，落在 4 周波与 12 周波的不同相位上：
+ * 行情是确定性的，所以这几个时刻的读数也是定值；多挑几个是为了证明不是碰巧好看。
+ */
+const READABILITY_NOWS = Object.freeze([
+  TF_NOW,
+  new Date(2027, 1, 10, 9, 12, 0, 0).getTime(),
+  new Date(2027, 5, 1, 21, 47, 0, 0).getTime()
+])
+
+/** 连续同向收盘最长的一段（根数：1 = 一根都没连着同向，24 = 一路单边）。 */
+function longestTrendRun (closes) {
+  let best = 1
+  let current = 1
+  let direction = 0
+  for (let index = 1; index < closes.length; index += 1) {
+    const step = Math.sign(closes[index] - closes[index - 1])
+    if (step === 0) continue
+    if (step === direction) current += 1
+    else {
+      direction = step
+      current = 2
+    }
+    if (current > best) best = current
+  }
+  return best
+}
+
+function medianOf (values) {
+  const sorted = [...values].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle]
+}
+
+/**
+ * 一张粗周期图的读数：
+ * `run` 趋势段（同向收盘最长一段）、`rangeRatio` 总振幅 / 单根振幅中位数
+ * （≈1 就是「每根各走各的」，越大越像一段行情）、`bodyRatio` 实体占单根振幅的均值。
+ */
+function readabilityOf (chart) {
+  const bars = chart.bars
+  const totalRange = Math.max(...bars.map((bar) => bar.high)) - Math.min(...bars.map((bar) => bar.low))
+  const medianRange = medianOf(bars.map((bar) => bar.high - bar.low))
+  const bodyRatio = bars.reduce(
+    (sum, bar) => sum + (bar.high === bar.low ? 0 : Math.abs(bar.close - bar.open) / (bar.high - bar.low)),
+    0
+  ) / bars.length
+  return {
+    run: longestTrendRun(bars.map((bar) => bar.close)),
+    rangeRatio: totalRange / medianRange,
+    bodyRatio
+  }
+}
+
+/**
+ * 票 86 的核心验收（ADR-0030）：日线/周线要能读出趋势，不能是「开收盘贴均值、影线满幅」。
+ *
+ * 阈值是照着模型量出来的，不是编的（旧模型同一时刻的读数写在下面做对照）：
+ *   1 日：趋势段 5–7 根（旧 3）、总振幅 3.8–5.0× 单根（旧 1.1×）；
+ *   1 周：趋势段 4 根（旧 3）、总振幅 2.1–2.2× 单根（旧 1.1×）、实体占比 0.41–0.49（旧 0.38–0.42
+ *         但那是「影线满幅」下的假实体：单根振幅本身就接近整张图）。
+ * 三个作物 × 三个时刻一起断言，谁把长波幅度调小了都会在这里露出来。
+ */
+test('票 86：多尺度慢波——1 日/1 周都读得出趋势，周线实体不是针', () => {
+  for (const crop of BOARD_CROPS) {
+    for (const now of READABILITY_NOWS) {
+      const day = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1d' }))
+      const dayTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 日'
+      assert.ok(day.run >= 4, dayTag + '趋势段只有 ' + day.run + ' 根')
+      assert.ok(day.rangeRatio >= 2, dayTag + '总振幅只有单根的 ' + day.rangeRatio.toFixed(2) + ' 倍')
+
+      const week = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1w' }))
+      const weekTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 周'
+      assert.ok(week.run >= 3, weekTag + '趋势段只有 ' + week.run + ' 根')
+      assert.ok(week.rangeRatio >= 1.8, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
+      // 实体占比：影线不是「接近满幅」，收盘价确实落在这一周的实际移动上。
+      assert.ok(week.bodyRatio >= 0.35, weekTag + '实体占比只有 ' + week.bodyRatio.toFixed(3))
+    }
+  }
+})
+
+/**
+ * 票 86：短波只是从「风」收成「呼吸」，没有把 15 分钟图做平，价格也不去撞夹子。
+ * - 6 小时（24 根整根 + 当前一根）的最高最低差 ≥ 底价的 10%：实测 13–24%（旧模型 ≈38%）；
+ * - 夹取 [0.55, 1.75] × 底价 是兜底，不是日常：一年 × 三个作物 × 每根 3 个 tick 扫下来，
+ *   价格仍在 [0.58, 1.70] × 底价 之内（实测 0.61–1.65），没有一根是被夹出来的。
+ */
+test('票 86：15 分钟仍有日内波动，价格离夹子有余量', () => {
+  for (const crop of BOARD_CROPS) {
+    const base = CROPS[crop].base
+    const chart = barsFor({ crop, now: TF_NOW })
+    const highs = chart.bars.map((bar) => bar.high).concat(chart.current.high)
+    const lows = chart.bars.map((bar) => bar.low).concat(chart.current.low)
+    const range = Math.max(...highs) - Math.min(...lows)
+    assert.ok(
+      range >= base * 0.1,
+      crop + ' 6 小时振幅只有底价的 ' + ((range / base) * 100).toFixed(1) + '%'
+    )
+  }
+  // 逐 slot 扫一年：快噪声的格点就在整数 slot 上，取开盘/半根/收盘三针已经够密。
+  for (const crop of BOARD_CROPS) {
+    const base = CROPS[crop].base
+    const firstSlot = slotIndexAt(TF_NOW)
+    let lowest = Infinity
+    let highest = -Infinity
+    for (let offset = 0; offset < 365 * 96; offset += 1) {
+      for (const tick of [0, SLOT_TICKS / 2, SLOT_TICKS]) {
+        const ratio = boardPrice({ crop, slot: firstSlot + offset, tick }) / base
+        if (ratio < lowest) lowest = ratio
+        if (ratio > highest) highest = ratio
+      }
+    }
+    assert.ok(lowest >= 0.58, crop + ' 价格贴到夹取下沿：' + lowest.toFixed(3))
+    assert.ok(highest <= 1.7, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
+  }
+})
+
+/**
+ * 票 86 的回归：采样细化只改「看哪几针」，不动结算/路径/止损。
+ *
+ * 合约结算只认 15 分钟收盘（`slotClosePrice` = 下一根开盘）；粗周期的收/开是**桶边界**
+ * 那一刻的现价——那是某个 15 分钟的**开盘**，不是收盘，所以它进不了结算。
+ * 这里同时钉住两件事：
+ * 1) 结算的输入仍然只有两个价格（票 86 曲线下的结果是定值，改采样不该动它）；
+ * 2) 路径扫描仍逐分钟走**绝对分钟格点**：测试自己重扫一遍，结果逐字相同。
+ */
+test('票 86：采样细化只改显示——结算/路径/止损仍只认 15 分钟与逐分钟格点', () => {
+  const slot = slotIndexAt(TF_NOW)
+  const close = slotClosePrice('tomato', slot)
+  // 结算价 = 本根收盘 = 下一根开盘（票 79 的口径），窗口在看哪个周期都一样。
+  assert.equal(close, boardPrice({ crop: 'tomato', slot, tick: SLOT_TICKS }))
+  assert.equal(close, boardPrice({ crop: 'tomato', slot: slot + 1, tick: 0 }))
+  // 1 周/1 日的收盘落在桶边界（本地零点/整点）上，是 15 分钟的开盘价，不是收盘价。
+  const week = barsForTimeframe({ crop: 'tomato', now: TF_NOW, timeframe: '1w' })
+  const lastWeek = week.bars.at(-1)
+  assert.equal(lastWeek.close, boardPrice({ crop: 'tomato', slot: slotIndexAt(lastWeek.end), tick: 0 }))
+  // 结算 = 保证金 × 杠杆 × (现价/入场 − 1)，只在最后取整；亏损封顶保证金。
+  assert.deepEqual(
+    settlementOf({ side: 'long', margin: 100, leverage: 5, entry: 5, mark: close }),
+    { pnl: 110, credit: 210 }
+  )
+  assert.deepEqual(
+    settlementOf({ side: 'short', margin: 100, leverage: 5, entry: 5, mark: close }),
+    { pnl: -100, credit: 0 }
+  )
+
+  // 路径扫描的参考实现：从下一个整数分钟走到终点，端点也算（和 pathScan 同一条网格）。
+  const referenceScan = (from, to, triggered, reason) => {
+    let cursor = Math.ceil(from / TICK_MS) * TICK_MS
+    if (cursor <= from) cursor += TICK_MS
+    while (cursor < to) {
+      const mark = markPrice({ crop: 'tomato', now: cursor })
+      if (triggered(mark)) return { at: cursor, exit: mark, reason }
+      cursor += TICK_MS
+    }
+    const mark = markPrice({ crop: 'tomato', now: to })
+    return triggered(mark) ? { at: to, exit: mark, reason } : null
+  }
+
+  // 强平：20× 做多，插针那一分钟就穿线——逐分钟重扫，第一处触发必须完全对上。
+  const { slot: spikeSlot, entry } = spikeLong(SLOT + 3)
+  const from = spikeSlot * SLOT_MS
+  const to = (spikeSlot + 1) * SLOT_MS
+  const liquidation = liquidationPriceOf({ side: 'long', entry, leverage: 20 })
+  assert.deepEqual(
+    pathScan({ crop: 'tomato', side: 'long', margin: 50, leverage: 20, entry, from, to }),
+    referenceScan(from, to, (mark) => isLiquidated({ side: 'long', mark, liquidation }), 'liquidate')
+  )
+  // 止损：5× 的 −25% 保证金 = 价格 −5%，同一根里先撞到它（强平线在 −20%，这一根摸不到）。
+  assert.deepEqual(
+    pathScan({ crop: 'tomato', side: 'long', margin: 50, leverage: 5, entry, stopLoss: 0.25, from, to }),
+    referenceScan(
+      from,
+      to,
+      (mark) => isStopLossHit({ side: 'long', margin: 50, leverage: 5, entry, mark, stopLoss: 0.25 }),
+      'stop'
+    )
+  )
 })
 
 test('票 81：风向是确定性的 55–68% 弱信号，同一根内不变', () => {
