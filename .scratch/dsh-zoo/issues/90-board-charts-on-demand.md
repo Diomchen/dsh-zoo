@@ -49,3 +49,7 @@
 `encodeMessage()` 返回 null——与现场一致。
 
 `trading-charts` 单种回执（同样过白名单）：约 11.7 KiB。
+
+## 进度
+
+- [x] 实现
