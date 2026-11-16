@@ -16,6 +16,7 @@ import { resetCropCatalog } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
 import {
   BOARD_CROPS,
+  BOARD_TIMEFRAMES,
   SLOT_MS,
   TICK_MS,
   TRADING_LEVERAGES,
@@ -419,6 +420,70 @@ test('票 81 e2e：三作物 K 线 + 风向随 /state 下发；成形那根随�
   }
   assert.notEqual(after.body.trading.charts.tomato.current.price,
     before.body.trading.charts.tomato.current.price)
+})
+
+test('票 84 e2e：四周期随 /state 下发；切周期不改持仓/硬币/周盈亏，结算仍按 15 分', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: OPEN_AT }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+
+  // 先开一手：切换周期时这手仓位、硬币、周盈亏都不许动。
+  const opened = await action(service, {
+    action: 'trading-open-position', side: 'long', margin: 50, leverage: 1, cropId: 'tomato'
+  })
+  assert.equal(opened.body.ok, true)
+  const before = (await state(service)).body.trading
+  const ids = BOARD_TIMEFRAMES.map(({ id }) => id)
+  assert.deepEqual(Object.keys(before.timeframes), ids)
+  assert.deepEqual(before.limits.timeframes, BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })))
+  for (const { id } of BOARD_TIMEFRAMES) {
+    assert.deepEqual(Object.keys(before.timeframes[id]), BOARD_CROPS, id + ' 有三个作物')
+    for (const crop of BOARD_CROPS) {
+      const chart = before.timeframes[id][crop]
+      assert.equal(chart.bars.length, 24, id + ' / ' + crop + ' 最近 24 根')
+      assert.ok(chart.current.start <= clock.value && clock.value < chart.current.end)
+      assert.equal(chart.current.tick === null, id !== '15m', id + ' 的 tick 口径')
+      for (const bar of chart.bars) assert.ok(bar.end > bar.start, id + ' 每根都有 start/end')
+    }
+  }
+  // 15 分仍就是旧字段 charts 的那一份，`payload.bar` 也还是它。
+  assert.deepEqual(before.timeframes['15m'], before.charts)
+  assert.equal(before.bar.price, before.charts.tomato.current.price)
+
+  // 窗口切周期是纯视图换图：同一份 payload 里硬币/持仓/周盈亏一个字不动。
+  const money = JSON.stringify({ coins: before.coins, positions: before.positions, week: before.week })
+  for (const id of ids) {
+    const board = boardView.boardView(before, { now: clock.value, timeframe: id })
+    assert.equal(board.chart.timeframe, id)
+    assert.equal(board.chart.hasChart, true)
+    assert.equal(board.chart.settleNote.visible, id !== '15m')
+    assert.equal(JSON.stringify({ coins: before.coins, positions: before.positions, week: before.week }), money)
+  }
+
+  // 时钟推到这一根收盘之后：结算仍用 15 分钟收盘价，跟窗口正在看哪个周期无关。
+  const position = before.positions[0]
+  clock.value = SLOT_EDGE + SLOT_MS + 1000
+  assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
+  const afterState = await state(service)
+  const settled = afterState.body.trading
+  const expected = settlementOf({
+    side: 'long',
+    margin: 50,
+    leverage: 1,
+    entry: position.entry,
+    mark: slotClosePrice('tomato', position.slot)
+  })
+  assert.equal(settled.positions.length, 0)
+  assert.equal(settled.history.length, 1)
+  assert.equal(settled.history[0].reason, 'settle')
+  assert.equal(settled.history[0].exit, slotClosePrice('tomato', position.slot))
+  assert.equal(settled.history[0].pnl, expected.pnl)
+  assert.equal(settled.week.pnl, expected.pnl)
+  assert.equal(afterState.body.farm.coins, 450 + expected.credit)
+  // 结算之后新一包仍然带四个周期（窗口不用重开）。
+  assert.deepEqual(Object.keys(settled.timeframes), ids)
 })
 
 test('票 81 e2e：周一 00:00 清零的是本周盈亏，不是硬币', async (t) => {

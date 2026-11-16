@@ -8,9 +8,12 @@
  * 窗口不自己改状态、不自己算钱，也不自己算价（K 线几何在 `trading-view.js` 里，
  * 这里只把 view 给的坐标画成 SVG 元素）。
  *
- * 键盘：Tab 顺序就是 DOM 顺序（作物页签 → 方向 → 保证金 → 杠杆 → 开一手 → 每手仓位
- * 的止损/平仓）；Enter/Space 是原生按钮行为；Esc 关窗。窗口失焦**不**关窗
- * （macOS 中文输入法候选窗会抢焦点，农场窗踩过这个坑）。
+ * 键盘：Tab 顺序就是 DOM 顺序（作物页签 → 周期页签 → 方向 → 保证金 → 杠杆 → 开一手
+ * → 每手仓位的止损/平仓）；Enter/Space 是原生按钮行为；Esc 关窗。失焦策略见 ADR-0029：
+ * 点窗口外面会收起所有插件窗，输入法合成期间例外（旧「永不按 blur 关」的约定已作废）。
+ *
+ * 票 84：周期切换只换本地图（`payload.timeframes` 一次全下发），不发 IPC、不重开窗；
+ * 合约结算仍然只认 15 分钟收盘，所以切周期绝不动持仓/硬币/周盈亏。
  */
 'use strict'
 
@@ -26,11 +29,13 @@ const countdownEl = document.getElementById('countdown')
 const coinsAvailableEl = document.getElementById('coins-available')
 const coinsTotalEl = document.getElementById('coins-total')
 const cropTabsEl = document.getElementById('crop-tabs')
+const timeframeTabsEl = document.getElementById('timeframe-tabs')
 const chartPriceEl = document.getElementById('chart-price')
 const chartChangeEl = document.getElementById('chart-change')
 const windEl = document.getElementById('wind')
 const chartEl = document.getElementById('chart')
 const chartEmptyEl = document.getElementById('chart-empty')
+const chartSettleHintEl = document.getElementById('chart-settle-hint')
 const legendEl = document.getElementById('legend')
 const slotNoteEl = document.getElementById('slot-note')
 const orderCropEl = document.getElementById('order-crop')
@@ -91,6 +96,8 @@ let side = 'long'
 let margin = 50
 let leverage = 1
 let crop = null
+/** 票 84：选中的 K 线周期（只活在窗口里；切换不发 IPC，也不影响结算）。 */
+let timeframe = '15m'
 /** 票 83：保证金选的是不是「全下」（金额每包按可用硬币现算，所以只记这个布尔）。 */
 let allIn = false
 /** 到价面板开没开；关着时输入框和挂单按钮不出现（SPEC：下单区只在点开「到价」时出现）。 */
@@ -141,6 +148,21 @@ function renderChart (board) {
     button.textContent = choice.label
     cropTabsEl.append(button)
   }
+  // 周期页签：清单/文案来自 payload（宿主唯一来源），这里只画。
+  timeframeTabsEl.textContent = ''
+  for (const choice of chart.timeframes) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'timeframe-tab'
+    button.dataset.timeframe = choice.id
+    button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
+    button.disabled = choice.disabled
+    button.textContent = choice.label
+    timeframeTabsEl.append(button)
+  }
+  chartSettleHintEl.textContent = chart.settleNote.text
+  chartSettleHintEl.dataset.visible = chart.settleNote.visible ? 'true' : 'false'
+  chartEl.setAttribute('aria-label', chart.ariaLabel)
   const header = board.header
   chartPriceEl.textContent = chart.priceText
   setTone(chartPriceEl, header.tone)
@@ -494,6 +516,7 @@ function focusKeyOf (element) {
   if (element === limitPlaceEl) return 'limit-place'
   const data = element.dataset ?? {}
   if (data.crop !== undefined) return 'crop:' + data.crop
+  if (data.timeframe !== undefined) return 'timeframe:' + data.timeframe
   if (data.side !== undefined) return 'side:' + data.side
   // 「全下」的金额每包都变，用语义键记住焦点，别和同金额的预设按钮撞车。
   if (data.allIn === 'true') return 'margin:all-in'
@@ -508,6 +531,7 @@ function focusKeyOf (element) {
 /** 焦点身份 → 回到哪个容器里找同名的按钮（`crop:tomato` → 页签组里的 tomato）。 */
 const FOCUS_ROOTS = {
   crop: cropTabsEl,
+  timeframe: timeframeTabsEl,
   side: sideRowEl,
   margin: marginRowEl,
   leverage: leverageRowEl,
@@ -565,6 +589,7 @@ function render () {
     margin,
     leverage,
     crop,
+    timeframe,
     limitOpen,
     targetText,
     allIn
@@ -582,6 +607,7 @@ function render () {
   leverage = board.order.leverage
   allIn = board.order.allIn
   crop = board.chart.crop
+  timeframe = board.chart.timeframe
   // Tab 顺序按纯视图给的逻辑顺序落到 tabindex（DOM 已全部建好）。
   applyTabOrder(payload)
   if (!focusedOnce && payload !== null) {
@@ -637,6 +663,14 @@ cropTabsEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-crop]')
   if (button === null || button.dataset.crop === '') return
   crop = button.dataset.crop
+  render()
+})
+
+// 票 84：切周期只换本地图，不重开窗、不请宿主刷新；结算是另一条路。
+timeframeTabsEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-timeframe]')
+  if (button === null || button.disabled) return
+  timeframe = button.dataset.timeframe
   render()
 })
 

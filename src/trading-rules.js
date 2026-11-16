@@ -3,6 +3,8 @@
  *
  * 这一层不读盘、不碰时钟、不碰网络：价格只由 `作物 + slot + tick + 版本盐` 决定，
  * 同一套代码在任何机器上算出同一张图（ADR-0028：不做对手盘、不做服务器）。
+ * 票 84 的 1 时/1 日/1 周只是把**同一条**曲线按更粗的桶采样来画趋势（显示用近似）；
+ * 合约结算仍然只认 15 分钟收盘，粗周期一根都不参与（见 `barsForTimeframe`）。
  *
  * 行情只有 `boardPrice()` 一个入口：当前价、收盘结算价、K 线（票 81）、
  * 离线补算与强平（票 80）都必须调它。多写一个价格公式，就会出现「图上没插针、
@@ -20,6 +22,8 @@ import { CROPS } from './farm-rules.js'
 export const SLOT_MS = 15 * 60 * 1000
 export const SLOT_TICKS = 15
 export const TICK_MS = SLOT_MS / SLOT_TICKS
+/** 1 小时 = 4 个 slot（票 84 的 1 时桶，纪元对齐）。 */
+const HOUR_MS = 60 * 60 * 1000
 /**
  * 路径检查的窗口上限：3 天 = 288 根。离线很久回来时，循环必须有界——
  * 超过这一段的部分不逐分钟扫，由调用方按「那一根的收盘价」结掉
@@ -89,6 +93,28 @@ const TWO_PI = Math.PI * 2
 export const BOARD_BAR_COUNT = 24
 /** 兜底上限：payload 是跨进程数据，24 之外再多画只会白占带宽。 */
 const MAX_BOARD_BAR_COUNT = 72
+/**
+ * 盘口 K 线的周期（票 84）：`15m` 就是合约本身的一根（`barsFor`，精确到 1 分钟），
+ * 其余三个只是把**同一条** `boardPrice()` 曲线按更粗的桶读出来看趋势。
+ * 这里是周期清单的唯一来源：`limits.timeframes` 直接由它下发，窗口不复制一份。
+ */
+export const BOARD_TIMEFRAMES = Object.freeze([
+  Object.freeze({ id: '15m', label: '15分' }),
+  Object.freeze({ id: '1h', label: '1时' }),
+  Object.freeze({ id: '1d', label: '1日' }),
+  Object.freeze({ id: '1w', label: '1周' })
+])
+/**
+ * 粗周期的采样步长（票 84）：1 时每 5 分钟、1 日每小时、1 周每 6 小时。
+ * **采样只用于画图**：粗周期看不出 15 分钟里的插针，而合约结算仍然只认
+ * `slotClosePrice()`（15 分钟收盘）。所以这里只决定「看哪几个点」，
+ * 不引入第二种价格公式——每一针还是 `markPrice()`。
+ */
+const TIMEFRAME_SAMPLE_MS = Object.freeze({
+  '1h': 5 * TICK_MS,
+  '1d': 60 * TICK_MS,
+  '1w': 6 * 60 * TICK_MS
+})
 /**
  * 风向 = 慢趋势在本根的斜率（本根起点 → 下一根起点），**快噪声不参与**。
  * 置信度 55–68% 是产品口径：慢趋势的斜率越陡越可信，但快噪声随时能把弱信号打反，
@@ -226,6 +252,8 @@ export function markPrice ({ crop, now } = {}) {
  * 为什么只取整数 tick：1 分钟就是图上最小的刻度，再密的采样只会让 payload 变大，
  * 而落在两根 tick 之间的极值在图上根本看不出来。收盘 = 下一根的开盘由
  * `boardPrice()` 的插值方式保证，所以相邻两根天然连续，不用额外对齐。
+ * `start`/`end` 是这一根的真实毫秒边界（票 84）：窗口用它写时间标签，
+ * 不再打印「自 1970 起的第几根」这种玩家看不懂的绝对序号。
  */
 function barAt (crop, slot) {
   const open = boardPrice({ crop, slot, tick: 0 })
@@ -237,7 +265,15 @@ function barAt (crop, slot) {
     if (price > high) high = price
     if (price < low) low = price
   }
-  return { slot, open, high, low, close }
+  return {
+    slot,
+    start: slot * SLOT_MS,
+    end: (slot + 1) * SLOT_MS,
+    open,
+    high,
+    low,
+    close
+  }
 }
 
 /**
@@ -283,11 +319,161 @@ export function barsFor ({ crop, now, count = BOARD_BAR_COUNT } = {}) {
     bars,
     current: {
       slot: bounds.slot,
+      start: bounds.start,
+      end: bounds.end,
       open,
       high,
       low,
       price,
       tick: Math.round(tick * 100) / 100,
+      remainingMs: Math.max(0, bounds.end - stamp)
+    }
+  }
+}
+
+/**
+ * 本地自然日 00:00（票 84 的「1 日」桶边界）。
+ * 写法和 `weekStartOf()` 同一条：先归零时分秒，跨夏令时那天也不会偏到前一天 23:00。
+ * 日/周的边界必须按**本地日历**走，不能用 `start + 24h`——夏令时那天会错一小时。
+ */
+function dayStartOf (stamp) {
+  const date = new Date(stamp)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
+/** 本地日历 +`days` 天的 00:00：`setDate` 按本地日历走，跨夏令时也落在本地零点。 */
+function shiftLocalDayStart (start, days) {
+  const date = new Date(start)
+  date.setDate(date.getDate() + days)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
+/**
+ * 一个粗周期桶的边界（票 84）：`start` 是桶起点，`end` 是下一个桶的起点。
+ * 1 时按纪元整点对齐（全世界同一条线，和 slot 一样）；1 日/1 周按本地日历对齐。
+ */
+function bucketBoundsOf (timeframe, stamp) {
+  if (timeframe === '1h') {
+    const start = Math.floor(stamp / HOUR_MS) * HOUR_MS
+    return { start, end: start + HOUR_MS }
+  }
+  if (timeframe === '1d') {
+    const start = dayStartOf(stamp)
+    return { start, end: shiftLocalDayStart(start, 1) }
+  }
+  if (timeframe === '1w') {
+    const start = weekStartOf(stamp)
+    if (start === null) return null
+    return { start, end: shiftLocalDayStart(start, 7) }
+  }
+  return null
+}
+
+/** 上一个桶的起点：1 时是整点减法；1 日/1 周走本地日历（夏令时安全）。 */
+function previousBucketStartOf (timeframe, start) {
+  if (timeframe === '1h') return start - HOUR_MS
+  if (timeframe === '1d') return shiftLocalDayStart(start, -1)
+  if (timeframe === '1w') return shiftLocalDayStart(start, -7)
+  return null
+}
+
+/**
+ * 粗周期在 `[start, limit]` 上的采样价：从 `start` 起每 `stepMs` 一针，**两端都算**
+ * （起点是开盘、终点是收盘）。终点不落在整步上时补最后一针，所以本地日/周在夏令时
+ * 那天也照样首尾对齐；形成中的桶把 `limit = now`，只采到此刻。
+ */
+function sampledPrices (crop, start, limit, stepMs) {
+  const prices = []
+  for (let at = start; at < limit; at += stepMs) {
+    const price = markPrice({ crop, now: at })
+    if (price === null) return null
+    prices.push(price)
+  }
+  const last = markPrice({ crop, now: limit })
+  if (last === null) return null
+  prices.push(last)
+  return prices
+}
+
+/**
+ * 一根粗周期的 OHLC：开 = 第一针、收 = 最后一针、高/低 = 采样路径上的极值。
+ * 采样只用于画图（显示用近似）；`close` 仍然只是 `boardPrice()` 在那一刻的价，
+ * 不是第二种结算公式——合约结算只认 15 分钟收盘（`slotClosePrice()`）。
+ */
+function coarseBarAt (crop, timeframe, start, limit) {
+  const stepMs = TIMEFRAME_SAMPLE_MS[timeframe]
+  const prices = sampledPrices(crop, start, limit, stepMs)
+  if (prices === null) return null
+  let high = prices[0]
+  let low = prices[0]
+  for (const price of prices) {
+    if (price > high) high = price
+    if (price < low) low = price
+  }
+  return {
+    slot: Math.floor(start / SLOT_MS),
+    open: prices[0],
+    high,
+    low,
+    close: prices[prices.length - 1]
+  }
+}
+
+/**
+ * 任意周期的「最近 `count` 根 + 当前形成中的一根」（票 84）。
+ *
+ * `15m` 原样转给 `barsFor()`——那是合约本身的一根，精确到 1 分钟 tick，
+ * 语义一个字都没改；`1h`/`1d`/`1w` 由同一条 `boardPrice()` 曲线按粗桶采样，
+ * 只为了看趋势。`current.tick` 对粗周期是 `null`：`第 m/15 分钟` 这种进度
+ * 只对 15 分钟的合约根有意义。
+ *
+ * 返回形状与 `barsFor()` 一致（`base` + `bars` + `current`），只是每根多带
+ * `start`/`end` 毫秒边界；窗口按 payload 画，不自己算桶。
+ */
+export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_BAR_COUNT } = {}) {
+  if (timeframe === '15m') return barsFor({ crop, now, count })
+  if (baseOf(crop) === null) return null
+  if (TIMEFRAME_SAMPLE_MS[timeframe] === undefined) return null
+  const stamp = finiteNumber(now)
+  if (stamp === null) return null
+  const total = Number.isInteger(count)
+    ? Math.floor(clampNumber(count, 1, MAX_BOARD_BAR_COUNT))
+    : BOARD_BAR_COUNT
+  const bounds = bucketBoundsOf(timeframe, stamp)
+  if (bounds === null) return null
+  // 先把「当前桶 + 它的 total 个前任」的起点串起来（旧 → 新），再逐段采样。
+  const starts = [bounds.start]
+  for (let index = 0; index < total; index += 1) {
+    const previous = previousBucketStartOf(timeframe, starts[starts.length - 1])
+    if (previous === null) return null
+    starts.push(previous)
+  }
+  const bars = []
+  for (let index = starts.length - 1; index >= 1; index -= 1) {
+    const barStart = starts[index]
+    const barEnd = starts[index - 1]
+    const bar = coarseBarAt(crop, timeframe, barStart, barEnd)
+    if (bar === null) return null
+    bars.push({ ...bar, start: barStart, end: barEnd })
+  }
+  const forming = coarseBarAt(crop, timeframe, bounds.start, stamp)
+  const price = markPrice({ crop, now: stamp })
+  if (forming === null || price === null) return null
+  return {
+    base: baseOf(crop),
+    bars,
+    current: {
+      slot: Math.floor(bounds.start / SLOT_MS),
+      start: bounds.start,
+      end: bounds.end,
+      open: forming.open,
+      high: forming.high,
+      low: forming.low,
+      price,
+      // 粗周期没有「本根第几分钟」：`第 m/15 分钟` 只属于 15 分钟合约。
+      tick: null,
       remainingMs: Math.max(0, bounds.end - stamp)
     }
   }

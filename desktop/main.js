@@ -54,6 +54,10 @@ const shared = require('./shared.js')
 const giftPath = require('./gift-path.js')
 // `dshzoo://crops/<hash>.<ext>` 的白名单（票 59）：同样是一份纯函数、单独可单测。
 const cropPath = require('./crop-path.js')
+// 盘口窗位置恢复/夹取（票 85 / ADR-0029）：坐标算术是纯函数，单独一份、可单测。
+const windowBounds = require('./window-bounds.js')
+// 点窗口外面收起所有插件窗（票 85 / ADR-0029）：判定表是纯函数，单独一份、可单测。
+const windowDismiss = require('./window-dismiss.js')
 
 const APP_NAME = 'dsh-zoo-desktop'
 const HOST_STALE_MS = 30000
@@ -155,9 +159,9 @@ let giftTimer = null
 /** 「带派」申请的流水号，只用于给 action id 起个不重复的名字。 */
 let giftSeq = 0
 /**
- * 农场小窗（ticket 40）。和改名/带派同一类独立窗口，但**刻意不按失焦关闭**：
- * macOS 中文输入法候选窗会抢焦点，blur 关窗会重演「打中文时小窗消失」。
- * 关窗只由 Esc / 右上角 × / 宿主 `close:true`（再点一次「农场」）/ 主窗 hide / 退出驱动；
+ * 农场小窗（ticket 40）。和改名/带派同一类独立窗口：失焦 200ms 后，如果焦点没有落到
+ * 另一扇插件窗，就收起所有插件窗（ADR-0029；输入法合成期间例外）。
+ * 显式关窗仍由 Esc / 右上角 × / 宿主 `close:true`（再点一次「农场」）/ 主窗 hide / 退出驱动；
  * 10 秒是**动作等待**超时，不是窗口寿命。
  */
 let farmWin = null
@@ -189,9 +193,9 @@ let lastFarmWindowOpen = null
 /** 农场申请的流水号，只用于给 action id 起个不重复的名字。 */
 let farmSeq = 0
 /**
- * 盘口小窗（票 79）。和农场窗同一类独立窗口：**刻意不按失焦关闭**
- * （macOS 中文输入法候选窗会抢焦点，blur 关窗会变成「打中文时窗消失」）。
- * 关窗只由 Esc / 右上角 × / 宿主 `close:true`（再点一次「盘口」）/ 主窗 hide / 退出驱动；
+ * 盘口小窗（票 79）。和农场窗同一类独立窗口：失焦 200ms 后，如果焦点没有落到另一扇
+ * 插件窗，就收起所有插件窗（ADR-0029；输入法合成期间例外）。
+ * 显式关窗仍由 Esc / 右上角 × / 宿主 `close:true`（再点一次「盘口」）/ 主窗 hide / 退出驱动；
  * 10 秒是**动作等待**超时，不是窗口寿命。
  */
 let boardWin = null
@@ -207,6 +211,18 @@ let boardTimer = null
 let lastBoardWindowOpen = null
 /** 盘口申请的流水号，只用于给 action id 起个不重复的名字。 */
 let boardSeq = 0
+/** 盘口窗拖动后延迟落盘的计时器（ADR-0029：`moved` 连续来，不必每帧写盘）。 */
+let boardPositionTimer = null
+/**
+ * 四扇插件窗里正在输入法合成的 webContents id（ADR-0029 / 票 85）。
+ * 候选窗抢焦点会触发 blur；只有 compositionstart..compositionend 之间不收起窗口。
+ */
+const composing = new Map()
+/** 共享的“失焦 200ms 后收起”计时器：新的一次失焦顶掉旧的，焦点回到插件窗就清掉。 */
+let dismissTimer = null
+let dismissBlurAt = 0
+/** 原生文件选择器开着时不算“点外面”：它是窗口自己的模态对话框，不是用户点了桌面。 */
+let giftPicking = false
 /** 桌面窗口覆盖的矩形（所有显示器工作区的并集，DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
 let workArea = null
 let scene = shared.emptyScene()
@@ -281,6 +297,12 @@ let insideSince = 0
 let pointerOverride = null
 /** 调试用：锁住输入时忽略窗口 blur（冒烟用合成输入，环境里的焦点变化不应打断用例）。 */
 let debugInputLocked = false
+/**
+ * 冒烟用的失焦锁（票 85）：`debug-blur` 模拟的是“输入法候选窗抢焦点”，不是用户点了桌面。
+ * 新策略是“失焦 200ms 后收起所有插件窗”，所以这条旧冒烟路径必须显式跳过收起，
+ * 否则“失焦不关改名/带派/农场窗”的现场断言会变成假失败。
+ */
+let debugBlurLocked = false
 
 let pointerTimer = null
 let hostPollTimer = null
@@ -503,6 +525,174 @@ function focusAppForDialog () {
     // 旧版 Electron 没有 steal：窗口自己的 show/focus 已是尽力而为
   }
 }
+
+// ---------------------------------------------------------------------------
+// 点窗口外面收起所有插件窗（ADR-0029 / 票 85）
+//
+// 四扇插件窗（盘口 / 农场 / 带派 / 改名）共享一条失焦策略：失焦后等 200ms，焦点没有
+// 落到另一扇插件窗、没有在输入法合成、没有冒烟/原生对话框锁、也不在退出途中，就一起收起。
+// 200ms 是给“打开另一扇窗”留的窗口：旧窗先 blur，新窗随后才 ready-to-show/focus；
+// 焦点一旦回到任一插件窗，或者新窗刚建出来，就清掉这条计时器
+// （旧政策“永不按 blur 关”作废）。
+// ---------------------------------------------------------------------------
+
+/** 当前还活着、可参与判定的插件窗；名字只用于诊断。 */
+function pluginWindows () {
+  const candidates = [
+    { name: 'board', window: boardWin },
+    { name: 'farm', window: farmWin },
+    { name: 'gift', window: giftWin },
+    { name: 'rename', window: renameWin }
+  ]
+  const open = []
+  for (const candidate of candidates) {
+    try {
+      if (candidate.window !== null && !candidate.window.isDestroyed()) open.push(candidate)
+    } catch {
+      // 正在销毁：这一扇不参与本次判定
+    }
+  }
+  return open
+}
+
+/** 插件窗的 webContents id；纯判定 `shouldDismissOnBlur` 只认这个集合。 */
+function pluginWindowIds () {
+  const ids = []
+  for (const entry of pluginWindows()) {
+    try {
+      ids.push(entry.window.webContents.id)
+    } catch {
+      // 正在销毁：这一扇不参与本次判定
+    }
+  }
+  return ids
+}
+
+/** 当前系统焦点是不是落在某扇插件窗上；是就返回它的 id，否则 null（桌面/别的应用）。 */
+function focusedPluginWindowId () {
+  let focused = null
+  try {
+    focused = BrowserWindow.getFocusedWindow()
+  } catch {
+    focused = null
+  }
+  if (focused === null) return null
+  for (const entry of pluginWindows()) {
+    if (entry.window !== focused) continue
+    try {
+      return entry.window.webContents.id
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** preload 的 `dsh-zoo:composing` 只认四扇插件窗自己；主窗/陌生 webContents 一律不记。 */
+function isPluginWebContents (contents) {
+  for (const entry of pluginWindows()) {
+    try {
+      if (entry.window.webContents === contents) return true
+    } catch {
+      // 正在销毁：继续看下一扇
+    }
+  }
+  return false
+}
+
+/** 任一插件窗正在输入法合成：整组都不收（收起会打断另一扇窗正在打的字）。 */
+function isAnyPluginComposing () {
+  for (const entry of pluginWindows()) {
+    try {
+      if (composing.get(entry.window.webContents.id) === true) return true
+    } catch {
+      // 正在销毁：继续看下一扇
+    }
+  }
+  return false
+}
+
+function cancelBlurDismiss () {
+  if (dismissTimer === null) return
+  clearTimeout(dismissTimer)
+  dismissTimer = null
+}
+
+/** 收起全部插件窗：每扇都走自己的 close 函数，宿主仍能收到 farm/board 的关闭回报。 */
+function closeAllPluginWindows (reason) {
+  cancelBlurDismiss()
+  closeRenameWindow(reason)
+  closeGiftWindow(reason)
+  closeFarmWindow(reason)
+  closeBoardWindow(reason)
+}
+
+/** 失焦后只排一次计时器；新的失焦会顶掉旧的，焦点回来就取消。 */
+function scheduleBlurDismiss () {
+  if (quitting) return
+  cancelBlurDismiss()
+  dismissBlurAt = Date.now()
+  const timer = setTimeout(() => {
+    if (dismissTimer !== timer) return
+    dismissTimer = null
+    const dismiss = windowDismiss.shouldDismissOnBlur({
+      focusedId: focusedPluginWindowId(),
+      pluginIds: pluginWindowIds(),
+      composing: isAnyPluginComposing(),
+      locked: debugBlurLocked || debugInputLocked || giftPicking,
+      quitting,
+      blurAgeMs: Date.now() - dismissBlurAt
+    })
+    if (dismiss) closeAllPluginWindows('dismiss')
+  }, windowDismiss.DISMISS_DELAY_MS)
+  timer.unref?.()
+  dismissTimer = timer
+}
+
+/**
+ * 点宠物本体也算“点窗口外面”（ADR-0029）。主窗是 `focusable:false`，点它不一定会让
+ * 插件窗收到 blur，所以这里从可信左键按下直接补一次；显式点击不看重焦点，只保留
+ * 输入法合成 / 冒烟锁 / 原生文件选择器 / 退出这几道边界。
+ */
+function dismissPluginWindowsOnOutsideClick () {
+  const dismiss = windowDismiss.shouldDismissOnBlur({
+    focusedId: null,
+    pluginIds: pluginWindowIds(),
+    composing: isAnyPluginComposing(),
+    locked: debugBlurLocked || debugInputLocked || giftPicking,
+    quitting,
+    // 显式点击不经过 200ms 计时器，等价于“已经等够了”。
+    blurAgeMs: windowDismiss.DISMISS_DELAY_MS
+  })
+  if (dismiss) closeAllPluginWindows('dismiss')
+}
+
+/**
+ * 四扇插件窗共用的一条接线。新窗一建出来就先取消待收起的计时器：从菜单点「农场」时，
+ * 上一扇盘口窗先 blur，但新窗要等 ready-to-show 才 focus，不能让它被旧计时器吞掉。
+ */
+function adoptPluginWindow (created) {
+  cancelBlurDismiss()
+  let contentsId = null
+  try {
+    contentsId = created.webContents.id
+  } catch {
+    contentsId = null
+  }
+  created.on('focus', () => cancelBlurDismiss())
+  created.on('blur', () => scheduleBlurDismiss())
+  created.on('closed', () => {
+    if (contentsId !== null) composing.delete(contentsId)
+    cancelBlurDismiss()
+  })
+}
+
+ipcMain.on('dsh-zoo:composing', (event, active) => {
+  if (!isPluginWebContents(event.sender)) return
+  const id = event.sender.id
+  if (active === true) composing.set(id, true)
+  else composing.delete(id)
+})
 
 // ---------------------------------------------------------------------------
 // dshzoo://asset/<name>.webm
@@ -1021,7 +1211,11 @@ ipcMain.on('dsh-zoo:input', (event, payload) => {
     return
   }
   lastTrustedInputAt = Date.now()
-  if (report.type === 'down') trustedDowns += 1
+  if (report.type === 'down') {
+    trustedDowns += 1
+    // 主窗 focusable:false，点宠物本身不一定会让插件窗收到 blur；补一次显式“点外面”。
+    dismissPluginWindowsOnOutsideClick()
+  }
 })
 
 ipcMain.on('dsh-zoo:rects', (event, payload) => {
@@ -1420,6 +1614,8 @@ const FARM_TIMEOUT_MS = 10000
 const BOARD_WIDTH = 760
 const BOARD_HEIGHT = 700
 const BOARD_TIMEOUT_MS = 10000
+/** 拖动结束后 250ms 落盘（ADR-0029）：`moved` 会连续来，不必每帧写盘。 */
+const BOARD_POSITION_SAVE_MS = 250
 /**
  * 农场窗默认不置顶；用户可在窗口右上角自己切换，选择记在 userData 下，
  * 下次开窗沿用。桌面宠物本体的置顶是另一扇窗，不受这里影响。
@@ -1558,8 +1754,9 @@ function openRenameWindow () {
     // 置顶已由构造参数保证
   }
   created.webContents.on('context-menu', (event) => event.preventDefault())
-  // **不要**在 blur 时关窗：macOS 上打中文时，输入法候选窗会抢走键盘焦点，这扇窗
-  // 也跟着 blur —— 现场就是「打中文时改名小窗消失」。关窗只由 Esc / 取消 / 保存驱动。
+  // ADR-0029：失焦不再“永不关窗”——200ms 后焦点没回到任何插件窗就收起全部；
+  // 正在输入法合成时跳过，避免候选窗抢焦点把正在打的名字吞掉。
+  adoptPluginWindow(created)
   created.on('closed', () => {
     if (renameWin === created) renameWin = null
     clearRenameTimer()
@@ -1691,8 +1888,9 @@ function openGiftWindow () {
     // 置顶已由构造参数保证
   }
   created.webContents.on('context-menu', (event) => event.preventDefault())
-  // 和改名窗同一条：字条要能打中文，输入法候选窗触发的 blur 不能关窗。
-  // 选文件时系统对话框也会让窗口失焦；关窗只由取消 / 提交 / Esc 驱动，不再需要例外。
+  // 和改名窗同一条（ADR-0029）：字条要能打中文，输入法合成期间失焦不收起；
+  // 其它窗口失焦就按共享策略收起。选文件时系统对话框会让窗口失焦，`giftPicking` 期间跳过。
+  adoptPluginWindow(created)
   created.on('closed', () => {
     if (giftWin === created) giftWin = null
     clearGiftTimer()
@@ -1777,12 +1975,17 @@ function startGiftPending (action, event) {
  */
 async function pickGiftFile () {
   if (giftWin === null || giftWin.isDestroyed()) return
+  // 系统文件选择器是这扇窗自己的模态对话框，不是“点了桌面”：它在的时候失焦不收起
+  // （ADR-0029 的锁例外）。finally 保证无论选没选、抛没抛都会解锁。
+  giftPicking = true
   let result
   try {
     result = await dialog.showOpenDialog(giftWin, { properties: ['openFile'] })
   } catch {
     sendGiftResult({ ok: false, code: 'pick-failed' })
     return
+  } finally {
+    giftPicking = false
   }
   if (giftWin === null || giftWin.isDestroyed()) return
   giftWin.focus()
@@ -1805,7 +2008,7 @@ async function pickGiftFile () {
 //
 // 数据全部来自宿主（`farm-window` 命令），窗口是 file:// 页面，不读盘、不联网。
 // 安全模型与改名/带派一致：独立 preload、只把「种/收/浇/施肥」当申请交上去；
-// **与它们唯一的区别是不按 blur 关窗**（IME 候选窗会抢焦点），见 openFarmWindow。
+// 失焦策略也一致（ADR-0029）：200ms 后焦点没回到插件窗就收起全部，输入法合成期间例外。
 // ---------------------------------------------------------------------------
 
 /** 贴着宠物开窗；没有命中矩形（宠物刚出门/还没画出来）就落在工作区中央。 */
@@ -1879,9 +2082,10 @@ function openFarmWindow () {
   applyFarmPinned(created)
   created.webContents.once('did-finish-load', sendFarmPinned)
   created.webContents.on('context-menu', (event) => event.preventDefault())
-  // **不要**在 blur 时关窗：macOS 上打中文时输入法候选窗会抢走键盘焦点，这扇窗也会 blur。
-  // 农场窗没有输入框也一样——41/44 的页签迟早会加输入。关窗只由 Esc / × / 宿主 close:true /
-  // hide / 退出驱动；10 秒超时是「等宿主回执」的上限，不是窗口寿命。
+  // ADR-0029：失焦 200ms 后焦点没回到插件窗就收起全部；输入法合成期间例外。
+  // 显式关窗仍只由 Esc / × / 宿主 close:true / hide / 退出驱动；
+  // 10 秒超时是“等宿主回执”的上限，不是窗口寿命。
+  adoptPluginWindow(created)
   created.on('closed', () => {
     if (farmWin === created) farmWin = null
     farmPending = null
@@ -1990,18 +2194,58 @@ function startFarmPending (action, event) {
 // 所以先居中，工作区放不下再夹进去。
 // ---------------------------------------------------------------------------
 
-/** 居中 + 夹取：多屏/小笔记本上都落在工作区里，不出现负坐标。 */
+/**
+ * 盘口窗位置（ADR-0029）：上次拖动的位置在 userData/board-window.json；坏文件或离屏
+ * 回落到今天开窗时的居中位置。多屏时恢复点落在哪块屏，就夹进那块屏的工作区。
+ */
 function boardBounds () {
+  // 居中仍以整张虚拟桌面（workArea）为参照：和票 79 的旧行为一致，不因为这次改动跳位置。
   const area = workArea ?? screen.getPrimaryDisplay().workArea
-  const center = (start, span, size) => {
-    const centered = start + (span - size) / 2
-    const edge = start + span - size - 8
-    return Math.round(Math.max(start + 8, Math.min(centered, edge)))
+  let displays = []
+  try {
+    displays = screen.getAllDisplays().map((display) => display.workArea)
+  } catch {
+    displays = []
   }
-  return {
-    x: center(area.x, area.width, BOARD_WIDTH),
-    y: center(area.y, area.height, BOARD_HEIGHT)
+  return windowBounds.pickBounds({
+    saved: windowBounds.readPosition(boardPositionFile()),
+    areas: displays,
+    area,
+    width: BOARD_WIDTH,
+    height: BOARD_HEIGHT
+  })
+}
+
+function boardPositionFile () {
+  return path.join(app.getPath('userData'), windowBounds.BOARD_POSITION_FILE)
+}
+
+function clearBoardPositionTimer () {
+  if (boardPositionTimer === null) return
+  clearTimeout(boardPositionTimer)
+  boardPositionTimer = null
+}
+
+/** 把当前左上角写盘；关窗/退出时也走这里（拖动后 250ms 内关窗不丢位置）。 */
+function saveBoardPosition (source) {
+  if (source === null || source.isDestroyed()) return
+  let bounds
+  try {
+    bounds = source.getBounds()
+  } catch {
+    return
   }
+  windowBounds.writePosition(boardPositionFile(), { x: bounds.x, y: bounds.y })
+}
+
+/** `moved` 连续触发时只写最后一次（250ms）；写盘失败只影响下次开窗。 */
+function scheduleBoardPositionSave (source) {
+  clearBoardPositionTimer()
+  boardPositionTimer = setTimeout(() => {
+    boardPositionTimer = null
+    saveBoardPosition(source)
+  }, BOARD_POSITION_SAVE_MS)
+  boardPositionTimer.unref?.()
 }
 
 function openBoardWindow () {
@@ -2027,7 +2271,8 @@ function openBoardWindow () {
     focusable: true,
     acceptFirstMouse: true,
     resizable: false,
-    movable: false,
+    // 票 85 / ADR-0029：只有这扇窗可拖动（标题栏的拖动区在 board.html 里）；尺寸仍固定。
+    movable: true,
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
@@ -2048,11 +2293,15 @@ function openBoardWindow () {
   notifyBoardWindowState()
   created.webContents.once('did-finish-load', sendBoardState)
   created.webContents.on('context-menu', (event) => event.preventDefault())
-  // **不要**在 blur 时关窗：和农场窗同一个现场（打中文时小窗消失）。
+  // 拖动只动位置，不改尺寸；`moved` 后延迟写 userData/board-window.json。
+  created.on('moved', () => scheduleBoardPositionSave(created))
+  // ADR-0029：失焦 200ms 后焦点没回到插件窗就收起全部；输入法合成期间例外。
+  adoptPluginWindow(created)
   created.on('closed', () => {
     if (boardWin === created) boardWin = null
     boardPending = null
     clearBoardTimer()
+    clearBoardPositionTimer()
     notifyBoardWindowState()
   })
   created.once('ready-to-show', () => {
@@ -2068,9 +2317,12 @@ function openBoardWindow () {
 function closeBoardWindow (reason) {
   boardPending = null
   clearBoardTimer()
+  clearBoardPositionTimer()
   const target = boardWin
   boardWin = null
   if (target !== null && !target.isDestroyed()) {
+    // 拖完立刻关窗时 250ms 的落盘还没到：先补一次，下次开窗不会回到旧位置。
+    saveBoardPosition(target)
     try {
       target.destroy()
     } catch {
@@ -2507,13 +2759,20 @@ function applyCommand (command) {
       return
     }
     case 'debug-blur': {
-      // 冒烟用：模拟“输入法候选窗/别的窗口抢走键盘焦点”。任何小窗都不该因此关掉
-      // （现场：打中文时小窗消失；农场窗同样不按 blur 关闭）。
+      // 冒烟用：模拟“输入法候选窗/别的窗口抢走键盘焦点”。ADR-0029 之后失焦本来会收起，
+      // 但这条命令模拟的不是用户点桌面，所以上锁一秒，保住旧断言“失焦不关小窗”。
       if (!debugEnabled) return
       const target = command.window === 'bring'
         ? giftWin
-        : command.window === 'farm' ? farmWin : renameWin
+        : command.window === 'farm'
+          ? farmWin
+          : command.window === 'board' ? boardWin : renameWin
+      debugBlurLocked = true
       if (target !== null && !target.isDestroyed()) target.blur()
+      const unlock = setTimeout(() => {
+        debugBlurLocked = false
+      }, 1000)
+      unlock.unref?.()
       return
     }
     case 'debug-dispatch':
@@ -3268,6 +3527,7 @@ function shutdown (code) {
   closeRenameWindow('shutdown')
   closeGiftWindow('shutdown')
   closeFarmWindow('shutdown')
+  closeBoardWindow('shutdown')
   unhookWindowMessages()
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()
@@ -3308,6 +3568,8 @@ function stopTimers () {
     clearTimeout(mediaWaitTimer)
     mediaWaitTimer = null
   }
+  // 退出/失联时别让一条迟到的“点外面”计时器再去碰正在销毁的窗口。
+  cancelBlurDismiss()
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { existsSync } from 'node:fs'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, relative } from 'node:path'
 import { PassThrough } from 'node:stream'
@@ -2339,4 +2339,35 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   assert.equal(children[0].parsedLines().at(-1).close, true)
   children[0].emitLine({ type: 'farm-window-state', open: false })
   assert.equal(manager.status().farmOpen, false)
+})
+
+// ---------------------------------------------------------------------------
+// 票 85：点窗口外面收起所有插件窗（ADR-0029）
+// ---------------------------------------------------------------------------
+
+test('票 85：四扇插件窗都接上同一条失焦策略，debug-blur 仍走 blur 锁（静态窄口）', async () => {
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  // 四扇窗各调用一次：盘口 / 农场 / 带派 / 改名。
+  assert.equal((main.match(/adoptPluginWindow\(created\)/g) ?? []).length, 4)
+  assert.match(main, /created\.on\('focus', \(\) => cancelBlurDismiss\(\)\)/)
+  assert.match(main, /created\.on\('blur', \(\) => scheduleBlurDismiss\(\)\)/)
+  assert.match(main, /ipcMain\.on\('dsh-zoo:composing'/)
+  assert.match(main, /closeAllPluginWindows\('dismiss'\)/)
+  // 主窗 focusable:false，点宠物本身不一定会 blur 插件窗；可信左键按下要补一次显式收起。
+  assert.match(main, /dismissPluginWindowsOnOutsideClick\(\)/)
+  // 冒烟用的 debug-blur 必须上锁，否则旧的“失焦不关小窗”断言会假失败。
+  assert.match(main, /debugBlurLocked = true/)
+  // 盘口窗是唯一可拖动的插件窗；位置写 userData/board-window.json。
+  assert.match(main, /movable: true/)
+  assert.match(main, /boardPositionFile/)
+})
+
+test('票 85：四扇窗的 preload 都上报 compositionstart / compositionend', async () => {
+  for (const name of ['board-preload.js', 'farm-preload.js', 'gift-preload.js', 'rename-preload.js']) {
+    const source = await readFile(new URL('../desktop/' + name, import.meta.url), 'utf8')
+    assert.match(source, /addEventListener\('compositionstart'/, name + ' 要监听 compositionstart')
+    assert.match(source, /addEventListener\('compositionend'/, name + ' 要监听 compositionend')
+    assert.match(source, /ipcRenderer\.send\('dsh-zoo:composing', true\)/, name + ' 要上报开始')
+    assert.match(source, /ipcRenderer\.send\('dsh-zoo:composing', false\)/, name + ' 要上报结束')
+  }
 })
