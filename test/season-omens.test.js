@@ -61,16 +61,18 @@ test('freshOmen：熊獾固定本地 15:00 出现、持续 3 小时', () => {
   assert.ok(first.end <= AUTUMN.end)
 })
 
-test('蛙雨/野火窗口随机，熊獾/巨鹿固定在 15:00', () => {
+test('蛙雨/野火在 09:00～19:00 随机，熊獾/巨鹿固定在 15:00', () => {
   const spring = { id: 'spring', start: AUTUMN.start, end: AUTUMN.end }
   const summer = { id: 'summer', start: AUTUMN.start, end: AUTUMN.end }
   const winter = { id: 'winter', start: AUTUMN.start, end: AUTUMN.end }
   for (const season of [spring, summer]) {
     const omen = freshOmen(season)
+    const hour = new Date(omen.start).getHours()
+    assert.ok(hour >= 9 && hour <= 19, `${season.id} 来客应在 09:00～19:00 出现，实际 ${hour}:00`)
     assert.equal(omen.end - omen.start, OMEN_WINDOW_MS)
     assert.ok(omen.start >= season.start)
     assert.ok(omen.start <= season.end - OMEN_WINDOW_MS)
-    assert.notEqual(omen.start, new Date(season.start).setHours(15, 0, 0, 0))
+    assert.equal(freshOmen(season).start, omen.start, '同一天同一季的窗口应稳定')
   }
   const deer = freshOmen(winter)
   const fixed = new Date(winter.start)
