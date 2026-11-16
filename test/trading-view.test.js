@@ -9,7 +9,7 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 
-import { pnlOf } from '../src/trading-rules.js'
+import { liquidationPriceOf, pnlOf } from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
 const view = require('../desktop/trading-view.js')
@@ -172,6 +172,9 @@ test('票 81：下单区有三档杠杆（来自 payload）、预览句与作物
   assert.equal(order.hint, '')
   assert.equal(order.submitLabel, '开一手')
   assert.equal(order.preview, '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
+  // SPEC v10 US7：下单前就能看到强平价；做空的强平线在现价上方。
+  assert.equal(order.liquidationPrice, 5.06 * 1.2)
+  assert.equal(order.liquidationText, '强平价 6.07 · 涨到就平')
   assert.deepEqual(order.sides.map((choice) => choice.label), ['做多', '做空'])
   // 票 83：三档预设 + 一颗「全下」（金额 = 此刻可用硬币 120）。
   assert.deepEqual(order.margins.map((choice) => choice.margin), [50, 100, 250, 120])
@@ -207,6 +210,37 @@ test('票 81：预览句 1× 的强平是「—」；涨跌 1% 的数与 pnlOf �
       assert.equal(Math.round(-predicted * 100), Math.round(minusOne * 100), margin + '×' + leverage)
     }
   }
+})
+
+test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式（drift）', () => {
+  const at = payload()
+  at.charts.tomato = chart({
+    base: 100,
+    current: { slot: SLOT, open: 100, high: 100, low: 100, price: 100, tick: 0, remainingMs: 1 }
+  })
+  for (const side of ['long', 'short']) {
+    for (const leverage of [5, 20]) {
+      const order = view.orderView(at, { side, leverage, margin: 50 })
+      assert.equal(
+        order.liquidationPrice,
+        liquidationPriceOf({ side, entry: 100, leverage }),
+        side + ' ' + leverage + '× 的强平价必须和宿主一致'
+      )
+      assert.equal(order.liquidationText,
+        '强平价 ' + order.liquidationPrice.toFixed(2) + ' · ' +
+        (side === 'long' ? '跌到就平' : '涨到就平'))
+    }
+  }
+  // 1× 没有强平线：数字是 null，文案是「强平价 —」（SPEC v10 US7）。
+  const oneX = view.orderView(at, { leverage: 1, margin: 50 })
+  assert.equal(oneX.liquidationPrice, null)
+  assert.equal(oneX.liquidationText, '强平价 —')
+  // 没有现价（老宿主/坏包）：不凭空造一条线。
+  assert.equal(view.orderView({ coins: { available: 100 } }).liquidationPrice, null)
+  assert.equal(view.orderView({ coins: { available: 100 } }).liquidationText, '强平价 —')
+  // 预览句仍是 SPEC v10 的原文，不被强平价那行改写。
+  assert.equal(view.orderView(at, { side: 'short', leverage: 5, margin: 100 }).preview,
+    '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
 })
 
 test('票 79：硬币不够时按钮禁用并写明原因；0 硬币写「去种地」', () => {
@@ -683,4 +717,9 @@ test('User Story 30：盘口窗上写明「没有手续费、没有资金费、�
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
   assert.match(html, /没有手续费、没有资金费、没有风险控制/)
   assert.match(html, /硬币赔光就去种地/)
+  // SPEC v10 US7：下单区真的有一行强平价，并且渲染端把它填进去。
+  assert.match(html, /id="order-liquidation"/)
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /order-liquidation/)
+  assert.match(script, /order\.liquidationText/)
 })

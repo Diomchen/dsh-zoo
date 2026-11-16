@@ -38,6 +38,7 @@ const sideRowEl = document.getElementById('side-row')
 const marginRowEl = document.getElementById('margin-row')
 const leverageRowEl = document.getElementById('leverage-row')
 const previewEl = document.getElementById('preview')
+const liquidationEl = document.getElementById('order-liquidation')
 const submitEl = document.getElementById('submit')
 const orderHintEl = document.getElementById('order-hint')
 const limitToggleEl = document.getElementById('limit-toggle')
@@ -271,6 +272,8 @@ function renderOrder (board) {
     leverageRowEl.append(button)
   }
   previewEl.textContent = order.preview
+  // 强平价单独一行（US7）：预览句保持 SPEC v10 的原文不动。
+  liquidationEl.textContent = order.liquidationText
   submitEl.textContent = pending ? '下单中…' : order.submitLabel
   submitEl.dataset.side = order.side
   submitEl.disabled = pending || !order.canSubmit
