@@ -3,24 +3,32 @@
   <head>
     <meta charset="utf-8" />
     <!--
-      盘口小窗（票 79–85 / 87）：三作物 K 线（15 分/1 时/1 日/1 周）、下单、到价挂单/撤单、
-      持仓/止损、最近结算、本周盈亏、真人周榜与 LAN 情绪。图表上的周期只是看盘视角；
-      合约仍按 15 分钟收盘结算（ADR-0029 第 4 条）。
+      盘口小窗（票 79–85 / 87 / 89）：固定 760×700，页面本身不滚动。
 
-      票 87：图占满 720 宽（viewBox 720×280，右侧价格轴 + 底部时间轴 + 十字线便签），
-      下面两列左=持仓/最近结算、右=下单/周榜；窗口固定 760×700，页面本身不滚动。
-      网格/蜡烛/参考线套 SVG 手绘滤镜，轴字/便签文字在另一层保持清晰；下单主按钮
-      固定在卡片底部（控件区自己滚），半高布局下也能一键开仓。
+      版面（票 89 重做）：
+        顶栏 52：盘口 + 当前作物 / 本周胶囊 / 可用·锁定 / 收盘倒计时 / ×。
+        图带 286：作物条 42（任意数量作物单行横向滚动，左右箭头 + 滚轮 + 键盘，
+                  右侧 4 档周期分段控件）+ 图头 30 + 手绘 K 线 198（票 87 的 SVG/轴/十字线）。
+        下半区：左 minmax(0,1fr) = 持仓 + 到价挂单（同一个滚动区）+ 最近结算 120（滚）；
+                右 300 = 下单（不滚、不裁切）+ 周榜（滚）。
+      所有卡片都是 2px 墨线 + 硬投影 + wobbly 圆角（手绘 token）；跌蜡烛空心，
+      不只靠颜色；焦点环在每颗控件上都看得见。
+
+      下单区为什么拆成 label 40 + 控件 minmax(0,1fr) 的 grid：旧版把「方向/杠杆」塞进同一
+      flex 行，760×700 下 20×、全下、到价整行被横向裁掉（票 89 的实机截图）。四档保证金 /
+      三档杠杆用 repeat(N, minmax(0,1fr))，300px 宽度下也不会把 chip 挤出去；
+      控件区不套滚动容器，主按钮固定在卡片底部。
+
+      文案（票 89）：删掉副标题、长提示和长空态；只留预览句、差 N 硬币/去种地、
+      非 15 分周期的「15 分钟结算」。正文/标签 ≥12px，只有图轴/参考线标签/便签 11px。
 
       和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
       /state。行情、硬币、持仓、挂单、历史、周盈亏、风向、真人周榜全部由宿主随
       `board-window` 命令推过来，这里只画、只把「申请」交回主进程。窗口能收键盘
       （focusable），失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
 
-      Tab 顺序 = DOM 顺序：作物页签 → 周期页签 → 方向 → 保证金 → 杠杆 → 到价开关
-      → 目标价输入框 → 挂单按钮（后两个只在「到价」点开时出现）→ 开一手 → 每张挂单的撤单
-      → 每手仓位的止损/平仓。右栏（下单）在 DOM 里紧跟在图表之后，靠 grid-area 放到视觉
-      右侧；开仓按钮虽然在滚动区外，tabindex 仍由 `focusOrder()` 落到正确位置。
+      Tab 顺序 = `focusOrder()`（trading-view.js）：× → 作物条箭头 → 作物 chip → 周期
+      → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单撤单 → 持仓止损/平仓。
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -29,12 +37,18 @@
     <title>盘口</title>
     <style>
       :root {
-        --cream: #faf8f5;
-        --card: #fffdfa;
+        /* 票 89 手绘 token：纸感底、墨线、硬投影、wobbly 圆角；跟随现有奶油/祖母绿/玫瑰色。 */
+        --paper: #fdfbf7;
+        --card: #fffefa;
         --ink: #2f3a34;
         --ink-soft: #626a63;
         --muted: #666d66;
-        --line: #ede5da;
+        --line: #e7dfd2;
+        --line-strong: #d9cfbf;
+        --radius: 14px 12px 13px 11px;
+        --radius-sm: 9px 7px 10px 6px;
+        --shadow: 2px 2px 0 rgba(47, 58, 52, 0.08);
+        --shadow-card: 3px 3px 0 rgba(47, 58, 52, 0.06);
         --emerald: #2e9e6b;
         --emerald-btn: #23815a;
         --emerald-deep: #1b6b4a;
@@ -45,12 +59,8 @@
         --rose: #c25b50;
         --rose-ink: #a8352a;
         --rose-soft: #fbeae7;
-        --line-strong: #ded4c4;
         --disabled-bg: #f2efe8;
         --disabled-ink: #8d8b82;
-        --focus: #1f7a52;
-        --shadow-soft: 0 4px 14px rgba(63, 54, 38, 0.07);
-        --shadow-lift: 0 10px 26px rgba(63, 54, 38, 0.13);
       }
       * {
         box-sizing: border-box;
@@ -69,34 +79,43 @@
         user-select: none;
         -webkit-user-select: none;
       }
-      button {
+      button,
+      input {
         font-family: inherit;
       }
+      /* 票 89：焦点环用虚线墨色，任何控件上都看得见；鼠标点不画环。 */
       :focus-visible {
-        outline: 2px solid var(--focus);
+        outline: 2px dashed var(--ink);
         outline-offset: 2px;
       }
+      button:disabled,
+      input:disabled {
+        opacity: 0.45;
+        cursor: not-allowed;
+      }
       .app {
+        position: relative;
         display: flex;
         flex-direction: column;
-        height: calc(100% - 16px);
-        margin: 8px;
+        height: 100%;
         overflow: hidden;
-        border: 1px solid rgba(255, 255, 255, 0.85);
-        border-radius: 22px;
+        border: 2px solid var(--line-strong);
+        border-radius: 20px 18px 22px 16px;
         background:
-          radial-gradient(circle at 10% -8%, rgba(255, 255, 255, 0.9), transparent 42%),
-          linear-gradient(168deg, #fffdf9 0%, var(--cream) 56%, #f6f1e9 100%);
-        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+          radial-gradient(circle at 9% -8%, rgba(255, 255, 255, 0.92), transparent 44%),
+          var(--paper);
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9);
       }
+      /* ------------------------------ 顶栏 ------------------------------ */
       .topbar {
         flex: none;
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 7px 12px 6px;
-        background: rgba(255, 255, 255, 0.74);
-        border-bottom: 1px solid var(--line);
+        gap: 8px;
+        height: 52px;
+        padding: 0 12px;
+        background: rgba(255, 254, 250, 0.72);
+        border-bottom: 2px solid var(--line);
         /* 票 85 / ADR-0029：只有标题栏是拖动区；下面的按钮/页签/输入必须 no-drag，
            否则点「×」会变成拖窗口。标题栏以外默认不可拖。 */
         -webkit-app-region: drag;
@@ -107,7 +126,6 @@
       .topbar select,
       .topbar textarea,
       .topbar [role='button'],
-      .topbar [role='tab'],
       .topbar [contenteditable='true'] {
         -webkit-app-region: no-drag;
       }
@@ -122,43 +140,45 @@
       .brand {
         display: flex;
         align-items: center;
-        gap: 10px;
+        gap: 7px;
         min-width: 0;
       }
       .brand-mark {
-        width: 30px;
-        height: 30px;
+        width: 28px;
+        height: 28px;
         flex: none;
         display: grid;
         place-items: center;
-        border-radius: 10px;
+        border-radius: 9px 8px 10px 7px;
         background: var(--emerald-soft);
-        font-size: 16px;
+        font-size: 14px;
+      }
+      .brand-text {
+        min-width: 0;
       }
       .brand-text h1 {
         margin: 0;
         font-size: 14px;
         font-weight: 700;
         letter-spacing: 0.01em;
-      }
-      .brand-text p {
-        margin: 2px 0 0;
-        font-size: 11px;
-        color: var(--muted);
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .week {
         display: flex;
         align-items: baseline;
-        gap: 5px;
+        gap: 4px;
         flex: none;
         margin-left: auto;
-        padding: 5px 10px;
-        border-radius: 12px;
+        padding: 3px 9px;
+        border-radius: 11px 9px 12px 8px;
+        border: 2px solid var(--line-strong);
         background: var(--card);
-        border: 1px solid var(--line);
-        font-size: 11px;
+        font-size: 12px;
         white-space: nowrap;
+        /* 手绘感：一周的盈亏像一张贴歪的小票。只这一处旋转，保持克制。 */
+        transform: rotate(-0.4deg);
       }
       .week b {
         font-size: 13px;
@@ -174,39 +194,25 @@
         color: var(--muted);
         font-variant-numeric: tabular-nums;
       }
-      .countdown {
-        display: flex;
-        flex-direction: column;
-        align-items: flex-end;
-        flex: none;
-        min-width: 68px;
-      }
-      .countdown b {
-        font-size: 17px;
-        font-variant-numeric: tabular-nums;
-        letter-spacing: 0.02em;
-      }
-      .countdown span {
-        font-size: 10px;
-        color: var(--muted);
-      }
       .wallet {
         display: flex;
         align-items: center;
-        gap: 6px;
+        /* 相邻点击目标至少 8px（票 89 的 UX 规则）。 */
+        gap: 8px;
         flex: none;
       }
       .pill {
         display: inline-flex;
         align-items: center;
         gap: 4px;
-        padding: 5px 9px;
-        border-radius: 999px;
-        font-size: 11px;
-        font-weight: 600;
+        padding: 3px 8px;
+        border-radius: 10px 8px 11px 7px;
+        border: 2px solid var(--line);
         background: var(--card);
-        border: 1px solid var(--line);
+        font-size: 12px;
+        font-weight: 600;
         white-space: nowrap;
+        box-shadow: var(--shadow);
       }
       .pill small {
         color: var(--muted);
@@ -215,130 +221,240 @@
       .pill b {
         font-variant-numeric: tabular-nums;
       }
-      .close {
-        width: 26px;
-        height: 26px;
+      .countdown {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
         flex: none;
-        border: none;
-        border-radius: 9px;
-        background: rgba(47, 58, 52, 0.06);
+        min-width: 58px;
+        line-height: 1.05;
+      }
+      .countdown span {
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .countdown b {
+        font-size: 18px;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+      }
+      .close {
+        width: 28px;
+        height: 28px;
+        flex: none;
+        display: grid;
+        place-items: center;
+        border: 2px solid var(--line);
+        border-radius: 9px 8px 10px 7px;
+        background: var(--card);
         color: var(--ink-soft);
         font-size: 15px;
         line-height: 1;
         cursor: pointer;
+        box-shadow: var(--shadow);
       }
       .close:hover {
-        background: var(--rose-soft);
+        border-color: var(--rose);
         color: var(--rose-ink);
       }
+      /* ------------------------------ 版面 ------------------------------ */
       .body {
         flex: 1;
         min-height: 0;
         display: grid;
-        /* 票 87：上图下两列——图占满整行，下面左侧持仓/结算、右侧下单/周榜。 */
-        grid-template-columns: minmax(0, 1fr) 308px;
-        grid-template-rows: auto minmax(0, 1.85fr) minmax(0, 1fr);
-        grid-template-areas:
-          'chart chart'
-          'positions order'
-          'history neighbor';
-        gap: 10px;
-        padding: 8px 12px 10px;
+        /* 图带 286 固定；下半区吃掉剩余高度（760×700 下约 336）。 */
+        grid-template-rows: 286px minmax(0, 1fr);
+        gap: 8px;
+        padding: 6px 12px 8px;
         overflow: hidden;
       }
       .card {
         min-width: 0;
         background: var(--card);
-        border: 1px solid var(--line);
-        border-radius: 16px;
-        box-shadow: var(--shadow-soft);
-        padding: 8px 10px;
+        border: 2px solid var(--line);
+        border-radius: var(--radius);
+        box-shadow: var(--shadow-card);
       }
       .card-head {
+        flex: none;
         display: flex;
-        align-items: baseline;
+        align-items: center;
         justify-content: space-between;
-        gap: 8px;
-        margin-bottom: 4px;
+        gap: 6px;
+        height: 22px;
+        margin-bottom: 2px;
       }
       .card-head h2 {
         margin: 0;
+        flex: none;
         font-size: 12px;
         font-weight: 700;
         letter-spacing: 0.02em;
         color: var(--ink-soft);
+        white-space: nowrap;
       }
       .card-head span {
-        font-size: 10px;
+        min-width: 0;
+        font-size: 12px;
         color: var(--muted);
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .scroll {
         overflow-y: auto;
+        /* 票 89：列表只纵向滚；横向溢出说明某行排错了，不能让它长出横向滚动条吃掉高度。 */
+        overflow-x: hidden;
+        min-height: 0;
         padding-right: 2px;
       }
       .scroll::-webkit-scrollbar {
-        width: 6px;
+        width: 5px;
       }
       .scroll::-webkit-scrollbar-thumb {
         background: rgba(47, 58, 52, 0.18);
         border-radius: 999px;
       }
-      /* ------------------------------ 图表 ------------------------------ */
+      /* 空态只占一行：不再用一段话撑出半个卡片。 */
+      .empty {
+        margin: 4px 2px 0;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.4;
+      }
+      .empty[hidden] {
+        display: none;
+      }
+      /* ------------------------------ 图带 ------------------------------ */
       .chart-card {
-        grid-area: chart;
         display: flex;
         flex-direction: column;
-        /* 图要占满 720：边框+内边距之外都是绘图区，轴字在 SVG 里自己留白。 */
-        padding: 7px 10px 6px;
+        padding: 6px 10px;
+        overflow: hidden;
       }
-      .chart-head {
+      /* 作物条 42：单行横滚，任意数量；右侧周期分段控件固定。 */
+      .crop-strip {
+        flex: none;
         display: flex;
         align-items: center;
-        gap: 6px;
-        margin-bottom: 4px;
+        gap: 8px;
+        height: 42px;
         min-width: 0;
+      }
+      .strip-arrow {
+        flex: none;
+        width: 26px;
+        height: 26px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: 2px solid var(--line-strong);
+        border-radius: 9px 7px 10px 6px;
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 15px;
+        line-height: 1;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .strip-arrow:hover:enabled {
+        border-color: var(--emerald);
+        color: var(--emerald-deep);
+      }
+      .crop-viewport {
+        position: relative;
+        flex: 1;
+        min-width: 0;
+        height: 100%;
+      }
+      /* 两端渐隐：只在真的还有作物没露出来时出现（data-can-left/right）。 */
+      .crop-viewport::before,
+      .crop-viewport::after {
+        content: '';
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 18px;
+        z-index: 1;
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 0.12s ease;
+      }
+      .crop-viewport::before {
+        left: 0;
+        background: linear-gradient(90deg, var(--card), rgba(255, 254, 250, 0));
+      }
+      .crop-viewport::after {
+        right: 0;
+        background: linear-gradient(270deg, var(--card), rgba(255, 254, 250, 0));
+      }
+      .crop-viewport[data-can-left='true']::before,
+      .crop-viewport[data-can-right='true']::after {
+        opacity: 1;
+      }
+      .crop-scroll {
+        height: 100%;
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: none;
+      }
+      .crop-scroll::-webkit-scrollbar {
+        display: none;
       }
       .crop-tabs {
         display: flex;
-        gap: 4px;
-        flex: none;
+        align-items: center;
+        gap: 8px;
+        height: 100%;
+        padding: 0 3px;
       }
       .crop-tab {
-        padding: 3px 8px;
-        border-radius: 8px;
-        border: 1px solid var(--line-strong);
+        flex: none;
+        height: 28px;
+        padding: 0 10px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius-sm);
         background: var(--card);
         color: var(--ink-soft);
-        font-size: 11px;
+        font-size: 12px;
         font-weight: 600;
-        cursor: pointer;
         white-space: nowrap;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+        transition: transform 0.12s ease, border-color 0.12s ease;
       }
       .crop-tab:hover {
         border-color: var(--emerald);
       }
+      /* 选中项 = 2px 墨线 + 极轻的旋转（每屏只有这一处“贴纸”感）。 */
       .crop-tab[aria-pressed='true'] {
-        border-color: var(--emerald-btn);
+        border-color: var(--ink);
         background: var(--emerald-soft);
         color: var(--emerald-deep);
+        transform: rotate(-0.4deg);
       }
-      /* 票 84：周期页签比作物页签更紧凑——它只是看盘视角，不是交易对象。 */
       .timeframe-tabs {
-        display: flex;
-        gap: 3px;
         flex: none;
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        padding: 2px;
+        border: 2px solid var(--line);
+        border-radius: 10px 8px 11px 7px;
+        background: var(--paper);
       }
       .timeframe-tab {
-        padding: 2px 6px;
-        border-radius: 7px;
-        border: 1px solid var(--line);
-        background: var(--card);
+        height: 24px;
+        padding: 0 6px;
+        border: 1px solid transparent;
+        border-radius: 7px 6px 8px 5px;
+        background: transparent;
         color: var(--ink-soft);
-        font-size: 10px;
+        font-size: 12px;
         font-weight: 600;
-        cursor: pointer;
         white-space: nowrap;
+        cursor: pointer;
       }
       .timeframe-tab:hover:enabled {
         border-color: var(--emerald);
@@ -349,20 +465,24 @@
         color: var(--emerald-deep);
       }
       .timeframe-tab:disabled {
-        border-color: var(--line);
+        border-color: transparent;
         background: var(--disabled-bg);
         color: var(--disabled-ink);
-        cursor: default;
+        cursor: not-allowed;
       }
-      .chart-quote {
+      /* 图头 28：价格 26 / 涨跌 12 / 风向 / 结算提示 / 本根时间。 */
+      .chart-head {
+        flex: none;
         display: flex;
-        align-items: baseline;
-        gap: 5px;
-        margin-left: auto;
+        align-items: center;
+        gap: 6px;
+        height: 30px;
         min-width: 0;
       }
       .chart-price {
-        font-size: 17px;
+        flex: none;
+        font-size: 26px;
+        line-height: 1;
         font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
@@ -373,17 +493,19 @@
         color: var(--rose-ink);
       }
       .chart-change {
-        font-size: 10px;
+        flex: none;
+        font-size: 12px;
         font-weight: 600;
         font-variant-numeric: tabular-nums;
         color: var(--muted);
       }
       .wind {
-        padding: 3px 7px;
+        flex: none;
+        padding: 2px 7px;
         border-radius: 999px;
         background: var(--amber-soft);
         color: var(--amber-ink);
-        font-size: 10px;
+        font-size: 12px;
         font-weight: 600;
         white-space: nowrap;
       }
@@ -400,14 +522,36 @@
         opacity: 0.75;
         margin-left: 3px;
       }
+      .chart-settle-hint {
+        margin: 0 0 0 auto;
+        min-width: 0;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        /* 用 hidden 占位而不是 display:none：切周期时图头不跳。 */
+        visibility: hidden;
+      }
+      .chart-settle-hint[data-visible='true'] {
+        visibility: visible;
+      }
+      .slot-note {
+        flex: none;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      /* 图 198：viewBox 720×198；轴字/便签 11px（全窗唯一允许的 11px）。 */
       .chart-svg {
         display: block;
+        flex: none;
         width: 100%;
-        height: 280px;
+        height: 198px;
         font-family: inherit;
         shape-rendering: geometricPrecision;
       }
-      /* 手绘墨迹层：滤镜只套这里；下面的文字层不套，轴标签/便签始终清晰。 */
       .chart-svg .chart-paper {
         fill: #fffefb;
         stroke: #f0e8dc;
@@ -447,9 +591,12 @@
         fill: var(--emerald);
         stroke: var(--emerald-deep);
       }
-      .chart-svg .body.down {
-        fill: var(--rose);
-        stroke: var(--rose-ink);
+      /* 票 89：跌蜡烛空心（纸色填充 + 2px 玫瑰描边），涨跌不只靠颜色。 */
+      .chart-svg .body.down,
+      .chart-svg .body[data-hollow='true'] {
+        fill: var(--paper);
+        stroke: var(--rose);
+        stroke-width: 2;
       }
       .chart-svg .body.forming {
         opacity: 0.55;
@@ -479,7 +626,7 @@
         stroke: var(--rose);
       }
       .chart-svg .price-tag-text {
-        font-size: 10px;
+        font-size: 11px;
         font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
@@ -499,17 +646,17 @@
         stroke-width: 1;
       }
       .chart-svg .axis-text {
-        font-size: 9px;
+        font-size: 11px;
         fill: var(--muted);
         font-variant-numeric: tabular-nums;
       }
       .chart-svg .ref-label {
-        font-size: 9px;
+        font-size: 11px;
         font-weight: 700;
         font-variant-numeric: tabular-nums;
         paint-order: stroke;
         stroke: #fffefb;
-        stroke-width: 2.4px;
+        stroke-width: 2.6px;
         stroke-linejoin: round;
       }
       .chart-svg .ref-label-base {
@@ -546,159 +693,304 @@
         stroke-width: 1;
       }
       .chart-svg .crosshair-title {
-        font-size: 9px;
+        font-size: 11px;
         font-weight: 700;
         fill: var(--amber-ink);
       }
       .chart-svg .crosshair-label {
-        font-size: 9px;
+        font-size: 11px;
         fill: var(--muted);
       }
       .chart-svg .crosshair-value {
-        font-size: 9.5px;
+        font-size: 11px;
         font-weight: 600;
         fill: var(--ink);
         font-variant-numeric: tabular-nums;
       }
       .chart-empty {
         margin: 0;
-        height: 280px;
+        height: 198px;
         display: grid;
         place-items: center;
-        font-size: 11px;
+        font-size: 12px;
         color: var(--muted);
         text-align: center;
       }
       .chart-empty[hidden] {
         display: none;
       }
-      .chart-foot {
+      /* ------------------------------ 下半区 ------------------------------ */
+      .bottom {
+        min-height: 0;
+        display: grid;
+        /* 票 89：左列吃掉剩余宽度，右侧下单列固定 300（四档保证金按它量）。 */
+        grid-template-columns: minmax(0, 1fr) 300px;
+        gap: 8px;
+        overflow: hidden;
+      }
+      .left-col {
+        min-width: 0;
+        min-height: 0;
+        display: grid;
+        grid-template-rows: minmax(0, 1fr) 120px;
+        gap: 8px;
+      }
+      .right-col {
+        min-width: 0;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .positions-card,
+      .history-card,
+      .league-card {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        padding: 6px 8px;
+        overflow: hidden;
+      }
+      .positions-card .scroll,
+      .history-card .scroll,
+      .league-card .scroll {
+        flex: 1;
+        min-height: 0;
+      }
+      /* ------------------------------ 持仓/结算 ------------------------------ */
+      .position {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 5px 7px;
+        border: 1px solid var(--line);
+        border-radius: 10px 9px 11px 8px;
+        background: linear-gradient(180deg, #fffefb, #fbf7f0);
+      }
+      .position + .position {
+        margin-top: 4px;
+      }
+      .position-head {
         display: flex;
         align-items: center;
-        gap: 8px;
-        margin-top: 2px;
-        font-size: 9.5px;
+        justify-content: space-between;
+        gap: 6px;
         min-width: 0;
       }
-      .legend {
-        display: flex;
-        gap: 8px;
-        flex: none;
-        font-size: 9.5px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
-      }
-      .legend i {
-        display: inline-block;
-        width: 10px;
-        height: 2px;
-        margin-right: 3px;
-        vertical-align: middle;
-      }
-      .legend i.base {
-        background: var(--amber);
-      }
-      .legend i.entry {
-        background: var(--emerald);
-      }
-      .legend i.liquidation {
-        background: var(--rose);
-      }
-      .legend b {
-        color: var(--ink-soft);
-        font-weight: 600;
-      }
-      .slot-note {
-        font-size: 9.5px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-        flex: none;
-      }
-      /* 票 84：切到粗周期时的一行提示。用 visibility 占位，切周期时窗口不跳。 */
-      .chart-settle-hint {
-        margin: 0;
-        flex: 1;
+      .position-title {
         min-width: 0;
-        font-size: 9.5px;
-        color: var(--muted);
-        text-align: right;
+        font-size: 12px;
+        font-weight: 700;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        visibility: hidden;
       }
-      .chart-settle-hint[data-visible='true'] {
-        visibility: visible;
-      }
-      /* ------------------------------ 下单 ------------------------------ */
-      .order-card {
-        grid-area: order;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        padding: 7px 9px;
-        /* 票 87：下半区变矮，控件区自己滚；「开一手」固定在卡片底部永远可见。 */
-        overflow: hidden;
-      }
-      .order-card .card-head {
-        margin-bottom: 0;
-        flex: none;
-      }
-      .order-scroll {
-        flex: 1;
-        min-height: 0;
-        overflow-y: auto;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        padding-right: 2px;
-      }
-      .order-actions {
-        flex: none;
-        padding-top: 3px;
-        border-top: 1px dashed var(--line);
-      }
-      .field-label {
-        font-size: 9.5px;
+      .position-meta {
+        font-size: 12px;
         color: var(--muted);
-        margin-bottom: 2px;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
-      /* 票 87：下半区变矮，方向/杠杆并排、标签贴左，省下一整行。 */
-      .field-row {
+      .position-side {
         display: flex;
         align-items: center;
-        gap: 5px;
-      }
-      .field-row .field-label {
-        margin: 0;
+        gap: 8px;
         flex: none;
       }
-      .field-row .side-row {
-        flex: 1.05;
+      .pnl {
+        font-size: 18px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        min-width: 54px;
+        text-align: right;
       }
-      .field-row .leverage-row {
-        flex: 1;
+      .pnl[data-tone='up'] {
+        color: var(--emerald-deep);
       }
-      .chip-row {
-        display: flex;
-        gap: 4px;
-        min-width: 0;
+      .pnl[data-tone='down'] {
+        color: var(--rose-ink);
       }
-      .chip {
-        flex: 1;
-        min-width: 0;
-        padding: 4px 5px;
-        border-radius: 8px;
-        border: 1px solid var(--line-strong);
+      .pnl[data-tone='flat'] {
+        color: var(--ink-soft);
+      }
+      .ghost {
+        flex: none;
+        height: 24px;
+        padding: 0 8px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius-sm);
         background: var(--card);
-        color: var(--ink);
-        font-size: 11px;
+        color: var(--ink-soft);
+        font-size: 12px;
         font-weight: 600;
         white-space: nowrap;
         cursor: pointer;
+        box-shadow: var(--shadow);
       }
-      .chip:hover {
+      .ghost:hover:not(:disabled) {
+        border-color: var(--rose);
+        color: var(--rose-ink);
+      }
+      .ghost.stop[aria-pressed='true'] {
+        border-color: var(--amber);
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+      }
+      .row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 4px 0;
+        font-size: 12px;
+        min-width: 0;
+      }
+      .row + .row {
+        border-top: 1px dashed var(--line);
+      }
+      .row-main {
+        min-width: 0;
+      }
+      .row-title {
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .row-meta {
+        margin-top: 1px;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* 结算行压成一行：标题 + 价格/原因/时间 + 盈亏。3 笔在 120px 的卡片里也看得全。 */
+      .history-row {
+        padding: 1px 0;
+      }
+      .history-row .row-main {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        min-width: 0;
+      }
+      .history-row .row-title {
+        flex: none;
+      }
+      .history-row .row-meta {
+        flex: 1;
+        min-width: 0;
+        margin-top: 0;
+      }
+      /* 结算行不让 18px 的盈亏把卡片撑高：这里和榜单一样用紧凑字号。 */
+      .history-card .pnl {
+        font-size: 14px;
+        min-width: 46px;
+      }
+      /* ------------------------------ 下单（不滚、不裁） ------------------------------ */
+      .order-card {
+        flex: none;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 5px 8px;
+        /* 票 89 的硬要求：下单卡自己绝不出现滚动条；内容按 300px 宽 + 真实高度排。 */
+        overflow: visible;
+      }
+      .order-head {
+        height: 26px;
+        margin-bottom: 0;
+      }
+      .order-head h2 {
+        flex: none;
+      }
+      .order-head .order-crop {
+        flex: 1;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .limit-toggle {
+        flex: none;
+        height: 26px;
+        padding: 0 9px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius-sm);
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .limit-toggle:hover {
+        border-color: var(--amber);
+        color: var(--amber-ink);
+      }
+      .limit-toggle[aria-pressed='true'] {
+        border-color: var(--amber);
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+      }
+      .limit-note {
+        flex: none;
+        max-width: 96px;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      /* 两列行：标签 40 + 控件 minmax(0,1fr)。34px 行高留足点击面积。 */
+      .field-row {
+        display: grid;
+        grid-template-columns: 40px minmax(0, 1fr);
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
+      }
+      .field-label {
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .chip-row {
+        display: grid;
+        gap: 8px;
+        min-width: 0;
+      }
+      .chip-row.side {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+      .chip-row.margins {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+      .chip-row.leverages {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+      .chip {
+        min-width: 0;
+        height: 28px;
+        padding: 0 6px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius-sm);
+        background: var(--card);
+        color: var(--ink);
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .chip:hover:enabled {
         border-color: var(--emerald);
       }
       .chip[aria-pressed='true'] {
@@ -712,381 +1004,212 @@
         color: var(--rose-ink);
       }
       .chip:disabled {
-        background: var(--disabled-bg);
         border-color: var(--line);
+        background: var(--disabled-bg);
         color: var(--disabled-ink);
-        cursor: not-allowed;
       }
       .preview {
         margin: 0;
-        padding: 4px 7px;
-        border-radius: 8px;
-        background: rgba(47, 58, 52, 0.035);
-        font-size: 9.5px;
+        font-size: 12px;
         color: var(--ink-soft);
-        line-height: 1.4;
         font-variant-numeric: tabular-nums;
+        line-height: 1.25;
+        /* 预览句只留一行；超长省略（产品原文不动）。 */
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
-      /* 下单前的强平价（SPEC v10 US7）：和预览句分两行，预览句的措辞是产品硬文案。 */
       .liquidation {
         margin: 0;
-        padding: 0 2px;
-        font-size: 9.5px;
-        color: var(--ink-soft);
+        font-size: 12px;
+        color: var(--muted);
         font-variant-numeric: tabular-nums;
+        line-height: 1.25;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .order-actions {
+        margin-top: auto;
+        padding-top: 3px;
+        border-top: 1px dashed var(--line);
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
       }
       .submit {
         width: 100%;
-        padding: 7px 12px;
-        border: none;
-        border-radius: 10px;
+        height: 32px;
+        border: 2px solid var(--emerald-deep);
+        border-radius: 10px 8px 11px 7px;
         background: var(--emerald-btn);
         color: #fff;
         font-size: 13px;
         font-weight: 700;
         cursor: pointer;
+        box-shadow: var(--shadow);
       }
       .submit:hover:not(:disabled) {
         background: var(--emerald-deep);
       }
       .submit[data-side='short'] {
+        border-color: #8c2b22;
         background: var(--rose-ink);
       }
       .submit[data-side='short']:hover:not(:disabled) {
         background: #8c2b22;
       }
       .submit:disabled {
+        border-color: var(--line);
         background: var(--disabled-bg);
-        border: 1px solid var(--line);
         color: var(--disabled-ink);
-        cursor: not-allowed;
       }
       .hint {
         margin: 0;
-        font-size: 10px;
+        font-size: 12px;
         color: var(--amber-ink);
-        line-height: 1.4;
+        line-height: 1.2;
       }
       .hint:empty {
         display: none;
       }
-      /* ------------------------------ 到价挂单（票 83） ------------------------------ */
-      .limit {
-        display: flex;
-        flex-direction: column;
-        gap: 5px;
-      }
-      .limit-head {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-      }
-      .limit-toggle {
-        flex: none;
-      }
-      .limit-toggle[aria-pressed='true'] {
-        border-color: var(--amber);
-        background: var(--amber-soft);
-        color: var(--amber-ink);
-      }
-      .limit-note {
-        min-width: 0;
-        font-size: 10px;
+      /* 票 89：fine print 一整段压成一行，放在左列最底（结算卡页脚），不占下单卡的高度。 */
+      .fine {
+        margin: 2px 0 0;
+        padding-top: 2px;
+        border-top: 1px dashed var(--line);
+        font-size: 12px;
         color: var(--muted);
+        line-height: 1.1;
+        text-align: center;
         white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
       }
+      /* 到价展开：只多一行目标价（34）；带子/错误各一行，错误为空就不占位。 */
       .limit-box {
         display: flex;
         flex-direction: column;
-        gap: 4px;
-        padding: 7px 8px;
-        border: 1px dashed var(--line-strong);
-        border-radius: 10px;
-        background: rgba(231, 162, 58, 0.05);
+        gap: 3px;
       }
       .limit-box[hidden] {
         display: none;
       }
-      .limit-input-row {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-      }
-      .limit-input-row .field-label {
-        margin: 0;
-        flex: none;
-      }
       .limit-input {
-        flex: 1;
         min-width: 0;
-        padding: 6px 8px;
-        border-radius: 9px;
-        border: 1px solid var(--line-strong);
+        height: 28px;
+        padding: 0 8px;
+        border: 2px solid var(--line-strong);
+        border-radius: 9px 7px 10px 6px;
         background: var(--card);
         color: var(--ink);
-        font-family: inherit;
         font-size: 13px;
         font-variant-numeric: tabular-nums;
+        box-shadow: var(--shadow);
       }
-      .limit-input:focus-visible {
-        outline: 2px solid var(--focus);
-        outline-offset: 1px;
+      .limit-row {
+        display: grid;
+        grid-template-columns: 40px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        min-height: 34px;
       }
       .limit-place {
-        flex: none;
-      }
-      .limit-band {
-        margin: 0;
-        font-size: 10px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
+        height: 28px;
       }
       .limit-hint {
         margin: 0;
-        font-size: 10px;
+        font-size: 12px;
         color: var(--amber-ink);
-        line-height: 1.5;
+        line-height: 1.2;
       }
       .limit-hint:empty {
         display: none;
+      }
+      /* 到价挂单：和持仓同一个滚动区；没有单时整块不占高度。 */
+      .orders-wrap[hidden] {
+        display: none;
+      }
+      .orders-wrap {
+        margin-bottom: 4px;
       }
       .orders-head {
         display: flex;
         align-items: baseline;
         justify-content: space-between;
         gap: 8px;
-        padding-top: 3px;
-        border-top: 1px dashed var(--line);
-        font-size: 9.5px;
+        padding-bottom: 2px;
+        border-bottom: 1px dashed var(--line);
+        font-size: 12px;
         color: var(--muted);
-      }
-      .orders {
-        flex: 0 1 auto;
-        max-height: 46px;
-        min-height: 0;
       }
       .order-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 8px;
-        padding: 4px 0;
+        padding: 3px 0;
         font-size: 12px;
+        min-width: 0;
       }
       .order-row + .order-row {
         border-top: 1px dashed var(--line);
       }
+      .order-row .row-main {
+        min-width: 0;
+      }
       .order-row .row-title {
         font-size: 12px;
       }
-      .order-row .row-meta {
+      .order-remaining {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
         font-variant-numeric: tabular-nums;
       }
       .order-cancel {
         flex: none;
       }
-      .fine {
-        margin: auto 0 0;
-        padding-top: 4px;
-        border-top: 1px dashed var(--line);
-        font-size: 9px;
-        color: var(--muted);
-        line-height: 1.45;
-      }
-      /* ------------------------------ 持仓/历史 ------------------------------ */
-      .positions-card,
-      .history-card {
-        display: flex;
-        flex-direction: column;
-        min-height: 0;
-        padding: 7px 9px;
-      }
-      .positions-card .scroll,
-      .history-card .scroll {
-        flex: 1;
-        min-height: 0;
-      }
-      .positions-card {
-        grid-area: positions;
-      }
-      .history-card {
-        grid-area: history;
-      }
-      .position {
-        display: flex;
-        flex-direction: column;
-        gap: 2px;
+      /* ------------------------------ 真人周榜 ------------------------------ */
+      .league-card {
         padding: 5px 8px;
-        border-radius: 12px;
-        border: 1px solid var(--line);
-        background: linear-gradient(180deg, #fffefb, #fbf7f0);
       }
-      .position + .position {
-        margin-top: 4px;
+      .league-card .card-head {
+        height: 20px;
+        margin-bottom: 1px;
       }
-      .position-head {
+      .sentiment {
         display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 8px;
-      }
-      .position-title {
-        font-size: 12px;
-        font-weight: 700;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .position-meta {
-        font-size: 10px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .position-side {
-        display: flex;
-        align-items: center;
-        gap: 6px;
+        align-items: baseline;
+        gap: 4px;
         flex: none;
-      }
-      .pnl {
-        font-size: 14px;
-        font-weight: 700;
-        font-variant-numeric: tabular-nums;
-        min-width: 52px;
-        text-align: right;
-      }
-      .pnl[data-tone='up'] {
-        color: var(--emerald-deep);
-      }
-      .pnl[data-tone='down'] {
-        color: var(--rose-ink);
-      }
-      .pnl[data-tone='flat'] {
-        color: var(--ink-soft);
-      }
-      .ghost {
-        padding: 6px 9px;
-        border-radius: 9px;
-        border: 1px solid var(--line-strong);
-        background: var(--card);
-        color: var(--ink-soft);
-        font-size: 11px;
-        font-weight: 600;
-        cursor: pointer;
-        white-space: nowrap;
-      }
-      .ghost:hover:not(:disabled) {
-        border-color: var(--rose);
-        color: var(--rose-ink);
-      }
-      .ghost.stop[aria-pressed='true'] {
-        border-color: var(--amber);
-        background: var(--amber-soft);
-        color: var(--amber-ink);
-      }
-      .ghost:disabled {
-        background: var(--disabled-bg);
-        color: var(--disabled-ink);
-        cursor: not-allowed;
-      }
-      .row {
-        display: flex;
-        align-items: baseline;
-        justify-content: space-between;
-        gap: 10px;
-        padding: 3px 0;
-        font-size: 11.5px;
-      }
-      .row + .row {
-        border-top: 1px dashed var(--line);
-      }
-      .row-main {
-        min-width: 0;
-      }
-      .row-title {
-        font-weight: 600;
-      }
-      .row-meta {
-        margin-top: 1px;
-        font-size: 10px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
-      }
-      .empty {
-        margin: 2px 0 0;
-        font-size: 10.5px;
-        color: var(--muted);
-        line-height: 1.6;
-      }
-      .empty[hidden] {
-        display: none;
-      }
-      /* ------------------------------ 真人周榜（票 82） ------------------------------ */
-      .neighbor-card {
-        grid-area: neighbor;
-        display: flex;
-        flex-direction: column;
-        min-height: 0;
-        padding: 7px 9px;
-      }
-      .neighbor-card .scroll {
-        flex: 1;
-        min-height: 0;
-      }
-      .sentiment-inline {
-        display: flex;
-        align-items: baseline;
-        gap: 4px;
-        margin-left: auto;
-        font-size: 9.5px;
-        color: var(--muted);
-        white-space: nowrap;
-      }
-      .sentiment-value {
         font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .sentiment b {
+        font-size: 13px;
         font-weight: 700;
         color: var(--ink-soft);
         font-variant-numeric: tabular-nums;
       }
-      .sentiment-value[data-tone='up'] {
+      .sentiment b[data-tone='up'],
+      .sentiment b[data-tone='long'] {
         color: var(--emerald-deep);
       }
-      .sentiment-value[data-tone='down'] {
+      .sentiment b[data-tone='down'],
+      .sentiment b[data-tone='short'] {
         color: var(--rose-ink);
       }
-      /* US19：邻居的当前持仓画成小 chip（作物 + 多/空 + 杠杆），摘要仍保留多空计数。 */
-      .league-chips {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 4px;
-        margin-top: 3px;
+      .league-row {
+        align-items: flex-start;
+        padding: 1px 0;
       }
-      .league-chip {
-        padding: 1px 6px;
-        border-radius: 999px;
-        background: var(--emerald-soft);
-        color: var(--emerald-deep);
-        font-size: 10px;
-        font-weight: 600;
-        white-space: nowrap;
+      .league-row .row-title,
+      .league-row .row-meta {
+        line-height: 1.1;
       }
-      .league-chip[data-tone='short'] {
-        background: var(--rose-soft);
-        color: var(--rose-ink);
-      }
-      .league-chip.more {
-        background: rgba(47, 58, 52, 0.06);
-        color: var(--muted);
-      }
-      /* 本机那一行一直高亮：榜上第一眼要找的是自己的名次，不是邻居。 */
       .league-row.me {
         margin: 0 -6px;
-        padding: 4px 6px;
+        padding: 1px 6px;
         border-radius: 8px;
         background: var(--emerald-soft);
       }
@@ -1098,14 +1221,13 @@
         text-align: right;
         white-space: nowrap;
       }
-      /* 榜行比持仓卡密：分数用 12px，够看清又不把一屏挤成两行。 */
       .league-row .pnl {
-        font-size: 12px;
-        min-width: 40px;
+        font-size: 14px;
+        min-width: 34px;
       }
       .league-pct {
-        margin-left: 6px;
-        font-size: 10px;
+        display: block;
+        font-size: 12px;
         color: var(--muted);
         font-variant-numeric: tabular-nums;
       }
@@ -1114,6 +1236,31 @@
       }
       .league-pct[data-tone='down'] {
         color: var(--rose-ink);
+      }
+      .league-chips {
+        display: inline-flex;
+        flex-wrap: nowrap;
+        gap: 3px;
+        margin-left: 4px;
+        vertical-align: middle;
+        overflow: hidden;
+      }
+      .league-chip {
+        padding: 0 5px;
+        border-radius: 999px;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .league-chip[data-tone='short'] {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .league-chip.more {
+        background: rgba(47, 58, 52, 0.06);
+        color: var(--muted);
       }
       /* ------------------------------ 其他 ------------------------------ */
       .toasts {
@@ -1133,11 +1280,19 @@
         background: rgba(47, 58, 52, 0.92);
         color: #fff;
         font-size: 12px;
-        box-shadow: var(--shadow-lift);
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.2);
         white-space: nowrap;
       }
       .toast.error {
         background: var(--rose-ink);
+      }
+      /* 每屏最多一两处动效：除 hover/选中过渡外不加动画；用户要求减少动态时直接关掉。 */
+      @media (prefers-reduced-motion: reduce) {
+        .crop-tab,
+        .crop-viewport::before,
+        .crop-viewport::after {
+          transition: none;
+        }
       }
     </style>
   </head>
@@ -1149,79 +1304,139 @@
           <span class="brand-mark" aria-hidden="true">📈</span>
           <div class="brand-text">
             <h1 id="board-title">盘口</h1>
-            <p id="board-subtitle">15 分钟合约 · 收盘自动结算</p>
           </div>
         </div>
-        <div class="week" title="本周交易盈亏（已实现 + 未实现）与收益率；周一 00:00 清零，硬币不清零">
-          <small>本周</small><b id="week-pnl" data-tone="flat">0.0</b><span id="week-pct">—</span>
+        <div
+          class="week"
+          id="week"
+          title="本周交易盈亏（已实现 + 未实现）与收益率；周一 00:00 清零，硬币不清零"
+        >
+          <span>本周</span>
+          <b id="week-pnl" data-tone="flat">0.0</b>
+          <span id="week-pct">(—)</span>
         </div>
         <div class="wallet">
           <span class="pill" title="可用硬币 = 农场硬币">
             <small>可用</small><b id="coins-available">0</b>
           </span>
-          <span class="pill" title="可用 + 锁定保证金 + 未实现盈亏">
-            <small>含锁定</small><b id="coins-total">0</b>
+          <span class="pill" title="锁定保证金（持仓 + 到价挂单）">
+            <small>锁定</small><b id="coins-locked">0</b>
           </span>
         </div>
         <div class="countdown" title="距这一根收盘">
-          <b id="countdown">15:00</b>
           <span>距收盘</span>
+          <b id="countdown">15:00</b>
         </div>
         <button class="close" id="close" type="button" aria-label="关闭盘口">×</button>
       </header>
 
       <div class="body">
         <section class="card chart-card" aria-label="行情 K 线">
-          <div class="chart-head">
-            <div class="crop-tabs" id="crop-tabs" role="group" aria-label="作物"></div>
-            <div class="timeframe-tabs" id="timeframe-tabs" role="group" aria-label="K 线周期"></div>
-            <div class="chart-quote">
-              <b class="chart-price" id="chart-price" data-tone="flat">—</b>
-              <span class="chart-change" id="chart-change">—</span>
-              <span class="wind" id="wind" data-tone="flat">风向 —</span>
+          <div class="crop-strip">
+            <button
+              class="strip-arrow"
+              id="crop-prev"
+              type="button"
+              aria-label="上一组作物"
+              title="上一组作物"
+            >‹</button>
+            <div class="crop-viewport" id="crop-viewport">
+              <div class="crop-scroll" id="crop-scroll">
+                <div class="crop-tabs" id="crop-tabs" role="group" aria-label="作物"></div>
+              </div>
             </div>
+            <button
+              class="strip-arrow"
+              id="crop-next"
+              type="button"
+              aria-label="下一组作物"
+              title="下一组作物"
+            >›</button>
+            <div
+              class="timeframe-tabs"
+              id="timeframe-tabs"
+              role="group"
+              aria-label="K 线周期"
+            ></div>
+          </div>
+          <div class="chart-head">
+            <b class="chart-price" id="chart-price" data-tone="flat">—</b>
+            <span class="chart-change" id="chart-change">—</span>
+            <span class="wind" id="wind" data-tone="flat">风向 —</span>
+            <span class="chart-settle-hint" id="chart-settle-hint" data-visible="false"></span>
+            <span class="slot-note" id="slot-note">—</span>
           </div>
           <svg
             class="chart-svg"
             id="chart"
-            viewBox="0 0 720 280"
+            viewBox="0 0 720 198"
             preserveAspectRatio="none"
             role="img"
             aria-label="K 线"
           ></svg>
-          <p class="chart-empty" id="chart-empty" hidden>行情还在算，稍等一下。</p>
-          <div class="chart-foot">
-            <span class="legend" id="legend"></span>
-            <span class="chart-settle-hint" id="chart-settle-hint" data-visible="false"></span>
-            <span class="slot-note" id="slot-note">—</span>
-          </div>
+          <p class="chart-empty" id="chart-empty" hidden>行情还在算</p>
         </section>
 
-        <section class="card order-card" aria-labelledby="order-title">
-          <div class="card-head">
-            <h2 id="order-title">下单</h2>
-            <span id="order-crop">小番茄</span>
+        <div class="bottom">
+          <div class="left-col">
+            <section class="card positions-card" aria-labelledby="positions-title">
+              <div class="card-head">
+                <h2 id="positions-title">持仓</h2>
+                <span id="positions-meta">持仓 0</span>
+              </div>
+              <!-- 票 89：到价挂单跟持仓同属「还开着的仓」，放在同一个滚动区里；
+                   下单卡因此永远不滚、不裁，右列只留下单 + 周榜。 -->
+              <div class="scroll" id="blotter">
+                <div class="orders-wrap" id="orders-wrap" hidden>
+                  <div class="orders-head">
+                    <span>到价挂单</span>
+                    <span id="orders-meta">挂单 0</span>
+                  </div>
+                  <div id="orders"></div>
+                </div>
+                <div id="positions"></div>
+              </div>
+              <p class="empty" id="positions-empty">还没有持仓</p>
+            </section>
+
+            <section class="card history-card" aria-labelledby="history-title">
+              <div class="card-head">
+                <h2 id="history-title">最近结算</h2>
+                <span id="history-meta">0 笔</span>
+              </div>
+              <div class="scroll" id="history"></div>
+              <p class="empty" id="history-empty">还没有结算</p>
+              <p class="fine">无手续费 · 无资金费 · 无风控</p>
+            </section>
           </div>
-          <div class="order-scroll">
-            <div class="field-row">
-              <span class="field-label">方向</span>
-              <div class="chip-row side-row" id="side-row" role="group" aria-label="方向"></div>
-              <span class="field-label">杠杆</span>
-              <div class="chip-row leverage-row" id="leverage-row" role="group" aria-label="杠杆"></div>
-            </div>
-            <div class="field-row">
-              <span class="field-label">保证金</span>
-              <div class="chip-row" id="margin-row" role="group" aria-label="保证金"></div>
-            </div>
-            <div class="limit">
-              <div class="limit-head">
-                <button class="ghost limit-toggle" id="limit-toggle" type="button" aria-pressed="false">
-                  到价
-                </button>
-                <span class="limit-note" id="limit-note">关：直接按现价开仓</span>
+
+          <div class="right-col">
+            <section class="card order-card" aria-labelledby="order-title">
+              <div class="card-head order-head">
+                <h2 id="order-title">下单</h2>
+                <span class="order-crop" id="order-crop">小番茄</span>
+                <button
+                  class="limit-toggle"
+                  id="limit-toggle"
+                  type="button"
+                  aria-pressed="false"
+                >到价</button>
+                <span class="limit-note" id="limit-note"></span>
+              </div>
+              <div class="field-row">
+                <span class="field-label">方向</span>
+                <div class="chip-row side" id="side-row" role="group" aria-label="方向"></div>
+              </div>
+              <div class="field-row">
+                <span class="field-label">保证金</span>
+                <div class="chip-row margins" id="margin-row" role="group" aria-label="保证金"></div>
+              </div>
+              <div class="field-row">
+                <span class="field-label">杠杆</span>
+                <div class="chip-row leverages" id="leverage-row" role="group" aria-label="杠杆"></div>
               </div>
               <div class="limit-box" id="limit-box" hidden>
-                <div class="limit-input-row">
+                <div class="limit-row">
                   <label class="field-label" for="limit-target">目标价</label>
                   <input
                     class="limit-input"
@@ -1231,62 +1446,33 @@
                     autocomplete="off"
                     spellcheck="false"
                     placeholder="5.00"
-                    aria-describedby="limit-band limit-hint"
+                    aria-describedby="limit-note limit-hint"
                   />
                   <button class="ghost limit-place" id="limit-place" type="button">挂单</button>
                 </div>
-                <p class="limit-band" id="limit-band"></p>
                 <p class="limit-hint" id="limit-hint"></p>
               </div>
-            </div>
-            <p class="preview" id="preview"></p>
-            <p class="liquidation" id="order-liquidation"></p>
-            <div class="orders-head">
-              <span>到价挂单</span>
-              <span id="orders-meta">挂单 0</span>
-            </div>
-            <div class="scroll orders" id="orders"></div>
-            <p class="empty" id="orders-empty">没有挂单。</p>
-            <p class="fine">
-              没有手续费、没有资金费、没有风险控制。关掉窗口也会照常收盘结算；硬币赔光就去种地。
-            </p>
-          </div>
-          <div class="order-actions">
-            <button class="submit" id="submit" type="button">开一手</button>
-            <p class="hint" id="order-hint"></p>
-          </div>
-        </section>
+              <p class="preview" id="preview"></p>
+              <p class="liquidation" id="order-liquidation"></p>
+              <div class="order-actions">
+                <p class="hint" id="order-hint"></p>
+                <button class="submit" id="submit" type="button">开一手</button>
+              </div>
+            </section>
 
-        <section class="card positions-card" aria-labelledby="positions-title">
-          <div class="card-head">
-            <h2 id="positions-title">持仓</h2>
-            <span id="positions-meta">持仓 0</span>
+            <section class="card league-card" aria-labelledby="league-title">
+              <div class="card-head">
+                <h2 id="league-title">真人周榜</h2>
+                <span class="sentiment">
+                  <span>情绪</span>
+                  <b id="sentiment" data-tone="flat">观望</b>
+                </span>
+              </div>
+              <div class="scroll" id="league"></div>
+              <p class="empty" id="neighbor-empty">等邻居上线</p>
+            </section>
           </div>
-          <div class="scroll" id="positions"></div>
-          <p class="empty" id="positions-empty">还没有持仓。</p>
-        </section>
-
-        <section class="card history-card" aria-labelledby="history-title">
-          <div class="card-head">
-            <h2 id="history-title">最近结算</h2>
-            <span id="history-meta">0 笔</span>
-          </div>
-          <div class="scroll" id="history"></div>
-          <p class="empty" id="history-empty">还没有结算记录。</p>
-        </section>
-
-        <section class="card neighbor-card" aria-labelledby="neighbor-title">
-          <div class="card-head">
-            <h2 id="neighbor-title">真人周榜</h2>
-            <span class="sentiment-inline">
-              <span>LAN 情绪</span>
-              <b class="sentiment-value" id="sentiment" data-tone="flat">观望</b>
-            </span>
-            <span id="league-count">1 人</span>
-          </div>
-          <div class="scroll" id="league"></div>
-          <p class="empty" id="neighbor-empty">还没有邻居上线。</p>
-        </section>
+        </div>
       </div>
 
       <div class="toasts" id="toasts"></div>
