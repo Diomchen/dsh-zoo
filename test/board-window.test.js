@@ -213,7 +213,7 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
   assert.deepEqual(state.positions, [])
   assert.deepEqual(state.history, [])
   assert.deepEqual(state.orders, [])
-  // 没有邻居时 watchers 是 0/0：窗口照旧画「还没有邻居上线」。
+  // 没有邻居时 watchers 是 0/0：窗口照旧画「等邻居上线」。
   assert.deepEqual(state.league.watchers, { online: 0, reported: 0 })
   assert.deepEqual(state.limits, {
     margins: [50, 100, 250],
@@ -944,7 +944,7 @@ test('票 82：payload 带真人周榜（只有自己 → 观望），并能穿�
   assert.equal(board.league.rows[0].positionsText, '观望')
   assert.equal(board.league.sentiment.text, '观望')
   assert.equal(board.league.hasPeers, false)
-  assert.match(board.league.empty, /还没有邻居上线/)
+  assert.match(board.league.empty, /等邻居上线/)
 
   // 开一手：下一包 payload 的榜自己那行就有一条多单，情绪变「多 1 · 空 0」。
   const opened = await callAction(service, {
@@ -1148,19 +1148,47 @@ test('票 85：盘口窗可拖动，位置记在 userData/board-window.json（�
   assert.doesNotMatch(html, /\.(?:body|card|chart-card)[^{]*\{[^}]*-webkit-app-region:\s*drag/)
 })
 
-test('票 87：盘口版面上图下两列、图 720×280，手绘/十字线接线齐全', async () => {
-  // 版面是纯静态的：grid 把 chart 铺满整行，下面两列左持仓/结算、右下单/周榜。
+test('票 87 / 票 89：盘口版面上图带 + 下两列，图 720×198，手绘/十字线接线齐全', async () => {
+  // 版面是纯静态的：图带 286（作物条 42 + 图头 30 + 图 198 + 边框/内边距），下面两列左持仓/结算、右下单/周榜。
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
-  assert.match(html, /grid-template-areas:[\s\S]*?'chart chart'[\s\S]*?'positions order'[\s\S]*?'history neighbor'/)
-  assert.match(html, /grid-template-columns: minmax\(0, 1fr\) 308px/)
-  // 图必须占满卡片宽度：viewBox 与 CSS 高度一致，由 board.js 按几何再写一次。
-  assert.match(html, /viewBox="0 0 720 280"/)
-  assert.match(html, /\.chart-svg \{[\s\S]*?height: 280px/)
+  assert.match(html, /grid-template-rows: 286px minmax\(0, 1fr\)/)
+  assert.match(html, /grid-template-columns: minmax\(0, 1fr\) 300px/)
+  assert.match(html, /\.crop-strip \{[\s\S]*?height: 42px/)
+  assert.match(html, /viewBox="0 0 720 198"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 198px/)
   assert.doesNotMatch(html, /viewBox="0 0 384 188"/)
-  // 760×700 内不整页滚动：页面本身 overflow hidden，只有列表/控件内部滚。
-  assert.match(html, /overflow: hidden;/)
-  assert.match(html, /class="order-scroll"/)
+  // 760×700 内不整页滚动：页面本身 overflow hidden，只有列表内部滚。
+  assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)
+  // 票 89 的硬要求：下单卡不滚动、不裁切；每行 label 40 + 控件 minmax(0,1fr)。
+  assert.doesNotMatch(html, /order-scroll/)
+  const fieldRow = /\.field-row \{([\s\S]*?)\}/.exec(html)
+  assert.ok(fieldRow, '下单区应有 .field-row 两列行')
+  assert.match(fieldRow[1], /grid-template-columns: 40px minmax\(0, 1fr\)/)
+  assert.match(html, /repeat\(4, minmax\(0, 1fr\)\)/)
+  assert.match(html, /repeat\(3, minmax\(0, 1fr\)\)/)
+  const orderCard = /\.order-card \{([\s\S]*?)\}/.exec(html)
+  assert.ok(orderCard, '应有 .order-card 规则')
+  assert.match(orderCard[1], /overflow: visible/)
+  assert.doesNotMatch(orderCard[1], /overflow-y: auto|overflow: auto/)
   assert.match(html, /class="order-actions"/)
+  assert.match(html, /id="submit"/)
+  // 焦点环/禁用态/数字等宽：票 89 的三条硬规则。
+  assert.match(html, /:focus-visible \{[\s\S]*?outline: 2px dashed var\(--ink\)/)
+  assert.match(html, /button:disabled,[\s\S]*?opacity: 0\.45/)
+  assert.match(html, /\.pnl \{[\s\S]*?font-size: 18px/)
+  assert.match(html, /font-variant-numeric: tabular-nums/)
+  // 作物条：单行横滚容器 + 左右箭头 + 渐隐；不换行、不撑高。
+  assert.match(html, /id="crop-scroll"/)
+  assert.match(html, /id="crop-prev"/)
+  assert.match(html, /id="crop-next"/)
+  const cropScroll = /\.crop-scroll \{([\s\S]*?)\}/.exec(html)
+  assert.ok(cropScroll, '应有 .crop-scroll 规则')
+  assert.match(cropScroll[1], /overflow-x: auto/)
+  assert.match(cropScroll[1], /overflow-y: hidden/)
+  // 到价挂单跟持仓在左列同一个滚动区里（票 89）：右列只剩 下单 + 周榜，
+  // 下单卡不会因为挂单卡片而溢出 760×700。
+  assert.match(html, /id="blotter"[\s\S]*?id="orders-wrap"[\s\S]*?id="positions"/)
+  assert.doesNotMatch(html, /orders-card/)
   // 票 84 的周期提示与页签没有在这次改版里丢。
   assert.match(html, /id="timeframe-tabs"/)
   assert.match(html, /id="chart-settle-hint"/)
@@ -1175,13 +1203,24 @@ test('票 87：盘口版面上图下两列、图 720×280，手绘/十字线接�
   assert.match(script, /view\.crosshairAt/)
   assert.match(script, /pointermove/)
   assert.match(script, /pointerleave/)
+  // 票 89：作物条的箭头/滚轮/键盘/选中项滚进视野都接上了。
+  assert.match(script, /updateCropArrows/)
+  assert.match(script, /ensureCropVisible/)
+  assert.match(script, /cropScrollEl\.addEventListener\('wheel'/)
+  assert.match(script, /cropTabsEl\.addEventListener\('keydown'/)
+  assert.match(script, /'data-hollow': candle\.hollow/)
+  assert.match(script, /ordersWrapEl\.hidden/)
   assert.doesNotMatch(script, /console\.log/)
 
   // 纯视图的尺寸与列归属是公开常量，Node 测试和窗口吃同一份。
   assert.equal(boardView.BOARD_WIDTH, 760)
   assert.equal(boardView.BOARD_HEIGHT, 700)
   assert.equal(boardView.CHART_WIDTH, 720)
-  assert.equal(boardView.CHART_HEIGHT, 280)
+  assert.equal(boardView.CHART_HEIGHT, 198)
+  assert.equal(boardView.LAYOUT.headerHeight, 52)
+  assert.equal(boardView.LAYOUT.cropStripHeight, 42)
+  assert.equal(boardView.LAYOUT.chartCardHeight, 286)
+  assert.equal(boardView.LAYOUT.bottom.rightWidth, 300)
   assert.deepEqual(boardView.LAYOUT.columns.left, ['positions', 'history'])
   assert.deepEqual(boardView.LAYOUT.columns.right, ['order', 'league'])
 })
