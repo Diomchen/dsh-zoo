@@ -1128,3 +1128,22 @@ test('评审 P1：shot 命令支持盘口窗（关着回 not-ready，不误拍�
   assert.match(main, /target === 'board' \? boardWin/)
   assert.match(main, /command\.window === 'bring' \|\| command\.window === 'farm' \|\| command\.window === 'board'/)
 })
+
+test('票 85：盘口窗可拖动，位置记在 userData/board-window.json（静态窄口）', async () => {
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  const open = main.slice(main.indexOf('function openBoardWindow'), main.indexOf('function closeBoardWindow'))
+  assert.match(open, /movable: true/, '盘口窗要可拖动')
+  assert.match(open, /created\.on\('moved'/, '松手后要记位置')
+  assert.match(main, /BOARD_POSITION_SAVE_MS = 250/, '位置落盘要防抖，不是每帧写')
+  assert.match(main, /boardPositionFile/)
+  assert.match(main, /windowBounds\.readPosition/)
+  assert.match(main, /windowBounds\.writePosition/)
+
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /\.topbar \{[\s\S]*?-webkit-app-region:\s*drag/)
+  // 只有标题栏是拖动区；交互子元素都要退出，否则点 × 会变成拖窗口。
+  assert.match(html, /\.topbar button,[\s\S]*?-webkit-app-region:\s*no-drag/)
+  assert.match(html, /drag-grip/)
+  assert.equal((html.match(/-webkit-app-region:\s*drag/g) ?? []).length, 1, '拖动区只能有一处（标题栏）')
+  assert.doesNotMatch(html, /\.(?:body|card|chart-card)[^{]*\{[^}]*-webkit-app-region:\s*drag/)
+})
