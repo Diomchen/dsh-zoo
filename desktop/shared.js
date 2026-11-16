@@ -2732,6 +2732,9 @@
       case 'debug-farm-read':
         // 冒烟用：读农场小窗里每张卡的 stage / countdown 文本，验多地块倒计时。
         return { ok: true, command: { type, id } }
+      case 'debug-farm-spark':
+        // 冒烟用：真发一次 mouseenter，读成交价曲线的悬停气泡。
+        return { ok: true, command: { type, id } }
       case 'debug-farm-block': {
         // 冒烟用：阻塞渲染进程 N 毫秒，模拟 setInterval 被延迟/后台节流。
         const ms = Math.min(15000, Math.max(0, Math.floor(Number(raw.ms) || 0)))
@@ -2932,6 +2935,23 @@
           }
         }
         return { ok: true, event: { type, id, plots } }
+      }
+      case 'farm-spark': {
+        // 冒烟用：成交价曲线的悬停结果（气泡文本/是否显示/是否贴着点）。
+        return {
+          ok: true,
+          event: {
+            type,
+            id,
+            dots: Math.max(0, Math.floor(Number(raw.dots) || 0)),
+            tips: Math.max(0, Math.floor(Number(raw.tips) || 0)),
+            connected: raw.connected === true,
+            tip: normalizeLabel(raw.tip, ''),
+            show: raw.show === true,
+            note: normalizeLabel(raw.note, ''),
+            near: raw.near === true
+          }
+        }
       }
       case 'farm-block':
         // 冒烟用（ticket 47.1）：渲染进程阻塞结束。
