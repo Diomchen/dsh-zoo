@@ -1498,7 +1498,7 @@
         width: 16px;
         height: 16px;
         margin: -8px 0 0 -8px;
-        cursor: help;
+        cursor: pointer;
         z-index: 2;
       }
       .market-spark-dot::after {
@@ -1527,7 +1527,27 @@
         margin: -4.5px 0 0 -4.5px;
       }
       .market-spark-dot:hover::after {
-        transform: scale(1.35);
+        transform: scale(1.25);
+      }
+      /* 悬停气泡：绝对定位在点上方，pointer-events:none，纯视觉，不挤动布局。 */
+      .market-spark-tip {
+        position: absolute;
+        z-index: 3;
+        padding: 2px 6px;
+        border-radius: 6px;
+        background: rgba(47, 58, 52, 0.94);
+        color: #fff;
+        font-size: 9px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        pointer-events: none;
+        transform: translate(-50%, -150%);
+        opacity: 0;
+        transition: opacity 60ms ease;
+      }
+      .market-spark-tip[data-show='true'] {
+        opacity: 1;
       }
       .market-spark.up polyline {
         stroke: var(--emerald);
