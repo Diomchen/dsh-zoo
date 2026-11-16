@@ -90,6 +90,20 @@
   const MAX_MENU_ACTIONS = 256
   // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
   const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'home', 'reload', 'scan-skins']
+  /**
+   * 右键工具项 → 宿主动作申请（评审 P2）：渲染端以前用一条 `id === 'reload' || …` 的
+   * 手写链，多一个工具就要改两处。现在只有这一张表，`runMenuTool` 直接查它。
+   * `home` 不在这里：它只在本机把宠物挪回出生点，不发任何申请。
+   * 键集合 = `MENU_TOOL_IDS` 去掉 home，`test/desktop-menu.test.js` 盯着。
+   */
+  const MENU_TOOL_REQUESTS = Object.freeze({
+    'open-site': 'open-site',
+    bring: 'bring',
+    farm: 'farm-open',
+    trading: 'trading-open',
+    reload: 'reload',
+    'scan-skins': 'scan-skins'
+  })
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -4211,6 +4225,7 @@
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
+    MENU_TOOL_REQUESTS,
     MAX_FARM_PLOTS,
     MIN_FARM_PLOTS,
     CROP_IDS,
