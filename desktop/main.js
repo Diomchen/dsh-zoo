@@ -2385,6 +2385,33 @@ function applyCommand (command) {
         }))
       return
     }
+    case 'debug-farm-season': {
+      // 冒烟用：读来客卡现在长什么样——处理完之后下拉框和按钮必须消失，只剩一句结论。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const card = document.querySelector("#omen-card");' +
+        'const done = card === null ? null : card.querySelector(".season-done");' +
+        'return {' +
+        'hidden: card === null || card.hidden === true,' +
+        'done: done === null ? "" : done.textContent,' +
+        'selects: card === null ? 0 : card.querySelectorAll("select").length,' +
+        'buttons: card === null ? 0 : card.querySelectorAll("[data-season-action^=\\"omen-\\"]").length' +
+        '};' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true)
+        .then((result) => writeEvent({ type: 'farm-season', id: command.id, ...result }))
+        .catch((error) => writeEvent({
+          type: 'error',
+          id: command.id,
+          code: 'farm-season-failed',
+          message: String(error?.message ?? error)
+        }))
+      return
+    }
     case 'debug-farm-spark': {
       // 冒烟用：真发一次 mouseenter，读悬停气泡文本与位置——光看 CSS 断言不出抖动/错位。
       if (!debugEnabled) return

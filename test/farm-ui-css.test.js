@@ -183,3 +183,19 @@ test('market sparkline is rendered as an inline SVG with trend colors', () => {
   assert.match(renderer, /market-spark-dot/)
   assert.match(renderer, /market-spark-tip/)
 })
+
+test('来客处理完只剩一句结论：不再画下拉框和按钮', () => {
+  // 通用 .season-card p 是隐藏的，结论那句要显式 display:block，否则“已处理”看不见。
+  const done = bodyOf('.season-card .season-done')
+  assert.match(done, /display:\s*block/)
+  assert.match(renderer, /season-done/)
+  assert.match(renderer, /card\.finished === true/)
+  // 提前 return 之后才建 select；处理过就根本走不到那段。
+  assert.match(renderer, /resultText/)
+  assert.doesNotMatch(renderer, /card\.resolved === true[\s\S]{0,40}guardOptions/)
+})
+
+test('节日领过奖也只留状态，不再摆一个点不动的按钮', () => {
+  assert.match(renderer, /已领取今天奖励/)
+  assert.match(renderer, /if \(card\.claimed\)/)
+})

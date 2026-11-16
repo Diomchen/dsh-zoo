@@ -2609,8 +2609,21 @@ async function verifyFarmWindow () {
           ready: false, claimed: false, reward: { coins: 50, dew: 4 }
         },
         omen: {
-          id: 'autumn-bearger', name: '熊獾', emoji: '🐻',
-          resolved: false, choice: null, canFeed: true,
+          id: 'autumn-bearger', name: '熊獾', emoji: '🐻', tag: '季候来客',
+          active: true, resolved: false, choice: null, canFeed: true,
+          start: start.getTime(), end: end.getTime(),
+          remainingMs: Math.max(0, end.getTime() - Date.now()),
+          guardBase: 0.3,
+          guardPets: 1,
+          choices: [
+            { id: 'guard', label: '守夜', affordable: true },
+            { id: 'feed', label: '投喂', affordable: true }
+          ],
+          guardOptions: [
+            { guards: 0, chance: 0.3, cost: 0, affordable: true },
+            { guards: 1, chance: 0.8, cost: 20, affordable: true },
+            { guards: 2, chance: 1, cost: 40, affordable: false, reason: '没有足够的空闲宠物' }
+          ],
           stakes: {
             guardReward: { coins: 40, dew: 3 }, failLoss: 3, feedCost: 3,
             feedReward: { coins: 0, dew: 2, seeds: { rice: 1 } }, ignoreLoss: 1
@@ -3021,6 +3034,67 @@ async function verifyFarmWindow () {
     '悬停气泡截图'
   )
   assert(sparkShot.width > 0 && existsSync(sparkPath), '悬停气泡截图落盘：' + sparkPath)
+
+  // 来客卡：没处理时有下拉框和按钮；处理完只剩一句“已处理”，控件必须全部消失。
+  client.send({ type: 'debug-farm-tab', tab: 'farm', id: 'smoke-farm-omen-tab' })
+  await sleep(500)
+  const omenLive = await (() => {
+    client.send({ type: 'debug-farm-season', id: 'smoke-farm-omen-live' })
+    return client.waitFrom(
+      client.mark(),
+      (event) => event.id === 'smoke-farm-omen-live',
+      6000,
+      '读来客卡（未处理）'
+    )
+  })()
+  assert(omenLive.type === 'farm-season', '读来客卡：' + (omenLive.message ?? omenLive.type))
+  assert(omenLive.selects === 1, '未处理时有守卫下拉框（selects=' + omenLive.selects + '）')
+  assert(omenLive.buttons === 2, '未处理时有两个选择按钮（buttons=' + omenLive.buttons + '）')
+  assert(omenLive.done === '', '未处理时不显示“已处理”')
+
+  const doneSeason = {
+    ...fullFarm.season,
+    omen: {
+      ...fullFarm.season.omen,
+      active: true,
+      resolved: true,
+      choice: 'guard',
+      result: {
+        success: true,
+        loss: { crops: 0, witherPlots: 0, freezePlots: 0 },
+        reward: { coins: 40, dew: 3, seeds: { rice: 1 } }
+      }
+    }
+  }
+  client.send({
+    type: 'farm-window',
+    open: true,
+    farm: { ...fullFarm, season: doneSeason },
+    market: fullMarket,
+    contracts: fullContracts
+  })
+  await sleep(400)
+  client.send({ type: 'debug-farm-season', id: 'smoke-farm-omen-done' })
+  const omenDone = await client.waitFrom(
+    client.mark(),
+    (event) => event.id === 'smoke-farm-omen-done',
+    6000,
+    '读来客卡（已处理）'
+  )
+  assert(omenDone.type === 'farm-season', '读已处理来客卡：' + (omenDone.message ?? omenDone.type))
+  assert(omenDone.hidden === false, '已处理的来客卡仍然可见（显示结论）')
+  assert(omenDone.selects === 0, '处理完不再显示下拉框（selects=' + omenDone.selects + '）')
+  assert(omenDone.buttons === 0, '处理完不再显示按钮（buttons=' + omenDone.buttons + '）')
+  assert(/^已处理/.test(omenDone.done), '处理完显示结论：' + omenDone.done)
+  const omenPath = join(OUT_DIR, '47-farm-omen-done.png')
+  client.send({ type: 'shot', id: 'smoke-farm-omen-shot', path: omenPath, window: 'farm' })
+  const omenShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-omen-shot',
+    8000,
+    '已处理来客截图'
+  )
+  assert(omenShot.width > 0 && existsSync(omenPath), '已处理来客截图落盘：' + omenPath)
 
   const hirePath = join(OUT_DIR, '47-farm-hire.png')
   client.send({ type: 'debug-farm-tab', tab: 'hire', id: 'smoke-farm-hire-tab' })
