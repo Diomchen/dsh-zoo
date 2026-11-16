@@ -3007,14 +3007,27 @@
     finishDrag(event.clientX, event.clientY)
   })
   /**
+   * 这一次按下有没有被渲染端看到（票 76）。
+   *
+   * 「收到 up、却没有对应的 down」是左键在窗口/系统层被吞掉的现场信号：主进程据此
+   * 重放一次「穿透 → 可交互」，用户不用重启 helper、也不用把鼠标移开再移回来。
+   */
+  let pressSeen = false
+  /**
    * 真实输入的心跳（ticket 30）：只数 `isTrusted` 的按下/抬起，合成事件一律不算。
    * 冒烟锁住输入时也不数——那是测试在用 sendInputEvent 驱动，不是人真的点了。
    */
   function onTrustedPointer (event) {
     if (!event.isTrusted || inputLocked) return
     if (typeof api?.reportInput !== 'function') return
+    const kind = event.type === 'pointerdown' ? 'down' : 'up'
+    // 按下在别处发生、松手才进到这只窗口（例如从桌面拖进来再松开）也会走到 lost-down：
+    // 一次多余的重放无害，漏报才会让窗口一直卡在假可交互。
+    const lost = kind === 'up' && !pressSeen
+    if (kind === 'down') pressSeen = true
+    else pressSeen = false
     try {
-      api.reportInput({ type: event.type === 'pointerdown' ? 'down' : 'up' })
+      api.reportInput(lost ? { type: 'lost-down' } : { type: kind })
     } catch {
       // 诊断坏了不能影响输入
     }
@@ -3024,6 +3037,7 @@
   window.addEventListener('pointerup', onTrustedPointer, { capture: true, passive: true })
 
   window.addEventListener('pointercancel', () => {
+    pressSeen = false
     abortDrag()
     abortChipDrag()
   })

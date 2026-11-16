@@ -125,6 +125,23 @@
    */
   const BUSY_MAX_MS = 30000
 
+  /**
+   * 「我们声称可交互」需要周期性重新落到 native 层（票 76）。
+   *
+   * 现场：Windows 上 `setIgnoreMouseEvents(false)` 偶发不生效，而 `setIgnore()` 看到状态
+   * 没变就直接 return —— 主进程认为窗口可交互、OS 却仍然把左键给下层，一直卡到一次真正的
+   * `true → false` 翻转或 helper 重启（票 30 现场靠「重载配置」恢复的就是这条）。主进程每隔
+   * 这么久把**同一个值**重放一次：语义不变，只是让 native 层重新落一遍。
+   */
+  const INTERACTIVE_REASSERT_MS = 2000
+  /**
+   * 丢 down 自愈的冷却（票 76）。
+   *
+   * 渲染端一发现「只有 up、没有 down」就报一次（那说明左键在窗口/系统层被吞了）；主进程据此
+   * 重放一次穿透→可交互。冷却避免合成输入、边界按下把重放抖成循环。
+   */
+  const LOST_DOWN_HEAL_COOLDOWN_MS = 1000
+
   const DEFAULT_COLOR = '#3b74d8'
   const ITEM_KINDS = ['pet', 'card']
   // ticket 44：worker 是「别人家的宠物在我家打工」，与 guest/visitor 都不是一回事。
@@ -2618,19 +2635,44 @@
   }
 
   /**
-   * 渲染端上报的「可信输入」（ipc `dsh-zoo:input`，ticket 30）。
+   * 渲染端上报的「可信输入」（ipc `dsh-zoo:input`，ticket 30 / 76）。
    *
    * 现场出现过「窗口显示可交互、右键能开菜单，真实左键却进不了渲染端」。`ignoring=false`
    * 只说明我们把 `WS_EX_TRANSPARENT` 摘了，`busy=false` 只说明租约没立起来——中间没有任何
    * 东西能证明「点击真的到过渲染端」。这个计数器就是那个东西：只有 `isTrusted` 的按下才报。
    *
+   * `lost-down` 不是计数（票 76）：渲染端收到 `pointerup` 却从没收到对应的
+   * `pointerdown` —— 左键在窗口/系统层被吞掉的现场信号。主进程据此重放一次
+   * 「穿透 → 可交互」，不重启 helper 也能把卡住的输入态解开。
+   *
    * @param {unknown} raw
-   * @returns {{type:'down'|'up'}|null}
+   * @returns {{type:'down'|'up'|'lost-down'}|null}
    */
   function normalizeInputReport (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-    if (raw.type !== 'down' && raw.type !== 'up') return null
+    if (raw.type !== 'down' && raw.type !== 'up' && raw.type !== 'lost-down') return null
     return { type: raw.type }
+  }
+
+  /**
+   * HWND 层收到的鼠标消息计数（票 76，只有 Windows 会填）。
+   *
+   * 为什么还要这一层：DOM 侧的 `pointerdown` 说明「Chromium 把事件派发到了页面」，
+   * 但「OS 到底有没有把左键消息投给这个窗口」只能看 WndProc。两个数一起看才能分开
+   * 「窗口没拿到」和「拿到了但 Chromium 吞了」。
+   *
+   * @param {unknown} raw
+   * @returns {{leftDown:number,leftUp:number,rightDown:number,rightUp:number}}
+   */
+  function normalizeWindowMessages (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const count = (value) => (Number.isInteger(value) && value >= 0 ? value : 0)
+    return {
+      leftDown: count(source.leftDown),
+      leftUp: count(source.leftUp),
+      rightDown: count(source.rightDown),
+      rightUp: count(source.rightUp)
+    }
   }
 
   /** 编码一行；超长返回 null，调用方必须放弃发送（而不是把管道写坏）。 */
@@ -2957,6 +2999,13 @@
       lastTrustedInputAgeMs: isFiniteNumber(raw.lastTrustedInputAgeMs) && raw.lastTrustedInputAgeMs >= 0
         ? raw.lastTrustedInputAgeMs
         : null,
+      // 票 76：丢 down 的次数与自愈重放次数；窗口层与 native 层各自一份计数，现场能分开读。
+      lostDowns: Number.isInteger(raw.lostDowns) && raw.lostDowns >= 0 ? raw.lostDowns : 0,
+      lastLostDownAgeMs: isFiniteNumber(raw.lastLostDownAgeMs) && raw.lastLostDownAgeMs >= 0
+        ? raw.lastLostDownAgeMs
+        : null,
+      reasserts: Number.isInteger(raw.reasserts) && raw.reasserts >= 0 ? raw.reasserts : 0,
+      windowMessages: normalizeWindowMessages(raw.windowMessages),
       busyCapMs: isFiniteNumber(raw.busyCapMs) && raw.busyCapMs >= 0 ? raw.busyCapMs : null,
       busyFrozen: raw.busyFrozen === true,
       rendererRects: Number.isInteger(raw.rendererRects) && raw.rendererRects >= 0 ? raw.rendererRects : 0,
@@ -3628,6 +3677,27 @@
     }
   }
 
+  /**
+   * 「可交互」要不要再向 native 层重放一次（票 76）。
+   *
+   * 只在 `ignoring === false` 时重放：穿透态本来就是「什么都不接」，重放没有意义。
+   * `lastAt === 0`（还没重放过）时第一拍就重放——把「刚翻成可交互」也压实一次。
+   * 时钟回拨（`now < lastAt`）按到点处理，宁可多重放一次也不要把窗口卡在假可交互。
+   *
+   * @param {{ignoring?:boolean, now?:number, lastAt?:number, intervalMs?:number}} options
+   * @returns {boolean}
+   */
+  function shouldReassert (options = {}) {
+    if (options.ignoring !== false) return false
+    if (!Number.isFinite(options.now)) return false
+    const interval = Number.isFinite(options.intervalMs) && options.intervalMs > 0
+      ? options.intervalMs
+      : INTERACTIVE_REASSERT_MS
+    const lastAt = Number.isFinite(options.lastAt) && options.lastAt > 0 ? options.lastAt : 0
+    if (lastAt === 0) return true
+    return options.now - lastAt >= interval || options.now < lastAt
+  }
+
   return {
     MAX_LINE_LENGTH,
     MAX_SCENE_ITEMS,
@@ -3650,6 +3720,8 @@
     BUSY_HEARTBEAT_MS,
     BUSY_LEASE_MS,
     BUSY_MAX_MS,
+    INTERACTIVE_REASSERT_MS,
+    LOST_DOWN_HEAL_COOLDOWN_MS,
     DEFAULT_COLOR,
     ITEM_KINDS,
     PET_ROLES,
@@ -3776,6 +3848,7 @@
     toScreenPoint,
     shouldReadStdinDirectly,
     shouldBeInteractive,
+    shouldReassert,
     hashString,
     colorForPet,
     initialVelocity,
