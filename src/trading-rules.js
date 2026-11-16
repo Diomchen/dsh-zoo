@@ -217,16 +217,20 @@ function slowLevel (crop, x) {
 }
 
 /**
- * 快噪声分量：格点在**整数 slot** 上，tick 之间用 smoothstep 插值。
- * 这样 `tick = 0` 正好落在格点上，`tick = 15` 正好落在下一个格点上——
+ * 快噪声分量：格点在**半根**（slot 的 1/2，即 tick 7.5）上，tick 之间用 smoothstep 插值。
+ *
+ * 为什么不是整根一格：整根一格时一根里的 1 分钟路径是**单调**的（smoothstep 从 a 到 b
+ * 不回弯），现实里不存在的「插针→收回」「同一根里先破止损再站回去」这些场景就一个都没有了
+ * （票 86 实测：20k 根里 0 根能先跌破 1.25% 再收回）。半根一格之后 1 分钟图会拐一次弯，
+ * 而整根边界仍然是格点（`tick = 0` / `tick = 15` 都落在格点上）——
  * 一根的收盘价天然等于下一根的开盘价，不需要额外对齐。
  */
 function fastLevel (crop, x) {
-  const slot = Math.floor(x)
-  const frac = x - slot
+  const cell = Math.floor(x * 2)
+  const frac = x * 2 - cell
   const smooth = frac * frac * (3 - 2 * frac)
-  const a = unitHash(PRICE_SALT + ':' + crop + ':fast:' + slot) * 2 - 1
-  const b = unitHash(PRICE_SALT + ':' + crop + ':fast:' + (slot + 1)) * 2 - 1
+  const a = unitHash(PRICE_SALT + ':' + crop + ':fast:' + cell) * 2 - 1
+  const b = unitHash(PRICE_SALT + ':' + crop + ':fast:' + (cell + 1)) * 2 - 1
   return (a * (1 - smooth) + b * smooth) * FAST_AMPLITUDE
 }
 
