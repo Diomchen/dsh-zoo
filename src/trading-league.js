@@ -116,13 +116,13 @@ function sentimentOf (rows) {
 }
 
 /**
- * 合并成榜：`self` 是本机（`{ deviceId, nickname, weekPnl, weekBase, positions }`），
- * `peers` 是 service 从内存 Map 取出来的邻居 digested（`{ deviceId, nickname,
- * weekPnl, weekPnlPct, positions, seenAt }`），`now` 是本机时钟。
+ * 合并成榜：`self` 是本机（`{ deviceId, nickname, weekPnl, weekPnlPct?, weekBase,
+ * positions }`），`peers` 是 service 从内存 Map 取出来的邻居周报
+ * （`{ deviceId, nickname, weekPnl, weekPnlPct, positions, seenAt }`），`now` 是本机时钟。
  *
  * 返回 `{ rows, sentiment, self }`：`rows` 已排序（含 `me: true` 的本机行），
  * `sentiment` 是上面那三格计数，`self` 是窗口抬头用的本机分数
- * （和手机里发出去的那条 digest 同源，免得榜上和自报对不上）。
+ * （和本机发出去的那条 digest 同源，免得榜上和自报对不上）。
  * 唯一不发 `trading-digest` 的邻居不会出现——旧版本静默降级（SPEC「旧邻居」）。
  */
 export function buildLeague ({ self = null, peers = [], now = Date.now() } = {}) {
