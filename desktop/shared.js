@@ -946,12 +946,16 @@
       choices,
       canFeed: raw.canFeed === true,
       guardBase: Number.isFinite(Number(raw.guardBase)) ? Math.min(1, Math.max(0, Number(raw.guardBase))) : 0,
+      guardPets: Number.isFinite(Number(raw.guardPets)) ? Math.min(2, Math.max(0, Math.floor(Number(raw.guardPets)))) : 0,
       guardOptions: Array.isArray(raw.guardOptions)
         ? raw.guardOptions.slice(0, 3).map((option) => ({
           guards: Number.isInteger(Number(option?.guards)) ? Math.min(2, Math.max(0, Number(option.guards))) : 0,
           chance: Number.isFinite(Number(option?.chance)) ? Math.min(1, Math.max(0, Number(option.chance))) : 0,
           cost: Number.isFinite(Number(option?.cost)) ? Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(Number(option.cost)))) : 0,
-          affordable: option?.affordable === true
+          affordable: option?.affordable === true,
+          ...(typeof option?.reason === 'string' && option.reason !== ''
+            ? { reason: normalizeText(option.reason, '', 40) }
+            : {})
         }))
         : [],
       stakes: {

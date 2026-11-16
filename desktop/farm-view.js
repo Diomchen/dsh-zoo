@@ -416,6 +416,9 @@
         chance,
         cost,
         affordable: option?.affordable !== false,
+        ...(typeof option?.reason === 'string' && option.reason !== ''
+          ? { reason: option.reason }
+          : {}),
         label: (guards === 0 ? '不另雇' : '雇 ' + guards + ' 名') + ' · ' +
           Math.round(chance * 100) + '%' + (cost > 0 ? ' · ' + cost + ' 硬币' : '')
       }
@@ -436,6 +439,7 @@
       guardText: guardReward === '' ? '守卫成功没有奖励；失败损失 ' + failText + '。' : '守卫成功 ' + guardReward + '；失败损失 ' + failText + '。',
       guardOptions,
       guardBase: Number.isFinite(Number(omen.guardBase)) ? Math.min(1, Math.max(0, Number(omen.guardBase))) : 0,
+      guardPets: Number.isFinite(Number(omen.guardPets)) ? Math.min(2, Math.max(0, Math.floor(Number(omen.guardPets)))) : 0,
       feedText: cost === '' ? feedChoice.label + '不花资源，稳过。' : feedChoice.label + ' ' + cost + (feedReward === '' ? '，稳过。' : '，换 ' + feedReward + '。'),
       ignoreText: ignoreParts.length === 0 ? '' : '不管它：' + ignoreParts.join(' + ') + '。',
       actions: [

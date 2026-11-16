@@ -124,6 +124,7 @@ const RESULT_CODE_TEXT = {
   'omen-resolved': '这位来客已经处理过了。',
   'bad-choice': '这个选择不对，再试一次。',
   'bad-guards': '守卫人数只能是 0～2 人。',
+  'no-guard-pet': '没有足够的空闲宠物帮你守夜。',
   'not-enough-crops': '仓库里的作物不够。',
   // 雇佣（ticket 44）
   'own-pet': '不能雇自己的宠物。',
@@ -510,7 +511,7 @@ function renderOmenCard (season) {
     guardPicker = document.createElement('label')
     guardPicker.className = 'omen-guard'
     const caption = document.createElement('span')
-    caption.textContent = '守卫'
+    caption.textContent = '守卫 · 空闲宠物 ' + (Number(card.guardPets) || 0)
     const select = document.createElement('select')
     select.id = 'omen-guard-count'
     for (const option of card.guardOptions) {
@@ -519,6 +520,7 @@ function renderOmenCard (season) {
       item.textContent = option.label
       item.disabled = option.affordable === false
       item.selected = option.guards === omenGuardCount
+      if (option.reason) item.title = option.reason
       select.append(item)
     }
     guardPicker.append(caption, select)
