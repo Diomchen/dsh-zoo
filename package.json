@@ -1,7 +1,7 @@
 {
   "name": "dsh-zoo",
   "version": "1.6.7",
-  "description": "灞€鍩熺綉 DSH 瀹犵墿锛氫簰鐩哥湅寰楄銆佷簰鐩镐覆闂ㄣ€佹崕绀肩墿锛岃繕鑳界鍦般€佸伔鑿溿€侀泧宸ュ拰浜ゆ槗銆?路 LAN pets for DeepSeek Harness.",
+  "description": "局域网 DSH 宠物：互相看得见、互相串门、捎礼物，还能种地、偷菜、雇工和交易。 · LAN pets for DeepSeek Harness.",
   "type": "module",
   "main": "index.js",
   "exports": {
