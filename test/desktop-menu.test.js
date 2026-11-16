@@ -8,6 +8,7 @@ import { readFile } from 'node:fs/promises'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
+import { MENU_TOOL_LABELS } from '../src/menu.js'
 
 test('菜单：工具项只认固定 id，坏条目只丢自己', () => {
   const menu = shared.normalizeMenu({
@@ -203,4 +204,13 @@ test('菜单：渲染端 runMenuTool 查同一张表，不再手写 id 链', asy
   const source = await readFile(new URL('../desktop/renderer.js', import.meta.url), 'utf8')
   assert.match(source, /shared\.MENU_TOOL_REQUESTS\[id\]/)
   assert.doesNotMatch(source, /id === 'reload' \|\| id === 'open-site'/)
+})
+
+test('菜单：shared 的工具 id 与宿主 MENU_TOOL_LABELS 同集合', () => {
+  // helper/渲染端各写一份 id 列表，靠这条断言防漂移（评审 P2 的「一张表」）。
+  assert.deepEqual(shared.MENU_TOOL_IDS, Object.keys(MENU_TOOL_LABELS))
+  assert.deepEqual(
+    Object.keys(shared.MENU_TOOL_REQUESTS),
+    shared.MENU_TOOL_IDS.filter((id) => id !== 'home')
+  )
 })
