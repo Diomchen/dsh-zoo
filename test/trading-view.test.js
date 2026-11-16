@@ -791,27 +791,40 @@ test('票 87：十字线吸附最近一根、便签写时间与开高低收，�
   assert.ok(forming.highlight.width >= target.width)
 })
 
-test('票 87 / 票 89：版面常量是「图带 286 + 下半区两列」，图 720×200，老 payload 也能画', async () => {
+test('票 91：版面常量是「作物条 40 / 图 268 / 下单横条 104 / 底部 196」，老 payload 也能画', async () => {
   assert.equal(view.BOARD_WIDTH, 760)
   assert.equal(view.BOARD_HEIGHT, 700)
   assert.equal(view.CHART_WIDTH, 720)
-  assert.equal(view.CHART_HEIGHT, 198)
+  assert.equal(view.CHART_HEIGHT, 228)
   assert.deepEqual(view.LAYOUT.columns.left, ['positions', 'history'])
-  assert.deepEqual(view.LAYOUT.columns.right, ['order', 'league'])
+  // 票 91：下单搬去图下横条，右列只剩真人周榜。
+  assert.deepEqual(view.LAYOUT.columns.right, ['league'])
   assert.equal(view.LAYOUT.chart.fullWidth, true)
-  // 票 89 的固定版面数字：窗口 CSS 与测试吃同一份。
-  assert.equal(view.LAYOUT.headerHeight, 52)
-  assert.equal(view.LAYOUT.cropStripHeight, 42)
-  assert.equal(view.LAYOUT.chartCardHeight, 286)
+  // 票 91 的固定版面数字：窗口 CSS 与测试吃同一份。
+  assert.equal(view.LAYOUT.headerHeight, 50)
+  assert.equal(view.LAYOUT.cropStripHeight, 40)
+  assert.equal(view.LAYOUT.chartCardHeight, 268)
+  assert.equal(view.LAYOUT.orderBarHeight, 104)
+  assert.equal(view.LAYOUT.orderBar.height, 104)
+  assert.equal(view.LAYOUT.orderBar.rows, 2)
+  assert.equal(view.LAYOUT.orderBar.controlHeight, 32)
+  assert.equal(view.LAYOUT.orderBar.submitWidth, 132)
+  assert.equal(view.LAYOUT.orderBar.submitHeight, 36)
+  assert.equal(view.LAYOUT.orderBar.gap, 10)
+  assert.equal(view.LAYOUT.orderBar.marginColumns, 4)
+  assert.equal(view.LAYOUT.orderBar.leverageColumns, 3)
   assert.equal(view.LAYOUT.bottom.rightWidth, 300)
-  assert.equal(view.LAYOUT.bottom.controlRow, 34)
-  assert.equal(view.LAYOUT.bottom.historyHeight, 120)
-  assert.equal(view.LAYOUT.bottom.marginColumns, 4)
-  assert.equal(view.LAYOUT.bottom.leverageColumns, 3)
+  assert.equal(view.LAYOUT.bottom.historyHeight, 88)
+  // 760×700 的高度预算必须刚好用完：app 边框 4 + 顶栏 50 + body 上下 padding 14 +
+  // 三处 8px 行距 + 作物 40 + 图 268 + 下单 104 + 底部 196 = 700。
+  const heightBudget = 4 + view.LAYOUT.headerHeight + 14 + 3 * 8 +
+    view.LAYOUT.cropStripHeight + view.LAYOUT.chartCardHeight +
+    view.LAYOUT.orderBarHeight + 196
+  assert.equal(heightBudget, view.LAYOUT.board.height)
 
   const board = view.boardView(tfPayload(), { crop: 'tomato', now: SLOT_EDGE })
   assert.equal(board.chart.geometry.width, 720)
-  assert.equal(board.chart.geometry.height, 198)
+  assert.equal(board.chart.geometry.height, 228)
   assert.ok(board.chart.geometry.timeTicks.length >= 3)
   // 老 payload（只有 charts，没有 timeframes/start/end）不抛：图照画，时间轴没数据就留空。
   const legacy = view.boardView(payload(), { crop: 'tomato', now: SLOT_EDGE })
@@ -824,17 +837,18 @@ test('票 87 / 票 89：版面常量是「图带 286 + 下半区两列」，图 
   assert.equal(view.boardView(payload({ charts: undefined }), { now: SLOT_EDGE }).chart.geometry, null)
 
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
-  // 图带独占整行：作物条 + 图头 + 200 高的 SVG；旧的三块拼图布局不许回来。
-  assert.match(html, /grid-template-rows: 286px minmax\(0, 1fr\)/)
+  // 票 91：作物条 / 图卡 / 下单横条 / 底部四行，顺序和高度都写死在 .body 的 grid 里。
+  assert.match(html, /grid-template-rows: 40px 268px 104px minmax\(0, 1fr\)/)
   assert.match(html, /class="card chart-card"/)
-  assert.match(html, /viewBox="0 0 720 198"/)
-  assert.match(html, /\.chart-svg \{[\s\S]*?height: 198px/)
+  assert.match(html, /class="card order-bar"/)
+  assert.match(html, /viewBox="0 0 720 228"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 228px/)
   assert.doesNotMatch(html, /grid-template-areas:[\s\S]{0,80}'chart order'/)
   // 页面本身不滚（内层列表可以滚），窗口内容 760×700 内收住。
   assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)
-  // 票 89：下单卡不再有内部滚动区；主按钮固定在卡片底部。
+  // 下单横条不套内部滚动容器；主按钮就在横条里（不再是卡片底部）。
   assert.doesNotMatch(html, /order-scroll/)
-  assert.match(html, /class="order-actions"/)
+  assert.match(html, /class="order-row order-row-primary"/)
   assert.match(html, /id="submit"/)
   // 手绘滤镜只引用一次；文字在独立清晰层，不套滤镜。
   const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
@@ -894,8 +908,10 @@ test('票 89：作物条支持任意数量（10 种），选中索引与箭头�
   assert.equal(board.crops.length, 10)
   assert.equal(board.cropStrip.selectedIndex, 0)
   const keys = view.focusOrder(ten)
-  assert.deepEqual(keys.slice(0, 3), ['close-button', 'crop-prev', 'crop:pea'])
-  assert.deepEqual(keys.slice(11, 14), ['crop:grape', 'crop-next', 'timeframe:15m'])
+  assert.deepEqual(keys.slice(0, 3), ['display-toggle', 'chart-type:candle', 'chart-type:line'])
+  assert.equal(keys[5], 'close-button')
+  assert.equal(keys[6], 'crop-prev')
+  assert.deepEqual(keys.slice(16, 19), ['crop:grape', 'crop-next', 'timeframe:15m'])
   assert.equal(new Set(keys).size, keys.length)
 })
 
@@ -971,17 +987,31 @@ test('票 89：跌蜡烛空心——视图给 hollow、DOM 写 data-hollow、CSS
   assert.match(html, /stroke: var\(--rose\)/)
 })
 
-test('票 89：下单区两列 grid、4/3 档、没有滚动容器；11px 只留给图轴', async () => {
+test('票 91：下单横条两排、4/3 档、没有滚动容器；11px 只留给图轴', async () => {
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
-  const fieldRow = /\.field-row \{([\s\S]*?)\}/.exec(html)
-  assert.ok(fieldRow)
-  assert.match(fieldRow[1], /grid-template-columns: 40px minmax\(0, 1fr\)/)
-  assert.match(html, /\.chip-row\.margins \{[\s\S]*?repeat\(4, minmax\(0, 1fr\)\)/)
-  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(3, minmax\(0, 1fr\)\)/)
-  const orderCard = /\.order-card \{([\s\S]*?)\}/.exec(html)
-  assert.ok(orderCard)
-  assert.match(orderCard[1], /overflow: visible/)
-  assert.doesNotMatch(orderCard[1], /overflow-y: auto|overflow: auto/)
+  // 票 91：整宽横条里的两排，不再是 300px 窄列里的三行 label+控件。
+  assert.match(html, /class="order-row order-row-primary"/)
+  assert.match(html, /class="order-row order-row-secondary"/)
+  assert.doesNotMatch(html, /\.field-row \{/)
+  assert.match(html, /\.order-row \.chip-row\.margins \{[\s\S]*?repeat\(4, 42px\)/)
+  assert.match(html, /\.order-row \.chip-row\.leverages \{[\s\S]*?repeat\(3, 42px\)/)
+  // 同一组内相邻点击目标 ≥8px；组与组之间 ≥10px。
+  assert.match(html, /\.order-row \.chip-row \{[\s\S]*?gap: 8px/)
+  assert.match(html, /\.order-row \{[\s\S]*?gap: 10px/)
+  const orderBar = /\.order-bar \{([\s\S]*?)\}/.exec(html)
+  assert.ok(orderBar)
+  assert.match(orderBar[1], /overflow: visible/)
+  assert.doesNotMatch(orderBar[1], /overflow-y: auto|overflow: auto/)
+  // 横条高度/主按钮尺寸/控件高度/间距都来自纯视图的契约，CSS 得跟它一致。
+  assert.match(html, /\.order-bar \{[\s\S]*?gap: 12px/)
+  assert.match(html, /\.order-row \{[\s\S]*?gap: 10px/)
+  assert.match(html, /\.order-row-primary \{[\s\S]*?height: 36px/)
+  assert.match(html, /\.order-row-secondary \{[\s\S]*?height: 32px/)
+  assert.match(html, /\.chip \{[\s\S]*?height: 32px/)
+  assert.match(html, /\.submit \{[\s\S]*?width: 132px;\s*height: 36px/)
+  // 到价面板是横条下方的浮层：不推页面、不撑高，也不会被卡片裁掉。
+  assert.match(html, /\.limit-box \{[\s\S]*?position: absolute;/)
+  assert.match(html, /\.limit-box \{[\s\S]*?top: calc\(100% \+ 6px\)/)
   const preview = /\.preview \{([\s\S]*?)\}/.exec(html)
   assert.match(preview[1], /white-space: nowrap/)
   assert.match(preview[1], /text-overflow: ellipsis/)
@@ -1233,6 +1263,10 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
   }
   const keys = view.focusOrder(payload({ orders: [order], positions: [position] }))
   assert.deepEqual(keys, [
+    // 票 91：顶栏「显示」弹层在 × 左边；两组分段的选项紧跟开关（收起时不可聚焦）。
+    'display-toggle',
+    'chart-type:candle', 'chart-type:line',
+    'theme:color', 'theme:mono',
     'close-button',
     // 票 89：作物条的左右滚动箭头排在作物 chip 两边。
     'crop-prev',
@@ -1252,13 +1286,14 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
   // 老/坏 payload 退回兜底白名单，不抛；每一步都是窗口认得的键。
   for (const bad of [null, undefined, 42, 'x', []]) {
     const fallback = view.focusOrder(bad)
-    assert.equal(fallback[0], 'close-button')
+    assert.equal(fallback[0], 'display-toggle')
+    assert.equal(fallback[5], 'close-button')
     assert.deepEqual(fallback.slice(-4), ['limit-toggle', 'limit-input', 'limit-place', 'submit'])
     assert.equal(new Set(fallback).size, fallback.length)
   }
   // 票 84：四档周期都进 Tab 顺序，紧跟在作物页签后面，且不重复。
   const four = view.focusOrder(tfPayload())
-  assert.deepEqual(four.slice(6, 10), ['timeframe:15m', 'timeframe:1h', 'timeframe:1d', 'timeframe:1w'])
+  assert.deepEqual(four.slice(11, 15), ['timeframe:15m', 'timeframe:1h', 'timeframe:1d', 'timeframe:1w'])
   assert.equal(new Set(four).size, four.length)
 })
 
@@ -1725,4 +1760,238 @@ test('票 90：图缓存最多 4 种作物，命中就不再请求；推包里�
   assert.equal(followed.chart.crop, 'tomato')
   assert.equal(followed.chart.hasChart, true)
   assert.equal(followed.header.priceText, '5.06')
+})
+
+// ---------------------------------------------------------------------------
+// 票 91：下单横条 / 折线 / 黑白模式 / 本机显示偏好
+// ---------------------------------------------------------------------------
+
+test('票 91：显示偏好规范化、L/M 切换与 localStorage 往返（坏存储静默退默认）', () => {
+  assert.deepEqual(view.displayPrefs(null), { chartType: 'candle', theme: 'color' })
+  assert.deepEqual(view.displayPrefs(undefined), { chartType: 'candle', theme: 'color' })
+  assert.deepEqual(view.displayPrefs('line'), { chartType: 'candle', theme: 'color' })
+  assert.deepEqual(view.displayPrefs({ chartType: 'line', theme: 'mono' }),
+    { chartType: 'line', theme: 'mono' })
+  // 认不出的值逐字段退回默认，不把整份偏好丢掉。
+  assert.deepEqual(view.displayPrefs({ chartType: 'area', theme: 'mono' }),
+    { chartType: 'candle', theme: 'mono' })
+  assert.deepEqual(view.displayPrefs({ chartType: 'line', theme: 'neon' }),
+    { chartType: 'line', theme: 'color' })
+
+  // L/M 的开关函数：返回新对象，不改入参。
+  const input = { chartType: 'line', theme: 'color' }
+  assert.deepEqual(view.toggleChartType(input), { chartType: 'candle', theme: 'color' })
+  assert.deepEqual(view.toggleTheme(input), { chartType: 'line', theme: 'mono' })
+  assert.deepEqual(input, { chartType: 'line', theme: 'color' })
+  assert.equal(view.DISPLAY_SHORTCUTS.chartType, 'l')
+  assert.equal(view.DISPLAY_SHORTCUTS.theme, 'm')
+  assert.equal(view.DISPLAY_STORAGE_KEY, 'dsh-zoo-board-prefs')
+
+  // 注入假 storage：只写固定键，值是两个白名单字段（顺序稳定）。
+  const store = new Map()
+  const storage = {
+    getItem (key) { return store.has(key) ? store.get(key) : null },
+    setItem (key, value) { store.set(key, value) }
+  }
+  assert.deepEqual(view.readDisplayPrefs(storage), { chartType: 'candle', theme: 'color' })
+  assert.equal(view.writeDisplayPrefs(storage, { chartType: 'line', theme: 'mono' }), true)
+  assert.equal(store.has('dsh-zoo-board-prefs'), true)
+  assert.equal(store.get('dsh-zoo-board-prefs'), '{"chartType":"line","theme":"mono"}')
+  assert.deepEqual(view.readDisplayPrefs(storage), { chartType: 'line', theme: 'mono' })
+  // 坏 JSON / 半截值 / 空串都退默认，不抛。
+  store.set('dsh-zoo-board-prefs', '{oops')
+  assert.deepEqual(view.readDisplayPrefs(storage), { chartType: 'candle', theme: 'color' })
+  store.set('dsh-zoo-board-prefs', '')
+  assert.deepEqual(view.readDisplayPrefs(storage), { chartType: 'candle', theme: 'color' })
+  // getItem/setItem 抛错（隐私模式/坏 storage）也静默：存不了偏好不该让盘口打不开。
+  const broken = {
+    getItem () { throw new Error('blocked') },
+    setItem () { throw new Error('blocked') }
+  }
+  assert.deepEqual(view.readDisplayPrefs(broken), { chartType: 'candle', theme: 'color' })
+  assert.equal(view.writeDisplayPrefs(broken, { chartType: 'line' }), false)
+  assert.deepEqual(view.readDisplayPrefs(null), { chartType: 'candle', theme: 'color' })
+  assert.equal(view.writeDisplayPrefs(null, { chartType: 'line' }), false)
+})
+
+test('票 91：黑白标记落在 body 属性上，弹层两组分段的文案/选中态来自纯视图', () => {
+  const color = view.displayView({ chartType: 'candle', theme: 'color' })
+  assert.equal(color.mono, false)
+  assert.equal(color.line, false)
+  assert.deepEqual(color.body, {})
+  assert.equal(color.labels.chartType, '蜡烛')
+  assert.equal(color.labels.theme, '彩色')
+  assert.equal(color.labels.chartGroup, '图表')
+  assert.equal(color.labels.themeGroup, '配色')
+  assert.deepEqual(color.chartOptions, [
+    { id: 'candle', label: '蜡烛', active: true },
+    { id: 'line', label: '折线', active: false }
+  ])
+  assert.deepEqual(color.themeOptions, [
+    { id: 'color', label: '彩色', active: true },
+    { id: 'mono', label: '黑白', active: false }
+  ])
+
+  const mono = view.displayView({ chartType: 'line', theme: 'mono' })
+  assert.equal(mono.mono, true)
+  assert.equal(mono.line, true)
+  assert.deepEqual(mono.body, { 'data-mono': '1' })
+  assert.equal(mono.labels.chartType, '折线')
+  assert.equal(mono.labels.theme, '黑白')
+  assert.equal(mono.chartOptions[1].active, true)
+  assert.equal(mono.themeOptions[1].active, true)
+
+  // 黑白下盈亏数字补 ▲/▼；彩色模式原样（只作为 mono 专属字段存在）。
+  assert.equal(view.monoNumber('+0.5', 'up'), '▲ +0.5')
+  assert.equal(view.monoNumber('-0.5', 'down'), '▼ -0.5')
+  assert.equal(view.monoNumber('0.0', 'flat'), '0.0')
+  assert.equal(view.monoNumber('—', 'flat'), '—')
+
+  const positions = [{
+    id: 'p1', crop: 'tomato', side: 'long', margin: 50, leverage: 5,
+    entry: 5, mark: 5.2, pnl: 12.3, liquidation: 4, stopLoss: 0
+  }, {
+    id: 'p2', crop: 'carrot', side: 'short', margin: 50, leverage: 1,
+    entry: 6, mark: 6.1, pnl: -4.5, liquidation: null, stopLoss: 0
+  }, {
+    id: 'p3', crop: 'pumpkin', side: 'long', margin: 50, leverage: 1,
+    entry: 30, mark: 30, pnl: 0, liquidation: null, stopLoss: 0
+  }]
+  const history = [
+    { id: 'h1', crop: 'tomato', side: 'long', leverage: 5, entry: 5, exit: 5.1, pnl: 3.2, reason: 'close', at: SLOT_EDGE },
+    { id: 'h2', crop: 'rice', side: 'short', leverage: 20, entry: 10, exit: 10.2, pnl: -2, reason: 'liquidate', at: SLOT_EDGE }
+  ]
+  const board = view.boardView(payload({ positions, history, league: league() }), {
+    now: SLOT_EDGE,
+    theme: 'mono'
+  })
+  assert.equal(board.display.mono, true)
+  assert.deepEqual(board.positions.map((card) => card.pnlText), ['+12.3', '-4.5', '0.0'])
+  assert.deepEqual(board.positions.map((card) => card.pnlMonoText), ['▲ +12.3', '▼ -4.5', '0.0'])
+  assert.deepEqual(board.history.map((row) => row.pnlMonoText), ['▲ +3.2', '▼ -2.0'])
+  // 顶栏本周胶囊：彩色时 U+2212 口径不变，黑白时前面加方向记号。
+  assert.equal(board.week.pnlMinusText, '+10.5')
+  assert.equal(board.week.pnlMonoText, '▲ +10.5')
+  // 真人周榜：盈亏与收益率都带记号；没报收益率仍是「—」。
+  assert.deepEqual(board.league.rows.map((row) => row.pnlMonoText), ['▲ +12', '▼ -8'])
+  assert.deepEqual(board.league.rows.map((row) => row.pctMonoText), ['▲ +3.50%', '—'])
+  assert.equal(board.league.rows[0].pctText, '+3.50%', '老字段口径不变')
+})
+
+test('票 91：折线几何——收盘价折线、12% 面积、现价圆点都在绘图区里', () => {
+  const geometry = view.chartGeometry({
+    base: 5,
+    bars: [
+      { slot: 1, start: 1, end: 2, open: 5, high: 5.2, low: 4.8, close: 4.9 },
+      { slot: 2, start: 2, end: 3, open: 4.9, high: 5.1, low: 4.8, close: 5 }
+    ],
+    current: { slot: 3, start: 3, end: 4, open: 5, high: 5.1, low: 4.9, price: 5.06, tick: 1 }
+  })
+  const line = view.lineSeries(geometry)
+  assert.equal(line.points.length, 3)
+  // 收盘价：历史两根取 close，形成中的那根取现价（和十字线便签同一口径）。
+  assert.deepEqual(line.points.map((point) => point.close), [4.9, 5, 5.06])
+  assert.equal(line.points[2].forming, true)
+  assert.equal(line.areaOpacity, 0.12)
+  assert.equal(view.LINE_AREA_OPACITY, 0.12)
+  const bottom = geometry.plot.top + geometry.plot.height
+  assert.equal(line.bottom, bottom)
+  for (const point of line.points) {
+    assert.ok(point.x >= geometry.plot.left && point.x <= geometry.plot.left + geometry.plot.width)
+    assert.ok(point.y >= geometry.plot.top && point.y <= bottom)
+  }
+  // 点的 y 就是几何里算好的 closeY（不在窗口里重算价格映射）。
+  assert.equal(line.points[0].y, geometry.bars[0].closeY)
+  assert.equal(line.points[2].y, geometry.forming.closeY)
+  assert.match(line.path, /^M /)
+  assert.equal((line.path.match(/L /g) ?? []).length, 2)
+  // 面积是闭合路径：首点垂到绘图区底、末点再垂下去收口。
+  assert.match(line.area, /^M /)
+  assert.match(line.area, / Z$/)
+  assert.ok(line.area.includes(' ' + bottom))
+  // 现价圆点 = 最后一个点；半径 > 0，坐标在绘图区里。
+  assert.equal(line.dot.x, line.points[2].x)
+  assert.equal(line.dot.y, line.points[2].y)
+  assert.equal(line.dot.value, 5.06)
+  assert.ok(line.dot.radius >= 3)
+  assert.equal(view.lineSeries(null), null)
+  assert.equal(view.lineSeries({}), null)
+
+  // chartView：蜡烛是默认；折线只多出 line（轴/参考线/蜡烛几何一个都没变）。
+  const candle = view.chartView(payload(), { crop: 'tomato' })
+  assert.equal(candle.chartType, 'candle')
+  assert.equal(candle.line, null)
+  assert.match(candle.ariaLabel, /K 线/)
+  const lineView = view.chartView(payload(), { crop: 'tomato', chartType: 'line' })
+  assert.equal(lineView.chartType, 'line')
+  assert.equal(lineView.chartTypeLabel, '折线')
+  assert.equal(lineView.line.points.length, 25, '24 根历史 + 形成中的一根')
+  assert.deepEqual(lineView.geometry.priceTicks, candle.geometry.priceTicks)
+  assert.deepEqual(lineView.geometry.timeTicks, candle.geometry.timeTicks)
+  assert.equal(lineView.geometry.bars.length, candle.geometry.bars.length)
+  assert.match(lineView.ariaLabel, /折线/)
+  // 坏包/空图：折线也是 null，不造空路径。
+  assert.equal(view.chartView(payload({ charts: undefined }), { chartType: 'line' }).line, null)
+
+  // boardView 把本机偏好透给 chart.display，并保持 order/positions/history 一个字段不变。
+  const before = view.boardView(payload(), { now: SLOT_EDGE })
+  const after = view.boardView(payload(), { now: SLOT_EDGE, chartType: 'line', theme: 'mono' })
+  assert.equal(after.chart.chartType, 'line')
+  assert.ok(after.chart.line !== null)
+  assert.equal(after.display.mono, true)
+  assert.deepEqual(after.order.preview, before.order.preview)
+  assert.deepEqual(after.positions, before.positions)
+  assert.deepEqual(after.history, before.history)
+  assert.equal(after.header.priceText, before.header.priceText)
+})
+
+test('票 91：下单横条第二行的预览句只留「涨 1% / 跌 1%」；强平价字段不变', () => {
+  const order = view.orderView(payload({ coins: { available: 500 } }), { margin: 100, leverage: 5 })
+  assert.equal(order.preview, '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
+  assert.equal(order.previewShort, '涨 1% +5 · 跌 1% −5')
+  // 做多 + 5×：5.06 × (1 − 1/5) = 4.048 → 4.05，且方向文案是「跌到就平」。
+  assert.equal(order.liquidationText, '强平价 4.05 · 跌到就平')
+  // 1× 没有强平：横条第二行显示「强平价 —」（与旧字段同一口径）。
+  const oneX = view.orderView(payload({ coins: { available: 500 } }), { margin: 100, leverage: 1 })
+  assert.equal(oneX.previewShort, '涨 1% +1 · 跌 1% −1')
+  assert.equal(oneX.liquidationText, '强平价 —')
+  // 全下：金额按可用硬币现算，预览句跟着变。
+  const allIn = view.orderView(payload({ coins: { available: 250 } }), { allIn: true, leverage: 5 })
+  assert.equal(allIn.margin, 250)
+  assert.equal(allIn.previewShort, '涨 1% +12.5 · 跌 1% −12.5')
+})
+
+test('票 91：显示弹层的 aria/键盘/外点关闭接线在页面与渲染端里（CSP 安全）', async () => {
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  // 顶栏「显示」：aria-haspopup/controls/expanded；弹层是 dialog + 两组 segmented。
+  assert.match(html, /id="display-toggle"/)
+  assert.match(html, /aria-haspopup="dialog"/)
+  assert.match(html, /aria-controls="display-pop"/)
+  assert.match(html, /aria-expanded="false"/)
+  assert.match(html, /id="display-pop" role="dialog" aria-label="显示选项" hidden/)
+  assert.match(html, /id="chart-type-options"[\s\S]{0,120}role="group"/)
+  assert.match(html, /id="theme-options"[\s\S]{0,120}role="group"/)
+  assert.match(html, /aria-labelledby="chart-type-label"/)
+  assert.match(html, /aria-labelledby="theme-label"/)
+  // 外点/Esc 关闭 + 键盘可达：渲染端监听 click（不是 inline onclick），并维护 aria-expanded。
+  assert.match(script, /document\.addEventListener\('click'/)
+  assert.match(script, /displayPopEl\.contains\(target\)/)
+  assert.match(script, /setAttribute\('aria-expanded'/)
+  assert.match(script, /displayToggleEl\.focus/)
+  // L/M 只在「不是输入框、不是输入法合成、没有组合键」时才切；守卫必须出现在快捷键之前。
+  const guard = script.indexOf('isTextEntry(event.target)')
+  const shortcut = script.indexOf('DISPLAY_SHORTCUTS.chartType')
+  assert.ok(guard > 0 && shortcut > guard, '输入框守卫必须在 L/M 判断之前')
+  assert.match(script, /event\.isComposing === true/)
+  assert.match(script, /event\.metaKey/)
+  assert.match(script, /event\.ctrlKey/)
+  assert.match(script, /event\.altKey/)
+  assert.match(script, /stopPropagation\(\)/)
+  // 偏好读写走注入的 storage，没有硬编码 window.localStorage（读不到也不抛）。
+  assert.match(script, /view\.readDisplayPrefs\(readPrefsStorage\(\)\)/)
+  assert.match(script, /view\.writeDisplayPrefs/)
+  assert.match(script, /window\.localStorage/)
+  // CSP：没有内联事件处理器。
+  assert.doesNotMatch(html, /\son(?:click|change|input|keydown|load)=/)
 })

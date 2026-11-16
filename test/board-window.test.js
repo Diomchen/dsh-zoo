@@ -1658,31 +1658,48 @@ test('票 85：盘口窗可拖动，位置记在 userData/board-window.json（�
   assert.doesNotMatch(html, /\.(?:body|card|chart-card)[^{]*\{[^}]*-webkit-app-region:\s*drag/)
 })
 
-test('票 87 / 票 89：盘口版面上图带 + 下两列，图 720×198，手绘/十字线接线齐全', async () => {
-  // 版面是纯静态的：图带 286（作物条 42 + 图头 30 + 图 198 + 边框/内边距），下面两列左持仓/结算、右下单/周榜。
+test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字线/显示选项接线齐全', async () => {
+  // 版面是纯静态的：作物条 40 / 图卡 268 / 下单横条 104 / 底部 196；
+  // 下单不再占右列，右列 300 只放真人周榜。
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
-  assert.match(html, /grid-template-rows: 286px minmax\(0, 1fr\)/)
+  assert.match(html, /grid-template-rows: 40px 268px 104px minmax\(0, 1fr\)/)
   assert.match(html, /grid-template-columns: minmax\(0, 1fr\) 300px/)
-  assert.match(html, /\.crop-strip \{[\s\S]*?height: 42px/)
-  assert.match(html, /viewBox="0 0 720 198"/)
-  assert.match(html, /\.chart-svg \{[\s\S]*?height: 198px/)
+  assert.match(html, /\.crop-strip \{[\s\S]*?height: 40px/)
+  assert.match(html, /viewBox="0 0 720 228"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 228px/)
   assert.doesNotMatch(html, /viewBox="0 0 384 188"/)
   // 760×700 内不整页滚动：页面本身 overflow hidden，只有列表内部滚。
   assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)
-  // 票 89 的硬要求：下单卡不滚动、不裁切；每行 label 40 + 控件 minmax(0,1fr)。
+  // 票 91 的硬要求：下单横条不滚动、不裁切；主按钮 132×36 就在第一排。
   assert.doesNotMatch(html, /order-scroll/)
-  const fieldRow = /\.field-row \{([\s\S]*?)\}/.exec(html)
-  assert.ok(fieldRow, '下单区应有 .field-row 两列行')
-  assert.match(fieldRow[1], /grid-template-columns: 40px minmax\(0, 1fr\)/)
-  assert.match(html, /repeat\(4, minmax\(0, 1fr\)\)/)
-  assert.match(html, /repeat\(3, minmax\(0, 1fr\)\)/)
-  const orderCard = /\.order-card \{([\s\S]*?)\}/.exec(html)
-  assert.ok(orderCard, '应有 .order-card 规则')
-  assert.match(orderCard[1], /overflow: visible/)
-  assert.doesNotMatch(orderCard[1], /overflow-y: auto|overflow: auto/)
-  assert.match(html, /class="order-actions"/)
+  assert.match(html, /class="order-row order-row-primary"/)
+  assert.match(html, /class="order-row order-row-secondary"/)
+  assert.match(html, /repeat\(4, 42px\)/)
+  assert.match(html, /repeat\(3, 42px\)/)
+  const orderBar = /\.order-bar \{([\s\S]*?)\}/.exec(html)
+  assert.ok(orderBar, '应有 .order-bar 规则')
+  assert.match(orderBar[1], /overflow: visible/)
+  assert.doesNotMatch(orderBar[1], /overflow-y: auto|overflow: auto/)
+  assert.match(html, /\.submit \{[\s\S]*?width: 132px;\s*height: 36px/)
   assert.match(html, /id="submit"/)
-  // 焦点环/禁用态/数字等宽：票 89 的三条硬规则。
+  // 到价展开是横条下的浮层：不推页面、不裁切。
+  assert.match(html, /\.limit-box \{[\s\S]*?position: absolute;/)
+  // 显示弹层：按钮 + 两组分段 + 收起态；键盘可达。
+  assert.match(html, /id="display-toggle"/)
+  assert.match(html, /aria-haspopup="dialog"/)
+  assert.match(html, /aria-controls="display-pop"/)
+  assert.match(html, /id="display-pop"[\s\S]*?role="dialog"/)
+  assert.match(html, /id="chart-type-options"/)
+  assert.match(html, /id="theme-options"/)
+  assert.match(html, /\.display-pop\[hidden\] \{[\s\S]*?display: none/)
+  // 折线样式：手绘 stroke、12% 面积、现价圆点；黑白 token 覆盖与蜡烛实心/空心语义。
+  assert.match(html, /\.chart-svg \.line-path \{/)
+  assert.match(html, /\.chart-svg \.line-area \{[\s\S]*?opacity: 0\.12/)
+  assert.match(html, /\.chart-svg \.line-dot \{/)
+  assert.match(html, /body\[data-mono='1'\] \{/)
+  assert.match(html, /body\[data-mono='1'\] \.chart-svg \.body\.up \{[\s\S]*?fill: var\(--ink\)/)
+  assert.match(html, /body\[data-mono='1'\] \.chart-svg \.body\.down,[\s\S]*?fill: var\(--card\)/)
+  // 焦点环/禁用态/数字等宽：票 89 的三条硬规则还在。
   assert.match(html, /:focus-visible \{[\s\S]*?outline: 2px dashed var\(--ink\)/)
   assert.match(html, /button:disabled,[\s\S]*?opacity: 0\.45/)
   assert.match(html, /\.pnl \{[\s\S]*?font-size: 18px/)
@@ -1695,8 +1712,7 @@ test('票 87 / 票 89：盘口版面上图带 + 下两列，图 720×198，手�
   assert.ok(cropScroll, '应有 .crop-scroll 规则')
   assert.match(cropScroll[1], /overflow-x: auto/)
   assert.match(cropScroll[1], /overflow-y: hidden/)
-  // 到价挂单跟持仓在左列同一个滚动区里（票 89）：右列只剩 下单 + 周榜，
-  // 下单卡不会因为挂单卡片而溢出 760×700。
+  // 到价挂单跟持仓在左列同一个滚动区里（票 89）：横条不会因为挂单卡片而溢出 760×700。
   assert.match(html, /id="blotter"[\s\S]*?id="orders-wrap"[\s\S]*?id="positions"/)
   assert.doesNotMatch(html, /orders-card/)
   // 票 84 的周期提示与页签没有在这次改版里丢。
@@ -1728,15 +1744,30 @@ test('票 87 / 票 89：盘口版面上图带 + 下两列，图 720×198，手�
   assert.match(script, /chartsPending/)
   assert.doesNotMatch(script, /console\.log/)
 
+  // 票 91：显示选项在渲染端的接线——偏好读写、L/M 快捷键、黑白属性、折线层。
+  assert.match(script, /view\.readDisplayPrefs/)
+  assert.match(script, /view\.writeDisplayPrefs/)
+  assert.match(script, /DISPLAY_SHORTCUTS\.chartType/)
+  assert.match(script, /DISPLAY_SHORTCUTS\.theme/)
+  assert.match(script, /document\.body\.dataset\.mono/)
+  assert.match(script, /chart\.line/)
+  assert.match(script, /class: 'line-area'/)
+  assert.match(script, /class: 'line-path'/)
+  assert.match(script, /class: 'line-dot'/)
+  assert.match(script, /isTextEntry/)
+  assert.match(script, /displayOpen = false/)
+  assert.match(script, /limitOpen = false/)
+
   // 纯视图的尺寸与列归属是公开常量，Node 测试和窗口吃同一份。
   assert.equal(boardView.BOARD_WIDTH, 760)
   assert.equal(boardView.BOARD_HEIGHT, 700)
   assert.equal(boardView.CHART_WIDTH, 720)
-  assert.equal(boardView.CHART_HEIGHT, 198)
-  assert.equal(boardView.LAYOUT.headerHeight, 52)
-  assert.equal(boardView.LAYOUT.cropStripHeight, 42)
-  assert.equal(boardView.LAYOUT.chartCardHeight, 286)
+  assert.equal(boardView.CHART_HEIGHT, 228)
+  assert.equal(boardView.LAYOUT.headerHeight, 50)
+  assert.equal(boardView.LAYOUT.cropStripHeight, 40)
+  assert.equal(boardView.LAYOUT.chartCardHeight, 268)
+  assert.equal(boardView.LAYOUT.orderBarHeight, 104)
   assert.equal(boardView.LAYOUT.bottom.rightWidth, 300)
   assert.deepEqual(boardView.LAYOUT.columns.left, ['positions', 'history'])
-  assert.deepEqual(boardView.LAYOUT.columns.right, ['order', 'league'])
+  assert.deepEqual(boardView.LAYOUT.columns.right, ['league'])
 })
