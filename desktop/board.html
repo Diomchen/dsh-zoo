@@ -1,0 +1,1059 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      盘口小窗（票 79 / 票 81 / 票 82 / 票 83）：三作物 K 线、下单、到价挂单/撤单、
+      持仓/止损、最近结算、本周盈亏、真人周榜与 LAN 情绪。
+
+      和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
+      /state。行情、硬币、持仓、挂单、历史、周盈亏、风向、真人周榜全部由宿主随
+      `board-window` 命令推过来，这里只画、只把「申请」交回主进程。窗口能收键盘
+      （focusable），但**不按失焦关窗**：macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
+
+      Tab 顺序 = DOM 顺序：作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价输入框
+      → 挂单按钮（后两个只在「到价」点开时出现）→ 开一手 → 每张挂单的撤单 → 每手仓位的
+      止损/平仓。右栏（下单）在 DOM 里紧跟在图表之后，靠 grid-area 放到视觉右侧，
+      键盘走起来才顺。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dshzoo:"
+    />
+    <title>盘口</title>
+    <style>
+      :root {
+        --cream: #faf8f5;
+        --card: #fffdfa;
+        --ink: #2f3a34;
+        --ink-soft: #626a63;
+        --muted: #666d66;
+        --line: #ede5da;
+        --emerald: #2e9e6b;
+        --emerald-btn: #23815a;
+        --emerald-deep: #1b6b4a;
+        --emerald-soft: #e8f6ee;
+        --amber: #e7a23a;
+        --amber-ink: #8a5a12;
+        --amber-soft: #fdf3e2;
+        --rose: #c25b50;
+        --rose-ink: #a8352a;
+        --rose-soft: #fbeae7;
+        --line-strong: #ded4c4;
+        --disabled-bg: #f2efe8;
+        --disabled-ink: #8d8b82;
+        --focus: #1f7a52;
+        --shadow-soft: 0 4px 14px rgba(63, 54, 38, 0.07);
+        --shadow-lift: 0 10px 26px rgba(63, 54, 38, 0.13);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+          'Microsoft YaHei', 'Segoe UI', system-ui, sans-serif;
+        color: var(--ink);
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      button {
+        font-family: inherit;
+      }
+      :focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 2px;
+      }
+      .app {
+        display: flex;
+        flex-direction: column;
+        height: calc(100% - 16px);
+        margin: 8px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.85);
+        border-radius: 22px;
+        background:
+          radial-gradient(circle at 10% -8%, rgba(255, 255, 255, 0.9), transparent 42%),
+          linear-gradient(168deg, #fffdf9 0%, var(--cream) 56%, #f6f1e9 100%);
+        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+      }
+      .topbar {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px 9px;
+        background: rgba(255, 255, 255, 0.74);
+        border-bottom: 1px solid var(--line);
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      .brand-mark {
+        width: 34px;
+        height: 34px;
+        flex: none;
+        display: grid;
+        place-items: center;
+        border-radius: 11px;
+        background: var(--emerald-soft);
+        font-size: 18px;
+      }
+      .brand-text h1 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+      }
+      .brand-text p {
+        margin: 2px 0 0;
+        font-size: 11px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .week {
+        display: flex;
+        align-items: baseline;
+        gap: 5px;
+        flex: none;
+        margin-left: auto;
+        padding: 5px 10px;
+        border-radius: 12px;
+        background: var(--card);
+        border: 1px solid var(--line);
+        font-size: 11px;
+        white-space: nowrap;
+      }
+      .week b {
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+      }
+      .week b[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .week b[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .week span {
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .countdown {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        flex: none;
+        min-width: 68px;
+      }
+      .countdown b {
+        font-size: 18px;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+      }
+      .countdown span {
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .wallet {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: none;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        background: var(--card);
+        border: 1px solid var(--line);
+        white-space: nowrap;
+      }
+      .pill small {
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .pill b {
+        font-variant-numeric: tabular-nums;
+      }
+      .close {
+        width: 26px;
+        height: 26px;
+        flex: none;
+        border: none;
+        border-radius: 9px;
+        background: rgba(47, 58, 52, 0.06);
+        color: var(--ink-soft);
+        font-size: 15px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .close:hover {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .body {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 288px;
+        grid-template-rows: auto minmax(0, 1fr) auto;
+        grid-template-areas:
+          'chart order'
+          'positions order'
+          'history neighbor';
+        gap: 10px;
+        padding: 10px 12px 12px;
+        overflow: hidden;
+      }
+      .card {
+        min-width: 0;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        box-shadow: var(--shadow-soft);
+        padding: 10px 12px;
+      }
+      .card-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+      .card-head h2 {
+        margin: 0;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: var(--ink-soft);
+      }
+      .card-head span {
+        font-size: 10px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .scroll {
+        overflow-y: auto;
+        padding-right: 2px;
+      }
+      .scroll::-webkit-scrollbar {
+        width: 6px;
+      }
+      .scroll::-webkit-scrollbar-thumb {
+        background: rgba(47, 58, 52, 0.18);
+        border-radius: 999px;
+      }
+      /* ------------------------------ 图表 ------------------------------ */
+      .chart-card {
+        grid-area: chart;
+        display: flex;
+        flex-direction: column;
+      }
+      .chart-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+      .crop-tabs {
+        display: flex;
+        gap: 5px;
+      }
+      .crop-tab {
+        padding: 5px 9px;
+        border-radius: 9px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .crop-tab:hover {
+        border-color: var(--emerald);
+      }
+      .crop-tab[aria-pressed='true'] {
+        border-color: var(--emerald-btn);
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .chart-quote {
+        display: flex;
+        align-items: baseline;
+        gap: 6px;
+        margin-left: auto;
+      }
+      .chart-price {
+        font-size: 20px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      .chart-price[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .chart-price[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .chart-change {
+        font-size: 11px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        color: var(--muted);
+      }
+      .wind {
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+        font-size: 11px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .wind[data-tone='up'] {
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .wind[data-tone='down'] {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .wind small {
+        font-weight: 500;
+        opacity: 0.75;
+        margin-left: 3px;
+      }
+      .chart-svg {
+        display: block;
+        width: 100%;
+        height: 188px;
+      }
+      .chart-svg .grid {
+        stroke: rgba(47, 58, 52, 0.07);
+        stroke-width: 1;
+      }
+      .chart-svg .ref {
+        stroke-width: 1.2;
+        stroke-dasharray: 5 4;
+      }
+      .chart-svg .ref[data-key='base'] {
+        stroke: var(--amber);
+      }
+      .chart-svg .ref[data-key='entry'] {
+        stroke: var(--emerald);
+      }
+      .chart-svg .ref[data-key='liquidation'] {
+        stroke: var(--rose);
+      }
+      .chart-svg .wick.up {
+        stroke: var(--emerald);
+      }
+      .chart-svg .wick.down {
+        stroke: var(--rose);
+      }
+      .chart-svg .body.up {
+        fill: var(--emerald);
+      }
+      .chart-svg .body.down {
+        fill: var(--rose);
+      }
+      .chart-svg .body.forming {
+        opacity: 0.55;
+      }
+      .chart-svg .price-line {
+        stroke: var(--ink-soft);
+        stroke-width: 1;
+        stroke-dasharray: 3 3;
+        opacity: 0.5;
+      }
+      .chart-empty {
+        margin: 0;
+        padding: 64px 0;
+        font-size: 11px;
+        color: var(--muted);
+        text-align: center;
+      }
+      .chart-empty[hidden] {
+        display: none;
+      }
+      .chart-foot {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-top: 6px;
+      }
+      .legend {
+        display: flex;
+        gap: 10px;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .legend i {
+        display: inline-block;
+        width: 10px;
+        height: 2px;
+        margin-right: 4px;
+        vertical-align: middle;
+      }
+      .legend i.base {
+        background: var(--amber);
+      }
+      .legend i.entry {
+        background: var(--emerald);
+      }
+      .legend i.liquidation {
+        background: var(--rose);
+      }
+      .legend b {
+        color: var(--ink-soft);
+        font-weight: 600;
+      }
+      .slot-note {
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      /* ------------------------------ 下单 ------------------------------ */
+      .order-card {
+        grid-area: order;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+        /* 到价面板展开后内容会变高：极端字号/缩放时宁可让这一栏自己滚，也不挤掉开仓按钮。 */
+        overflow-y: auto;
+      }
+      .order-card .card-head {
+        margin-bottom: 0;
+      }
+      .field-label {
+        font-size: 10px;
+        color: var(--muted);
+        margin-bottom: 4px;
+      }
+      .chip-row {
+        display: flex;
+        gap: 6px;
+      }
+      .chip {
+        flex: 1;
+        padding: 8px 10px;
+        border-radius: 11px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .chip:hover {
+        border-color: var(--emerald);
+      }
+      .chip[aria-pressed='true'] {
+        border-color: var(--emerald-btn);
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .chip.short[aria-pressed='true'] {
+        border-color: var(--rose);
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .chip:disabled {
+        background: var(--disabled-bg);
+        border-color: var(--line);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .preview {
+        margin: 0;
+        padding: 8px 9px;
+        border-radius: 10px;
+        background: rgba(47, 58, 52, 0.035);
+        font-size: 11px;
+        color: var(--ink-soft);
+        line-height: 1.5;
+        font-variant-numeric: tabular-nums;
+      }
+      /* 下单前的强平价（SPEC v10 US7）：和预览句分两行，预览句的措辞是产品硬文案。 */
+      .liquidation {
+        margin: 0;
+        padding: 0 2px;
+        font-size: 11px;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+      .submit {
+        width: 100%;
+        padding: 11px 12px;
+        border: none;
+        border-radius: 13px;
+        background: var(--emerald-btn);
+        color: #fff;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .submit:hover:not(:disabled) {
+        background: var(--emerald-deep);
+      }
+      .submit[data-side='short'] {
+        background: var(--rose-ink);
+      }
+      .submit[data-side='short']:hover:not(:disabled) {
+        background: #8c2b22;
+      }
+      .submit:disabled {
+        background: var(--disabled-bg);
+        border: 1px solid var(--line);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .hint {
+        margin: 0;
+        font-size: 11px;
+        color: var(--amber-ink);
+        line-height: 1.5;
+      }
+      .hint:empty {
+        display: none;
+      }
+      /* ------------------------------ 到价挂单（票 83） ------------------------------ */
+      .limit {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .limit-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .limit-toggle {
+        flex: none;
+      }
+      .limit-toggle[aria-pressed='true'] {
+        border-color: var(--amber);
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+      }
+      .limit-note {
+        min-width: 0;
+        font-size: 10px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .limit-box {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 7px 8px;
+        border: 1px dashed var(--line-strong);
+        border-radius: 10px;
+        background: rgba(231, 162, 58, 0.05);
+      }
+      .limit-box[hidden] {
+        display: none;
+      }
+      .limit-input-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .limit-input-row .field-label {
+        margin: 0;
+        flex: none;
+      }
+      .limit-input {
+        flex: 1;
+        min-width: 0;
+        padding: 6px 8px;
+        border-radius: 9px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink);
+        font-family: inherit;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+      }
+      .limit-input:focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 1px;
+      }
+      .limit-place {
+        flex: none;
+      }
+      .limit-band {
+        margin: 0;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .limit-hint {
+        margin: 0;
+        font-size: 10px;
+        color: var(--amber-ink);
+        line-height: 1.5;
+      }
+      .limit-hint:empty {
+        display: none;
+      }
+      .orders-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        padding-top: 6px;
+        border-top: 1px dashed var(--line);
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .orders {
+        flex: 0 1 auto;
+        max-height: 64px;
+        min-height: 0;
+      }
+      .order-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 4px 0;
+        font-size: 12px;
+      }
+      .order-row + .order-row {
+        border-top: 1px dashed var(--line);
+      }
+      .order-row .row-title {
+        font-size: 12px;
+      }
+      .order-row .row-meta {
+        font-variant-numeric: tabular-nums;
+      }
+      .order-cancel {
+        flex: none;
+      }
+      .fine {
+        margin: auto 0 0;
+        padding-top: 6px;
+        border-top: 1px dashed var(--line);
+        font-size: 10px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      /* ------------------------------ 持仓/历史 ------------------------------ */
+      .positions-card,
+      .history-card {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .positions-card {
+        grid-area: positions;
+      }
+      .history-card {
+        grid-area: history;
+      }
+      .position {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        padding: 7px 10px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, #fffefb, #fbf7f0);
+      }
+      .position + .position {
+        margin-top: 6px;
+      }
+      .position-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+      .position-title {
+        font-size: 12px;
+        font-weight: 700;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .position-meta {
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .position-side {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: none;
+      }
+      .pnl {
+        font-size: 14px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        min-width: 52px;
+        text-align: right;
+      }
+      .pnl[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .pnl[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .pnl[data-tone='flat'] {
+        color: var(--ink-soft);
+      }
+      .ghost {
+        padding: 6px 9px;
+        border-radius: 9px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .ghost:hover:not(:disabled) {
+        border-color: var(--rose);
+        color: var(--rose-ink);
+      }
+      .ghost.stop[aria-pressed='true'] {
+        border-color: var(--amber);
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+      }
+      .ghost:disabled {
+        background: var(--disabled-bg);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 5px 0;
+        font-size: 12px;
+      }
+      .row + .row {
+        border-top: 1px dashed var(--line);
+      }
+      .row-main {
+        min-width: 0;
+      }
+      .row-title {
+        font-weight: 600;
+      }
+      .row-meta {
+        margin-top: 1px;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .empty {
+        margin: 2px 0 0;
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .empty[hidden] {
+        display: none;
+      }
+      /* ------------------------------ 真人周榜（票 82） ------------------------------ */
+      .neighbor-card {
+        grid-area: neighbor;
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+      }
+      .neighbor-card .scroll {
+        flex: 1;
+        min-height: 0;
+      }
+      .sentiment {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 4px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--line);
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .sentiment-value {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+      .sentiment-value[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .sentiment-value[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      /* US19：邻居的当前持仓画成小 chip（作物 + 多/空 + 杠杆），摘要仍保留多空计数。 */
+      .league-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 3px;
+      }
+      .league-chip {
+        padding: 1px 6px;
+        border-radius: 999px;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+        font-size: 10px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .league-chip[data-tone='short'] {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .league-chip.more {
+        background: rgba(47, 58, 52, 0.06);
+        color: var(--muted);
+      }
+      /* 本机那一行一直高亮：榜上第一眼要找的是自己的名次，不是邻居。 */
+      .league-row.me {
+        margin: 0 -6px;
+        padding: 4px 6px;
+        border-radius: 8px;
+        background: var(--emerald-soft);
+      }
+      .league-row.me + .league-row {
+        border-top: none;
+      }
+      .league-score {
+        flex: none;
+        text-align: right;
+        white-space: nowrap;
+      }
+      /* 榜行比持仓卡密：分数用 12px，够看清又不把一屏挤成两行。 */
+      .league-row .pnl {
+        font-size: 12px;
+        min-width: 40px;
+      }
+      .league-pct {
+        margin-left: 6px;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .league-pct[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .league-pct[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      /* ------------------------------ 其他 ------------------------------ */
+      .foot {
+        flex: none;
+        padding: 6px 14px 8px;
+        border-top: 1px solid var(--line);
+        font-size: 10px;
+        color: var(--muted);
+        text-align: center;
+      }
+      .toasts {
+        position: absolute;
+        left: 50%;
+        bottom: 18px;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        align-items: center;
+        pointer-events: none;
+      }
+      .toast {
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: rgba(47, 58, 52, 0.92);
+        color: #fff;
+        font-size: 12px;
+        box-shadow: var(--shadow-lift);
+        white-space: nowrap;
+      }
+      .toast.error {
+        background: var(--rose-ink);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">📈</span>
+          <div class="brand-text">
+            <h1 id="board-title">盘口</h1>
+            <p id="board-subtitle">15 分钟合约 · 收盘自动结算</p>
+          </div>
+        </div>
+        <div class="week" title="本周交易盈亏（已实现 + 未实现）与收益率；周一 00:00 清零，硬币不清零">
+          <small>本周</small><b id="week-pnl" data-tone="flat">0.0</b><span id="week-pct">—</span>
+        </div>
+        <div class="wallet">
+          <span class="pill" title="可用硬币 = 农场硬币">
+            <small>可用</small><b id="coins-available">0</b>
+          </span>
+          <span class="pill" title="可用 + 锁定保证金 + 未实现盈亏">
+            <small>含锁定</small><b id="coins-total">0</b>
+          </span>
+        </div>
+        <div class="countdown" title="距这一根收盘">
+          <b id="countdown">15:00</b>
+          <span>距收盘</span>
+        </div>
+        <button class="close" id="close" type="button" aria-label="关闭盘口">×</button>
+      </header>
+
+      <div class="body">
+        <section class="card chart-card" aria-label="行情 K 线">
+          <div class="chart-head">
+            <div class="crop-tabs" id="crop-tabs" role="group" aria-label="作物"></div>
+            <div class="chart-quote">
+              <b class="chart-price" id="chart-price" data-tone="flat">—</b>
+              <span class="chart-change" id="chart-change">—</span>
+              <span class="wind" id="wind" data-tone="flat">风向 —</span>
+            </div>
+          </div>
+          <svg
+            class="chart-svg"
+            id="chart"
+            viewBox="0 0 384 188"
+            preserveAspectRatio="none"
+            role="img"
+            aria-label="15 分钟 K 线：底价、入场、强平参考线"
+          ></svg>
+          <p class="chart-empty" id="chart-empty" hidden>行情还在算，稍等一下。</p>
+          <div class="chart-foot">
+            <span class="legend" id="legend"></span>
+            <span class="slot-note" id="slot-note">第 — 根</span>
+          </div>
+        </section>
+
+        <section class="card order-card" aria-labelledby="order-title">
+          <div class="card-head">
+            <h2 id="order-title">下单</h2>
+            <span id="order-crop">小番茄</span>
+          </div>
+          <div>
+            <div class="field-label">方向</div>
+            <div class="chip-row" id="side-row" role="group" aria-label="方向"></div>
+          </div>
+          <div>
+            <div class="field-label">保证金</div>
+            <div class="chip-row" id="margin-row" role="group" aria-label="保证金"></div>
+          </div>
+          <div>
+            <div class="field-label">杠杆</div>
+            <div class="chip-row" id="leverage-row" role="group" aria-label="杠杆"></div>
+          </div>
+          <div class="limit">
+            <div class="limit-head">
+              <button class="ghost limit-toggle" id="limit-toggle" type="button" aria-pressed="false">
+                到价
+              </button>
+              <span class="limit-note" id="limit-note">关：直接按现价开仓</span>
+            </div>
+            <div class="limit-box" id="limit-box" hidden>
+              <div class="limit-input-row">
+                <label class="field-label" for="limit-target">目标价</label>
+                <input
+                  class="limit-input"
+                  id="limit-target"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="5.00"
+                  aria-describedby="limit-band limit-hint"
+                />
+                <button class="ghost limit-place" id="limit-place" type="button">挂单</button>
+              </div>
+              <p class="limit-band" id="limit-band"></p>
+              <p class="limit-hint" id="limit-hint"></p>
+            </div>
+          </div>
+          <p class="preview" id="preview"></p>
+          <p class="liquidation" id="order-liquidation"></p>
+          <button class="submit" id="submit" type="button">开一手</button>
+          <p class="hint" id="order-hint"></p>
+          <div class="orders-head">
+            <span>到价挂单</span>
+            <span id="orders-meta">挂单 0</span>
+          </div>
+          <div class="scroll orders" id="orders"></div>
+          <p class="empty" id="orders-empty">没有挂单。</p>
+          <p class="fine">
+            没有手续费、没有资金费、没有风险控制。关掉窗口也会照常收盘结算；硬币赔光就去种地。
+          </p>
+        </section>
+
+        <section class="card positions-card" aria-labelledby="positions-title">
+          <div class="card-head">
+            <h2 id="positions-title">持仓</h2>
+            <span id="positions-meta">持仓 0</span>
+          </div>
+          <div class="scroll" id="positions"></div>
+          <p class="empty" id="positions-empty">还没有持仓。</p>
+        </section>
+
+        <section class="card history-card" aria-labelledby="history-title">
+          <div class="card-head">
+            <h2 id="history-title">最近结算</h2>
+            <span id="history-meta">0 笔</span>
+          </div>
+          <div class="scroll" id="history"></div>
+          <p class="empty" id="history-empty">还没有结算记录。</p>
+        </section>
+
+        <section class="card neighbor-card" aria-labelledby="neighbor-title">
+          <div class="card-head">
+            <h2 id="neighbor-title">真人周榜</h2>
+            <span id="league-count">1 人</span>
+          </div>
+          <div class="sentiment">
+            <span>LAN 情绪</span>
+            <b class="sentiment-value" id="sentiment" data-tone="flat">观望</b>
+          </div>
+          <div class="scroll" id="league"></div>
+          <p class="empty" id="neighbor-empty">还没有邻居上线。</p>
+        </section>
+      </div>
+
+      <div class="foot">15 分钟一根 · 做多/做空 · 硬币赔光就去种地 · 风向只是慢趋势，不是保证</div>
+      <div class="toasts" id="toasts"></div>
+    </div>
+    <script src="trading-view.js"></script>
+    <script src="board.js"></script>
+  </body>
+</html>

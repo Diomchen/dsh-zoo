@@ -88,7 +88,22 @@
   const MAX_MENU_TOOLS = 8
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'home', 'reload', 'scan-skins']
+  // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'home', 'reload', 'scan-skins']
+  /**
+   * 右键工具项 → 宿主动作申请（评审 P2）：渲染端以前用一条 `id === 'reload' || …` 的
+   * 手写链，多一个工具就要改两处。现在只有这一张表，`runMenuTool` 直接查它。
+   * `home` 不在这里：它只在本机把宠物挪回出生点，不发任何申请。
+   * 键集合 = `MENU_TOOL_IDS` 去掉 home，`test/desktop-menu.test.js` 盯着。
+   */
+  const MENU_TOOL_REQUESTS = Object.freeze({
+    'open-site': 'open-site',
+    bring: 'bring',
+    farm: 'farm-open',
+    trading: 'trading-open',
+    reload: 'reload',
+    'scan-skins': 'scan-skins'
+  })
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -193,6 +208,69 @@
    */
   const FARM_REFRESH_ACTIONS = ['farm-refresh', 'farm-own']
   /**
+   * 票 79：农场窗头部的「盘口」按钮。它只是**开窗申请**（和右键「盘口」同一个宿主入口），
+   * 所以挂进 FARM_ACTIONS 走同一条 `farm-submit` → action-result 回路，不带任何字段。
+   */
+  const BOARD_OPEN_ACTIONS = ['trading-open']
+  /**
+   * 盘口小窗能提交的动作（票 79 / 票 81 / 票 83）。字段窄到不能再窄：
+   *   trading-open-position  { side, margin, leverage, cropId }
+   *   trading-close-position { positionId }
+   *   trading-set-stop       { positionId, level }（票 81：持仓卡上的止损循环）
+   *   trading-place-order    { side, margin, leverage, cropId, target }（票 83：到价挂单）
+   *   trading-cancel-order   { orderId }（票 83：撤单）
+   *   trading-refresh        无字段（倒计时到 0 时请宿主结这一根并重推一拍）
+   * 价格、硬币、盈亏、成交价全由宿主算，窗口一概不传。
+   */
+  const BOARD_SUBMIT_ACTIONS = [
+    'trading-open-position',
+    'trading-close-position',
+    'trading-set-stop',
+    'trading-place-order',
+    'trading-cancel-order',
+    'trading-refresh'
+  ]
+  const BOARD_SIDES = ['long', 'short']
+  const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
+  /**
+   * 盘口杠杆的形状上限（票 81 / 评审 P2）：与 `src/trading-rules.js` 的 `MAX_LEVERAGE` 同值。
+   * 这一层只守形状（读盘/白名单），1×/5×/20× 的产品白名单由宿主按 `TRADING_LEVERAGES` 校验；
+   * `test/farm-constants-drift.test.js` 有 drift 断言盯着两个数相等。
+   */
+  const BOARD_MAX_LEVERAGE = 20
+  /**
+   * 止损档位（票 81）：0 = 关，其余是「亏掉保证金的这个比例就平仓」。
+   * 窗口的按钮循环「关 → −25% → −50% → −100% → 关」，宿主的 store（票 80）
+   * 按同一组数校验；两边各留一份，靠 `test/board-window.test.js` 的 drift 断言对齐。
+   */
+  const BOARD_STOP_LEVELS = [0, 0.25, 0.5, 1]
+  /**
+   * 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。
+   * 持仓/挂单放到 200（评审 P1）：宿主按最新在前下发，200 条足够覆盖正常玩家的全部
+   * 未平仓位；真超了由 `positionsTotal`/`ordersTotal` 告诉窗口「显示最近 200」。
+   */
+  const BOARD_MAX_PRICE = 1000000000
+  const BOARD_MAX_POSITIONS = 200
+  const BOARD_MAX_ORDERS = 200
+  const BOARD_MAX_HISTORY = 50
+  const BOARD_MAX_LIMITS = 8
+  const BOARD_MAX_CHARTS = 8
+  /** 宿主给 24 根 + 当前一根；留一点余量，换根数时不必两边同改。 */
+  const BOARD_MAX_BARS = 40
+  const BOARD_MAX_TICK = 15
+  /**
+   * 票 82：真人周榜。一屏最多 32 行、每行最多 8 条持仓（与报文上限一致），
+   * 情绪计数最多是「行 × 持仓」——这三个数只做形状夹取，不是产品规则。
+   * 分数/收益率的范围与宿主 `src/protocol.js` 的 MAX_WEEK_PNL / MAX_WEEK_PNL_PCT 同源。
+   */
+  const BOARD_MAX_LEAGUE_ROWS = 32
+  const BOARD_MAX_LEAGUE_POSITIONS = 8
+  const BOARD_MAX_LEAGUE_COUNT = BOARD_MAX_LEAGUE_ROWS * BOARD_MAX_LEAGUE_POSITIONS
+  /** 旧版本邻居的可见计数：与 `src/protocol.js` 的 MAX_NEIGHBORS（64）同量级，只做形状夹取。 */
+  const BOARD_MAX_WATCHERS = 64
+  const BOARD_MAX_WEEK_PNL = 1000000
+  const BOARD_MAX_WEEK_PNL_PCT = 1000
+  /**
    * 地块解锁（ticket 48）：只带可选的 `expectedUnlocked`（窗口看到的已解锁数）。
    * 价格与下一块地在哪全由宿主算；窗口不传钱、不传地块 id。
    */
@@ -228,7 +306,9 @@
     FARM_LAND_ACTIONS,
     FARM_LOOK_ACTIONS,
     FARM_EVENT_ACTIONS,
-    FARM_OMEN_ACTIONS
+    FARM_OMEN_ACTIONS,
+    // 票 79：农场窗头部的「盘口」按钮（无字段，只是开窗申请）。
+    BOARD_OPEN_ACTIONS
   )
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
@@ -262,13 +342,15 @@
   const MENU_ACTION_IDS = [
     'play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins', 'farm-open',
     // 票 52/53：右键邻居看田、从看田窗派它去偷（都只带 deviceId）。
-    'farm-look', 'farm-raid'
+    'farm-look', 'farm-raid',
+    // 票 79：右键「盘口」只发一个空动作，开/关与整份视图都在宿主。
+    ...BOARD_OPEN_ACTIONS
   ]
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
   const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
-  /** helper → 宿主能报的全部动作：控件 + 菜单。 */
-  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS)
+  /** helper → 宿主能报的全部动作：控件 + 菜单 + 盘口小窗的提交（三条不同的 IPC 入口）。 */
+  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
   const MAX_ACTION_TEXT = 64
   /**
@@ -1620,6 +1702,480 @@
     }
   }
 
+  /**
+   * 盘口小窗（票 79）的**宿主 → helper** 白名单。
+   *
+   * 窗口是 sandboxed 的 file:// 页面，只认这一份形状：多一个字段都进不去，
+   * 数字要么是有限数、要么是 null（null 在视图层画成「—」）。
+   * 业务白名单（50/100、1×）不在这里抄一遍——那是宿主的 `trading-rules.js`，
+   * 这一层只管**形状**；抄两份迟早漂移（§9.3 的教训）。
+   */
+  function normalizeBoardNumber (value, min, max) {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return null
+    return Math.min(max, Math.max(min, num))
+  }
+
+  function normalizeBoardInt (value, min, max) {
+    const num = normalizeBoardNumber(value, min, max)
+    return num === null ? null : Math.round(num)
+  }
+
+  function strictBoardInt (value, min, max) {
+    const num = Number(value)
+    if (!Number.isInteger(num) || num < min || num > max) return null
+    return num
+  }
+
+  function normalizeBoardPosition (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeId(raw.id)
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    if (id === null || crop === null || side === null) return null
+    const margin = normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS)
+    const leverage = normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
+    const entry = normalizeBoardNumber(raw.entry, 0, BOARD_MAX_PRICE)
+    if (margin === null || leverage === null || entry === null) return null
+    return {
+      id,
+      crop,
+      side,
+      margin,
+      leverage,
+      entry,
+      mark: normalizeBoardNumber(raw.mark, 0, BOARD_MAX_PRICE),
+      pnl: normalizeBoardNumber(raw.pnl, -BOARD_MAX_PRICE, BOARD_MAX_PRICE),
+      // 票 81：强平价（1× 是 null → 窗口显示「—」）与止损档位（0 = 关）。
+      // `null` 必须原样留下：它的意思是「这一手没有强平价」，不是 0。
+      // 认不出的档位退成「关」：宁可少一道自动平仓，也不替玩家猜一档。
+      liquidation: raw.liquidation === null || raw.liquidation === undefined
+        ? null
+        : normalizeBoardNumber(raw.liquidation, 0, BOARD_MAX_PRICE),
+      stopLoss: BOARD_STOP_LEVELS.includes(raw.stopLoss) ? raw.stopLoss : 0,
+      openedAt: normalizeBoardInt(raw.openedAt, 0, Number.MAX_SAFE_INTEGER),
+      slot: normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER),
+      // 结算中的仓位只能看不能点平仓（钱已经走了一半，宿主会回 settling）。
+      ...(raw.settling === true ? { settling: true } : {})
+    }
+  }
+
+  function normalizeBoardHistory (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeId(raw.id)
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    if (id === null || crop === null || side === null) return null
+    if (!BOARD_REASONS.includes(raw.reason)) return null
+    const entry = normalizeBoardNumber(raw.entry, 0, BOARD_MAX_PRICE)
+    const exit = normalizeBoardNumber(raw.exit, 0, BOARD_MAX_PRICE)
+    const pnl = normalizeBoardNumber(raw.pnl, -BOARD_MAX_PRICE, BOARD_MAX_PRICE)
+    const at = normalizeBoardInt(raw.at, 0, Number.MAX_SAFE_INTEGER)
+    if (entry === null || exit === null || pnl === null || at === null) return null
+    return {
+      id,
+      crop,
+      side,
+      margin: normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS) ?? 0,
+      leverage: normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE) ?? 1,
+      entry,
+      exit,
+      pnl,
+      reason: raw.reason,
+      at
+    }
+  }
+
+  /**
+   * 到价挂单（票 83）：`{ id, crop, side, target, margin, leverage, placedAt, slot, remainingMs }`。
+   * 保证金/方向/杠杆只是形状校验（50/250/全下与 1×/5×/20× 由宿主再判一次）；
+   * `remainingMs` 是「距本根收盘」的展示值，窗口每秒本地递减，不拿它算钱。
+   */
+  function normalizeBoardOrder (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeId(raw.id)
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    if (id === null || crop === null || side === null) return null
+    const target = normalizeBoardNumber(raw.target, 0, BOARD_MAX_PRICE)
+    const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
+    const leverage = normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
+    const placedAt = normalizeBoardInt(raw.placedAt, 0, Number.MAX_SAFE_INTEGER)
+    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
+    if (target === null || target <= 0 || margin === null || leverage === null ||
+      placedAt === null || slot === null) {
+      return null
+    }
+    return {
+      id,
+      crop,
+      side,
+      target,
+      margin,
+      leverage,
+      placedAt,
+      slot,
+      remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0
+    }
+  }
+
+  function normalizeBoardOrders (raw) {
+    const orders = []
+    for (const candidate of Array.isArray(raw) ? raw : []) {
+      if (orders.length >= BOARD_MAX_ORDERS) break
+      const order = normalizeBoardOrder(candidate)
+      if (order !== null) orders.push(order)
+    }
+    return orders
+  }
+
+  function normalizeBoardLimits (raw) {
+    const margins = []
+    for (const candidate of Array.isArray(raw.margins) ? raw.margins : []) {
+      if (margins.length >= BOARD_MAX_LIMITS) break
+      const margin = strictBoardInt(candidate, 1, MAX_FARM_COINS)
+      if (margin !== null && !margins.includes(margin)) margins.push(margin)
+    }
+    const leverages = []
+    for (const candidate of Array.isArray(raw.leverages) ? raw.leverages : []) {
+      if (leverages.length >= BOARD_MAX_LIMITS) break
+      const leverage = strictBoardInt(candidate, 1, BOARD_MAX_LEVERAGE)
+      if (leverage !== null && !leverages.includes(leverage)) leverages.push(leverage)
+    }
+    const crops = []
+    for (const candidate of Array.isArray(raw.crops) ? raw.crops : []) {
+      if (crops.length >= BOARD_MAX_LIMITS) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const id = normalizeCropId(candidate.id)
+      if (id === null || crops.some((crop) => crop.id === id)) continue
+      crops.push({ id, name: normalizeLabel(candidate.name, id) })
+    }
+    return {
+      margins,
+      leverages,
+      crops,
+      historyLimit: normalizeBoardInt(raw.historyLimit, 0, BOARD_MAX_HISTORY) ?? BOARD_MAX_HISTORY,
+      // 票 83：宿主是否支持「全下」。旧宿主没有这个字段 → false（窗口不画那颗按钮）。
+      allIn: raw.allIn === true,
+      // 票 83：到价目标价带的比例（宿主 `PRICE_FLOOR_RATIO` / `PRICE_CEIL_RATIO`）。
+      // 窗口只画提示，不拿它算钱；比例坏了就是 null，窗口不显示价格带（宿主照样会拒坏目标价）。
+      targetRatio: normalizeBoardTargetRatio(raw.targetRatio)
+    }
+  }
+
+  /** `{ floor, ceil }`：两个有限正数、floor < ceil，否则整块当没有。 */
+  function normalizeBoardTargetRatio (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const floor = normalizeBoardNumber(raw.floor, 0, 100)
+    const ceil = normalizeBoardNumber(raw.ceil, 0, 100)
+    if (floor === null || ceil === null || floor <= 0 || ceil <= floor) return null
+    return { floor, ceil }
+  }
+
+  /** 一根 K 线：开高低收都是价格；slot 只当横轴的键。坏一根丢一根，图少一根不影响别的。 */
+  function normalizeBoardBar (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
+    const open = normalizeBoardNumber(raw.open, 0, BOARD_MAX_PRICE)
+    const high = normalizeBoardNumber(raw.high, 0, BOARD_MAX_PRICE)
+    const low = normalizeBoardNumber(raw.low, 0, BOARD_MAX_PRICE)
+    const close = normalizeBoardNumber(raw.close, 0, BOARD_MAX_PRICE)
+    if (slot === null || open === null || high === null || low === null || close === null) return null
+    return { slot, open, high, low, close }
+  }
+
+  /** 当前形成中的一根（票 81）：`price` 是现价，`tick` 是已经走了几分钟。 */
+  function normalizeBoardCurrentBar (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
+    const open = normalizeBoardNumber(raw.open, 0, BOARD_MAX_PRICE)
+    const high = normalizeBoardNumber(raw.high, 0, BOARD_MAX_PRICE)
+    const low = normalizeBoardNumber(raw.low, 0, BOARD_MAX_PRICE)
+    const price = normalizeBoardNumber(raw.price, 0, BOARD_MAX_PRICE)
+    if (slot === null || open === null || high === null || low === null || price === null) return null
+    return {
+      slot,
+      open,
+      high,
+      low,
+      price,
+      tick: normalizeBoardNumber(raw.tick, 0, BOARD_MAX_TICK) ?? 0,
+      remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0
+    }
+  }
+
+  /** 一张图：底价 + 最近若干整根 + 当前一根。坏成空图（窗口画空态），不整窗失败。 */
+  function normalizeBoardChart (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const base = normalizeBoardNumber(raw.base, 0, BOARD_MAX_PRICE)
+    if (base === null) return null
+    const bars = []
+    for (const candidate of Array.isArray(raw.bars) ? raw.bars : []) {
+      if (bars.length >= BOARD_MAX_BARS) break
+      const bar = normalizeBoardBar(candidate)
+      if (bar !== null) bars.push(bar)
+    }
+    return { base, bars, current: normalizeBoardCurrentBar(raw.current) }
+  }
+
+  /** `charts: { tomato: {…}, … }`：只认运行时目录里的作物 id，多余的键丢掉。 */
+  function normalizeBoardCharts (raw) {
+    const charts = {}
+    let count = 0
+    for (const key of Object.keys(raw)) {
+      if (count >= BOARD_MAX_CHARTS) break
+      const crop = normalizeCropId(key)
+      if (crop === null) continue
+      const chart = normalizeBoardChart(raw[key])
+      if (chart === null) continue
+      charts[crop] = chart
+      count += 1
+    }
+    return charts
+  }
+
+  /** `hint: { tomato: { direction, confidence }, … }`：方向只有三种，置信度必须 0–1。 */
+  function normalizeBoardHints (raw) {
+    const hints = {}
+    let count = 0
+    for (const key of Object.keys(raw)) {
+      if (count >= BOARD_MAX_CHARTS) break
+      const crop = normalizeCropId(key)
+      if (crop === null) continue
+      const entry = raw[key]
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+      const direction = entry.direction === 'up' || entry.direction === 'down'
+        ? entry.direction
+        : entry.direction === 'flat' ? 'flat' : null
+      const confidence = normalizeBoardNumber(entry.confidence, 0, 1)
+      if (direction === null || confidence === null) continue
+      hints[crop] = { direction, confidence }
+      count += 1
+    }
+    return hints
+  }
+
+  /** 榜上一条持仓（票 82）：只有作物/方向/杠杆——保证金与入场价根本不在报文里。 */
+  function normalizeBoardLeaguePosition (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
+    if (crop === null || side === null || leverage === null) return null
+    return { crop, side, leverage }
+  }
+
+  /**
+   * 榜上一行。`weekPnl` 是排序键（宿主已按它排好），`weekPnlPct` 是可选比率
+   * （0.035 = +3.5%），缺省就是 null（窗口画「—」）。`me` 是本机那一行，窗口高亮它。
+   */
+  function normalizeBoardLeagueRow (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const deviceId = normalizeUuid(raw.deviceId)
+    const weekPnl = normalizeBoardNumber(raw.weekPnl, -BOARD_MAX_WEEK_PNL, BOARD_MAX_WEEK_PNL)
+    if (deviceId === null || weekPnl === null) return null
+    const positions = []
+    for (const candidate of Array.isArray(raw.positions) ? raw.positions : []) {
+      if (positions.length >= BOARD_MAX_LEAGUE_POSITIONS) break
+      const position = normalizeBoardLeaguePosition(candidate)
+      if (position === null) continue
+      positions.push(position)
+    }
+    return {
+      deviceId,
+      nickname: normalizeLabel(raw.nickname, '邻居'),
+      weekPnl,
+      weekPnlPct: raw.weekPnlPct === null || raw.weekPnlPct === undefined
+        ? null
+        : normalizeBoardNumber(raw.weekPnlPct, -BOARD_MAX_WEEK_PNL_PCT, BOARD_MAX_WEEK_PNL_PCT),
+      positions,
+      me: raw.me === true
+    }
+  }
+
+  /**
+   * `league: { rows, sentiment, self }`（票 82）。坏行只丢自己、重复 deviceId 只留第一条；
+   * 整块缺失/坏形状就是空榜 → 窗口画「还没有邻居上线」。
+   */
+  function normalizeBoardLeague (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const rows = []
+    const seen = new Set()
+    for (const candidate of Array.isArray(source.rows) ? source.rows : []) {
+      if (rows.length >= BOARD_MAX_LEAGUE_ROWS) break
+      const row = normalizeBoardLeagueRow(candidate)
+      if (row === null || seen.has(row.deviceId)) continue
+      seen.add(row.deviceId)
+      rows.push(row)
+    }
+    const counts = source.sentiment !== null && typeof source.sentiment === 'object' &&
+      !Array.isArray(source.sentiment)
+      ? source.sentiment
+      : {}
+    const own = source.self !== null && typeof source.self === 'object' && !Array.isArray(source.self)
+      ? source.self
+      : {}
+    // 旧版本邻居（评审 P1）：有人在线、但一条周报都没发时，窗口要画「旧版本」而不是
+    // 「还没有邻居上线」。这两个数只是展示用的计数，坏了归零。
+    const watchers = source.watchers !== null && typeof source.watchers === 'object' &&
+      !Array.isArray(source.watchers)
+      ? source.watchers
+      : {}
+    return {
+      rows,
+      sentiment: {
+        long: normalizeBoardInt(counts.long, 0, BOARD_MAX_LEAGUE_COUNT) ?? 0,
+        short: normalizeBoardInt(counts.short, 0, BOARD_MAX_LEAGUE_COUNT) ?? 0,
+        flat: normalizeBoardInt(counts.flat, 0, BOARD_MAX_LEAGUE_COUNT) ?? 0
+      },
+      self: {
+        weekPnl: normalizeBoardNumber(own.weekPnl, -BOARD_MAX_WEEK_PNL, BOARD_MAX_WEEK_PNL) ?? 0,
+        weekPnlPct: own.weekPnlPct === null || own.weekPnlPct === undefined
+          ? null
+          : normalizeBoardNumber(own.weekPnlPct, -BOARD_MAX_WEEK_PNL_PCT, BOARD_MAX_WEEK_PNL_PCT)
+      },
+      watchers: {
+        online: normalizeBoardInt(watchers.online, 0, BOARD_MAX_WATCHERS) ?? 0,
+        reported: normalizeBoardInt(watchers.reported, 0, BOARD_MAX_WATCHERS) ?? 0
+      }
+    }
+  }
+
+  /** 整份盘口视图；坏到不成形状就返回 null（窗口画空态，不崩）。 */
+  function normalizeBoardView (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const coinsRaw = raw.coins !== null && typeof raw.coins === 'object' && !Array.isArray(raw.coins)
+      ? raw.coins
+      : {}
+    const weekRaw = raw.week !== null && typeof raw.week === 'object' && !Array.isArray(raw.week)
+      ? raw.week
+      : {}
+    const limitsRaw = raw.limits !== null && typeof raw.limits === 'object' && !Array.isArray(raw.limits)
+      ? raw.limits
+      : {}
+    const barRaw = raw.bar !== null && typeof raw.bar === 'object' && !Array.isArray(raw.bar)
+      ? raw.bar
+      : null
+    const rawPositions = Array.isArray(raw.positions) ? raw.positions : []
+    const positions = []
+    for (const candidate of rawPositions) {
+      if (positions.length >= BOARD_MAX_POSITIONS) break
+      const position = normalizeBoardPosition(candidate)
+      if (position !== null) positions.push(position)
+    }
+    const history = []
+    for (const candidate of Array.isArray(raw.history) ? raw.history : []) {
+      if (history.length >= BOARD_MAX_HISTORY) break
+      const entry = normalizeBoardHistory(candidate)
+      if (entry !== null) history.push(entry)
+    }
+    return {
+      coins: {
+        available: normalizeBoardInt(coinsRaw.available, 0, MAX_FARM_COINS) ?? 0,
+        locked: normalizeBoardInt(coinsRaw.locked, 0, MAX_FARM_COINS) ?? 0,
+        total: normalizeBoardInt(coinsRaw.total, 0, MAX_FARM_COINS) ?? 0
+      },
+      week: {
+        start: normalizeBoardInt(weekRaw.start, 0, Number.MAX_SAFE_INTEGER) ?? 0,
+        // pnl 是已实现（落盘、榜也用）；unrealized 与 total 是票 81 的展示口径
+        // （顶部的「本周盈亏」= 已实现 + 未实现），收益率用 total / base。
+        pnl: normalizeBoardInt(weekRaw.pnl, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0,
+        base: normalizeBoardInt(weekRaw.base, 0, MAX_FARM_COINS) ?? 0,
+        unrealized: normalizeBoardInt(weekRaw.unrealized, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0,
+        total: normalizeBoardInt(weekRaw.total, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0
+      },
+      limits: normalizeBoardLimits(limitsRaw),
+      // 票 81：三作物各自的 K 线与风向；缺了就画空态（老宿主/坏包都走这条路）。
+      charts: normalizeBoardCharts(
+        raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
+          ? raw.charts
+          : {}
+      ),
+      hint: normalizeBoardHints(
+        raw.hint !== null && typeof raw.hint === 'object' && !Array.isArray(raw.hint)
+          ? raw.hint
+          : {}
+      ),
+      bar: barRaw === null
+        ? null
+        : {
+          crop: normalizeCropId(barRaw.crop),
+          slot: normalizeBoardInt(barRaw.slot, 0, Number.MAX_SAFE_INTEGER),
+          start: normalizeBoardInt(barRaw.start, 0, Number.MAX_SAFE_INTEGER),
+          end: normalizeBoardInt(barRaw.end, 0, Number.MAX_SAFE_INTEGER),
+          remainingMs: normalizeBoardInt(barRaw.remainingMs, 0, 24 * 60 * 60 * 1000),
+          open: normalizeBoardNumber(barRaw.open, 0, BOARD_MAX_PRICE),
+          price: normalizeBoardNumber(barRaw.price, 0, BOARD_MAX_PRICE)
+        },
+      positions,
+      // 总数是账本里的真实条数（评审 P1）：宿主没给就退回这次收到的条数；
+      // 窗口用「持仓 N · 显示最近 200」说明截断，而不是假装只有画出来的这些。
+      positionsTotal: normalizeBoardInt(raw.positionsTotal, 0, Number.MAX_SAFE_INTEGER) ??
+        rawPositions.length,
+      history,
+      // 票 83：到价挂单（宿主已经按形状校验过；这里再白名单一遍，防止窗口收到多余字段）。
+      // §9.4 的老坑：这一行要是继续硬编码 []，宿主发了、窗口永远收不到。
+      orders: normalizeBoardOrders(raw.orders),
+      ordersTotal: normalizeBoardInt(raw.ordersTotal, 0, Number.MAX_SAFE_INTEGER) ??
+        (Array.isArray(raw.orders) ? raw.orders.length : 0),
+      // 票 82：真人周榜 + LAN 情绪。老宿主没有这一块时是空榜（窗口画「还没有邻居上线」）。
+      league: normalizeBoardLeague(raw.league)
+    }
+  }
+
+  /** `board-window` 命令：和农场窗一样，刷新（open:false）与关窗（close:true）必须分开。 */
+  function normalizeBoardWindow (raw) {
+    return {
+      open: raw.open === true,
+      ...(raw.close === true ? { close: true } : {}),
+      state: normalizeBoardView(raw.state)
+    }
+  }
+
+  /** 盘口小窗提交（`dsh-zoo:board-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
+  function normalizeBoardAction (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+    if (!BOARD_SUBMIT_ACTIONS.includes(action)) return null
+    if (action === 'trading-refresh') return { action }
+    if (action === 'trading-close-position') {
+      const positionId = normalizeUuid(raw.positionId)
+      return positionId === null ? null : { action, positionId }
+    }
+    // 止损循环（票 81）：窗口只报「哪一手 + 下一档」；档位必须正好是四个之一。
+    if (action === 'trading-set-stop') {
+      const positionId = normalizeUuid(raw.positionId)
+      if (positionId === null) return null
+      const level = Number(raw.level)
+      if (!BOARD_STOP_LEVELS.includes(level)) return null
+      return { action, positionId, level }
+    }
+    // 撤单（票 83）：只认 UUID；坏 id 整条拒绝，不做半截猜测。
+    if (action === 'trading-cancel-order') {
+      const orderId = normalizeUuid(raw.orderId)
+      return orderId === null ? null : { action, orderId }
+    }
+    // 到价挂单（票 83）：形状合法即可，目标价是否落在价格带、保证金够不够，
+    // 由宿主按 `trading-rules` 再判一次（并回人话）。
+    if (action === 'trading-place-order') {
+      const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+      const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
+      const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
+      const cropId = normalizeCropId(raw.cropId)
+      const target = Number(raw.target)
+      if (side === null || margin === null || leverage === null || cropId === null) return null
+      if (!Number.isFinite(target) || target <= 0 || target > BOARD_MAX_PRICE) return null
+      return { action, side, margin, leverage, cropId, target }
+    }
+    // 开仓：形状合法即可；保证金/杠杆白名单由宿主按 trading-rules 再判一次（并回人话）。
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
+    const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
+    const cropId = normalizeCropId(raw.cropId)
+    if (side === null || margin === null || leverage === null || cropId === null) return null
+    return { action, side, margin, leverage, cropId }
+  }
+
   /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
   /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
@@ -1690,6 +2246,8 @@
     }
     // 重推当前视图 / 切回我的农场：不带其它字段，宿主按自己记得的模式重画。
     if (action === 'farm-refresh' || action === 'farm-own') return { action }
+    // 票 79：农场窗的「盘口」按钮只是开窗申请，不带字段。
+    if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
     if (action === 'farm-unlock') {
       if (raw.expectedUnlocked === undefined || raw.expectedUnlocked === null) return { action }
@@ -2852,11 +3410,23 @@
        */
       case 'farm-window':
         return { ok: true, command: { type, id, ...normalizeFarmWindow(raw) } }
+      /**
+       * 盘口小窗（票 79）：`open:true` 打开/聚焦，`open:false` 只刷新已经开着的那扇，
+       * `close:true` 才是关窗。内容和农场窗一样由宿主算好：窗口不读盘、不联网。
+       */
+      case 'board-window':
+        return { ok: true, command: { type, id, ...normalizeBoardWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
         // 冒烟可以点名抓小窗；主窗仍是默认目标。
-        const window = raw.window === 'bring' ? 'bring' : raw.window === 'farm' ? 'farm' : null
+        const window = raw.window === 'bring'
+          ? 'bring'
+          : raw.window === 'farm'
+            ? 'farm'
+            : raw.window === 'board'
+              ? 'board'
+              : null
         return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
@@ -2885,7 +3455,13 @@
       case 'debug-blur': {
         // 冒烟用：模拟输入法候选窗/别的窗口抢走小窗焦点。小窗都**不**该因此关掉
         // （现场：打中文时小窗消失；农场窗也一样）。
-        const window = raw.window === 'bring' ? 'bring' : raw.window === 'farm' ? 'farm' : 'rename'
+        const window = raw.window === 'bring'
+          ? 'bring'
+          : raw.window === 'farm'
+            ? 'farm'
+            : raw.window === 'board'
+              ? 'board'
+              : 'rename'
         return { ok: true, command: { type, id, window } }
       }
       case 'debug-farm-submit': {
@@ -3028,6 +3604,10 @@
       farmOpen: raw.farmOpen === true,
       farmVisible: raw.farmVisible === true,
       farmFocused: raw.farmFocused === true,
+      // 票 79：盘口小窗同样分「开着 / 看得见 / 拿到焦点」。
+      boardOpen: raw.boardOpen === true,
+      boardVisible: raw.boardVisible === true,
+      boardFocused: raw.boardFocused === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -3185,6 +3765,9 @@
             open: raw.open === true
           }
         }
+      case 'board-window-state':
+        // 票 79：盘口小窗同一套语义——×/Esc 关窗后，右键「盘口」必须能重新打开。
+        return { ok: true, event: { type, id, open: raw.open === true } }
       case 'action': {
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
         if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
@@ -3216,6 +3799,14 @@
         // 换皮只带素材源 id（ticket 32）：注册表在宿主那边，这里只守形状。
         const skinId = action === 'use-skin' ? normalizeSkinId(raw.skinId) : null
         if (action === 'use-skin' && skinId === null) return { ok: false, error: 'bad-skin-id' }
+        // 盘口小窗（票 79–83）：这几条动作走自己的白名单。落到下面农场那一段窄口，
+        // side/margin/target/orderId 会被整条削掉——窗口看起来只是「点了没反应」。
+        // 这里和 `normalizeBoardAction` 是**同一份**校验，不另抄一份字段表。
+        if (BOARD_SUBMIT_ACTIONS.includes(action)) {
+          const normalized = normalizeBoardAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-board-action' }
+          return { ok: true, event: { type, id, ...normalized } }
+        }
         // 雇佣（ticket 44）：四个动作的字段与窗口提交共用同一条白名单。
         if (FARM_HIRE_ACTIONS.includes(action)) {
           const normalized = normalizeFarmAction(raw)
@@ -3731,6 +4322,12 @@
     CONTROL_ACTIONS,
     GIFT_ACTIONS,
     FARM_ACTIONS,
+    BOARD_OPEN_ACTIONS,
+    BOARD_SUBMIT_ACTIONS,
+    BOARD_SIDES,
+    BOARD_STOP_LEVELS,
+    BOARD_MAX_LEVERAGE,
+    normalizeBoardOrders,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
     FARM_LAND_ACTIONS,
@@ -3754,6 +4351,7 @@
     MENU_ACTION_IDS,
     DESKTOP_ACTIONS,
     MENU_TOOL_IDS,
+    MENU_TOOL_REQUESTS,
     MAX_FARM_PLOTS,
     MIN_FARM_PLOTS,
     CROP_IDS,
@@ -3773,6 +4371,9 @@
     normalizeFarmPlot,
     normalizeFarmLogEntry,
     normalizeFarmWindow,
+    normalizeBoardWindow,
+    normalizeBoardView,
+    normalizeBoardAction,
     normalizeSeason,
     applyCropCatalog,
     normalizeFarmAction,

@@ -63,6 +63,21 @@ import {
   plotUnlockCost,
   stealSucceeds
 } from './farm-rules.js'
+import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
+import { buildLeague, watcherCounts } from './trading-league.js'
+import {
+  BOARD_CROPS,
+  PRICE_CEIL_RATIO,
+  PRICE_FLOOR_RATIO,
+  TRADING_LEVERAGES,
+  TRADING_MARGINS,
+  boardPrice,
+  barsFor,
+  hintOf,
+  markPrice,
+  slotBounds
+} from './trading-rules.js'
+import { tradingErrorText } from './trading-text.js'
 import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
 import { GUARD_HIRE_COST, GUARD_HIRE_STEP, MAX_TEMP_GUARDS } from './season-omens.js'
@@ -107,7 +122,12 @@ import {
   MARKET_DIGEST_INTERVAL_MS,
   MAX_GIFT_BYTES,
   MAX_RAID_PLOTS,
+  MAX_TRADING_POSITIONS,
+  MAX_WEEK_PNL,
+  MAX_WEEK_PNL_PCT,
   PLOT_ID_RE,
+  TRADING_DIGEST_FRESH_MS,
+  TRADING_DIGEST_INTERVAL_MS,
   normalizeCaps,
   createRateLimiter,
   encodeCropCatalog,
@@ -116,6 +136,7 @@ import {
   MAX_CATALOG_ENTRIES_PER_PACKET,
   encodeFarmActionResult,
   encodeMarketDigest,
+  encodeTradingDigest,
   normalizeSkinId,
   PEER_LOST_MS,
   VISIT_MAX_MS,
@@ -312,6 +333,16 @@ export function createService (ctx, options = {}) {
     const stamp = Number(value)
     return Number.isFinite(stamp) ? stamp : Date.now()
   }
+  // 盘口（票 79）也走同一个测试时钟：slot 完全由本机时钟决定，不传就与农场共用。
+  const tradingNow = typeof options.tradingNow === 'function' ? options.tradingNow : farmNow
+  const tradingClock = () => {
+    const value = tradingNow === undefined ? Date.now() : tradingNow()
+    const stamp = Number(value)
+    return Number.isFinite(stamp) ? stamp : Date.now()
+  }
+  // 盘口周报（票 82）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值
+  // （与行情 gossip 同款），测试注入更小的值把「等 30 秒」变成几十毫秒。
+  const tradingDigestMs = positiveOption(options.tradingDigestMs, TRADING_DIGEST_INTERVAL_MS, 10)
 
   let identity = null
   let discovery = null
@@ -329,6 +360,8 @@ export function createService (ctx, options = {}) {
   let market = null
   // 雇佣合同账本（ticket 44）：读不出来 = 本次运行不能雇/被雇，串门与农场照常。
   let contracts = null
+  // 盘口账本（票 79）：钱包是农场硬币，所以只在农场起来之后才建；读不出来 = 空盘口。
+  let trading = null
   let contractsReadyAt = 0
   /** 在飞雇佣：requestId → { deviceId, data, attempts, deadline, resolve, timer, done }。 */
   const workRequests = new Map()
@@ -352,6 +385,12 @@ export function createService (ctx, options = {}) {
    * 挂牌与昵称留在这里，44 不再逐个问邻居。过期判断用 `at`。
    */
   const peerDigests = new Map()
+  /**
+   * 放行邻居最近一条盘口周报（票 82）：
+   * deviceId → { weekPnl, weekPnlPct, positions, at, seenAt, nickname }。
+   * **只活在内存里**，不落盘：榜是社交信任，邻居退出后就该消失（SPEC「不做强防作弊」）。
+   */
+  const tradingDigests = new Map()
   let settings = null
   let bridge = null
   let desktop = null
@@ -683,6 +722,8 @@ export function createService (ctx, options = {}) {
   let farmWindowVisitId = null
   /** 农场窗是否被打开过：没开过就不必为合同/digest 变化推 `open:false`。 */
   let farmWindowOpened = false
+  /** 宿主记住的盘口窗开关（票 79）：helper 报的真实状态优先，和农场窗同款。 */
+  let tradingWindowOpened = false
   let farmWindowVisitView = null
   /**
    * 农场窗此刻在看的邻居（票 52 的只读模式）：`{ deviceId, view }`，`null` = 没在看别人家。
@@ -730,6 +771,20 @@ export function createService (ctx, options = {}) {
     max: 1,
     maxSources: 128,
     now: marketClock
+  })
+  /**
+   * 盘口周报的发送节拍（票 82）：只按 due 发，不学行情 digest 的「变了就发」。
+   * 周报里的分数带未实现盈亏、每分钟都在变；跟着变化发会让节拍随行情漂
+   * （有仓位时几乎每分钟一封），而 SPEC 要的是固定的「每 30 秒/peer，最多」。
+   * 榜晚一条不算问题，超频反而会被邻居的限速门直接丢掉。
+   */
+  let tradingDigestAt = Number.NEGATIVE_INFINITY
+  /** 接收端第二份限速器：同一条 trading-digest 的第四道门（SPEC「30 秒最多 1 条」）。 */
+  const tradingDigestLimiter = createRateLimiter({
+    windowMs: tradingDigestMs,
+    max: 1,
+    maxSources: 128,
+    now: tradingClock
   })
   let visitTimer = null
   let autoVisitTimer = null
@@ -1055,6 +1110,63 @@ export function createService (ctx, options = {}) {
     // 票 52 回归：窗口里「我的农场」那颗圆片——从只读视图切回自己农场的唯一出口。
     if (action === 'farm-own') return handleFarmOwn()
 
+    // 盘口（票 79）：右键菜单和农场窗的「盘口」是同一个开/关入口；HTTP/脚本可以用
+    // `trading-close` 明确关窗，用 `trading-refresh` 请宿主结这一根并重推一拍。
+    if (action === 'trading-open') return handleTradingOpen()
+    if (action === 'trading-close') return closeTradingWindow('trading-close')
+    if (action === 'trading-refresh') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      await trading.tick()
+      refreshTradingWindow()
+      return { ok: true, action: 'trading-refresh' }
+    }
+    // 开/平仓：窗口只发方向、保证金和仓位 id；成交价、硬币、盈亏全由宿主算。
+    if (action === 'trading-open-position') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.openPosition({
+        side: body?.side,
+        margin: body?.margin,
+        leverage: body?.leverage,
+        crop: body?.cropId
+      })
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+    if (action === 'trading-close-position') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.closePosition(body?.positionId)
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+    // 止损档位循环（票 81 的持仓卡按钮，票 80 的 store 校验并落地）：
+    // 窗口只报「哪一手 + 下一档」，白名单校验、落盘与「现在是哪一档」都由账本给。
+    if (action === 'trading-set-stop') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.setStopLoss(body?.positionId, body?.level)
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+    // 到价挂单（票 83）：窗口只报方向/作物/目标价/保证金/杠杆；白名单、锁币与成交
+    // 全在 `src/trading.js`——价格、硬币、盈亏一概不由窗口决定。
+    if (action === 'trading-place-order') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.placeOrder({
+        crop: body?.cropId,
+        side: body?.side,
+        target: body?.target,
+        margin: body?.margin,
+        leverage: body?.leverage
+      })
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+    if (action === 'trading-cancel-order') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.cancelOrder(body?.orderId)
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') return recallPet()
 
@@ -1291,7 +1403,9 @@ export function createService (ctx, options = {}) {
       // `crops.hash` 比：一致就说明目录同步完了。
       crops: { hash: cropCatalogHash, count: CROP_IDS.length },
       // 雇佣合同（ticket 44）：store 没起来也给完整空形状，绝不 undefined。
-      contracts: contractsView()
+      contracts: contractsView(),
+      // 盘口（票 79）：和盘口窗同一份形状（价格/硬币/持仓/历史/本周 + 按钮白名单）。
+      trading: tradingWindowView()
     }
   }
 
@@ -1970,6 +2084,282 @@ export function createService (ctx, options = {}) {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
     return { ok: true, action, window: 'closed' }
+  }
+
+  // -------------------------------------------------------------------------
+  // 盘口小窗（票 79）：菜单/农场窗按钮的唯一入口 + 整份视图组装
+  // -------------------------------------------------------------------------
+
+  /**
+   * 硬币口径（票 79）：no lock API——开仓就 `spendCoins` 扣掉，所以
+   *   - 可用 = farm 硬币余额（`/state.farm.coins` 也跟着变，SPEC 接受）；
+   *   - 含锁定 = 可用 + 未平仓保证金 + 未实现盈亏（**只在展示层加回**，farm.json 不动）。
+   * 盘口没有「锁定」字段，锁的钱也不存在 farm.json 里（坏 trading.json 就按坏账处理）。
+   */
+  function tradingCoinsView (view) {
+    const available = farm?.snapshot().coins ?? 0
+    const locked = Math.max(0, Math.round(view.locked))
+    const unrealized = Math.round(view.unrealized)
+    return { available, locked, total: Math.max(0, available + locked + unrealized) }
+  }
+
+  /**
+   * 当前这一根：价格与倒计时。公式只有 `src/trading-rules.js` 一份——
+   * 窗口、收盘结算、K 线（票 81）与强平（票 80）都调它。
+   * 这里是**第一个作物**的那一根（`payload.bar`，票 79 的窗口认它）；
+   * 三个作物各自的完整 OHLC 在 `payload.charts` 里。
+   */
+  function tradingBarView (now) {
+    const bounds = slotBounds(now)
+    if (bounds === null) return null
+    const crop = BOARD_CROPS[0]
+    return {
+      crop,
+      cropName: CROPS[crop]?.name ?? crop,
+      slot: bounds.slot,
+      start: bounds.start,
+      end: bounds.end,
+      remainingMs: Math.max(0, bounds.end - now),
+      // 本根的涨跌基准就是开盘价（= 上一根的收盘价）。
+      open: boardPrice({ crop, slot: bounds.slot, tick: 0 }),
+      price: markPrice({ crop, now })
+    }
+  }
+
+  /**
+   * 三个作物各一份「最近 24 根 + 当前一根」（票 81）。一次算齐：
+   * 窗口切页签是本地换图，不再找宿主；一分钟一包的推送成本也不到一千次纯散列。
+   * 单个作物算不出来（作物目录坏了）就跳过它，窗口画空态而不是整窗失败。
+   */
+  function tradingChartsView (now) {
+    const charts = {}
+    for (const crop of BOARD_CROPS) {
+      const chart = barsFor({ crop, now })
+      if (chart !== null) charts[crop] = chart
+    }
+    return charts
+  }
+
+  /** 风向（票 81）：慢趋势方向 + 55–68% 置信度。窗口只展示，必须写「不是保证」。 */
+  function tradingHintView (now) {
+    const hints = {}
+    for (const crop of BOARD_CROPS) {
+      const hint = hintOf({ crop, now })
+      if (hint !== null) hints[crop] = hint
+    }
+    return hints
+  }
+
+  /**
+   * 本周盈亏（票 81）：**已实现 + 未实现**。
+   * `pnl` 保留 store 的已实现口径（落盘、榜也用），`unrealized` 按现价现算，
+   * `total` 是窗口顶部显示的那个数；收益率 = `total / base`（base 0 时窗口画「—」）。
+   */
+  function tradingWeekView (view) {
+    const unrealized = Math.round(view.unrealized)
+    return {
+      start: view.week.start,
+      pnl: view.week.pnl,
+      base: view.week.base,
+      unrealized,
+      total: view.week.pnl + unrealized
+    }
+  }
+
+  /**
+   * 本机这一条盘口周报（票 82）：发出去的和榜上自己那一行必须是**同一份数**。
+   * `weekPnl` 是四舍五入后的金币（榜按它排序）；`weekPnlPct` 是比率（0.035 = +3.5%），
+   * `week.base` 为 0（新账本/坏文件）时返回 null，编码层就不带这个键。
+   * 只投影持仓的三个公开字段：硬币、保证金、入场价、历史一概不出本机。
+   *
+   * 分数在出口夹到协议边界（评审 P0）：线上字段是**展示上限**，不是本地账本的真相。
+   * 1,000,000 硬币 × 20× 的浮盈、或一个很小的 `week.base`，都能让真实值超出
+   * `MAX_WEEK_PNL` / `MAX_WEEK_PNL_PCT`；不夹的话编码层整包拒绝，这位玩家会从
+   * 每个邻居的榜上消失——比「分数封顶」糟得多。硬币、持仓、`trading.json` 一分不动。
+   */
+  function tradingSelfDigest (view, week, now) {
+    const positions = []
+    for (const position of view.positions) {
+      // 报文上限 8 条（不是仓位上限）：超出的不发，本机照常算钱。
+      if (positions.length >= MAX_TRADING_POSITIONS) break
+      positions.push({ crop: position.crop, side: position.side, leverage: position.leverage })
+    }
+    const weekPnl = Math.round(week.total)
+    const weekPnlPct = week.base > 0 ? week.total / week.base : null
+    return {
+      at: now,
+      weekPnl: Math.min(MAX_WEEK_PNL, Math.max(-MAX_WEEK_PNL, weekPnl)),
+      weekPnlPct: weekPnlPct === null
+        ? null
+        : Math.min(MAX_WEEK_PNL_PCT, Math.max(-MAX_WEEK_PNL_PCT, weekPnlPct)),
+      positions
+    }
+  }
+
+  /**
+   * 真人周榜 + LAN 情绪（票 82）：自己 + 内存里的邻居周报。
+   * 四道门已经在接收端判过（放行/新鲜度/限流/白名单），这里只做「还活着吗」
+   * 与排序（见 `src/trading-league.js`）。邻居不落盘、不发请求，榜过期就淡出。
+   */
+  function tradingLeagueView (now, self, week) {
+    const snapshot = room.snapshot()
+    const me = snapshot.self
+    const peers = []
+    for (const [deviceId, digest] of tradingDigests) {
+      peers.push({ deviceId, ...digest })
+    }
+    // 旧版本邻居（评审 P1）：放行且在线，但一条新鲜周报都没有。窗口据此把空态
+    // 从「还没有邻居上线」换成「邻居是旧版本，还没有周报」——两种空态不能混。
+    const watchers = watcherCounts({
+      neighbors: snapshot.neighbors,
+      digests: [...tradingDigests].map(([deviceId, digest]) => ({
+        deviceId,
+        seenAt: digest.seenAt
+      })),
+      now
+    })
+    return buildLeague({
+      self: {
+        deviceId: me.deviceId ?? identity?.deviceId ?? '',
+        nickname: me.nickname,
+        weekPnl: self.weekPnl,
+        // 收益率只由本机算：与窗口抬头同一个分子/分母（未取整的 total / base），
+        // 免得榜上那一列和顶部的收益率差一次取整。
+        weekPnlPct: self.weekPnlPct,
+        weekBase: week.base,
+        positions: self.positions
+      },
+      peers,
+      watchers,
+      now
+    })
+  }
+
+  /**
+   * 盘口窗的持仓/挂单按**最新在前**下发（评审 P1）：窗口最多画 200 条，账本里可以更多；
+   * 旧到新的顺序会让截断正好截掉玩家刚开、最想平掉的那一单。`openedAt`/`placedAt`
+   * 是两边的排序键；时间相同时后写入的排前面（数组下标兜底，排序稳定）。
+   */
+  function newestFirst (items, key) {
+    return items
+      .map((item, index) => ({ item, index }))
+      .sort((left, right) => (right.item[key] - left.item[key]) || (right.index - left.index))
+      .map((entry) => entry.item)
+  }
+
+  /**
+   * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
+   * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
+   * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
+   * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
+   */
+  function tradingWindowView () {
+    const now = tradingClock()
+    const view = trading === null
+      ? initialTradingView()
+      : trading.view({ now, historyLimit: TRADING_VIEW_HISTORY })
+    const week = tradingWeekView(view)
+    const self = tradingSelfDigest(view, week, now)
+    return {
+      coins: tradingCoinsView(view),
+      week,
+      bar: tradingBarView(now),
+      charts: tradingChartsView(now),
+      hint: tradingHintView(now),
+      positions: newestFirst(view.positions, 'openedAt'),
+      // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
+      // 不会把 240 手假装成 200 手（评审 P1）。
+      positionsTotal: view.positions.length,
+      history: view.history,
+      orders: newestFirst(view.orders, 'placedAt'),
+      ordersTotal: view.orders.length,
+      // 票 82：真人周榜 + LAN 情绪。没有邻居时只有自己一行（窗口画「还没有邻居上线」）。
+      league: tradingLeagueView(now, self, week),
+      limits: {
+        margins: TRADING_MARGINS.slice(),
+        leverages: TRADING_LEVERAGES.slice(),
+        crops: BOARD_CROPS.map((id) => ({ id, name: CROPS[id]?.name ?? id })),
+        historyLimit: TRADING_VIEW_HISTORY,
+        // 票 83：窗口在预设之外多画一颗「全下」（金额 = 当前可用硬币）。
+        // 旧宿主没有这个字段 → 窗口不画；保证金本身的校验由 store 按任意金额放行。
+        allIn: true,
+        // 到价目标价带（0.55–1.75× 底价）。把比例随包下发，窗口就不用再抄
+        // `PRICE_FLOOR_RATIO` / `PRICE_CEIL_RATIO` 一份（§9.3 的 drift 坑）。
+        targetRatio: { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO }
+      }
+    }
+  }
+
+  /**
+   * 菜单「盘口」/农场窗按钮（票 79）：开着就关，否则打开/聚焦。
+   *
+   * 「开着」以 helper 报上来的真实窗口状态为准（`desktop.status().boardOpen`）：
+   * 用户用 ×/Esc 关过窗后，再点「盘口」必须重新打开，而不是对着空气发一条关闭。
+   */
+  function handleTradingOpen () {
+    if (desktop === null || typeof desktop.boardWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
+    }
+    if (tradingWindowOpenNow()) return closeTradingWindow('trading-open')
+    const opened = desktop.boardWindow({ open: true, state: tradingWindowView() })
+    if (opened !== true) {
+      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
+    }
+    tradingWindowOpened = true
+    // 成功也带一句话：农场窗里点「盘口」时，toast 要能说清发生了什么。
+    return { ok: true, action: 'trading-open', window: 'opened', notice: '盘口已打开。' }
+  }
+
+  /** 盘口窗此刻是否真的开着（helper 优先；测试替身/老 helper 退回宿主记录）。 */
+  function tradingWindowOpenNow () {
+    if (desktop !== null && typeof desktop.status === 'function') {
+      const status = desktop.status()
+      if (status !== null && typeof status === 'object' && typeof status.boardOpen === 'boolean') {
+        return status.boardOpen
+      }
+    }
+    return tradingWindowOpened === true
+  }
+
+  /**
+   * 关窗的唯一出口：右键「盘口」再点一次和 `trading-close` 动作共用。
+   * `close:true` 与刷新用的 `open:false` 明确分开——刷新不能把窗口关掉。
+   */
+  function closeTradingWindow (action = 'trading-close') {
+    if (desktop === null || typeof desktop.boardWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
+    }
+    let sent = false
+    try {
+      sent = desktop.boardWindow({ open: false, close: true }) === true
+    } catch {
+      sent = false
+    }
+    tradingWindowOpened = false
+    if (sent !== true) {
+      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
+    }
+    return { ok: true, action, window: 'closed', notice: '盘口已经关了。' }
+  }
+
+  /** 刷新已经开着的盘口窗（`open:false` 不会新开窗）。 */
+  function pushTradingWindow () {
+    if (desktop === null || typeof desktop.boardWindow !== 'function') return false
+    try {
+      return desktop.boardWindow({ open: false, state: tradingWindowView() }) === true
+    } catch {
+      // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
+      return false
+    }
+  }
+
+  /**
+   * 开/平仓/收盘结算/换周之后刷新盘口窗。没开窗就不发——盘口是本机玩法，
+   * 关掉窗口不影响结算（tick 照跑）。
+   */
+  function refreshTradingWindow () {
+    if (tradingWindowOpenNow() !== true) return
+    pushTradingWindow()
   }
 
   /**
@@ -4090,6 +4480,21 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 盘口（票 79）：钱包就是农场硬币，必须在农场之后建。
+      // 坏文件只降级成空盘口（锁定的保证金按坏账处理），不挡启动。
+      if (farm !== null) {
+        try {
+          trading = await createTradingStore(
+            dir,
+            tradingNow === undefined ? { log, farm } : { log, now: tradingNow, farm }
+          )
+        } catch (error) {
+          trading = null
+          warn(ctx, '盘口初始化失败，本次按空盘口运行：' + message(error))
+        }
+      }
+      if (disposed) return
+
       // 季节/节日/来客（票 65/67）：只写 season.json；坏文件降级成「没有节日」，
       // 但季节本身仍由纯规则按本地日期算，农场照常运行。
       try {
@@ -4238,6 +4643,10 @@ export function createService (ctx, options = {}) {
               // 行情 gossip（ticket 42）。**不能落到 else**：那会当成 beacon 刷新邻居灯，
               // 看起来没坏，但价格永远进不了 index。
               handleMarketDigest(packet)
+            } else if (packet.type === 'trading-digest') {
+              // 盘口周报（票 82）。**不能落到 else**：那会当成 beacon 刷新邻居灯，
+              // 不报错，但榜上永远不会有这位邻居。
+              handleTradingDigest(packet)
             } else if (packet.type === 'farm-action') {
               // ticket 43：主人侧的落账要等磁盘/随机/日志，不能冒到 socket 循环。
               void handleFarmActionPacket(packet)
@@ -4715,6 +5124,9 @@ export function createService (ctx, options = {}) {
             farmWindowOpened = event.open === true
             // 票 52 回归：用户自己关掉的窗，不该在下次开窗时还记得"在看谁家"。
             if (farmWindowOpened !== true) farmWindowLook = null
+          } else if (event?.type === 'board-window-state') {
+            // 票 79：盘口窗真的开了/关了（含用户点 ×/Esc）。右键「盘口」靠它决定开还是关。
+            tradingWindowOpened = event.open === true
           } else if (event?.type === 'action') {
             // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
             // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。
@@ -4867,6 +5279,19 @@ export function createService (ctx, options = {}) {
         minHours: event.minHours ?? undefined,
         maxHours: event.maxHours ?? undefined,
         enabled: event.enabled ?? undefined,
+        // 盘口（票 79）：方向/保证金/杠杆/仓位 id。价格、硬币、盈亏一概不接。
+        side: event.side ?? undefined,
+        margin: event.margin ?? undefined,
+        leverage: event.leverage ?? undefined,
+        positionId: event.positionId ?? undefined,
+        // 票 81：止损档位（0 / 0.25 / 0.5 / 1）只改这一手的平仓线，钱的事全在 store。
+        // 少拷这行，票 80 的 store 收到的平台档位永远是 undefined（`trading-set-stop` 白过）。
+        level: event.level ?? undefined,
+        // 票 83：到价挂单的目标价与撤单的订单 id。少拷任一字段，小窗的到价按钮
+        // 到了宿主就只剩一句「缺少目标价」——四跳白名单（preload → main IPC →
+        // shared.normalizeBoardAction → 这里）少一跳都会静默丢。
+        target: event.target ?? undefined,
+        orderId: event.orderId ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
         gift: event.gift ?? undefined
       })
@@ -5304,6 +5729,10 @@ export function createService (ctx, options = {}) {
     // 农场（ticket 40）：39 的错误码各有下一步，文案在 src/farm-text.js（HTTP/桌面/小窗同源）。
     const farmNotice = farmErrorText(error)
     if (farmNotice !== null) return farmNotice
+    // 盘口（票 79）：只是盘口才有的错误码（方向/保证金/杠杆/仓位）走 trading-text。
+    // 共用的 `no-coin` 留在上面那句农场文案，两边意思一样。
+    const tradingNotice = tradingErrorText(error)
+    if (tradingNotice !== null) return tradingNotice
     // 背包（ticket 24）：小窗/HTTP 的失败一律说人话，五个错误码各有各的下一步。
     if (error === 'backpack-full' || error === 'too-large' || error === 'no-such-file' ||
       error === 'gift-out') {
@@ -5532,6 +5961,8 @@ export function createService (ctx, options = {}) {
   /** 邻居被拒绝/移除：摘掉行情并重算指数（store 没有这条记录时是 no-op）。 */
   function forgetPeerDigest (deviceId) {
     peerDigests.delete(deviceId)
+    // 票 82：邻居被拒绝/移除后，榜上的那一行也要当场消失（数据只在这里，store 里没有）。
+    if (tradingDigests.delete(deviceId)) refreshTradingWindow()
     if (market === null) return
     try {
       const result = market.removeDigest(deviceId)
@@ -5540,6 +5971,82 @@ export function createService (ctx, options = {}) {
       })
     } catch (error) {
       warnOnce('market-cleanup', '行情清理失败：' + message(error))
+    }
+  }
+
+  /**
+   * 向所有已放行邻居发一轮盘口周报（票 82）。
+   *
+   * 只按 `tradingDigestMs`（生产 30 秒）发；走 `discovery.sendTo`（内部再查 mayTalkTo），
+   * 失败不重试——下一拍自然带最新分数补上。一个放行邻居都没有时不算「发过」，
+   * 邻居一出现就能收到第一条。`force` 只给测试/诊断用（会撞上接收端的限速门）。
+   */
+  function sendTradingDigest ({ force = false } = {}) {
+    if (disposed || discovery === null || identity === null || trading === null) return 0
+    const now = tradingClock()
+    if (!force && now - tradingDigestAt < tradingDigestMs) return 0
+    const targets = room.heartbeatTargets()
+    // 一个放行邻居都没有：这不算「发过」，邻居一出现就能收到第一条。
+    if (targets.length === 0) return 0
+    const view = trading.view({ now })
+    const digest = tradingSelfDigest(view, tradingWeekView(view), now)
+    let data
+    try {
+      data = encodeTradingDigest({
+        deviceId: identity.deviceId,
+        at: digest.at,
+        weekPnl: digest.weekPnl,
+        weekPnlPct: digest.weekPnlPct,
+        positions: digest.positions
+      })
+    } catch (error) {
+      // 本机盘口数据坏了只停这一轮广播，不影响盘口本身；日志去重，别每 30 秒刷一条。
+      // 出口已经把分数夹进协议范围，走到这里说明是真坏了（不是「赢太多」）。
+      warnOnce('trading-digest-encode', '盘口周报没编出来，本轮跳过：' + message(error))
+      return 0
+    }
+    let sent = 0
+    for (const deviceId of targets) {
+      try {
+        if (discovery.sendTo(deviceId, data)) sent += 1
+      } catch {
+        // 一个坏地址不能挡住其他邻居的周报
+      }
+    }
+    tradingDigestAt = now
+    return sent
+  }
+
+  /**
+   * 收到一条盘口周报（票 82）。四道门（SPEC「真人榜与协议」）：
+   *   1. 只认已放行邻居——未放行的人连榜都不该上；
+   *   2. `at` 必须在本机时钟 `TRADING_DIGEST_FRESH_MS` 内（显式传盘口自己的常量，
+   *      不借行情 digest 的 `MARKET_DIGEST_FRESH_MS`——两个节拍将来分开调时不跟着漂）；
+   *   3. 同一 peer 一个窗口最多 1 条（`tradingDigestLimiter`）；
+   *   4. 协议层已把字段/数组长度/数值范围白名单过一遍，坏字段整包丢。
+   * 通过后只写 service 的内存 Map：**不碰硬币、不碰仓位、不写 trading.json**。
+   * 伪造 digest 最多骗到榜上的数字（SPEC「不做强防作弊」），改不了本机的账。
+   */
+  function handleTradingDigest (packet) {
+    if (disposed) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    const now = tradingClock()
+    if (!isFreshMarketSample(packet.at, now, TRADING_DIGEST_FRESH_MS)) return
+    if (!tradingDigestLimiter.allow(packet.deviceId, now)) return
+    try {
+      tradingDigests.set(packet.deviceId, {
+        weekPnl: packet.weekPnl,
+        weekPnlPct: packet.weekPnlPct ?? null,
+        positions: packet.positions.map((position) => ({ ...position })),
+        at: packet.at,
+        // 本机收到的时间：榜的新鲜度只认这个（邻居的表不准也不该影响它在不在榜上）。
+        seenAt: now,
+        nickname: neighborNickname(packet.deviceId)
+      })
+      // 榜变了要重推一拍：开着窗的玩家不用重开就能看到邻居的新分数/持仓。
+      refreshTradingWindow()
+    } catch (error) {
+      warnOnce('trading-digest', '盘口周报处理失败，已丢弃：' + message(error))
     }
   }
 
@@ -5568,6 +6075,8 @@ export function createService (ctx, options = {}) {
       flushRoomEffects()
       // 行情每 30 秒一轮；价格/挂牌变了则下一拍立刻发（不等节拍）。
       sendMarketDigest()
+      // 盘口周报（票 82）只按 30 秒节拍发，给真人周榜喂数。
+      sendTradingDigest()
     }, interval)
     tickTimer.unref?.()
   }
@@ -5629,7 +6138,10 @@ export function createService (ctx, options = {}) {
         ticks.push(['农场', farm?.tick()])
         if (market !== null) ticks.push(['交易所', market.tick()])
         ticks.push(['季节', settleSeasonTick(seasonNow())])
+        // 红包（主线 1.6.5）：过期未领取的红包在 tick 里退休。
         ticks.push(['红包', expirePackets(Date.now())])
+        // 盘口（票 79）搭同一班车：60 秒一拍正好是 1 个 tick；收盘/换周后把新盘面推给窗口。
+        if (trading !== null) ticks.push(['盘口', trading.tick().then(() => refreshTradingWindow())])
       } catch (error) {
         warnOnce('farm-tick', '农场 tick 失败：' + message(error))
         return
@@ -6618,8 +7130,12 @@ export function createService (ctx, options = {}) {
     sendHeartbeats,
     /** 手动补发一轮行情（测试用；正常由 1 秒巡检按 30 秒/变化触发）。 */
     sendMarketDigest,
+    /** 票 82 的测试/诊断缝：手动补发一轮盘口周报（正常由 1 秒巡检按 30 秒触发）。 */
+    sendTradingDigest,
     /** ticket 44 的测试/诊断缝：雇工页数据与唯一守卫计算点。 */
     contractWindow: () => contractWindowView(),
+    /** 票 79 的测试/诊断缝：盘口窗当前会收到的整份视图。 */
+    tradingWindow: () => tradingWindowView(),
     farmGuard: () => farmGuard(),
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),
@@ -6680,12 +7196,18 @@ export function createService (ctx, options = {}) {
       contractAttempts.clear()
       contracts = null
       farm = null
+      // tick 会随 farmTimer 一起停，但 store 引用也要放开：卸载后不该再写盘。
+      trading = null
       season = null
       market = null
       digestLimiter.clear()
       peerDigests.clear()
       marketDigestAt = Number.NEGATIVE_INFINITY
       marketDigestSignature = null
+      // 票 82：周报的两份内存（限速桶 + 邻居榜）。榜不落盘，卸载即清空。
+      tradingDigestLimiter.clear()
+      tradingDigests.clear()
+      tradingDigestAt = Number.NEGATIVE_INFINITY
       stopDesktopSync()
       unsubscribeSessionEvents()
       try { skinServer?.close() } catch { /* 关不掉也不能挡住卸载 */ }
@@ -6714,6 +7236,7 @@ export function createService (ctx, options = {}) {
       farmWindowOpened = false
       farmWindowLook = null
       lookRefreshBlockedUntil = 0
+      tradingWindowOpened = false
       // 回执不再发了；还没回执的礼物先写回 idle，再放开背包引用。
       receipts.clear()
       releaseOutboundGiftsOnDispose()

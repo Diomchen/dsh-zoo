@@ -27,6 +27,9 @@ import {
 } from './contracts-rules.js'
 import { CROPS, CROP_IDS, MAX_GUARD, isCropId, MINUTE_MS } from './farm-rules.js'
 import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
+// 票 82：盘口周报只认盘口的作物/方向/杠杆白名单——白名单的真相在 `src/trading-rules.js`
+// （盘口窗口的按钮也由它下发），协议层不另抄一份。
+import { isBoardCrop, isBoardSide, isTradingLeverage } from './trading-rules.js'
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -68,6 +71,27 @@ export const GUEST_TTL_MS = 30000
  */
 export const MARKET_DIGEST_INTERVAL_MS = 30 * 1000
 export const MARKET_DIGEST_FRESH_MS = 2 * MINUTE_MS
+/**
+ * 盘口周报（票 82）：每 30 秒一条 `trading-digest`；接收端只认 2 分钟内的样本。
+ * 和行情 gossip 同口径：发送节拍同时也是「1 个 peer 30 秒最多 1 条」的限速窗口。
+ */
+export const TRADING_DIGEST_INTERVAL_MS = 30 * 1000
+export const TRADING_DIGEST_FRESH_MS = 2 * MINUTE_MS
+/**
+ * 一条周报最多带 8 条持仓（SPEC v10「真人榜与协议」）。这不是产品上的仓位上限
+ * （ADR-0028 明确没有），只是报文的体积与展示上限：超出的部分不发，本机照常持仓。
+ */
+export const MAX_TRADING_POSITIONS = 8
+/**
+ * 本周盈亏（金币）的线上范围：与农场硬币上限同量级（`MAX_COINS` = 1,000,000，
+ * 在 `src/farm.js`）。这里不 import 农场（协议层要能纯粹地单独加载），只跟着这个量级走。
+ */
+export const MAX_WEEK_PNL = 1_000_000
+/**
+ * 收益率是**比率**（0.035 = +3.5%，与 SPEC v10「收益率 = weekPnl / weekBase」同口径），
+ * 不是百分数：邻居自报这个数，窗口画的时候乘 100。杠杆下单可能远超 100%，留到 ±1000 倍。
+ */
+export const MAX_WEEK_PNL_PCT = 1000
 /**
  * 雇工挂牌的真实可用性（ticket 44）：`ready` / `off` / `visiting` / `working`。
  * 枚举与 `src/contracts-rules.js` 同源；`null` 只为兼容旧版本保留。
@@ -276,6 +300,8 @@ export const PACKET_TYPES = Object.freeze([
   'packet-return',
   'packet-returned',
   'market-digest',
+  // 票 82：盘口周报（本周盈亏 + 当前持仓）。老版本按「未知类型」整包丢掉，不崩。
+  'trading-digest',
   // 票 59：运行时作物目录。老版本会按「未知类型」直接丢掉这两条，不崩。
   'crop-catalog-request',
   'crop-catalog',
@@ -636,6 +662,45 @@ export function normalizeDigestAt (value) {
   return Number.isSafeInteger(value) && value > 0 ? value : null
 }
 
+/**
+ * 盘口周报的分数：本周交易盈亏（金币），有限数且落在 ±MAX_WEEK_PNL。
+ * 坏值整包丢（不是归零）：`NaN`/字符串一旦进榜，排序和窗口都会画出一行坏数字。
+ */
+export function normalizeWeeklyPnl (value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  if (value < -MAX_WEEK_PNL || value > MAX_WEEK_PNL) return null
+  return value
+}
+
+/** 可选收益率（比率，见 MAX_WEEK_PNL_PCT 的注释）：有限数且落在 ±1000 倍。 */
+export function normalizeWeeklyPnlPct (value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  if (value < -MAX_WEEK_PNL_PCT || value > MAX_WEEK_PNL_PCT) return null
+  return value
+}
+
+/**
+ * 周报里的持仓：最多 8 条，每条只留 `{ crop, side, leverage }`。
+ *
+ * 与行情 digest「坏条目丢自己」**不同**：这里任何一条坏就整包丢。
+ * 为什么：持仓列表是「谁在逆势」的全部依据，半截列表比没有更容易被误读
+ * （少了做空那几条，看起来就像满仓做多）；而合法条目只有三个小字段，
+ * 对不上就说明对方坏了，整包丢最省事。
+ */
+export function normalizeTradingPositions (value) {
+  if (!Array.isArray(value)) return null
+  if (value.length > MAX_TRADING_POSITIONS) return null
+  const positions = []
+  for (const entry of value) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
+    if (!isBoardCrop(entry.crop)) return null
+    if (!isBoardSide(entry.side)) return null
+    if (!isTradingLeverage(entry.leverage)) return null
+    positions.push({ crop: entry.crop, side: entry.side, leverage: entry.leverage })
+  }
+  return positions
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.DSH_ZOO_PORT
@@ -653,6 +718,7 @@ export function resolvePort (env = process.env) {
  *   visit-deny              → { v, type, deviceId, visitId, reason }
  *   gift-received           → { v, type, deviceId, visitId, giftId }
  *   market-digest           → { v, type, deviceId, at, prices, hire }
+ *   trading-digest          → { v, type, deviceId, at, weekPnl[, weekPnlPct], positions }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
@@ -700,6 +766,10 @@ function buildPacket ({
   at,
   prices,
   hire,
+  // 票 82：盘口周报的三个字段（持仓只有 crop/side/leverage）
+  weekPnl,
+  weekPnlPct,
+  positions,
   requestId,
   plotId,
   ok,
@@ -796,6 +866,25 @@ function buildPacket ({
     const safeHire = normalizeDigestHire(hire)
     if (safeHire === null) throw new Error('protocol: invalid digest hire')
     packet = { ...base, at: stamp, prices: safePrices, hire: safeHire }
+  } else if (type === 'trading-digest') {
+    // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，weekPnl/positions 会在这里消失。
+    const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
+    if (stamp === null) throw new Error('protocol: invalid digest time')
+    const safePnl = normalizeWeeklyPnl(weekPnl)
+    if (safePnl === null) throw new Error('protocol: invalid week pnl')
+    // 收益率是**可选**的：本机没有 base 时就整条不带这个键（而不是发一个 0）。
+    const hasPct = weekPnlPct !== undefined && weekPnlPct !== null
+    const safePct = hasPct ? normalizeWeeklyPnlPct(weekPnlPct) : null
+    if (hasPct && safePct === null) throw new Error('protocol: invalid week pnl pct')
+    const safePositions = normalizeTradingPositions(positions)
+    if (safePositions === null) throw new Error('protocol: invalid trading positions')
+    packet = {
+      ...base,
+      at: stamp,
+      weekPnl: safePnl,
+      ...(safePct === null ? {} : { weekPnlPct: safePct }),
+      positions: safePositions
+    }
   } else if (type === 'farm-action') {
     // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，requestId/action/plotId 会消失。
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
@@ -1119,6 +1208,17 @@ export function encodeMarketDigest ({ deviceId, at, prices, hire, now } = {}) {
 }
 
 /**
+ * 盘口周报（票 82）：只报「本周交易盈亏 + 当前持仓（作物/方向/杠杆）」。
+ *
+ * 这里**没有**硬币余额、保证金、入场价、历史——不是漏了，是协议就不给这个入口：
+ * 邻居只需要知道分数和方向（SPEC v10「不包含硬币余额、保证金、入场价、历史」）。
+ * `positions` 最多 `MAX_TRADING_POSITIONS` 条；`weekPnlPct` 是可选比率，缺省就不带这个键。
+ */
+export function encodeTradingDigest ({ deviceId, at, weekPnl, weekPnlPct, positions, now } = {}) {
+  return encodePacket({ type: 'trading-digest', deviceId, at, weekPnl, weekPnlPct, positions, now })
+}
+
+/**
  * 农场动作（ticket 43）：访客 → 主人。
  * 只带这次动作的全部输入；没有昵称、端口、坐标、路径或自由文本。
  */
@@ -1376,6 +1476,34 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         at,
         prices,
         hire
+      }
+    }
+  }
+
+  // 盘口周报（票 82）：**不**落进 VISIT_TYPES（那里只重建四个字段）。
+  // 任何一项坏都整包丢（含持仓里的一条）：榜上不留半截行；昵称/端口等一律不读。
+  if (raw.type === 'trading-digest') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    const weekPnl = normalizeWeeklyPnl(raw.weekPnl)
+    if (weekPnl === null) return fail('week-pnl')
+    let weekPnlPct = null
+    if (raw.weekPnlPct !== undefined && raw.weekPnlPct !== null) {
+      weekPnlPct = normalizeWeeklyPnlPct(raw.weekPnlPct)
+      if (weekPnlPct === null) return fail('week-pnl-pct')
+    }
+    const positions = normalizeTradingPositions(raw.positions)
+    if (positions === null) return fail('positions')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        weekPnl,
+        ...(weekPnlPct === null ? {} : { weekPnlPct }),
+        positions
       }
     }
   }
