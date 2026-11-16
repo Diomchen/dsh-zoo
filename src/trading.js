@@ -1,19 +1,19 @@
 /**
- * 盘口账本（票 79）：`<dataDir>/trading.json` v1。
+ * 盘口账本（票 79/80）：`<dataDir>/trading.json` v1。
  *
  * 形状（SPEC v10「硬币与账本」）：
  *   {
  *     "version": 1,
  *     "week": { "start": 1763308800000, "pnl": 0, "base": 30 },
  *     "positions": [
- *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 1,
- *         "entry": 5.12, "openedAt": 1763308800000, "slot": 1959232,
+ *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
+ *         "entry": 5.12, "openedAt": 1763308800000, "slot": 1959232, "stopLoss": 0.5,
  *         "settling": { "at": 1763309700000, "exit": 5.3, "pnl": 8, "credit": 58, "reason": "close" } }
  *     ],
  *     "orders": [],
  *     "history": [
- *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 1,
- *         "entry": 5.12, "exit": 5.3, "pnl": 8, "reason": "settle", "at": 1763309700000 }
+ *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
+ *         "entry": 5.12, "exit": 5.3, "pnl": 8, "reason": "liquidate", "at": 1763309700000 }
  *     ]
  *   }
  *
@@ -26,6 +26,11 @@
  *   - **结算幂等**：先写 `settling` 意图再动钱，再记历史/删仓位；启动时看到 `settling`
  *     只补后半段，绝不重复铸币（与 `src/contracts.js` 的 beginSettle/finishSettle 同源，
  *     宁可少退一次也不重复发钱）。
+ *
+ * 票 80 只做**加法**（`version` 还是 1）：每个仓位多存一个 `stopLoss` 档位；
+ * 强平价不落盘——它由 `side + entry + leverage` 现算（`liquidationPriceOf`），
+ * 存一份就会和改过的 entry/杠杆对不上。逐分钟的强平/止损检查全在 `pathScan()`：
+ * tick、插针、快进时钟、离线补算走同一条路，账本这里只负责「先写意图再动钱」。
  *
  * 容错与 `src/farm.js` / `src/market.js` 同一套路：
  *   - 文件不存在：空盘口（本周从此刻起算），不告警；
@@ -45,18 +50,25 @@ import { parseJsonText } from './json-text.js'
 import {
   BOARD_CROPS,
   SLOT_MS,
+  TRADING_CLOSE_REASONS,
   isBoardCrop,
   isBoardSide,
+  isStopLossLevel,
   isStoredLeverage,
   isTradingLeverage,
   isTradingMargin,
+  liquidationPriceOf,
   markPrice,
+  pathScan,
   pnlOf,
   settlementOf,
   slotClosePrice,
   slotIndexAt,
   weekStartOf
 } from './trading-rules.js'
+
+/** 结算原因的枚举住在纯规则里（`normalize` 与文案表共用一份）；这里原样转出给老调用方。 */
+export { TRADING_CLOSE_REASONS }
 
 export const TRADING_FILE = 'trading.json'
 export const TRADING_VERSION = 1
@@ -65,8 +77,6 @@ export const MAX_TRADING_HISTORY = 200
 export const TRADING_VIEW_HISTORY = 50
 /** 写盘节流：tick 有变化也最多每 30 秒落一次；开/平/结算这些动钱的动作总是立即落盘。 */
 export const SAVE_THROTTLE_MS = 30 * 1000
-/** 结算原因固定枚举；票 80 加 `liquidate`（强平）与 `stop`（止损）。 */
-export const TRADING_CLOSE_REASONS = Object.freeze(['close', 'settle'])
 const MAX_PRICE = 1_000_000_000
 const MAX_ID_LENGTH = 64
 
@@ -184,6 +194,16 @@ function normalizeSettling (value) {
   return { settling: { at, exit, pnl, credit, reason }, repaired: 0 }
 }
 
+/**
+ * 止损档位（票 80）：0 = 关；0.25/0.5/1 = 亏掉多少比例的保证金就平。
+ * 没写 = 关（老档案天然升级，不算修补）；写了但不在这四档 = 关 + 记**一处**修补。
+ * 它是认识的字段，绝不能当成「未知键」再多算一处（否则每次启动都白告警一次）。
+ */
+function normalizeStopLoss (value) {
+  if (value === undefined) return { level: 0, repaired: 0 }
+  return isStopLossLevel(value) ? { level: value, repaired: 0 } : { level: 0, repaired: 1 }
+}
+
 function normalizePosition (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
   const id = normalizeId(value.id)
@@ -198,6 +218,7 @@ function normalizePosition (value) {
   const openedAt = timestamp(value.openedAt)
   if (openedAt === null) return null
   const settling = normalizeSettling(value.settling)
+  const stopLoss = normalizeStopLoss(value.stopLoss)
   return {
     position: {
       id,
@@ -209,9 +230,10 @@ function normalizePosition (value) {
       openedAt,
       // slot 是**派生字段**：按 openedAt 重算，文件里写错了也不信。
       slot: slotIndexAt(openedAt),
+      stopLoss: stopLoss.level,
       ...(settling.settling === null ? {} : { settling: settling.settling })
     },
-    repaired: settling.repaired
+    repaired: settling.repaired + stopLoss.repaired
   }
 }
 
@@ -357,6 +379,13 @@ class TradingStore {
   #now
   #state = initialTradingState(0, 0)
   #warned = new Set()
+  /**
+   * 每手仓位「已经检查到哪一刻」（position.id → 毫秒）。**只在内存里**：
+   *   - 重启后没有它 → 从 `openedAt` 重扫，离线期间撞过的强平/止损照样补出来；
+   *   - 落了盘反而危险：存档里的一切都可能被人改，路径检查的起点不该由它决定。
+   * 起点只影响「从哪一分钟开始算」，终点永远跟收盘对齐，所以结果依旧只由仓位与时间决定。
+   */
+  #checked = new Map()
   /** 串行化：同一毫秒里的两笔开/平不能互相写掉对方的仓位。 */
   #chain = Promise.resolve()
   #lastWriteAt = Number.NEGATIVE_INFINITY
@@ -414,9 +443,9 @@ class TradingStore {
       this.#finishSettle(position, position.settling)
       resumed = true
     }
-    // 离线跨过收盘：启动就把这些仓位按它们各自那一根的收盘价结掉，
+    // 离线跨过收盘/撞过强平线：启动就把这些仓位结掉（先路径、后收盘），
     // 用户打开盘口时看到的不是「昨天还开着」的旧仓位。
-    const closed = await this.#settleClosed(now)
+    const closed = await this.#settleDue(now)
     // 坏文件不覆盖（等下一次动作/tick 再写）；补出来的补结算、跨周与修补要立刻落盘。
     if (!normalized.corrupt && (resumed || rolled || closed || normalized.repaired > 0)) {
       await this.#persist(true)
@@ -465,8 +494,17 @@ class TradingStore {
   }
 
   /**
-   * 每分钟一拍：跨周就重设本周，收过盘且还没结算的仓位按收盘价结算。
-   * 返回本次是否改动了盘面（宿主据此决定要不要重推窗口）。
+   * 一键止损（票 80）：0 = 关，0.25/0.5/1 = 亏掉这么多比例的保证金就平。
+   * 只改这一档，不动钱也不动仓位；窗口负责循环档位，白名单校验在这里——
+   * 别把 0.3 这种值写进账本（重启后它就成了一条永远不触发的档）。
+   */
+  setStopLoss (positionId, level) {
+    return this.#enqueue(() => this.#setStopLoss(positionId, level))
+  }
+
+  /**
+   * 每分钟一拍：跨周就重设本周；还没结算的仓位先逐分钟走一遍路径（强平/止损），
+   * 收过盘的再按收盘价结。返回本次是否改动了盘面（宿主据此决定要不要重推窗口）。
    */
   tick () {
     return this.#enqueue(() => this.#tick())
@@ -504,7 +542,9 @@ class TradingStore {
       leverage,
       entry,
       openedAt: now,
-      slot: slotIndexAt(now)
+      slot: slotIndexAt(now),
+      // 止损默认关（SPEC：玩家工具，不是系统强加的风控）；开仓时不接受档位，只走 setStopLoss。
+      stopLoss: 0
     }
     this.#state.positions.push(position)
     const persisted = await this.#persist(true)
@@ -530,26 +570,66 @@ class TradingStore {
     return this.#settle(position, { exit, reason: safeReason, at: now })
   }
 
+  async #setStopLoss (positionId, level) {
+    if (typeof positionId !== 'string' || positionId === '') return tradingError('no-position')
+    if (!isStopLossLevel(level)) return tradingError('bad-stop')
+    const position = this.#state.positions.find((candidate) => candidate.id === positionId)
+    if (position === undefined) return tradingError('no-position')
+    // 结算中的仓位只剩「记历史」这一步，改档位没有意义（钱已经走出去了）。
+    if (position.settling !== undefined) return tradingError('settling')
+    const now = this.#nowMs()
+    position.stopLoss = level
+    // 新档位从「设下的这一刻」开始生效：不翻旧账去按更早的 mark 平
+    // （那会让「刚设的止损」按一个几分钟前的价成交，说不通）。
+    this.#checked.set(position.id, now)
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'trading-set-stop',
+      position: this.#positionView(position, now),
+      coins: this.#coinBase(),
+      // 宿主回给窗口的 toast：说清「现在是哪一档」，而不是只回一个 ok。
+      notice: level === 0 ? '止损已关闭。' : '止损已设为 −' + Math.round(level * 100) + '% 保证金。',
+      persisted
+    }
+  }
+
   async #tick () {
     const now = this.#nowMs()
     const rolled = this.#rollWeek(now)
-    const settled = await this.#settleClosed(now)
+    const settled = await this.#settleDue(now)
     if (!rolled && !settled) return false
     await this.#persist(settled)
     return true
   }
 
   /**
-   * 把已经收盘的仓位按「它们各自那一根的收盘价」结掉——在线的 tick 与启动补算
-   * 走同一个函数，所以离线补出来的价和图上最后一根永远一致。
+   * 每个还没结算的仓位走一遍「路径 → 收盘」：
+   *   1. 从**上一次检查到的时刻**（重启后从 `openedAt`）到「此刻与这一根收盘的较早者」
+   *      逐分钟找强平/止损（`pathScan`）；
+   *   2. 找到就按那一刻的价平（原因 `liquidate` / `stop`），插针和快进时钟都不放过；
+   *   3. 没找到且这一根已经收盘，才按这一根的收盘价结（原因 `settle`）。
+   * 在线的 tick 与启动补算走同一个函数，所以离线补出来的价和图上最后一根永远一致。
    */
-  async #settleClosed (now) {
+  async #settleDue (now) {
     const currentSlot = slotIndexAt(now)
     let settled = false
     for (const position of [...this.#state.positions]) {
-      // 已经收盘才结；结算中的仓位等重启补后半段，不重复动钱。
-      if (position.slot >= currentSlot) continue
+      // 结算中的仓位等重启补后半段，不重复动钱。
       if (position.settling !== undefined) continue
+      const horizon = Math.min(now, (position.slot + 1) * SLOT_MS)
+      const trigger = this.#triggerOf(position, horizon)
+      if (trigger !== null) {
+        this.#checked.delete(position.id)
+        const result = await this.#settle(position, trigger)
+        if (result.ok === true) settled = true
+        continue
+      }
+      // 这一根还没收盘：仓位照常开着，记住这次检查到哪，等下一拍或收盘。
+      if (position.slot >= currentSlot) {
+        this.#rememberCheck(position, horizon)
+        continue
+      }
       const exit = slotClosePrice(position.crop, position.slot)
       if (exit === null) continue
       const result = await this.#settle(position, {
@@ -560,6 +640,36 @@ class TradingStore {
       if (result.ok === true) settled = true
     }
     return settled
+  }
+
+  /**
+   * 这个仓位在 `[上次检查到的时刻, horizon]` 这段路上撞过强平线或止损档没有。
+   *
+   * 为什么不能只看端点：快进时钟、关掉 DSH 几小时再回来、中间某一分钟插针又弹回去，
+   * 端点可能完全安全，而仓位早就该平了。强平是系统规则，止损是玩家工具，都不许被跳过。
+   *
+   * 终点是「此刻与这一根收盘的较早者」：收盘之后由 `settle` 接管，扫过去只会把收盘价
+   * 换成中间某一分钟，反而和图上最后一根对不上。仓位只活一根，所以这段路最长一根，
+   * `pathScan` 的 3 天上限在账本里永远碰不到（它防的是别处传入的离谱区间）。
+   */
+  #triggerOf (position, horizon) {
+    const from = Math.max(position.openedAt, this.#checked.get(position.id) ?? position.openedAt)
+    return pathScan({
+      crop: position.crop,
+      side: position.side,
+      margin: position.margin,
+      leverage: position.leverage,
+      entry: position.entry,
+      stopLoss: position.stopLoss,
+      from,
+      to: horizon
+    })
+  }
+
+  /** 记住「这手仓位已经检查到这个时刻」；时钟往后退时不倒着走。 */
+  #rememberCheck (position, horizon) {
+    const previous = this.#checked.get(position.id) ?? position.openedAt
+    if (horizon > previous) this.#checked.set(position.id, horizon)
   }
 
   /**
@@ -609,6 +719,7 @@ class TradingStore {
   #finishSettle (position, settling) {
     const index = this.#state.positions.indexOf(position)
     if (index >= 0) this.#state.positions.splice(index, 1)
+    this.#checked.delete(position.id)
     const history = {
       id: randomUUID(),
       crop: position.crop,
@@ -665,6 +776,15 @@ class TradingStore {
       entry: position.entry,
       openedAt: position.openedAt,
       slot: position.slot,
+      // 强平价是派生字段（票 80）：1× 没有强平 → null，窗口画「—」。
+      // 不落盘：改了 entry/杠杆以后，存下来的那条线会立刻变成假话。
+      liquidation: liquidationPriceOf({
+        side: position.side,
+        entry: position.entry,
+        leverage: position.leverage
+      }),
+      // 0 = 关（默认）；窗口的循环按钮就按这个值显示「关 / −25% / −50% / −100%」。
+      stopLoss: position.stopLoss ?? 0,
       mark,
       pnl,
       ...(settling === undefined ? {} : { settling: true })
