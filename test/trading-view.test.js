@@ -1590,3 +1590,132 @@ test('评审 P2：窗口兜底错误文案与 trading-text.js 同码同文（dri
   assert.match(table['no-order'], /刷新一下就好/)
   assert.match(table['no-position'], /刷新一下就好/)
 })
+
+// ---------------------------------------------------------------------------
+// 票 90：盘口图按需拉取——视图侧的合并、缓存与加载态
+// ---------------------------------------------------------------------------
+
+/** 新宿主的按需包：只有一种作物的四个周期 + 这一种的风向（老包的 charts 不再复制）。 */
+function lazyPayload (crop = 'tomato') {
+  return payload({
+    charts: {},
+    timeframes: {
+      '15m': { [crop]: chart() },
+      '1h': { [crop]: chart({ base: 6 }) },
+      '1d': { [crop]: chart({ base: 6 }) },
+      '1w': { [crop]: chart({ base: 6 }) }
+    },
+    hint: { [crop]: { direction: 'up', confidence: 0.62 } }
+  })
+}
+
+/** `trading-charts` 的回执：请求哪一位就只给哪一位的四个周期 + 风向。 */
+function chartsReply (crop) {
+  return {
+    crop,
+    timeframes: {
+      '15m': { [crop]: chart({ base: 6 }) },
+      '1h': { [crop]: chart({ base: 6 }) },
+      '1d': { [crop]: chart({ base: 6 }) },
+      '1w': { [crop]: chart({ base: 6 }) }
+    },
+    hint: { [crop]: { direction: 'down', confidence: 0.58 } }
+  }
+}
+
+test('票 90：withCropCharts 只把请求的作物并进 payload，别的字段与作物一律不动', () => {
+  const lazy = lazyPayload('tomato')
+  const merged = view.withCropCharts(lazy, chartsReply('carrot'))
+
+  // 入参不被改：窗口只是拼一份新的给视图画。
+  assert.deepEqual(Object.keys(lazy.timeframes['15m']), ['tomato'])
+  assert.equal('carrot' in lazy.hint, false)
+
+  assert.notEqual(merged, lazy)
+  assert.deepEqual(Object.keys(merged.timeframes['15m']), ['tomato', 'carrot'])
+  assert.equal(merged.timeframes['15m'].carrot.base, 6)
+  // 别的周期也跟着并进来（四个周期一起画，切周期不用再问宿主）。
+  for (const id of ['15m', '1h', '1d', '1w']) assert.ok(merged.timeframes[id].carrot, id)
+  assert.deepEqual(merged.hint.carrot, { direction: 'down', confidence: 0.58 })
+  assert.deepEqual(merged.hint.tomato, lazy.hint.tomato)
+  // 钱/持仓/榜这些跟图无关的字段原样保留。
+  assert.equal(merged.coins.available, lazy.coins.available)
+  assert.equal(merged.positions, lazy.positions)
+  assert.equal(merged.league, lazy.league)
+
+  // 合并后的包能直接画出请求的作物：价格/风向都是它自己的。
+  const board = view.boardView(merged, { now: SLOT_EDGE + 5 * 60 * 1000, crop: 'carrot' })
+  assert.equal(board.chart.hasChart, true)
+  assert.equal(board.chart.priceText, '5.06')
+  assert.equal(board.header.cropName, '胡萝卜')
+  assert.equal(board.hint.confidenceText, '58%')
+
+  // 坏回执不炸、也不把 payload 改坏（宿主超时/老版本没有这个动作）。
+  for (const bad of [null, undefined, 42, 'x', {}, { crop: 42 }, { crop: '' }]) {
+    assert.doesNotThrow(() => view.withCropCharts(lazy, bad))
+  }
+  assert.deepEqual(Object.keys(view.withCropCharts(lazy, {}).timeframes['15m']), ['tomato'])
+  assert.equal(view.withCropCharts(null, chartsReply('carrot')), null)
+})
+
+test('票 90：缺图时是「正在加载」而不是「行情还在算」；不拿别的作物的 bar 冒充价格', () => {
+  const lazy = lazyPayload('tomato')
+  const now = SLOT_EDGE + 5 * 60 * 1000
+  const loading = view.boardView(lazy, { now, crop: 'carrot', chartsLoading: true })
+  const idle = view.boardView(lazy, { now, crop: 'carrot' })
+
+  assert.equal(loading.chart.hasChart, false)
+  assert.equal(loading.chart.loading, true)
+  assert.match(loading.chart.emptyText, /正在加载/)
+  // 没有在等宿主时还是原来那句空态。
+  assert.equal(idle.chart.loading, false)
+  assert.equal(idle.chart.emptyText, '行情还在算')
+
+  // 顶部：作物名跟着选择走，但价格不能拿推包里另一种作物的 bar 顶上。
+  assert.equal(loading.header.cropName, '胡萝卜')
+  assert.equal(loading.header.priceText, '—')
+  // 倒计时是同一根（bar 是全局的），不会因为缺图 reset。
+  assert.equal(loading.header.countdownText, idle.header.countdownText)
+  assert.equal(loading.header.countdownText, '10:00')
+
+  // 画出来的图加载完就恢复（同一条选择，只是把回执并进去）。
+  const board = view.boardView(view.withCropCharts(lazy, chartsReply('carrot')), { now, crop: 'carrot' })
+  assert.equal(board.chart.hasChart, true)
+  assert.equal(board.chart.loading, false)
+})
+
+test('票 90：图缓存最多 4 种作物，命中就不再请求；推包里已有图先收进缓存', () => {
+  assert.equal(view.CHART_CACHE_LIMIT, 4)
+  const cache = view.createChartCache()
+  assert.equal(cache.size(), 0)
+  for (const crop of ['tomato', 'carrot', 'pumpkin', 'pea']) cache.set(crop, chartsReply(crop))
+  assert.equal(cache.size(), 4)
+  // 命中会刷新「最近用过」：tomato 最旧时碰一下它，再加第五种就该淘汰 carrot。
+  assert.equal(cache.get('tomato').timeframes['15m'].tomato.base, 6)
+  cache.set('corn', chartsReply('corn'))
+  assert.equal(cache.size(), 4)
+  assert.equal(cache.has('carrot'), false, '淘汰最久没看过的一种')
+  assert.equal(cache.has('tomato'), true)
+  assert.equal(cache.has('corn'), true)
+  assert.equal(cache.get('nope'), null)
+
+  // 推包里有图：第一次从推包取（并顺手进缓存），第二次命中缓存 —— 窗口据此不发第二次请求。
+  const lazy = lazyPayload('tomato')
+  const fresh = view.createChartCache()
+  const first = view.chartsFor(lazy, fresh, 'tomato')
+  assert.equal(first.from, 'payload')
+  assert.equal(first.timeframes['15m'].tomato.base, 5)
+  const again = view.chartsFor(lazy, fresh, 'tomato')
+  assert.equal(again.from, 'cache')
+  // 推包里没有、缓存里也没有 → from null（窗口显示加载中并提交 trading-charts）。
+  const missing = view.chartsFor(lazy, fresh, 'carrot')
+  assert.equal(missing.from, null)
+  assert.equal(missing.timeframes, null)
+
+  // 新宿主的按需包只带一种；老宿主全量包不猜（报 null 也不影响视图回退 charts）。
+  assert.equal(view.chartsCropOf(lazy), 'tomato')
+  assert.equal(view.chartsCropOf(payload()), null)
+  assert.equal(view.chartsCropOf(null), null)
+  assert.equal(view.hasCropCharts(lazy, 'tomato'), true)
+  assert.equal(view.hasCropCharts(lazy, 'carrot'), false)
+})

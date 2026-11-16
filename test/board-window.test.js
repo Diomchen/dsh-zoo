@@ -23,6 +23,7 @@ import { createService } from '../src/service.js'
 import { TRADING_FILE } from '../src/trading.js'
 import { MAX_WEEK_PNL, MAX_WEEK_PNL_PCT } from '../src/protocol.js'
 import { buildLeague } from '../src/trading-league.js'
+import { tradingErrorText } from '../src/trading-text.js'
 import {
   BOARD_TIMEFRAMES,
   SLOT_MS,
@@ -44,6 +45,36 @@ const boardView = require('../desktop/trading-view.js')
 
 const SLOT_EDGE = 1763308800000
 
+/**
+ * 票 90：合成一份更大的作物目录（内置 10 种 + `extra` 种）。
+ * 只为了让「盘口包会不会被作物数撑爆」可测——真实目录是运行时数据，
+ * 现场已经长到 15 种，测试里直接造 15 / 40 种更快也更稳。
+ */
+function addSyntheticCrops (extra) {
+  const entries = []
+  for (let index = 0; index < extra; index += 1) {
+    entries.push({
+      id: 'synth' + String(index).padStart(2, '0'),
+      name: '合成作物' + index,
+      growMs: (2 + (index % 9)) * 60 * 60 * 1000,
+      seedPrice: 10 + index,
+      yield: 2 + (index % 4),
+      base: 5 + (index % 7)
+    })
+  }
+  applyCropCatalog(entries)
+}
+
+/** 票 90：宿主编一条 `board-window` 命令的真实字节数（helper 白名单之后）。 */
+function boardLineOf (state) {
+  const line = shared.encodeMessage({
+    type: 'board-window',
+    open: true,
+    state: shared.normalizeBoardView(state)
+  })
+  return line === null ? null : { line, bytes: Buffer.byteLength(line, 'utf8') }
+}
+
 function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -59,7 +90,10 @@ async function waitFor (predicate, timeoutMs = 3000) {
 
 function fakeCtx () {
   const routes = []
+  // 票 90：发送失败要留一条带尺寸的诊断，用例把它抓下来断言。
+  const warnings = []
   return {
+    warnings,
     ctx: {
       webServer: {
         register (options) {
@@ -67,7 +101,7 @@ function fakeCtx () {
           return () => {}
         }
       },
-      logger: { info () {}, warn () {} }
+      logger: { info () {}, warn (line) { warnings.push(line) } }
     },
     routes
   }
@@ -85,7 +119,7 @@ async function seedFarm (dir, coins = 500) {
 }
 
 function makeService (t, options = {}) {
-  const { ctx, routes } = fakeCtx()
+  const { ctx, routes, warnings } = fakeCtx()
   const service = createService(ctx, {
     network: false,
     petBridge: false,
@@ -93,6 +127,7 @@ function makeService (t, options = {}) {
     ...options
   })
   service.routes = routes
+  service.warnings = warnings
   t.after(() => service.dispose())
   t.after(() => resetCropCatalog())
   return service
@@ -130,15 +165,15 @@ function callAction (service, body) {
 }
 
 /** 只记录场景/窗口命令/action-result 的桌面替身；不 spawn Electron。 */
-function desktopDouble () {
+function desktopDouble (options = {}) {
   const calls = { scenes: [], windows: [], board: [], results: [] }
   let onEvent = null
   let farmOpen = false
   let boardOpen = false
   return {
     calls,
-    factory (options) {
-      onEvent = options.onEvent
+    factory (factoryOptions) {
+      onEvent = factoryOptions.onEvent
       return {
         start () { return { ok: true, pid: 4242 } },
         update (scene) { calls.scenes.push(scene); return true },
@@ -152,9 +187,14 @@ function desktopDouble () {
         },
         boardWindow (payload) {
           calls.board.push(payload)
+          // 票 90：桌面层健康、但这条命令发不出去（编码超限/管道坏了）的替身。
+          if (options.boardSendFails === true) return false
           if (payload.close === true) boardOpen = false
           else if (payload.open === true) boardOpen = true
           return true
+        },
+        lastCommandFailure () {
+          return options.boardSendFails === true ? (options.boardFailure ?? null) : null
         },
         actionResult (id, result) {
           calls.results.push({ id, result })
@@ -863,6 +903,218 @@ test('票 84：payload 带四周期 × 目录全部作物 K 线（含 start/end�
     assert.deepEqual(board.chart.timeframes.map((entry) => entry.active),
       ids.map((candidate) => candidate === id))
   }
+})
+
+test('票 90：首包只带当前作物的图与风向，limits 仍列全部作物；trading-charts 按需拉并持续选中', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 4 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  const crops = boardCrops()
+  assert.equal(crops.length, 10)
+  const state = desktop.calls.board[0].state
+  // 首包只带目录第一个作物（票 90 的「按需」起点），四个周期都只有它。
+  assert.deepEqual(Object.keys(state.timeframes), ['15m', '1h', '1d', '1w'])
+  for (const id of ['15m', '1h', '1d', '1w']) {
+    assert.deepEqual(Object.keys(state.timeframes[id]), [crops[0]], id + ' 只带当前作物')
+    assert.equal(state.timeframes[id][crops[0]].bars.length, 24)
+  }
+  assert.deepEqual(Object.keys(state.hint), [crops[0]])
+  assert.equal(state.bar.crop, crops[0])
+  // limits 仍然是完整目录：作物条/下单白名单不跟着按需缩水。
+  assert.deepEqual(state.limits.crops.map((entry) => entry.id), crops)
+
+  // 这一包真的能过 helper 白名单并编成一行（票 90 的现场就是这一步返回 null）。
+  const firstLine = boardLineOf(state)
+  assert.notEqual(firstLine, null)
+  assert.ok(firstLine.bytes < 128 * 1024, '首包 ' + firstLine.bytes + ' B 应远低于 128 KiB')
+
+  // 窗口切到番茄：走新动作 `trading-charts`，只回番茄这一种的四个周期。
+  const charts = await callAction(service, { action: 'trading-charts', cropId: 'tomato' })
+  assert.equal(charts.status, 200)
+  assert.equal(charts.body.ok, true)
+  assert.equal(charts.body.action, 'trading-charts')
+  assert.equal(charts.body.crop, 'tomato')
+  assert.deepEqual(Object.keys(charts.body), ['ok', 'action', 'crop', 'timeframes', 'hint'])
+  assert.deepEqual(Object.keys(charts.body.timeframes), ['15m', '1h', '1d', '1w'])
+  for (const id of ['15m', '1h', '1d', '1w']) {
+    assert.deepEqual(Object.keys(charts.body.timeframes[id]), ['tomato'], id + ' 只回请求的作物')
+    assert.equal(charts.body.timeframes[id].tomato.bars.length, 24)
+  }
+  assert.deepEqual(Object.keys(charts.body.hint), ['tomato'])
+  assert.ok(charts.body.hint.tomato.confidence >= 0.55 && charts.body.hint.tomato.confidence <= 0.68)
+
+  // 选中态是宿主记着的：之后的 /state 与推送都只带番茄，且 bar 也换成番茄。
+  const after = (await call(service, '/dsh-zoo/state')).body.trading
+  assert.deepEqual(Object.keys(after.timeframes['15m']), ['tomato'])
+  assert.equal(after.bar.crop, 'tomato')
+  assert.equal(after.timeframes['15m'].tomato.current.price, markPrice({ crop: 'tomato', now: clock.value }))
+  clock.value += TICK_MS
+  assert.equal((await callAction(service, { action: 'trading-refresh' })).body.ok, true)
+  const pushed = desktop.calls.board.at(-1)
+  assert.equal(pushed.open, false)
+  assert.deepEqual(Object.keys(pushed.state.timeframes['15m']), ['tomato'], '推送不许把选择打回默认')
+  assert.equal(pushed.state.bar.crop, 'tomato')
+
+  // 窗口那一条真实回路（helper action → action-result）也把图带回去：
+  // 少了这一跳，窗口切作物只能看见「加载中」。
+  desktop.emit({ type: 'action', id: 'board-charts-1', action: 'trading-charts', cropId: 'carrot' })
+  await waitFor(() => desktop.calls.results.length === 1)
+  const reply = desktop.calls.results[0].result
+  assert.equal(reply.ok, true)
+  assert.equal(reply.action, 'trading-charts')
+  assert.equal(reply.crop, 'carrot')
+  assert.deepEqual(Object.keys(reply.timeframes), ['15m', '1h', '1d', '1w'])
+  assert.deepEqual(Object.keys(reply.timeframes['1h']), ['carrot'])
+  assert.deepEqual(Object.keys(reply.hint), ['carrot'])
+  // helper 的 action-result 白名单同样要放行这一组字段（§9.4 的老坑：宿主发了、helper 削了）。
+  const hop = shared.normalizeHostCommand({
+    type: 'action-result',
+    id: 'board-charts-1',
+    ok: true,
+    action: 'trading-charts',
+    crop: 'carrot',
+    timeframes: reply.timeframes,
+    hint: reply.hint
+  })
+  assert.equal(hop.ok, true)
+  assert.equal(hop.command.action, 'trading-charts')
+  assert.equal(hop.command.crop, 'carrot')
+  assert.equal(hop.command.timeframes['15m'].carrot.bars.length, 24)
+  assert.equal(hop.command.hint.carrot.direction, reply.hint.carrot.direction)
+
+  // 窗口提交的白名单也认这个动作；坏作物在 helper 就挡掉（形状层）。
+  assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-charts', cropId: 'carrot' }),
+    { action: 'trading-charts', cropId: 'carrot' })
+  assert.equal(shared.normalizeBoardAction({ action: 'trading-charts' }), null)
+  assert.equal(shared.normalizeBoardAction({ action: 'trading-charts', cropId: 'Not A Crop!' }), null)
+
+  // 宿主侧：未知/坏作物给她稳定错误码 + 人话，且不改当前选择。
+  for (const bad of ['nope', '', null, 42]) {
+    const refused = await callAction(service, { action: 'trading-charts', cropId: bad })
+    assert.equal(refused.status, 409, JSON.stringify(bad))
+    assert.equal(refused.body.ok, false)
+    assert.equal(refused.body.error, 'bad-crop')
+    assert.equal(refused.body.notice, tradingErrorText('bad-crop'))
+  }
+  assert.deepEqual(Object.keys(service.tradingWindow().timeframes['15m']), ['carrot'])
+})
+
+test('票 90：15 / 40 种作物目录下盘口包仍能编成一行（远低于 128 KiB 与 256 KiB 上限）', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 3 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  // 真实目录（本仓库 10 种）：基线。
+  assert.equal(boardCrops().length, 10)
+  const real = boardLineOf(service.tradingWindow())
+  assert.notEqual(real, null)
+  assert.ok(real.bytes < 128 * 1024, '真实目录 ' + real.bytes + ' B')
+
+  // 现场目录（15 种）：这一步在票 90 之前会返回 null（归一化后 308 KiB）。
+  addSyntheticCrops(5)
+  assert.equal(boardCrops().length, 15)
+  const fifteen = boardLineOf(service.tradingWindow())
+  assert.notEqual(fifteen, null, '15 种作物的盘口包必须编得出来')
+  assert.ok(fifteen.bytes < 128 * 1024, '15 种作物 ' + fifteen.bytes + ' B 应远低于 128 KiB')
+  // 「能编出来」还要「能打开窗」：走真实开窗入口，拿到的包一样能编。
+  const opened = await callAction(service, { action: 'trading-open' })
+  assert.equal(opened.body.ok, true, JSON.stringify(opened.body))
+  assert.equal(opened.body.window, 'opened')
+  const openedLine = boardLineOf(desktop.calls.board[0].state)
+  assert.notEqual(openedLine, null)
+  assert.ok(openedLine.bytes < 128 * 1024, '开窗命令 ' + openedLine.bytes + ' B')
+
+  // 40 种合成作物：把「作物目录继续长」这件事钉死（只有当前选择的作物会进包）。
+  addSyntheticCrops(25)
+  assert.equal(boardCrops().length, 40)
+  const forty = boardLineOf(service.tradingWindow())
+  assert.notEqual(forty, null, '40 种作物的盘口包必须编得出来')
+  assert.ok(forty.bytes < 128 * 1024, '40 种作物 ' + forty.bytes + ' B 应远低于 128 KiB')
+  const payload = service.tradingWindow()
+  assert.equal(Object.keys(payload.timeframes['15m']).length, 1, '按需：一包只带一种作物的图')
+  assert.equal(Object.keys(payload.hint).length, 1)
+  assert.equal(payload.bar.crop, Object.keys(payload.timeframes['15m'])[0])
+  assert.equal(payload.limits.crops.length, 40, 'limits 仍是完整目录（helper 另外按 32 截断）')
+})
+
+test('票 90：桌面层健康但指令发不出去 → board-send-failed（不是 desktop-off），并 warnOnce 一条带尺寸的诊断', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 3 * TICK_MS }
+  const desktop = desktopDouble({
+    boardSendFails: true,
+    boardFailure: {
+      type: 'board-window',
+      reason: 'size',
+      bytes: 308 * 1024,
+      limit: shared.MAX_LINE_LENGTH
+    }
+  })
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const opened = await callAction(service, { action: 'trading-open' })
+  assert.equal(opened.status, 409)
+  assert.equal(opened.body.ok, false)
+  assert.equal(opened.body.error, 'board-send-failed')
+  assert.equal(opened.body.notice, '盘口窗指令发不出去（盘口数据可能太大），这次没打开。')
+  assert.notEqual(opened.body.error, 'desktop-off', '桌面层明明是好的，不许再误报没在运行')
+  // 诊断只留一条，而且要带得上尺寸/上限（现场就是 308 KiB > 256 KiB）。
+  assert.equal(service.warnings.length, 1, service.warnings.join(' / '))
+  assert.match(service.warnings[0], /308 KiB/)
+  assert.match(service.warnings[0], /256 KiB/)
+  assert.match(service.warnings[0], /board-window/)
+
+  // 关窗指令同样发不出去：同一个错误码，诊断不再刷第二条。
+  const closed = await callAction(service, { action: 'trading-close' })
+  assert.equal(closed.body.error, 'board-send-failed')
+  assert.equal(closed.body.notice, tradingErrorText('board-send-failed'))
+  assert.equal(service.warnings.length, 1, 'warnOnce：同一类发送失败只记一次')
+})
+
+test('票 90：真的没有桌面层时仍然报 desktop-off（别把两种失败混成一种）', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktop: false
+  })
+  await service.ready
+  const opened = await callAction(service, { action: 'trading-open' })
+  assert.equal(opened.status, 409)
+  assert.equal(opened.body.error, 'desktop-off')
+  assert.equal(opened.body.notice, tradingErrorText('desktop-off'))
+  assert.equal(service.warnings.length, 0, '没有桌面层不是 size 问题，不刷发送失败诊断')
 })
 
 test('票 84：timeframes 白名单——未知周期/坏数字/超量都不抛，start/end 原样放行', () => {
