@@ -729,13 +729,12 @@ function renderLookPlots () {
 }
 
 /**
- * 票 55：农场窗里的邻居切换器。第一颗永远是「我的农场」——切回来发 `farm-refresh`，
- * 宿主会按 `self.out` 重算模式（没出门就是 owner）。其余每颗对应一位邻居，点了发 `farm-look`。
- */
-/**
  * 票 55/56：农场窗里的邻居切换器。
  * 邻居 ≤3 铺一排圆片（一眼全见）；更多就收进「当前视图」胶囊后面的列表——
  * 形状由 `view.neighborSwitch()` 决定，这里只画。
+ *
+ * 第一颗永远是「我的农场」——切回来发 `farm-own`（宿主丢掉"正在看谁家"的记录，
+ * 再按 `self.out` 重算模式：没出门就是 owner）；其余每颗对应一位邻居，点了发 `farm-look`。
  */
 function renderNeighborChips () {
   if (plotsEl === null) return
@@ -773,7 +772,9 @@ function renderNeighborChips () {
     me.setAttribute('aria-pressed', mode === 'look' ? 'false' : 'true')
     me.disabled = busy
     me.addEventListener('click', () => {
-      if (mode === 'look') submit({ action: 'farm-refresh' })
+      // 票 52 回归：「我的农场」发 `farm-own`（显式切回），不是 `farm-refresh`
+      // ——后者是"到点确认"，必须留在当前视图。
+      if (mode === 'look') submit({ action: 'farm-own' })
     })
     row.appendChild(me)
     for (const item of model.items) row.appendChild(neighborChipButton(item))
@@ -798,7 +799,7 @@ function buildNeighborMenu (model) {
   own.textContent = '我的农场'
   own.addEventListener('click', () => {
     nnOpen = false
-    if (mode === 'look') submit({ action: 'farm-refresh' })
+    if (mode === 'look') submit({ action: 'farm-own' })
     else renderPlots()
   })
   list.appendChild(own)
@@ -2057,9 +2058,14 @@ function requestFarmRefresh () {
  * 到 0 也不本地标 mature——请宿主确认，避免本地时钟早几毫秒时收获被回 not-mature。
  */
 function tickPlots () {
-  const plots = mode === 'visitor' && visit !== null && Array.isArray(visit.plots)
-    ? visit.plots
-    : (farm !== null && Array.isArray(farm.plots) ? farm.plots : null)
+  // 票 52 回归：看田时画的是邻居家的地块（`look.plots`），倒计时也必须走那一份。
+  // 以前这里只认 visitor / farm，于是看田窗口的倒计时被**自家**地块推着走：
+  // 自家作物一熟就发一次 farm-refresh，把窗口踢回自己农场。
+  const plots = mode === 'look' && look !== null && Array.isArray(look.plots)
+    ? look.plots
+    : mode === 'visitor' && visit !== null && Array.isArray(visit.plots)
+      ? visit.plots
+      : (farm !== null && Array.isArray(farm.plots) ? farm.plots : null)
   if (plots === null) return
   const now = Date.now()
   for (const plot of plots) {
@@ -2522,6 +2528,8 @@ api?.onState((payload) => {
   // ticket 47.1：每次宿主 state 都是新的倒计时基线；重置“到点确认”的在飞标记。
   primeCountdowns(farm?.plots)
   primeCountdowns(visit?.plots)
+  // 票 52 回归：看田的倒计时属于**邻居家**的地块，它们也得有自己的基线。
+  primeCountdowns(look?.plots)
   // ticket 61：合同倒计时也走同一条纪律（地块修过一次，雇佣这边漏了）。
   primeContractCountdowns(contracts?.outgoing)
   primeContractCountdowns(contracts?.incoming)
