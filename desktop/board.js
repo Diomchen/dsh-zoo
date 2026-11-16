@@ -1,7 +1,7 @@
 /**
- * 盘口小窗的渲染端（票 79 / 票 81）。
+ * 盘口小窗的渲染端（票 79 / 票 81 / 票 82）。
  *
- * 它只做三件事：把宿主推来的盘口视图画成卡片（K 线、下单、持仓、历史、周盈亏）；
+ * 它只做三件事：把宿主推来的盘口视图画成卡片（K 线、下单、持仓、历史、周盈亏、真人周榜）；
  * 每秒本地递减收盘倒计时（到 0 请宿主结这一根并重推一拍）；
  * 把「开仓 / 止损 / 平仓」当**申请**交给主进程。
  * 价格、硬币、盈亏、能不能下单全部由宿主算，成功与否也等宿主回执——
@@ -46,6 +46,9 @@ const positionsEmptyEl = document.getElementById('positions-empty')
 const historyEl = document.getElementById('history')
 const historyMetaEl = document.getElementById('history-meta')
 const historyEmptyEl = document.getElementById('history-empty')
+const leagueEl = document.getElementById('league')
+const leagueCountEl = document.getElementById('league-count')
+const sentimentEl = document.getElementById('sentiment')
 const neighborEmptyEl = document.getElementById('neighbor-empty')
 const closeButton = document.getElementById('close')
 const toastsEl = document.getElementById('toasts')
@@ -332,6 +335,51 @@ function renderHistory (board) {
 }
 
 /**
+ * 真人周榜（票 82）：本机那一行高亮，右边是本周盈亏与收益率（没有就「—」），
+ * 下面一行是持仓摘要（`多 2 · 空 1` / `观望`）。只有自己时在榜下补空态文案。
+ * 排序、新鲜度、计数都由宿主算好，这里只画。
+ */
+function renderLeague (board) {
+  const league = board.league
+  leagueEl.textContent = ''
+  for (const row of league.rows) {
+    const line = document.createElement('div')
+    line.className = 'row league-row' + (row.me ? ' me' : '')
+
+    const main = document.createElement('div')
+    main.className = 'row-main'
+    const title = document.createElement('div')
+    title.className = 'row-title'
+    title.textContent = row.me ? row.nickname + '（我）' : row.nickname
+    const meta = document.createElement('div')
+    meta.className = 'row-meta'
+    meta.textContent = row.positionsText
+    main.append(title, meta)
+
+    const score = document.createElement('div')
+    score.className = 'league-score'
+    const pnl = document.createElement('b')
+    pnl.className = 'pnl'
+    pnl.dataset.tone = row.pnlTone
+    pnl.textContent = row.pnlText
+    const pct = document.createElement('span')
+    pct.className = 'league-pct'
+    pct.dataset.tone = row.pctTone
+    pct.textContent = row.pctText
+    score.append(pnl, pct)
+
+    line.append(main, score)
+    leagueEl.append(line)
+  }
+  leagueCountEl.textContent = league.countText
+  sentimentEl.textContent = league.sentiment.text
+  sentimentEl.dataset.tone = league.sentiment.tone
+  // 只有自己：榜照画（自己那行），下面补一句「还没有邻居上线…行情照走」。
+  neighborEmptyEl.hidden = league.hasPeers
+  neighborEmptyEl.textContent = league.empty
+}
+
+/**
  * 重画会把按钮整个换掉，焦点跟着 DOM 一起没了：键盘用户切一档就掉回文档开头。
  * 所以在重画前记下焦点是谁，画完按同一个「身份」放回去（找不到就算了）。
  */
@@ -380,8 +428,7 @@ function render () {
   renderOrder(board)
   renderPositions(board)
   renderHistory(board)
-  // 票 82 才有人榜数据：这里先画空态，免得那一行看起来像坏了。
-  neighborEmptyEl.textContent = board.hints.neighbors
+  renderLeague(board)
   // 选择可能被新一包换掉（白名单变了）：记住真实生效的值。
   side = board.order.side
   margin = board.order.margin
