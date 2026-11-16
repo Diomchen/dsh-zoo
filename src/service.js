@@ -69,6 +69,8 @@ import {
   TRADING_LEVERAGES,
   TRADING_MARGINS,
   boardPrice,
+  barsFor,
+  hintOf,
   markPrice,
   slotBounds
 } from './trading-rules.js'
@@ -1099,8 +1101,8 @@ export function createService (ctx, options = {}) {
       if (result?.ok === true) refreshTradingWindow()
       return result
     }
-    // 一键止损（票 80）：窗口只管循环档位（关 / −25% / −50% / −100% 保证金），
-    // 白名单校验、落盘与「现在是哪一档」的 notice 都由账本给。
+    // 止损档位循环（票 81 的持仓卡按钮，票 80 的 store 校验并落地）：
+    // 窗口只报「哪一手 + 下一档」，白名单校验、落盘与「现在是哪一档」都由账本给。
     if (action === 'trading-set-stop') {
       if (trading === null) return { ok: false, error: 'starting' }
       const result = await trading.setStopLoss(body?.positionId, body?.level)
@@ -2046,7 +2048,9 @@ export function createService (ctx, options = {}) {
 
   /**
    * 当前这一根：价格与倒计时。公式只有 `src/trading-rules.js` 一份——
-   * 窗口、收盘结算、将来的 K 线（票 81）与强平（票 80）都调它。
+   * 窗口、收盘结算、K 线（票 81）与强平（票 80）都调它。
+   * 这里是**第一个作物**的那一根（`payload.bar`，票 79 的窗口认它）；
+   * 三个作物各自的完整 OHLC 在 `payload.charts` 里。
    */
   function tradingBarView (now) {
     const bounds = slotBounds(now)
@@ -2066,6 +2070,46 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 三个作物各一份「最近 24 根 + 当前一根」（票 81）。一次算齐：
+   * 窗口切页签是本地换图，不再找宿主；一分钟一包的推送成本也不到一千次纯散列。
+   * 单个作物算不出来（作物目录坏了）就跳过它，窗口画空态而不是整窗失败。
+   */
+  function tradingChartsView (now) {
+    const charts = {}
+    for (const crop of BOARD_CROPS) {
+      const chart = barsFor({ crop, now })
+      if (chart !== null) charts[crop] = chart
+    }
+    return charts
+  }
+
+  /** 风向（票 81）：慢趋势方向 + 55–68% 置信度。窗口只展示，必须写「不是保证」。 */
+  function tradingHintView (now) {
+    const hints = {}
+    for (const crop of BOARD_CROPS) {
+      const hint = hintOf({ crop, now })
+      if (hint !== null) hints[crop] = hint
+    }
+    return hints
+  }
+
+  /**
+   * 本周盈亏（票 81）：**已实现 + 未实现**。
+   * `pnl` 保留 store 的已实现口径（落盘、榜也用），`unrealized` 按现价现算，
+   * `total` 是窗口顶部显示的那个数；收益率 = `total / base`（base 0 时窗口画「—」）。
+   */
+  function tradingWeekView (view) {
+    const unrealized = Math.round(view.unrealized)
+    return {
+      start: view.week.start,
+      pnl: view.week.pnl,
+      base: view.week.base,
+      unrealized,
+      total: view.week.pnl + unrealized
+    }
+  }
+
+  /**
    * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
    * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
    * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
@@ -2078,8 +2122,10 @@ export function createService (ctx, options = {}) {
       : trading.view({ now, historyLimit: TRADING_VIEW_HISTORY })
     return {
       coins: tradingCoinsView(view),
-      week: view.week,
+      week: tradingWeekView(view),
       bar: tradingBarView(now),
+      charts: tradingChartsView(now),
+      hint: tradingHintView(now),
       positions: view.positions,
       history: view.history,
       orders: view.orders,
@@ -4877,6 +4923,9 @@ export function createService (ctx, options = {}) {
         margin: event.margin ?? undefined,
         leverage: event.leverage ?? undefined,
         positionId: event.positionId ?? undefined,
+        // 票 81：止损档位（0 / 0.25 / 0.5 / 1）只改这一手的平仓线，钱的事全在 store。
+        // 少拷这行，票 80 的 store 收到的平台档位永远是 undefined（`trading-set-stop` 白过）。
+        level: event.level ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
         gift: event.gift ?? undefined
       })

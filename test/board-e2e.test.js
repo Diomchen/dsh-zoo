@@ -15,16 +15,24 @@ import { FARM_FILE } from '../src/farm.js'
 import { resetCropCatalog } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
 import {
+  BOARD_CROPS,
   SLOT_MS,
   TICK_MS,
+  TRADING_LEVERAGES,
   boardPrice,
   liquidationPriceOf,
+  markPrice,
   settlementOf,
   slotClosePrice,
   slotIndexAt,
   weekStartOf
 } from '../src/trading-rules.js'
+import { createRequire } from 'node:module'
 import { TRADING_FILE } from '../src/trading.js'
+
+const require = createRequire(import.meta.url)
+// 窗口的纯视图：e2e 要确认 /state 下发的包真的画得出来（0 硬币写「去种地」）。
+const boardView = require('../desktop/trading-view.js')
 
 const SLOT_EDGE = 1763308800000
 const OPEN_AT = SLOT_EDGE + 5 * TICK_MS
@@ -130,7 +138,8 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
   assert.equal(before.body.trading.bar.remainingMs, SLOT_MS - 5 * TICK_MS)
   assert.ok(before.body.trading.bar.price > 0)
   assert.deepEqual(before.body.trading.limits.margins, [50, 100])
-  assert.deepEqual(before.body.trading.limits.leverages, [1, 5, 20])
+  // 杠杆白名单与纯规则同源：票 80 换成 [1,5,20] 时这里不用改。
+  assert.deepEqual(before.body.trading.limits.leverages, TRADING_LEVERAGES.slice())
   assert.equal(before.body.trading.week.start, weekStartOf(OPEN_AT))
   assert.equal(before.body.trading.week.base, 500)
 
@@ -358,4 +367,115 @@ test('票 80 e2e：一键止损 → /state 反映档位 → 到线平，原因�
   assert.equal(settled.body.trading.coins.available, settled.body.farm.coins)
   assert.equal(settled.body.trading.coins.locked, 0)
   assert.equal(settled.body.trading.coins.total, settled.body.farm.coins)
+})
+
+test('票 81 e2e：三作物 K 线 + 风向随 /state 下发；成形那根随时钟前进', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: OPEN_AT }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+
+  const before = await state(service)
+  const trading = before.body.trading
+  assert.deepEqual(Object.keys(trading.charts), BOARD_CROPS)
+  for (const crop of BOARD_CROPS) {
+    const chart = trading.charts[crop]
+    assert.equal(chart.bars.length, 24, crop + ' 最近 24 根')
+    assert.equal(chart.current.slot, trading.bar.slot)
+    assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
+    // 每根的高低点都要夹住开收（图上的影线不能比实体短）。
+    for (const bar of chart.bars) {
+      assert.ok(bar.high >= Math.max(bar.open, bar.close), crop + ' 高点越界：' + bar.slot)
+      assert.ok(bar.low <= Math.min(bar.open, bar.close), crop + ' 低点越界：' + bar.slot)
+    }
+    assert.ok(trading.hint[crop].confidence >= 0.55 && trading.hint[crop].confidence <= 0.68)
+  }
+  // `payload.bar` 还是第一个作物的当前一根（票 79 的窗口认它）。
+  assert.equal(trading.bar.crop, BOARD_CROPS[0])
+  assert.equal(trading.bar.price, trading.charts[BOARD_CROPS[0]].current.price)
+  // 窗口的纯视图吃得下这一包：图例、风向「不是保证」、三页签。
+  const board = boardView.boardView(trading, { now: clock.value })
+  assert.equal(board.chart.geometry.bars.length, 24)
+  assert.equal(board.chart.legend[0].text, trading.charts.tomato.base.toFixed(2))
+  assert.equal(board.hint.note, '不是保证')
+  assert.equal(board.crops.length, 3)
+
+  // 过两分钟：tick 前进两格，价格与剩余时间都跟着走（不是等 15 分钟才结算）。
+  clock.value = OPEN_AT + 2 * TICK_MS
+  assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
+  const after = await state(service)
+  for (const crop of BOARD_CROPS) {
+    const current = after.body.trading.charts[crop].current
+    assert.equal(current.slot, before.body.trading.charts[crop].current.slot)
+    assert.equal(current.tick, 7)
+    assert.equal(current.price, markPrice({ crop, now: clock.value }))
+    assert.equal(current.remainingMs, SLOT_MS - 7 * TICK_MS)
+  }
+  assert.notEqual(after.body.trading.charts.tomato.current.price,
+    before.body.trading.charts.tomato.current.price)
+})
+
+test('票 81 e2e：周一 00:00 清零的是本周盈亏，不是硬币', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  // 星期天晚上：先做出一笔已实现盈亏，落在「本周」。
+  const sunday = new Date(2026, 10, 22, 23, 30, 0, 0).getTime()
+  const clock = { value: sunday }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+  const opened = await action(service, {
+    action: 'trading-open-position', side: 'long', margin: 50, leverage: 1, cropId: 'tomato'
+  })
+  assert.equal(opened.body.ok, true)
+  clock.value = sunday + TICK_MS
+  assert.equal((await action(service, { action: 'trading-close-position', positionId: opened.body.position.id })).body.ok, true)
+  const sundayState = await state(service)
+  const pnl = sundayState.body.trading.week.pnl
+  const coins = sundayState.body.farm.coins
+  assert.equal(sundayState.body.trading.history.length, 1)
+  assert.equal(sundayState.body.trading.week.start, weekStartOf(sunday))
+  assert.equal(sundayState.body.trading.week.base, 500)
+
+  // 周一 00:00:30：分数清零、base 换成此刻的硬币，硬币与历史一分不动。
+  const monday = new Date(2026, 10, 23, 0, 0, 30, 0, 0).getTime()
+  clock.value = monday
+  assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
+  const mondayState = await state(service)
+  assert.equal(mondayState.body.trading.week.pnl, 0, '本周盈亏清零')
+  assert.equal(mondayState.body.trading.week.total, 0)
+  assert.equal(mondayState.body.trading.week.start, weekStartOf(monday), '换周起点')
+  assert.equal(mondayState.body.trading.week.base, mondayState.body.farm.coins, '新一周的收益率分母')
+  assert.equal(mondayState.body.farm.coins, coins, '硬币不清零')
+  assert.equal(mondayState.body.trading.history.length, 1, '历史不清零')
+  assert.equal(mondayState.body.trading.history[0].pnl, pnl)
+  // 窗口顶部显示的是新一周的 0 与「—」（base 有了，收益率是 0.00%）。
+  const week = boardView.boardView(mondayState.body.trading, { now: monday }).week
+  assert.equal(week.pnlText, '0.0')
+  assert.equal(week.pctText, '0.00%')
+})
+
+test('票 81 e2e：0 硬币时按钮写「去种地」，下单被拒绝且硬币不为负', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 0)
+  const clock = { value: OPEN_AT }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+
+  const broke = await state(service)
+  assert.equal(broke.body.farm.coins, 0)
+  assert.equal(broke.body.trading.coins.available, 0)
+  const board = boardView.boardView(broke.body.trading, { now: clock.value })
+  assert.equal(board.order.canSubmit, false)
+  assert.equal(board.order.submitLabel, '去种地')
+  assert.match(board.order.hint, /先去种地/)
+  assert.match(board.hints.positions, /去种地/)
+
+  const refused = await action(service, {
+    action: 'trading-open-position', side: 'long', margin: 50, leverage: 1, cropId: 'tomato'
+  })
+  assert.equal(refused.status, 409)
+  assert.equal(refused.body.error, 'no-coin')
+  assert.equal((await state(service)).body.farm.coins, 0)
+  assert.deepEqual((await state(service)).body.trading.positions, [])
 })
