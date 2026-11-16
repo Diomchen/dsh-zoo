@@ -141,7 +141,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
 | `pong` | `id?` | 对 `ping` |
-| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `bounds` / `pointer` / `renameOpen` / `bringOpen` / `farmOpen` / `farmVisible` / `farmFocused` 等 |
+| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `trustedInputs` / `lostDowns` / `reasserts` / `windowMessages` / `bounds` / `pointer` / `renameOpen` / `bringOpen` / `farmOpen` / `farmVisible` / `farmFocused` 等 |
 
 `ready` 里的 `workArea` 是**整张虚拟桌面**：所有显示器工作区的并集（DIP），也就是窗口实际
 覆盖的那块矩形；`displays` 里带每块屏的 `bounds` / `workArea` / `scaleFactor` / `primary`。
@@ -284,6 +284,17 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
    接管鼠标，并用“宠物/胶囊 + 控件”的桥接矩形（`ui:bridge:prompt` / `ui:bridge:away`）盖住间隙。
    **拖胶囊是唯一的例外**：拖动期间和宠物拖拽一样持租约，并额外上报 `ui:chip-drag`
    （胶囊 + 光标附近 80px 的并集），松手立刻撤掉。
+9. **可交互态会粘住，所以要重放（票 76）。** `setIgnore()` 在 `ignoreState.ignoring === next`
+   时直接 return，所以一次没在 Windows 上落住的 `setIgnoreMouseEvents(false)` 会让主进程一直
+   认为窗口可交互、OS 却仍把左键交给下层，直到一次真正的 `true → false` 翻转或 helper 重启。
+   两道兜底：
+   - 可交互期间每 `INTERACTIVE_REASSERT_MS`（2s）把同一个 `setIgnoreMouseEvents(false)` 重放一次
+     （`reassertInteractive()`，计入 `status.reasserts`）；穿透态不重放。
+   - 渲染端发现 `pointerup` 没有对应的 `pointerdown` 时上报 `dsh-zoo:input {type:'lost-down'}`；
+     主进程 `healLostDown()` 立刻重放一次「穿透 → 可交互」（`LOST_DOWN_HEAL_COOLDOWN_MS`=1s 冷却）。
+   `status` 的 `lostDowns` / `lastLostDownAgeMs` 是这条路径的观测口；`windowMessages`
+   （Windows 上 `hookWindowMessage` 数 `WM_LBUTTONDOWN/UP`、`WM_RBUTTONDOWN/UP`）说明
+   OS 到底有没有把消息投给这个窗口——两个都没有 = 消息没到窗口，有而 DOM 没有 = Chromium 吞了。
 
 ## 素材协议 `dshzoo://`
 

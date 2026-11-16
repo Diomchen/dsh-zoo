@@ -208,6 +208,25 @@ const mediaHistory = []
  */
 let trustedDowns = 0
 let lastTrustedInputAt = 0
+/**
+ * 票 76：渲染端「收到 up、没收到 down」的次数。左键在窗口/系统层被吞掉时就是这个形状；
+ * 主进程收到一次就重放一次「穿透 → 可交互」，不重启 helper 也能把卡住的输入态解开。
+ */
+let lostDowns = 0
+let lastLostDownAt = 0
+let lastHealAt = 0
+/**
+ * 票 76：「可交互」向 native 层重放的次数与时刻。`setIgnore()` 在状态没变时直接 return，
+ * 一次没落成功的 `setIgnoreMouseEvents(false)` 会让窗口一直停在假可交互——所以这里定时重放。
+ */
+let reasserts = 0
+let lastReassertAt = 0
+/**
+ * 票 76：HWND 层真实收到的鼠标消息计数（只有 Windows 会填）。DOM 侧的 pointerdown 说明
+ * 「Chromium 派发到了页面」，这一份说明「OS 到底有没有把消息投给这个窗口」，现场靠两者对账。
+ */
+const windowMessages = { leftDown: 0, leftUp: 0, rightDown: 0, rightUp: 0 }
+const hookedMessages = []
 let rendererReady = false
 let quitting = false
 let readySent = false
@@ -381,6 +400,7 @@ function createWindow () {
     }
   }
   win.webContents.setBackgroundThrottling(false)
+  hookWindowMessages(win)
   win.webContents.on('context-menu', (event) => event.preventDefault())
   win.webContents.on('render-process-gone', (_event, details) => {
     reportError('render-process-gone', new Error(String(details?.reason ?? 'unknown')))
@@ -743,6 +763,43 @@ function setIgnore (ignore, reason) {
   emitHit(reason)
 }
 
+/**
+ * 把「可交互」再向 native 层重放一次（票 76）。
+ *
+ * 为什么需要：`setIgnoreMouseEvents(false)` 在 Windows 上偶发不落，而 `setIgnore()` 看到
+ * 状态没变就直接 return —— 主进程认为窗口可交互、OS 却仍把左键交给下层，一直卡到一次真正的
+ * `true → false` 翻转或 helper 重启（票 30 现场靠「重载配置」恢复的就是这条）。重放同一个值
+ * 不改变语义，只是让 native 层重新落一遍；穿透态不重放（它本来就不接输入）。
+ */
+function reassertInteractive () {
+  if (win === null || win.isDestroyed() || ignoreState.ignoring !== false) return false
+  try {
+    win.setIgnoreMouseEvents(false, { forward: true })
+  } catch (error) {
+    reportError('reassert-failed', error)
+    return false
+  }
+  lastReassertAt = Date.now()
+  reasserts += 1
+  return true
+}
+
+/**
+ * 丢 down 自愈（票 76）：渲染端确认「收到 up 却没有 down」时，强制走一次真实的
+ * `穿透 → 可交互` 翻转，等价于 `debug-kick-input`，但由用户的一次真实点击触发，
+ * 不需要重启 helper。带冷却，避免合成输入/边界按下把它抖成循环。
+ */
+function healLostDown () {
+  const now = Date.now()
+  lostDowns += 1
+  lastLostDownAt = now
+  if (now - lastHealAt < shared.LOST_DOWN_HEAL_COOLDOWN_MS) return false
+  lastHealAt = now
+  setIgnore(true, 'lost-down-heal')
+  applyDecision('lost-down-heal')
+  return true
+}
+
 function forceIgnore (reason) {
   hover.inside = false
   hover.lastAt = 0
@@ -817,6 +874,10 @@ function applyDecision (reason) {
     now
   })
   setIgnore(!decision.interactive, decision.reason || reason)
+  // 票 76：可交互态定时重放一次 native 调用，修掉「我们说是可交互、系统没落上」的粘滞。
+  if (shared.shouldReassert({ ignoring: ignoreState.ignoring, now: Date.now(), lastAt: lastReassertAt })) {
+    reassertInteractive()
+  }
 }
 
 /**
@@ -935,6 +996,11 @@ ipcMain.on('dsh-zoo:input', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   const report = shared.normalizeInputReport(payload)
   if (report === null) return
+  if (report.type === 'lost-down') {
+    // 票 76：左键在窗口/系统层被吞了。不计入 trustedInputs——它压根没到。
+    healLostDown()
+    return
+  }
   lastTrustedInputAt = Date.now()
   if (report.type === 'down') trustedDowns += 1
 })
@@ -2642,6 +2708,11 @@ function statusEvent (id) {
     // ticket 30：可信左键到了几次、最后一次到现在多久——「可交互但点不进来」就看这两个数。
     trustedInputs: trustedDowns,
     lastTrustedInputAgeMs: lastTrustedInputAt > 0 ? now - lastTrustedInputAt : null,
+    // 票 76：丢 down 与自愈重放的计数；windowMessages 是 HWND 层真实收到的鼠标消息。
+    lostDowns,
+    lastLostDownAgeMs: lastLostDownAt > 0 ? now - lastLostDownAt : null,
+    reasserts,
+    windowMessages: { ...windowMessages },
     media: lastMedia,
     mediaHistory: mediaHistory.slice(),
     overlayRects: overlayRects.length,
@@ -2881,6 +2952,49 @@ function scheduleDisplayRefresh () {
 // 退出
 // ---------------------------------------------------------------------------
 
+/**
+ * 票 76：记录 HWND 层真实收到的鼠标消息（只有 Windows 有）。
+ *
+ * 为什么要这一层：DOM 的 `pointerdown` 只能证明「Chromium 派发到了页面」；现场需要知道
+ * 「OS 到底有没有把消息投给这个窗口」——`WM_LBUTTONDOWN` 有而 DOM 没有 = Chromium/窗口层吞的，
+ * 两个都没有 = 消息根本没到这个窗口。`hookWindowMessage` 只读、不改消息，失败就放弃（诊断不能
+ * 影响窗口本身）。`WM_NCHITTEST` 的返回值拿不到，所以这里只数鼠标键，不数命中测试。
+ */
+function hookWindowMessages (target) {
+  if (process.platform !== 'win32' || target === null || target.isDestroyed()) return
+  if (typeof target.hookWindowMessage !== 'function') return
+  const messages = [
+    [0x0201, 'leftDown'],
+    [0x0202, 'leftUp'],
+    [0x0204, 'rightDown'],
+    [0x0205, 'rightUp']
+  ]
+  for (const [messageId, key] of messages) {
+    try {
+      target.hookWindowMessage(messageId, () => {
+        windowMessages[key] += 1
+      })
+      hookedMessages.push(messageId)
+    } catch (error) {
+      // 老版本/受限环境没有这个能力：观测缺一块，产品行为不受影响。
+      reportError('hook-message-failed', error)
+      return
+    }
+  }
+}
+
+/** 退窗口前把消息钩子摘掉：hookWindowMessage 的钩子不随 destroy 自动清。 */
+function unhookWindowMessages () {
+  if (win === null || win.isDestroyed() || typeof win.unhookWindowMessage !== 'function') return
+  for (const messageId of hookedMessages.splice(0)) {
+    try {
+      win.unhookWindowMessage(messageId)
+    } catch {
+      // 已经没了
+    }
+  }
+}
+
 function shutdown (code) {
   if (quitting) return
   quitting = true
@@ -2897,6 +3011,7 @@ function shutdown (code) {
   closeRenameWindow('shutdown')
   closeGiftWindow('shutdown')
   closeFarmWindow('shutdown')
+  unhookWindowMessages()
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()
   } catch {
