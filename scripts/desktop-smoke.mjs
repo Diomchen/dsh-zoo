@@ -2984,6 +2984,33 @@ async function verifyFarmWindow () {
   }
   assert(marketVisible > marketImage.width * marketImage.height * 0.2, '交易所页画出了可见内容')
 
+  // 悬停气泡：真发 mouseenter，价格要出现在点的附近，而不是把旁边文字挤来挤去。
+  client.send({ type: 'debug-farm-spark', id: 'smoke-farm-spark-hover' })
+  const sparkHover = await client.waitFrom(
+    client.mark(),
+    (event) => event.id === 'smoke-farm-spark-hover',
+    6000,
+    '成交价曲线悬停'
+  )
+  assert(sparkHover.type === 'farm-spark', '读成交价曲线：' + (sparkHover.message ?? sparkHover.type))
+  assert(sparkHover.dots > 0, '成交价曲线上有可悬停的点')
+  assert(sparkHover.tips > 0 && sparkHover.connected === true,
+    '气泡元素在页面里（tips=' + sparkHover.tips + ', connected=' + sparkHover.connected + '）')
+  assert(sparkHover.show === true, '悬停后气泡显示：' + sparkHover.tip)
+  assert(/·\s*\d+\s*硬币/.test(sparkHover.tip), '气泡写的是这条记录的价格：' + sparkHover.tip)
+  assert(sparkHover.near === true, '气泡出现在点的附近')
+  assert(sparkHover.note === '24h 卖价' || sparkHover.note === '24h · 暂无成交', '曲线右侧文字不随悬停变化：' + sparkHover.note)
+  const sparkPath = join(OUT_DIR, '47-farm-spark-hover.png')
+  await sleep(250)
+  client.send({ type: 'shot', id: 'smoke-farm-spark-shot', path: sparkPath, window: 'farm' })
+  const sparkShot = await client.waitFrom(
+    client.mark(),
+    (event) => event.type === 'shot' && event.id === 'smoke-farm-spark-shot',
+    8000,
+    '悬停气泡截图'
+  )
+  assert(sparkShot.width > 0 && existsSync(sparkPath), '悬停气泡截图落盘：' + sparkPath)
+
   const hirePath = join(OUT_DIR, '47-farm-hire.png')
   client.send({ type: 'debug-farm-tab', tab: 'hire', id: 'smoke-farm-hire-tab' })
   await sleep(750)
