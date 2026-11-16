@@ -1486,6 +1486,28 @@
       .market-spark .market-spark-end {
         fill: var(--muted);
       }
+      .market-spark .market-spark-point {
+        fill: var(--muted);
+        stroke: var(--card);
+        stroke-width: 1.2;
+        opacity: 0.9;
+        pointer-events: none;
+        vector-effect: non-scaling-stroke;
+      }
+      .market-spark .market-spark-hit {
+        fill: transparent;
+        pointer-events: all;
+        cursor: help;
+      }
+      .market-spark-point-group:hover .market-spark-point {
+        opacity: 1;
+      }
+      .market-spark.up .market-spark-point {
+        fill: var(--emerald);
+      }
+      .market-spark.down .market-spark-point {
+        fill: var(--rose);
+      }
       .market-spark.up polyline {
         stroke: var(--emerald);
       }
@@ -1510,10 +1532,12 @@
       }
       .market-spark-note {
         flex: none;
+        min-width: 76px;
         color: var(--muted);
         font-size: 9px;
         font-weight: 600;
         font-variant-numeric: tabular-nums;
+        text-align: right;
         white-space: nowrap;
       }
 
