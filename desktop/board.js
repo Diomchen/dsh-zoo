@@ -70,16 +70,16 @@ const toastsEl = document.getElementById('toasts')
  */
 const RESULT_CODE_TEXT = {
   timeout: '桌面宿主没有回应，这次操作可能没有生效。',
-  'host-unavailable': '桌面宿主没有连接，这次没有完成。',
+  'host-unavailable': '桌面宿主没有连接，这次操作没有完成。',
   'bad-board-action': '这个操作缺少方向或保证金，再试一次。',
   'bad-crop': '这种作物暂时没有盘口。',
   'bad-side': '方向只有做多和做空。',
   'bad-margin': '保证金要是 1 到 1,000,000 之间的整数硬币。',
   'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20×）。',
   'bad-target': '目标价超出这张图的价格范围，换一个价再挂。',
-  'no-order': '这张挂单已经成交或撤掉了。',
+  'no-order': '这张挂单已经成交或撤掉了，刷新一下就好。',
   'no-coin': '硬币不够，先去种地或卖点作物。',
-  'no-position': '这个仓位已经平掉了。',
+  'no-position': '这个仓位已经平掉了，刷新一下就好。',
   settling: '这个仓位正在结算，等一下再看。',
   starting: '盘口还在准备中，稍等一下再试。'
 }

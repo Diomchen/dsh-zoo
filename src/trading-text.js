@@ -1,8 +1,10 @@
 /**
- * 盘口失败的「错误码 → 人话」唯一文案表（票 79/80）。
+ * 盘口失败的「错误码 → 人话」文案表（票 79/80）。
  *
- * 三条路共用这一份：`POST /dsh-zoo/action` 的失败、盘口小窗的 action-result
- * （宿主给的 notice 优先，这份是兜底）、以及渲染端拿不到 notice 时的兜底。
+ * 宿主侧两条路共用这一份：`POST /dsh-zoo/action` 的失败、盘口小窗的 action-result
+ * （宿主给的 notice 优先，这份是兜底）。渲染端（`desktop/board.js`）不是 ESM、拿不到
+ * 这份模块，另抄了一份 `RESULT_CODE_TEXT`——**复制是预期的，漂移不是**：
+ * `test/trading-view.test.js` 逐条比对两边共有的错误码，文案必须一模一样。
  *
  * 纪律和 `farm-text.js` / `gift-text.js` 一样：不出现错误码、堆栈或磁盘细节，
  * 每句话都告诉用户**下一步能做什么**。未知错误码返回 null，由调用方兜底。
