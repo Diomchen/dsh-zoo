@@ -1,11 +1,23 @@
 # 发布与上架 dsh-market
 
+## 发版正文从哪来
+
+打 `v*` tag 时 CI 的 `release` job 会读 `docs/releases/<tag 去掉 v>.md`：
+
+- 有这个文件 → 用它当 GitHub Release 正文（`--notes-file`）；
+- 没有 → 退回 `--generate-notes`，用自动汇总的提交列表。
+
+已经存在的 release 不会重建，但重新推 tag 时会重传资产并用同一个文件覆盖正文
+（`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
+再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
+
 ## 1.6.3 版本记录
 
-GitHub Release 用的简版文案：[`releases/1.6.3.md`](releases/1.6.3.md)。
+GitHub Release 正文就是 [`releases/1.6.3.md`](releases/1.6.3.md)。
 
 1.6.2 的 tag 打早了：那会儿还没有合并远端的「看田窗口」修复，所以 1.6.3 = 1.6.2 全部内容 +
 看田窗口修复。代码层面没有新功能，存档与协议都不变。
+
 
 ## 1.6.2 版本记录
 
