@@ -1260,13 +1260,18 @@ function renderMarket () {
     sparkWrap.className = 'market-spark-wrap'
     const sparkNote = document.createElement('span')
     sparkNote.className = 'market-spark-note'
-    sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h · 悬停看价'
+    sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h 卖价'
     const sparkPlot = document.createElement('div')
     sparkPlot.className = 'market-spark-plot ' + spark.trend + (spark.empty ? ' empty' : '')
     sparkPlot.setAttribute('role', 'img')
     sparkPlot.setAttribute('aria-label', spark.empty
       ? '最近 24 小时没有成交'
       : '最近 24 小时成交价与当前卖价，共 ' + spark.marks.length + ' 个点')
+    // 悬停提示浮在点上方：只在显示/隐藏时改透明度，不参与布局，
+    // 避免文字变化把图表挤动、导致光标在点上反复进出（抖动）。
+    const sparkTip = document.createElement('span')
+    sparkTip.className = 'market-spark-tip'
+    sparkTip.dataset.show = 'false'
     const sparkSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
     sparkSvg.setAttribute('class', 'market-spark ' + spark.trend + (spark.empty ? ' empty' : ''))
     sparkSvg.setAttribute('viewBox', '0 0 100 24')
@@ -1289,10 +1294,16 @@ function renderMarket () {
         sparkDot.setAttribute('aria-label', formatSparkTime(mark.at) + ' · '
           + Math.round(mark.price) + ' 硬币' + (mark.current ? '（当前卖价）' : ''))
         sparkDot.addEventListener('mouseenter', () => {
-          sparkNote.textContent = formatSparkTime(mark.at) + ' · ' + Math.round(mark.price)
+          sparkTip.textContent = formatSparkTime(mark.at) + ' · ' + Math.round(mark.price) + ' 硬币'
+          // 靠近左/右边缘时把气泡贴边，避免被卡片裁掉一半。
+          const anchor = Math.min(1, Math.max(0, mark.x / 100))
+          sparkTip.style.left = (anchor * 100).toFixed(2) + '%'
+          sparkTip.style.top = (mark.y / 24 * 100).toFixed(2) + '%'
+          sparkTip.style.transform = 'translate(' + (-anchor * 100).toFixed(2) + '%, -150%)'
+          sparkTip.dataset.show = 'true'
         })
         sparkDot.addEventListener('mouseleave', () => {
-          sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h · 悬停看价'
+          sparkTip.dataset.show = 'false'
         })
         sparkPlot.appendChild(sparkDot)
       }
@@ -1300,6 +1311,7 @@ function renderMarket () {
       sparkSvg.appendChild(sparkLine)
     }
     sparkPlot.appendChild(sparkSvg)
+    sparkPlot.appendChild(sparkTip)
     sparkWrap.appendChild(sparkPlot)
     sparkWrap.appendChild(sparkNote)
     if (spark.empty) {

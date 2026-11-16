@@ -2385,6 +2385,48 @@ function applyCommand (command) {
         }))
       return
     }
+    case 'debug-farm-spark': {
+      // 冒烟用：真发一次 mouseenter，读悬停气泡文本与位置——光看 CSS 断言不出抖动/错位。
+      if (!debugEnabled) return
+      if (farmWin === null || farmWin.isDestroyed()) {
+        writeEvent({ type: 'error', id: command.id, code: 'not-ready', message: 'farm window not open' })
+        return
+      }
+      const script = '(() => {' +
+        'const dots = Array.from(document.querySelectorAll(".market-spark-dot"));' +
+        'if (dots.length === 0) return { dots: 0, tip: "", show: false, note: "" };' +
+        // 取第一个真正在视口里的点：列表可以滚动，最后一个点可能在屏幕外。
+        'const dot = dots.find((candidate) => {' +
+        'const rect = candidate.getBoundingClientRect();' +
+        'return rect.top > 0 && rect.bottom < window.innerHeight && rect.left >= 0 && rect.right <= window.innerWidth;' +
+        '}) || dots[0];' +
+        'dot.dispatchEvent(new MouseEvent("mouseenter", { bubbles: false }));' +
+        'const tip = dot.parentElement === null ? null : dot.parentElement.querySelector(".market-spark-tip");' +
+        'const note = dot.parentElement === null ? null : dot.parentElement.parentElement.querySelector(".market-spark-note");' +
+        'const dotRect = dot.getBoundingClientRect();' +
+        'const tipRect = tip === null ? null : tip.getBoundingClientRect();' +
+        'const shown = tip !== null && tip.dataset.show === "true";' +
+        'return {' +
+        'dots: dots.length,' +
+        'tips: document.querySelectorAll(".market-spark-tip").length,' +
+        'connected: tip !== null && tip.isConnected === true,' +
+        'tip: tip === null ? "" : tip.textContent,' +
+        'show: shown,' +
+        'note: note === null ? "" : note.textContent,' +
+        'near: tipRect !== null && Math.abs((tipRect.left + tipRect.width / 2) - (dotRect.left + dotRect.width / 2)) < 60' +
+        ' && tipRect.bottom <= dotRect.top + 12 && tipRect.bottom > dotRect.top - 48' +
+        '};' +
+        '})()'
+      void farmWin.webContents.executeJavaScript(script, true)
+        .then((result) => writeEvent({ type: 'farm-spark', id: command.id, ...result }))
+        .catch((error) => writeEvent({
+          type: 'error',
+          id: command.id,
+          code: 'farm-spark-failed',
+          message: String(error?.message ?? error)
+        }))
+      return
+    }
     case 'debug-farm-block': {
       // 冒烟用（ticket 47.1）：阻塞渲染进程，模拟 interval 被调度延迟/后台节流。
       if (!debugEnabled) return
