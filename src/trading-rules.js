@@ -4,9 +4,10 @@
  * 这一层不读盘、不碰时钟、不碰网络：价格只由 `作物 + slot + tick + 版本盐` 决定，
  * 同一套代码在任何机器上算出同一张图（ADR-0027：不做对手盘、不做服务器）。
  *
- * 行情只有 `boardPrice()` 一个入口：当前价、收盘结算价、将来的 K 线（票 81）、
+ * 行情只有 `boardPrice()` 一个入口：当前价、收盘结算价、K 线（票 81）、
  * 离线补算与强平（票 80）都必须调它。多写一个价格公式，就会出现「图上没插针、
- * 结算却强平」这种对不上账的现场。
+ * 结算却强平」这种对不上账的现场。K 线（`barsFor`）与风向（`hintOf`）也一样：
+ * 它们只是把同一条曲线按根/按 tick 读出来，不引入第二个公式。
  */
 
 import { CROPS } from './farm-rules.js'
@@ -27,8 +28,11 @@ export const PRICE_CEIL_RATIO = 1.75
  * 票 79 只做一个作物、一档杠杆、两档保证金。这几个数组是**下单白名单**，
  * 也是窗口按钮的唯一来源（宿主随 payload 下发，窗口不复制一份，省掉 drift 测试）。
  * 票 80 加 5×/20×，票 81 加三个作物——只改这里。
+ *
+ * 三作物的顺序就是窗口页签与 payload 的顺序（tomato 是第一根 `payload.bar` 的来源）；
+ * 底价差得开（5 / 6 / 30），切页签时曲线形状一眼能分辨。
  */
-export const BOARD_CROPS = Object.freeze(['tomato'])
+export const BOARD_CROPS = Object.freeze(['tomato', 'carrot', 'pumpkin'])
 export const TRADING_MARGINS = Object.freeze([50, 100])
 export const TRADING_LEVERAGES = Object.freeze([1])
 /** 读盘时杠杆的形状上限：票 80 的 [1, 5, 20] 从这里取，别在 store 里另写一个 20。 */
@@ -47,6 +51,25 @@ const SLOW_AMPLITUDE = 0.19
 /** 快噪声：每个 slot 一个散列值、tick 之间平滑插值，幅度约 ±2.2%。 */
 const FAST_AMPLITUDE = 0.022
 const TWO_PI = Math.PI * 2
+
+/**
+ * K 线显示最近 24 根 + 当前形成中的一根（SPEC v10「行情」）。
+ * 根数只在这里定一份：窗口按 payload 画，不自己算也不自己截。
+ */
+export const BOARD_BAR_COUNT = 24
+/** 兜底上限：payload 是跨进程数据，24 之外再多画只会白占带宽。 */
+const MAX_BOARD_BAR_COUNT = 72
+/**
+ * 风向 = 慢趋势在本根的斜率（本根起点 → 下一根起点），**快噪声不参与**。
+ * 置信度 55–68% 是产品口径：慢趋势的斜率越陡越可信，但快噪声随时能把弱信号打反，
+ * 所以封顶 68%，UI 必须写「不是保证」（SPEC v10「行情」）。
+ * 取本根起点而不是「此刻」，是为了让一根之内风向不闪。
+ */
+const HINT_FLAT_SLOPE = 0.002
+const HINT_MIN_CONFIDENCE = 0.55
+const HINT_MAX_CONFIDENCE = 0.68
+/** 慢趋势（两条正弦叠加）的斜率最大约 0.12/根；达到 0.08 就算顶格。 */
+const HINT_FULL_SLOPE = 0.08
 
 function finiteNumber (value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -165,6 +188,99 @@ export function markPrice ({ crop, now } = {}) {
   const slot = Math.floor(stamp / SLOT_MS)
   const tick = (stamp - slot * SLOT_MS) / TICK_MS
   return boardPrice({ crop, slot, tick })
+}
+
+/**
+ * 一整根的历史 K 线：开 = tick 0，收 = tick 15，高低点按**整数 tick**取样。
+ *
+ * 为什么只取整数 tick：1 分钟就是图上最小的刻度，再密的采样只会让 payload 变大，
+ * 而落在两根 tick 之间的极值在图上根本看不出来。收盘 = 下一根的开盘由
+ * `boardPrice()` 的插值方式保证，所以相邻两根天然连续，不用额外对齐。
+ */
+function barAt (crop, slot) {
+  const open = boardPrice({ crop, slot, tick: 0 })
+  const close = boardPrice({ crop, slot, tick: SLOT_TICKS })
+  let high = Math.max(open, close)
+  let low = Math.min(open, close)
+  for (let tick = 1; tick < SLOT_TICKS; tick += 1) {
+    const price = boardPrice({ crop, slot, tick })
+    if (price > high) high = price
+    if (price < low) low = price
+  }
+  return { slot, open, high, low, close }
+}
+
+/**
+ * 最近 `count` 根 + 当前形成中的一根（票 81）。
+ *
+ * `bars` 是过去的整根（旧 → 新，最后一根的收盘就是当前根的开盘）；
+ * `current` 是这一根的实时 OHLC：`price` 是此刻的现价，`tick` 是已经走了多少分钟
+ * （0–15，两位小数，窗口拿它画进度），`remainingMs` 是距收盘。
+ * `base` 一起带出去：窗口的底价参考线、夹取范围、下单预览都靠它对齐，
+ * 不让窗口自己再猜一次作物底价。
+ *
+ * 认不出作物 / 时间不是有限数时返回 null：窗口画空态，绝不算出另一张图。
+ */
+export function barsFor ({ crop, now, count = BOARD_BAR_COUNT } = {}) {
+  if (baseOf(crop) === null) return null
+  const stamp = finiteNumber(now)
+  if (stamp === null) return null
+  const bounds = slotBounds(stamp)
+  if (bounds === null) return null
+  const total = Number.isInteger(count)
+    ? Math.floor(clampNumber(count, 1, MAX_BOARD_BAR_COUNT))
+    : BOARD_BAR_COUNT
+  const bars = []
+  for (let offset = total; offset >= 1; offset -= 1) {
+    bars.push(barAt(crop, bounds.slot - offset))
+  }
+  const open = boardPrice({ crop, slot: bounds.slot, tick: 0 })
+  const price = markPrice({ crop, now: stamp })
+  // 底价坏了/时钟坏了在上面的 baseOf/slotBounds 已经挡掉；这里只防一条窄路：
+  // 价格算不出来时宁可返回 null 让窗口画空态，也不往 payload 里塞 NaN。
+  if (open === null || price === null) return null
+  const tick = (stamp - bounds.start) / TICK_MS
+  let high = Math.max(open, price)
+  let low = Math.min(open, price)
+  // 已经走完的整分钟也参与高低点；加上此刻的现价（可能落在半分钟上）。
+  for (let step = 1; step <= Math.floor(tick); step += 1) {
+    const sampled = boardPrice({ crop, slot: bounds.slot, tick: step })
+    if (sampled > high) high = sampled
+    if (sampled < low) low = sampled
+  }
+  return {
+    base: baseOf(crop),
+    bars,
+    current: {
+      slot: bounds.slot,
+      open,
+      high,
+      low,
+      price,
+      tick: Math.round(tick * 100) / 100,
+      remainingMs: Math.max(0, bounds.end - stamp)
+    }
+  }
+}
+
+/**
+ * 风向提示（票 81）：慢趋势在本根的斜率 → 方向 + 置信度。
+ *
+ * 只读 `slowLevel()`，不碰快噪声：这正是 SPEC 说的「快噪声会把弱信号打反，
+ * UI 必须写不是保证」——所以这里给的永远是一个 55–68% 的弱信号，不是预测。
+ * 同一根内返回值恒定（取本根起点），窗口每秒重画也不会闪。
+ */
+export function hintOf ({ crop, now } = {}) {
+  if (baseOf(crop) === null) return null
+  const slot = slotIndexAt(now)
+  if (slot === null) return null
+  const slope = slowLevel(crop, slot + 1) - slowLevel(crop, slot)
+  const strength = Math.min(1, Math.abs(slope) / HINT_FULL_SLOPE)
+  const confidence = Math.round(
+    (HINT_MIN_CONFIDENCE + (HINT_MAX_CONFIDENCE - HINT_MIN_CONFIDENCE) * strength) * 100
+  ) / 100
+  const direction = Math.abs(slope) < HINT_FLAT_SLOPE ? 'flat' : slope > 0 ? 'up' : 'down'
+  return { direction, confidence }
 }
 
 export function isBoardCrop (value) {
