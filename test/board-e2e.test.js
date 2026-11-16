@@ -121,7 +121,7 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
   assert.equal(before.body.trading.bar.remainingMs, SLOT_MS - 5 * TICK_MS)
   assert.ok(before.body.trading.bar.price > 0)
   assert.deepEqual(before.body.trading.limits.margins, [50, 100])
-  assert.deepEqual(before.body.trading.limits.leverages, [1])
+  assert.deepEqual(before.body.trading.limits.leverages, [1, 5, 20])
   assert.equal(before.body.trading.week.start, weekStartOf(OPEN_AT))
   assert.equal(before.body.trading.week.base, 500)
 
@@ -222,7 +222,7 @@ test('票 79 e2e：硬币不够（含 0 硬币）拒绝开仓，硬币不为负'
   // 方向/保证金不在白名单里也拒绝，且不碰硬币。
   assert.equal((await action(service, { action: 'trading-open-position', side: 'up', margin: 50 })).body.error, 'bad-side')
   assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 250 })).body.error, 'bad-margin')
-  assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 50, leverage: 5 })).body.error, 'bad-leverage')
+  assert.equal((await action(service, { action: 'trading-open-position', side: 'long', margin: 50, leverage: 2 })).body.error, 'bad-leverage')
   assert.equal((await action(service, { action: 'trading-close-position', positionId: 'nope' })).body.error, 'no-position')
   assert.equal((await state(service)).body.farm.coins, 30)
 })
