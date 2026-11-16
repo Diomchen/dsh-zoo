@@ -2353,6 +2353,8 @@ test('票 85：四扇插件窗都接上同一条失焦策略，debug-blur 仍走
   assert.match(main, /created\.on\('blur', \(\) => scheduleBlurDismiss\(\)\)/)
   assert.match(main, /ipcMain\.on\('dsh-zoo:composing'/)
   assert.match(main, /closeAllPluginWindows\('dismiss'\)/)
+  // 主窗 focusable:false，点宠物本身不一定会 blur 插件窗；可信左键按下要补一次显式收起。
+  assert.match(main, /dismissPluginWindowsOnOutsideClick\(\)/)
   // 冒烟用的 debug-blur 必须上锁，否则旧的“失焦不关小窗”断言会假失败。
   assert.match(main, /debugBlurLocked = true/)
   // 盘口窗是唯一可拖动的插件窗；位置写 userData/board-window.json。
