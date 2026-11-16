@@ -1,5 +1,5 @@
 /**
- * 盘口小窗的渲染端（票 79 / 票 81 / 票 82）。
+ * 盘口小窗的渲染端（票 79 / 票 81 / 票 82 / 票 89）。
  *
  * 它只做三件事：把宿主推来的盘口视图画成卡片（K 线、下单、持仓、历史、周盈亏、真人周榜）；
  * 每秒本地递减收盘倒计时（到 0 请宿主结这一根并重推一拍）；
@@ -8,12 +8,13 @@
  * 窗口不自己改状态、不自己算钱，也不自己算价（K 线几何在 `trading-view.js` 里，
  * 这里只把 view 给的坐标画成 SVG 元素）。
  *
- * 键盘：Tab 顺序就是 DOM 顺序（作物页签 → 周期页签 → 方向 → 保证金 → 杠杆 → 开一手
- * → 每手仓位的止损/平仓）；Enter/Space 是原生按钮行为；Esc 关窗。失焦策略见 ADR-0029：
- * 点窗口外面会收起所有插件窗，输入法合成期间例外（旧「永不按 blur 关」的约定已作废）。
+ * 票 89：作物条是单行横向滚动（10 种作物也不换行、不撑高）：左右箭头按实际滚动位置
+ * 禁用、滚轮横滚、键盘 ←/→/Home/End 切作物、选中 chip 滚进视野；所有滚动都只发生在
+ * 列表内部，页面本身不滚。下单卡不套滚动容器，主按钮固定在卡片底部。
  *
- * 票 84：周期切换只换本地图（`payload.timeframes` 一次全下发），不发 IPC、不重开窗；
- * 合约结算仍然只认 15 分钟收盘，所以切周期绝不动持仓/硬币/周盈亏。
+ * 键盘：Tab 顺序由 `view.focusOrder()` 落到 tabindex（箭头 → 作物 chip → 周期 → 方向 →
+ * 保证金 → 杠杆 → 到价 → 开一手 → 挂单撤单 → 持仓止损/平仓）；Enter/Space 是原生按钮
+ * 行为；Esc 关窗。失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
  */
 'use strict'
 
@@ -22,13 +23,16 @@ const view = window.dshZooBoardView
 const SVG_NS = 'http://www.w3.org/2000/svg'
 
 const titleEl = document.getElementById('board-title')
-const subtitleEl = document.getElementById('board-subtitle')
 const weekPnlEl = document.getElementById('week-pnl')
 const weekPctEl = document.getElementById('week-pct')
 const countdownEl = document.getElementById('countdown')
 const coinsAvailableEl = document.getElementById('coins-available')
-const coinsTotalEl = document.getElementById('coins-total')
+const coinsLockedEl = document.getElementById('coins-locked')
 const cropTabsEl = document.getElementById('crop-tabs')
+const cropScrollEl = document.getElementById('crop-scroll')
+const cropViewportEl = document.getElementById('crop-viewport')
+const cropPrevEl = document.getElementById('crop-prev')
+const cropNextEl = document.getElementById('crop-next')
 const timeframeTabsEl = document.getElementById('timeframe-tabs')
 const chartPriceEl = document.getElementById('chart-price')
 const chartChangeEl = document.getElementById('chart-change')
@@ -36,7 +40,6 @@ const windEl = document.getElementById('wind')
 const chartEl = document.getElementById('chart')
 const chartEmptyEl = document.getElementById('chart-empty')
 const chartSettleHintEl = document.getElementById('chart-settle-hint')
-const legendEl = document.getElementById('legend')
 const slotNoteEl = document.getElementById('slot-note')
 const orderCropEl = document.getElementById('order-crop')
 const sideRowEl = document.getElementById('side-row')
@@ -50,12 +53,11 @@ const limitToggleEl = document.getElementById('limit-toggle')
 const limitNoteEl = document.getElementById('limit-note')
 const limitBoxEl = document.getElementById('limit-box')
 const limitInputEl = document.getElementById('limit-target')
-const limitBandEl = document.getElementById('limit-band')
 const limitHintEl = document.getElementById('limit-hint')
 const limitPlaceEl = document.getElementById('limit-place')
+const ordersWrapEl = document.getElementById('orders-wrap')
 const ordersEl = document.getElementById('orders')
 const ordersMetaEl = document.getElementById('orders-meta')
-const ordersEmptyEl = document.getElementById('orders-empty')
 const positionsEl = document.getElementById('positions')
 const positionsMetaEl = document.getElementById('positions-meta')
 const positionsEmptyEl = document.getElementById('positions-empty')
@@ -63,7 +65,6 @@ const historyEl = document.getElementById('history')
 const historyMetaEl = document.getElementById('history-meta')
 const historyEmptyEl = document.getElementById('history-empty')
 const leagueEl = document.getElementById('league')
-const leagueCountEl = document.getElementById('league-count')
 const sentimentEl = document.getElementById('sentiment')
 const neighborEmptyEl = document.getElementById('neighbor-empty')
 const closeButton = document.getElementById('close')
@@ -123,7 +124,7 @@ function svgEl (tag, attrs = {}) {
   return element
 }
 
-/** 轴/图例/便签都是文字：单独建 text 节点，不套手绘滤镜，保证清晰。 */
+/** 轴/参考线标签/便签都是文字：单独建 text 节点，不套手绘滤镜，保证清晰。 */
 function svgText (text, attrs = {}) {
   const element = svgEl('text', attrs)
   element.textContent = text
@@ -133,13 +134,13 @@ function svgText (text, attrs = {}) {
 function renderHeader (board) {
   const header = board.header
   titleEl.textContent = header.cropName === '—' ? '盘口' : '盘口 · ' + header.cropName
-  subtitleEl.textContent = '15 分钟合约 · 收盘自动结算'
   countdownEl.textContent = header.countdownText
   coinsAvailableEl.textContent = header.coinsAvailableText
-  coinsTotalEl.textContent = header.coinsTotalText
-  weekPnlEl.textContent = board.week.pnlText
+  coinsLockedEl.textContent = header.coinsLockedText
+  // 票 89：顶栏一颗胶囊，负号用 U+2212，收益率一位小数放括号里。
+  weekPnlEl.textContent = board.week.pnlMinusText
+  weekPctEl.textContent = board.week.pctParenText
   setTone(weekPnlEl, board.week.pnlTone)
-  weekPctEl.textContent = board.week.pctText
   orderCropEl.textContent = board.order.cropName
 }
 
@@ -198,16 +199,16 @@ function paintCrosshair (hit) {
   group.append(svgText(hit.title, {
     class: 'crosshair-title',
     x: card.left + 9,
-    y: card.top + 15
+    y: card.top + 18
   }))
   for (let index = 0; index < hit.rows.length; index += 1) {
     const row = hit.rows[index]
     const column = index % 2
     const line = Math.floor(index / 2)
     const x = card.left + 9 + column * (card.width / 2)
-    const y = card.top + 31 + line * 14
+    const y = card.top + 34 + line * 16
     group.append(svgText(row.label, { class: 'crosshair-label', x, y }))
-    group.append(svgText(row.text, { class: 'crosshair-value', x: x + 12, y }))
+    group.append(svgText(row.text, { class: 'crosshair-value', x: x + 14, y }))
   }
   chartEl.append(group)
 }
@@ -225,13 +226,15 @@ function chartPointOf (event) {
 
 function renderChart (board) {
   const chart = board.chart
+  // 票 89：作物 chip 支持任意数量；条本身横滚，不换行、不撑高（数量来自 payload）。
   cropTabsEl.textContent = ''
-  for (const choice of board.crops) {
+  for (const choice of board.cropStrip.items) {
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'crop-tab'
     button.dataset.crop = choice.id ?? ''
     button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
+    button.title = choice.name
     button.textContent = choice.label
     cropTabsEl.append(button)
   }
@@ -244,6 +247,8 @@ function renderChart (board) {
     button.dataset.timeframe = choice.id
     button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
     button.disabled = choice.disabled
+    // 禁用原因：老 payload 没有这个周期的图（新宿主四档都有）。
+    if (choice.disabled) button.title = '这个周期还没有图'
     button.textContent = choice.label
     timeframeTabsEl.append(button)
   }
@@ -265,17 +270,9 @@ function renderChart (board) {
   windEl.setAttribute('aria-label', '风向 ' + hint.label + ' ' + hint.confidenceText + '，' + hint.note)
   setTone(windEl, hint.tone)
   slotNoteEl.textContent = chart.slotText
-
-  legendEl.textContent = ''
-  for (const entry of chart.legend) {
-    const item = document.createElement('span')
-    const mark = document.createElement('i')
-    mark.className = entry.tone
-    const value = document.createElement('b')
-    value.textContent = entry.text
-    item.append(mark, document.createTextNode(entry.label + ' '), value)
-    legendEl.append(item)
-  }
+  // 票 89：没有独立的图例行；底价/入场/强平在图的右端各有标签，少一行小字。
+  updateCropArrows()
+  ensureCropVisible()
 
   // K 线：view 给的已经是 viewBox 坐标，这里只建元素，不做任何换算。
   chartEl.textContent = ''
@@ -294,7 +291,7 @@ function renderChart (board) {
   const plotRight = plot.left + plot.width
   const plotBottom = plot.top + plot.height
 
-  // 手绘滤镜只定义一次、只套在「墨迹层」；轴文字/图例/便签是另一层，永远清晰。
+  // 手绘滤镜只定义一次、只套在「墨迹层」；轴文字/参考线标签/便签是另一层，永远清晰。
   const defs = svgEl('defs', {})
   const filter = svgEl('filter', {
     id: geometry.sketch.filterId,
@@ -406,6 +403,8 @@ function renderChart (board) {
       height: candle.bodyHeight,
       rx: candle.sketch.bodyRadius,
       'stroke-width': candle.sketch.bodyStrokeWidth,
+      // 票 89：跌蜡烛空心；属性同时给测试和 CSS 一个明确的钩子（不只靠 class/颜色）。
+      'data-hollow': candle.hollow ? 'true' : 'false',
       transform: 'rotate(' + candle.sketch.tilt + ' ' + candle.centerX + ' ' +
         (candle.bodyTop + candle.bodyHeight / 2) + ')'
     })
@@ -414,6 +413,7 @@ function renderChart (board) {
   ink.append(plotInk)
 
   // 现价胶囊：贴纸 + 手绘引线，画在右侧价格轴槽里，不挡 K 线。
+  // 票 89：贴纸底画到清晰层（轴字之后），否则同一高度的轴刻度会从贴纸下面透出来（4.84 变成双影）。
   const tag = geometry.priceTag
   if (tag !== null) {
     ink.append(svgEl('path', {
@@ -421,15 +421,6 @@ function renderChart (board) {
       d: 'M ' + tag.leader.x1 + ' ' + tag.leader.y1 +
         ' Q ' + ((tag.leader.x1 + tag.leader.x2) / 2) + ' ' + (tag.leader.y1 - 5) +
         ' ' + tag.leader.x2 + ' ' + tag.leader.y2
-    }))
-    ink.append(svgEl('rect', {
-      class: 'price-tag ' + tag.tone,
-      x: tag.x,
-      y: tag.y,
-      width: tag.width,
-      height: tag.height,
-      rx: 8,
-      transform: 'rotate(-1.4 ' + (tag.x + tag.width / 2) + ' ' + tag.centerY + ')'
     }))
   }
   chartEl.append(ink)
@@ -491,11 +482,21 @@ function renderChart (board) {
       class: 'ref-label ref-label-' + line.key,
       'data-key': line.key,
       x: plotRight - 5,
-      y: line.y - 4,
+      // 票 89：标签 y 由视图错开过，避免入场贴着底价时两行字叠在一起。
+      y: line.labelY,
       'text-anchor': 'end'
     }))
   }
   if (tag !== null) {
+    crisp.append(svgEl('rect', {
+      class: 'price-tag ' + tag.tone,
+      x: tag.x,
+      y: tag.y,
+      width: tag.width,
+      height: tag.height,
+      rx: 8,
+      transform: 'rotate(-1.4 ' + (tag.x + tag.width / 2) + ' ' + tag.centerY + ')'
+    }))
     crisp.append(svgText(tag.text, {
       class: 'price-tag-text ' + tag.tone,
       x: tag.x + tag.width / 2,
@@ -539,6 +540,8 @@ function renderOrder (board) {
     button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
     button.disabled = choice.disabled
     button.textContent = choice.label
+    // 票 89：禁用态给一个看得见的理由（按钮 title + 下方 order-hint 的「差 N 硬币」）。
+    button.title = choice.disabled ? (choice.disabledReason ?? '') : ''
     marginRowEl.append(button)
   }
   leverageRowEl.textContent = ''
@@ -563,9 +566,10 @@ function renderOrder (board) {
   const limit = order.limit
   limitToggleEl.textContent = limit.toggleLabel
   limitToggleEl.setAttribute('aria-pressed', limitOpen ? 'true' : 'false')
-  limitNoteEl.textContent = limitOpen ? '开：到价才成交，收盘没成交自动撤' : '关：直接按现价开仓'
+  // 票 89：关着不写提示；开着只写可挂价格带（方向/自动撤单在 title 里）。
+  limitToggleEl.title = limit.noteTitle
+  limitNoteEl.textContent = limit.noteText
   limitBoxEl.hidden = !limitOpen
-  limitBandEl.textContent = limit.bandText === '' ? '' : '可挂 ' + limit.bandText
   limitHintEl.textContent = limit.hint
   limitPlaceEl.textContent = limit.placeLabel
   limitPlaceEl.disabled = pending || !limit.canPlace
@@ -578,10 +582,13 @@ function renderOrder (board) {
 }
 
 /**
- * 到价挂单列表（票 83）：方向/作物/杠杆、目标价、保证金、距收盘的剩余时间 + 撤单。
- * 剩余时间每秒由 `tick()` 按 `data-until` 重算，重画整张列表会把焦点弄丢。
+ * 到价挂单列表（票 83 / 票 89）：方向/作物/杠杆、目标价、保证金、距收盘的剩余时间 + 撤单。
+ * 票 89 把它从下单卡里搬出来：下单卡不滚动，挂单列表跟持仓在左列同一个滚动区，
+ * 有单才出现。剩余时间每秒由 `tick()` 按 `data-until` 重算，重画整张列表会把焦点弄丢。
  */
 function renderOrders (board) {
+  // 票 89：挂单跟持仓一起滚（左列），没有单时整块不占高度；下单卡因此永远不滚。
+  ordersWrapEl.hidden = board.orders.length === 0
   ordersEl.textContent = ''
   for (const row of board.orders) {
     const line = document.createElement('div')
@@ -613,8 +620,6 @@ function renderOrders (board) {
     ordersEl.append(line)
   }
   ordersMetaEl.textContent = board.ordersMetaText
-  ordersEmptyEl.hidden = board.orders.length > 0
-  ordersEmptyEl.textContent = board.hints.orders
 }
 
 function renderPositions (board) {
@@ -643,13 +648,16 @@ function renderPositions (board) {
     stop.setAttribute('aria-pressed', card.stopLevel === 0 ? 'false' : 'true')
     stop.disabled = !card.canStop
     stop.textContent = card.stopTitle
-    stop.title = '点一下切到下一档：关 / −25% / −50% / −100% 保证金'
+    stop.title = card.canStop
+      ? '点一下切到下一档：关 / −25% / −50% / −100% 保证金'
+      : '结算中，等一下'
     const close = document.createElement('button')
     close.type = 'button'
     close.className = 'ghost'
     close.dataset.close = card.id
     close.disabled = !card.canClose
     close.textContent = card.closeLabel
+    close.title = card.canClose ? '按现价平仓' : '结算中，等一下'
     right.append(pnl, stop, close)
     head.append(title, right)
 
@@ -663,6 +671,7 @@ function renderPositions (board) {
     row.append(head, meta)
     positionsEl.append(row)
   }
+  // 挂单数量在持仓卡里的「到价挂单」小标题上，卡头不重复写一遍。
   positionsMetaEl.textContent = board.positionsMetaText
   positionsEmptyEl.hidden = board.positions.length > 0
   positionsEmptyEl.textContent = board.hints.positions
@@ -672,7 +681,8 @@ function renderHistory (board) {
   historyEl.textContent = ''
   for (const row of board.history) {
     const line = document.createElement('div')
-    line.className = 'row'
+    // 票 89：结算行压成一行（标题 + 价格/原因/时间 + 盈亏），3 笔也能在 120px 里看全。
+    line.className = 'row history-row'
 
     const main = document.createElement('div')
     main.className = 'row-main'
@@ -753,10 +763,10 @@ function renderLeague (board) {
     line.append(main, score)
     leagueEl.append(line)
   }
-  leagueCountEl.textContent = league.countText
+  // 票 89：卡片头只留「情绪 观望」；「1 人」这种计数不再挤在标题行。
   sentimentEl.textContent = league.sentiment.text
   sentimentEl.dataset.tone = league.sentiment.tone
-  // 只有自己：榜照画（自己那行），下面补一句「还没有邻居上线…行情照走」。
+  // 只有自己：榜照画（自己那行），下面补一句「等邻居上线」。
   neighborEmptyEl.hidden = league.hasPeers
   neighborEmptyEl.textContent = league.empty
 }
@@ -769,6 +779,8 @@ function focusKeyOf (element) {
   if (element === null || element === undefined) return null
   if (element === submitEl) return 'submit'
   if (element === closeButton) return 'close-button'
+  if (element === cropPrevEl) return 'crop-prev'
+  if (element === cropNextEl) return 'crop-next'
   if (element === limitToggleEl) return 'limit-toggle'
   if (element === limitInputEl) return 'limit-input'
   if (element === limitPlaceEl) return 'limit-place'
@@ -786,7 +798,7 @@ function focusKeyOf (element) {
   return null
 }
 
-/** 焦点身份 → 回到哪个容器里找同名的按钮（`crop:tomato` → 页签组里的 tomato）。 */
+/** 焦点身份 → 回到哪个容器里找同名的按钮（`crop:tomato` → 作物条组里的 tomato）。 */
 const FOCUS_ROOTS = {
   crop: cropTabsEl,
   timeframe: timeframeTabsEl,
@@ -806,6 +818,8 @@ function focusElementOf (key) {
   if (key === null || key === undefined) return null
   if (key === 'submit') return submitEl
   if (key === 'close-button') return closeButton
+  if (key === 'crop-prev') return cropPrevEl
+  if (key === 'crop-next') return cropNextEl
   if (key === 'limit-toggle') return limitToggleEl
   if (key === 'limit-input') return limitInputEl
   if (key === 'limit-place') return limitPlaceEl
@@ -822,6 +836,56 @@ function focusElementOf (key) {
 function focusByKey (key) {
   const element = focusElementOf(key)
   if (element !== null) element.focus({ preventScroll: true })
+}
+
+/**
+ * 作物条（票 89）：左右箭头按**真实滚动位置**禁用，两端渐隐跟着亮灭。
+ * 纯视图的 `cropStripView().arrows` 只给首帧估算；DOM 量出来后以这里为准。
+ * 箭头被禁用时如果焦点正好在它身上，把焦点交给另一颗箭头（或当前 chip），
+ * 否则 Chrome 会把焦点丢回 body。实时更新只做这件事，不抢别的焦点。
+ */
+function updateCropArrows () {
+  const max = cropScrollEl.scrollWidth - cropScrollEl.clientWidth
+  const canLeft = max > 1 && cropScrollEl.scrollLeft > 1
+  const canRight = max > 1 && cropScrollEl.scrollLeft < max - 1
+  cropViewportEl.dataset.canLeft = canLeft ? 'true' : 'false'
+  cropViewportEl.dataset.canRight = canRight ? 'true' : 'false'
+  cropPrevEl.disabled = !canLeft
+  cropNextEl.disabled = !canRight
+  cropPrevEl.title = canLeft ? '上一组作物' : '已经是第一组'
+  cropNextEl.title = canRight ? '下一组作物' : '已经是最后一组'
+  if (cropPrevEl.disabled && document.activeElement === cropPrevEl) {
+    const fallback = cropNextEl.disabled ? cropTabsEl.querySelector('[data-crop]') : cropNextEl
+    if (fallback !== null) fallback.focus({ preventScroll: true })
+  } else if (cropNextEl.disabled && document.activeElement === cropNextEl) {
+    const fallback = cropPrevEl.disabled ? cropTabsEl.querySelector('[data-crop]') : cropPrevEl
+    if (fallback !== null) fallback.focus({ preventScroll: true })
+  }
+}
+
+/** 选中的 chip 滚进视野（只动作物条，不碰页面/焦点）。 */
+function ensureCropVisible () {
+  const chip = cropTabsEl.querySelector('[data-crop][aria-pressed="true"]')
+  if (chip === null || cropScrollEl.clientWidth <= 0) return
+  const left = chip.offsetLeft
+  const right = left + chip.offsetWidth
+  const viewLeft = cropScrollEl.scrollLeft
+  const viewRight = viewLeft + cropScrollEl.clientWidth
+  if (left < viewLeft + 6) {
+    cropScrollEl.scrollLeft = Math.max(0, left - 6)
+  } else if (right > viewRight - 6) {
+    cropScrollEl.scrollLeft = right - cropScrollEl.clientWidth + 6
+  }
+}
+
+/** 箭头翻一页（约 70% 视口宽）；用户要求减少动态时不滑。 */
+function scrollCropsBy (direction) {
+  const max = cropScrollEl.scrollWidth - cropScrollEl.clientWidth
+  if (max <= 1) return
+  const step = Math.max(120, Math.round(cropScrollEl.clientWidth * 0.7))
+  const reduced = typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches
+  cropScrollEl.scrollBy({ left: direction * step, behavior: reduced ? 'auto' : 'smooth' })
 }
 
 /**
@@ -870,7 +934,9 @@ function render () {
   applyTabOrder(payload)
   if (!focusedOnce && payload !== null) {
     focusedOnce = true
-    const first = cropTabsEl.querySelector('[data-crop]')
+    // 首帧把焦点放在**当前作物**上（不是第一颗）：键盘 ←/→ 从正在看的那一种开始。
+    const first = cropTabsEl.querySelector('[data-crop][aria-pressed="true"]') ??
+      cropTabsEl.querySelector('[data-crop]')
     if (first !== null) first.focus({ preventScroll: true })
     return
   }
@@ -938,6 +1004,44 @@ cropTabsEl.addEventListener('click', (event) => {
   render()
 })
 
+// 票 89：键盘 ←/→/Home/End 直接切作物（不用先 Tab 到 chip 再按空格）。
+cropTabsEl.addEventListener('keydown', (event) => {
+  if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' &&
+    event.key !== 'Home' && event.key !== 'End') return
+  const buttons = Array.from(cropTabsEl.querySelectorAll('[data-crop]'))
+  if (buttons.length === 0) return
+  const current = buttons.findIndex((button) => button.dataset.crop === crop)
+  const index = current < 0 ? 0 : current
+  let next = index
+  if (event.key === 'ArrowLeft') next = Math.max(0, index - 1)
+  else if (event.key === 'ArrowRight') next = Math.min(buttons.length - 1, index + 1)
+  else if (event.key === 'Home') next = 0
+  else next = buttons.length - 1
+  event.preventDefault()
+  if (next === index) return
+  const id = buttons[next].dataset.crop
+  crop = id
+  render()
+  // 重画把 chip 换掉了：把焦点放回**新的**那一颗（render 里的 focusByKey 只认得旧键）。
+  const target = Array.from(cropTabsEl.querySelectorAll('[data-crop]'))
+    .find((button) => button.dataset.crop === id)
+  if (target !== undefined) target.focus({ preventScroll: true })
+  ensureCropVisible()
+})
+
+cropPrevEl.addEventListener('click', () => scrollCropsBy(-1))
+cropNextEl.addEventListener('click', () => scrollCropsBy(1))
+cropScrollEl.addEventListener('scroll', updateCropArrows, { passive: true })
+// 鼠标滚轮在作物条上横滚（页面本身不滚；只有条真的溢出时才接管）。
+cropScrollEl.addEventListener('wheel', (event) => {
+  if (cropScrollEl.scrollWidth <= cropScrollEl.clientWidth) return
+  const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY
+  if (delta === 0) return
+  event.preventDefault()
+  cropScrollEl.scrollLeft += delta
+}, { passive: false })
+window.addEventListener('resize', updateCropArrows)
+
 // 票 84：切周期只换本地图，不重开窗、不请宿主刷新；结算是另一条路。
 timeframeTabsEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-timeframe]')
@@ -978,12 +1082,8 @@ leverageRowEl.addEventListener('click', (event) => {
 limitToggleEl.addEventListener('click', () => {
   limitOpen = !limitOpen
   render()
-  // 点开就聚焦到目标价：键盘用户少按一次 Tab。控件区变矮后会滚动，
-  // 这里把输入框滚到可见位置（只滚 order-scroll，不动整页）。
-  if (limitOpen) {
-    limitInputEl.focus({ preventScroll: true })
-    limitInputEl.scrollIntoView({ block: 'nearest', inline: 'nearest' })
-  }
+  // 点开就聚焦到目标价：键盘用户少按一次 Tab。下单卡本身不滚，不用再把它推进视野。
+  if (limitOpen) limitInputEl.focus({ preventScroll: true })
 })
 
 limitInputEl.addEventListener('input', () => {
