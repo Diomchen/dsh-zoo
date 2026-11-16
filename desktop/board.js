@@ -123,6 +123,13 @@ function svgEl (tag, attrs = {}) {
   return element
 }
 
+/** 轴/图例/便签都是文字：单独建 text 节点，不套手绘滤镜，保证清晰。 */
+function svgText (text, attrs = {}) {
+  const element = svgEl('text', attrs)
+  element.textContent = text
+  return element
+}
+
 function renderHeader (board) {
   const header = board.header
   titleEl.textContent = header.cropName === '—' ? '盘口' : '盘口 · ' + header.cropName
@@ -134,6 +141,86 @@ function renderHeader (board) {
   setTone(weekPnlEl, board.week.pnlTone)
   weekPctEl.textContent = board.week.pctText
   orderCropEl.textContent = board.order.cropName
+}
+
+/**
+ * 当前图的几何快照（viewBox 坐标）与指针位置（票 87）。
+ * 重画时按同一份几何重建十字线，鼠标不用再动一下；指针离开就清空。
+ */
+let chartGeometry = null
+let chartPointer = null
+
+/** 清掉旧十字线；`hit` 为空就只清不画。 */
+function paintCrosshair (hit) {
+  const previous = chartEl.querySelector('.chart-crosshair')
+  if (previous !== null) previous.remove()
+  if (hit === null || chartGeometry === null) return
+  const plot = chartGeometry.plot
+  const group = svgEl('g', { class: 'chart-crosshair' })
+  group.append(svgEl('rect', {
+    class: 'crosshair-highlight',
+    x: hit.highlight.x,
+    y: hit.highlight.y,
+    width: hit.highlight.width,
+    height: hit.highlight.height,
+    rx: 4
+  }))
+  group.append(svgEl('line', {
+    class: 'crosshair-line',
+    x1: hit.x,
+    y1: plot.top,
+    x2: hit.x,
+    y2: plot.top + plot.height
+  }))
+  group.append(svgEl('line', {
+    class: 'crosshair-line',
+    x1: plot.left,
+    y1: hit.y,
+    x2: plot.left + plot.width,
+    y2: hit.y
+  }))
+  const card = hit.card
+  group.append(svgEl('rect', {
+    class: 'crosshair-card',
+    x: card.left,
+    y: card.top,
+    width: card.width,
+    height: card.height,
+    rx: 9
+  }))
+  // 折角：便签右下角折一下，像真的被手贴上去。
+  group.append(svgEl('path', {
+    class: 'crosshair-fold',
+    d: 'M ' + (card.left + card.width - 14) + ' ' + (card.top + card.height) +
+      ' L ' + (card.left + card.width) + ' ' + (card.top + card.height - 14) +
+      ' L ' + (card.left + card.width) + ' ' + (card.top + card.height) + ' Z'
+  }))
+  group.append(svgText(hit.title, {
+    class: 'crosshair-title',
+    x: card.left + 9,
+    y: card.top + 15
+  }))
+  for (let index = 0; index < hit.rows.length; index += 1) {
+    const row = hit.rows[index]
+    const column = index % 2
+    const line = Math.floor(index / 2)
+    const x = card.left + 9 + column * (card.width / 2)
+    const y = card.top + 31 + line * 14
+    group.append(svgText(row.label, { class: 'crosshair-label', x, y }))
+    group.append(svgText(row.text, { class: 'crosshair-value', x: x + 12, y }))
+  }
+  chartEl.append(group)
+}
+
+/** 视口坐标 → viewBox 坐标（`preserveAspectRatio="none"` 时是线性缩放，直接乘）。 */
+function chartPointOf (event) {
+  if (chartGeometry === null) return null
+  const rect = chartEl.getBoundingClientRect()
+  if (rect.width <= 0 || rect.height <= 0) return null
+  return {
+    x: ((event.clientX - rect.left) / rect.width) * chartGeometry.width,
+    y: ((event.clientY - rect.top) / rect.height) * chartGeometry.height
+  }
 }
 
 function renderChart (board) {
@@ -196,37 +283,103 @@ function renderChart (board) {
   chartEl.hidden = !chart.hasChart
   const geometry = chart.geometry
   if (geometry === null) {
+    chartGeometry = null
+    chartPointer = null
     chartEmptyEl.textContent = chart.emptyText
     return
   }
+  chartGeometry = geometry
   chartEl.setAttribute('viewBox', '0 0 ' + geometry.width + ' ' + geometry.height)
-  for (const y of geometry.grid) {
-    chartEl.append(svgEl('line', {
+  const plot = geometry.plot
+  const plotRight = plot.left + plot.width
+  const plotBottom = plot.top + plot.height
+
+  // 手绘滤镜只定义一次、只套在「墨迹层」；轴文字/图例/便签是另一层，永远清晰。
+  const defs = svgEl('defs', {})
+  const filter = svgEl('filter', {
+    id: geometry.sketch.filterId,
+    x: '-6%',
+    y: '-6%',
+    width: '112%',
+    height: '112%'
+  })
+  filter.append(svgEl('feTurbulence', {
+    type: 'fractalNoise',
+    baseFrequency: geometry.sketch.baseFrequency,
+    numOctaves: geometry.sketch.numOctaves,
+    seed: geometry.sketch.seed,
+    result: 'ink-noise'
+  }))
+  filter.append(svgEl('feDisplacementMap', {
+    in: 'SourceGraphic',
+    in2: 'ink-noise',
+    scale: geometry.sketch.scale,
+    xChannelSelector: 'R',
+    yChannelSelector: 'G'
+  }))
+  defs.append(filter)
+  const clip = svgEl('clipPath', { id: 'plot-clip' })
+  clip.append(svgEl('rect', {
+    x: plot.left,
+    y: plot.top,
+    width: plot.width,
+    height: plot.height
+  }))
+  defs.append(clip)
+  chartEl.append(defs)
+
+  chartEl.append(svgEl('rect', {
+    class: 'chart-paper',
+    x: 1,
+    y: 1,
+    width: geometry.width - 2,
+    height: geometry.height - 2,
+    rx: 12
+  }))
+
+  const ink = svgEl('g', {
+    class: 'chart-ink',
+    filter: geometry.sketch.filter
+  })
+  // 网格/参考线/蜡烛裁在绘图区里；价格胶囊画在右侧轴槽，不能被裁掉。
+  const plotInk = svgEl('g', { 'clip-path': 'url(#plot-clip)' })
+  for (const tick of geometry.priceTicks) {
+    plotInk.append(svgEl('line', {
       class: 'grid',
-      x1: geometry.plot.left,
-      x2: geometry.plot.left + geometry.plot.width,
-      y1: y,
-      y2: y,
+      x1: plot.left,
+      x2: plotRight,
+      y1: tick.y,
+      y2: tick.y,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+  }
+  for (const tick of geometry.timeTicks) {
+    plotInk.append(svgEl('line', {
+      class: 'grid',
+      x1: tick.x,
+      x2: tick.x,
+      y1: plot.top,
+      y2: plotBottom,
       'vector-effect': 'non-scaling-stroke'
     }))
   }
   for (const line of geometry.lines) {
     if (line.visible !== true) continue
-    chartEl.append(svgEl('line', {
+    plotInk.append(svgEl('line', {
       class: 'ref',
       'data-key': line.key,
-      x1: geometry.plot.left,
-      x2: geometry.plot.left + geometry.plot.width,
+      x1: plot.left,
+      x2: plotRight,
       y1: line.y,
       y2: line.y,
       'vector-effect': 'non-scaling-stroke'
     }))
   }
   if (geometry.priceLine !== null) {
-    chartEl.append(svgEl('line', {
+    plotInk.append(svgEl('line', {
       class: 'price-line',
-      x1: geometry.plot.left,
-      x2: geometry.plot.left + geometry.plot.width,
+      x1: plot.left,
+      x2: plotRight,
       y1: geometry.priceLine.y,
       y2: geometry.priceLine.y,
       'vector-effect': 'non-scaling-stroke'
@@ -235,12 +388,14 @@ function renderChart (board) {
   const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
   for (const candle of candles) {
     const tone = candle.up ? 'up' : 'down'
-    chartEl.append(svgEl('line', {
+    plotInk.append(svgEl('line', {
       class: 'wick ' + tone,
       x1: candle.centerX,
       x2: candle.centerX,
       y1: candle.wickTop,
       y2: candle.wickBottom,
+      'stroke-width': candle.sketch.wickWidth,
+      'stroke-linecap': geometry.sketch.lineCap,
       'vector-effect': 'non-scaling-stroke'
     }))
     const body = svgEl('rect', {
@@ -249,9 +404,112 @@ function renderChart (board) {
       y: candle.bodyTop,
       width: candle.width,
       height: candle.bodyHeight,
-      rx: 1
+      rx: candle.sketch.bodyRadius,
+      'stroke-width': candle.sketch.bodyStrokeWidth,
+      transform: 'rotate(' + candle.sketch.tilt + ' ' + candle.centerX + ' ' +
+        (candle.bodyTop + candle.bodyHeight / 2) + ')'
     })
-    chartEl.append(body)
+    plotInk.append(body)
+  }
+  ink.append(plotInk)
+
+  // 现价胶囊：贴纸 + 手绘引线，画在右侧价格轴槽里，不挡 K 线。
+  const tag = geometry.priceTag
+  if (tag !== null) {
+    ink.append(svgEl('path', {
+      class: 'price-leader',
+      d: 'M ' + tag.leader.x1 + ' ' + tag.leader.y1 +
+        ' Q ' + ((tag.leader.x1 + tag.leader.x2) / 2) + ' ' + (tag.leader.y1 - 5) +
+        ' ' + tag.leader.x2 + ' ' + tag.leader.y2
+    }))
+    ink.append(svgEl('rect', {
+      class: 'price-tag ' + tag.tone,
+      x: tag.x,
+      y: tag.y,
+      width: tag.width,
+      height: tag.height,
+      rx: 8,
+      transform: 'rotate(-1.4 ' + (tag.x + tag.width / 2) + ' ' + tag.centerY + ')'
+    }))
+  }
+  chartEl.append(ink)
+
+  // 轴与标签：刻度线进墨迹层（会轻微抖），轴文字在清晰层（不抖）。
+  const crisp = svgEl('g', { class: 'chart-crisp' })
+  const ticksInk = svgEl('g', {})
+  ticksInk.append(svgEl('line', {
+    class: 'axis-line',
+    x1: plotRight,
+    x2: plotRight,
+    y1: plot.top,
+    y2: plotBottom,
+    'vector-effect': 'non-scaling-stroke'
+  }))
+  ticksInk.append(svgEl('line', {
+    class: 'axis-line',
+    x1: plot.left,
+    x2: plotRight,
+    y1: plotBottom,
+    y2: plotBottom,
+    'vector-effect': 'non-scaling-stroke'
+  }))
+  for (const tick of geometry.priceTicks) {
+    ticksInk.append(svgEl('line', {
+      class: 'axis-tick',
+      x1: plotRight,
+      x2: plotRight + 4,
+      y1: tick.y,
+      y2: tick.y,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+    crisp.append(svgText(tick.text, {
+      class: 'axis-text axis-price',
+      x: plotRight + 8,
+      y: tick.y + 3
+    }))
+  }
+  for (const tick of geometry.timeTicks) {
+    ticksInk.append(svgEl('line', {
+      class: 'axis-tick',
+      x1: tick.x,
+      x2: tick.x,
+      y1: plotBottom,
+      y2: plotBottom + 3,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+    crisp.append(svgText(tick.text, {
+      class: 'axis-text axis-time',
+      x: tick.x,
+      y: plotBottom + 15,
+      'text-anchor': tick.anchor
+    }))
+  }
+  // 参考线在右端写一次名字+价格：轴上看得出底价/入场/强平分别是哪条。
+  for (const line of geometry.lines) {
+    if (line.visible !== true) continue
+    crisp.append(svgText(line.label + ' ' + line.text, {
+      class: 'ref-label ref-label-' + line.key,
+      'data-key': line.key,
+      x: plotRight - 5,
+      y: line.y - 4,
+      'text-anchor': 'end'
+    }))
+  }
+  if (tag !== null) {
+    crisp.append(svgText(tag.text, {
+      class: 'price-tag-text ' + tag.tone,
+      x: tag.x + tag.width / 2,
+      y: tag.centerY + 3.5,
+      'text-anchor': 'middle',
+      transform: 'rotate(-1.4 ' + (tag.x + tag.width / 2) + ' ' + tag.centerY + ')'
+    }))
+  }
+  ink.append(ticksInk)
+  chartEl.append(crisp)
+
+  // 重画后按上一次的指针位置补回十字线（宿主每分钟推一包，鼠标不用重新动）。
+  if (chartPointer !== null) {
+    paintCrosshair(view.crosshairAt(geometry, chartPointer.x, chartPointer.y))
   }
 }
 
@@ -659,6 +917,20 @@ function submitAction (action) {
   api.submit(action)
 }
 
+// 票 87：十字线只改 SVG 里的一个覆盖层，不重画整窗、不触发任何 IPC。
+chartEl.addEventListener('pointermove', (event) => {
+  if (chartGeometry === null) return
+  const point = chartPointOf(event)
+  if (point === null) return
+  chartPointer = point
+  paintCrosshair(view.crosshairAt(chartGeometry, point.x, point.y))
+})
+
+chartEl.addEventListener('pointerleave', () => {
+  chartPointer = null
+  paintCrosshair(null)
+})
+
 cropTabsEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-crop]')
   if (button === null || button.dataset.crop === '') return
@@ -706,8 +978,12 @@ leverageRowEl.addEventListener('click', (event) => {
 limitToggleEl.addEventListener('click', () => {
   limitOpen = !limitOpen
   render()
-  // 点开就聚焦到目标价：键盘用户少按一次 Tab（输入框此前是 hidden，焦点本来也不在那儿）。
-  if (limitOpen) limitInputEl.focus({ preventScroll: true })
+  // 点开就聚焦到目标价：键盘用户少按一次 Tab。控件区变矮后会滚动，
+  // 这里把输入框滚到可见位置（只滚 order-scroll，不动整页）。
+  if (limitOpen) {
+    limitInputEl.focus({ preventScroll: true })
+    limitInputEl.scrollIntoView({ block: 'nearest', inline: 'nearest' })
+  }
 })
 
 limitInputEl.addEventListener('input', () => {

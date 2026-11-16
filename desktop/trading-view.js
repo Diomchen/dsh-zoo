@@ -38,10 +38,43 @@
    * 三个作物共用同一根，所以倒计时其实只用 `bar.end`，这里只兜底老 payload。
    */
   const SLOT_MS = 15 * MINUTE_MS
-  /** K 线的 viewBox 尺寸：窗口 760×700 时左栏卡片内宽约 384px、图高 188px，1 单位≈1px。 */
-  const CHART_WIDTH = 384
-  const CHART_HEIGHT = 188
+  /**
+   * 票 87：图占满窗口宽度（盘口窗固定 760×700，左右各留 8px 外框 + 12px 内边距），
+   * 1 单位≈1px。`CHART_PADDING` 仍是纯价格映射的旧默认值（老测试/调用直接量 viewBox 时用它），
+   * 轴与价格标签的留白由 `CHART_AXIS_PADDING` 在 `chartView` 里显式传入。
+   */
+  const BOARD_WIDTH = 760
+  const BOARD_HEIGHT = 700
+  const CHART_WIDTH = 720
+  const CHART_HEIGHT = 280
   const CHART_PADDING = Object.freeze({ top: 8, right: 4, bottom: 6, left: 4 })
+  /** 右侧价格轴 + 底部时间轴的留白；文字不套滤镜，所以轴标签不会被画出锯齿。 */
+  const CHART_AXIS_PADDING = Object.freeze({ top: 14, right: 62, bottom: 26, left: 10 })
+  /**
+   * 手绘笔触：`feTurbulence` 出噪声、`feDisplacementMap` 把线条轻微推歪。
+   * 种子/幅度固定（不随重画变化），所以同一张图每次截图都一样；文字不进这层滤镜。
+   */
+  const SKETCH = Object.freeze({
+    filterId: 'sketch-ink',
+    seed: 7,
+    scale: 1.7,
+    baseFrequency: '0.02 0.032',
+    numOctaves: 2,
+    lineCap: 'round'
+  })
+  /** 版面：图表独占一行，下面两列（左持仓/结算，右下单/周榜）。DOM 顺序仍按 Tab 顺序。 */
+  const LAYOUT = Object.freeze({
+    board: Object.freeze({ width: BOARD_WIDTH, height: BOARD_HEIGHT }),
+    chart: Object.freeze({
+      width: CHART_WIDTH,
+      height: CHART_HEIGHT,
+      fullWidth: true
+    }),
+    columns: Object.freeze({
+      left: Object.freeze(['positions', 'history']),
+      right: Object.freeze(['order', 'league'])
+    })
+  })
   /** 兜底白名单：宿主每一包都会带 `limits`，这里只在极端情况下（老宿主/坏包）用。 */
   const FALLBACK_LIMITS = Object.freeze({
     margins: Object.freeze([50, 100, 250]),
@@ -471,6 +504,7 @@
     if (bars.length === 0 && current === null) return null
     const width = Math.max(80, toNumber(options.width) ?? CHART_WIDTH)
     const height = Math.max(60, toNumber(options.height) ?? CHART_HEIGHT)
+    const timeframe = typeof options.timeframe === 'string' ? options.timeframe : CONTRACT_TIMEFRAME
     const padding = { ...CHART_PADDING, ...(options.padding ?? {}) }
     const plot = {
       left: padding.left,
@@ -517,26 +551,35 @@
     const yOf = (value) => plot.top + ((max - value) / span) * plot.height
     // 一根蜡烛 = 一根影线（高→低）+ 一个实体（开→收）；实体至少 1px，否则平盘那根会消失。
     const total = bars.length + (current === null ? 0 : 1)
+    const slotWidth = plot.width / Math.max(1, total)
     const toBody = (open, close, slot, index) => {
-      const slotWidth = plot.width / Math.max(1, total)
       const bodyWidth = Math.max(2, Math.min(14, slotWidth * 0.62))
       const centerX = plot.left + slotWidth * (index + 0.5)
       const openY = yOf(open)
       const closeY = yOf(close)
       return {
+        index,
         slot,
+        open,
+        close,
         centerX,
         x: centerX - bodyWidth / 2,
         width: bodyWidth,
         bodyTop: Math.min(openY, closeY),
         bodyHeight: Math.max(1, Math.abs(closeY - openY)),
-        up: close >= open
+        up: close >= open,
+        // 票 87：每根蜡烛的墨水参数（粗细/圆角/倾斜）都由确定性哈希给出。
+        sketch: candleSketchOf(index, slot)
       }
     }
     const scaled = bars.map((bar, index) => {
       const body = toBody(bar.open, bar.close, bar.slot, index)
       return {
         ...body,
+        start: toNumber(bar.start),
+        end: toNumber(bar.end),
+        high: bar.high,
+        low: bar.low,
         wickTop: yOf(bar.high),
         wickBottom: yOf(bar.low)
       }
@@ -545,11 +588,16 @@
       ? null
       : {
           ...toBody(current.open, current.price, current.slot, bars.length),
+          start: toNumber(current.start),
+          end: toNumber(current.end),
+          high: current.high,
+          low: current.low,
           wickTop: yOf(current.high),
           wickBottom: yOf(current.low),
           price: current.price,
           tick: toNumber(current.tick) ?? 0
         }
+    const lineLabels = { base: '底价', entry: '入场', liquidation: '强平' }
     const lines = [
       { key: 'base', value: Number.isFinite(base) ? base : null },
       { key: 'entry', value: entry },
@@ -560,21 +608,35 @@
       const visible = line.value >= min && line.value <= max
       return {
         ...line,
+        label: lineLabels[line.key],
+        text: formatPrice(line.value),
         y: visible ? y : null,
         visible
       }
     })
-    return {
+    const geometry = {
       width,
       height,
       plot,
       domain: { min, max },
+      timeframe,
+      slotWidth,
       bars: scaled,
       forming,
       lines,
       priceLine: current === null ? null : { value: current.price, y: yOf(current.price) },
-      grid: [plot.top, plot.top + plot.height / 2, plot.top + plot.height]
+      grid: [plot.top, plot.top + plot.height / 2, plot.top + plot.height],
+      sketch: {
+        ...SKETCH,
+        // 让 DOM 只引用一次 `url(#sketch-ink)`：滤镜只套在网格/参考线/蜡烛这一层。
+        filter: 'url(#' + SKETCH.filterId + ')'
+      }
     }
+    geometry.axes = chartAxes(geometry, timeframe)
+    geometry.priceTicks = geometry.axes.price
+    geometry.timeTicks = geometry.axes.time
+    geometry.priceTag = priceTagOf(geometry)
+    return geometry
   }
 
   /**
@@ -660,6 +722,235 @@
   }
 
   /**
+   * 时间轴的刻度文案（票 87）：比便签/标题更短，3–5 个才排得下。
+   * 15 分写「11:30–11:45」（一根的完整区间，和工单示例一致）；1 时只写起点
+   * 「14:00」；1 日/1 周写「11月16日」。四档都不是绝对根号，换时区也不会漂。
+   */
+  function timeTickLabelOf (timeframe, start, end) {
+    const startMs = toNumber(start)
+    if (startMs === null) return '—'
+    if (timeframe === '1h') return formatClock(startMs)
+    if (timeframe === '1d' || timeframe === '1w') return formatMonthDay(startMs)
+    return timeLabelOf(timeframe, start, end)
+  }
+
+  /**
+   * 手绘用的确定性抖动量（票 87）：只吃根序号/slot，不读随机数、不读时钟。
+   * 这样同一张图每次重画/截图都完全一样，Node 测试也能断言「笔触有变化但可复现」。
+   * 用 Math.imul 做 32 位乘法，避免大数在 JS 里丢精度。
+   */
+  function sketchHashOf (index, slot) {
+    let hash = Math.imul(index + 1, 0x9e3779b1)
+    if (Number.isFinite(slot)) hash = Math.imul(hash ^ (Math.floor(slot) & 0xffff), 0x85ebca6b)
+    hash ^= hash >>> 13
+    hash = Math.imul(hash, 0xc2b2ae35)
+    hash ^= hash >>> 16
+    return hash >>> 0
+  }
+
+  /** 一根蜡烛的「墨水参数」：影线粗细、实体圆角、轻微倾斜。范围写死在测试里。 */
+  function candleSketchOf (index, slot) {
+    const hash = sketchHashOf(index, slot)
+    return {
+      // 1.3–1.9px：同一张图里有粗有细，像不同力度落笔，但不至于断线。
+      wickWidth: Number((1.3 + (hash % 7) * 0.1).toFixed(2)),
+      // 2–3px 圆角：卡通手绘的实体不是直角方块。
+      bodyRadius: 2 + (hash % 2),
+      // ±0.6°：只歪一点点，横排看仍是一条时间轴。
+      tilt: Number(((((hash >>> 3) % 9) - 4) * 0.15).toFixed(2)),
+      bodyStrokeWidth: Number((0.7 + ((hash >>> 5) % 3) * 0.15).toFixed(2))
+    }
+  }
+
+  /**
+   * 价格轴（票 87）：4–5 档，包含最高/最低（y 与 plot 顶/底重合）。
+   * 文案统一走 `formatPrice`，与图例、持仓卡的数字口径一致。
+   */
+  function priceTicksOf (plot, domain) {
+    const count = plot.height >= 240 ? 5 : 4
+    const ticks = []
+    for (let index = 0; index < count; index += 1) {
+      const ratio = index / (count - 1)
+      const value = domain.max - (domain.max - domain.min) * ratio
+      ticks.push({
+        value,
+        y: plot.top + plot.height * ratio,
+        text: formatPrice(value)
+      })
+    }
+    return ticks
+  }
+
+  /**
+   * 时间轴（票 87）：从有 `start` 的蜡烛里等距挑 3–5 根，取实体中心 x。
+   * 老宿主没有 start/end 时整条轴留空（不画「—」占位）——图还能看，只是没有时间刻度。
+   */
+  function timeTicksOf (plot, candles, timeframe) {
+    const timed = candles.filter((candle) => toNumber(candle.start) !== null)
+    if (timed.length === 0) return []
+    const desired = plot.width >= 560 ? 5 : 4
+    const count = Math.min(desired, timed.length)
+    if (count <= 0) return []
+    const ticks = []
+    for (let index = 0; index < count; index += 1) {
+      const position = count === 1
+        ? 0
+        : Math.round((index * (timed.length - 1)) / (count - 1))
+      const candle = timed[position]
+      const x = candle.centerX
+      if (ticks.some((tick) => Math.abs(tick.x - x) < 1)) continue
+      ticks.push({
+        x,
+        text: timeTickLabelOf(timeframe, candle.start, candle.end),
+        index: candle.index,
+        // 首尾刻度贴边：DOM 用 text-anchor 让标签留在画布内。
+        anchor: index === 0 ? 'start' : index === count - 1 ? 'end' : 'middle'
+      })
+    }
+    return ticks
+  }
+
+  /** 轴刻度的公开入口：DOM 只读，不在窗口里重算价格/时间格式。 */
+  function chartAxes (geometry, timeframe = CONTRACT_TIMEFRAME) {
+    if (geometry === null || typeof geometry !== 'object') return { price: [], time: [] }
+    const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
+    return {
+      price: priceTicksOf(geometry.plot, geometry.domain),
+      time: timeTicksOf(geometry.plot, candles, timeframe)
+    }
+  }
+
+  /**
+   * 现价胶囊（票 87）：贴在右侧价格轴里，跟随**最后一根**的收盘/现价。
+   * 画在轴槽里，不压 K 线；引线从最后一根实体指向胶囊，像贴纸被人用笔连过去。
+   * 轴槽只有 62px 宽，胶囊宽度按 `formatPrice` 的实际字符数收窄/放宽。
+   */
+  function priceTagOf (geometry) {
+    if (geometry === null || typeof geometry !== 'object') return null
+    const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
+    const last = candles[candles.length - 1]
+    if (last === undefined) return null
+    const value = geometry.forming === null ? last.close : geometry.forming.price
+    if (!Number.isFinite(value)) return null
+    const span = geometry.domain.max - geometry.domain.min
+    const y = span <= 0
+      ? geometry.plot.top + geometry.plot.height / 2
+      : geometry.plot.top + ((geometry.domain.max - value) / span) * geometry.plot.height
+    const text = formatPrice(value)
+    const width = Math.max(42, text.length * 6.2 + 14)
+    const height = 19
+    const left = Math.min(
+      geometry.width - width - 3,
+      geometry.plot.left + geometry.plot.width + 5
+    )
+    const top = Math.max(
+      geometry.plot.top,
+      Math.min(geometry.plot.top + geometry.plot.height - height, y - height / 2)
+    )
+    return {
+      value,
+      text,
+      tone: last.up ? 'up' : 'down',
+      x: left,
+      y: top,
+      width,
+      height,
+      centerY: top + height / 2,
+      // 引线从左端出发，落到最后一根实体/影线的中段（看起来像手画的指引）。
+      leader: {
+        x1: last.centerX,
+        y1: Math.max(last.wickTop, Math.min(last.wickBottom, y)),
+        x2: left,
+        y2: top + height / 2
+      }
+    }
+  }
+
+  function clampNumber (value, min, max) {
+    return Math.max(min, Math.min(max, value))
+  }
+
+  /**
+   * 十字线（票 87）：x 吸附最近一根蜡烛；y 跟指针但夹在绘图区里。
+   * 返回便签的全部内容（时间 + 开/高/低/收）与已经夹进 plot 的坐标，
+   * 窗口只按这些字段画线/画卡，不再做命中或排版计算。
+   */
+  function crosshairAt (geometry, x, y = null) {
+    if (geometry === null || typeof geometry !== 'object') return null
+    const pointerX = toNumber(x)
+    if (pointerX === null) return null
+    const plot = geometry.plot
+    if (pointerX < plot.left || pointerX > plot.left + plot.width) return null
+    const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
+    if (candles.length === 0) return null
+    let nearest = candles[0]
+    let nearestIndex = 0
+    for (let index = 1; index < candles.length; index += 1) {
+      if (Math.abs(candles[index].centerX - pointerX) < Math.abs(nearest.centerX - pointerX)) {
+        nearest = candles[index]
+        nearestIndex = index
+      }
+    }
+    const pointerY = toNumber(y)
+    const crosshairY = pointerY === null
+      ? clampNumber(nearest.bodyTop + nearest.bodyHeight / 2, plot.top, plot.top + plot.height)
+      : clampNumber(pointerY, plot.top, plot.top + plot.height)
+    const forming = geometry.forming !== null && nearestIndex === candles.length - 1
+    const close = forming ? geometry.forming.price : nearest.close
+    const values = {
+      open: nearest.open,
+      high: nearest.high,
+      low: nearest.low,
+      close
+    }
+    const timeText = timeLabelOf(geometry.timeframe, nearest.start, nearest.end)
+    const rows = [
+      { key: 'open', label: '开', text: formatPrice(values.open) },
+      { key: 'high', label: '高', text: formatPrice(values.high) },
+      { key: 'low', label: '低', text: formatPrice(values.low) },
+      { key: 'close', label: '收', text: formatPrice(values.close) }
+    ]
+    const text = timeText + ' 开 ' + formatPrice(values.open) + ' 高 ' + formatPrice(values.high) +
+      ' 低 ' + formatPrice(values.low) + ' 收 ' + formatPrice(values.close)
+    const cardWidth = Math.min(188, Math.max(96, plot.width - 8))
+    const cardHeight = Math.min(66, Math.max(40, plot.height - 8))
+    // 便签放指针右上方；靠右就翻到左边，靠上就翻到下面，最后再整体夹进绘图区。
+    let left = nearest.centerX + 12
+    if (left + cardWidth > plot.left + plot.width - 4) left = nearest.centerX - cardWidth - 12
+    left = clampNumber(left, plot.left + 4, plot.left + plot.width - cardWidth - 4)
+    let top = crosshairY - cardHeight - 10
+    if (top < plot.top + 4) top = crosshairY + 12
+    top = clampNumber(top, plot.top + 4, plot.top + plot.height - cardHeight - 4)
+    return {
+      index: nearestIndex,
+      slot: nearest.slot,
+      forming,
+      x: nearest.centerX,
+      y: crosshairY,
+      candle: nearest,
+      timeText,
+      title: timeText + (forming ? ' · 进行中' : ''),
+      rows,
+      text,
+      card: {
+        left,
+        top,
+        width: cardWidth,
+        height: cardHeight,
+        timeText,
+        rows,
+        text
+      },
+      highlight: {
+        x: nearest.x - 2,
+        y: nearest.wickTop - 2,
+        width: nearest.width + 4,
+        height: Math.max(4, nearest.wickBottom - nearest.wickTop + 4)
+      }
+    }
+  }
+
+  /**
    * 一张图的全部内容：作物/周期页签、价格、图例、时间标签与几何。
    * `hasChart:false` 时 `geometry:null` + 一句空态（老宿主/坏包不会白屏）。
    *
@@ -689,6 +980,9 @@
       : chartGeometry(chart, {
         width,
         height,
+        // 轴/价格胶囊的留白只属于窗口版式；直接调 chartGeometry 的纯映射保持旧默认。
+        padding: CHART_AXIS_PADDING,
+        timeframe: period,
         entry: references.entry,
         liquidation: references.liquidation
       })
@@ -718,7 +1012,8 @@
         text: SETTLE_NOTE_TEXT,
         visible: !onContractBar
       },
-      ariaLabel: label + ' K 线：' + (onContractBar ? '底价、入场、强平参考线' : '只画底价线，看趋势'),
+      ariaLabel: label + ' K 线：' + (onContractBar ? '底价、入场、强平参考线' : '只画底价线，看趋势') +
+        '；右侧价格轴、底部时间轴，悬停看每根 OHLC',
       reference: references.reference,
       entry: references.entry,
       liquidation: references.liquidation,
@@ -1210,8 +1505,14 @@
   }
 
   return {
+    BOARD_WIDTH,
+    BOARD_HEIGHT,
     CHART_WIDTH,
     CHART_HEIGHT,
+    CHART_PADDING,
+    CHART_AXIS_PADDING,
+    LAYOUT,
+    SKETCH,
     formatCoins,
     formatCountdown,
     formatPrice,
@@ -1219,6 +1520,8 @@
     formatTrim,
     reasonText,
     cropNameOf,
+    timeLabelOf,
+    timeTickLabelOf,
     stopLevels,
     stopLabel,
     nextStopLevel,
@@ -1226,6 +1529,10 @@
     hintView,
     headerView,
     chartGeometry,
+    chartAxes,
+    priceTagOf,
+    crosshairAt,
+    candleSketchOf,
     chartView,
     previewView,
     orderView,
