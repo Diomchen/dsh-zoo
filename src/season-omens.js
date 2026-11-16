@@ -6,9 +6,9 @@
  * 来客窗口里还可以临时雇 1～2 名守卫：每名 +0.5，最高 1.0。
  * 来客不是偷菜：守卫成功 = 偷菜判定失败。
  *
- * 票 74 起四季各有一位来客；蛙雨/野火在当天随机一个整分钟出现，熊獾/巨鹿固定在
- * 本地 15:00 出现，二者都持续 3 小时。这样重启、换窗口、多开都不会让来客时间漂移；
- * 同一天同一季的玩家看到的是同一个窗口。
+ * 票 74 起四季各有一位来客；蛙雨/野火在本地 09:00～19:00 之间随机一个整分钟出现，
+ * 熊獾/巨鹿固定在本地 15:00 出现，二者都持续 3 小时。这样重启、换窗口、多开都不会让
+ * 来客时间漂移；同一天同一季的玩家看到的是同一个窗口。
  */
 import { HOUR_MS, MINUTE_MS } from './season-rules.js'
 import { stealSucceeds } from './farm-rules.js'
@@ -25,7 +25,7 @@ const DEFS = Object.freeze({
     emoji: '🐸',
     season: 'spring',
     tag: '春夜来客',
-    window: Object.freeze({ mode: 'random' }),
+    window: Object.freeze({ mode: 'random', fromHour: 9, toHour: 19 }),
     guard: Object.freeze({
       label: '赶走',
       detail: '带人把蛙群赶回田外；失败会踩坏两块正在长的地。'
@@ -46,7 +46,7 @@ const DEFS = Object.freeze({
     emoji: '🔥',
     season: 'summer',
     tag: '夏夜来客',
-    window: Object.freeze({ mode: 'random' }),
+    window: Object.freeze({ mode: 'random', fromHour: 9, toHour: 19 }),
     guard: Object.freeze({
       label: '隔离',
       detail: '抢在火势蔓延前清出隔离带；失败会烧掉两块成熟作物。'
@@ -186,7 +186,7 @@ function hash32 (text) {
 }
 
 /**
- * 蛙雨/野火：当天 00:00～21:00 之间的某个整分钟，持续 3 小时；用「当天 start + 来客 id」
+ * 蛙雨/野火：本地 09:00～19:00 之间的某个整分钟开始，持续 3 小时；用「当天 start + 来客 id」
  * 做稳定散列，避免 Math.random 在重启后换时间。
  * 熊獾/巨鹿：固定本地 15:00 开始，持续 3 小时。
  */
@@ -200,12 +200,22 @@ export function omenWindowFor (season, meta = omenFor(season?.id)) {
     const from = Math.min(Math.max(start, fixed.getTime()), Math.max(start, end - OMEN_WINDOW_MS))
     return { start: from, end: Math.min(end, from + OMEN_WINDOW_MS) }
   }
-  const room = Math.max(0, end - start - OMEN_WINDOW_MS)
+  const fromHour = Number(meta.window?.fromHour)
+  const toHour = Number(meta.window?.toHour)
+  const dayStart = new Date(start)
+  const earliest = new Date(dayStart)
+  earliest.setHours(Number.isFinite(fromHour) ? fromHour : 9, 0, 0, 0)
+  const latest = new Date(dayStart)
+  latest.setHours(Number.isFinite(toHour) ? toHour : 19, 0, 0, 0)
+  const room = Math.max(0, latest.getTime() - earliest.getTime())
   const slots = Math.floor(room / MINUTE_MS)
   const offset = slots > 0
     ? (hash32(start + ':' + meta.id) % (slots + 1)) * MINUTE_MS
     : 0
-  const from = start + offset
+  const from = Math.min(
+    Math.max(start, earliest.getTime() + offset),
+    Math.max(start, end - OMEN_WINDOW_MS)
+  )
   return { start: from, end: Math.min(end, from + OMEN_WINDOW_MS) }
 }
 

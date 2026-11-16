@@ -20,7 +20,7 @@
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
-农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 待机 / 露水”同义。
+农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
 
 ## Language
 
@@ -226,12 +226,15 @@ _Avoid_: 订单, 协议, order, deal
 宠物在家时对农场的保护；它出门串门或在外打工时失效。
 _Avoid_: 防守, 保安, defend, protect
 
-**待机 (Idle)**：
-DSH 开着、主人 10 分钟没做过农场动作的状态；它攒“露水”，给农场加成。
-_Avoid_: 挂机, 闲置, AFK
+**在线 (Online)**：
+DSH 开着就累计“露水”，不再要求“没做农场动作”；种/收/浇/施肥/买卖/雇佣都不打断计时。
+代码里的 `idle` 是历史命名，语义已放宽为“DSH 在线”。
+_Avoid_: 待机, 挂机, AFK
 
 **露水 (Dew)**：
-待机攒出来的资源，用来浇水/施肥；有每日上限。
+在线累计的资源，用来浇水/施肥；每天最多新增 48，余额也封顶 48。
+本地午夜只重置“今天已挣”的额度，保留未花完的余额
+（[ADR-0024](docs/adr/0024-dew-accrues-while-online.md)）。
 _Avoid_: 能量, 体力, energy, water
 
 **离线生长 (Offline Growth)**：
@@ -267,7 +270,7 @@ _Avoid_: 死亡, 烂掉, dead, rotten
 _Avoid_: 活动, 任务, activity, quest
 
 **季候来客 (Omen)**：
-每个季节出现 3 小时的一位来客（蛙雨/野火随机，熊獾/巨鹿固定 15:00），用一张卡二选一处理；失败或忽略只造成
+每个季节出现 3 小时的一位来客（春夏 09:00–19:00 随机，秋冬固定 15:00），用一张卡二选一处理；失败或忽略只造成
 表中损失，不打架、不毁存档（[ADR-0022](docs/adr/0022-seasonal-omen.md)）。
 _Avoid_: Boss, 怪物, 战斗, monster, combat
 
@@ -295,3 +298,8 @@ _Avoid_: 冰封, 冻结, ice, freeze
 **解冻 (Thaw)**：
 把冻住的地块恢复为正常生长，代价 2 露水 + 5 硬币；不是治疗，不改变作物和生长进度。
 _Avoid_: 治疗, 修复, heal, repair
+
+**铲除 (Clear)**：
+把生长中或冻住的作物直接清空为草地；免费、不退种子、不产作物，用于换季前止损或清掉冻住的地。
+成熟要先收割，枯萎直接重种。宿主动作 `farm-clear`。
+_Avoid_: 删除, 拔掉, delete, remove

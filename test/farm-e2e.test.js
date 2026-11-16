@@ -209,6 +209,28 @@ test('HTTP：初始农场 → 种 → 等 → 收 → 再种；硬币/种子/作
   assert.equal(afterRestart.body.farm.log.length, 4)
 })
 
+test('HTTP：farm-clear 清空生长中作物，不退种子；空地再铲回 plot-empty', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: NOON }
+  const service = makeService(t, dir, { farmNow: () => clock.value })
+  await service.ready
+
+  await action(service, { action: 'plant', plotId: 'p1', cropId: 'tomato' })
+  const cleared = await action(service, { action: 'farm-clear', plotId: 'p1' })
+  assert.equal(cleared.status, 200)
+  assert.equal(cleared.body.ok, true)
+  assert.equal(cleared.body.action, 'clear')
+  assert.equal(cleared.body.crop, 'tomato')
+  assert.equal(cleared.body.plot.crop, null)
+  assert.deepEqual(cleared.body.seeds, { tomato: 1 })
+  assert.equal(cleared.body.coins, 30)
+
+  const again = await action(service, { action: 'farm-clear', plotId: 'p1' })
+  assert.deepEqual(again.body, { ok: false, error: 'plot-empty', persisted: false })
+  const final = await state(service)
+  assert.equal(final.body.farm.log[0].kind, 'clear')
+})
+
 test('HTTP：六个错误码都能从 action 原样拿到', async (t) => {
   const dir = await tempDir(t)
   const clock = { value: NOON }

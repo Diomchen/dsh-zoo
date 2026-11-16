@@ -278,7 +278,7 @@ test('动作错误码：bad-plot / plot-occupied / bad-crop / no-seed / not-matu
   assert.equal((await store.plant('p1', 'carrot')).error, 'plot-occupied')
   assert.equal((await store.harvest('p1')).error, 'not-mature')
 
-  // 种下那一刻 dewAt 被重置：0 露水时浇水/施肥都明确 no-dew。
+  // 0 露水时浇水/施肥都明确 no-dew；动作本身不再重置露水计时。
   assert.equal((await store.water('p1')).error, 'no-dew')
   assert.equal((await store.fertilize('p1')).error, 'no-dew')
 
@@ -304,6 +304,39 @@ test('动作错误码：bad-plot / plot-occupied / bad-crop / no-seed / not-matu
   clock.advance(30 * MINUTE_MS)
   const harvested = await store.harvest('p1')
   assert.equal(harvested.qty, 4, '3 + 施肥 1')
+})
+
+test('铲除：生长中清空不退种子，成熟/枯萎/空地拒绝', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { log: logSink().log, now: clock.now })
+
+  const planted = await store.plant('p1', 'tomato')
+  assert.equal(planted.ok, true)
+  assert.equal(planted.seeds.tomato, 1)
+
+  const cleared = await store.clear('p1')
+  assert.equal(cleared.ok, true)
+  assert.equal(cleared.action, 'clear')
+  assert.equal(cleared.crop, 'tomato')
+  assert.equal(cleared.qty, 0)
+  assert.equal(cleared.plot.crop, null)
+  assert.equal(cleared.seeds.tomato, 1, '铲除不退种子')
+  assert.equal(cleared.coins, START_COINS, '铲除不收费')
+  assert.equal(store.snapshot().log[0].kind, 'clear')
+  assert.equal((await store.clear('p1')).error, 'plot-empty')
+  assert.equal((await store.clear('p9')).error, 'bad-plot')
+
+  await store.plant('p2', 'tomato')
+  clock.advance(CROPS.tomato.growMs)
+  assert.equal((await store.clear('p2')).error, 'plot-mature')
+
+  const witheredDir = await tempDir(t)
+  await writeFarm(witheredDir, farmFile({
+    plots: [plantedPlot('p1', 'tomato', { withered: true }), emptyPlot('p2'), emptyPlot('p3'), emptyPlot('p4')]
+  }))
+  const witheredStore = await createFarmStore(witheredDir, { log: logSink().log, now: clock.now })
+  assert.equal((await witheredStore.clear('p1')).error, 'withered')
 })
 
 test('收获被偷扣减、最低 0；仓库到 999 就夹取，不出现负数', async (t) => {
@@ -356,7 +389,7 @@ test('并发动作串行落盘：两块地同时种下不会互相写掉', async
 // 生长 / 露水 / 离线
 // ---------------------------------------------------------------------------
 
-test('tick：每 10 分钟 +1 露水，8 小时到 48 封顶；跨本地午夜归零', async (t) => {
+test('tick：每 10 分钟 +1 露水，8 小时到 48 封顶；跨本地午夜保留余额', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock()
   const store = await createFarmStore(dir, { log: logSink().log, now: clock.now })
@@ -376,17 +409,26 @@ test('tick：每 10 分钟 +1 露水，8 小时到 48 封顶；跨本地午夜�
   await store.tick()
   assert.equal(store.snapshot().dew, MAX_DEW, '到顶后不再涨')
 
-  // 跨日：23:50 开始，00:10 这一拍把余额清掉，再从 0 重新攒。
+  // 跨日：23:50 有 12 露水，00:10 这一拍只重置当日已挣，余额保留，再继续攒。
   const secondDir = await tempDir(t)
   const late = new Date(2026, 4, 6, 23, 50, 0).getTime()
+  await writeFarm(secondDir, farmFile({
+    dew: 12,
+    dewAt: late,
+    dewDay: localDayKey(late),
+    lastTickAt: late
+  }))
   const lateClock = makeClock(late)
   const lateStore = await createFarmStore(secondDir, { log: logSink().log, now: lateClock.now })
+  assert.equal(lateStore.snapshot().dew, 12)
   lateClock.advance(20 * MINUTE_MS)
   await lateStore.tick()
-  assert.equal(lateStore.snapshot().dew, 0, '跨本地午夜归零')
+  assert.equal(lateStore.snapshot().dew, 12, '跨本地午夜保留余额')
+  assert.equal(lateStore.snapshot().dewEarned, 0, '只重置今天已挣')
   lateClock.advance(10 * MINUTE_MS)
   await lateStore.tick()
-  assert.equal(lateStore.snapshot().dew, 1)
+  assert.equal(lateStore.snapshot().dew, 13)
+  assert.equal(lateStore.snapshot().dewEarned, 1)
 })
 
 test('露水日上限按已挣算：余额花光也不补；跨本地日才恢复', async (t) => {
@@ -455,7 +497,7 @@ test('离线生长：补 min(now − lastTickAt, 12h)，成熟即停，不枯萎
   assert.equal(store.snapshot().dew, 1)
 })
 
-test('离线跨日：dewDay 不同 → 露水归零；成熟地块再过多久都不掉产量', async (t) => {
+test('离线跨日：dewDay 不同 → 余额保留，已挣额度重置；成熟地块再过多久都不掉产量', async (t) => {
   const dir = await tempDir(t)
   const mature = plantedPlot('p1', 'tomato', { grownMs: CROPS.tomato.growMs })
   await writeFarm(dir, farmFile({
@@ -467,12 +509,13 @@ test('离线跨日：dewDay 不同 → 露水归零；成熟地块再过多久�
   }))
   const tomorrow = NOON + 24 * HOUR_MS
   const store = await createFarmStore(dir, { log: logSink().log, now: makeClock(tomorrow).now })
-  assert.equal(store.snapshot().dew, 0)
+  assert.equal(store.snapshot().dew, 20)
+  assert.equal(store.snapshot().dewEarned, 0)
   assert.equal(store.snapshot().plots[0].grownMs, CROPS.tomato.growMs)
   assert.equal(store.snapshot().plots[0].crop, 'tomato')
   const file = await readFarm(dir)
   assert.equal(file.dewDay, localDayKey(tomorrow))
-  assert.equal(file.dew, 0)
+  assert.equal(file.dew, 20)
 })
 
 test('重启：种下的地/种子/日志都在；离线那段时间按 12h 规则补', async (t) => {
@@ -625,25 +668,38 @@ test('markStolen 日限额：3/访客/农场、5/农场；被抓也占次数（�
   assert.equal(limits.steal.usedOnFarm, 5)
 })
 
-test('touch：雇佣等农场动作重置待机计时；不影响露水余额', async (t) => {
+test('touch：在线心跳不重置待机计时；不影响露水余额', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock()
-  await writeFarm(dir, farmFile({ dew: 4, dewEarned: 4 }))
+  await writeFarm(dir, farmFile({ dew: 4, dewEarned: 4, dewAt: NOON, dewDay: TODAY }))
   const store = await createFarmStore(dir, { now: clock.now })
 
   clock.advance(9 * MINUTE_MS)
   const touched = await store.touch()
   assert.equal(touched.ok, true)
-  assert.equal(touched.dewAt, clock.now())
+  assert.equal(touched.dewAt, NOON, '心跳不推翻原来的计时锚点')
   const file = await readFarm(dir)
-  assert.equal(file.dewAt, clock.now(), '待机锚点被推到点击那一刻')
-  assert.equal(file.dew, 4, '重置待机不是奖励/扣除露水')
+  assert.equal(file.dewAt, NOON, '待机锚点保持原样')
+  assert.equal(file.dew, 4, '心跳不是奖励/扣除露水')
 
-  // 重置后 10 分钟才重新攒到 1 滴（部分间隔不跨过这次点击）。
-  clock.advance(10 * MINUTE_MS)
+  // 从原锚点算，第 10 分钟照常 +1，不被 9 分钟时的心跳打断。
+  clock.advance(1 * MINUTE_MS)
   await store.tick()
   const after = await readFarm(dir)
   assert.equal(after.dew, 5)
+})
+
+test('种/收/浇/施肥不重置露水计时：动作间隔 5 分钟仍按 10 分钟 +1', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  await store.plant('p1', 'tomato')
+  clock.advance(5 * MINUTE_MS)
+  await store.plant('p2', 'tomato')
+  clock.advance(5 * MINUTE_MS)
+  await store.tick()
+  assert.equal(store.snapshot().dew, 1, '动作没有把 10 分钟锚点推后')
 })
 
 test('noteHire / noteSettle：日志带 who/wage/hours/earned，仍然只保留最近 50 条', async (t) => {

@@ -98,6 +98,8 @@ const RESULT_CODE_TEXT = {
   'bad-crop': '这种作物种不了，换一种吧。',
   'bad-qty': '数量要在 1–99 之间。',
   'plot-occupied': '这块地已经种上了，先收掉再种。',
+  'plot-empty': '这块地本来就是空的。',
+  'plot-mature': '已经成熟了，先收割吧。',
   'not-mature': '还没熟呢，再等一会儿。',
   'no-seed': '没有这种种子了，先去交易所买。',
   'no-crop': '没有这种作物了，先种一点再来卖。',
@@ -139,6 +141,7 @@ const RESULT_CODE_TEXT = {
 const LOG_TEXT = {
   plant: '种下',
   harvest: '收获',
+  clear: '铲除',
   steal: '被偷',
   help: '帮忙',
   hire: '雇工',
@@ -193,6 +196,8 @@ let activeTab = 'farm'
 let plantTarget = null
 /** 解锁弹窗当前的地价卡；null = 弹窗关闭。ticket 49。 */
 let unlockTarget = null
+/** 铲除的两段确认：plotId + 第一次点击时间；4 秒内再点才真的铲。 */
+let clearArmed = null
 /** 一键收割的串行队列：一次只发一个 farm-harvest，等回执再发下一条。 */
 let batch = null
 /** 来客卡上临时雇的守卫人数（0～2）；只影响下一次守夜结算。 */
@@ -813,6 +818,7 @@ function neighborChipButton (item) {
 
 function renderPlots () {
   plotsEl.textContent = ''
+  clearArmed = null
   countdowns.clear()
   progressBars.clear()
   renderNeighborChips()
@@ -938,6 +944,8 @@ function renderLog () {
       text.textContent = '冻住了 ' + (Number(entry.qty) || 1) + ' 块地，要生火解冻'
     } else if (entry.kind === 'thaw') {
       text.textContent = '生火解冻了一块地'
+    } else if (entry.kind === 'clear') {
+      text.textContent = '铲除了' + (crop === null ? '一株作物' : '一株' + crop.name)
     } else if (entry.kind === 'omen') {
       const lost = Number(entry.qty) || 0
       const wither = Number(entry.wither) || 0
@@ -2114,7 +2122,27 @@ plotsEl.addEventListener('click', (event) => {
       submit({ action: 'farm-plant', plotId, cropId: buttonEl.dataset.cropId })
       return
     }
-    if (action === 'harvest' || action === 'water' || action === 'fertilize') {
+    if (action === 'clear') {
+      const now = Date.now()
+      if (clearArmed !== null && clearArmed.plotId === plotId && now - clearArmed.at <= 4000) {
+        clearArmed = null
+        submit({ action: 'farm-clear', plotId })
+        return
+      }
+      clearArmed = { plotId, at: now }
+      buttonEl.textContent = '确认铲除？'
+      buttonEl.dataset.armed = 'true'
+      setTimeout(() => {
+        if (clearArmed === null || clearArmed.plotId !== plotId || Date.now() - clearArmed.at < 4000) return
+        clearArmed = null
+        if (buttonEl.isConnected) {
+          buttonEl.textContent = '铲除'
+          delete buttonEl.dataset.armed
+        }
+      }, 4000)
+      return
+    }
+    if (action === 'harvest' || action === 'water' || action === 'fertilize' || action === 'thaw') {
       submit({ action: 'farm-' + action, plotId })
       return
     }

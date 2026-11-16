@@ -148,6 +148,8 @@
     'farm-harvest',
     'farm-water',
     'farm-fertilize',
+    // 票 77：生长中/冻住的作物可以提前铲除，清出地块重种。
+    'farm-clear',
     // 票 75：冻住的地要花露水+硬币生火解冻。
     'farm-thaw',
     // ticket 43：访客偷/帮也是地块动作；只带 plotId，visitId/requestId 由宿主生成。
@@ -298,7 +300,7 @@
    */
   const CROP_IDS = ['pea', 'tomato', 'strawberry', 'radish', 'carrot', 'rice', 'corn', 'watermelon', 'pumpkin', 'grape']
   const FARM_STAGES = ['empty', 'growing', 'mature', 'withered', 'frozen']
-  const FARM_LOG_KINDS = ['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock', 'season', 'event', 'wither', 'freeze', 'thaw', 'omen']
+  const FARM_LOG_KINDS = ['plant', 'harvest', 'clear', 'steal', 'help', 'hire', 'settle', 'unlock', 'season', 'event', 'wither', 'freeze', 'thaw', 'omen']
   const MAX_FARM_COINS = 1000000
   const MAX_FARM_STACK = 999
   const MAX_FARM_DEW = 48
