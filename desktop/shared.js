@@ -199,20 +199,36 @@
    */
   const BOARD_OPEN_ACTIONS = ['trading-open']
   /**
-   * 盘口小窗能提交的动作（票 79）。字段窄到不能再窄：
+   * 盘口小窗能提交的动作（票 79 / 票 81）。字段窄到不能再窄：
    *   trading-open-position  { side, margin, leverage, cropId }
    *   trading-close-position { positionId }
+   *   trading-set-stop       { positionId, level }（票 81：持仓卡上的止损循环）
    *   trading-refresh        无字段（倒计时到 0 时请宿主结这一根并重推一拍）
    * 价格、硬币、盈亏、成交价全由宿主算，窗口一概不传。
    */
-  const BOARD_SUBMIT_ACTIONS = ['trading-open-position', 'trading-close-position', 'trading-refresh']
+  const BOARD_SUBMIT_ACTIONS = [
+    'trading-open-position',
+    'trading-close-position',
+    'trading-set-stop',
+    'trading-refresh'
+  ]
   const BOARD_SIDES = ['long', 'short']
   const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
-  /** 一包最多画多少手/多少笔：窗口只滚一屏，不用把整份历史搬过去。 */
+  /**
+   * 止损档位（票 81）：0 = 关，其余是「亏掉保证金的这个比例就平仓」。
+   * 窗口的按钮循环「关 → −25% → −50% → −100% → 关」，宿主的 store（票 80）
+   * 按同一组数校验；两边各留一份，靠 `test/board-window.test.js` 的 drift 断言对齐。
+   */
+  const BOARD_STOP_LEVELS = [0, 0.25, 0.5, 1]
+  /** 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。 */
   const BOARD_MAX_PRICE = 1000000000
   const BOARD_MAX_POSITIONS = 32
   const BOARD_MAX_HISTORY = 50
   const BOARD_MAX_LIMITS = 8
+  const BOARD_MAX_CHARTS = 8
+  /** 宿主给 24 根 + 当前一根；留一点余量，换根数时不必两边同改。 */
+  const BOARD_MAX_BARS = 40
+  const BOARD_MAX_TICK = 15
   /**
    * 地块解锁（ticket 48）：只带可选的 `expectedUnlocked`（窗口看到的已解锁数）。
    * 价格与下一块地在哪全由宿主算；窗口不传钱、不传地块 id。
@@ -1589,6 +1605,15 @@
       entry,
       mark: normalizeBoardNumber(raw.mark, 0, BOARD_MAX_PRICE),
       pnl: normalizeBoardNumber(raw.pnl, -BOARD_MAX_PRICE, BOARD_MAX_PRICE),
+      // 票 81：强平价（1× 是 null → 窗口显示「—」）与止损档位（0 = 关）。
+      // `null` 必须原样留下：它的意思是「这一手没有强平价」，不是 0。
+      // 认不出的档位退成「关」：宁可少一道自动平仓，也不替玩家猜一档。
+      liquidation: raw.liquidation === null || raw.liquidation === undefined
+        ? null
+        : normalizeBoardNumber(raw.liquidation, 0, BOARD_MAX_PRICE),
+      stopLoss: BOARD_STOP_LEVELS.includes(raw.stopLoss) ? raw.stopLoss : 0,
+      openedAt: normalizeBoardInt(raw.openedAt, 0, Number.MAX_SAFE_INTEGER),
+      slot: normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER),
       // 结算中的仓位只能看不能点平仓（钱已经走了一半，宿主会回 settling）。
       ...(raw.settling === true ? { settling: true } : {})
     }
@@ -1649,6 +1674,89 @@
     }
   }
 
+  /** 一根 K 线：开高低收都是价格；slot 只当横轴的键。坏一根丢一根，图少一根不影响别的。 */
+  function normalizeBoardBar (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
+    const open = normalizeBoardNumber(raw.open, 0, BOARD_MAX_PRICE)
+    const high = normalizeBoardNumber(raw.high, 0, BOARD_MAX_PRICE)
+    const low = normalizeBoardNumber(raw.low, 0, BOARD_MAX_PRICE)
+    const close = normalizeBoardNumber(raw.close, 0, BOARD_MAX_PRICE)
+    if (slot === null || open === null || high === null || low === null || close === null) return null
+    return { slot, open, high, low, close }
+  }
+
+  /** 当前形成中的一根（票 81）：`price` 是现价，`tick` 是已经走了几分钟。 */
+  function normalizeBoardCurrentBar (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
+    const open = normalizeBoardNumber(raw.open, 0, BOARD_MAX_PRICE)
+    const high = normalizeBoardNumber(raw.high, 0, BOARD_MAX_PRICE)
+    const low = normalizeBoardNumber(raw.low, 0, BOARD_MAX_PRICE)
+    const price = normalizeBoardNumber(raw.price, 0, BOARD_MAX_PRICE)
+    if (slot === null || open === null || high === null || low === null || price === null) return null
+    return {
+      slot,
+      open,
+      high,
+      low,
+      price,
+      tick: normalizeBoardNumber(raw.tick, 0, BOARD_MAX_TICK) ?? 0,
+      remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0
+    }
+  }
+
+  /** 一张图：底价 + 最近若干整根 + 当前一根。坏成空图（窗口画空态），不整窗失败。 */
+  function normalizeBoardChart (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const base = normalizeBoardNumber(raw.base, 0, BOARD_MAX_PRICE)
+    if (base === null) return null
+    const bars = []
+    for (const candidate of Array.isArray(raw.bars) ? raw.bars : []) {
+      if (bars.length >= BOARD_MAX_BARS) break
+      const bar = normalizeBoardBar(candidate)
+      if (bar !== null) bars.push(bar)
+    }
+    return { base, bars, current: normalizeBoardCurrentBar(raw.current) }
+  }
+
+  /** `charts: { tomato: {…}, … }`：只认运行时目录里的作物 id，多余的键丢掉。 */
+  function normalizeBoardCharts (raw) {
+    const charts = {}
+    let count = 0
+    for (const key of Object.keys(raw)) {
+      if (count >= BOARD_MAX_CHARTS) break
+      const crop = normalizeCropId(key)
+      if (crop === null) continue
+      const chart = normalizeBoardChart(raw[key])
+      if (chart === null) continue
+      charts[crop] = chart
+      count += 1
+    }
+    return charts
+  }
+
+  /** `hint: { tomato: { direction, confidence }, … }`：方向只有三种，置信度必须 0–1。 */
+  function normalizeBoardHints (raw) {
+    const hints = {}
+    let count = 0
+    for (const key of Object.keys(raw)) {
+      if (count >= BOARD_MAX_CHARTS) break
+      const crop = normalizeCropId(key)
+      if (crop === null) continue
+      const entry = raw[key]
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+      const direction = entry.direction === 'up' || entry.direction === 'down'
+        ? entry.direction
+        : entry.direction === 'flat' ? 'flat' : null
+      const confidence = normalizeBoardNumber(entry.confidence, 0, 1)
+      if (direction === null || confidence === null) continue
+      hints[crop] = { direction, confidence }
+      count += 1
+    }
+    return hints
+  }
+
   /** 整份盘口视图；坏到不成形状就返回 null（窗口画空态，不崩）。 */
   function normalizeBoardView (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
@@ -1684,10 +1792,25 @@
       },
       week: {
         start: normalizeBoardInt(weekRaw.start, 0, Number.MAX_SAFE_INTEGER) ?? 0,
+        // pnl 是已实现（落盘、榜也用）；unrealized 与 total 是票 81 的展示口径
+        // （顶部的「本周盈亏」= 已实现 + 未实现），收益率用 total / base。
         pnl: normalizeBoardInt(weekRaw.pnl, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0,
-        base: normalizeBoardInt(weekRaw.base, 0, MAX_FARM_COINS) ?? 0
+        base: normalizeBoardInt(weekRaw.base, 0, MAX_FARM_COINS) ?? 0,
+        unrealized: normalizeBoardInt(weekRaw.unrealized, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0,
+        total: normalizeBoardInt(weekRaw.total, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0
       },
       limits: normalizeBoardLimits(limitsRaw),
+      // 票 81：三作物各自的 K 线与风向；缺了就画空态（老宿主/坏包都走这条路）。
+      charts: normalizeBoardCharts(
+        raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
+          ? raw.charts
+          : {}
+      ),
+      hint: normalizeBoardHints(
+        raw.hint !== null && typeof raw.hint === 'object' && !Array.isArray(raw.hint)
+          ? raw.hint
+          : {}
+      ),
       bar: barRaw === null
         ? null
         : {
@@ -1724,6 +1847,14 @@
     if (action === 'trading-close-position') {
       const positionId = normalizeUuid(raw.positionId)
       return positionId === null ? null : { action, positionId }
+    }
+    // 止损循环（票 81）：窗口只报「哪一手 + 下一档」；档位必须正好是四个之一。
+    if (action === 'trading-set-stop') {
+      const positionId = normalizeUuid(raw.positionId)
+      if (positionId === null) return null
+      const level = Number(raw.level)
+      if (!BOARD_STOP_LEVELS.includes(level)) return null
+      return { action, positionId, level }
     }
     // 开仓：形状合法即可，50/100 与 1× 由宿主按 trading-rules 再判一次（并回人话）。
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
@@ -3849,6 +3980,7 @@
     BOARD_OPEN_ACTIONS,
     BOARD_SUBMIT_ACTIONS,
     BOARD_SIDES,
+    BOARD_STOP_LEVELS,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
     FARM_LAND_ACTIONS,
