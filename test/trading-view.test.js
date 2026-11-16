@@ -174,6 +174,40 @@ function tfPayload (overrides = {}) {
   }
 }
 
+/** 票 88/89：运行时目录已有 10 种作物；盘口不能比农场少，作物条要能横滚。 */
+const TEN_CROPS = [
+  ['pea', '豌豆', 6],
+  ['tomato', '小番茄', 5],
+  ['strawberry', '草莓', 7],
+  ['radish', '白萝卜', 8],
+  ['carrot', '胡萝卜', 6],
+  ['rice', '稻米', 10],
+  ['corn', '玉米', 9],
+  ['watermelon', '西瓜', 24],
+  ['pumpkin', '南瓜', 30],
+  ['grape', '葡萄', 24]
+]
+
+function tenCropPayload (overrides = {}) {
+  const charts = {}
+  const hint = {}
+  for (const [id, , price] of TEN_CROPS) {
+    charts[id] = chart({ base: price })
+    hint[id] = { direction: 'up', confidence: 0.6 }
+  }
+  return payload({
+    limits: {
+      ...LIMITS,
+      crops: TEN_CROPS.map(([id, name]) => ({ id, name })),
+      timeframes: TIMEFRAMES
+    },
+    charts,
+    hint,
+    timeframes: { '15m': charts },
+    ...overrides
+  })
+}
+
 test('票 79：顶部显示当前价、本根涨跌、mm:ss 倒计时与两种硬币', () => {
   // 开盘 5 分钟后：还剩 10 分钟。
   const header = view.headerView(payload(), SLOT_EDGE + 5 * 60 * 1000)
@@ -340,26 +374,30 @@ test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式�
     '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
 })
 
-test('票 79：硬币不够时按钮禁用并写明原因；0 硬币写「去种地」', () => {
+test('票 79 / 票 89：硬币不够时按钮禁用并写明「差 N 硬币」；0 硬币写「去种地」', () => {
   const small = view.orderView(payload({ coins: { available: 49, locked: 0, total: 49 } }), { margin: 50 })
   assert.equal(small.canSubmit, false)
-  assert.match(small.hint, /硬币不够/)
+  assert.equal(small.hint, '差 1 硬币')
   assert.equal(small.margins[0].disabled, true)
+  assert.equal(small.margins[0].disabledReason, '差 1 硬币')
   assert.equal(small.margins[1].disabled, true)
   assert.equal(small.margins[2].disabled, true)
   // 全下 49 是合法金额（够不着 50 的预设，但押上全部 49 是可以的）。
   assert.equal(small.margins[3].margin, 49)
   assert.equal(small.margins[3].disabled, false)
+  assert.equal(small.margins[3].disabledReason, '')
 
   const broke = view.orderView(payload({ coins: { available: 0, locked: 100, total: 100 } }), { margin: 50 })
   assert.equal(broke.canSubmit, false)
-  assert.match(broke.hint, /先去种地/)
+  assert.equal(broke.hint, '去种地')
   assert.equal(broke.submitLabel, '去种地')
+  assert.equal(broke.margins[0].disabledReason, '差 50 硬币')
   assert.equal(broke.margins[3].label, '全下')
   assert.equal(broke.margins[3].margin, 0)
   assert.equal(broke.margins[3].disabled, true, '0 硬币时全下也禁用')
+  assert.equal(broke.margins[3].disabledReason, '去种地')
   assert.equal(view.emptyHints(payload({ coins: { available: 0, locked: 100, total: 100 } })).positions,
-    '还没有持仓。硬币不够开仓时，先去种地。')
+    '还没有持仓')
 })
 
 test('票 81：K 线几何——24 根 + 当前一根，高低点映射到 viewBox，底价/入场/强平线', () => {
@@ -372,7 +410,7 @@ test('票 81：K 线几何——24 根 + 当前一根，高低点映射到 viewB
     current: null
   }, { width: 384, height: 200, entry: 5.2, liquidation: 4.5 })
   assert.equal(geometry.width, 384)
-  assert.equal(geometry.height, 200)
+  assert.equal(geometry.height, 200, 'chartGeometry 的显式 height 仍由调用方给')
   // 定义域 = [4, 6]（两根的高点/低点），底价 5 与入场/强平都在里面。
   assert.deepEqual(geometry.domain, { min: 4, max: 6 })
   assert.deepEqual(geometry.grid, [8, 101, 194])
@@ -554,7 +592,7 @@ test('票 84：入场/强平线只在 15 分画；其它周期只画底价线并
     assert.equal(chart.geometry.lines.find((line) => line.key === 'liquidation').visible, false)
     // 产品文案：看趋势可以，结算仍只认 15 分钟收盘。
     assert.equal(chart.settleNote.visible, true)
-    assert.equal(chart.settleNote.text, '合约仍按 15 分钟收盘结算；其它周期只看趋势')
+    assert.equal(chart.settleNote.text, '15 分钟结算')
   }
 })
 
@@ -753,18 +791,27 @@ test('票 87：十字线吸附最近一根、便签写时间与开高低收，�
   assert.ok(forming.highlight.width >= target.width)
 })
 
-test('票 87：版面常量就是「上图下两列」，图 720×280，老 payload 也能画', async () => {
+test('票 87 / 票 89：版面常量是「图带 286 + 下半区两列」，图 720×200，老 payload 也能画', async () => {
   assert.equal(view.BOARD_WIDTH, 760)
   assert.equal(view.BOARD_HEIGHT, 700)
   assert.equal(view.CHART_WIDTH, 720)
-  assert.equal(view.CHART_HEIGHT, 280)
+  assert.equal(view.CHART_HEIGHT, 198)
   assert.deepEqual(view.LAYOUT.columns.left, ['positions', 'history'])
   assert.deepEqual(view.LAYOUT.columns.right, ['order', 'league'])
   assert.equal(view.LAYOUT.chart.fullWidth, true)
+  // 票 89 的固定版面数字：窗口 CSS 与测试吃同一份。
+  assert.equal(view.LAYOUT.headerHeight, 52)
+  assert.equal(view.LAYOUT.cropStripHeight, 42)
+  assert.equal(view.LAYOUT.chartCardHeight, 286)
+  assert.equal(view.LAYOUT.bottom.rightWidth, 300)
+  assert.equal(view.LAYOUT.bottom.controlRow, 34)
+  assert.equal(view.LAYOUT.bottom.historyHeight, 120)
+  assert.equal(view.LAYOUT.bottom.marginColumns, 4)
+  assert.equal(view.LAYOUT.bottom.leverageColumns, 3)
 
   const board = view.boardView(tfPayload(), { crop: 'tomato', now: SLOT_EDGE })
   assert.equal(board.chart.geometry.width, 720)
-  assert.equal(board.chart.geometry.height, 280)
+  assert.equal(board.chart.geometry.height, 198)
   assert.ok(board.chart.geometry.timeTicks.length >= 3)
   // 老 payload（只有 charts，没有 timeframes/start/end）不抛：图照画，时间轴没数据就留空。
   const legacy = view.boardView(payload(), { crop: 'tomato', now: SLOT_EDGE })
@@ -777,16 +824,16 @@ test('票 87：版面常量就是「上图下两列」，图 720×280，老 payl
   assert.equal(view.boardView(payload({ charts: undefined }), { now: SLOT_EDGE }).chart.geometry, null)
 
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
-  // 图独占整行：grid 区域两列都叫 chart；旧的三块拼图布局不许回来。
-  assert.match(html, /grid-template-areas:\s*\n\s*'chart chart'/)
-  assert.doesNotMatch(html, /grid-template-areas:[\s\S]{0,80}'chart order'/)
+  // 图带独占整行：作物条 + 图头 + 200 高的 SVG；旧的三块拼图布局不许回来。
+  assert.match(html, /grid-template-rows: 286px minmax\(0, 1fr\)/)
   assert.match(html, /class="card chart-card"/)
-  assert.match(html, /viewBox="0 0 720 280"/)
-  assert.match(html, /\.chart-svg \{[\s\S]*?height: 280px/)
+  assert.match(html, /viewBox="0 0 720 198"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 198px/)
+  assert.doesNotMatch(html, /grid-template-areas:[\s\S]{0,80}'chart order'/)
   // 页面本身不滚（内层列表可以滚），窗口内容 760×700 内收住。
   assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)
-  // 下单主按钮固定在卡片底部：滚动区只放控件，开仓按钮永远可见。
-  assert.match(html, /class="order-scroll"/)
+  // 票 89：下单卡不再有内部滚动区；主按钮固定在卡片底部。
+  assert.doesNotMatch(html, /order-scroll/)
   assert.match(html, /class="order-actions"/)
   assert.match(html, /id="submit"/)
   // 手绘滤镜只引用一次；文字在独立清晰层，不套滤镜。
@@ -804,12 +851,172 @@ test('票 87：版面常量就是「上图下两列」，图 720×280，老 payl
   assert.match(script, /view\.crosshairAt/)
   assert.match(script, /addEventListener\('pointermove'/)
   assert.match(script, /addEventListener\('pointerleave'/)
+  // 票 89：跌蜡烛空心属性接到 DOM 上。
+  assert.match(script, /data-hollow/)
   assert.doesNotMatch(script, /console\.log/)
 })
 
 
-test('票 81：作物页签有三个、切换后价格/风向/图例都跟着换', () => {
-  const board = view.boardView(payload(), { now: SLOT_EDGE + 5 * 60 * 1000 })
+test('票 89：作物条支持任意数量（10 种），选中索引与箭头禁用态来自纯视图', () => {
+  const ten = tenCropPayload()
+  const first = view.cropStripView(ten, null)
+  assert.equal(first.items.length, 10)
+  assert.equal(first.selectedIndex, 0)
+  assert.equal(first.overflow, true)
+  assert.equal(first.arrows.prev.enabled, false)
+  assert.equal(first.arrows.next.enabled, true)
+  assert.equal(first.arrows.prev.disabledReason, '已经是第一组')
+
+  const last = view.cropStripView(ten, 'grape')
+  assert.equal(last.selectedIndex, 9)
+  assert.equal(last.windowStart, 4)
+  assert.equal(last.arrows.prev.enabled, true)
+  assert.equal(last.arrows.next.enabled, false)
+  assert.equal(last.arrows.next.disabledReason, '已经是最后一组')
+  assert.equal(last.items.filter((item) => item.active).length, 1)
+  // 选中第 6 种时窗口居中，两边都还能滚。
+  const middle = view.cropStripView(ten, 'rice')
+  assert.equal(middle.selectedIndex, 5)
+  assert.equal(middle.windowStart, 2)
+  assert.equal(middle.arrows.prev.enabled, true)
+  assert.equal(middle.arrows.next.enabled, true)
+
+  // 3 种作物不溢出：两颗箭头都禁用，作物条不出现渐隐。
+  const three = view.cropStripView(payload(), null)
+  assert.equal(three.overflow, false)
+  assert.equal(three.windowStart, 0)
+  assert.equal(three.arrows.prev.enabled, false)
+  assert.equal(three.arrows.next.enabled, false)
+
+  // boardView 带同一份 cropStrip；Tab 顺序含 10 个 chip + 两颗箭头且不重复。
+  const board = view.boardView(ten, { now: SLOT_EDGE })
+  assert.equal(board.cropStrip.items.length, 10)
+  assert.equal(board.crops.length, 10)
+  assert.equal(board.cropStrip.selectedIndex, 0)
+  const keys = view.focusOrder(ten)
+  assert.deepEqual(keys.slice(0, 3), ['close-button', 'crop-prev', 'crop:pea'])
+  assert.deepEqual(keys.slice(11, 14), ['crop:grape', 'crop-next', 'timeframe:15m'])
+  assert.equal(new Set(keys).size, keys.length)
+})
+
+test('票 89：文案瘦身——周胶囊一位小数、空态一行、结算提示最短', async () => {
+  const week = view.weekView(payload({ week: { pnl: -3, base: 65, unrealized: 0, total: -3 } }))
+  assert.equal(week.pnlMinusText, '−3.0')
+  assert.equal(week.pctParenText, '(−4.6%)')
+  assert.equal(week.pillText, '本周 −3.0 (−4.6%)')
+  assert.equal(week.pnlText, '-3.0', '裸数字仍走 ASCII，表格里正负号宽度一致')
+  assert.equal(view.weekView(payload({ week: { pnl: 0, base: 0 } })).pillText, '本周 0.0 (—)')
+
+  assert.deepEqual(view.emptyHints(payload()), {
+    positions: '还没有持仓',
+    history: '还没有结算',
+    orders: '没有挂单',
+    neighbors: '等邻居上线'
+  })
+
+  const weekly = view.chartView(tfPayload(), { crop: 'tomato', timeframe: '1w' })
+  assert.equal(weekly.settleNote.text, '15 分钟结算')
+  assert.equal(weekly.settleNote.visible, true)
+  assert.equal(view.chartView(tfPayload(), { timeframe: '15m' }).settleNote.visible, false)
+  assert.equal(view.chartView(payload({ charts: undefined })).emptyText, '行情还在算')
+
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  const gone = [
+    '15 分钟合约 · 收盘自动结算',
+    '关：直接按现价开仓',
+    '硬币不够，选小一点的保证金或先去卖点作物',
+    '还没有持仓。选好方向和保证金',
+    '还没有结算记录。收盘或手动平仓后',
+    '等邻居打开 DSH 就会出现在这里',
+    'LAN 情绪',
+    '合约仍按 15 分钟收盘结算',
+    '没有手续费、没有资金费、没有风险控制',
+    '硬币赔光就去种地'
+  ]
+  for (const text of gone) assert.ok(!html.includes(text), 'board.html 还留着旧长句：' + text)
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  for (const text of gone) assert.ok(!script.includes(text), 'board.js 还留着旧长句：' + text)
+})
+
+test('票 89：跌蜡烛空心——视图给 hollow、DOM 写 data-hollow、CSS 用纸色填充', async () => {
+  const geometry = view.chartGeometry({
+    base: 5,
+    bars: [
+      { slot: 1, open: 5, high: 5.2, low: 4.8, close: 4.9 },
+      { slot: 2, open: 4.9, high: 5.1, low: 4.8, close: 5 }
+    ]
+  })
+  assert.equal(geometry.bars[0].up, false)
+  assert.equal(geometry.bars[0].hollow, true)
+  assert.equal(geometry.bars[1].up, true)
+  assert.equal(geometry.bars[1].hollow, false)
+  // 形成中的那一根也带同一个字段。
+  const forming = view.chartView(tfPayload(), { crop: 'tomato' }).geometry.forming
+  assert.equal(typeof forming.hollow, 'boolean')
+  // 票 89：底价/入场挨得很近时，参考线标签要错开而不是叠字。
+  const close = view.chartGeometry({
+    base: 5,
+    bars: [{ slot: 1, open: 4.9, high: 5.1, low: 4.8, close: 5 }],
+    current: { slot: 2, open: 5, high: 5.1, low: 4.9, price: 5, tick: 1, remainingMs: 1 }
+  }, { entry: 4.99, liquidation: 4.98 })
+  const labels = close.lines.filter((line) => line.visible).map((line) => line.labelY)
+  assert.equal(labels.length, 3)
+  for (let index = 1; index < labels.length; index += 1) {
+    assert.ok(labels[index] - labels[index - 1] >= 13, '参考线标签至少错开 13px')
+  }
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /'data-hollow': candle\.hollow/)
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /\.chart-svg \.body\.down,[\s\S]*?fill: var\(--paper\)/)
+  assert.match(html, /stroke: var\(--rose\)/)
+})
+
+test('票 89：下单区两列 grid、4/3 档、没有滚动容器；11px 只留给图轴', async () => {
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  const fieldRow = /\.field-row \{([\s\S]*?)\}/.exec(html)
+  assert.ok(fieldRow)
+  assert.match(fieldRow[1], /grid-template-columns: 40px minmax\(0, 1fr\)/)
+  assert.match(html, /\.chip-row\.margins \{[\s\S]*?repeat\(4, minmax\(0, 1fr\)\)/)
+  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(3, minmax\(0, 1fr\)\)/)
+  const orderCard = /\.order-card \{([\s\S]*?)\}/.exec(html)
+  assert.ok(orderCard)
+  assert.match(orderCard[1], /overflow: visible/)
+  assert.doesNotMatch(orderCard[1], /overflow-y: auto|overflow: auto/)
+  const preview = /\.preview \{([\s\S]*?)\}/.exec(html)
+  assert.match(preview[1], /white-space: nowrap/)
+  assert.match(preview[1], /text-overflow: ellipsis/)
+  assert.match(html, /id="crop-scroll"/)
+  assert.match(html, /id="crop-prev"/)
+  assert.match(html, /id="crop-next"/)
+  const cropScroll = /\.crop-scroll \{([\s\S]*?)\}/.exec(html)
+  assert.ok(cropScroll)
+  assert.match(cropScroll[1], /overflow-x: auto/)
+  assert.match(cropScroll[1], /overflow-y: hidden/)
+
+  // 字号：除图轴/便签的 11px 外，正文/标签都 ≥12px；11px 只出现在 `.chart-svg` 规则里。
+  const css = html.slice(html.indexOf('<style>'), html.indexOf('</style>'))
+  let checked = 0
+  for (const [, selector, body] of css.matchAll(/([^{}]+)\{([^}]*)\}/g)) {
+    for (const match of body.matchAll(/font-size:\s*([\d.]+)px/g)) {
+      checked += 1
+      const size = Number(match[1])
+      assert.ok(size >= 11, selector.trim() + ' 的字号 ' + size + 'px 太小')
+      if (size === 11) assert.match(selector, /\.chart-svg/, selector.trim() + ' 的 11px 只允许图轴/便签')
+    }
+  }
+  assert.ok(checked > 20, '字号检查至少覆盖 20 条规则（实际 ' + checked + '）')
+
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /updateCropArrows/)
+  assert.match(script, /ensureCropVisible/)
+  assert.match(script, /scrollCropsBy/)
+  assert.match(script, /addEventListener\('wheel'/)
+  assert.match(script, /addEventListener\('keydown'/)
+  // 下单卡不滚：渲染端不再把目标价往某个滚动区里推。
+  assert.doesNotMatch(script, /scrollIntoView/)
+})
+
+test('票 81：作物页签有三个、切换后价格/风向/图例都跟着换', () => {  const board = view.boardView(payload(), { now: SLOT_EDGE + 5 * 60 * 1000 })
   assert.deepEqual(board.crops.map((crop) => crop.id), ['tomato', 'carrot', 'pumpkin'])
   assert.deepEqual(board.crops.map((crop) => crop.label), ['小番茄', '胡萝卜', '南瓜'])
   assert.equal(board.crops[0].active, true)
@@ -926,11 +1133,11 @@ test('票 79：空态与坏输入都不抛——没有盘口数据时也能画�
     assert.equal(board.header.priceText, '—')
     assert.equal(board.chart.hasChart, false)
     assert.equal(board.week.pctText, '—')
-    assert.match(board.hints.history, /还没有结算记录/)
+    assert.equal(board.hints.history, '还没有结算')
     // 票 82：没有 league 就画空榜，空态文案照旧。
     assert.deepEqual(board.league.rows, [])
     assert.equal(board.league.hasPeers, false)
-    assert.match(board.hints.neighbors, /还没有邻居上线/)
+    assert.equal(board.hints.neighbors, '等邻居上线')
   }
   // 老 payload 没有 limits.leverages：杠杆退回 1×（票 80 之后宿主会下发 [1,5,20]）。
   const legacy = view.orderView({ coins: { available: 120 } })
@@ -1027,7 +1234,10 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
   const keys = view.focusOrder(payload({ orders: [order], positions: [position] }))
   assert.deepEqual(keys, [
     'close-button',
+    // 票 89：作物条的左右滚动箭头排在作物 chip 两边。
+    'crop-prev',
     'crop:tomato', 'crop:carrot', 'crop:pumpkin',
+    'crop-next',
     // 老 payload 只有 15 分一档，周期页签照样进 Tab 顺序（票 84）。
     'timeframe:15m',
     'side:long', 'side:short',
@@ -1048,7 +1258,7 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
   }
   // 票 84：四档周期都进 Tab 顺序，紧跟在作物页签后面，且不重复。
   const four = view.focusOrder(tfPayload())
-  assert.deepEqual(four.slice(4, 8), ['timeframe:15m', 'timeframe:1h', 'timeframe:1d', 'timeframe:1w'])
+  assert.deepEqual(four.slice(6, 10), ['timeframe:15m', 'timeframe:1h', 'timeframe:1d', 'timeframe:1w'])
   assert.equal(new Set(four).size, four.length)
 })
 
@@ -1104,7 +1314,7 @@ test('术语 US19：邻居持仓 chips——最多 3 条 + 「+N」，空仓仍�
   assert.deepEqual(mixed.rows[0].chips.map((chip) => chip.text), ['小番茄多 1×'])
 })
 
-test('票 82：只有自己时写「观望」，并保留「还没有邻居上线…行情照走」', () => {
+test('票 82 / 票 89：只有自己时写「观望」，空态只留一行「等邻居上线」', () => {
   const alone = view.boardView(payload({
     league: league({
       rows: [{
@@ -1125,8 +1335,7 @@ test('票 82：只有自己时写「观望」，并保留「还没有邻居上�
   assert.equal(alone.league.hasPeers, false)
   assert.equal(alone.league.sentiment.text, '观望')
   assert.equal(alone.league.sentiment.tone, 'flat')
-  assert.match(alone.league.empty, /还没有邻居上线/)
-  assert.match(alone.league.empty, /行情照走/)
+  assert.equal(alone.league.empty, '等邻居上线')
 
   // 有仓位的人写「多 2 · 空 1」；全场空仓的判定只看 long + short。
   const both = view.leagueView({
@@ -1156,17 +1365,16 @@ test('术语 SPEC 旧邻居：有人在线但没周报时，空态写「旧版�
   const old = alone({ online: 2, reported: 0 })
   assert.deepEqual(old.league.watchers, { online: 2, reported: 0 })
   assert.equal(old.league.empty, '邻居是旧版本，还没有周报')
-  assert.doesNotMatch(old.league.empty, /还没有邻居上线/)
-  // 没有在线邻居 → 原来的「还没有邻居上线…行情照走」。
-  assert.match(alone({ online: 0, reported: 0 }).league.empty, /还没有邻居上线/)
-  assert.match(alone({ online: 0, reported: 0 }).league.empty, /行情照走/)
+  assert.doesNotMatch(old.league.empty, /等邻居上线/)
+  // 没有在线邻居 → 一行「等邻居上线」。
+  assert.equal(alone({ online: 0, reported: 0 }).league.empty, '等邻居上线')
   // 有人在线、也确实发过周报（只是行还没到/被过滤）→ 不冒充旧版本。
-  assert.match(alone({ online: 2, reported: 1 }).league.empty, /还没有邻居上线/)
+  assert.equal(alone({ online: 2, reported: 1 }).league.empty, '等邻居上线')
   // 坏 watchers 不抛，按 0/0 处理。
   for (const bad of [null, 'x', 42, [], { online: 'x', reported: -1 }]) {
     const board = alone(bad)
     assert.deepEqual(board.league.watchers, { online: 0, reported: 0 }, JSON.stringify(bad))
-    assert.match(board.league.empty, /还没有邻居上线/)
+    assert.equal(board.league.empty, '等邻居上线')
   }
 })
 
@@ -1195,14 +1403,17 @@ test('票 83：到价面板——没点开时只有开关；点开后目标价�
   assert.equal(closed.limit.bandText, '2.75–8.75', '0.55–1.75 × 底价 5')
   assert.equal(closed.limit.placeLabel, '挂单')
   assert.equal(closed.limit.hint, '')
+  // 票 89：关着时不写「关：直接按现价开仓」，开着只写可挂价格带。
+  assert.equal(closed.limit.noteText, '')
 
   const opened = view.orderView(payload(), { limitOpen: true })
   assert.equal(opened.limit.enabled, true)
   assert.equal(opened.limit.canPlace, true)
   assert.equal(opened.limit.target, 5.06)
   assert.equal(opened.limit.hint, '')
-  assert.match(opened.limit.note, /跌到目标价/)
-  assert.match(opened.limit.note, /收盘没成交自动撤单/)
+  assert.equal(opened.limit.noteText, '可挂 2.75–8.75')
+  assert.match(opened.limit.noteTitle, /跌到目标价/)
+  assert.match(opened.limit.noteTitle, /收盘没成交自动撤单/)
 
   // 玩家输到一半的原文原样带回；带外目标价不装成可用。
   const outside = view.orderView(payload(), { limitOpen: true, targetText: '99' })
@@ -1213,7 +1424,7 @@ test('票 83：到价面板——没点开时只有开关；点开后目标价�
   assert.equal(half.limit.targetText, '5.')
   // 做空等的是「涨到目标价」。
   const short = view.orderView(payload(), { side: 'short', limitOpen: true, targetText: '5.5' })
-  assert.match(short.limit.note, /涨到目标价/)
+  assert.match(short.limit.noteTitle, /涨到目标价/)
   assert.equal(short.limit.target, 5.5)
   assert.equal(short.limit.canPlace, true)
 
@@ -1223,7 +1434,7 @@ test('票 83：到价面板——没点开时只有开关；点开后目标价�
     targetText: '5.5'
   })
   assert.equal(poor.limit.canPlace, false)
-  assert.match(poor.limit.hint, /硬币不够/)
+  assert.equal(poor.limit.hint, '差 10 硬币')
 })
 
 test('票 83：全下——按钮金额 = 可用硬币，选中后预览/强平按这个金额算', () => {
@@ -1277,8 +1488,8 @@ test('票 83：挂单列表——方向/作物/目标价/保证金/距收盘的�
   assert.deepEqual(view.orderRows(payload({ orders: [] })), [])
   const board = view.boardView(payload({ orders: [order] }), { now: SLOT_EDGE + 5 * 60 * 1000 })
   assert.equal(board.orders.length, 1)
-  assert.match(view.emptyHints(payload()).orders, /点开「到价」/)
-  assert.match(view.emptyHints(payload({ coins: { available: 0, locked: 0, total: 0 } })).orders, /先去种地/)
+  assert.equal(view.emptyHints(payload()).orders, '没有挂单')
+  assert.equal(view.emptyHints(payload({ coins: { available: 0, locked: 0, total: 0 } })).orders, '没有挂单')
 })
 
 test('评审 P2：到价目标带只从 payload 比例算，与宿主常量同源（drift）', () => {
@@ -1342,10 +1553,10 @@ test('评审 P1：持仓/挂单表头用真实总数说明截断（显示最近 
   assert.equal(view.boardView(payload({ orders: [order(0)] }), { now: SLOT_EDGE }).ordersMetaText, '挂单 1')
 })
 
-test('User Story 30：盘口窗上写明「没有手续费、没有资金费、没有风险控制」', async () => {
+test('User Story 30：盘口窗上写明「无手续费 · 无资金费 · 无风控」', async () => {
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
-  assert.match(html, /没有手续费、没有资金费、没有风险控制/)
-  assert.match(html, /硬币赔光就去种地/)
+  // 票 89：一整段 fine print 压成一行，放在下单卡底部。
+  assert.match(html, /无手续费 · 无资金费 · 无风控/)
   // SPEC v10 US7：下单区真的有一行强平价，并且渲染端把它填进去。
   assert.match(html, /id="order-liquidation"/)
   const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
