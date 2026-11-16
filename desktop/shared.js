@@ -88,7 +88,8 @@
   const MAX_MENU_TOOLS = 8
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'home', 'reload', 'scan-skins']
+  // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'home', 'reload', 'scan-skins']
 
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
@@ -193,6 +194,26 @@
    */
   const FARM_REFRESH_ACTIONS = ['farm-refresh', 'farm-own']
   /**
+   * 票 79：农场窗头部的「盘口」按钮。它只是**开窗申请**（和右键「盘口」同一个宿主入口），
+   * 所以挂进 FARM_ACTIONS 走同一条 `farm-submit` → action-result 回路，不带任何字段。
+   */
+  const BOARD_OPEN_ACTIONS = ['trading-open']
+  /**
+   * 盘口小窗能提交的动作（票 79）。字段窄到不能再窄：
+   *   trading-open-position  { side, margin, leverage, cropId }
+   *   trading-close-position { positionId }
+   *   trading-refresh        无字段（倒计时到 0 时请宿主结这一根并重推一拍）
+   * 价格、硬币、盈亏、成交价全由宿主算，窗口一概不传。
+   */
+  const BOARD_SUBMIT_ACTIONS = ['trading-open-position', 'trading-close-position', 'trading-refresh']
+  const BOARD_SIDES = ['long', 'short']
+  const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
+  /** 一包最多画多少手/多少笔：窗口只滚一屏，不用把整份历史搬过去。 */
+  const BOARD_MAX_PRICE = 1000000000
+  const BOARD_MAX_POSITIONS = 32
+  const BOARD_MAX_HISTORY = 50
+  const BOARD_MAX_LIMITS = 8
+  /**
    * 地块解锁（ticket 48）：只带可选的 `expectedUnlocked`（窗口看到的已解锁数）。
    * 价格与下一块地在哪全由宿主算；窗口不传钱、不传地块 id。
    */
@@ -228,7 +249,9 @@
     FARM_LAND_ACTIONS,
     FARM_LOOK_ACTIONS,
     FARM_EVENT_ACTIONS,
-    FARM_OMEN_ACTIONS
+    FARM_OMEN_ACTIONS,
+    // 票 79：农场窗头部的「盘口」按钮（无字段，只是开窗申请）。
+    BOARD_OPEN_ACTIONS
   )
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
@@ -260,7 +283,9 @@
   const MENU_ACTION_IDS = [
     'play-anim', 'reload', 'open-site', 'bring', 'use-skin', 'scan-skins', 'farm-open',
     // 票 52/53：右键邻居看田、从看田窗派它去偷（都只带 deviceId）。
-    'farm-look', 'farm-raid'
+    'farm-look', 'farm-raid',
+    // 票 79：右键「盘口」只发一个空动作，开/关与整份视图都在宿主。
+    ...BOARD_OPEN_ACTIONS
   ]
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
@@ -1520,6 +1545,195 @@
     }
   }
 
+  /**
+   * 盘口小窗（票 79）的**宿主 → helper** 白名单。
+   *
+   * 窗口是 sandboxed 的 file:// 页面，只认这一份形状：多一个字段都进不去，
+   * 数字要么是有限数、要么是 null（null 在视图层画成「—」）。
+   * 业务白名单（50/100、1×）不在这里抄一遍——那是宿主的 `trading-rules.js`，
+   * 这一层只管**形状**；抄两份迟早漂移（§9.3 的教训）。
+   */
+  function normalizeBoardNumber (value, min, max) {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return null
+    return Math.min(max, Math.max(min, num))
+  }
+
+  function normalizeBoardInt (value, min, max) {
+    const num = normalizeBoardNumber(value, min, max)
+    return num === null ? null : Math.round(num)
+  }
+
+  function strictBoardInt (value, min, max) {
+    const num = Number(value)
+    if (!Number.isInteger(num) || num < min || num > max) return null
+    return num
+  }
+
+  function normalizeBoardPosition (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeId(raw.id)
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    if (id === null || crop === null || side === null) return null
+    const margin = normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS)
+    const leverage = normalizeBoardInt(raw.leverage, 1, 20)
+    const entry = normalizeBoardNumber(raw.entry, 0, BOARD_MAX_PRICE)
+    if (margin === null || leverage === null || entry === null) return null
+    return {
+      id,
+      crop,
+      side,
+      margin,
+      leverage,
+      entry,
+      mark: normalizeBoardNumber(raw.mark, 0, BOARD_MAX_PRICE),
+      pnl: normalizeBoardNumber(raw.pnl, -BOARD_MAX_PRICE, BOARD_MAX_PRICE),
+      // 结算中的仓位只能看不能点平仓（钱已经走了一半，宿主会回 settling）。
+      ...(raw.settling === true ? { settling: true } : {})
+    }
+  }
+
+  function normalizeBoardHistory (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeId(raw.id)
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    if (id === null || crop === null || side === null) return null
+    if (!BOARD_REASONS.includes(raw.reason)) return null
+    const entry = normalizeBoardNumber(raw.entry, 0, BOARD_MAX_PRICE)
+    const exit = normalizeBoardNumber(raw.exit, 0, BOARD_MAX_PRICE)
+    const pnl = normalizeBoardNumber(raw.pnl, -BOARD_MAX_PRICE, BOARD_MAX_PRICE)
+    const at = normalizeBoardInt(raw.at, 0, Number.MAX_SAFE_INTEGER)
+    if (entry === null || exit === null || pnl === null || at === null) return null
+    return {
+      id,
+      crop,
+      side,
+      margin: normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS) ?? 0,
+      leverage: normalizeBoardInt(raw.leverage, 1, 20) ?? 1,
+      entry,
+      exit,
+      pnl,
+      reason: raw.reason,
+      at
+    }
+  }
+
+  function normalizeBoardLimits (raw) {
+    const margins = []
+    for (const candidate of Array.isArray(raw.margins) ? raw.margins : []) {
+      if (margins.length >= BOARD_MAX_LIMITS) break
+      const margin = strictBoardInt(candidate, 1, MAX_FARM_COINS)
+      if (margin !== null && !margins.includes(margin)) margins.push(margin)
+    }
+    const leverages = []
+    for (const candidate of Array.isArray(raw.leverages) ? raw.leverages : []) {
+      if (leverages.length >= BOARD_MAX_LIMITS) break
+      const leverage = strictBoardInt(candidate, 1, 20)
+      if (leverage !== null && !leverages.includes(leverage)) leverages.push(leverage)
+    }
+    const crops = []
+    for (const candidate of Array.isArray(raw.crops) ? raw.crops : []) {
+      if (crops.length >= BOARD_MAX_LIMITS) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const id = normalizeCropId(candidate.id)
+      if (id === null || crops.some((crop) => crop.id === id)) continue
+      crops.push({ id, name: normalizeLabel(candidate.name, id) })
+    }
+    return {
+      margins,
+      leverages,
+      crops,
+      historyLimit: normalizeBoardInt(raw.historyLimit, 0, BOARD_MAX_HISTORY) ?? BOARD_MAX_HISTORY
+    }
+  }
+
+  /** 整份盘口视图；坏到不成形状就返回 null（窗口画空态，不崩）。 */
+  function normalizeBoardView (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const coinsRaw = raw.coins !== null && typeof raw.coins === 'object' && !Array.isArray(raw.coins)
+      ? raw.coins
+      : {}
+    const weekRaw = raw.week !== null && typeof raw.week === 'object' && !Array.isArray(raw.week)
+      ? raw.week
+      : {}
+    const limitsRaw = raw.limits !== null && typeof raw.limits === 'object' && !Array.isArray(raw.limits)
+      ? raw.limits
+      : {}
+    const barRaw = raw.bar !== null && typeof raw.bar === 'object' && !Array.isArray(raw.bar)
+      ? raw.bar
+      : null
+    const positions = []
+    for (const candidate of Array.isArray(raw.positions) ? raw.positions : []) {
+      if (positions.length >= BOARD_MAX_POSITIONS) break
+      const position = normalizeBoardPosition(candidate)
+      if (position !== null) positions.push(position)
+    }
+    const history = []
+    for (const candidate of Array.isArray(raw.history) ? raw.history : []) {
+      if (history.length >= BOARD_MAX_HISTORY) break
+      const entry = normalizeBoardHistory(candidate)
+      if (entry !== null) history.push(entry)
+    }
+    return {
+      coins: {
+        available: normalizeBoardInt(coinsRaw.available, 0, MAX_FARM_COINS) ?? 0,
+        locked: normalizeBoardInt(coinsRaw.locked, 0, MAX_FARM_COINS) ?? 0,
+        total: normalizeBoardInt(coinsRaw.total, 0, MAX_FARM_COINS) ?? 0
+      },
+      week: {
+        start: normalizeBoardInt(weekRaw.start, 0, Number.MAX_SAFE_INTEGER) ?? 0,
+        pnl: normalizeBoardInt(weekRaw.pnl, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0,
+        base: normalizeBoardInt(weekRaw.base, 0, MAX_FARM_COINS) ?? 0
+      },
+      limits: normalizeBoardLimits(limitsRaw),
+      bar: barRaw === null
+        ? null
+        : {
+          crop: normalizeCropId(barRaw.crop),
+          slot: normalizeBoardInt(barRaw.slot, 0, Number.MAX_SAFE_INTEGER),
+          start: normalizeBoardInt(barRaw.start, 0, Number.MAX_SAFE_INTEGER),
+          end: normalizeBoardInt(barRaw.end, 0, Number.MAX_SAFE_INTEGER),
+          remainingMs: normalizeBoardInt(barRaw.remainingMs, 0, 24 * 60 * 60 * 1000),
+          open: normalizeBoardNumber(barRaw.open, 0, BOARD_MAX_PRICE),
+          price: normalizeBoardNumber(barRaw.price, 0, BOARD_MAX_PRICE)
+        },
+      positions,
+      history,
+      // 票 83 之前挂单只有空形状；窗口已经认这个字段，省得下一票再改白名单。
+      orders: []
+    }
+  }
+
+  /** `board-window` 命令：和农场窗一样，刷新（open:false）与关窗（close:true）必须分开。 */
+  function normalizeBoardWindow (raw) {
+    return {
+      open: raw.open === true,
+      ...(raw.close === true ? { close: true } : {}),
+      state: normalizeBoardView(raw.state)
+    }
+  }
+
+  /** 盘口小窗提交（`dsh-zoo:board-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
+  function normalizeBoardAction (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+    if (!BOARD_SUBMIT_ACTIONS.includes(action)) return null
+    if (action === 'trading-refresh') return { action }
+    if (action === 'trading-close-position') {
+      const positionId = normalizeUuid(raw.positionId)
+      return positionId === null ? null : { action, positionId }
+    }
+    // 开仓：形状合法即可，50/100 与 1× 由宿主按 trading-rules 再判一次（并回人话）。
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
+    const leverage = strictBoardInt(raw.leverage, 1, 20)
+    const cropId = normalizeCropId(raw.cropId)
+    if (side === null || margin === null || leverage === null || cropId === null) return null
+    return { action, side, margin, leverage, cropId }
+  }
+
   /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
   /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
@@ -1590,6 +1804,8 @@
     }
     // 重推当前视图 / 切回我的农场：不带其它字段，宿主按自己记得的模式重画。
     if (action === 'farm-refresh' || action === 'farm-own') return { action }
+    // 票 79：农场窗的「盘口」按钮只是开窗申请，不带字段。
+    if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
     if (action === 'farm-unlock') {
       if (raw.expectedUnlocked === undefined || raw.expectedUnlocked === null) return { action }
@@ -2726,11 +2942,23 @@
        */
       case 'farm-window':
         return { ok: true, command: { type, id, ...normalizeFarmWindow(raw) } }
+      /**
+       * 盘口小窗（票 79）：`open:true` 打开/聚焦，`open:false` 只刷新已经开着的那扇，
+       * `close:true` 才是关窗。内容和农场窗一样由宿主算好：窗口不读盘、不联网。
+       */
+      case 'board-window':
+        return { ok: true, command: { type, id, ...normalizeBoardWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
         // 冒烟可以点名抓小窗；主窗仍是默认目标。
-        const window = raw.window === 'bring' ? 'bring' : raw.window === 'farm' ? 'farm' : null
+        const window = raw.window === 'bring'
+          ? 'bring'
+          : raw.window === 'farm'
+            ? 'farm'
+            : raw.window === 'board'
+              ? 'board'
+              : null
         return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
@@ -2759,7 +2987,13 @@
       case 'debug-blur': {
         // 冒烟用：模拟输入法候选窗/别的窗口抢走小窗焦点。小窗都**不**该因此关掉
         // （现场：打中文时小窗消失；农场窗也一样）。
-        const window = raw.window === 'bring' ? 'bring' : raw.window === 'farm' ? 'farm' : 'rename'
+        const window = raw.window === 'bring'
+          ? 'bring'
+          : raw.window === 'farm'
+            ? 'farm'
+            : raw.window === 'board'
+              ? 'board'
+              : 'rename'
         return { ok: true, command: { type, id, window } }
       }
       case 'debug-farm-submit': {
@@ -2902,6 +3136,10 @@
       farmOpen: raw.farmOpen === true,
       farmVisible: raw.farmVisible === true,
       farmFocused: raw.farmFocused === true,
+      // 票 79：盘口小窗同样分「开着 / 看得见 / 拿到焦点」。
+      boardOpen: raw.boardOpen === true,
+      boardVisible: raw.boardVisible === true,
+      boardFocused: raw.boardFocused === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -3059,6 +3297,9 @@
             open: raw.open === true
           }
         }
+      case 'board-window-state':
+        // 票 79：盘口小窗同一套语义——×/Esc 关窗后，右键「盘口」必须能重新打开。
+        return { ok: true, event: { type, id, open: raw.open === true } }
       case 'action': {
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
         if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
@@ -3605,6 +3846,9 @@
     CONTROL_ACTIONS,
     GIFT_ACTIONS,
     FARM_ACTIONS,
+    BOARD_OPEN_ACTIONS,
+    BOARD_SUBMIT_ACTIONS,
+    BOARD_SIDES,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
     FARM_LAND_ACTIONS,
@@ -3647,6 +3891,9 @@
     normalizeFarmPlot,
     normalizeFarmLogEntry,
     normalizeFarmWindow,
+    normalizeBoardWindow,
+    normalizeBoardView,
+    normalizeBoardAction,
     normalizeSeason,
     applyCropCatalog,
     normalizeFarmAction,

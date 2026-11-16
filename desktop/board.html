@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      盘口小窗（票 79）：15 分钟合约的价格、倒计时、一键开/平与最近结算。
+
+      和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
+      /state。行情、硬币、持仓、历史全部由宿主随 `board-window` 命令推过来，
+      这里只画、只把「申请」交回主进程。窗口能收键盘（focusable），但**不按失焦关窗**：
+      macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
+
+      票 81 会把这里扩成完整的 K 线 + 三作物 + 周榜；票 79 只做最小可用的一屏。
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dshzoo:"
+    />
+    <title>盘口</title>
+    <style>
+      :root {
+        --cream: #faf8f5;
+        --card: #fffdfa;
+        --ink: #2f3a34;
+        --ink-soft: #626a63;
+        --muted: #666d66;
+        --line: #ede5da;
+        --emerald: #2e9e6b;
+        --emerald-btn: #23815a;
+        --emerald-deep: #1b6b4a;
+        --emerald-soft: #e8f6ee;
+        --amber: #e7a23a;
+        --amber-ink: #8a5a12;
+        --amber-soft: #fdf3e2;
+        --rose: #c25b50;
+        --rose-ink: #a8352a;
+        --rose-soft: #fbeae7;
+        --line-strong: #ded4c4;
+        --disabled-bg: #f2efe8;
+        --disabled-ink: #8d8b82;
+        --focus: #1f7a52;
+        --shadow-soft: 0 4px 14px rgba(63, 54, 38, 0.07);
+        --shadow-lift: 0 10px 26px rgba(63, 54, 38, 0.13);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+          'Microsoft YaHei', 'Segoe UI', system-ui, sans-serif;
+        color: var(--ink);
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      button {
+        font-family: inherit;
+      }
+      :focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 2px;
+      }
+      .app {
+        display: flex;
+        flex-direction: column;
+        height: calc(100% - 16px);
+        margin: 8px;
+        overflow: hidden;
+        border: 1px solid rgba(255, 255, 255, 0.85);
+        border-radius: 22px;
+        background:
+          radial-gradient(circle at 10% -8%, rgba(255, 255, 255, 0.9), transparent 42%),
+          linear-gradient(168deg, #fffdf9 0%, var(--cream) 56%, #f6f1e9 100%);
+        box-shadow: 0 18px 40px rgba(15, 23, 42, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.9);
+      }
+      .topbar {
+        flex: none;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px 10px;
+        background: rgba(255, 255, 255, 0.74);
+        border-bottom: 1px solid var(--line);
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      .brand-mark {
+        width: 34px;
+        height: 34px;
+        flex: none;
+        display: grid;
+        place-items: center;
+        border-radius: 11px;
+        background: var(--emerald-soft);
+        font-size: 18px;
+      }
+      .brand-text h1 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+      }
+      .brand-text p {
+        margin: 2px 0 0;
+        font-size: 11px;
+        color: var(--muted);
+      }
+      .quote {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        min-width: 0;
+      }
+      .price {
+        font-size: 26px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.02em;
+      }
+      .price[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .price[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .change {
+        font-size: 12px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      .change[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .change[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .change[data-tone='flat'] {
+        color: var(--muted);
+      }
+      .countdown {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        min-width: 74px;
+      }
+      .countdown b {
+        font-size: 18px;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 0.02em;
+      }
+      .countdown span {
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .wallet {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: none;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        padding: 5px 9px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 600;
+        background: var(--card);
+        border: 1px solid var(--line);
+        white-space: nowrap;
+      }
+      .pill small {
+        color: var(--muted);
+        font-weight: 500;
+      }
+      .pill b {
+        font-variant-numeric: tabular-nums;
+      }
+      .close {
+        width: 26px;
+        height: 26px;
+        flex: none;
+        border: none;
+        border-radius: 9px;
+        background: rgba(47, 58, 52, 0.06);
+        color: var(--ink-soft);
+        font-size: 15px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .close:hover {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .body {
+        flex: 1;
+        min-height: 0;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 268px;
+        gap: 12px;
+        padding: 12px 14px 14px;
+        overflow: hidden;
+      }
+      .column {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 2px;
+      }
+      .column::-webkit-scrollbar {
+        width: 6px;
+      }
+      .column::-webkit-scrollbar-thumb {
+        background: rgba(47, 58, 52, 0.18);
+        border-radius: 999px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        box-shadow: var(--shadow-soft);
+        padding: 12px 13px;
+      }
+      .card-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 8px;
+      }
+      .card-head h2 {
+        margin: 0;
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+        color: var(--ink-soft);
+      }
+      .card-head span {
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .side-row,
+      .margin-row {
+        display: flex;
+        gap: 8px;
+      }
+      .chip {
+        flex: 1;
+        padding: 9px 10px;
+        border-radius: 12px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink);
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .chip:hover {
+        border-color: var(--emerald);
+      }
+      .chip[aria-pressed='true'] {
+        border-color: var(--emerald-btn);
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .chip.short[aria-pressed='true'] {
+        border-color: var(--rose);
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .chip:disabled {
+        background: var(--disabled-bg);
+        border-color: var(--line);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .preview {
+        margin: 10px 0 8px;
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+      .submit {
+        width: 100%;
+        padding: 11px 12px;
+        border: none;
+        border-radius: 13px;
+        background: var(--emerald-btn);
+        color: #fff;
+        font-size: 14px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .submit:hover:not(:disabled) {
+        background: var(--emerald-deep);
+      }
+      .submit[data-side='short'] {
+        background: var(--rose-ink);
+      }
+      .submit[data-side='short']:hover:not(:disabled) {
+        background: #8c2b22;
+      }
+      .submit:disabled {
+        background: var(--disabled-bg);
+        border: 1px solid var(--line);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .hint {
+        margin: 8px 0 0;
+        font-size: 11px;
+        color: var(--amber-ink);
+        min-height: 0;
+      }
+      .hint:empty {
+        display: none;
+      }
+      .position {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 11px;
+        border-radius: 13px;
+        border: 1px solid var(--line);
+        background: linear-gradient(180deg, #fffefb, #fbf7f0);
+      }
+      .position + .position {
+        margin-top: 8px;
+      }
+      .position-main {
+        min-width: 0;
+      }
+      .position-title {
+        font-size: 13px;
+        font-weight: 700;
+      }
+      .position-meta {
+        margin-top: 3px;
+        font-size: 11px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .position-side {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex: none;
+      }
+      .pnl {
+        font-size: 15px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+      }
+      .pnl[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .pnl[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .pnl[data-tone='flat'] {
+        color: var(--ink-soft);
+      }
+      .ghost {
+        padding: 7px 11px;
+        border-radius: 10px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+      .ghost:hover:not(:disabled) {
+        border-color: var(--rose);
+        color: var(--rose-ink);
+      }
+      .ghost:disabled {
+        background: var(--disabled-bg);
+        color: var(--disabled-ink);
+        cursor: not-allowed;
+      }
+      .row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 7px 0;
+        font-size: 12px;
+      }
+      .row + .row {
+        border-top: 1px dashed var(--line);
+      }
+      .row-main {
+        min-width: 0;
+      }
+      .row-title {
+        font-weight: 600;
+      }
+      .row-meta {
+        margin-top: 2px;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .empty {
+        margin: 4px 0 0;
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+      .foot {
+        flex: none;
+        padding: 8px 14px 10px;
+        border-top: 1px solid var(--line);
+        font-size: 10px;
+        color: var(--muted);
+        text-align: center;
+      }
+      .toasts {
+        position: absolute;
+        left: 50%;
+        bottom: 18px;
+        transform: translateX(-50%);
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        align-items: center;
+        pointer-events: none;
+      }
+      .toast {
+        padding: 8px 14px;
+        border-radius: 999px;
+        background: rgba(47, 58, 52, 0.92);
+        color: #fff;
+        font-size: 12px;
+        box-shadow: var(--shadow-lift);
+        white-space: nowrap;
+      }
+      .toast.error {
+        background: var(--rose-ink);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">📈</span>
+          <div class="brand-text">
+            <h1 id="board-title">盘口</h1>
+            <p id="board-subtitle">15 分钟合约 · 收盘自动结算</p>
+          </div>
+        </div>
+        <div class="quote">
+          <b class="price" id="price" data-tone="flat">—</b>
+          <span class="change" id="change" data-tone="flat">—</span>
+        </div>
+        <div class="countdown" title="距这一根收盘">
+          <b id="countdown">15:00</b>
+          <span>距收盘</span>
+        </div>
+        <div class="wallet">
+          <span class="pill" title="可用硬币 = 农场硬币">
+            <small>可用</small><b id="coins-available">0</b>
+          </span>
+          <span class="pill" title="可用 + 锁定保证金 + 未实现盈亏">
+            <small>含锁定</small><b id="coins-total">0</b>
+          </span>
+          <button class="close" id="close" type="button" aria-label="关闭盘口">×</button>
+        </div>
+      </header>
+
+      <div class="body">
+        <div class="column">
+          <section class="card" aria-labelledby="positions-title">
+            <div class="card-head">
+              <h2 id="positions-title">持仓</h2>
+              <span id="positions-meta">0 手</span>
+            </div>
+            <div id="positions"></div>
+            <p class="empty" id="positions-empty">还没有持仓。选好方向和保证金，一键开一手。</p>
+          </section>
+
+          <section class="card" aria-labelledby="history-title">
+            <div class="card-head">
+              <h2 id="history-title">最近结算</h2>
+              <span id="history-meta">0 笔</span>
+            </div>
+            <div id="history"></div>
+            <p class="empty" id="history-empty">还没有结算记录。收盘或手动平仓后会出现在这里。</p>
+          </section>
+        </div>
+
+        <div class="column">
+          <section class="card" aria-labelledby="order-title">
+            <div class="card-head">
+              <h2 id="order-title">下单</h2>
+              <span id="order-crop">小番茄</span>
+            </div>
+            <div class="side-row" id="side-row" role="group" aria-label="方向"></div>
+            <div class="margin-row" id="margin-row" role="group" aria-label="保证金" style="margin-top: 8px"></div>
+            <p class="preview" id="preview"></p>
+            <button class="submit" id="submit" type="button">做多 50</button>
+            <p class="hint" id="order-hint"></p>
+          </section>
+        </div>
+      </div>
+
+      <div class="foot">15 分钟一根 · 做多/做空 1× · 没有手续费、没有资金费 · 硬币赔光就去种地</div>
+      <div class="toasts" id="toasts"></div>
+    </div>
+    <script src="trading-view.js"></script>
+    <script src="board.js"></script>
+  </body>
+</html>

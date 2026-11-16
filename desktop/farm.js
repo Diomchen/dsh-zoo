@@ -78,6 +78,7 @@ const unlockConfirmEl = document.getElementById('unlock-confirm')
 const unlockCloseEl = document.getElementById('unlock-modal-close')
 const closeButton = document.getElementById('close')
 const pinButton = document.getElementById('pin')
+const boardButton = document.getElementById('board')
 
 /** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
 const HIRE_WAGE_MIN = 1
@@ -2470,6 +2471,12 @@ hirePageEl?.addEventListener('click', (event) => {
 })
 
 closeButton.addEventListener('click', () => api?.close())
+
+// 票 79：头部的「盘口」按钮只是**开窗申请**（和右键「盘口」同一个宿主入口），
+// 走和种地/买种一样的 farm-submit → action-result 回路，失败会冒一句人话。
+if (boardButton !== null) {
+  boardButton.addEventListener('click', () => submit({ action: 'trading-open' }))
+}
 
 if (pinButton !== null) {
   pinButton.addEventListener('click', () => {
