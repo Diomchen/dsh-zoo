@@ -201,7 +201,7 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
   assert.deepEqual(state.orders, [])
   assert.deepEqual(state.limits, {
     margins: [50, 100],
-    leverages: [1],
+    leverages: [1, 5, 20],
     crops: [{ id: 'tomato', name: '小番茄' }],
     historyLimit: 50
   })
