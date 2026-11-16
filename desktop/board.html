@@ -1508,6 +1508,10 @@
         这里补图表里那几处纸色/贴纸色，保证整窗真正去饱和。
         涨跌语义不靠颜色：涨=实心墨色、跌=空心墨色（描边墨色），数字带 ▲▼/±。
       */
+      /* 品牌图标是 emoji：彩色会漏出来，黑白模式统一压成灰度。 */
+      body[data-mono='1'] .brand-mark {
+        filter: grayscale(1);
+      }
       body[data-mono='1'] .position {
         background: linear-gradient(180deg, #ffffff, #f4f4f5);
       }
