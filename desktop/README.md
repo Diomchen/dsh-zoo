@@ -495,7 +495,10 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 和农场窗同一条模型：**宿主算数据，helper 只画和收输入**。
 
 - 宿主用 `board-window { open, state }` 下发整份视图（硬币、本周盈亏、三作物 K 线、风向、
-  持仓、挂单、历史、真人周榜、`limits`）；窗口读不到 `/state`，也不自己算价/算钱。
+  持仓、挂单、历史、真人周榜、`limits`）；窗口读不到 `/state`，价格、硬币、盈亏入账与
+  「能不能下单/平仓」全由宿主算。窗口只用 payload 的现价算两处**展示用**数字：
+  下单预览（涨跌 1% 的盈亏与强平亏损）和强平价/到价目标带；两者都不改账本，
+  `test/trading-view.test.js` 有 drift 断言盯着它们和 `src/trading-rules.js` 一致。
 - 渲染端用 `dsh-zoo:board-submit` 发一次申请，字段经 `shared.normalizeBoardAction` 白名单后
   落到宿主的 `trading-*` 动作；结果走 `action-result`，成功不关窗，失败冒人话。
 - `dsh-zoo:board-ready` / `dsh-zoo:board-close` / `dsh-zoo:board-state` / `dsh-zoo:board-result`

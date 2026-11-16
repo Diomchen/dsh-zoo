@@ -10,7 +10,13 @@ import { createRequire } from 'node:module'
 import test from 'node:test'
 
 import { TRADING_ERROR_CODES, tradingErrorText } from '../src/trading-text.js'
-import { liquidationPriceOf, pnlOf } from '../src/trading-rules.js'
+import {
+  PRICE_CEIL_RATIO,
+  PRICE_FLOOR_RATIO,
+  liquidationPriceOf,
+  pnlOf,
+  targetBandOf
+} from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
 const view = require('../desktop/trading-view.js')
@@ -802,6 +808,28 @@ test('票 83：挂单列表——方向/作物/目标价/保证金/距收盘的�
   assert.equal(board.orders.length, 1)
   assert.match(view.emptyHints(payload()).orders, /点开「到价」/)
   assert.match(view.emptyHints(payload({ coins: { available: 0, locked: 0, total: 0 } })).orders, /先去种地/)
+})
+
+test('评审 P2：到价目标带只从 payload 比例算，与宿主常量同源（drift）', () => {
+  const band = targetBandOf({ crop: 'tomato' })
+  const base = payload().charts.tomato.base
+  assert.deepEqual(band, {
+    min: base * PRICE_FLOOR_RATIO,
+    max: base * PRICE_CEIL_RATIO
+  })
+  const viewPayload = payload()
+  viewPayload.limits = {
+    ...LIMITS,
+    targetRatio: { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO }
+  }
+  const order = view.orderView(viewPayload)
+  assert.equal(order.limit.bandText, view.formatPrice(band.min) + '–' + view.formatPrice(band.max))
+  assert.equal(order.limit.bandText, '2.75–8.75')
+  // 窗口没有把 0.55/1.75 写死：换一组比例，带子跟着 payload 走（老宿主可只发比例）。
+  const shifted = view.orderView(payload({
+    limits: { ...LIMITS, targetRatio: { floor: 0.5, ceil: 2 } }
+  }))
+  assert.equal(shifted.limit.bandText, '2.50–10.00')
 })
 
 test('评审 P1：持仓/挂单表头用真实总数说明截断（显示最近 200）', () => {

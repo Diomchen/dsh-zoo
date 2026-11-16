@@ -25,6 +25,8 @@ import {
   BOARD_CROPS,
   SLOT_MS,
   TICK_MS,
+  PRICE_CEIL_RATIO,
+  PRICE_FLOOR_RATIO,
   TRADING_LEVERAGES,
   TRADING_STOP_LEVELS,
   markPrice,
@@ -219,7 +221,7 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
     historyLimit: 50,
     // 票 83：「全下」与目标价带都随包下发，窗口不抄宿主常量。
     allIn: true,
-    targetRatio: { floor: 0.55, ceil: 1.75 }
+    targetRatio: { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO }
   })
   // 这一包能直接喂给窗口的纯视图（窗口只画）。
   const board = boardView.boardView(state, { now: clock.value })
@@ -371,7 +373,8 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.equal('secret' in normalized.command.state.bar, false)
   assert.deepEqual(normalized.command.state.limits.margins, [50, 100, 250])
   assert.equal(normalized.command.state.limits.allIn, true)
-  assert.deepEqual(normalized.command.state.limits.targetRatio, { floor: 0.55, ceil: 1.75 })
+  assert.deepEqual(normalized.command.state.limits.targetRatio,
+    { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO })
   assert.deepEqual(normalized.command.state.limits.crops, [{ id: 'tomato', name: '小番茄' }])
   assert.equal('secret' in normalized.command.state.positions[0], false)
   assert.equal(normalized.command.state.positions[0].id, 'p1')
