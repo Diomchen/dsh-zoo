@@ -19,7 +19,9 @@ import {
 } from '../src/trading.js'
 import {
   SLOT_MS,
+  SLOT_TICKS,
   TICK_MS,
+  boardPrice,
   markPrice,
   slotClosePrice,
   slotIndexAt,
@@ -31,20 +33,45 @@ const SLOT_EDGE = 1763308800000
 const SLOT = SLOT_EDGE / SLOT_MS
 const MONDAY = weekStartOf(SLOT_EDGE)
 /**
- * 成交用的那一根（slot 1959232）：tick 1→15 一路下跌（6.10 → 5.79）。
+ * 成交用的那一根：tick 1→15 一路下跌（价格是算出来的，见 `priceAt`），
  * 做多 target 取第 14 分钟的价 → 第 14 分钟第一次越价；做空 target 取第 1 分钟的最高价。
  */
 const FILL_SLOT = SLOT
 const LONG_FILL_TICK = 14
 const SHORT_FILL_TICK = 1
+
 /**
- * 插针用的下一根（slot 1959233）：tick 1 开在 5.752，tick 9 跌到 5.437（−5.5%）。
- * 20× 做多的强平线是 −5%，5× + −25% 止损也在同一分钟触发——正好测「成交后还会被强平/止损」。
- * 而这一根 tick 1 之后到收盘都不低于 5.18，用 5.181 当目标价可以测「没越价就到期退款」。
+ * 插针用的那一根：tick 1 开仓，之后**第一次**跌穿 −5.5% 在 `DROP_TICK`——20× 的强平线
+ * 是 −5%，5× + −25% 止损（−5% 价格）也在同一分钟触发，而且下一根的 tick 1 比这一根
+ * 所有 tick 都低：拿它当目标价，正好测「没越价就到期退款」。
+ * 票 86 把价格盐升到 board-v2 后行情全变，这一根按新行情现找，不再写死 slot / 5.181。
  */
-const DROP_SLOT = SLOT + 1
-const DROP_TICK = 9
-const NOFILL_TARGET = 5.181
+function dropBar (fromSlot) {
+  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+    const prices = []
+    for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+      prices.push(boardPrice({ crop: 'tomato', slot, tick }))
+    }
+    const entry = prices[1]
+    let dropTick = -1
+    for (let tick = 3; tick <= SLOT_TICKS; tick += 1) {
+      // −5.5%：5× 的 −25% 档要亏到 −13 以下（用例断言 pnl <= -13），比强平线多留一点。
+      if (prices[tick] <= entry * 0.945) {
+        dropTick = tick
+        break
+      }
+    }
+    if (dropTick < 0) continue
+    // 强平线（−5%）的第一次触发必须就是 dropTick：之前的分钟不能有更深的价。
+    if (prices.slice(2, dropTick).some((price) => price <= entry * 0.95)) continue
+    const low = Math.min(...prices.slice(1))
+    const nextFirst = boardPrice({ crop: 'tomato', slot: slot + 1, tick: 1 })
+    if (nextFirst >= low) continue
+    return { slot, dropTick, noFillTarget: nextFirst }
+  }
+  throw new Error('找不到「tick 1 开仓、之后跌穿 −5%、下一根更低」的行情（行情规则改了？）')
+}
+const { slot: DROP_SLOT, dropTick: DROP_TICK, noFillTarget: NOFILL_TARGET } = dropBar(SLOT + 2)
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-trading-orders-'))
@@ -111,6 +138,13 @@ async function writeTrading (dir, value) {
 
 function priceAt (slot, tick) {
   return markPrice({ crop: 'tomato', now: slot * SLOT_MS + tick * TICK_MS })
+}
+
+/** 这一根里所有 tick 的最低价（挑「绝不会成交」的目标价用）。 */
+function tickLowOf (slot) {
+  let low = Infinity
+  for (let tick = 0; tick <= SLOT_TICKS; tick += 1) low = Math.min(low, priceAt(slot, tick))
+  return low
 }
 
 test('票 83：挂单当场锁保证金一次；视图/存档有单；重启不重复扣钱', async (t) => {
@@ -253,7 +287,7 @@ test('票 83：这一根从没越价就不成交（哪怕此刻的现价已经�
   const clock = makeClock(placedAt)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  // DROP_SLOT 从 tick 1 到收盘都不低于 5.1817；目标 5.181 只在下一根才被摸到。
+  // 这一根从 tick 1 到收盘都不低于 NOFILL_TARGET；目标价只在下一根才被摸到。
   const later = (DROP_SLOT + 1) * SLOT_MS + TICK_MS
   assert.ok(markPrice({ crop: 'tomato', now: later }) <= NOFILL_TARGET, '此刻现价已经越过目标价')
   assert.equal((await store.placeOrder({
@@ -344,7 +378,9 @@ test('票 83：坏挂单行只丢自己并计修补；缺省 orders 不算修补
     id: 'o-good',
     crop: 'tomato',
     side: 'long',
-    target: 5.5,
+    // 目标价压在这一根所有 tick 之下（由行情现算）：写死 5.5 会被当场越价成交，
+    // 那就不是「好单读得回来」而是「好单已经成交」了。
+    target: tickLowOf(SLOT) * 0.999,
     margin: 50,
     leverage: 5,
     placedAt: SLOT_EDGE,
