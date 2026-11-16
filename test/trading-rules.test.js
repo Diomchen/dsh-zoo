@@ -64,7 +64,10 @@ const SLOT = SLOT_EDGE / SLOT_MS
 const BASE = 5
 const HOUR_MS = 60 * 60 * 1000
 /** 票 84 的固定「现在」：本地 2026-11-18（周三）13:37:25，离任何桶边界都很远。 */
-const TF_NOW = new Date(2026, 10, 18, 13, 37, 25, 0).getTime()
+// 绝对时刻（不是本地日历构造）：同一瞬间在任何 TZ 下都落在同一个 slot，
+// 结算定值才不会随 CI（UTC）和本机（+08）漂移；本地日历相关的期望由下面的
+// localDayStart/weekStartOf 自己算。
+const TF_NOW = Date.UTC(2026, 10, 18, 5, 37, 25, 0)
 
 /** 本地日历 +days 天的 00:00（测试自己算期望值，不调被测函数）。 */
 function localDayStart (ms, days = 0) {
