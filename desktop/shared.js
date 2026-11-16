@@ -199,10 +199,12 @@
    */
   const BOARD_OPEN_ACTIONS = ['trading-open']
   /**
-   * 盘口小窗能提交的动作（票 79 / 票 81）。字段窄到不能再窄：
+   * 盘口小窗能提交的动作（票 79 / 票 81 / 票 83）。字段窄到不能再窄：
    *   trading-open-position  { side, margin, leverage, cropId }
    *   trading-close-position { positionId }
    *   trading-set-stop       { positionId, level }（票 81：持仓卡上的止损循环）
+   *   trading-place-order    { side, margin, leverage, cropId, target }（票 83：到价挂单）
+   *   trading-cancel-order   { orderId }（票 83：撤单）
    *   trading-refresh        无字段（倒计时到 0 时请宿主结这一根并重推一拍）
    * 价格、硬币、盈亏、成交价全由宿主算，窗口一概不传。
    */
@@ -210,6 +212,8 @@
     'trading-open-position',
     'trading-close-position',
     'trading-set-stop',
+    'trading-place-order',
+    'trading-cancel-order',
     'trading-refresh'
   ]
   const BOARD_SIDES = ['long', 'short']
@@ -223,6 +227,8 @@
   /** 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。 */
   const BOARD_MAX_PRICE = 1000000000
   const BOARD_MAX_POSITIONS = 32
+  /** 挂单一屏最多画多少张：和持仓同一个数量级，多出来的不画（账本里还在）。 */
+  const BOARD_MAX_ORDERS = 32
   const BOARD_MAX_HISTORY = 50
   const BOARD_MAX_LIMITS = 8
   const BOARD_MAX_CHARTS = 8
@@ -316,8 +322,8 @@
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
   const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
-  /** helper → 宿主能报的全部动作：控件 + 菜单。 */
-  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS)
+  /** helper → 宿主能报的全部动作：控件 + 菜单 + 盘口小窗的提交（三条不同的 IPC 入口）。 */
+  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
   const MAX_ACTION_TEXT = 64
   /**
@@ -1655,6 +1661,49 @@
     }
   }
 
+  /**
+   * 到价挂单（票 83）：`{ id, crop, side, target, margin, leverage, placedAt, slot, remainingMs }`。
+   * 保证金/方向/杠杆只是形状校验（50/250/全下与 1×/5×/20× 由宿主再判一次）；
+   * `remainingMs` 是「距本根收盘」的展示值，窗口每秒本地递减，不拿它算钱。
+   */
+  function normalizeBoardOrder (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeId(raw.id)
+    const crop = normalizeCropId(raw.crop)
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    if (id === null || crop === null || side === null) return null
+    const target = normalizeBoardNumber(raw.target, 0, BOARD_MAX_PRICE)
+    const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
+    const leverage = normalizeBoardInt(raw.leverage, 1, 20)
+    const placedAt = normalizeBoardInt(raw.placedAt, 0, Number.MAX_SAFE_INTEGER)
+    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
+    if (target === null || target <= 0 || margin === null || leverage === null ||
+      placedAt === null || slot === null) {
+      return null
+    }
+    return {
+      id,
+      crop,
+      side,
+      target,
+      margin,
+      leverage,
+      placedAt,
+      slot,
+      remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0
+    }
+  }
+
+  function normalizeBoardOrders (raw) {
+    const orders = []
+    for (const candidate of Array.isArray(raw) ? raw : []) {
+      if (orders.length >= BOARD_MAX_ORDERS) break
+      const order = normalizeBoardOrder(candidate)
+      if (order !== null) orders.push(order)
+    }
+    return orders
+  }
+
   function normalizeBoardLimits (raw) {
     const margins = []
     for (const candidate of Array.isArray(raw.margins) ? raw.margins : []) {
@@ -1680,8 +1729,22 @@
       margins,
       leverages,
       crops,
-      historyLimit: normalizeBoardInt(raw.historyLimit, 0, BOARD_MAX_HISTORY) ?? BOARD_MAX_HISTORY
+      historyLimit: normalizeBoardInt(raw.historyLimit, 0, BOARD_MAX_HISTORY) ?? BOARD_MAX_HISTORY,
+      // 票 83：宿主是否支持「全下」。旧宿主没有这个字段 → false（窗口不画那颗按钮）。
+      allIn: raw.allIn === true,
+      // 票 83：到价目标价带的比例（宿主 `PRICE_FLOOR_RATIO` / `PRICE_CEIL_RATIO`）。
+      // 窗口只画提示，不拿它算钱；比例坏了就是 null，窗口不显示价格带（宿主照样会拒坏目标价）。
+      targetRatio: normalizeBoardTargetRatio(raw.targetRatio)
     }
+  }
+
+  /** `{ floor, ceil }`：两个有限正数、floor < ceil，否则整块当没有。 */
+  function normalizeBoardTargetRatio (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const floor = normalizeBoardNumber(raw.floor, 0, 100)
+    const ceil = normalizeBoardNumber(raw.ceil, 0, 100)
+    if (floor === null || ceil === null || floor <= 0 || ceil <= floor) return null
+    return { floor, ceil }
   }
 
   /** 一根 K 线：开高低收都是价格；slot 只当横轴的键。坏一根丢一根，图少一根不影响别的。 */
@@ -1910,8 +1973,9 @@
         },
       positions,
       history,
-      // 票 83 之前挂单只有空形状；窗口已经认这个字段，省得下一票再改白名单。
-      orders: [],
+      // 票 83：到价挂单（宿主已经按形状校验过；这里再白名单一遍，防止窗口收到多余字段）。
+      // §9.4 的老坑：这一行要是继续硬编码 []，宿主发了、窗口永远收不到。
+      orders: normalizeBoardOrders(raw.orders),
       // 票 82：真人周榜 + LAN 情绪。老宿主没有这一块时是空榜（窗口画「还没有邻居上线」）。
       league: normalizeBoardLeague(raw.league)
     }
@@ -1944,7 +2008,24 @@
       if (!BOARD_STOP_LEVELS.includes(level)) return null
       return { action, positionId, level }
     }
-    // 开仓：形状合法即可，50/100 与 1× 由宿主按 trading-rules 再判一次（并回人话）。
+    // 撤单（票 83）：只认 UUID；坏 id 整条拒绝，不做半截猜测。
+    if (action === 'trading-cancel-order') {
+      const orderId = normalizeUuid(raw.orderId)
+      return orderId === null ? null : { action, orderId }
+    }
+    // 到价挂单（票 83）：形状合法即可，目标价是否落在价格带、保证金够不够，
+    // 由宿主按 `trading-rules` 再判一次（并回人话）。
+    if (action === 'trading-place-order') {
+      const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+      const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
+      const leverage = strictBoardInt(raw.leverage, 1, 20)
+      const cropId = normalizeCropId(raw.cropId)
+      const target = Number(raw.target)
+      if (side === null || margin === null || leverage === null || cropId === null) return null
+      if (!Number.isFinite(target) || target <= 0 || target > BOARD_MAX_PRICE) return null
+      return { action, side, margin, leverage, cropId, target }
+    }
+    // 开仓：形状合法即可；保证金/杠杆白名单由宿主按 trading-rules 再判一次（并回人话）。
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
     const leverage = strictBoardInt(raw.leverage, 1, 20)
@@ -3550,6 +3631,14 @@
         // 换皮只带素材源 id（ticket 32）：注册表在宿主那边，这里只守形状。
         const skinId = action === 'use-skin' ? normalizeSkinId(raw.skinId) : null
         if (action === 'use-skin' && skinId === null) return { ok: false, error: 'bad-skin-id' }
+        // 盘口小窗（票 79–83）：这几条动作走自己的白名单。落到下面农场那一段窄口，
+        // side/margin/target/orderId 会被整条削掉——窗口看起来只是「点了没反应」。
+        // 这里和 `normalizeBoardAction` 是**同一份**校验，不另抄一份字段表。
+        if (BOARD_SUBMIT_ACTIONS.includes(action)) {
+          const normalized = normalizeBoardAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-board-action' }
+          return { ok: true, event: { type, id, ...normalized } }
+        }
         // 雇佣（ticket 44）：四个动作的字段与窗口提交共用同一条白名单。
         if (FARM_HIRE_ACTIONS.includes(action)) {
           const normalized = normalizeFarmAction(raw)
@@ -4069,6 +4158,7 @@
     BOARD_SUBMIT_ACTIONS,
     BOARD_SIDES,
     BOARD_STOP_LEVELS,
+    normalizeBoardOrders,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
     FARM_LAND_ACTIONS,
