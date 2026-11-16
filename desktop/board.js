@@ -61,7 +61,7 @@ const RESULT_CODE_TEXT = {
   'bad-crop': '这种作物暂时没有盘口。',
   'bad-side': '方向只有做多和做空。',
   'bad-margin': '保证金只有 50 和 100 两档。',
-  'bad-leverage': '这档杠杆还没开放。',
+  'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20×）。',
   'no-coin': '硬币不够，先去种地或卖点作物。',
   'no-position': '这个仓位已经平掉了。',
   settling: '这个仓位正在结算，等一下再看。',
