@@ -955,6 +955,19 @@ class FarmStore {
   }
 
   /**
+   * 红包（票 79）：按作物从仓库扣 n 个——指定作物，不挑底价。
+   * 寄出红包时就已经把这些东西交出去了，所以库存不够只能整笔拒绝。
+   */
+  takeCropOf (cropId, qty = 1) {
+    return this.#enqueue(() => this.#takeCropOf(cropId, qty))
+  }
+
+  /** 红包（票 79）：按作物从种子袋扣 n 颗；不够整笔拒绝。 */
+  takeSeedOf (cropId, qty = 1) {
+    return this.#enqueue(() => this.#takeSeedOf(cropId, qty))
+  }
+
+  /**
    * 票 74：来客失败时让地块枯萎。优先动正在长的地，再动成熟的地；
    * `matureOnly` 用于野火（只烧已经能收的）。没有可动的地就返回 qty 0，
    * 由 service 决定是否改扣仓库作物。
@@ -1615,6 +1628,54 @@ class FarmStore {
       shortfall: remaining,
       removed,
       crops: { ...this.#state.crops },
+      persisted
+    }
+  }
+
+  async #takeCropOf (rawCropId, rawQty) {
+    const cropId = normalizeCropId(rawCropId)
+    if (cropId === null) return farmError('bad-crop')
+    const qty = positiveInt(rawQty, MAX_STACK)
+    if (qty === null) return farmError('bad-qty')
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const have = Number(this.#state.crops[cropId]) || 0
+    if (have < qty) return farmError('not-enough-crops')
+    const left = have - qty
+    if (left > 0) this.#state.crops[cropId] = left
+    else delete this.#state.crops[cropId]
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'take-crop',
+      crop: cropId,
+      qty,
+      crops: { ...this.#state.crops },
+      persisted
+    }
+  }
+
+  async #takeSeedOf (rawCropId, rawQty) {
+    const cropId = normalizeCropId(rawCropId)
+    if (cropId === null) return farmError('bad-crop')
+    const qty = positiveInt(rawQty, MAX_STACK)
+    if (qty === null) return farmError('bad-qty')
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const have = Number(this.#state.seeds[cropId]) || 0
+    if (have < qty) return farmError('not-enough-seeds')
+    const left = have - qty
+    if (left > 0) this.#state.seeds[cropId] = left
+    else delete this.#state.seeds[cropId]
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'take-seed',
+      crop: cropId,
+      qty,
+      seeds: { ...this.#state.seeds },
       persisted
     }
   }
