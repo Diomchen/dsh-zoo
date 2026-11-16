@@ -10,7 +10,7 @@
       和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
       /state。行情、硬币、持仓、挂单、历史、周盈亏、风向、真人周榜全部由宿主随
       `board-window` 命令推过来，这里只画、只把「申请」交回主进程。窗口能收键盘
-      （focusable），但**不按失焦关窗**：macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
+      （focusable），失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
 
       Tab 顺序 = DOM 顺序：作物页签 → 周期页签 → 方向 → 保证金 → 杠杆 → 到价开关
       → 目标价输入框 → 挂单按钮（后两个只在「到价」点开时出现）→ 开一手 → 每张挂单的撤单
@@ -92,6 +92,27 @@
         padding: 10px 14px 9px;
         background: rgba(255, 255, 255, 0.74);
         border-bottom: 1px solid var(--line);
+        /* 票 85 / ADR-0029：只有标题栏是拖动区；下面的按钮/页签/输入必须 no-drag，
+           否则点「×」会变成拖窗口。标题栏以外默认不可拖。 */
+        -webkit-app-region: drag;
+      }
+      .topbar button,
+      .topbar a,
+      .topbar input,
+      .topbar select,
+      .topbar textarea,
+      .topbar [role='button'],
+      .topbar [role='tab'],
+      .topbar [contenteditable='true'] {
+        -webkit-app-region: no-drag;
+      }
+      .drag-grip {
+        flex: none;
+        color: var(--line-strong);
+        font-size: 14px;
+        line-height: 1;
+        letter-spacing: -2px;
+        user-select: none;
       }
       .brand {
         display: flex;
@@ -954,6 +975,7 @@
   <body>
     <div class="app">
       <header class="topbar">
+        <span class="drag-grip" aria-hidden="true">⠿</span>
         <div class="brand">
           <span class="brand-mark" aria-hidden="true">📈</span>
           <div class="brand-text">

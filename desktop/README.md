@@ -11,6 +11,8 @@ Electron 子进程：**一个**全屏透明窗，一次画完所有宠物；与�
   悬停/点击控件（串门/送客/放行卡/「不在家」胶囊与面板/提示气泡）也在这里
 - `shared.js` — 宿主/主进程/渲染端共用的纯逻辑：行协议、场景 v3（含 `controls` / `menu`）、物理、
   命中判定、穿透裁定
+- `window-bounds.js` — 盘口窗位置恢复/夹取（票 85 / ADR-0029）：纯坐标算术，注入 fs 可单测
+- `window-dismiss.js` — 点窗口外面收起所有插件窗的判定表（票 85 / ADR-0029）：纯函数，可单测
 
 ## 怎么跑
 
@@ -97,6 +99,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `debug-move` | `x`,`y` | 设光标 + 向渲染端 `sendInputEvent` 一条合成 mousemove |
 | `debug-input` | `x`,`y`,`action:'move'\|'down'\|'up'` | 合成鼠标事件（走真实输入管线；会被真实光标干扰，拖拽冒烟优先用 `debug-dispatch`） |
 | `debug-dispatch` | `x`,`y`,`phase:'down'\|'move'\|'up'\|'click'\|'blur'` | 在渲染端派发合成 `PointerEvent` / blur（走同一套处理器）；`click` 先在屏幕坐标做 `elementFromPoint`，再点按钮或宠物 |
+| `debug-blur` | `window?:'rename'\|'bring'\|'farm'\|'board'` | 调试/冒烟：模拟输入法候选窗抢焦点；先上 `debugBlurLocked` 一秒，所以不会触发“点窗口外面收起全部” |
 | `debug-renderer` | `id?` | 回 `renderer-state` 事件：渲染端探针（宠物位置/速度/素材/拖拽态/控件/overlay 矩形） |
 | `debug-freeze-hover` | `frozen` | 模拟渲染端死亡：忽略 hover 消息、清掉最近确认、**同时关掉主进程兜底** |
 | `debug-freeze-busy` | `frozen` | 模拟渲染端卡死：不再接受 busy 续期，已有租约按时间戳自然过期 |
@@ -332,6 +335,31 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   桌面上不会留下一个永远不动的窗口。
 - helper 重启后宿主会重新下发生成场景；`pid` 变了说明是新的渲染端，`reset: true` 让它重新出生。
 
+## 插件窗的失焦策略（ADR-0029 / 票 85）
+
+盘口 / 农场 / 带派 / 改名四扇插件窗共享同一条策略：失焦后等 200ms，如果
+`BrowserWindow.getFocusedWindow()` 不是另一扇插件窗、没有在输入法合成、没有冒烟 blur 锁、
+也不在退出途中，就**收起全部四扇**。延迟是为了躲开“打开另一扇窗”的瞬时失焦；焦点回到
+任一插件窗、或新窗刚建出来，都会取消计时器（`adoptPluginWindow`）。
+
+| 窗口 | 点窗口外面 | 输入法合成期间 | 位置 |
+| --- | --- | --- | --- |
+| 盘口 | 收起全部 | 不收起 | 拖动标题栏；`userData/board-window.json`（多屏夹回最近工作区，离屏/坏文件居中） |
+| 农场 | 收起全部 | 不收起 | 按宠物位置/工作区居中，每次开窗重算 |
+| 带派 | 收起全部 | 不收起 | 同上 |
+| 改名 | 收起全部 | 不收起 | 同上 |
+
+- 显式关闭（Esc / × / 宿主 `close:true` / 主窗 `hide` / 退出）不变，仍然只关对应窗口或全部。
+- 点宠物本体也算“点外面”：主窗是 `focusable:false`，点它不一定让插件窗收到 blur，
+  所以 `dsh-zoo:input` 的可信左键按下会直接走同一条判定收起（输入法合成/锁期间仍跳过）。
+- 输入法保护：每个 preload 在 `compositionstart` / `compositionend` 时向主进程发
+  `dsh-zoo:composing`；主进程按 `webContents.id` 记在 `Map` 里，合成期间整组跳过收起。
+  这是旧约定「打中文时别关」唯一保留的部分，不是「永不关」。
+- 系统文件选择器是带派窗自己的模态对话框；它开着时 `giftPicking` 也算锁，避免选文件被收起。
+- 冒烟：`debug-blur` 会先上 `debugBlurLocked` 一秒，模拟候选窗抢焦点而不是点桌面，
+  旧的“失焦不关小窗”断言仍然成立。
+- 位置只记盘口；农场/带派/改名每次按宠物位置或工作区居中（ADR-0029 的取舍）。
+
 ## 改名小窗（ticket 13）
 
 主窗 `focusable: false` 是刻意的（ADR-0005），所以**键盘输入只能单开一扇窗**：
@@ -343,7 +371,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   `dsh-zoo:rename-submit`，主进程转成一条 `{type:'action', action:'rename', nickname}` 交给宿主。
 - 宿主回的 `action-result` 按 action id 认领：成功就关窗，失败把 `notice` 发回小窗显示
   （`dsh-zoo:rename-result`），窗口不关、输入保留。
-- 失焦、Esc、主窗 `hide`、helper 退出都会关掉小窗；10 秒等不到宿主答复就报一句人话。
+- 失焦、Esc、主窗 `hide`、helper 退出都会关掉小窗；输入法合成期间例外（ADR-0029）；
+  10 秒等不到宿主答复就报一句人话。
 - 主窗的穿透/租约状态**完全不受影响**：小窗是另一个 BrowserWindow，关掉它不会改动任何
   `ignoreState` / `busy`。
 
@@ -490,8 +519,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
   偷/帮由宿主等 UDP 结果（最多约 1.8 秒），窗口只发一次申请。
 - 每块地、每份合同、每条日志都有二次校验：`shared.normalizeFarm` 只重建白名单字段，
   未知作物/坏阶段/坏价格/坏合同只丢自己，不把错误数据画进窗口。
-- ×、Esc、主窗 `hide`、helper 退出都会关窗；失焦不关（macOS 中文输入法候选窗会触发
-  blur，和改名/带派同一条取舍）。×/Esc 走窗口自己的 `dsh-zoo:farm-close` IPC，
+- ×、Esc、主窗 `hide`、helper 退出都会关窗；点窗口外面也会收起（ADR-0029，输入法合成
+  期间例外）。×/Esc 走窗口自己的 `dsh-zoo:farm-close` IPC，
   宿主只负责打开/刷新/显式 `close:true`。
 - 冒烟：`DSH_ZOO_SMOKE_ONLY=farm DSH_ZOO_SMOKE_NOTES=1 npm run smoke:desktop` 会验
   右键「农场」开窗、再点关闭、×/Esc 关闭和雇工仍带「打工」角标；并截农场菜单、
@@ -503,7 +532,10 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 ## 盘口小窗（票 79–83）
 
 盘口也是一扇独立的 `file://` 小窗（`board.html`，约 760×700，`focusable: true`），
-和农场窗同一条模型：**宿主算数据，helper 只画和收输入**。
+和农场窗同一条模型：**宿主算数据，helper 只画和收输入**。票 85 起它是唯一可拖动的
+插件窗：标题栏 `.topbar` 是 `-webkit-app-region: drag`，里面的按钮/页签/输入是 `no-drag`；
+`moved` 250ms 后把 `{x, y}` 写进 `userData/board-window.json`，下次开窗恢复并夹进
+保存点所在显示器的工作区，坏文件/离屏回落居中（`window-bounds.js`）。
 
 - 宿主用 `board-window { open, state }` 下发整份视图（硬币、本周盈亏、三作物 K 线、风向、
   持仓、挂单、历史、真人周榜、`limits`）；窗口读不到 `/state`，价格、硬币、盈亏入账与
@@ -517,7 +549,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 - 键盘：Tab 顺序由 `trading-view.js` 的纯函数 `focusOrder(payload)` 定义，`board.js` 按它
   写真实 tabindex（× → 作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 → 挂单 →
   开一手 → 撤单 → 持仓卡的止损/平仓）；Enter/Space 是按钮原生行为，Esc 关窗。
-  **失焦不关窗**（macOS 中文输入法候选窗会抢焦点，和农场窗同一条取舍）。
+  点窗口外面会收起所有插件窗（ADR-0029，输入法合成期间例外）。
 - ×、Esc 走窗口自己的 `dsh-zoo:board-close`；宿主只负责打开/刷新/显式 `close:true`。
   关窗后 host 继续每分钟撮合/结算，窗口不会因此停摆。
 - 截图：`shot` 的 `window:'board'` 抓这扇窗，窗口没开时回 `not-ready`（辅助进程只报错、
