@@ -2098,12 +2098,14 @@ function applyCommand (command) {
       return
     case 'bring-window': {
       // 宿主交下来的背包快照（ticket 24）：不落盘、不拼路径，只转发给窗口。
+      // 红包底数（票 79）跟着同一份快照走；宿主没发（旧版本）就没有这个字段。
       giftState = {
         items: command.items,
         count: command.count,
         maxItems: command.maxItems,
         maxTextLength: command.maxTextLength,
-        maxFileBytes: command.maxFileBytes
+        maxFileBytes: command.maxFileBytes,
+        ...(command.packet === undefined ? {} : { packet: command.packet })
       }
       if (command.open === true) {
         if (!openGiftWindow()) {
