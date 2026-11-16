@@ -164,7 +164,8 @@ test('票 79：白名单之外的作物/方向/保证金/杠杆都不开仓', as
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock: makeClock(), farm })
   assert.equal((await store.openPosition({ side: 'long', margin: 250 })).error, 'bad-margin')
-  assert.equal((await store.openPosition({ side: 'long', margin: 50, leverage: 5 })).error, 'bad-leverage')
+  // 2× 不在白名单里（只有 1× / 5× / 20×）。
+  assert.equal((await store.openPosition({ side: 'long', margin: 50, leverage: 2 })).error, 'bad-leverage')
   assert.equal((await store.openPosition({ side: 'up', margin: 50 })).error, 'bad-side')
   assert.equal((await store.openPosition({ side: 'long', margin: 50, crop: 'corn' })).error, 'bad-crop')
   assert.equal(farm.wallet.coins, 500, '拒绝的一律不扣钱')

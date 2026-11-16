@@ -1,12 +1,13 @@
 /**
- * 盘口纯规则（票 79）：15 分钟一根的确定性行情、盈亏与结算、本周起点。
+ * 盘口纯规则（票 79/80）：15 分钟一根的确定性行情、盈亏与结算、强平与止损、本周起点。
  *
  * 这一层不读盘、不碰时钟、不碰网络：价格只由 `作物 + slot + tick + 版本盐` 决定，
  * 同一套代码在任何机器上算出同一张图（ADR-0027：不做对手盘、不做服务器）。
  *
  * 行情只有 `boardPrice()` 一个入口：当前价、收盘结算价、将来的 K 线（票 81）、
  * 离线补算与强平（票 80）都必须调它。多写一个价格公式，就会出现「图上没插针、
- * 结算却强平」这种对不上账的现场。
+ * 结算却强平」这种对不上账的现场。`pathScan()` 是「按剩余路径检查」的唯一实现：
+ * 快进、插针、离线补算都走同一条逐分钟的路，谁也不许直接拿收盘价糊过去。
  */
 
 import { CROPS } from './farm-rules.js'
@@ -16,6 +17,13 @@ export const SLOT_MS = 15 * 60 * 1000
 export const SLOT_TICKS = 15
 export const TICK_MS = SLOT_MS / SLOT_TICKS
 /**
+ * 路径检查的窗口上限：3 天 = 288 根。离线很久回来时，循环必须有界——
+ * 超过这一段的部分不逐分钟扫，由调用方按「那一根的收盘价」结掉
+ * （票 80 的降级口径：宁可少扫，也不为了补一个月的账跑几万次）。
+ */
+export const MAX_PATH_SCAN_SLOTS = 3 * 96
+export const MAX_PATH_SCAN_MS = MAX_PATH_SCAN_SLOTS * SLOT_MS
+/**
  * 行情版本盐：调价格手感（幅度/波形）时一起改它，老图当场作废，
  * 而不是邻居算一份新、我算一份旧。它只进散列种子，不落盘。
  */
@@ -24,16 +32,25 @@ export const PRICE_SALT = 'board-v1'
 export const PRICE_FLOOR_RATIO = 0.55
 export const PRICE_CEIL_RATIO = 1.75
 /**
- * 票 79 只做一个作物、一档杠杆、两档保证金。这几个数组是**下单白名单**，
- * 也是窗口按钮的唯一来源（宿主随 payload 下发，窗口不复制一份，省掉 drift 测试）。
- * 票 80 加 5×/20×，票 81 加三个作物——只改这里。
+ * 票 79 只做一个作物、两档保证金；票 80 补齐杠杆与止损档。
+ * 这几个数组是**下单/设止损的白名单**，也是窗口按钮的唯一来源
+ * （宿主随 payload 下发，窗口不复制一份，省掉 drift 测试）。
+ * 票 81 加三个作物——只改这里。
  */
 export const BOARD_CROPS = Object.freeze(['tomato'])
 export const TRADING_MARGINS = Object.freeze([50, 100])
-export const TRADING_LEVERAGES = Object.freeze([1])
-/** 读盘时杠杆的形状上限：票 80 的 [1, 5, 20] 从这里取，别在 store 里另写一个 20。 */
+/** 1× / 5× / 20×（SPEC v10「交易与结算」）；1× 没有强平。 */
+export const TRADING_LEVERAGES = Object.freeze([1, 5, 20])
+/** 读盘时杠杆的形状上限：就是白名单里最大的那一档，别在 store 里另写一个 20。 */
 export const MAX_LEVERAGE = 20
 export const BOARD_SIDES = Object.freeze(['long', 'short'])
+/**
+ * 止损档位（票 80）：亏掉多少比例的保证金就平。`0` = 关，是默认值。
+ * 用**比例**而不是百分比数字：结算公式里直接乘 margin，不用再除一次 100。
+ */
+export const TRADING_STOP_LEVELS = Object.freeze([0, 0.25, 0.5, 1])
+/** 结算原因（SPEC v10「交易与结算」）：手动 / 收盘 / 强平 / 止损。 */
+export const TRADING_CLOSE_REASONS = Object.freeze(['close', 'settle', 'liquidate', 'stop'])
 
 /**
  * 慢趋势 = 两三条正弦叠加，半个周期（一波涨/一波跌）约 4–6 根。
@@ -217,6 +234,111 @@ export function settlementOf ({ side, margin, leverage = 1, entry, mark } = {}) 
   if (raw === null || marginValue === null || marginValue <= 0) return null
   const pnl = Math.round(Math.max(-marginValue, raw))
   return { pnl, credit: Math.max(0, Math.round(marginValue) + pnl) }
+}
+
+/**
+ * 强平价（票 80）：做多 `entry × (1 − 1/leverage)`，做空 `entry × (1 + 1/leverage)`。
+ * 1× 没有强平（价格要跌到 0 才亏光，而价格有底价），返回 null，窗口画「—」。
+ * 参数不成立也返回 null——调用方按「没有强平线」处理，不会凭空造一条线出来。
+ */
+export function liquidationPriceOf ({ side, entry, leverage = 1 } = {}) {
+  if (!isBoardSide(side)) return null
+  const entryPrice = finiteNumber(entry)
+  const leverageValue = finiteNumber(leverage)
+  if (entryPrice === null || entryPrice <= 0) return null
+  if (leverageValue === null || leverageValue <= 1) return null
+  const ratio = 1 / leverageValue
+  return side === 'long' ? entryPrice * (1 - ratio) : entryPrice * (1 + ratio)
+}
+
+/**
+ * 现价有没有撞到强平线。**相等也算撞线**：图上摸到那条线就是强平，
+ * 不做 `mark < liq` 的擦边豁免（票 80 的边界口径）。
+ */
+export function isLiquidated ({ side, mark, liquidation } = {}) {
+  if (!isBoardSide(side)) return false
+  const line = finiteNumber(liquidation)
+  const price = finiteNumber(mark)
+  if (line === null || line <= 0 || price === null || price < 0) return false
+  return side === 'long' ? price <= line : price >= line
+}
+
+export function isStopLossLevel (value) {
+  return typeof value === 'number' && Number.isFinite(value) && TRADING_STOP_LEVELS.includes(value)
+}
+
+/**
+ * 现价有没有撞到止损档（票 80）：浮亏 ≥ `level × margin` 就算。
+ * `level = 0`（默认关）永远不触发——它是玩家自己设的工具，不是系统风控。
+ * 亏损按未取整的浮盈亏比，取整只在 `settlementOf()` 里做一次。
+ */
+export function isStopLossHit ({ side, margin, leverage = 1, entry, mark, stopLoss = 0 } = {}) {
+  if (!isStopLossLevel(stopLoss) || stopLoss === 0) return false
+  const marginValue = finiteNumber(margin)
+  if (marginValue === null || marginValue <= 0) return false
+  const pnl = pnlOf({ side, margin: marginValue, leverage, entry, mark })
+  if (pnl === null) return false
+  return pnl <= -stopLoss * marginValue
+}
+
+/**
+ * 路径检查（票 80）：从 `from` 到 `to` 逐分钟走 `markPrice`（= `boardPrice`），
+ * 返回第一处触发 `{ at, exit, reason }`（同一刻先算玩家的 `stop`，再算系统的
+ * `liquidate`；见 `checkAt` 的注释），整条路径都没触发返回 null。
+ *
+ * 为什么不能只看端点：插针、快进时钟、关掉 DSH 几小时再回来，端点可能已经回到安全区，
+ * 而中间某一分钟早就撞线了。强平是系统规则，止损是玩家工具，两者都不许被「跳过」。
+ *
+ * 窗口上限 `MAX_PATH_SCAN_MS`（3 天）：更老的部分不逐分钟扫，调用方按仓位那一根的
+ * 收盘价结（循环有界，补账不会因为离线一个月而跑几十万次）。
+ */
+export function pathScan ({
+  crop,
+  side,
+  margin,
+  leverage = 1,
+  entry,
+  stopLoss = 0,
+  from,
+  to
+} = {}) {
+  if (!isBoardSide(side)) return null
+  const start = finiteNumber(from)
+  const end = finiteNumber(to)
+  const entryPrice = finiteNumber(entry)
+  const marginValue = finiteNumber(margin)
+  if (start === null || end === null || entryPrice === null || marginValue === null) return null
+  if (end <= start) return null
+  // 同一根里的 15 分钟也先算好：强平线一次算清，循环里不再重复求值。
+  const liquidation = liquidationPriceOf({ side, entry: entryPrice, leverage })
+  const checkAt = (at) => {
+    const exit = markPrice({ crop, now: at })
+    if (exit === null) return null
+    // 先看玩家自己设的止损：`−100%` 那一档与强平线是同一个价（都是亏光保证金），
+    // 档位既然存在就按「止损」记，钱一分不差（亏损封顶）。没设档位时强平兜底。
+    const hit = isStopLossHit({
+      side,
+      margin: marginValue,
+      leverage,
+      entry: entryPrice,
+      mark: exit,
+      stopLoss
+    })
+    if (hit) return { at, exit, reason: 'stop' }
+    if (isLiquidated({ side, mark: exit, liquidation })) return { at, exit, reason: 'liquidate' }
+    return null
+  }
+  const horizon = Math.min(end, start + MAX_PATH_SCAN_MS)
+  // 对齐到绝对分钟格点：同一段时间在任何机器上扫的是同样的点（开仓那一刻 pnl=0，不用重看）。
+  let cursor = Math.ceil(start / TICK_MS) * TICK_MS
+  if (cursor <= start) cursor += TICK_MS
+  while (cursor < horizon) {
+    const hit = checkAt(cursor)
+    if (hit !== null) return hit
+    cursor += TICK_MS
+  }
+  // 端点（收盘那一刻或「现在」）本身也要看：它可能不在分钟格点上。
+  return checkAt(horizon)
 }
 
 /**
