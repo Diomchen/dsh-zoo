@@ -122,7 +122,7 @@ export const MAX_PLOT_VISITORS = 50
 /** 每日访客计数最多记多少位访客；超出的按最旧丢（内存/文件都有界）。 */
 export const MAX_VISIT_STATS_VISITORS = 64
 
-const LOG_KINDS = new Set(['plant', 'harvest', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'freeze', 'thaw', 'season', 'event', 'omen'])
+const LOG_KINDS = new Set(['plant', 'harvest', 'clear', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'freeze', 'thaw', 'season', 'event', 'omen'])
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const WHO_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
 
@@ -899,6 +899,11 @@ class FarmStore {
     return this.#enqueue(() => this.#harvest(plotId))
   }
 
+  /** 铲除：提前放弃一株生长中或冻住的作物，清出地块；不退种子、不收作物。 */
+  clear (plotId) {
+    return this.#enqueue(() => this.#clear(plotId))
+  }
+
   water (plotId) {
     return this.#enqueue(() => this.#water(plotId))
   }
@@ -1261,6 +1266,46 @@ class FarmStore {
       plotId,
       crop: cropId,
       qty,
+      plot: emptyPlot(plotId),
+      coins: this.#state.coins,
+      seeds: { ...this.#state.seeds },
+      crops: { ...this.#state.crops },
+      dew: this.#state.dew,
+      dewEarned: this.#state.dewEarned,
+      persisted
+    }
+  }
+
+  /**
+   * 铲除（票 77）：只清「生长中」和「冻住」的作物。
+   * 成熟先收割、枯萎直接重种，都不该走铲除；空地/未知地块直接拒绝。
+   * 不退种子、不给作物，损失就是这株本身。
+   */
+  async #clear (rawPlotId) {
+    const plotId = normalizePlotId(rawPlotId)
+    if (plotId === null) return farmError('bad-plot')
+
+    const now = this.#nowMs()
+    this.#advance(now)
+
+    const index = this.#plotIndex(plotId)
+    if (index < 0) return farmError('bad-plot')
+    const plot = this.#state.plots[index]
+    if (plot === undefined || !isCropId(plot.crop)) return farmError('plot-empty')
+    if (plot.withered === true) return farmError('withered')
+    if (isMature(plot)) return farmError('plot-mature')
+
+    const cropId = plot.crop
+    this.#state.plots[index] = emptyPlot(plotId)
+    this.#appendLog({ at: now, kind: 'clear', crop: cropId, qty: 1 })
+
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'clear',
+      plotId,
+      crop: cropId,
+      qty: 0,
       plot: emptyPlot(plotId),
       coins: this.#state.coins,
       seeds: { ...this.#state.seeds },

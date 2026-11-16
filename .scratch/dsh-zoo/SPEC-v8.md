@@ -22,7 +22,7 @@
   day, start, end, remainingMs, active, resolved, choices, stakes }`；`choices[]` 带
   `cost/affordable/reason`。
 - **四季作物基价**（v1.5.1 平衡）：豌豆 6、西瓜 24、稻米 10、白萝卜 8；生长/种子/产量不变。
-- 实现票据：74（四季来客与随机窗口）、75（冻住/解冻与提高破坏力）；ADR-0023。
+- 实现票据：74（四季来客与随机窗口）、75（冻住/解冻与提高破坏力）、76（露水在线累计）、77（铲除地块）；ADR-0023/0024/0025。
 
 ## Problem Statement
 
@@ -276,3 +276,4 @@ dsh-zoo 两样都缺。
 - 74 four-omens：四季来客、随机 3 小时窗口、提高破坏力
 - 75 frozen-thaw：冻住阶段、解冻动作、换季冻死
 - 76 dew-production：露水改为在线累计，午夜保留余额（ADR-0024）
+- 77 clear-plot：生长中/冻住地块可铲除，两段点击确认（ADR-0025）

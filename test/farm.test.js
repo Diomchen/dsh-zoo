@@ -306,6 +306,39 @@ test('动作错误码：bad-plot / plot-occupied / bad-crop / no-seed / not-matu
   assert.equal(harvested.qty, 4, '3 + 施肥 1')
 })
 
+test('铲除：生长中清空不退种子，成熟/枯萎/空地拒绝', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { log: logSink().log, now: clock.now })
+
+  const planted = await store.plant('p1', 'tomato')
+  assert.equal(planted.ok, true)
+  assert.equal(planted.seeds.tomato, 1)
+
+  const cleared = await store.clear('p1')
+  assert.equal(cleared.ok, true)
+  assert.equal(cleared.action, 'clear')
+  assert.equal(cleared.crop, 'tomato')
+  assert.equal(cleared.qty, 0)
+  assert.equal(cleared.plot.crop, null)
+  assert.equal(cleared.seeds.tomato, 1, '铲除不退种子')
+  assert.equal(cleared.coins, START_COINS, '铲除不收费')
+  assert.equal(store.snapshot().log[0].kind, 'clear')
+  assert.equal((await store.clear('p1')).error, 'plot-empty')
+  assert.equal((await store.clear('p9')).error, 'bad-plot')
+
+  await store.plant('p2', 'tomato')
+  clock.advance(CROPS.tomato.growMs)
+  assert.equal((await store.clear('p2')).error, 'plot-mature')
+
+  const witheredDir = await tempDir(t)
+  await writeFarm(witheredDir, farmFile({
+    plots: [plantedPlot('p1', 'tomato', { withered: true }), emptyPlot('p2'), emptyPlot('p3'), emptyPlot('p4')]
+  }))
+  const witheredStore = await createFarmStore(witheredDir, { log: logSink().log, now: clock.now })
+  assert.equal((await witheredStore.clear('p1')).error, 'withered')
+})
+
 test('收获被偷扣减、最低 0；仓库到 999 就夹取，不出现负数', async (t) => {
   const dir = await tempDir(t)
   const matured = plantedPlot('p1', 'tomato', {

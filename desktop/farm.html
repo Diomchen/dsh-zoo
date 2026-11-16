@@ -1017,9 +1017,20 @@
       .chip-btn.harvest:hover:not(:disabled) {
         background: linear-gradient(135deg, #f5bd63, #e29b2f);
       }
+      .chip-btn.clear {
+        border-color: rgba(194, 91, 80, 0.26);
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .chip-btn.clear:hover:not(:disabled),
+      .chip-btn.clear[data-armed='true'] {
+        border-color: var(--rose);
+        background: #f6d9d4;
+      }
       .chip-btn:disabled,
       .chip-btn.primary:disabled,
-      .chip-btn.harvest:disabled {
+      .chip-btn.harvest:disabled,
+      .chip-btn.clear:disabled {
         border-color: #ede7dd;
         background: #fbfaf6;
         color: #b1afa4;
