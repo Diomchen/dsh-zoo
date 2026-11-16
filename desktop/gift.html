@@ -64,6 +64,11 @@
           radial-gradient(rgba(74, 74, 85, 0.05) 1px, transparent 1.1px);
         background-size: auto, 10px 10px;
         box-shadow: 4px 6px 0 rgba(74, 74, 85, 0.16), 0 16px 34px rgba(20, 24, 32, 0.3);
+        /* 票 79：红包面板比字条高得多，窗口高度固定，内容可滚；
+           底栏用 sticky 钉在卡片底部，保证「取消 / 放进背包」永远点得到。 */
+        overflow-y: auto;
+        overflow-x: hidden;
+        scrollbar-width: thin;
       }
       /* 贴在卡片上沿的和纸胶带：贴在「信」上的那一条，位置略微歪一点才像手贴的。 */
       .tape {
@@ -506,6 +511,14 @@
         display: flex;
         align-items: center;
         gap: 8px;
+        /* 钉在卡片底部：滚动时按钮不跟着内容跑出去。 */
+        position: sticky;
+        bottom: -12px;
+        z-index: 2;
+        margin-top: auto;
+        padding: 8px 0 0;
+        background-color: var(--paper);
+        box-shadow: 0 -8px 12px rgba(250, 246, 238, 0.95);
       }
       .foot-hint {
         flex: 1;

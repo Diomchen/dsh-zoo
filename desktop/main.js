@@ -1397,10 +1397,12 @@ const RENAME_HEIGHT = 168
 const RENAME_TIMEOUT_MS = 10000
 /**
  * 「带派」小窗（ticket 24）：比改名窗高，要放下字条、选文件按钮和背包列表。
- * 同样是一扇可聚焦的小窗——主窗永远 focusable:false（ADR-0005）。
+ * 票 79 加了红包面板（硬币 + 作物/种子步进 + 祝福语）后，380×480 会把
+ * 「取消 / 放进背包」挤出可视区，窗口还关不掉；放宽到 400×620，内容可滚，
+ * 底栏 sticky 钉住。同样是一扇可聚焦的小窗——主窗永远 focusable:false（ADR-0005）。
  */
-const GIFT_WIDTH = 380
-const GIFT_HEIGHT = 480
+const GIFT_WIDTH = 400
+const GIFT_HEIGHT = 620
 const GIFT_TIMEOUT_MS = 10000
 /**
  * 农场小窗（ticket 40）：比带派再大一圈，要放下 4 块地、库存行与记录。

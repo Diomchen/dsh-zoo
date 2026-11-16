@@ -11,6 +11,14 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.6.8 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.8.md`](releases/1.6.8.md)。
+
+修带派窗口装不下红包：窗口仍是给字条定的 380×480，红包面板把 `取消 / 放进背包`
+顶到卡片外，窗口既提不了交也关不掉。现在放宽到 400×620，卡片内容可滚，底栏
+sticky 钉住；存档、协议、红包规则都没动。
+
 ## 1.6.7 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.7.md`](releases/1.6.7.md)。
