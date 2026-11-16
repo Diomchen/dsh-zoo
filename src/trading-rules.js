@@ -57,7 +57,7 @@ export const MAX_LEVERAGE = 20
  * 票 83 的「全下」把保证金从一个固定档位变成「玩家自己填的数」，所以这里只守形状：
  * 整数 1..MAX_MARGIN。上限与硬币同值，是因为**保证金本来就是硬币**——超过钱包余额的
  * 申请会先被 `no-coin` 挡掉，这个数只防 `1e9` 那种把账本撑爆的离谱输入。
- * `test/trading-rules.test.js` 有一条与 `MAX_COINS` 的 drift 断言盯着它们相等。
+ * `test/farm-constants-drift.test.js` 有一条与 `MAX_COINS` 的 drift 断言盯着它们相等。
  */
 export const MAX_MARGIN = 1_000_000
 export const BOARD_SIDES = Object.freeze(['long', 'short'])
