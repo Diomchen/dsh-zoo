@@ -332,7 +332,7 @@ function renderOrders (board) {
     line.append(main, cancel)
     ordersEl.append(line)
   }
-  ordersMetaEl.textContent = board.orders.length + ' 张'
+  ordersMetaEl.textContent = board.ordersMetaText
   ordersEmptyEl.hidden = board.orders.length > 0
   ordersEmptyEl.textContent = board.hints.orders
 }
@@ -383,7 +383,7 @@ function renderPositions (board) {
     row.append(head, meta)
     positionsEl.append(row)
   }
-  positionsMetaEl.textContent = board.positions.length + ' 手'
+  positionsMetaEl.textContent = board.positionsMetaText
   positionsEmptyEl.hidden = board.positions.length > 0
   positionsEmptyEl.textContent = board.hints.positions
 }

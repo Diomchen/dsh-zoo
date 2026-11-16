@@ -803,6 +803,45 @@ test('票 83：挂单列表——方向/作物/目标价/保证金/距收盘的�
   assert.match(view.emptyHints(payload({ coins: { available: 0, locked: 0, total: 0 } })).orders, /先去种地/)
 })
 
+test('评审 P1：持仓/挂单表头用真实总数说明截断（显示最近 200）', () => {
+  const position = (index) => ({
+    id: 'p' + index,
+    crop: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 1,
+    entry: 5,
+    mark: 5,
+    pnl: 0,
+    liquidation: null,
+    stopLoss: 0
+  })
+  const many = Array.from({ length: 200 }, (_, index) => position(index))
+  const truncated = view.boardView(payload({ positions: many, positionsTotal: 240 }), { now: SLOT_EDGE })
+  assert.equal(truncated.positions.length, 200)
+  assert.equal(truncated.positionsMetaText, '持仓 240 · 显示最近 200')
+  const exact = view.boardView(payload({ positions: many.slice(0, 40), positionsTotal: 40 }), { now: SLOT_EDGE })
+  assert.equal(exact.positionsMetaText, '持仓 40')
+  // 老宿主没有 totals：表头退回真实收到的条数，不编一个不存在的合计。
+  const legacy = view.boardView(payload({ positions: many.slice(0, 3) }), { now: SLOT_EDGE })
+  assert.equal(legacy.positionsMetaText, '持仓 3')
+
+  const order = (index) => ({
+    id: 'o' + index,
+    crop: 'tomato',
+    side: 'long',
+    target: 2.75,
+    margin: 50,
+    leverage: 1,
+    placedAt: SLOT_EDGE,
+    slot: SLOT,
+    remainingMs: 1
+  })
+  const oneOfMany = view.boardView(payload({ orders: [order(0)], ordersTotal: 3 }), { now: SLOT_EDGE })
+  assert.equal(oneOfMany.ordersMetaText, '挂单 3 · 显示最近 1')
+  assert.equal(view.boardView(payload({ orders: [order(0)] }), { now: SLOT_EDGE }).ordersMetaText, '挂单 1')
+})
+
 test('User Story 30：盘口窗上写明「没有手续费、没有资金费、没有风险控制」', async () => {
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
   assert.match(html, /没有手续费、没有资金费、没有风险控制/)

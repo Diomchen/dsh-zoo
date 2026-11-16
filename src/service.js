@@ -2231,6 +2231,18 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 盘口窗的持仓/挂单按**最新在前**下发（评审 P1）：窗口最多画 200 条，账本里可以更多；
+   * 旧到新的顺序会让截断正好截掉玩家刚开、最想平掉的那一单。`openedAt`/`placedAt`
+   * 是两边的排序键；时间相同时后写入的排前面（数组下标兜底，排序稳定）。
+   */
+  function newestFirst (items, key) {
+    return items
+      .map((item, index) => ({ item, index }))
+      .sort((left, right) => (right.item[key] - left.item[key]) || (right.index - left.index))
+      .map((entry) => entry.item)
+  }
+
+  /**
    * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
    * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
    * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
@@ -2249,9 +2261,13 @@ export function createService (ctx, options = {}) {
       bar: tradingBarView(now),
       charts: tradingChartsView(now),
       hint: tradingHintView(now),
-      positions: view.positions,
+      positions: newestFirst(view.positions, 'openedAt'),
+      // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
+      // 不会把 240 手假装成 200 手（评审 P1）。
+      positionsTotal: view.positions.length,
       history: view.history,
-      orders: view.orders,
+      orders: newestFirst(view.orders, 'placedAt'),
+      ordersTotal: view.orders.length,
       // 票 82：真人周榜 + LAN 情绪。没有邻居时只有自己一行（窗口画「还没有邻居上线」）。
       league: tradingLeagueView(now, self, week),
       limits: {

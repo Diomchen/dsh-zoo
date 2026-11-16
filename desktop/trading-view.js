@@ -960,6 +960,17 @@
     }
   }
 
+  /**
+   * 列表头（评审 P1）：`持仓 240 · 显示最近 200`。
+   * `shown` 是窗口真正收到的条数（宿主按最新在前下发，上限在 `desktop/shared.js`），
+   * 合计来自 payload 的 `positionsTotal`/`ordersTotal`。这样截断时玩家知道还有更早的，
+   * 而不是以为账本里只有画出来的这些。老宿主没有 total 时退回 `shown`，不编数。
+   */
+  function listMetaText (label, shown, total) {
+    const count = Math.max(shown, Math.round(toNumber(total) ?? shown))
+    return count > shown ? label + ' ' + count + ' · 显示最近 ' + shown : label + ' ' + count
+  }
+
   /** 窗口要的全部内容（`board.js` 只负责把它画成 DOM）。 */
   function boardView (payload, {
     now = Date.now(),
@@ -985,6 +996,8 @@
       targetText,
       allIn
     })
+    const orders = orderRows(safe, now)
+    const positions = positionCards(safe)
     return {
       header: headerView(safe, now, selected),
       week: weekView(safe),
@@ -992,8 +1005,10 @@
       crops,
       chart: chartView(safe, { crop: selected, width, height }),
       order,
-      orders: orderRows(safe, now),
-      positions: positionCards(safe),
+      orders,
+      ordersMetaText: listMetaText('挂单', orders.length, safe === null ? null : safe.ordersTotal),
+      positions,
+      positionsMetaText: listMetaText('持仓', positions.length, safe === null ? null : safe.positionsTotal),
       history: historyRows(safe, now),
       league: leagueView(safe),
       hints: emptyHints(safe)

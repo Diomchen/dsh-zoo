@@ -224,11 +224,14 @@
    * 按同一组数校验；两边各留一份，靠 `test/board-window.test.js` 的 drift 断言对齐。
    */
   const BOARD_STOP_LEVELS = [0, 0.25, 0.5, 1]
-  /** 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。 */
+  /**
+   * 一包最多画多少手/多少笔/多少根：窗口只滚一屏，不用把整份历史搬过去。
+   * 持仓/挂单放到 200（评审 P1）：宿主按最新在前下发，200 条足够覆盖正常玩家的全部
+   * 未平仓位；真超了由 `positionsTotal`/`ordersTotal` 告诉窗口「显示最近 200」。
+   */
   const BOARD_MAX_PRICE = 1000000000
-  const BOARD_MAX_POSITIONS = 32
-  /** 挂单一屏最多画多少张：和持仓同一个数量级，多出来的不画（账本里还在）。 */
-  const BOARD_MAX_ORDERS = 32
+  const BOARD_MAX_POSITIONS = 200
+  const BOARD_MAX_ORDERS = 200
   const BOARD_MAX_HISTORY = 50
   const BOARD_MAX_LIMITS = 8
   const BOARD_MAX_CHARTS = 8
@@ -1933,8 +1936,9 @@
     const barRaw = raw.bar !== null && typeof raw.bar === 'object' && !Array.isArray(raw.bar)
       ? raw.bar
       : null
+    const rawPositions = Array.isArray(raw.positions) ? raw.positions : []
     const positions = []
-    for (const candidate of Array.isArray(raw.positions) ? raw.positions : []) {
+    for (const candidate of rawPositions) {
       if (positions.length >= BOARD_MAX_POSITIONS) break
       const position = normalizeBoardPosition(candidate)
       if (position !== null) positions.push(position)
@@ -1984,10 +1988,16 @@
           price: normalizeBoardNumber(barRaw.price, 0, BOARD_MAX_PRICE)
         },
       positions,
+      // 总数是账本里的真实条数（评审 P1）：宿主没给就退回这次收到的条数；
+      // 窗口用「持仓 N · 显示最近 200」说明截断，而不是假装只有画出来的这些。
+      positionsTotal: normalizeBoardInt(raw.positionsTotal, 0, Number.MAX_SAFE_INTEGER) ??
+        rawPositions.length,
       history,
       // 票 83：到价挂单（宿主已经按形状校验过；这里再白名单一遍，防止窗口收到多余字段）。
       // §9.4 的老坑：这一行要是继续硬编码 []，宿主发了、窗口永远收不到。
       orders: normalizeBoardOrders(raw.orders),
+      ordersTotal: normalizeBoardInt(raw.ordersTotal, 0, Number.MAX_SAFE_INTEGER) ??
+        (Array.isArray(raw.orders) ? raw.orders.length : 0),
       // 票 82：真人周榜 + LAN 情绪。老宿主没有这一块时是空榜（窗口画「还没有邻居上线」）。
       league: normalizeBoardLeague(raw.league)
     }
