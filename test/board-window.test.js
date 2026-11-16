@@ -20,7 +20,16 @@ import shared from '../desktop/shared.js'
 import { FARM_FILE } from '../src/farm.js'
 import { resetCropCatalog } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
-import { BOARD_CROPS, SLOT_MS, TICK_MS, TRADING_LEVERAGES, markPrice, settlementOf } from '../src/trading-rules.js'
+import { TRADING_FILE } from '../src/trading.js'
+import {
+  BOARD_CROPS,
+  SLOT_MS,
+  TICK_MS,
+  TRADING_LEVERAGES,
+  markPrice,
+  settlementOf,
+  slotIndexAt
+} from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
 // 渲染页和 Node 测试共用同一份纯视图模型（desktop/ 是 CommonJS）。
@@ -543,6 +552,25 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
     { online: 0, reported: 0 }
   )
 
+  // 评审 P1：持仓/挂单最多过 200 条；宿主没给 totals 时用收到条数兜底（不是被截后的 200）。
+  const manyPositions = Array.from({ length: 240 }, (_, index) => ({
+    id: 'p' + index, crop: 'tomato', side: 'long', margin: 50, leverage: 1, entry: 5
+  }))
+  const capped = shared.normalizeBoardView({ positions: manyPositions })
+  assert.equal(capped.positions.length, 200)
+  assert.equal(capped.positionsTotal, 240)
+  assert.equal(shared.normalizeBoardView({ positions: manyPositions, positionsTotal: 260 }).positionsTotal, 260)
+  const manyOrders = Array.from({ length: 240 }, (_, index) => ({
+    id: 'o' + index, crop: 'tomato', side: 'long', target: 5, margin: 50, leverage: 1,
+    placedAt: 1763308800000, slot: 1959232
+  }))
+  const cappedOrders = shared.normalizeBoardView({ orders: manyOrders })
+  assert.equal(cappedOrders.orders.length, 200)
+  assert.equal(cappedOrders.ordersTotal, 240)
+  // 老宿主/坏包没有这两块：总数就是 0，表头写「持仓 0 / 挂单 0」。
+  assert.equal(shared.normalizeBoardView({}).positionsTotal, 0)
+  assert.equal(shared.normalizeBoardView({}).ordersTotal, 0)
+
   // 票 83：到价挂单穿过 helper 白名单——§9.4 的老坑：宿主发了、窗口永远收不到。
   const orderId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f2a3b4c5d'
   const orderView = shared.normalizeBoardView({
@@ -575,6 +603,91 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
 
   // 读盘归一化（窗口形状）也不认多余字段。
   assert.deepEqual(shared.normalizeBoardView(null), null)
+})
+
+test('评审 P1：40 手持仓按最新在前下发，总数不丢，最新一手可平', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 5 * TICK_MS }
+  const id = (index) => '00000000-0000-4000-8000-' + String(index).padStart(12, '0')
+  const positions = []
+  for (let index = 0; index < 40; index += 1) {
+    positions.push({
+      id: id(index),
+      crop: 'tomato',
+      side: 'long',
+      margin: 50,
+      leverage: 1,
+      entry: 5,
+      // 都在当前这一根里；越早开的下标越大。最新 = id(0)。
+      openedAt: clock.value - index * 1000,
+      stopLoss: 0
+    })
+  }
+  // 挂单也按 placedAt 最新在前（目标价在带内、这一根里不会成交）。
+  const orders = [0, 1, 2].map((index) => ({
+    id: id(900 + index),
+    crop: 'tomato',
+    side: 'long',
+    target: 2.75,
+    margin: 50,
+    leverage: 1,
+    placedAt: clock.value - index * 1000,
+    slot: slotIndexAt(clock.value)
+  }))
+  await writeFile(join(dir, TRADING_FILE), JSON.stringify({
+    version: 1,
+    positions,
+    orders,
+    history: []
+  }), 'utf8')
+
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  const state = desktop.calls.board[0].state
+  assert.equal(state.positions.length, 40)
+  assert.equal(state.positionsTotal, 40)
+  assert.equal(state.positions[0].id, id(0), '最新开的一手排第一')
+  assert.equal(state.positions[39].id, id(39), '最早开的一手排最后')
+  assert.equal(state.orders.length, 3)
+  assert.equal(state.ordersTotal, 3)
+  assert.equal(state.orders[0].id, id(900), '最新挂的单排第一')
+
+  // 白名单 + 纯视图：第一张卡就是最新一手，而且真的能点平仓。
+  const normalized = shared.normalizeBoardView(state)
+  assert.equal(normalized.positionsTotal, 40)
+  const board = boardView.boardView(normalized, { now: clock.value })
+  assert.equal(board.positions[0].id, id(0))
+  assert.equal(board.positions[0].canClose, true)
+  assert.equal(board.positionsMetaText, '持仓 40')
+  assert.equal(board.ordersMetaText, '挂单 3')
+
+  // 平掉最新一手：账本剩 39 手，窗口的第一张卡换成第二新的那一手。
+  clock.value += TICK_MS
+  desktop.emit({
+    type: 'action',
+    id: 'board-close-newest',
+    action: 'trading-close-position',
+    positionId: id(0)
+  })
+  await waitFor(() => desktop.calls.results.length === 1)
+  assert.equal(desktop.calls.results[0].result.ok, true,
+    JSON.stringify(desktop.calls.results[0].result))
+  const after = shared.normalizeBoardView(desktop.calls.board.at(-1).state)
+  assert.equal(after.positionsTotal, 39)
+  assert.equal(after.positions.length, 39)
+  assert.equal(after.positions[0].id, id(1), '平掉最新的之后，第二新的排第一')
+  assert.equal(after.ordersTotal, 3)
 })
 
 test('票 81：整份 payload 带三作物 K 线 + 风向，并能穿过 helper 的白名单', async (t) => {
