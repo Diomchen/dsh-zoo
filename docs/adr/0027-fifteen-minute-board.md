@@ -99,7 +99,9 @@ LAN 只做同一张图和真人榜，不做对手盘。**
   tick 撮合/结算与中文错误文案。
 - **窗口** `desktop/trading-view.js`（纯视图）+ `desktop/board.{html,js,preload.js}`（DOM/IPC）+
   `desktop/shared.js` 的白名单归一化；入口在 `src/service.js` 的 `handleTradingOpen`。
-- **测试**：`test/trading-rules.test.js`、`test/trading.test.js`、`test/trading-orders.test.js`、
-  `test/trading-view.test.js`、`test/trading-league.test.js`、`test/protocol-trading.test.js`、
-  `test/board-window.test.js`、`test/board-e2e.test.js`、`test/trading-e2e.test.js`、
-  `test/trading-final-e2e.test.js`（无网络、假时钟）。
+- **测试**：纯规则/账本/协议/视图是 `test/trading-rules.test.js`、`test/trading.test.js`、
+  `test/trading-orders.test.js`、`test/trading-view.test.js`、`test/trading-league.test.js`、
+  `test/protocol-trading.test.js`；`test/board-window.test.js`、`test/board-e2e.test.js`、
+  `test/trading-final-e2e.test.js` 用假时钟 + 本地 HTTP（不开 socket、不 sleep）。
+  两台 service 的周报链路另走回环 UDP：`test/trading-e2e.test.js`（`network:true` + 127.0.0.1，
+  与 `test/work-e2e.test.js` 同一先例；不碰真实局域网，也不会和别的用例抢端口）。
