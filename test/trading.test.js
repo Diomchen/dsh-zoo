@@ -170,8 +170,8 @@ test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与�
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
 
-  assert.equal((await store.openPosition({ margin: 50 })).error, 'bad-side', '没给方向就拒绝')
-  const opened = await store.openPosition({ side: 'long', margin: 50 })
+  assert.equal((await store.openPosition({ crop: 'tomato', margin: 50 })).error, 'bad-side', '没给方向就拒绝')
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50 })
   assert.equal(opened.ok, true, JSON.stringify(opened))
   assert.equal(opened.persisted, true)
   assert.equal(farm.wallet.coins, 450, '开仓当场扣掉保证金')
@@ -215,14 +215,14 @@ test('票 79：硬币不够（含 0 硬币）拒绝开仓，硬币一分不动',
   const clock = makeClock()
   const farm = fakeFarm(49)
   const store = await openStore(dir, { clock, farm })
-  const result = await store.openPosition({ side: 'long', margin: 50 })
+  const result = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50 })
   assert.equal(result.ok, false)
   assert.equal(result.error, 'no-coin')
   assert.equal(farm.wallet.coins, 49)
 
   const broke = fakeFarm(0)
   const second = await openStore(await tempDir(t), { clock, farm: broke })
-  const refused = await second.openPosition({ side: 'short', margin: 100 })
+  const refused = await second.openPosition({ crop: 'tomato', side: 'short', margin: 100 })
   assert.equal(refused.error, 'no-coin')
   assert.equal(broke.wallet.coins, 0)
   assert.deepEqual(broke.calls, [], '没钱就不该碰钱包')
@@ -233,17 +233,17 @@ test('票 79/83：白名单之外的作物/方向/保证金/杠杆都不开仓',
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock: makeClock(), farm })
   // 票 83：250 已经是预设之一；坏保证金的边界改成 0 / 小数 / 超过硬币上限。
-  assert.equal((await store.openPosition({ side: 'long', margin: 0 })).error, 'bad-margin')
-  assert.equal((await store.openPosition({ side: 'long', margin: 50.5 })).error, 'bad-margin')
-  assert.equal((await store.openPosition({ side: 'long', margin: 1_000_001 })).error, 'bad-margin')
+  assert.equal((await store.openPosition({ crop: 'tomato', side: 'long', margin: 0 })).error, 'bad-margin')
+  assert.equal((await store.openPosition({ crop: 'tomato', side: 'long', margin: 50.5 })).error, 'bad-margin')
+  assert.equal((await store.openPosition({ crop: 'tomato', side: 'long', margin: 1_000_001 })).error, 'bad-margin')
   // 2× 不在白名单里（只有 1× / 5× / 20×）。
-  assert.equal((await store.openPosition({ side: 'long', margin: 50, leverage: 2 })).error, 'bad-leverage')
-  assert.equal((await store.openPosition({ side: 'up', margin: 50 })).error, 'bad-side')
-  assert.equal((await store.openPosition({ side: 'long', margin: 50, crop: 'corn' })).error, 'bad-crop')
+  assert.equal((await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 2 })).error, 'bad-leverage')
+  assert.equal((await store.openPosition({ crop: 'tomato', side: 'up', margin: 50 })).error, 'bad-side')
+  assert.equal((await store.openPosition({ side: 'long', margin: 50, crop: 'dragonfruit' })).error, 'bad-crop')
   assert.equal(farm.wallet.coins, 500, '拒绝的一律不扣钱')
   // 没有农场（启动早期）：明确回 starting。
   const orphan = await openStore(await tempDir(t), { clock: makeClock(), farm: null })
-  assert.equal((await orphan.openPosition({ side: 'long', margin: 50 })).error, 'starting')
+  assert.equal((await orphan.openPosition({ crop: 'tomato', side: 'long', margin: 50 })).error, 'starting')
 })
 
 test('票 79：手动平仓按现价结算，退回 保证金+盈亏（整数），历史一条', async (t) => {
@@ -251,7 +251,7 @@ test('票 79：手动平仓按现价结算，退回 保证金+盈亏（整数）
   const clock = makeClock(SLOT_EDGE + 2 * TICK_MS)
   const farm = fakeFarm(300)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 100 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 100 })
   const entry = opened.position.entry
 
   const closeAt = SLOT_EDGE + 11 * TICK_MS
@@ -282,7 +282,7 @@ test('票 79：硬币不会变负——价格暴跌也只亏掉保证金，credi
   const farm = fakeFarm(100)
   const clock = makeClock(SLOT_EDGE + 60 * 1000)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 100 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 100 })
   assert.equal(farm.wallet.coins, 0, '全部硬币押进去了')
 
   // 手改档案把入场价推到天上（模拟「买在顶上」），现价再怎么走都只亏保证金。
@@ -304,7 +304,7 @@ test('票 79：15 分钟收盘自动结算，用这一根的收盘价；重复 t
   const clock = makeClock(SLOT_EDGE + 4 * TICK_MS)
   const farm = fakeFarm(400)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'short', margin: 50 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'short', margin: 50 })
   const entry = opened.position.entry
   assert.equal(farm.wallet.coins, 350)
 
@@ -341,7 +341,7 @@ test('票 79：离线跨过收盘——启动就按那一根的收盘价结算�
   const clock = makeClock(SLOT_EDGE + 2 * TICK_MS)
   const farm = fakeFarm(300)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50 })
   assert.equal(farm.wallet.coins, 250)
 
   // 关掉 DSH 半小时再回来：行情是算出来的，收盘价不会因为离线而变。
@@ -369,8 +369,8 @@ test('票 79：重启恢复——持仓、本周盈亏、历史都从 trading.js
   const clock = makeClock(SLOT_EDGE + TICK_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const first = await store.openPosition({ side: 'long', margin: 50 })
-  const second = await store.openPosition({ side: 'short', margin: 100 })
+  const first = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50 })
+  const second = await store.openPosition({ crop: 'tomato', side: 'short', margin: 100 })
 
   // 换一个 store 实例（模拟重启），硬币余额不变。
   const restarted = await openStore(dir, { clock, farm })
@@ -465,7 +465,7 @@ test('票 79：单条坏持仓只丢自己；本周从本地周一算起，跨�
     positions: [
       { id: 'ok', crop: 'tomato', side: 'long', margin: 50, leverage: 1, entry: 5, openedAt: SLOT_EDGE, slot: SLOT },
       { id: 'bad-side', crop: 'tomato', side: 'sideways', margin: 50, leverage: 1, entry: 5, openedAt: SLOT_EDGE },
-      { id: 'bad-crop', crop: 'corn', side: 'long', margin: 50, leverage: 1, entry: 5, openedAt: SLOT_EDGE },
+      { id: 'bad-crop', crop: 'dragonfruit', side: 'long', margin: 50, leverage: 1, entry: 5, openedAt: SLOT_EDGE },
       { id: 'bad-margin', crop: 'tomato', side: 'long', margin: 0, leverage: 1, entry: 5, openedAt: SLOT_EDGE }
     ],
     orders: [{ id: 'o1' }, null],
@@ -578,9 +578,9 @@ test('票 80：5×/20× 开仓落盘；持仓带强平价与止损档，1× 没�
   const farm = fakeFarm(1000)
   const store = await openStore(dir, { clock, farm })
 
-  const one = await store.openPosition({ side: 'long', margin: 50, leverage: 1 })
-  const five = await store.openPosition({ side: 'long', margin: 50, leverage: 5 })
-  const twenty = await store.openPosition({ side: 'short', margin: 100, leverage: 20 })
+  const one = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 1 })
+  const five = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
+  const twenty = await store.openPosition({ crop: 'tomato', side: 'short', margin: 100, leverage: 20 })
   assert.equal(one.ok, true, JSON.stringify(one))
   assert.equal(five.ok, true, JSON.stringify(five))
   assert.equal(twenty.ok, true, JSON.stringify(twenty))
@@ -617,7 +617,7 @@ test('票 80：一键止损——档位循环落盘；坏档位拒绝；坏值�
   const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   const id = opened.position.id
 
   // 循环：−25% → −50% → −100% → 关，每次都说清现在是哪一档。
@@ -680,7 +680,7 @@ test('票 80：20× 强平——时钟跳过也按路径平，只亏保证金，
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
   assert.equal(opened.ok, true, JSON.stringify(opened))
   assert.equal(farm.wallet.coins, 450, '开仓当场扣掉保证金')
   const entry = opened.position.entry
@@ -722,7 +722,7 @@ test('票 80：硬币本来就是 0 时强平也不为负（亏损上限是保�
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(50)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
   assert.equal(farm.wallet.coins, 0, '全部硬币押进去了')
 
   clock.set((SLOT_80 + 1) * SLOT_MS + 1000)
@@ -740,7 +740,7 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
   // 5× 做多：−25% 保证金 = −5% 价格，强平线还在 −20%（先撞止损）。
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   const id = opened.position.id
   const entry = opened.position.entry
   assert.equal((await store.setStopLoss(id, 0.25)).ok, true)
@@ -766,7 +766,7 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   const otherClock = makeClock(OPEN_80)
   const otherFarm = fakeFarm(500)
   const noStop = await openStore(other, { clock: otherClock, farm: otherFarm })
-  const plain = await noStop.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  const plain = await noStop.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   assert.equal(plain.position.stopLoss, 0, '默认关')
   otherClock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await noStop.tick()
@@ -779,7 +779,7 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   const last = await tempDir(t)
   const lastClock = makeClock(OPEN_80)
   const lastStore = await openStore(last, { clock: lastClock, farm: fakeFarm(500) })
-  const taken = await lastStore.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  const taken = await lastStore.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
   const doomed = await lastStore.setStopLoss(taken.position.id, 1)
   assert.equal(doomed.ok, true)
   assert.equal(doomed.position.stopLoss, 1)
@@ -797,7 +797,7 @@ test('票 80（评审 P0）：设止损不跳过之前的强平路径，新止�
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
   assert.equal(opened.ok, true, JSON.stringify(opened))
   const entry = opened.position.entry
   assert.ok(liquidationPriceOf({ side: 'long', entry, leverage: 20 }) < entry * 0.96)
@@ -825,7 +825,7 @@ test('票 80（评审 P0）：设止损之前跌破档位的那一段不补平�
   const clock = makeClock(slot * SLOT_MS + 5 * TICK_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
   assert.equal(opened.ok, true, JSON.stringify(opened))
   const entry = opened.position.entry
   const stopPrice = entry * (1 - 0.25 / 20)
@@ -850,7 +850,7 @@ test('票 80（评审 P0）：快进跨多根仍按最早撞线那一刻平，�
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
   assert.equal(opened.ok, true, JSON.stringify(opened))
   clock.set(OPEN_80 + 6 * SLOT_MS)
   assert.equal(await store.tick(), true)
@@ -866,7 +866,7 @@ test('票 80（评审 P0）：快进跨多根仍按最早撞线那一刻平，�
   const stopClock = makeClock(OPEN_80)
   const stopFarm = fakeFarm(500)
   const stopStore = await openStore(stopDir, { clock: stopClock, farm: stopFarm })
-  const stopOpened = await stopStore.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  const stopOpened = await stopStore.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   assert.equal((await stopStore.setStopLoss(stopOpened.position.id, 0.25)).ok, true)
   stopClock.set(OPEN_80 + 6 * SLOT_MS)
   assert.equal(await stopStore.tick(), true)
@@ -882,7 +882,7 @@ test('票 80：关掉止损后不再触发；离线几个小时回来只补一�
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   const id = opened.position.id
   await store.setStopLoss(id, 0.25)
   await store.setStopLoss(id, 0)
@@ -897,7 +897,7 @@ test('票 80：关掉止损后不再触发；离线几个小时回来只补一�
   const offlineClock = makeClock(OPEN_80)
   const offlineFarm = fakeFarm(300)
   const before = await openStore(offline, { clock: offlineClock, farm: offlineFarm })
-  const pending = await before.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  const pending = await before.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   await before.setStopLoss(pending.position.id, 0.25)
   assert.equal(offlineFarm.wallet.coins, 250)
 

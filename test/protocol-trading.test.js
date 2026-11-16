@@ -12,6 +12,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
+import { applyCropCatalog, resetCropCatalog } from '../src/farm-rules.js'
 import {
   MAX_PACKET_BYTES,
   MAX_TRADING_POSITIONS,
@@ -152,7 +153,7 @@ test('票 82：持仓最多 8 条；坏一条就整包丢（不是丢那一条�
 
   // 一条坏持仓 → 整包丢：榜上不能出现「少了做空那几条」的半截列表。
   for (const bad of [
-    { crop: 'strawberry', side: 'long', leverage: 1 }, // 不是盘口作物
+    { crop: 'dragonfruit', side: 'long', leverage: 1 }, // 目录里没有的作物（票 88）
     { crop: 'tomato', side: 'up', leverage: 1 }, // 方向只有 long/short
     { crop: 'tomato', side: 'long', leverage: 2 }, // 杠杆只有 1/5/20
     { crop: 'tomato', side: 'long' }, // 缺杠杆
@@ -179,6 +180,61 @@ test('票 82：持仓最多 8 条；坏一条就整包丢（不是丢那一条�
       String(positions))
   }
   assert.equal(normalizeTradingPositions([]).length, 0)
+})
+
+/**
+ * 票 88 / ADR-0031：`trading-digest` 的作物白名单跟着运行时目录走。
+ * 内置十种都能上榜；运行时新增的作物（crops.json / LAN 同步）解析与编码都通；
+ * 目录里没有的、底价坏掉的仍然整包丢——旧邻居坏包的口径一个字没改。
+ */
+test('票 88：trading-digest 的作物白名单跟随目录——新作物照收、未知/坏底价整包丢', (t) => {
+  t.after(() => resetCropCatalog())
+  const deviceId = randomUUID()
+  // 内置十种全都能进 positions（不再是写死的番茄/胡萝卜/南瓜）。
+  for (const crop of [
+    'pea', 'tomato', 'strawberry', 'radish', 'carrot',
+    'rice', 'corn', 'watermelon', 'pumpkin', 'grape'
+  ]) {
+    const parsed = parsePacket(encodeTradingDigest({
+      deviceId,
+      weekPnl: 0,
+      positions: [{ crop, side: 'long', leverage: 5 }]
+    }))
+    assert.equal(parsed.ok, true, crop)
+    assert.deepEqual(parsed.packet.positions, [{ crop, side: 'long', leverage: 5 }])
+  }
+  // 目录里没有的作物：整包丢（不是丢那一条）。
+  assert.equal(parsePacket(encodeJson(validDigest({
+    positions: [{ crop: 'dragonfruit', side: 'long', leverage: 1 }]
+  }))).reason, 'positions')
+
+  // 运行时新增一种：不改协议就能收，编码端也认（本机自己上榜走同一条白名单）。
+  applyCropCatalog([
+    { id: 'blueberry', name: '蓝莓', growMs: 5 * 60 * 60 * 1000, seedPrice: 40, yield: 4, base: 12 }
+  ])
+  const added = parsePacket(encodeTradingDigest({
+    deviceId,
+    weekPnl: 12,
+    positions: [{ crop: 'blueberry', side: 'short', leverage: 20 }]
+  }))
+  assert.equal(added.ok, true)
+  assert.deepEqual(added.packet.positions, [{ crop: 'blueberry', side: 'short', leverage: 20 }])
+
+  // 坏底价的作物：价格都算不出来，与未知作物一样整包丢；编码端是程序错误，抛。
+  applyCropCatalog([
+    { id: 'bad-base', name: '坏底价', growMs: 5 * 60 * 60 * 1000, seedPrice: 10, yield: 1, base: 0 }
+  ])
+  assert.equal(parsePacket(encodeJson(validDigest({
+    positions: [{ crop: 'bad-base', side: 'long', leverage: 1 }]
+  }))).reason, 'positions')
+  assert.throws(
+    () => encodeTradingDigest({
+      deviceId,
+      weekPnl: 0,
+      positions: [{ crop: 'bad-base', side: 'long', leverage: 1 }]
+    }),
+    /trading positions/
+  )
 })
 
 test('票 82：weekPnl 是 ±1,000,000 内的有限数，坏了整包丢', () => {

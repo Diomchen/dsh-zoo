@@ -11,16 +11,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
+import shared from '../desktop/shared.js'
 import { FARM_FILE } from '../src/farm.js'
 import { resetCropCatalog } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
 import {
-  BOARD_CROPS,
   BOARD_TIMEFRAMES,
   SLOT_MS,
   SLOT_TICKS,
   TICK_MS,
   TRADING_LEVERAGES,
+  boardCrops,
   boardPrice,
   liquidationPriceOf,
   markPrice,
@@ -134,7 +135,8 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
   assert.equal(before.body.farm.coins, 500)
   assert.equal(before.body.trading.coins.available, 500)
   assert.equal(before.body.trading.coins.locked, 0)
-  assert.equal(before.body.trading.bar.crop, 'tomato')
+  // 票 88：`payload.bar` 是目录第一个作物（目录顺序 pea 打头），不再是写死的 tomato。
+  assert.equal(before.body.trading.bar.crop, boardCrops()[0])
   assert.equal(before.body.trading.bar.slot, slotIndexAt(OPEN_AT))
   assert.equal(before.body.trading.bar.end - before.body.trading.bar.start, SLOT_MS)
   assert.equal(before.body.trading.bar.remainingMs, SLOT_MS - 5 * TICK_MS)
@@ -167,7 +169,8 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
   const position = afterOpen.body.trading.positions[0]
   assert.equal(position.side, 'long')
   assert.equal(position.margin, 50)
-  assert.equal(position.entry, afterOpen.body.trading.bar.price, '成交价就是那一刻的现价')
+  // 这一手显式选的是 tomato；`payload.bar` 是目录第一个作物（pea），两者各算各的现价。
+  assert.equal(position.entry, markPrice({ crop: 'tomato', now: OPEN_AT }), '成交价就是那一刻的现价')
   assert.equal(Number.isFinite(position.pnl), true)
 
   // 3) 时钟推到收盘之后：trading-refresh 让宿主结这一根，用这一根的收盘价。
@@ -401,7 +404,7 @@ test('票 80 e2e：一键止损 → /state 反映档位 → 到线平，原因�
   assert.equal(settled.body.trading.coins.total, settled.body.farm.coins)
 })
 
-test('票 81 e2e：三作物 K 线 + 风向随 /state 下发；成形那根随时钟前进', async (t) => {
+test('票 81/88 e2e：目录全部作物 K 线 + 风向随 /state 下发；成形那根随时钟前进', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir, 500)
   const clock = { value: OPEN_AT }
@@ -410,9 +413,13 @@ test('票 81 e2e：三作物 K 线 + 风向随 /state 下发；成形那根随�
 
   const before = await state(service)
   const trading = before.body.trading
-  assert.deepEqual(Object.keys(trading.charts), BOARD_CROPS)
-  for (const crop of BOARD_CROPS) {
-    const chart = trading.charts[crop]
+  // 票 88：15 分图只下发在 `timeframes['15m']`；窗口视图读 helper 归一化后的对象形。
+  const crops = boardCrops()
+  assert.equal('charts' in trading, false)
+  assert.deepEqual(Object.keys(trading.timeframes['15m']), crops)
+  const view = shared.normalizeBoardView(trading)
+  for (const crop of crops) {
+    const chart = view.timeframes['15m'][crop]
     assert.equal(chart.bars.length, 24, crop + ' 最近 24 根')
     assert.equal(chart.current.slot, trading.bar.slot)
     assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
@@ -423,29 +430,29 @@ test('票 81 e2e：三作物 K 线 + 风向随 /state 下发；成形那根随�
     }
     assert.ok(trading.hint[crop].confidence >= 0.55 && trading.hint[crop].confidence <= 0.68)
   }
-  // `payload.bar` 还是第一个作物的当前一根（票 79 的窗口认它）。
-  assert.equal(trading.bar.crop, BOARD_CROPS[0])
-  assert.equal(trading.bar.price, trading.charts[BOARD_CROPS[0]].current.price)
-  // 窗口的纯视图吃得下这一包：图例、风向「不是保证」、三页签。
-  const board = boardView.boardView(trading, { now: clock.value })
+  // `payload.bar` 还是目录第一个作物的当前一根（票 79 的窗口认它；票 88 起顺序同目录）。
+  assert.equal(trading.bar.crop, crops[0])
+  assert.equal(trading.bar.price, trading.timeframes['15m'][crops[0]].current.price)
+  // 窗口的纯视图吃得下这一包：图例、风向「不是保证」、十页签。
+  const board = boardView.boardView(view, { now: clock.value })
   assert.equal(board.chart.geometry.bars.length, 24)
-  assert.equal(board.chart.legend[0].text, trading.charts.tomato.base.toFixed(2))
+  assert.equal(board.chart.legend[0].text, view.charts[crops[0]].base.toFixed(2))
   assert.equal(board.hint.note, '不是保证')
-  assert.equal(board.crops.length, 3)
+  assert.equal(board.crops.length, crops.length)
 
   // 过两分钟：tick 前进两格，价格与剩余时间都跟着走（不是等 15 分钟才结算）。
   clock.value = OPEN_AT + 2 * TICK_MS
   assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
   const after = await state(service)
-  for (const crop of BOARD_CROPS) {
-    const current = after.body.trading.charts[crop].current
-    assert.equal(current.slot, before.body.trading.charts[crop].current.slot)
+  for (const crop of crops) {
+    const current = after.body.trading.timeframes['15m'][crop].current
+    assert.equal(current.slot, before.body.trading.timeframes['15m'][crop].current.slot)
     assert.equal(current.tick, 7)
     assert.equal(current.price, markPrice({ crop, now: clock.value }))
     assert.equal(current.remainingMs, SLOT_MS - 7 * TICK_MS)
   }
-  assert.notEqual(after.body.trading.charts.tomato.current.price,
-    before.body.trading.charts.tomato.current.price)
+  assert.notEqual(after.body.trading.timeframes['15m'].tomato.current.price,
+    before.body.trading.timeframes['15m'].tomato.current.price)
 })
 
 test('票 84 e2e：四周期随 /state 下发；切周期不改持仓/硬币/周盈亏，结算仍按 15 分', async (t) => {
@@ -462,26 +469,29 @@ test('票 84 e2e：四周期随 /state 下发；切周期不改持仓/硬币/周
   assert.equal(opened.body.ok, true)
   const before = (await state(service)).body.trading
   const ids = BOARD_TIMEFRAMES.map(({ id }) => id)
+  const crops = boardCrops()
   assert.deepEqual(Object.keys(before.timeframes), ids)
   assert.deepEqual(before.limits.timeframes, BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })))
   for (const { id } of BOARD_TIMEFRAMES) {
-    assert.deepEqual(Object.keys(before.timeframes[id]), BOARD_CROPS, id + ' 有三个作物')
-    for (const crop of BOARD_CROPS) {
+    assert.deepEqual(Object.keys(before.timeframes[id]), crops, id + ' 带目录全部作物')
+    for (const crop of crops) {
       const chart = before.timeframes[id][crop]
       assert.equal(chart.bars.length, 24, id + ' / ' + crop + ' 最近 24 根')
       assert.ok(chart.current.start <= clock.value && clock.value < chart.current.end)
       assert.equal(chart.current.tick === null, id !== '15m', id + ' 的 tick 口径')
-      for (const bar of chart.bars) assert.ok(bar.end > bar.start, id + ' 每根都有 start/end')
+      // 票 88：紧凑数组 [slot, start, end, open, high, low, close]。
+      for (const bar of chart.bars) assert.ok(bar[2] > bar[1], id + ' 每根都有 start/end')
     }
   }
-  // 15 分仍就是旧字段 charts 的那一份，`payload.bar` 也还是它。
-  assert.deepEqual(before.timeframes['15m'], before.charts)
-  assert.equal(before.bar.price, before.charts.tomato.current.price)
+  // 15 分就是 `timeframes['15m']`（旧 `charts` 不再重复下发）。
+  assert.equal('charts' in before, false)
+  assert.equal(before.bar.price, before.timeframes['15m'][crops[0]].current.price)
 
   // 窗口切周期是纯视图换图：同一份 payload 里硬币/持仓/周盈亏一个字不动。
+  const view = shared.normalizeBoardView(before)
   const money = JSON.stringify({ coins: before.coins, positions: before.positions, week: before.week })
   for (const id of ids) {
-    const board = boardView.boardView(before, { now: clock.value, timeframe: id })
+    const board = boardView.boardView(view, { now: clock.value, timeframe: id })
     assert.equal(board.chart.timeframe, id)
     assert.equal(board.chart.hasChart, true)
     assert.equal(board.chart.settleNote.visible, id !== '15m')
