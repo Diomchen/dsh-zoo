@@ -150,3 +150,20 @@ test('bring-window 的红包底数要穿过白名单和主进程，不能在中�
   const main = await readFile(path.join(root, 'desktop/main.js'), 'utf8')
   assert.match(main, /packet: command\.packet/)
 })
+
+test('红包面板比字条高：窗口要够高，底栏要钉住，不然「取消 / 放进背包」会掉出可视区', async () => {
+  const main = await readFile(path.join(root, 'desktop/main.js'), 'utf8')
+  const height = main.match(/const GIFT_HEIGHT = (\d+)/)
+  assert.ok(height !== null, 'GIFT_HEIGHT 必须是字面量常量')
+  assert.ok(Number(height[1]) >= 600, `GIFT_HEIGHT=${height[1]} 放不下红包面板`)
+
+  const html = await readFile(path.join(root, 'desktop/gift.html'), 'utf8')
+  const card = html.match(/\.card \{[\s\S]*?\n {6}\}/)
+  assert.ok(card !== null, '.card 规则必须在')
+  assert.match(card[0], /overflow-y:\s*auto/, '卡片内容要能滚，否则底栏被挤出窗口')
+  const actions = html.match(/\.actions \{[\s\S]*?\n {6}\}/)
+  assert.ok(actions !== null, '.actions 规则必须在')
+  assert.match(actions[0], /position:\s*sticky/, '底栏要 sticky 钉住')
+  assert.match(actions[0], /bottom:\s*-?\d/, '底栏要贴底')
+})
+
