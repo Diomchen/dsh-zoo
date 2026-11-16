@@ -583,7 +583,7 @@ node scripts/stop-helper.mjs
 | 症状 | 先做什么 |
 | --- | --- |
 | 桌面窗挡住点击或位置怪 | `settings.json` 里设 `{"desktop": false}`，或 `DSH_ZOO_DESKTOP=0`；只关桌面层，网络照常 |
-| 宠物看得见但拖不动 | 先确认是否同时装了 `dsh-pet`（两个透明层）；再看 `/dsh-zoo/desktop` 的 `helperStatus` |
+| 宠物看得见但拖不动 | 先确认是否同时装了 `dsh-pet`（两个透明层）；再看 `/dsh-zoo/desktop` 的 `helperStatus`：`lostDowns` 在涨 = 左键被窗口层吞了，1.6.2 起会自动重放「穿透 → 可交互」，不用重启 helper；`windowMessages.leftDown` 不涨 = OS 根本没把左键消息给这个窗口 |
 | 看不到邻居 | 同一网段？UDP 45871 被占或被防火墙挡？macOS 允许传入连接？跑 `npm run fake-peer` 排除本机问题 |
 | 文件礼物取不到 | 对方 TCP 45873 不可达；串门本身仍成功，礼物会在串门结束时退回背包 |
 | 点了「改名」没有任何反应 | 桌面层跑的还是旧进程：`ps` 看 helper 的启动时间，比 `desktop/` 里文件的修改时间早就是它；重装 + 重启 DSH |
@@ -592,6 +592,11 @@ node scripts/stop-helper.mjs
 
 `/dsh-zoo/desktop` 里最常看的三项是 `ignoring`、`trustedInputs` 和 `busy`：`trustedInputs` 不增长，
 说明真实左键没进渲染端；涨了但 `busy` 不立，问题在渲染端。
+
+1.6.2 起再补三个数给「左键到底卡在哪一层」对账：`lostDowns`（渲染端只收到 up、没收到 down 的次数）、
+`reasserts`（把可交互重放给 native 层的次数）和 `windowMessages`（Windows 上窗口真实收到的
+左键/右键消息）。`windowMessages.leftDown` 有而 `trustedInputs` 不涨 = Chromium/窗口层吞的；
+两个都不涨 = OS 没把消息给这个窗口。
 
 ## 开发
 
