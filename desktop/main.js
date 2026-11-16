@@ -650,6 +650,24 @@ function scheduleBlurDismiss () {
 }
 
 /**
+ * 点宠物本体也算“点窗口外面”（ADR-0029）。主窗是 `focusable:false`，点它不一定会让
+ * 插件窗收到 blur，所以这里从可信左键按下直接补一次；显式点击不看重焦点，只保留
+ * 输入法合成 / 冒烟锁 / 原生文件选择器 / 退出这几道边界。
+ */
+function dismissPluginWindowsOnOutsideClick () {
+  const dismiss = windowDismiss.shouldDismissOnBlur({
+    focusedId: null,
+    pluginIds: pluginWindowIds(),
+    composing: isAnyPluginComposing(),
+    locked: debugBlurLocked || debugInputLocked || giftPicking,
+    quitting,
+    // 显式点击不经过 200ms 计时器，等价于“已经等够了”。
+    blurAgeMs: windowDismiss.DISMISS_DELAY_MS
+  })
+  if (dismiss) closeAllPluginWindows('dismiss')
+}
+
+/**
  * 四扇插件窗共用的一条接线。新窗一建出来就先取消待收起的计时器：从菜单点「农场」时，
  * 上一扇盘口窗先 blur，但新窗要等 ready-to-show 才 focus，不能让它被旧计时器吞掉。
  */
@@ -1193,7 +1211,11 @@ ipcMain.on('dsh-zoo:input', (event, payload) => {
     return
   }
   lastTrustedInputAt = Date.now()
-  if (report.type === 'down') trustedDowns += 1
+  if (report.type === 'down') {
+    trustedDowns += 1
+    // 主窗 focusable:false，点宠物本身不一定会让插件窗收到 blur；补一次显式“点外面”。
+    dismissPluginWindowsOnOutsideClick()
+  }
 })
 
 ipcMain.on('dsh-zoo:rects', (event, payload) => {
