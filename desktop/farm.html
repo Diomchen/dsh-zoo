@@ -1459,6 +1459,63 @@
         font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
+      /* 24h 成交价曲线：细线、无坐标轴，像交易所里的迷你走势图。 */
+      .market-spark-wrap {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        min-height: 24px;
+      }
+      .market-spark {
+        flex: 1;
+        height: 28px;
+        overflow: visible;
+      }
+      .market-spark polyline {
+        fill: none;
+        stroke: var(--muted);
+        stroke-width: 2.2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        vector-effect: non-scaling-stroke;
+      }
+      .market-spark .market-spark-area {
+        fill: var(--muted);
+        opacity: 0.09;
+      }
+      .market-spark .market-spark-end {
+        fill: var(--muted);
+      }
+      .market-spark.up polyline {
+        stroke: var(--emerald);
+      }
+      .market-spark.up .market-spark-area {
+        fill: var(--emerald);
+      }
+      .market-spark.up .market-spark-end {
+        fill: var(--emerald);
+      }
+      .market-spark.down polyline {
+        stroke: var(--rose);
+      }
+      .market-spark.down .market-spark-area {
+        fill: var(--rose);
+      }
+      .market-spark.down .market-spark-end {
+        fill: var(--rose);
+      }
+      .market-spark.empty polyline {
+        stroke: var(--line-strong);
+        stroke-dasharray: 4 4;
+      }
+      .market-spark-note {
+        flex: none;
+        color: var(--muted);
+        font-size: 9px;
+        font-weight: 600;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
 
       /* 数量步进器 + 买卖：一行放下，按钮至少 28px 高（WCAG 2.2 目标 ≥24px）。 */
       .market-trade {

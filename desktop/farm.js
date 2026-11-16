@@ -1241,6 +1241,43 @@ function renderMarket () {
     prices.appendChild(index)
     row.appendChild(prices)
 
+    // 24 小时成交价曲线：只画最近 50 笔里这个作物的成交，再补上“现在卖价”这个点。
+    // 没有曲线数据时也画一条虚线，避免玩家以为这里坏了。
+    const spark = view.marketSpark(market.history, cropId, { currentPrice: bidValue })
+    const sparkWrap = document.createElement('div')
+    sparkWrap.className = 'market-spark-wrap'
+    const sparkSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+    sparkSvg.setAttribute('class', 'market-spark ' + spark.trend + (spark.empty ? ' empty' : ''))
+    sparkSvg.setAttribute('viewBox', '0 0 100 24')
+    sparkSvg.setAttribute('preserveAspectRatio', 'none')
+    sparkSvg.setAttribute('aria-hidden', 'true')
+    const sparkLine = document.createElementNS('http://www.w3.org/2000/svg', 'polyline')
+    sparkLine.setAttribute('points', spark.path === '' ? '0,21 100,21' : spark.path)
+    if (!spark.empty && spark.area !== '') {
+      const sparkArea = document.createElementNS('http://www.w3.org/2000/svg', 'polygon')
+      sparkArea.setAttribute('class', 'market-spark-area')
+      sparkArea.setAttribute('points', spark.area)
+      sparkSvg.appendChild(sparkArea)
+      sparkSvg.appendChild(sparkLine)
+      const sparkEnd = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+      sparkEnd.setAttribute('class', 'market-spark-end')
+      sparkEnd.setAttribute('cx', String(spark.last.x))
+      sparkEnd.setAttribute('cy', String(spark.last.y))
+      sparkEnd.setAttribute('r', '1.8')
+      sparkSvg.appendChild(sparkEnd)
+    } else {
+      sparkSvg.appendChild(sparkLine)
+    }
+    const sparkNote = document.createElement('span')
+    sparkNote.className = 'market-spark-note'
+    sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h 卖价'
+    sparkWrap.appendChild(sparkSvg)
+    sparkWrap.appendChild(sparkNote)
+    sparkWrap.title = spark.empty
+      ? '最近 24 小时还没有这个作物的成交；卖出第一笔后这里会出现曲线'
+      : '最近 24 小时成交价与当前卖价，共 ' + spark.points.length + ' 个点'
+    row.appendChild(sparkWrap)
+
     const trade = document.createElement('div')
     trade.className = 'market-trade'
     const stepper = document.createElement('div')
