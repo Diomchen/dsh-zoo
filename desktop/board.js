@@ -1,24 +1,30 @@
 /**
- * 盘口小窗的渲染端（票 79 / 票 81 / 票 82 / 票 89）。
+ * 盘口小窗的渲染端（票 79 / 票 81 / 票 82 / 票 89 / 票 91）。
  *
- * 它只做三件事：把宿主推来的盘口视图画成卡片（K 线、下单、持仓、历史、周盈亏、真人周榜）；
- * 每秒本地递减收盘倒计时（到 0 请宿主结这一根并重推一拍）；
+ * 它只做三件事：把宿主推来的盘口视图画成卡片（K 线/折线、下单横条、持仓、历史、周盈亏、
+ * 真人周榜）；每秒本地递减收盘倒计时（到 0 请宿主结这一根并重推一拍）；
  * 把「开仓 / 止损 / 平仓」当**申请**交给主进程。
  * 价格、硬币、盈亏、能不能下单全部由宿主算，成功与否也等宿主回执——
- * 窗口不自己改状态、不自己算钱，也不自己算价（K 线几何在 `trading-view.js` 里，
+ * 窗口不自己改状态、不自己算钱，也不自己算价（图表几何在 `trading-view.js` 里，
  * 这里只把 view 给的坐标画成 SVG 元素）。
  *
  * 票 89：作物条是单行横向滚动（10 种作物也不换行、不撑高）：左右箭头按实际滚动位置
  * 禁用、滚轮横滚、键盘 ←/→/Home/End 切作物、选中 chip 滚进视野；所有滚动都只发生在
- * 列表内部，页面本身不滚。下单卡不套滚动容器，主按钮固定在卡片底部。
+ * 列表内部，页面本身不滚。
  *
  * 票 90：图按需拉取。宿主一包只带当前作物的四个周期；切作物先看本地缓存（最近 4 种），
  * 命中就本地换图，没有就先画「正在加载这张图…」再提交 `trading-charts { cropId }`，
  * 回执到了并进本地 state 重画。宿主的推送不会把用户正在看的作物打回默认。
  *
- * 键盘：Tab 顺序由 `view.focusOrder()` 落到 tabindex（箭头 → 作物 chip → 周期 → 方向 →
- * 保证金 → 杠杆 → 到价 → 开一手 → 挂单撤单 → 持仓止损/平仓）；Enter/Space 是原生按钮
- * 行为；Esc 关窗。失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
+ * 票 91：下单从 300px 窄列搬到图下整宽横条（两排、不滚不裁，到价面板是浮层）；
+ * 顶栏「显示」弹层切蜡烛/折线与彩色/黑白，`L`/`M` 是同一组快捷键；偏好只写本机
+ * `localStorage['dsh-zoo-board-prefs']`（失败静默）。黑白模式只是 `body[data-mono='1']`
+ * + CSS token 覆盖，数字补 ▲/▼——宿主与 payload 一个字段都没变。
+ *
+ * 键盘：Tab 顺序由 `view.focusOrder()` 落到 tabindex（显示开关/两组分段 → × → 箭头 →
+ * 作物 chip → 周期 → 方向 → 保证金 → 杠杆 → 到价 → 开一手 → 挂单撤单 → 持仓止损/平仓）；
+ * Enter/Space 是原生按钮行为；Esc 先收弹层、再关窗。失焦策略见 ADR-0029：
+ * 点窗口外面会收起所有插件窗，输入法合成期间例外。
  */
 'use strict'
 
@@ -45,7 +51,10 @@ const chartEl = document.getElementById('chart')
 const chartEmptyEl = document.getElementById('chart-empty')
 const chartSettleHintEl = document.getElementById('chart-settle-hint')
 const slotNoteEl = document.getElementById('slot-note')
-const orderCropEl = document.getElementById('order-crop')
+const displayToggleEl = document.getElementById('display-toggle')
+const displayPopEl = document.getElementById('display-pop')
+const chartTypeOptionsEl = document.getElementById('chart-type-options')
+const themeOptionsEl = document.getElementById('theme-options')
 const sideRowEl = document.getElementById('side-row')
 const marginRowEl = document.getElementById('margin-row')
 const leverageRowEl = document.getElementById('leverage-row')
@@ -94,6 +103,25 @@ const RESULT_CODE_TEXT = {
   starting: '盘口还在准备中，稍等一下再试。'
 }
 
+/**
+ * 票 91：本机偏好的存储口。file:// 页面在某些隐私策略下连读 `window.localStorage`
+ * 都会抛，所以这里自己 try 一次——拿不到就传 null，纯视图会退回默认偏好。
+ */
+function readPrefsStorage () {
+  try {
+    if (window.localStorage === null || typeof window.localStorage !== 'object') return null
+    return window.localStorage
+  } catch {
+    return null
+  }
+}
+
+/** 写偏好（纯视图里再 try/catch 一次）：失败静默，不影响这一屏的切换。 */
+function saveDisplayPrefs (next) {
+  displayPrefs = view.displayPrefs(next)
+  view.writeDisplayPrefs(readPrefsStorage(), displayPrefs)
+}
+
 /** 宿主推来的最后一份视图；null = 还没收到（窗口先画空态）。 */
 let payload = null
 /**
@@ -124,6 +152,13 @@ let targetText = ''
 let pending = false
 /** 这条在飞的申请是什么动作（票 90：靠它把 `trading-charts` 的回执和图对上）。 */
 let pendingAction = null
+/**
+ * 票 91：本机显示偏好（图表类型 / 配色）——只活在窗口里，从不发给宿主。
+ * 启动时从 localStorage 读一次（失败静默退默认）；每次改动都写回，重开窗保持上一次。
+ */
+let displayPrefs = view.readDisplayPrefs(readPrefsStorage())
+/** 顶栏「显示」弹层开没开；Esc/外点/再点一下都会关。 */
+let displayOpen = false
 /** 这一根的收盘时刻（本地倒计时基线，每次宿主推包都重置）。 */
 let barEnd = 0
 /** 这一根已经问过「到点了，重推一拍」没有；每根只问一次。 */
@@ -155,10 +190,48 @@ function renderHeader (board) {
   coinsAvailableEl.textContent = header.coinsAvailableText
   coinsLockedEl.textContent = header.coinsLockedText
   // 票 89：顶栏一颗胶囊，负号用 U+2212，收益率一位小数放括号里。
-  weekPnlEl.textContent = board.week.pnlMinusText
+  // 票 91：黑白模式下前面补 ▲/▼（颜色没了，方向还得读得出来）。
+  weekPnlEl.textContent = board.display.mono ? board.week.pnlMonoText : board.week.pnlMinusText
   weekPctEl.textContent = board.week.pctParenText
   setTone(weekPnlEl, board.week.pnlTone)
-  orderCropEl.textContent = board.order.cropName
+}
+
+/**
+ * 顶栏「显示」弹层（票 91）：两组分段的分段文案/选中态都来自纯视图，
+ * 这里只画按钮、设 `hidden` 与 `aria-expanded`。
+ *
+ * 黑白标记落在 `body[data-mono]` 上：CSS 的花样全部挂在它下面，渲染端不判断颜色。
+ */
+function renderDisplay (display) {
+  document.body.dataset.mono = display.mono ? '1' : '0'
+  displayToggleEl.setAttribute('aria-expanded', displayOpen ? 'true' : 'false')
+  displayToggleEl.setAttribute(
+    'aria-label',
+    '显示选项：' + display.labels.chartType + ' · ' + display.labels.theme
+  )
+  displayToggleEl.title = '显示：' + display.labels.chartType + ' · ' + display.labels.theme +
+    '（L 切图 / M 切配色）'
+  displayPopEl.hidden = !displayOpen
+  chartTypeOptionsEl.textContent = ''
+  for (const option of display.chartOptions) {
+    chartTypeOptionsEl.append(segmentButton('chart-type', option))
+  }
+  themeOptionsEl.textContent = ''
+  for (const option of display.themeOptions) {
+    themeOptionsEl.append(segmentButton('theme', option))
+  }
+}
+
+/** 分段控件里的一颗按钮：`data-chart-type` / `data-theme` 同时是焦点身份（重画后找回）。 */
+function segmentButton (kind, option) {
+  const button = document.createElement('button')
+  button.type = 'button'
+  button.className = 'seg'
+  if (kind === 'chart-type') button.dataset.chartType = option.id
+  else button.dataset.theme = option.id
+  button.setAttribute('aria-pressed', option.active ? 'true' : 'false')
+  button.textContent = option.label
+  return button
 }
 
 /**
@@ -399,33 +472,49 @@ function renderChart (board) {
       'vector-effect': 'non-scaling-stroke'
     }))
   }
-  const candles = geometry.forming === null ? geometry.bars : geometry.bars.concat([geometry.forming])
-  for (const candle of candles) {
-    const tone = candle.up ? 'up' : 'down'
-    plotInk.append(svgEl('line', {
-      class: 'wick ' + tone,
-      x1: candle.centerX,
-      x2: candle.centerX,
-      y1: candle.wickTop,
-      y2: candle.wickBottom,
-      'stroke-width': candle.sketch.wickWidth,
-      'stroke-linecap': geometry.sketch.lineCap,
+  if (chart.chartType === 'line' && chart.line !== null) {
+    // 票 91 折线：收盘价折线 + 12% 面积画在墨迹层（和蜡烛同一支手绘笔触）；
+    // 现价圆点在清晰层画（见下面 crisp），免得被参考线标签压住。轴/参考线/十字线不变。
+    plotInk.append(svgEl('path', {
+      class: 'line-area',
+      d: chart.line.area
+    }))
+    plotInk.append(svgEl('path', {
+      class: 'line-path',
+      d: chart.line.path,
       'vector-effect': 'non-scaling-stroke'
     }))
-    const body = svgEl('rect', {
-      class: 'body ' + tone + (candle === geometry.forming ? ' forming' : ''),
-      x: candle.x,
-      y: candle.bodyTop,
-      width: candle.width,
-      height: candle.bodyHeight,
-      rx: candle.sketch.bodyRadius,
-      'stroke-width': candle.sketch.bodyStrokeWidth,
-      // 票 89：跌蜡烛空心；属性同时给测试和 CSS 一个明确的钩子（不只靠 class/颜色）。
-      'data-hollow': candle.hollow ? 'true' : 'false',
-      transform: 'rotate(' + candle.sketch.tilt + ' ' + candle.centerX + ' ' +
-        (candle.bodyTop + candle.bodyHeight / 2) + ')'
-    })
-    plotInk.append(body)
+  } else {
+    const candles = geometry.forming === null
+      ? geometry.bars
+      : geometry.bars.concat([geometry.forming])
+    for (const candle of candles) {
+      const tone = candle.up ? 'up' : 'down'
+      plotInk.append(svgEl('line', {
+        class: 'wick ' + tone,
+        x1: candle.centerX,
+        x2: candle.centerX,
+        y1: candle.wickTop,
+        y2: candle.wickBottom,
+        'stroke-width': candle.sketch.wickWidth,
+        'stroke-linecap': geometry.sketch.lineCap,
+        'vector-effect': 'non-scaling-stroke'
+      }))
+      const body = svgEl('rect', {
+        class: 'body ' + tone + (candle === geometry.forming ? ' forming' : ''),
+        x: candle.x,
+        y: candle.bodyTop,
+        width: candle.width,
+        height: candle.bodyHeight,
+        rx: candle.sketch.bodyRadius,
+        'stroke-width': candle.sketch.bodyStrokeWidth,
+        // 票 89：跌蜡烛空心；属性同时给测试和 CSS 一个明确的钩子（不只靠 class/颜色）。
+        'data-hollow': candle.hollow ? 'true' : 'false',
+        transform: 'rotate(' + candle.sketch.tilt + ' ' + candle.centerX + ' ' +
+          (candle.bodyTop + candle.bodyHeight / 2) + ')'
+      })
+      plotInk.append(body)
+    }
   }
   ink.append(plotInk)
 
@@ -504,6 +593,17 @@ function renderChart (board) {
       'text-anchor': 'end'
     }))
   }
+  // 票 91：折线的现价圆点画在清晰层（参考线标签之后、价格贴纸之前）——
+  // 画在墨迹层会被「入场/底价」标签压住，看起来像少了这个点。
+  if (chart.chartType === 'line' && chart.line !== null) {
+    crisp.append(svgEl('circle', {
+      class: 'line-dot',
+      cx: chart.line.dot.x,
+      cy: chart.line.dot.y,
+      r: chart.line.dot.radius,
+      'vector-effect': 'non-scaling-stroke'
+    }))
+  }
   if (tag !== null) {
     crisp.append(svgEl('rect', {
       class: 'price-tag ' + tag.tone,
@@ -571,8 +671,9 @@ function renderOrder (board) {
     button.textContent = choice.label
     leverageRowEl.append(button)
   }
-  previewEl.textContent = order.preview
-  // 强平价单独一行（US7）：预览句保持 SPEC v10 的原文不动。
+  // 票 91：横条第二行只放「涨 1% +0.5 · 跌 1% −0.5 · 强平价 —」这一句；
+  // 完整预览句（带杠杆/保证金）仍在 `order.preview` 里，给旧调用方和测试。
+  previewEl.textContent = order.previewShort
   liquidationEl.textContent = order.liquidationText
   submitEl.textContent = pending && chartsPending === null ? '下单中…' : order.submitLabel
   submitEl.dataset.side = order.side
@@ -583,6 +684,8 @@ function renderOrder (board) {
   const limit = order.limit
   limitToggleEl.textContent = limit.toggleLabel
   limitToggleEl.setAttribute('aria-pressed', limitOpen ? 'true' : 'false')
+  // 到价面板是浮层：aria-expanded 让它对读屏也是「展开/收起」，不是页面多了一块。
+  limitToggleEl.setAttribute('aria-expanded', limitOpen ? 'true' : 'false')
   // 票 89：关着不写提示；开着只写可挂价格带（方向/自动撤单在 title 里）。
   limitToggleEl.title = limit.noteTitle
   limitNoteEl.textContent = limit.noteText
@@ -600,11 +703,12 @@ function renderOrder (board) {
 
 /**
  * 到价挂单列表（票 83 / 票 89）：方向/作物/杠杆、目标价、保证金、距收盘的剩余时间 + 撤单。
- * 票 89 把它从下单卡里搬出来：下单卡不滚动，挂单列表跟持仓在左列同一个滚动区，
- * 有单才出现。剩余时间每秒由 `tick()` 按 `data-until` 重算，重画整张列表会把焦点弄丢。
+ * 票 89 把它从下单区里搬出来：挂单列表跟持仓在左列同一个滚动区，有单才出现。
+ * 票 91 下单变成图下横条后这条不变——横条里没有列表，挂单仍只活在左列。
+ * 剩余时间每秒由 `tick()` 按 `data-until` 重算，重画整张列表会把焦点弄丢。
  */
 function renderOrders (board) {
-  // 票 89：挂单跟持仓一起滚（左列），没有单时整块不占高度；下单卡因此永远不滚。
+  // 票 89/91：挂单跟持仓一起滚（左列），没有单时整块不占高度；下单横条因此永远不滚。
   ordersWrapEl.hidden = board.orders.length === 0
   ordersEl.textContent = ''
   for (const row of board.orders) {
@@ -656,7 +760,8 @@ function renderPositions (board) {
     const pnl = document.createElement('b')
     pnl.className = 'pnl'
     pnl.dataset.tone = card.pnlTone
-    pnl.textContent = card.pnlText
+    // 票 91：黑白模式给盈亏补 ▲/▼（颜色没了，方向还要能读）。
+    pnl.textContent = board.display.mono ? card.pnlMonoText : card.pnlText
     const stop = document.createElement('button')
     stop.type = 'button'
     stop.className = 'ghost stop'
@@ -698,7 +803,7 @@ function renderHistory (board) {
   historyEl.textContent = ''
   for (const row of board.history) {
     const line = document.createElement('div')
-    // 票 89：结算行压成一行（标题 + 价格/原因/时间 + 盈亏），3 笔也能在 120px 里看全。
+    // 票 89：结算行压成一行（标题 + 价格/原因/时间 + 盈亏）；票 91 卡片高 88，超出内部滚。
     line.className = 'row history-row'
 
     const main = document.createElement('div')
@@ -714,7 +819,7 @@ function renderHistory (board) {
     const pnl = document.createElement('b')
     pnl.className = 'pnl'
     pnl.dataset.tone = row.pnlTone
-    pnl.textContent = row.pnlText
+    pnl.textContent = board.display.mono ? row.pnlMonoText : row.pnlText
 
     line.append(main, pnl)
     historyEl.append(line)
@@ -770,11 +875,11 @@ function renderLeague (board) {
     const pnl = document.createElement('b')
     pnl.className = 'pnl'
     pnl.dataset.tone = row.pnlTone
-    pnl.textContent = row.pnlText
+    pnl.textContent = board.display.mono ? row.pnlMonoText : row.pnlText
     const pct = document.createElement('span')
     pct.className = 'league-pct'
     pct.dataset.tone = row.pctTone
-    pct.textContent = row.pctText
+    pct.textContent = board.display.mono ? row.pctMonoText : row.pctText
     score.append(pnl, pct)
 
     line.append(main, score)
@@ -796,12 +901,16 @@ function focusKeyOf (element) {
   if (element === null || element === undefined) return null
   if (element === submitEl) return 'submit'
   if (element === closeButton) return 'close-button'
+  if (element === displayToggleEl) return 'display-toggle'
   if (element === cropPrevEl) return 'crop-prev'
   if (element === cropNextEl) return 'crop-next'
   if (element === limitToggleEl) return 'limit-toggle'
   if (element === limitInputEl) return 'limit-input'
   if (element === limitPlaceEl) return 'limit-place'
   const data = element.dataset ?? {}
+  // 票 91：显示弹层的两组分段（重画后按 id 找回同一颗）。
+  if (data.chartType !== undefined) return 'chart-type:' + data.chartType
+  if (data.theme !== undefined) return 'theme:' + data.theme
   if (data.crop !== undefined) return 'crop:' + data.crop
   if (data.timeframe !== undefined) return 'timeframe:' + data.timeframe
   if (data.side !== undefined) return 'side:' + data.side
@@ -817,6 +926,8 @@ function focusKeyOf (element) {
 
 /** 焦点身份 → 回到哪个容器里找同名的按钮（`crop:tomato` → 作物条组里的 tomato）。 */
 const FOCUS_ROOTS = {
+  'chart-type': chartTypeOptionsEl,
+  theme: themeOptionsEl,
   crop: cropTabsEl,
   timeframe: timeframeTabsEl,
   side: sideRowEl,
@@ -835,6 +946,7 @@ function focusElementOf (key) {
   if (key === null || key === undefined) return null
   if (key === 'submit') return submitEl
   if (key === 'close-button') return closeButton
+  if (key === 'display-toggle') return displayToggleEl
   if (key === 'crop-prev') return cropPrevEl
   if (key === 'crop-next') return cropNextEl
   if (key === 'limit-toggle') return limitToggleEl
@@ -983,9 +1095,13 @@ function render () {
     limitOpen,
     targetText,
     allIn,
-    chartsLoading
+    chartsLoading,
+    // 票 91：显示偏好只影响画法，不进宿主 payload。
+    chartType: displayPrefs.chartType,
+    theme: displayPrefs.theme
   })
   lastBoard = board
+  renderDisplay(board.display)
   renderHeader(board)
   renderChart(board)
   renderOrder(board)
@@ -1155,10 +1271,60 @@ leverageRowEl.addEventListener('click', (event) => {
   render()
 })
 
+// 票 91：显示弹层（图表类型 / 配色）。两组分段都是重画出来的按钮，监听挂在容器上。
+displayToggleEl.addEventListener('click', () => {
+  displayOpen = !displayOpen
+  // 两片浮层不同时开：显示选项优先，到价面板让位（反过来同理）。
+  if (displayOpen) limitOpen = false
+  render()
+  if (!displayOpen) {
+    displayToggleEl.focus({ preventScroll: true })
+    return
+  }
+  // 键盘用户打开弹层就落在当前选中的那一档，少按一次 Tab。
+  const current = chartTypeOptionsEl.querySelector('[aria-pressed="true"]') ??
+    chartTypeOptionsEl.querySelector('.seg')
+  if (current !== null) current.focus({ preventScroll: true })
+})
+
+chartTypeOptionsEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-chart-type]')
+  if (button === null) return
+  // 分段按钮会被下一次 render 换掉：先挡住 document 的「外点关闭」，
+  // 否则 target 已经离开 DOM，弹层会刚选完就自己合上。
+  event.stopPropagation()
+  saveDisplayPrefs({ ...displayPrefs, chartType: button.dataset.chartType })
+  render()
+})
+
+themeOptionsEl.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-theme]')
+  if (button === null) return
+  event.stopPropagation()
+  saveDisplayPrefs({ ...displayPrefs, theme: button.dataset.theme })
+  render()
+})
+
+/** 输入框/文本域/可编辑区里不抢字母键（ADR-0029 同一条：先让用户把字打完）。 */
+function isTextEntry (element) {
+  if (element === null || element === undefined) return false
+  if (element.tagName === 'INPUT' || element.tagName === 'TEXTAREA' || element.tagName === 'SELECT') {
+    return true
+  }
+  return element.isContentEditable === true
+}
+
+/** 改显示偏好：写本机存储 + 重画；不重开窗、不发任何 IPC。 */
+function setDisplayPrefs (next) {
+  saveDisplayPrefs(next)
+  render()
+}
+
 limitToggleEl.addEventListener('click', () => {
   limitOpen = !limitOpen
+  if (limitOpen) displayOpen = false
   render()
-  // 点开就聚焦到目标价：键盘用户少按一次 Tab。下单卡本身不滚，不用再把它推进视野。
+  // 点开就聚焦到目标价：键盘用户少按一次 Tab。浮层不推页面，不用再把它推进视野。
   if (limitOpen) limitInputEl.focus({ preventScroll: true })
 })
 
@@ -1211,10 +1377,53 @@ positionsEl.addEventListener('click', (event) => {
 
 closeButton.addEventListener('click', () => api?.close())
 
+// 票 91：Esc 先收弹层（显示 → 到价），都没有才关窗；旧行为（Esc 关窗）保留在最后一步。
 document.addEventListener('keydown', (event) => {
-  if (event.key !== 'Escape') return
-  event.preventDefault()
-  api?.close()
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    if (displayOpen) {
+      displayOpen = false
+      render()
+      displayToggleEl.focus({ preventScroll: true })
+      return
+    }
+    if (limitOpen) {
+      limitOpen = false
+      render()
+      limitToggleEl.focus({ preventScroll: true })
+      return
+    }
+    api?.close()
+    return
+  }
+  // L 切蜡烛/折线、M 切彩色/黑白：输入法合成、组合键、输入框聚焦时都不拦。
+  if (event.isComposing === true || event.metaKey || event.ctrlKey || event.altKey) return
+  if (isTextEntry(event.target)) return
+  const key = typeof event.key === 'string' ? event.key.toLowerCase() : ''
+  if (key === view.DISPLAY_SHORTCUTS.chartType) {
+    event.preventDefault()
+    setDisplayPrefs(view.toggleChartType(displayPrefs))
+    return
+  }
+  if (key === view.DISPLAY_SHORTCUTS.theme) {
+    event.preventDefault()
+    setDisplayPrefs(view.toggleTheme(displayPrefs))
+  }
+})
+
+// 弹层外点一下关闭（票 91）。监听 click 而不是 pointerdown：先让被点的控件跑完自己的
+// 动作，再收弹层——否则第一次点外面会被“重画”吃掉，看起来像点不动。
+document.addEventListener('click', (event) => {
+  const target = event.target
+  if (displayOpen && !displayPopEl.contains(target) && !displayToggleEl.contains(target)) {
+    displayOpen = false
+    render()
+    return
+  }
+  if (limitOpen && !limitBoxEl.contains(target) && !limitToggleEl.contains(target)) {
+    limitOpen = false
+    render()
+  }
 })
 
 api?.onState((next) => {
