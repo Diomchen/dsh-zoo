@@ -17,7 +17,6 @@ const {
   clampToWorkArea,
   centerInArea,
   isInsideArea,
-  nearestWorkArea,
   normalizePoint,
   pickBounds,
   readPosition,
@@ -30,6 +29,8 @@ const PRIMARY = { x: 0, y: 25, width: 1512, height: 957 }
 /** 右侧副屏：从主屏右边缘开始，略矮。 */
 const SECONDARY = { x: 1512, y: 0, width: 1440, height: 900 }
 const AREAS = [PRIMARY, SECONDARY]
+/** 多屏并集：包含菜单栏上沿和屏幕之间的空隙，不能当成“真实工作区”。 */
+const UNION = { x: 0, y: 0, width: 2952, height: 982 }
 
 test('票 85：保存点还在屏里 → 原样恢复（不居中）', () => {
   assert.equal(BOARD_POSITION_FILE, 'board-window.json')
@@ -107,6 +108,17 @@ test('票 85：多屏时按最近的那块屏夹取，不把副屏上的窗口�
     pickBounds({ saved: { x: 5000, y: 200 }, areas: [PRIMARY], area: PRIMARY, ...BOARD }),
     centerInArea(PRIMARY, BOARD)
   )
+  // 接缝 x=1512 同时属于两块屏：副屏只需挪 8px 边距，主屏要挪 768px → 跟副屏。
+  assert.deepEqual(
+    pickBounds({ saved: { x: 1512, y: 100 }, areas: AREAS, area: UNION, ...BOARD }),
+    { x: 1512 + 8, y: 100 }
+  )
+  // 多屏并集包含主屏菜单栏上沿（y 0..25）和屏幕间空隙：保存点落在那里不算“在屏里”，
+  // 否则会把窗口放到菜单栏底下。
+  assert.deepEqual(
+    pickBounds({ saved: { x: 300, y: 10 }, areas: AREAS, area: UNION, ...BOARD }),
+    centerInArea(UNION, BOARD)
+  )
   // 只给一块 area、不给 areas 也能工作（旧宿主/单屏）。
   assert.deepEqual(
     pickBounds({ saved: { x: 120, y: 80 }, area: PRIMARY, ...BOARD }),
@@ -114,15 +126,11 @@ test('票 85：多屏时按最近的那块屏夹取，不把副屏上的窗口�
   )
 })
 
-test('票 85：最近工作区 / 是否在屏里 / 过小工作区都按几何算', () => {
+test('票 85：是否在屏里 / 过小工作区都按几何算', () => {
   assert.equal(isInsideArea({ x: 10, y: 30 }, PRIMARY), true)
   assert.equal(isInsideArea({ x: 0, y: 0 }, PRIMARY), false, '主屏 y=25 以上是菜单栏')
   assert.equal(isInsideArea({ x: 1512, y: 100 }, PRIMARY), true, '贴右边缘仍算在屏里')
   assert.equal(isInsideArea({ x: -1, y: 100 }, PRIMARY), false)
-
-  assert.deepEqual(nearestWorkArea({ x: -100, y: 100 }, AREAS), PRIMARY)
-  assert.deepEqual(nearestWorkArea({ x: 2000, y: 100 }, AREAS), SECONDARY)
-  assert.equal(nearestWorkArea({ x: 0, y: 0 }, []), null)
 
   // 窗口比工作区还大：只能贴左上角留边距，不能算出负坐标/NaN。
   assert.deepEqual(
