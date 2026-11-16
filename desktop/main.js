@@ -188,6 +188,25 @@ let farmTimer = null
 let lastFarmWindowOpen = null
 /** 农场申请的流水号，只用于给 action id 起个不重复的名字。 */
 let farmSeq = 0
+/**
+ * 盘口小窗（票 79）。和农场窗同一类独立窗口：**刻意不按失焦关闭**
+ * （macOS 中文输入法候选窗会抢焦点，blur 关窗会变成「打中文时窗消失」）。
+ * 关窗只由 Esc / 右上角 × / 宿主 `close:true`（再点一次「盘口」）/ 主窗 hide / 退出驱动；
+ * 10 秒是**动作等待**超时，不是窗口寿命。
+ */
+let boardWin = null
+/** 宿主交下来的整份盘口视图（价格/倒计时/硬币/持仓/历史），窗口打开或刷新时原样转发。 */
+let boardState = null
+/** 正在等宿主答复的那次盘口动作（action id）与它的计时器。 */
+let boardPending = null
+let boardTimer = null
+/**
+ * 最近一次报给宿主的盘口窗开关（票 79）。宿主靠它把右键「盘口」变成开/关切换；
+ * 只在真的变了时发，避免每次 ready/status 都刷一条。
+ */
+let lastBoardWindowOpen = null
+/** 盘口申请的流水号，只用于给 action id 起个不重复的名字。 */
+let boardSeq = 0
 /** 桌面窗口覆盖的矩形（所有显示器工作区的并集，DIP）；小窗贴宠物时用它把窗口局部矩形换算成屏幕坐标。 */
 let workArea = null
 let scene = shared.emptyScene()
@@ -1313,6 +1332,37 @@ function isFarmSender (event) {
   return farmWin !== null && !farmWin.isDestroyed() && event.sender === farmWin.webContents
 }
 
+// ---------------------------------------------------------------------------
+// 盘口小窗的 IPC：只认这扇窗自己的 webContents
+// ---------------------------------------------------------------------------
+
+ipcMain.on('dsh-zoo:board-ready', (event) => {
+  if (!isBoardSender(event)) return
+  sendBoardState()
+})
+
+ipcMain.on('dsh-zoo:board-close', (event) => {
+  if (!isBoardSender(event)) return
+  closeBoardWindow('close')
+})
+
+ipcMain.on('dsh-zoo:board-submit', (event, payload) => {
+  if (!isBoardSender(event)) return
+  // 同一时间只等一条结果：连点两次时，第二条会静默落空——窗口的 pending 也会挡住它。
+  if (boardPending !== null) return
+  const action = shared.normalizeBoardAction(payload)
+  if (action === null) {
+    sendBoardResult({ ok: false, code: 'bad-board-action' })
+    return
+  }
+  startBoardPending(action.action, action)
+})
+
+/** 三条盘口 IPC 共用的一行守卫：只认这扇窗自己的 webContents。 */
+function isBoardSender (event) {
+  return boardWin !== null && !boardWin.isDestroyed() && event.sender === boardWin.webContents
+}
+
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
@@ -1363,6 +1413,13 @@ const GIFT_TIMEOUT_MS = 10000
 const FARM_WIDTH = 520
 const FARM_HEIGHT = 700
 const FARM_TIMEOUT_MS = 10000
+/**
+ * 盘口小窗（票 79）：比农场窗宽一圈，放得下价格/倒计时/下单区/持仓/最近结算。
+ * 票 81 加 K 线与周榜时不再改尺寸，只把两列填满。
+ */
+const BOARD_WIDTH = 760
+const BOARD_HEIGHT = 700
+const BOARD_TIMEOUT_MS = 10000
 /**
  * 农场窗默认不置顶；用户可在窗口右上角自己切换，选择记在 userData 下，
  * 下次开窗沿用。桌面宠物本体的置顶是另一扇窗，不受这里影响。
@@ -1925,6 +1982,163 @@ function startFarmPending (action, event) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// 盘口小窗（票 79）
+//
+// 数据和农场窗一样全部来自宿主（`board-window` 命令）：窗口是 file:// 页面，
+// 不读盘、不联网。唯一的区别是**不贴宠物**——760×700 贴着宠物会经常顶到屏幕边，
+// 所以先居中，工作区放不下再夹进去。
+// ---------------------------------------------------------------------------
+
+/** 居中 + 夹取：多屏/小笔记本上都落在工作区里，不出现负坐标。 */
+function boardBounds () {
+  const area = workArea ?? screen.getPrimaryDisplay().workArea
+  const center = (start, span, size) => {
+    const centered = start + (span - size) / 2
+    const edge = start + span - size - 8
+    return Math.round(Math.max(start + 8, Math.min(centered, edge)))
+  }
+  return {
+    x: center(area.x, area.width, BOARD_WIDTH),
+    y: center(area.y, area.height, BOARD_HEIGHT)
+  }
+}
+
+function openBoardWindow () {
+  if (boardWin !== null && !boardWin.isDestroyed()) {
+    boardWin.focus()
+    // 已经开着：把最新盘口推一遍（可能刚在别处开/平过仓）。
+    sendBoardState()
+    return true
+  }
+  if (win === null || win.isDestroyed()) return false
+  const created = new BrowserWindow({
+    ...boardBounds(),
+    width: BOARD_WIDTH,
+    height: BOARD_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    // 不置顶：宠物那扇全屏透明窗罩在最上面（它自己点得穿），置顶反而会盖住桌宠。
+    alwaysOnTop: false,
+    skipTaskbar: true,
+    hasShadow: true,
+    focusable: true,
+    acceptFirstMouse: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'board-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      // 倒计时每秒走一格；后台节流会让窗口看起来“卡住”。
+      backgroundThrottling: false,
+      devTools: debugEnabled,
+      spellcheck: false
+    }
+  })
+  boardWin = created
+  boardPending = null
+  clearBoardTimer()
+  notifyBoardWindowState()
+  created.webContents.once('did-finish-load', sendBoardState)
+  created.webContents.on('context-menu', (event) => event.preventDefault())
+  // **不要**在 blur 时关窗：和农场窗同一个现场（打中文时小窗消失）。
+  created.on('closed', () => {
+    if (boardWin === created) boardWin = null
+    boardPending = null
+    clearBoardTimer()
+    notifyBoardWindowState()
+  })
+  created.once('ready-to-show', () => {
+    if (boardWin !== created || created.isDestroyed()) return
+    created.show()
+    focusAppForDialog()
+    created.focus()
+  })
+  created.loadFile(path.join(__dirname, 'board.html')).catch(() => closeBoardWindow('load-failed'))
+  return true
+}
+
+function closeBoardWindow (reason) {
+  boardPending = null
+  clearBoardTimer()
+  const target = boardWin
+  boardWin = null
+  if (target !== null && !target.isDestroyed()) {
+    try {
+      target.destroy()
+    } catch {
+      // 已经没了
+    }
+  }
+  notifyBoardWindowState()
+}
+
+/**
+ * 把盘口窗的真实开关报给宿主（票 79）：×/Esc/宿主 `close:true`/hide/退出都汇到这一条。
+ * 只报变化；宿主据此把右键「盘口」做成开/关切换。
+ */
+function notifyBoardWindowState () {
+  const open = boardWin !== null && !boardWin.isDestroyed()
+  if (open === lastBoardWindowOpen) return
+  lastBoardWindowOpen = open
+  writeEvent({ type: 'board-window-state', open })
+}
+
+function clearBoardTimer () {
+  if (boardTimer === null) return
+  clearTimeout(boardTimer)
+  boardTimer = null
+}
+
+/** 整份盘口视图（价格/倒计时/硬币/持仓/历史 + 按钮白名单）。 */
+function sendBoardState () {
+  if (boardWin === null || boardWin.isDestroyed()) return
+  try {
+    boardWin.webContents.send('dsh-zoo:board-state', boardState)
+  } catch {
+    // 页面还没挂上：ready 会再来一次
+  }
+}
+
+function sendBoardResult (result) {
+  if (boardWin === null || boardWin.isDestroyed()) return
+  try {
+    boardWin.webContents.send('dsh-zoo:board-result', result)
+  } catch {
+    // 窗口刚被关掉：结果没人接就算了
+  }
+}
+
+/**
+ * 把一次开/平/重推交给宿主，并等 action-result。
+ * 与农场窗同一条 action-result 通道：id 对得上才收；成功**不关窗**（toast 一下继续做）。
+ */
+function startBoardPending (action, event) {
+  boardSeq += 1
+  const id = 'board-' + String(boardSeq) + '-' + Date.now().toString(36)
+  boardPending = { id, action }
+  clearBoardTimer()
+  boardTimer = setTimeout(() => {
+    if (boardPending === null || boardPending.id !== id) return
+    boardPending = null
+    sendBoardResult({ ok: false, code: 'timeout' })
+  }, BOARD_TIMEOUT_MS)
+  boardTimer.unref?.()
+  const written = writeEvent({ ...event, type: 'action', id })
+  if (!written) {
+    clearBoardTimer()
+    boardPending = null
+    sendBoardResult({ ok: false, code: 'host-unavailable' })
+  }
+}
+
 function pruneRendererRects () {
   if (rendererRects.length === 0) return
   const ids = new Set(scene.items.map((item) => item.id))
@@ -2079,6 +2293,17 @@ function applyCommand (command) {
         })
         return
       }
+      // 盘口小窗（票 79）：按 id 认领，**成功也留在窗里**——下一单接着做。
+      if (boardPending !== null && command.id === boardPending.id) {
+        boardPending = null
+        clearBoardTimer()
+        sendBoardResult({
+          ok: command.ok === true,
+          notice: command.notice,
+          code: command.error
+        })
+        return
+      }
       sendActionResult({
         id: command.id,
         ok: command.ok === true,
@@ -2096,6 +2321,7 @@ function applyCommand (command) {
       closeRenameWindow('hide')
       closeGiftWindow('hide')
       closeFarmWindow('hide')
+      closeBoardWindow('hide')
       if (win !== null && !win.isDestroyed()) win.hide()
       return
     case 'bring-window': {
@@ -2141,6 +2367,23 @@ function applyCommand (command) {
         }
       } else if (farmWin !== null && !farmWin.isDestroyed()) {
         sendFarmState()
+      }
+      return
+    }
+    case 'board-window': {
+      // 宿主交下来的整份盘口视图（票 79）：不落盘、不拼路径。
+      // `open:true` 打开/聚焦；`open:false` 刷新已开着的窗；`close:true` 才是关窗。
+      if (command.close === true) {
+        closeBoardWindow('host')
+        return
+      }
+      boardState = command.state ?? null
+      if (command.open === true) {
+        if (!openBoardWindow()) {
+          writeEvent({ type: 'error', id: command.id, code: 'board-window-failed', message: 'cannot open board window' })
+        }
+      } else if (boardWin !== null && !boardWin.isDestroyed()) {
+        sendBoardState()
       }
       return
     }
@@ -2212,9 +2455,11 @@ function applyCommand (command) {
       return
     }
     case 'shot':
-      // 冒烟可以点名抓「带派」/农场小窗；主窗没就绪不影响那扇窗的截图。
-      if (command.window === 'bring' || command.window === 'farm') {
-        const target = command.window === 'bring' ? giftWin : farmWin
+      // 冒烟可以点名抓「带派」/农场/盘口小窗；主窗没就绪不影响那扇窗的截图。
+      if (command.window === 'bring' || command.window === 'farm' || command.window === 'board') {
+        const target = command.window === 'bring'
+          ? giftWin
+          : command.window === 'farm' ? farmWin : boardWin
         if (target === null || target.isDestroyed()) {
           writeEvent({
             type: 'error',
@@ -2737,6 +2982,10 @@ function statusEvent (id) {
     farmOpen: farmWin !== null && !farmWin.isDestroyed(),
     farmVisible: farmWin !== null && !farmWin.isDestroyed() && farmWin.isVisible(),
     farmFocused: farmWin !== null && !farmWin.isDestroyed() && farmWin.isFocused(),
+    /** 盘口小窗（票 79）：同样分开报「开着 / 看得见 / 拿到焦点」。 */
+    boardOpen: boardWin !== null && !boardWin.isDestroyed(),
+    boardVisible: boardWin !== null && !boardWin.isDestroyed() && boardWin.isVisible(),
+    boardFocused: boardWin !== null && !boardWin.isDestroyed() && boardWin.isFocused(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
     alwaysOnTop: winFlag((candidate) => candidate.isAlwaysOnTop()),
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
@@ -2762,6 +3011,7 @@ function sendReady () {
   // ticket 46：新 helper 从「没有农场窗」开始。这里强制报一次真实状态，
   // 宿主重启/重连后不会沿用上一个 helper 的旧开关。
   lastFarmWindowOpen = null
+  lastBoardWindowOpen = null
   notifyFarmWindowState()
 }
 
@@ -2835,7 +3085,10 @@ function reportError (code, error) {
 
 async function captureTo (filePath, id, target = 'main') {
   // 冒烟可以点名抓小窗：主窗与它们各自 capturePage，别把两扇窗的坐标混在一起。
-  const window = target === 'bring' ? giftWin : target === 'farm' ? farmWin : win
+  // `board` 与农场窗同一条路（评审 P1）：盘口开着才能抓，关着由命令分支回 not-ready。
+  const window = target === 'bring'
+    ? giftWin
+    : target === 'farm' ? farmWin : target === 'board' ? boardWin : win
   const image = await capturePage(window)
   if (image === null) {
     writeEvent({ type: 'error', id, code: 'shot-failed', message: 'capturePage failed' })

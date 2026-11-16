@@ -33,12 +33,15 @@ import {
   HIRE_WAGE_MAX,
   HIRE_WAGE_MIN
 } from '../src/protocol.js'
+import { MAX_LEVERAGE, MAX_MARGIN, TRADING_STOP_LEVELS } from '../src/trading-rules.js'
+import shared from '../desktop/shared.js'
 
 const FARM_JS = new URL('../desktop/farm.js', import.meta.url)
 const SHARED_JS = new URL('../desktop/shared.js', import.meta.url)
 const require = createRequire(import.meta.url)
 // desktop/ 是 CommonJS：ticket 47 把作物显示表放进纯视图层，Node 与渲染页共用同一份。
 const farmView = require('../desktop/farm-view.js')
+const boardView = require('../desktop/trading-view.js')
 
 function numberConstant (source, name) {
   const match = source.match(new RegExp('(?:const\\s+)?' + name + '\\s*=\\s*([0-9.]+)'))
@@ -129,5 +132,24 @@ test('票 58：每种作物都有包内自带的 SVG，路径与 id 一一对应
     assert.match(svg, /^<svg[\s>]/, cropId + ' 不是 SVG')
     assert.match(svg, /viewBox="0 0 100 100"/, cropId + ' 的 viewBox 要统一成 100×100')
     assert.equal(svg.includes('<script'), false, cropId + ' 的图里不该有脚本')
+  }
+})
+
+test('票 83：盘口单笔保证金上限与农场硬币上限同值', () => {
+  // 「全下」把保证金从固定档位换成任意整数金额，上限必须和钱包同一把尺子：
+  // 超过钱包的申请先被 no-coin 挡掉，这个数只防离谱输入（见 MAX_MARGIN 的注释）。
+  assert.equal(MAX_MARGIN, MAX_COINS)
+})
+
+test('票 81/评审 P2：helper 与窗口的盘口杠杆/止损档与宿主同源', () => {
+  // 杠杆上限与止损四档各写一份（helper/渲染页不是 ESM），靠这两条断言防漂移。
+  assert.equal(shared.BOARD_MAX_LEVERAGE, MAX_LEVERAGE)
+  assert.deepEqual(shared.BOARD_STOP_LEVELS, TRADING_STOP_LEVELS)
+  // 窗口的循环按钮吃的是同一组档位；下一步永远在这四个值里转。
+  assert.deepEqual(boardView.stopLevels(), TRADING_STOP_LEVELS)
+  for (const level of TRADING_STOP_LEVELS) {
+    assert.equal(boardView.nextStopLevel(level), TRADING_STOP_LEVELS[
+      (TRADING_STOP_LEVELS.indexOf(level) + 1) % TRADING_STOP_LEVELS.length
+    ])
   }
 })
