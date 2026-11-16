@@ -215,7 +215,7 @@ export function visitLimitsFor (unlocked) {
   }
 }
 
-/** 露水：每 10 分钟待机 +1，每天最多挣 48、余额也封顶 48（SPEC v5）。 */
+/** 露水：DSH 开着每 10 分钟 +1，每天最多新增 48、余额也封顶 48（SPEC v5，1.6.1 调整）。 */
 export const DEW_INTERVAL_MS = 10 * MINUTE_MS
 export const MAX_DEW = 48
 /** 浇水 / 施肥的露水价（各一次）。 */
@@ -374,17 +374,16 @@ export function localDayKey (at) {
 }
 
 /**
- * 待机露水推进（纯函数）。
+ * 在线露水推进（纯函数）。
  *
- * - 同一本地日：每满 10 分钟 +1；**每天挣到的总量**封顶 48，余额也封顶 48。
+ * - 同一本地日：每满 10 分钟 +1；**当天挣到的总量**封顶 48，余额也封顶 48。
  *   只有余额会被花掉，`dewEarned` 记账不随花费回退——花光不能再刷当天的额度。
- * - 跨本地日：`dew` / `dewEarned` 都归零、`dewAt` 从 `now` 重新计时
+ * - 跨本地日：保留 `dew` 余额，只把 `dewEarned` 归零；`dewAt` 从 `now` 重新计时
  *   （午夜正好重置，不补前一天）。
  * - `dewAt` 缺失/倒退：从 `now` 重新计时，不产生负增长或瞬间满额。
- * - 旧文件没有 `dewEarned` 时按 0 起算，但当前余额一定算进「今天已挣」，
- *   避免手改/旧版本凭空多出额度。
+ * - 旧文件没有 `dewEarned` 时按 0 起算；余额仍受 48 上限约束，不会凭空多出容量。
  *
- * 关掉 DSH 的离线时间**不**在这里补：那是离线生长的事，露水只奖励「开着但没在玩」。
+ * 关掉 DSH 的离线时间**不**在这里补：那是离线生长的事，露水只奖励「DSH 开着」。
  * 调用方在加载时把 `dewAt` 设成 now 即可把这条规则写死。
  */
 export function advanceDew (state, now) {
@@ -410,15 +409,14 @@ export function advanceDew (state, now) {
   const day = localDayKey(current)
   let reset = false
   if (oldDay !== null && day !== null && oldDay !== day) {
-    balance = 0
+    // 余额是玩家资产，跨日保留；只重置当天的「已挣」额度。
+    earned = 0
     reset = true
   }
   if (oldEarnedDay !== null && day !== null && oldEarnedDay !== day) {
     earned = 0
     reset = true
   }
-  // 余额里的每一滴都算今天已经挣到的：手改文件/旧版本不能凭空多出额度。
-  earned = Math.max(earned, balance)
 
   if (reset) {
     // 跨日这一拍只做重置，不补午夜前后的零头；下一拍重新从 10 分钟起算。

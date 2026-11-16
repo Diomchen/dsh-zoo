@@ -275,3 +275,4 @@ dsh-zoo 两样都缺。
 - 73 docs-release：ADR、README、CONTEXT、1.5.0
 - 74 four-omens：四季来客、随机 3 小时窗口、提高破坏力
 - 75 frozen-thaw：冻住阶段、解冻动作、换季冻死
+- 76 dew-production：露水改为在线累计，午夜保留余额（ADR-0024）
