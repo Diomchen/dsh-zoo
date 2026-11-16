@@ -19,6 +19,9 @@ GitHub Release 正文就是 [`releases/1.6.7.md`](releases/1.6.7.md)。
 `packet`，所以窗口拿到的仍是没有红包底数的命令。现在 `packet` 原样随命令下发，
 真窗口里能按自己有的作物/种子加减。
 
+同一版还修了 `package.json` 被写出 UTF-8 BOM、导致插件加载器严格 `JSON.parse`
+失败的问题，并加了 `test/package-json.test.js` 守住这一点。
+
 ## 1.6.6 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.6.md`](releases/1.6.6.md)。
