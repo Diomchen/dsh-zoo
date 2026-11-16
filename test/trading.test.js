@@ -46,6 +46,36 @@ const SLOT_80 = SLOT + 1
 const OPEN_80 = SLOT_80 * SLOT_MS + 5 * TICK_MS
 const TICK_80 = 12
 
+/**
+ * 找一根「先跌破 −25% 止损档、随后又收回去」的行情（评审 P0 的回归用例）。
+ * 20× 做多时 −25% 保证金 = −1.25% 价格：挑那根里一次都没碰到 −5% 强平线的，
+ * 这样「旧插针补平」与「强平」不会被混在一起。返回开仓 tick、插针 tick 与
+ * 可以安全设止损的 tick。找不到就抛——行情规则改了，用例要重新挑点。
+ */
+function dipThenRecover (startSlot) {
+  for (let slot = startSlot; slot < startSlot + 600; slot += 1) {
+    const prices = []
+    for (let tick = 0; tick <= 15; tick += 1) {
+      prices.push(boardPrice({ crop: 'tomato', slot, tick }))
+    }
+    const entry = prices[5]
+    const threshold = entry * (1 - 0.25 / 20)
+    if (prices.some((price) => price <= entry * 0.95)) continue
+    for (let dip = 6; dip < 15; dip += 1) {
+      if (prices[dip] >= threshold) continue
+      for (let setTick = dip + 1; setTick < 15; setTick += 1) {
+        if (prices[setTick] < threshold) continue
+        let clean = true
+        for (let tick = setTick; tick <= 15; tick += 1) {
+          if (prices[tick] < threshold) clean = false
+        }
+        if (clean) return { slot, entry, dip, setTick }
+      }
+    }
+  }
+  throw new Error('找不到「先跌破止损再收回」的行情（行情规则改了？）')
+}
+
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-trading-'))
   t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
@@ -735,6 +765,91 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   assert.equal(lastRow.exit, boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 }))
 })
 
+test('票 80（评审 P0）：设止损不跳过之前的强平路径，新止损不按旧 mark 平', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock(OPEN_80)
+  const farm = fakeFarm(500)
+  const store = await openStore(dir, { clock, farm })
+  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  assert.equal(opened.ok, true, JSON.stringify(opened))
+  const entry = opened.position.entry
+  assert.ok(liquidationPriceOf({ side: 'long', entry, leverage: 20 }) < entry * 0.96)
+
+  // 时钟已经越过强平线（tick 12），但还没 tick：玩家偏偏在这时点了止损。
+  // 之前的实现会把「检查进度」也推到此刻，下一拍直接按止损平掉——强平被跳过。
+  clock.set(SLOT_80 * SLOT_MS + 13 * TICK_MS + 1000)
+  assert.equal((await store.setStopLoss(opened.position.id, 0.25)).ok, true)
+
+  assert.equal(await store.tick(), true)
+  const row = store.view().history[0]
+  const firstBreach = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 })
+  assert.equal(row.reason, 'liquidate', '下一拍仍要补出设止损之前越过的强平')
+  assert.equal(row.at, SLOT_80 * SLOT_MS + TICK_80 * TICK_MS, '平在最早撞线的那一分钟')
+  assert.equal(row.exit, firstBreach, '不是按设止损那一刻的 mark 平')
+  assert.equal(row.pnl, -50)
+  // 强平已经发生：止损档位不再有任何作用，钱只亏保证金。
+  assert.equal(farm.wallet.coins, 450)
+})
+
+test('票 80（评审 P0）：设止损之前跌破档位的那一段不补平，之后照常收盘结算', async (t) => {
+  const { slot, dip, setTick } = dipThenRecover(SLOT + 20)
+  assert.ok(dip < setTick)
+  const dir = await tempDir(t)
+  const clock = makeClock(slot * SLOT_MS + 5 * TICK_MS)
+  const farm = fakeFarm(500)
+  const store = await openStore(dir, { clock, farm })
+  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  assert.equal(opened.ok, true, JSON.stringify(opened))
+  const entry = opened.position.entry
+  const stopPrice = entry * (1 - 0.25 / 20)
+  // 插针那一分钟确实在档位之下：如果设止损时把整段路径重扫一遍，它就会被补平。
+  assert.ok(boardPrice({ crop: 'tomato', slot, tick: dip }) < stopPrice)
+
+  // 插针过后、价格收回档位上方时设止损：新档位只能从这一刻起生效。
+  clock.set(slot * SLOT_MS + setTick * TICK_MS)
+  assert.equal((await store.setStopLoss(opened.position.id, 0.25)).ok, true)
+  // 收盘后 tick：路径上从 setTick 起都没再跌破档位，也没碰强平线 → 按收盘价结算。
+  clock.set((slot + 1) * SLOT_MS)
+  assert.equal(await store.tick(), true)
+  const row = store.view().history[0]
+  assert.equal(row.reason, 'settle', '设止损之前的那次插针不能按新档位补平')
+  assert.equal(row.exit, slotClosePrice('tomato', slot))
+  assert.equal(row.at, (slot + 1) * SLOT_MS)
+})
+
+test('票 80（评审 P0）：快进跨多根仍按最早撞线那一刻平，不按收盘价敷衍', async (t) => {
+  // 强平：20× 做多，时钟一次跳过 6 根，路径上第一处触发仍在开仓那一根的 tick 12。
+  const dir = await tempDir(t)
+  const clock = makeClock(OPEN_80)
+  const farm = fakeFarm(500)
+  const store = await openStore(dir, { clock, farm })
+  const opened = await store.openPosition({ side: 'long', margin: 50, leverage: 20 })
+  assert.equal(opened.ok, true, JSON.stringify(opened))
+  clock.set(OPEN_80 + 6 * SLOT_MS)
+  assert.equal(await store.tick(), true)
+  const liquidated = store.view().history[0]
+  assert.equal(liquidated.reason, 'liquidate')
+  assert.equal(liquidated.at, SLOT_80 * SLOT_MS + TICK_80 * TICK_MS)
+  assert.equal(liquidated.exit, boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 }))
+  assert.ok(liquidated.exit > slotClosePrice('tomato', SLOT_80), '最早撞线价不是收盘价')
+  assert.equal(liquidated.pnl, -50)
+
+  // 止损：5× 做多 + −25% 档，同样跳 6 根；最早触发那一刻（同一个 tick 12）优先于收盘。
+  const stopDir = await tempDir(t)
+  const stopClock = makeClock(OPEN_80)
+  const stopFarm = fakeFarm(500)
+  const stopStore = await openStore(stopDir, { clock: stopClock, farm: stopFarm })
+  const stopOpened = await stopStore.openPosition({ side: 'long', margin: 50, leverage: 5 })
+  assert.equal((await stopStore.setStopLoss(stopOpened.position.id, 0.25)).ok, true)
+  stopClock.set(OPEN_80 + 6 * SLOT_MS)
+  assert.equal(await stopStore.tick(), true)
+  const stopped = stopStore.view().history[0]
+  assert.equal(stopped.reason, 'stop')
+  assert.equal(stopped.at, SLOT_80 * SLOT_MS + TICK_80 * TICK_MS)
+  assert.equal(stopped.exit, boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 }))
+  assert.ok(stopped.exit > slotClosePrice('tomato', SLOT_80), '最早撞线价不是收盘价')
+})
+
 test('票 80：关掉止损后不再触发；离线几个小时回来只补一次', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(OPEN_80)
@@ -774,6 +889,34 @@ test('票 80：关掉止损后不再触发；离线几个小时回来只补一�
   await again.tick()
   assert.equal(again.view().history.length, 1)
   assert.equal(offlineFarm.wallet.coins, coins)
+})
+
+test('票 80（评审 P2）：没有农场的 store 补结算时回 starting，不抛 TypeError', async (t) => {
+  const dir = await tempDir(t)
+  const entry = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: 5 })
+  // 1× 做多没有强平线、收盘价也高于 0：结算会有一笔 credit，正好走到 addCoins。
+  await writeTrading(dir, {
+    version: 1,
+    positions: [{
+      id: '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d',
+      crop: 'tomato',
+      side: 'long',
+      margin: 50,
+      leverage: 1,
+      entry,
+      openedAt: OPEN_80,
+      stopLoss: 0
+    }],
+    orders: [],
+    history: []
+  })
+  const clock = makeClock(OPEN_80 + 2 * SLOT_MS)
+  // load 就会尝试补结算这一手：没有农场时只能回 `starting`，不能让 TypeError 逃出来。
+  const store = await openStore(dir, { clock })
+  assert.equal(store.view().positions.length, 1, '仓位原样留着，等农场接上再结')
+  assert.equal(store.view().history.length, 0)
+  assert.equal(await store.tick(), false)
+  assert.equal(store.view().positions.length, 1)
 })
 
 test('票 80：结算原因枚举四项，文案表一项不缺', () => {

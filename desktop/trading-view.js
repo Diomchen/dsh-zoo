@@ -10,10 +10,11 @@
  * 为什么不能、K 线怎么画、一句话文案）必须能在 Node 里断言，不能只靠真 Electron 冒烟。
  * 数字口径全在这里统一：价格两位小数、盈亏一位小数、倒计时 mm:ss、图表用 viewBox 坐标。
  *
- * 三处「复制了宿主规则」的地方都有注释标出来：15 分钟一根（算倒数第二根的时间轴）、
- * 止损四档（按钮循环），以及下单杠杆/保证金/作物白名单（**不复制**，只吃 payload）。
- * 票 83 的到价目标价带（0.55–1.75× 底价）也只从 payload 的 `chart.base` 读，
- * 不在窗口里再写一遍 `PRICE_FLOOR_RATIO`。
+ * 复制了宿主规则的地方都有注释标出来：15 分钟一根（算倒数第二根的时间轴）、
+ * 止损四档（按钮循环）、下单前的强平价（与 `liquidationPriceOf` 同一条公式，只作展示，
+ * `test/trading-view.test.js` 有 drift 断言），以及下单杠杆/保证金/作物白名单
+ * （**不复制**，只吃 payload）。票 83 的到价目标价带（0.55–1.75× 底价）也只从
+ * payload 的 `chart.base` 读，不在窗口里再写一遍 `PRICE_FLOOR_RATIO`。
  */
 (function (root, factory) {
   'use strict'
@@ -372,7 +373,8 @@
       toNumber(bar.low) !== null && toNumber(bar.close) !== null
   }
 
-  function isCurrentLike (current) {
+  /** 当前这一根是「形成中」的 K 线：有开高低和现价（没有 close，收盘价要等结算）。 */
+  function isFormingBarLike (current) {
     if (current === null || typeof current !== 'object') return false
     return toNumber(current.open) !== null && toNumber(current.high) !== null &&
       toNumber(current.low) !== null && toNumber(current.price) !== null
@@ -388,7 +390,7 @@
   function chartGeometry (chart, options = {}) {
     if (chart === null || typeof chart !== 'object') return null
     const bars = (Array.isArray(chart.bars) ? chart.bars : []).filter(isBarLike)
-    const current = isCurrentLike(chart.current) ? chart.current : null
+    const current = isFormingBarLike(chart.current) ? chart.current : null
     const base = toNumber(chart.base)
     if (bars.length === 0 && current === null) return null
     const width = Math.max(80, toNumber(options.width) ?? CHART_WIDTH)
@@ -543,7 +545,7 @@
   function chartView (payload, { crop = null, width = CHART_WIDTH, height = CHART_HEIGHT } = {}) {
     const selected = pickCrop(payload, crop)
     const chart = chartOf(payload, selected)
-    const current = chart !== null && isCurrentLike(chart.current) ? chart.current : null
+    const current = chart !== null && isFormingBarLike(chart.current) ? chart.current : null
     const references = chartReferences(payload, selected)
     const tick = current === null ? null : toNumber(current.tick)
     const geometry = chart === null
@@ -661,7 +663,7 @@
 
     // 目标价：输入框空着时用当前现价当默认值；只在「到价」打开时才显示。
     const chart = chartOf(payload, chosenCrop)
-    const price = chart !== null && isCurrentLike(chart.current)
+    const price = chart !== null && isFormingBarLike(chart.current)
       ? toNumber(chart.current.price)
       : null
     const base = chart === null ? null : toNumber(chart.base)
@@ -669,6 +671,18 @@
     const band = base === null || ratio === null
       ? null
       : { min: base * ratio.floor, max: base * ratio.ceil }
+    // 强平价（SPEC v10 US7）：用 payload 的现价当入场价，下单前就告诉玩家会从哪里被平。
+    // 1× 没有强平线（价格有底价，跌不到 0），显示「—」。这是纯展示：公式与宿主
+    // `liquidationPriceOf()` 相同，`test/trading-view.test.js` 的 drift 断言盯着两边。
+    const liquidationPrice = price === null || chosenLeverage <= 1
+      ? null
+      : chosenSide === 'long'
+        ? price * (1 - 1 / chosenLeverage)
+        : price * (1 + 1 / chosenLeverage)
+    const liquidationText = liquidationPrice === null
+      ? '强平价 —'
+      : '强平价 ' + formatPrice(liquidationPrice) + ' · ' +
+        (chosenSide === 'long' ? '跌到就平' : '涨到就平')
     const defaultTargetText = price === null ? '' : formatPrice(price)
     const rawTarget = typeof targetText === 'string' ? targetText.trim() : ''
     const effectiveTargetText = rawTarget === '' ? defaultTargetText : rawTarget
@@ -712,6 +726,9 @@
       hint,
       preview: preview.text,
       previewParts: preview,
+      // 下单前的强平价（US7）：数字给 drift 测试，文案给窗口。
+      liquidationPrice,
+      liquidationText,
       // 0 硬币时按钮本身就是「去种地」——盘口不给救济，这是唯一的下一步。
       submitLabel: coins.available <= 0 ? '去种地' : '开一手',
       limit: {
@@ -875,10 +892,23 @@
       const pct = toNumber(entry.weekPnlPct)
       let long = 0
       let short = 0
+      const chips = []
       for (const position of Array.isArray(entry.positions) ? entry.positions : []) {
         if (position === null || typeof position !== 'object') continue
-        if (position.side === 'long') long += 1
-        else if (position.side === 'short') short += 1
+        const positionSide = position.side === 'long'
+          ? 'long'
+          : position.side === 'short' ? 'short' : null
+        if (positionSide === null) continue
+        if (positionSide === 'long') long += 1
+        else short += 1
+        // US19：邻居的「当前持仓」不能只有一个计数；作物 + 多/空 + 杠杆一眼能读。
+        // 作物名来自 payload.limits.crops；杠杆坏了按 1× 兜底，不画 NaN。
+        const positionLeverage = Math.max(1, Math.round(toNumber(position.leverage) ?? 1))
+        chips.push({
+          text: cropNameOf(safe, position.crop) + (positionSide === 'long' ? '多' : '空') +
+            ' ' + positionLeverage + '×',
+          tone: positionSide
+        })
       }
       const nickname = typeof entry.nickname === 'string' && entry.nickname.trim() !== ''
         ? entry.nickname.trim()
@@ -890,7 +920,10 @@
         pnlTone: toneOf(weekPnl),
         pctText: pct === null ? '—' : formatSigned(pct * 100, 2) + '%',
         pctTone: pct === null ? 'flat' : toneOf(pct * 100, 2),
-        positionsText: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short
+        positionsText: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
+        // US19：一屏最多画 3 条持仓；多出来的写「+N」，摘要仍保留完整计数。
+        chips: chips.slice(0, 3),
+        chipOverflowText: chips.length > 3 ? '+' + (chips.length - 3) : ''
       })
     }
     const counts = league.sentiment !== null && typeof league.sentiment === 'object'
@@ -898,11 +931,23 @@
       : {}
     const long = Math.max(0, Math.round(toNumber(counts.long) ?? 0))
     const short = Math.max(0, Math.round(toNumber(counts.short) ?? 0))
+    // 旧版本邻居（评审 P1）：宿主说「有人在线、但一条周报都没发」时，空态要明说
+    // 「旧版本」——「还没有邻居上线」会让人以为是自己网络坏了。
+    const watchersRaw = league.watchers !== null && typeof league.watchers === 'object'
+      ? league.watchers
+      : {}
+    const countOf = (value) => Math.max(0, Math.round(toNumber(value) ?? 0))
+    const watchers = {
+      online: countOf(watchersRaw.online),
+      reported: countOf(watchersRaw.reported)
+    }
+    const oldVersion = watchers.online > 0 && watchers.reported === 0
     return {
       rows,
       // 只有自己一行：窗口要在榜下面补一句「还没有邻居上线…行情照走」。
       hasPeers: rows.some((row) => !row.me),
       countText: rows.length + ' 人',
+      watchers,
       sentiment: {
         long,
         short,
@@ -910,8 +955,62 @@
         text: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
         tone: long === 0 && short === 0 ? 'flat' : long >= short ? 'long' : 'short'
       },
-      empty: emptyHints(safe).neighbors
+      empty: oldVersion
+        ? '邻居是旧版本，还没有周报'
+        : emptyHints(safe).neighbors
     }
+  }
+
+  /**
+   * Tab 顺序（票 81 / 评审 P2）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
+   *
+   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物页签 → 方向 → 保证金（预设 + 全下）→
+   * 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单卡的撤单 → 持仓卡的止损/平仓。
+   * 每项都是 `board.js` 的 `focusKeyOf` 能认出的键，且**不重复**（tabindex 只能给一个元素）。
+   * 纯函数：不碰 DOM，测试能直接断言；老/坏 payload 退回兜底白名单，不抛。
+   */
+  function focusOrder (payload) {
+    const limits = limitsOf(payload)
+    const order = ['close-button']
+    for (const crop of limits.crops) {
+      if (crop !== null && typeof crop === 'object' && typeof crop.id === 'string') {
+        order.push('crop:' + crop.id)
+      }
+    }
+    for (const side of Object.keys(SIDE_LABELS)) order.push('side:' + side)
+    for (const margin of limits.margins) order.push('margin:' + margin)
+    // 「全下」按钮的金额每包变，用语义键 `margin:all-in`（focusKeyOf 认 data-all-in）。
+    if (limits.allIn) order.push('margin:all-in')
+    for (const leverage of limits.leverages) order.push('leverage:' + leverage)
+    order.push('limit-toggle', 'limit-input', 'limit-place', 'submit')
+    const orders = payload !== null && typeof payload === 'object' && Array.isArray(payload.orders)
+      ? payload.orders
+      : []
+    for (const entry of orders) {
+      if (entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && entry.id !== '') {
+        order.push('cancel:' + entry.id)
+      }
+    }
+    const positions = payload !== null && typeof payload === 'object' && Array.isArray(payload.positions)
+      ? payload.positions
+      : []
+    for (const position of positions) {
+      if (position === null || typeof position !== 'object') continue
+      if (typeof position.id !== 'string' || position.id === '') continue
+      order.push('stop:' + position.id, 'close:' + position.id)
+    }
+    return order
+  }
+
+  /**
+   * 列表头（评审 P1）：`持仓 240 · 显示最近 200`。
+   * `shown` 是窗口真正收到的条数（宿主按最新在前下发，上限在 `desktop/shared.js`），
+   * 合计来自 payload 的 `positionsTotal`/`ordersTotal`。这样截断时玩家知道还有更早的，
+   * 而不是以为账本里只有画出来的这些。老宿主没有 total 时退回 `shown`，不编数。
+   */
+  function listMetaText (label, shown, total) {
+    const count = Math.max(shown, Math.round(toNumber(total) ?? shown))
+    return count > shown ? label + ' ' + count + ' · 显示最近 ' + shown : label + ' ' + count
   }
 
   /** 窗口要的全部内容（`board.js` 只负责把它画成 DOM）。 */
@@ -939,6 +1038,8 @@
       targetText,
       allIn
     })
+    const orders = orderRows(safe, now)
+    const positions = positionCards(safe)
     return {
       header: headerView(safe, now, selected),
       week: weekView(safe),
@@ -946,8 +1047,10 @@
       crops,
       chart: chartView(safe, { crop: selected, width, height }),
       order,
-      orders: orderRows(safe, now),
-      positions: positionCards(safe),
+      orders,
+      ordersMetaText: listMetaText('挂单', orders.length, safe === null ? null : safe.ordersTotal),
+      positions,
+      positionsMetaText: listMetaText('持仓', positions.length, safe === null ? null : safe.positionsTotal),
       history: historyRows(safe, now),
       league: leagueView(safe),
       hints: emptyHints(safe)
@@ -974,6 +1077,7 @@
     chartView,
     previewView,
     orderView,
+    focusOrder,
     orderRows,
     positionCards,
     historyRows,

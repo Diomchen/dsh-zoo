@@ -17,8 +17,10 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import { FARM_FILE } from '../src/farm.js'
+import { MAX_WEEK_PNL, MAX_WEEK_PNL_PCT } from '../src/protocol.js'
 import { createService } from '../src/service.js'
 import { TRADING_FILE } from '../src/trading.js'
+import { slotIndexAt, weekStartOf } from '../src/trading-rules.js'
 
 function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -153,10 +155,12 @@ function optionsFor (dir, port, targetPort, overrides = {}) {
  * `b`/`a` 的 overrides 分开传：发送节拍（DigestMs）两边要能不同——接收端限速窗口
  * 用 A 的值，发送节拍用 B 的值，这是下面几个用例的关键开关。
  */
-async function connectedPair (t, overrides = {}) {
+async function connectedPair (t, overrides = {}, { beforeB = null } = {}) {
   const dirA = await tempDir(t)
   const dirB = await tempDir(t)
   await seedFarm(dirB)
+  // B 的存档要在起服务之前落好：盘口只在 load 时读一次 trading.json。
+  if (beforeB !== null) await beforeB(dirB)
   const b = makeService(t, optionsFor(dirB, 0, 0, overrides.b))
   await b.ready
   const bPort = b.localPort()
@@ -234,6 +238,8 @@ test('票 82 e2e：榜里出现邻居自报的盈亏与持仓，且没有硬币/
   // 本机的收益率由本机的 base 算：这周还没做单，0 / base = 0。
   assert.equal(leagueOf(a).self.weekPnl, 0)
   assert.equal(leagueOf(a).self.weekPnlPct, 0)
+  // 旧版本邻居的可见状态由宿主播出：一位放行在线邻居，且已经报过新鲜周报。
+  assert.deepEqual(leagueOf(a).watchers, { online: 1, reported: 1 })
 
   // B 用真的动作开一手 5× 多单：下一包 digest 里应该出现这条持仓。
   const opened = await callAction(b, {
@@ -262,6 +268,53 @@ test('票 82 e2e：榜里出现邻居自报的盈亏与持仓，且没有硬币/
   assert.equal('close' in pushed, false, '刷新不能关窗')
   assert.equal(pushed.state.league.rows.length, 2)
   assert.equal(pushed.state.league.sentiment.long, 1)
+})
+
+test('票 82 e2e（评审 P0）：浮盈超出线上展示上限仍出现在邻居榜上，发送口不抛', async (t) => {
+  const now = Date.now()
+  const { a, b, bId } = await connectedPair(t, {
+    b: { tradingDigestMs: 60 },
+    a: { tradingDigestMs: 60 }
+  }, {
+    beforeB: async (dir) => {
+      // 1,000,000 硬币 × 20× 的一手：入场的现价差让浮盈远大于 MAX_WEEK_PNL；
+      // week.base = 1 让收益率也远大于 MAX_WEEK_PNL_PCT。两个字段都必须夹到线上边界，
+      // 否则编码层整包拒绝，这位玩家会从每个邻居的榜上彻底消失。
+      await seedFarm(dir, MAX_WEEK_PNL)
+      await writeFile(join(dir, TRADING_FILE), JSON.stringify({
+        version: 1,
+        week: { start: weekStartOf(now), pnl: 0, base: 1 },
+        positions: [{
+          id: '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d',
+          crop: 'tomato',
+          side: 'long',
+          margin: MAX_WEEK_PNL,
+          leverage: 20,
+          // 入场价故意远离现价：真实浮盈约 2e9，远超协议上限。
+          entry: 0.05,
+          // openedAt 放到一分钟后：即使用例刚好卡在 15 分钟边界，仓位也仍属于
+          // 「当前或下一根」，不会在 load 时被当成收盘仓位结掉（避免边界抖动）。
+          openedAt: now + 60 * 1000,
+          slot: slotIndexAt(now + 60 * 1000),
+          stopLoss: 0
+        }],
+        orders: [],
+        history: []
+      }), 'utf8')
+    }
+  })
+
+  const row = await waitForPeerRow(a, bId)
+  assert.equal(row.weekPnl, MAX_WEEK_PNL, '线上分数夹到 MAX_WEEK_PNL')
+  assert.equal(row.weekPnlPct, MAX_WEEK_PNL_PCT, '收益率夹到 MAX_WEEK_PNL_PCT')
+  // 本机账本保留真实数字：夹取只作用于线上展示字段，硬币/持仓/存档一分不动。
+  const own = b.snapshot().trading
+  assert.ok(own.week.total > MAX_WEEK_PNL, '本机本周盈亏仍是真实值')
+  assert.equal(own.week.pnl, 0, '已实现盈亏没被周报改过')
+  assert.equal(own.positions.length, 1, '持仓没被周报改过')
+  assert.equal(own.coins.available, MAX_WEEK_PNL, '农场硬币没被周报动过')
+  // 发送口不抛：编码不再因「赢太多」失败，一轮仍会交给 socket。
+  assert.equal(b.sendTradingDigest({ force: true }), 1)
 })
 
 test('票 82 e2e：伪造/坏字段的 digest 改不了本机硬币、持仓与 trading.json', async (t) => {
@@ -324,4 +377,27 @@ test('票 82 e2e：同一 peer 一个窗口最多 1 条，重复包不改分也�
   assert.equal(b.sendTo(aId, rawDigest(bId, { weekPnl: 444 })), true)
   await waitFor(() => peerRow(a, bId).weekPnl === 444)
   assert.equal(leagueOf(a).rows.length, 2)
+})
+
+test('票 82（评审 P2）：3 分钟前的周报被盘口新鲜度门丢掉，随后新鲜包照常收', async (t) => {
+  const { a, b, aId, bId } = await connectedPair(t, {
+    // A 的限速窗口 100ms；B 只在第一拍发一包（下一次 600 秒后），下面手动投包。
+    a: { tradingDigestMs: 100 },
+    b: { tradingDigestMs: 600000 }
+  })
+  await waitForPeerRow(a, bId)
+  await delay(150)
+
+  // 3 分钟前的样本：超过 TRADING_DIGEST_FRESH_MS（2 分钟）→ 整包丢，分数不动。
+  assert.equal(b.sendTo(aId, rawDigest(bId, {
+    weekPnl: 777,
+    at: Date.now() - 3 * 60 * 1000
+  })), true)
+  await delay(120)
+  assert.equal(peerRow(a, bId).weekPnl, 0, '过期样本不能改榜')
+
+  // 再等过限速窗口发一条新鲜的：证明刚才挡它的是新鲜度门，不是限速门。
+  await delay(150)
+  assert.equal(b.sendTo(aId, rawDigest(bId, { weekPnl: 888 })), true)
+  await waitFor(() => peerRow(a, bId).weekPnl === 888)
 })

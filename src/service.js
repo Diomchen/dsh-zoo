@@ -64,7 +64,7 @@ import {
   stealSucceeds
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
-import { buildLeague } from './trading-league.js'
+import { buildLeague, watcherCounts } from './trading-league.js'
 import {
   BOARD_CROPS,
   PRICE_CEIL_RATIO,
@@ -122,7 +122,10 @@ import {
   MAX_GIFT_BYTES,
   MAX_RAID_PLOTS,
   MAX_TRADING_POSITIONS,
+  MAX_WEEK_PNL,
+  MAX_WEEK_PNL_PCT,
   PLOT_ID_RE,
+  TRADING_DIGEST_FRESH_MS,
   TRADING_DIGEST_INTERVAL_MS,
   normalizeCaps,
   createRateLimiter,
@@ -2163,6 +2166,11 @@ export function createService (ctx, options = {}) {
    * `weekPnl` 是四舍五入后的金币（榜按它排序）；`weekPnlPct` 是比率（0.035 = +3.5%），
    * `week.base` 为 0（新账本/坏文件）时返回 null，编码层就不带这个键。
    * 只投影持仓的三个公开字段：硬币、保证金、入场价、历史一概不出本机。
+   *
+   * 分数在出口夹到协议边界（评审 P0）：线上字段是**展示上限**，不是本地账本的真相。
+   * 1,000,000 硬币 × 20× 的浮盈、或一个很小的 `week.base`，都能让真实值超出
+   * `MAX_WEEK_PNL` / `MAX_WEEK_PNL_PCT`；不夹的话编码层整包拒绝，这位玩家会从
+   * 每个邻居的榜上消失——比「分数封顶」糟得多。硬币、持仓、`trading.json` 一分不动。
    */
   function tradingSelfDigest (view, week, now) {
     const positions = []
@@ -2171,10 +2179,14 @@ export function createService (ctx, options = {}) {
       if (positions.length >= MAX_TRADING_POSITIONS) break
       positions.push({ crop: position.crop, side: position.side, leverage: position.leverage })
     }
+    const weekPnl = Math.round(week.total)
+    const weekPnlPct = week.base > 0 ? week.total / week.base : null
     return {
       at: now,
-      weekPnl: Math.round(week.total),
-      weekPnlPct: week.base > 0 ? week.total / week.base : null,
+      weekPnl: Math.min(MAX_WEEK_PNL, Math.max(-MAX_WEEK_PNL, weekPnl)),
+      weekPnlPct: weekPnlPct === null
+        ? null
+        : Math.min(MAX_WEEK_PNL_PCT, Math.max(-MAX_WEEK_PNL_PCT, weekPnlPct)),
       positions
     }
   }
@@ -2185,11 +2197,22 @@ export function createService (ctx, options = {}) {
    * 与排序（见 `src/trading-league.js`）。邻居不落盘、不发请求，榜过期就淡出。
    */
   function tradingLeagueView (now, self, week) {
-    const me = room.snapshot().self
+    const snapshot = room.snapshot()
+    const me = snapshot.self
     const peers = []
     for (const [deviceId, digest] of tradingDigests) {
       peers.push({ deviceId, ...digest })
     }
+    // 旧版本邻居（评审 P1）：放行且在线，但一条新鲜周报都没有。窗口据此把空态
+    // 从「还没有邻居上线」换成「邻居是旧版本，还没有周报」——两种空态不能混。
+    const watchers = watcherCounts({
+      neighbors: snapshot.neighbors,
+      digests: [...tradingDigests].map(([deviceId, digest]) => ({
+        deviceId,
+        seenAt: digest.seenAt
+      })),
+      now
+    })
     return buildLeague({
       self: {
         deviceId: me.deviceId ?? identity?.deviceId ?? '',
@@ -2202,8 +2225,21 @@ export function createService (ctx, options = {}) {
         positions: self.positions
       },
       peers,
+      watchers,
       now
     })
+  }
+
+  /**
+   * 盘口窗的持仓/挂单按**最新在前**下发（评审 P1）：窗口最多画 200 条，账本里可以更多；
+   * 旧到新的顺序会让截断正好截掉玩家刚开、最想平掉的那一单。`openedAt`/`placedAt`
+   * 是两边的排序键；时间相同时后写入的排前面（数组下标兜底，排序稳定）。
+   */
+  function newestFirst (items, key) {
+    return items
+      .map((item, index) => ({ item, index }))
+      .sort((left, right) => (right.item[key] - left.item[key]) || (right.index - left.index))
+      .map((entry) => entry.item)
   }
 
   /**
@@ -2225,9 +2261,13 @@ export function createService (ctx, options = {}) {
       bar: tradingBarView(now),
       charts: tradingChartsView(now),
       hint: tradingHintView(now),
-      positions: view.positions,
+      positions: newestFirst(view.positions, 'openedAt'),
+      // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
+      // 不会把 240 手假装成 200 手（评审 P1）。
+      positionsTotal: view.positions.length,
       history: view.history,
-      orders: view.orders,
+      orders: newestFirst(view.orders, 'placedAt'),
+      ordersTotal: view.orders.length,
       // 票 82：真人周榜 + LAN 情绪。没有邻居时只有自己一行（窗口画「还没有邻居上线」）。
       league: tradingLeagueView(now, self, week),
       limits: {
@@ -5749,8 +5789,10 @@ export function createService (ctx, options = {}) {
         weekPnlPct: digest.weekPnlPct,
         positions: digest.positions
       })
-    } catch {
-      // 本机盘口数据坏了只停这一轮广播，不影响盘口本身。
+    } catch (error) {
+      // 本机盘口数据坏了只停这一轮广播，不影响盘口本身；日志去重，别每 30 秒刷一条。
+      // 出口已经把分数夹进协议范围，走到这里说明是真坏了（不是「赢太多」）。
+      warnOnce('trading-digest-encode', '盘口周报没编出来，本轮跳过：' + message(error))
       return 0
     }
     let sent = 0
@@ -5768,7 +5810,8 @@ export function createService (ctx, options = {}) {
   /**
    * 收到一条盘口周报（票 82）。四道门（SPEC「真人榜与协议」）：
    *   1. 只认已放行邻居——未放行的人连榜都不该上；
-   *   2. `at` 必须在本机时钟 2 分钟内（`isFreshMarketSample` 是通用判据）；
+   *   2. `at` 必须在本机时钟 `TRADING_DIGEST_FRESH_MS` 内（显式传盘口自己的常量，
+   *      不借行情 digest 的 `MARKET_DIGEST_FRESH_MS`——两个节拍将来分开调时不跟着漂）；
    *   3. 同一 peer 一个窗口最多 1 条（`tradingDigestLimiter`）；
    *   4. 协议层已把字段/数组长度/数值范围白名单过一遍，坏字段整包丢。
    * 通过后只写 service 的内存 Map：**不碰硬币、不碰仓位、不写 trading.json**。
@@ -5778,7 +5821,7 @@ export function createService (ctx, options = {}) {
     if (disposed) return
     if (!room.mayTalkTo(packet.deviceId)) return
     const now = tradingClock()
-    if (!isFreshMarketSample(packet.at, now)) return
+    if (!isFreshMarketSample(packet.at, now, TRADING_DIGEST_FRESH_MS)) return
     if (!tradingDigestLimiter.allow(packet.deviceId, now)) return
     try {
       tradingDigests.set(packet.deviceId, {

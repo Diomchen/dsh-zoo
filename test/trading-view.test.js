@@ -9,7 +9,14 @@ import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 
-import { pnlOf } from '../src/trading-rules.js'
+import { TRADING_ERROR_CODES, tradingErrorText } from '../src/trading-text.js'
+import {
+  PRICE_CEIL_RATIO,
+  PRICE_FLOOR_RATIO,
+  liquidationPriceOf,
+  pnlOf,
+  targetBandOf
+} from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
 const view = require('../desktop/trading-view.js')
@@ -172,6 +179,9 @@ test('票 81：下单区有三档杠杆（来自 payload）、预览句与作物
   assert.equal(order.hint, '')
   assert.equal(order.submitLabel, '开一手')
   assert.equal(order.preview, '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
+  // SPEC v10 US7：下单前就能看到强平价；做空的强平线在现价上方。
+  assert.equal(order.liquidationPrice, 5.06 * 1.2)
+  assert.equal(order.liquidationText, '强平价 6.07 · 涨到就平')
   assert.deepEqual(order.sides.map((choice) => choice.label), ['做多', '做空'])
   // 票 83：三档预设 + 一颗「全下」（金额 = 此刻可用硬币 120）。
   assert.deepEqual(order.margins.map((choice) => choice.margin), [50, 100, 250, 120])
@@ -207,6 +217,37 @@ test('票 81：预览句 1× 的强平是「—」；涨跌 1% 的数与 pnlOf �
       assert.equal(Math.round(-predicted * 100), Math.round(minusOne * 100), margin + '×' + leverage)
     }
   }
+})
+
+test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式（drift）', () => {
+  const at = payload()
+  at.charts.tomato = chart({
+    base: 100,
+    current: { slot: SLOT, open: 100, high: 100, low: 100, price: 100, tick: 0, remainingMs: 1 }
+  })
+  for (const side of ['long', 'short']) {
+    for (const leverage of [5, 20]) {
+      const order = view.orderView(at, { side, leverage, margin: 50 })
+      assert.equal(
+        order.liquidationPrice,
+        liquidationPriceOf({ side, entry: 100, leverage }),
+        side + ' ' + leverage + '× 的强平价必须和宿主一致'
+      )
+      assert.equal(order.liquidationText,
+        '强平价 ' + order.liquidationPrice.toFixed(2) + ' · ' +
+        (side === 'long' ? '跌到就平' : '涨到就平'))
+    }
+  }
+  // 1× 没有强平线：数字是 null，文案是「强平价 —」（SPEC v10 US7）。
+  const oneX = view.orderView(at, { leverage: 1, margin: 50 })
+  assert.equal(oneX.liquidationPrice, null)
+  assert.equal(oneX.liquidationText, '强平价 —')
+  // 没有现价（老宿主/坏包）：不凭空造一条线。
+  assert.equal(view.orderView({ coins: { available: 100 } }).liquidationPrice, null)
+  assert.equal(view.orderView({ coins: { available: 100 } }).liquidationText, '强平价 —')
+  // 预览句仍是 SPEC v10 的原文，不被强平价那行改写。
+  assert.equal(view.orderView(at, { side: 'short', leverage: 5, margin: 100 }).preview,
+    '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
 })
 
 test('票 79：硬币不够时按钮禁用并写明原因；0 硬币写「去种地」', () => {
@@ -526,6 +567,10 @@ test('票 82：真人周榜画分数/收益率/持仓摘要；收益率是比率
   // 0.035 是比率 → +3.50%；邻居没报就是「—」，不拿 0% 冒充。
   assert.equal(win.pctText, '+3.50%')
   assert.equal(win.positionsText, '多 2 · 空 0')
+  // US19：邻居的持仓也画成 chip（作物名来自 payload.limits.crops）。
+  assert.deepEqual(win.chips.map((chip) => chip.text), ['小番茄多 5×', '胡萝卜多 1×'])
+  assert.deepEqual(win.chips.map((chip) => chip.tone), ['long', 'long'])
+  assert.equal(win.chipOverflowText, '')
   assert.equal(own.me, true)
   assert.equal(own.pnlText, '-8')
   assert.equal(own.pnlTone, 'down')
@@ -534,6 +579,104 @@ test('票 82：真人周榜画分数/收益率/持仓摘要；收益率是比率
   assert.equal(own.positionsText, '多 0 · 空 1')
   // LAN 情绪数的是仓位：2 多 + 1 空。
   assert.deepEqual(board.league.sentiment, { long: 2, short: 1, text: '多 2 · 空 1', tone: 'long' })
+})
+
+test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区 → 撤单 → 持仓卡', () => {
+  const order = {
+    id: ORDER_ID,
+    crop: 'tomato',
+    side: 'long',
+    target: 5.5,
+    margin: 50,
+    leverage: 5,
+    placedAt: SLOT_EDGE,
+    slot: SLOT,
+    remainingMs: 1
+  }
+  const position = {
+    id: 'p1',
+    crop: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 5,
+    entry: 5,
+    mark: 5,
+    pnl: 0,
+    liquidation: 4,
+    stopLoss: 0
+  }
+  const keys = view.focusOrder(payload({ orders: [order], positions: [position] }))
+  assert.deepEqual(keys, [
+    'close-button',
+    'crop:tomato', 'crop:carrot', 'crop:pumpkin',
+    'side:long', 'side:short',
+    'margin:50', 'margin:100', 'margin:250', 'margin:all-in',
+    'leverage:1', 'leverage:5', 'leverage:20',
+    'limit-toggle', 'limit-input', 'limit-place', 'submit',
+    'cancel:' + ORDER_ID,
+    'stop:p1', 'close:p1'
+  ])
+  // tabindex 只能给一个元素：顺序表里每个键唯一。
+  assert.equal(new Set(keys).size, keys.length)
+  // 老/坏 payload 退回兜底白名单，不抛；每一步都是窗口认得的键。
+  for (const bad of [null, undefined, 42, 'x', []]) {
+    const fallback = view.focusOrder(bad)
+    assert.equal(fallback[0], 'close-button')
+    assert.deepEqual(fallback.slice(-4), ['limit-toggle', 'limit-input', 'limit-place', 'submit'])
+    assert.equal(new Set(fallback).size, fallback.length)
+  }
+})
+
+test('术语 US19：邻居持仓 chips——最多 3 条 + 「+N」，空仓仍是观望', () => {
+  const crowded = view.leagueView(payload({
+    league: league({
+      rows: [{
+        deviceId: '00000000-0000-4000-8000-0000000000bb',
+        nickname: '满仓',
+        weekPnl: 9,
+        weekPnlPct: 0.02,
+        positions: [
+          { crop: 'tomato', side: 'long', leverage: 20 },
+          { crop: 'carrot', side: 'short', leverage: 5 },
+          { crop: 'pumpkin', side: 'long', leverage: 1 },
+          { crop: 'tomato', side: 'short', leverage: 5 },
+          { crop: 'carrot', side: 'long', leverage: 20 }
+        ],
+        me: false
+      }],
+      sentiment: { long: 3, short: 2, flat: 0 }
+    })
+  }))
+  const row = crowded.rows[0]
+  assert.deepEqual(row.chips.map((chip) => chip.text), ['小番茄多 20×', '胡萝卜空 5×', '南瓜多 1×'])
+  assert.deepEqual(row.chips.map((chip) => chip.tone), ['long', 'short', 'long'])
+  assert.equal(row.chipOverflowText, '+2')
+  assert.equal(row.positionsText, '多 3 · 空 2', '摘要仍保留完整计数')
+
+  // 空仓 = 观望：没有 chip，也没有「+0」。
+  const flat = view.leagueView(payload({
+    league: league({
+      rows: [{ deviceId: '00000000-0000-4000-8000-0000000000cc', nickname: '观望', weekPnl: 0, positions: [], me: false }],
+      sentiment: { long: 0, short: 0, flat: 1 }
+    })
+  }))
+  assert.deepEqual(flat.rows[0].chips, [])
+  assert.equal(flat.rows[0].chipOverflowText, '')
+  assert.equal(flat.rows[0].positionsText, '观望')
+  // 坏持仓条目只丢自己：不能把整行 chips 画成 NaN。
+  const mixed = view.leagueView(payload({
+    league: league({
+      rows: [{
+        deviceId: '00000000-0000-4000-8000-0000000000dd',
+        nickname: '坏行',
+        weekPnl: 1,
+        positions: [null, { side: 'up' }, { crop: 'tomato', side: 'long', leverage: 'x' }],
+        me: false
+      }],
+      sentiment: { long: 0, short: 0, flat: 1 }
+    })
+  }))
+  assert.deepEqual(mixed.rows[0].chips.map((chip) => chip.text), ['小番茄多 1×'])
 })
 
 test('票 82：只有自己时写「观望」，并保留「还没有邻居上线…行情照走」', () => {
@@ -566,6 +709,40 @@ test('票 82：只有自己时写「观望」，并保留「还没有邻居上�
   })
   assert.deepEqual(both.rows.map((row) => row.positionsText), ['多 2 · 空 0', '多 0 · 空 1'])
   assert.equal(both.sentiment.text, '观望')
+})
+
+test('术语 SPEC 旧邻居：有人在线但没周报时，空态写「旧版本」；其余不变', () => {
+  const own = {
+    deviceId: '00000000-0000-4000-8000-0000000000aa',
+    nickname: '小米',
+    weekPnl: 0,
+    weekPnlPct: 0,
+    positions: [],
+    me: true
+  }
+  const alone = (watchers) => view.boardView(payload({
+    league: league({
+      rows: [own],
+      sentiment: { long: 0, short: 0, flat: 1 },
+      watchers
+    })
+  }), { now: SLOT_EDGE })
+  // 邻居在线、但一条周报都没发 → 旧版本。
+  const old = alone({ online: 2, reported: 0 })
+  assert.deepEqual(old.league.watchers, { online: 2, reported: 0 })
+  assert.equal(old.league.empty, '邻居是旧版本，还没有周报')
+  assert.doesNotMatch(old.league.empty, /还没有邻居上线/)
+  // 没有在线邻居 → 原来的「还没有邻居上线…行情照走」。
+  assert.match(alone({ online: 0, reported: 0 }).league.empty, /还没有邻居上线/)
+  assert.match(alone({ online: 0, reported: 0 }).league.empty, /行情照走/)
+  // 有人在线、也确实发过周报（只是行还没到/被过滤）→ 不冒充旧版本。
+  assert.match(alone({ online: 2, reported: 1 }).league.empty, /还没有邻居上线/)
+  // 坏 watchers 不抛，按 0/0 处理。
+  for (const bad of [null, 'x', 42, [], { online: 'x', reported: -1 }]) {
+    const board = alone(bad)
+    assert.deepEqual(board.league.watchers, { online: 0, reported: 0 }, JSON.stringify(bad))
+    assert.match(board.league.empty, /还没有邻居上线/)
+  }
 })
 
 test('票 82：榜的坏输入不抛——缺行/坏行/缺情绪都退回空榜', () => {
@@ -679,8 +856,101 @@ test('票 83：挂单列表——方向/作物/目标价/保证金/距收盘的�
   assert.match(view.emptyHints(payload({ coins: { available: 0, locked: 0, total: 0 } })).orders, /先去种地/)
 })
 
+test('评审 P2：到价目标带只从 payload 比例算，与宿主常量同源（drift）', () => {
+  const band = targetBandOf({ crop: 'tomato' })
+  const base = payload().charts.tomato.base
+  assert.deepEqual(band, {
+    min: base * PRICE_FLOOR_RATIO,
+    max: base * PRICE_CEIL_RATIO
+  })
+  const viewPayload = payload()
+  viewPayload.limits = {
+    ...LIMITS,
+    targetRatio: { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO }
+  }
+  const order = view.orderView(viewPayload)
+  assert.equal(order.limit.bandText, view.formatPrice(band.min) + '–' + view.formatPrice(band.max))
+  assert.equal(order.limit.bandText, '2.75–8.75')
+  // 窗口没有把 0.55/1.75 写死：换一组比例，带子跟着 payload 走（老宿主可只发比例）。
+  const shifted = view.orderView(payload({
+    limits: { ...LIMITS, targetRatio: { floor: 0.5, ceil: 2 } }
+  }))
+  assert.equal(shifted.limit.bandText, '2.50–10.00')
+})
+
+test('评审 P1：持仓/挂单表头用真实总数说明截断（显示最近 200）', () => {
+  const position = (index) => ({
+    id: 'p' + index,
+    crop: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 1,
+    entry: 5,
+    mark: 5,
+    pnl: 0,
+    liquidation: null,
+    stopLoss: 0
+  })
+  const many = Array.from({ length: 200 }, (_, index) => position(index))
+  const truncated = view.boardView(payload({ positions: many, positionsTotal: 240 }), { now: SLOT_EDGE })
+  assert.equal(truncated.positions.length, 200)
+  assert.equal(truncated.positionsMetaText, '持仓 240 · 显示最近 200')
+  const exact = view.boardView(payload({ positions: many.slice(0, 40), positionsTotal: 40 }), { now: SLOT_EDGE })
+  assert.equal(exact.positionsMetaText, '持仓 40')
+  // 老宿主没有 totals：表头退回真实收到的条数，不编一个不存在的合计。
+  const legacy = view.boardView(payload({ positions: many.slice(0, 3) }), { now: SLOT_EDGE })
+  assert.equal(legacy.positionsMetaText, '持仓 3')
+
+  const order = (index) => ({
+    id: 'o' + index,
+    crop: 'tomato',
+    side: 'long',
+    target: 2.75,
+    margin: 50,
+    leverage: 1,
+    placedAt: SLOT_EDGE,
+    slot: SLOT,
+    remainingMs: 1
+  })
+  const oneOfMany = view.boardView(payload({ orders: [order(0)], ordersTotal: 3 }), { now: SLOT_EDGE })
+  assert.equal(oneOfMany.ordersMetaText, '挂单 3 · 显示最近 1')
+  assert.equal(view.boardView(payload({ orders: [order(0)] }), { now: SLOT_EDGE }).ordersMetaText, '挂单 1')
+})
+
 test('User Story 30：盘口窗上写明「没有手续费、没有资金费、没有风险控制」', async () => {
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
   assert.match(html, /没有手续费、没有资金费、没有风险控制/)
   assert.match(html, /硬币赔光就去种地/)
+  // SPEC v10 US7：下单区真的有一行强平价，并且渲染端把它填进去。
+  assert.match(html, /id="order-liquidation"/)
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /order-liquidation/)
+  assert.match(script, /order\.liquidationText/)
+  // US19：榜行把 view 给的 chips 画出来（不是只画「多 N · 空 M」计数）。
+  assert.match(script, /league-chips/)
+  assert.match(script, /chipOverflowText/)
+  // 票 81 的键盘验收：Tab 顺序由纯函数给，窗口把它落到真实 tabindex。
+  assert.match(script, /view\.focusOrder\(payload\)/)
+  assert.match(script, /tabIndex = index/)
+})
+
+test('评审 P2：窗口兜底错误文案与 trading-text.js 同码同文（drift）', async () => {
+  // 渲染端不是 ESM，抄一份可以；两边的同一错误码必须一个字都不差。
+  const source = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  const block = /const RESULT_CODE_TEXT = \{([\s\S]*?)\n\}/.exec(source)
+  assert.ok(block, 'board.js 应该有 RESULT_CODE_TEXT')
+  const table = {}
+  for (const match of block[1].matchAll(/(?:'([^']+)'|([A-Za-z-]+)):\s*'([^']+)'/g)) {
+    table[match[1] ?? match[2]] = match[3]
+  }
+  let shared = 0
+  for (const code of TRADING_ERROR_CODES) {
+    if (!(code in table)) continue
+    shared += 1
+    assert.equal(table[code], tradingErrorText(code), code + ' 的兜底文案漂了')
+  }
+  assert.ok(shared >= 11, '窗口的兜底表至少要覆盖 11 个宿主错误码（实际 ' + shared + '）')
+  // 这两条在评审里明确漂过：钉住它们，避免「两边一起改错」也能过。
+  assert.match(table['no-order'], /刷新一下就好/)
+  assert.match(table['no-position'], /刷新一下就好/)
 })

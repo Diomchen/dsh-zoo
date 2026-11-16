@@ -443,6 +443,11 @@ export function isStopLossHit ({ side, margin, leverage = 1, entry, mark, stopLo
  * 为什么不能只看端点：插针、快进时钟、关掉 DSH 几小时再回来，端点可能已经回到安全区，
  * 而中间某一分钟早就撞线了。强平是系统规则，止损是玩家工具，两者都不许被「跳过」。
  *
+ * `stopFrom` 是**止损的生效时刻**（缺省 = `from`，老调用方行为不变）：止损是玩家在
+ * 某一刻自己设的工具，只能从那一刻往后看；而强平是从 `from` 起就一直有效的系统规则。
+ * 两个游标分开传，是因为账本里「设止损」不能顺手把强平的检查进度也挪走——设止损之前
+ * 已经越过强平线的那一段，下一拍仍然要补出来（评审 P0）。
+ *
  * 窗口上限 `MAX_PATH_SCAN_MS`（3 天）：更老的部分不逐分钟扫，调用方按仓位那一根的
  * 收盘价结（循环有界，补账不会因为离线一个月而跑几十万次）。
  */
@@ -454,7 +459,8 @@ export function pathScan ({
   entry,
   stopLoss = 0,
   from,
-  to
+  to,
+  stopFrom
 } = {}) {
   if (!isBoardSide(side)) return null
   const start = finiteNumber(from)
@@ -463,6 +469,8 @@ export function pathScan ({
   const marginValue = finiteNumber(margin)
   if (start === null || end === null || entryPrice === null || marginValue === null) return null
   if (end <= start) return null
+  // 止损只在设下之后生效；没给就按老口径「整段都能止损」（from 之前没有可扫的点）。
+  const stopStart = finiteNumber(stopFrom) ?? start
   // 同一根里的 15 分钟也先算好：强平线一次算清，循环里不再重复求值。
   const liquidation = liquidationPriceOf({ side, entry: entryPrice, leverage })
   const checkAt = (at) => {
@@ -470,7 +478,8 @@ export function pathScan ({
     if (exit === null) return null
     // 先看玩家自己设的止损：`−100%` 那一档与强平线是同一个价（都是亏光保证金），
     // 档位既然存在就按「止损」记，钱一分不差（亏损封顶）。没设档位时强平兜底。
-    const hit = isStopLossHit({
+    // 止损的生效时刻之前不参与判定——设止损不翻旧账，强平则照常从路径起点检查。
+    const hit = at >= stopStart && isStopLossHit({
       side,
       margin: marginValue,
       leverage,

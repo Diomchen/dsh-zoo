@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -20,7 +20,19 @@ import shared from '../desktop/shared.js'
 import { FARM_FILE } from '../src/farm.js'
 import { resetCropCatalog } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
-import { BOARD_CROPS, SLOT_MS, TICK_MS, TRADING_LEVERAGES, markPrice, settlementOf } from '../src/trading-rules.js'
+import { TRADING_FILE } from '../src/trading.js'
+import {
+  BOARD_CROPS,
+  SLOT_MS,
+  TICK_MS,
+  PRICE_CEIL_RATIO,
+  PRICE_FLOOR_RATIO,
+  TRADING_LEVERAGES,
+  TRADING_STOP_LEVELS,
+  markPrice,
+  settlementOf,
+  slotIndexAt
+} from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
 // 渲染页和 Node 测试共用同一份纯视图模型（desktop/ 是 CommonJS）。
@@ -199,6 +211,8 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
   assert.deepEqual(state.positions, [])
   assert.deepEqual(state.history, [])
   assert.deepEqual(state.orders, [])
+  // 没有邻居时 watchers 是 0/0：窗口照旧画「还没有邻居上线」。
+  assert.deepEqual(state.league.watchers, { online: 0, reported: 0 })
   assert.deepEqual(state.limits, {
     margins: [50, 100, 250],
     // 杠杆与作物白名单都与纯规则同源：票 80 把杠杆换成 [1,5,20] 时这里不用改。
@@ -207,7 +221,7 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
     historyLimit: 50,
     // 票 83：「全下」与目标价带都随包下发，窗口不抄宿主常量。
     allIn: true,
-    targetRatio: { floor: 0.55, ceil: 1.75 }
+    targetRatio: { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO }
   })
   // 这一包能直接喂给窗口的纯视图（窗口只画）。
   const board = boardView.boardView(state, { now: clock.value })
@@ -359,7 +373,8 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.equal('secret' in normalized.command.state.bar, false)
   assert.deepEqual(normalized.command.state.limits.margins, [50, 100, 250])
   assert.equal(normalized.command.state.limits.allIn, true)
-  assert.deepEqual(normalized.command.state.limits.targetRatio, { floor: 0.55, ceil: 1.75 })
+  assert.deepEqual(normalized.command.state.limits.targetRatio,
+    { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO })
   assert.deepEqual(normalized.command.state.limits.crops, [{ id: 'tomato', name: '小番茄' }])
   assert.equal('secret' in normalized.command.state.positions[0], false)
   assert.equal(normalized.command.state.positions[0].id, 'p1')
@@ -416,8 +431,11 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   ]) {
     assert.equal(shared.normalizeBoardAction(bad), null, JSON.stringify(bad))
   }
-  // 窗口与 helper 的止损四档是同一组数（改档位时三处一起改）。
+  // 窗口 / helper / 宿主三处的止损四档是同一组数（改档位时一起改）。
   assert.deepEqual(shared.BOARD_STOP_LEVELS, boardView.stopLevels())
+  assert.deepEqual(shared.BOARD_STOP_LEVELS, TRADING_STOP_LEVELS)
+  // 杠杆的形状上限也同源（helper 不再各写一个 20）。
+  assert.equal(shared.BOARD_MAX_LEVERAGE, 20)
   // 票 83：到价挂单 / 撤单的字段白名单。
   assert.deepEqual(
     shared.normalizeBoardAction({
@@ -517,10 +535,12 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
       ],
       sentiment: { long: 1, short: 1, flat: 0, secret: 1 },
       self: { weekPnl: 12, weekPnlPct: 0.035, coins: 999, secret: 1 },
+      // 旧版本邻居的可见计数（评审 P1）：只认两个非负整数。
+      watchers: { online: 2, reported: 1, secret: 1 },
       secret: 1
     }
   }).league
-  assert.deepEqual(Object.keys(league), ['rows', 'sentiment', 'self'])
+  assert.deepEqual(Object.keys(league), ['rows', 'sentiment', 'self', 'watchers'])
   assert.equal(league.rows.length, 2)
   assert.deepEqual(league.rows.map((row) => row.nickname), ['小米', '邻居'])
   assert.equal(league.rows[0].me, true)
@@ -531,6 +551,32 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.equal(league.rows[1].weekPnlPct, null, '邻居没报收益率就是 null（窗口画「—」）')
   assert.deepEqual(league.sentiment, { long: 1, short: 1, flat: 0 })
   assert.deepEqual(league.self, { weekPnl: 12, weekPnlPct: 0.035 })
+  assert.deepEqual(league.watchers, { online: 2, reported: 1 })
+  // 缺/坏 watchers 归零，而不是把 NaN 画到窗口上。
+  assert.deepEqual(shared.normalizeBoardView({}).league.watchers, { online: 0, reported: 0 })
+  assert.deepEqual(
+    shared.normalizeBoardView({ league: { watchers: { online: 'x', reported: -1 } } }).league.watchers,
+    { online: 0, reported: 0 }
+  )
+
+  // 评审 P1：持仓/挂单最多过 200 条；宿主没给 totals 时用收到条数兜底（不是被截后的 200）。
+  const manyPositions = Array.from({ length: 240 }, (_, index) => ({
+    id: 'p' + index, crop: 'tomato', side: 'long', margin: 50, leverage: 1, entry: 5
+  }))
+  const capped = shared.normalizeBoardView({ positions: manyPositions })
+  assert.equal(capped.positions.length, 200)
+  assert.equal(capped.positionsTotal, 240)
+  assert.equal(shared.normalizeBoardView({ positions: manyPositions, positionsTotal: 260 }).positionsTotal, 260)
+  const manyOrders = Array.from({ length: 240 }, (_, index) => ({
+    id: 'o' + index, crop: 'tomato', side: 'long', target: 5, margin: 50, leverage: 1,
+    placedAt: 1763308800000, slot: 1959232
+  }))
+  const cappedOrders = shared.normalizeBoardView({ orders: manyOrders })
+  assert.equal(cappedOrders.orders.length, 200)
+  assert.equal(cappedOrders.ordersTotal, 240)
+  // 老宿主/坏包没有这两块：总数就是 0，表头写「持仓 0 / 挂单 0」。
+  assert.equal(shared.normalizeBoardView({}).positionsTotal, 0)
+  assert.equal(shared.normalizeBoardView({}).ordersTotal, 0)
 
   // 票 83：到价挂单穿过 helper 白名单——§9.4 的老坑：宿主发了、窗口永远收不到。
   const orderId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f2a3b4c5d'
@@ -564,6 +610,91 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
 
   // 读盘归一化（窗口形状）也不认多余字段。
   assert.deepEqual(shared.normalizeBoardView(null), null)
+})
+
+test('评审 P1：40 手持仓按最新在前下发，总数不丢，最新一手可平', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 5 * TICK_MS }
+  const id = (index) => '00000000-0000-4000-8000-' + String(index).padStart(12, '0')
+  const positions = []
+  for (let index = 0; index < 40; index += 1) {
+    positions.push({
+      id: id(index),
+      crop: 'tomato',
+      side: 'long',
+      margin: 50,
+      leverage: 1,
+      entry: 5,
+      // 都在当前这一根里；越早开的下标越大。最新 = id(0)。
+      openedAt: clock.value - index * 1000,
+      stopLoss: 0
+    })
+  }
+  // 挂单也按 placedAt 最新在前（目标价在带内、这一根里不会成交）。
+  const orders = [0, 1, 2].map((index) => ({
+    id: id(900 + index),
+    crop: 'tomato',
+    side: 'long',
+    target: 2.75,
+    margin: 50,
+    leverage: 1,
+    placedAt: clock.value - index * 1000,
+    slot: slotIndexAt(clock.value)
+  }))
+  await writeFile(join(dir, TRADING_FILE), JSON.stringify({
+    version: 1,
+    positions,
+    orders,
+    history: []
+  }), 'utf8')
+
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  const state = desktop.calls.board[0].state
+  assert.equal(state.positions.length, 40)
+  assert.equal(state.positionsTotal, 40)
+  assert.equal(state.positions[0].id, id(0), '最新开的一手排第一')
+  assert.equal(state.positions[39].id, id(39), '最早开的一手排最后')
+  assert.equal(state.orders.length, 3)
+  assert.equal(state.ordersTotal, 3)
+  assert.equal(state.orders[0].id, id(900), '最新挂的单排第一')
+
+  // 白名单 + 纯视图：第一张卡就是最新一手，而且真的能点平仓。
+  const normalized = shared.normalizeBoardView(state)
+  assert.equal(normalized.positionsTotal, 40)
+  const board = boardView.boardView(normalized, { now: clock.value })
+  assert.equal(board.positions[0].id, id(0))
+  assert.equal(board.positions[0].canClose, true)
+  assert.equal(board.positionsMetaText, '持仓 40')
+  assert.equal(board.ordersMetaText, '挂单 3')
+
+  // 平掉最新一手：账本剩 39 手，窗口的第一张卡换成第二新的那一手。
+  clock.value += TICK_MS
+  desktop.emit({
+    type: 'action',
+    id: 'board-close-newest',
+    action: 'trading-close-position',
+    positionId: id(0)
+  })
+  await waitFor(() => desktop.calls.results.length === 1)
+  assert.equal(desktop.calls.results[0].result.ok, true,
+    JSON.stringify(desktop.calls.results[0].result))
+  const after = shared.normalizeBoardView(desktop.calls.board.at(-1).state)
+  assert.equal(after.positionsTotal, 39)
+  assert.equal(after.positions.length, 39)
+  assert.equal(after.positions[0].id, id(1), '平掉最新的之后，第二新的排第一')
+  assert.equal(after.ordersTotal, 3)
 })
 
 test('票 81：整份 payload 带三作物 K 线 + 风向，并能穿过 helper 的白名单', async (t) => {
@@ -839,4 +970,13 @@ test('票 83：到价挂单/撤单穿过 helper 白名单到宿主；payload 带
   })
   assert.equal(refused.status, 409)
   assert.equal(refused.body.error, 'bad-target')
+})
+
+test('评审 P1：shot 命令支持盘口窗（关着回 not-ready，不误拍主窗）', async () => {
+  // helper 需要 Electron 才能真跑，这里盯源码接线：`board` 必须落到 boardWin，
+  // 且命令分支把它和 bring/farm 放在同一组（关窗走统一的 not-ready）。
+  const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
+  assert.match(main, /command\.window === 'board'/)
+  assert.match(main, /target === 'board' \? boardWin/)
+  assert.match(main, /command\.window === 'bring' \|\| command\.window === 'farm' \|\| command\.window === 'board'/)
 })
