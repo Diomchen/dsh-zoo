@@ -1099,6 +1099,14 @@ export function createService (ctx, options = {}) {
       if (result?.ok === true) refreshTradingWindow()
       return result
     }
+    // 一键止损（票 80）：窗口只管循环档位（关 / −25% / −50% / −100% 保证金），
+    // 白名单校验、落盘与「现在是哪一档」的 notice 都由账本给。
+    if (action === 'trading-set-stop') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.setStopLoss(body?.positionId, body?.level)
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') return recallPet()
@@ -2059,7 +2067,9 @@ export function createService (ctx, options = {}) {
 
   /**
    * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
-   * 按钮白名单（50/100、1×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
+   * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
+   * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
+   * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
    */
   function tradingWindowView () {
     const now = tradingClock()
