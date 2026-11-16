@@ -3,18 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <!--
-      盘口小窗（票 79 / 票 81 / 票 82 / 票 83）：三作物 K 线、下单、到价挂单/撤单、
-      持仓/止损、最近结算、本周盈亏、真人周榜与 LAN 情绪。
+      盘口小窗（票 79 / 票 81 / 票 82 / 票 83 / 票 84）：三作物 K 线（15 分/1 时/1 日/1 周）、
+      下单、到价挂单/撤单、持仓/止损、最近结算、本周盈亏、真人周榜与 LAN 情绪。
+      图表上的周期只是看盘视角；合约仍按 15 分钟收盘结算（ADR-0029 第 4 条）。
 
       和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
       /state。行情、硬币、持仓、挂单、历史、周盈亏、风向、真人周榜全部由宿主随
       `board-window` 命令推过来，这里只画、只把「申请」交回主进程。窗口能收键盘
-      （focusable），但**不按失焦关窗**：macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
+      （focusable），失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
 
-      Tab 顺序 = DOM 顺序：作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价输入框
-      → 挂单按钮（后两个只在「到价」点开时出现）→ 开一手 → 每张挂单的撤单 → 每手仓位的
-      止损/平仓。右栏（下单）在 DOM 里紧跟在图表之后，靠 grid-area 放到视觉右侧，
-      键盘走起来才顺。
+      Tab 顺序 = DOM 顺序：作物页签 → 周期页签 → 方向 → 保证金 → 杠杆 → 到价开关
+      → 目标价输入框 → 挂单按钮（后两个只在「到价」点开时出现）→ 开一手 → 每张挂单的撤单
+      → 每手仓位的止损/平仓。右栏（下单）在 DOM 里紧跟在图表之后，靠 grid-area 放到视觉
+      右侧，键盘走起来才顺。
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -91,6 +92,27 @@
         padding: 10px 14px 9px;
         background: rgba(255, 255, 255, 0.74);
         border-bottom: 1px solid var(--line);
+        /* 票 85 / ADR-0029：只有标题栏是拖动区；下面的按钮/页签/输入必须 no-drag，
+           否则点「×」会变成拖窗口。标题栏以外默认不可拖。 */
+        -webkit-app-region: drag;
+      }
+      .topbar button,
+      .topbar a,
+      .topbar input,
+      .topbar select,
+      .topbar textarea,
+      .topbar [role='button'],
+      .topbar [role='tab'],
+      .topbar [contenteditable='true'] {
+        -webkit-app-region: no-drag;
+      }
+      .drag-grip {
+        flex: none;
+        color: var(--line-strong);
+        font-size: 14px;
+        line-height: 1;
+        letter-spacing: -2px;
+        user-select: none;
       }
       .brand {
         display: flex;
@@ -291,6 +313,37 @@
         background: var(--emerald-soft);
         color: var(--emerald-deep);
       }
+      /* 票 84：周期页签比作物页签更紧凑——它只是看盘视角，不是交易对象。 */
+      .timeframe-tabs {
+        display: flex;
+        gap: 4px;
+        margin-bottom: 5px;
+      }
+      .timeframe-tab {
+        padding: 2px 8px;
+        border-radius: 7px;
+        border: 1px solid var(--line);
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 11px;
+        font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap;
+      }
+      .timeframe-tab:hover:enabled {
+        border-color: var(--emerald);
+      }
+      .timeframe-tab[aria-pressed='true'] {
+        border-color: var(--emerald-btn);
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .timeframe-tab:disabled {
+        border-color: var(--line);
+        background: var(--disabled-bg);
+        color: var(--disabled-ink);
+        cursor: default;
+      }
       .chart-quote {
         display: flex;
         align-items: baseline;
@@ -428,6 +481,18 @@
         color: var(--muted);
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
+      }
+      /* 票 84：切到粗周期时的一行提示。用 visibility 占位，切周期时窗口不跳。 */
+      .chart-settle-hint {
+        margin: 3px 0 0;
+        min-height: 13px;
+        font-size: 10px;
+        line-height: 13px;
+        color: var(--muted);
+        visibility: hidden;
+      }
+      .chart-settle-hint[data-visible='true'] {
+        visibility: visible;
       }
       /* ------------------------------ 下单 ------------------------------ */
       .order-card {
@@ -910,6 +975,7 @@
   <body>
     <div class="app">
       <header class="topbar">
+        <span class="drag-grip" aria-hidden="true">⠿</span>
         <div class="brand">
           <span class="brand-mark" aria-hidden="true">📈</span>
           <div class="brand-text">
@@ -945,19 +1011,21 @@
               <span class="wind" id="wind" data-tone="flat">风向 —</span>
             </div>
           </div>
+          <div class="timeframe-tabs" id="timeframe-tabs" role="group" aria-label="K 线周期"></div>
           <svg
             class="chart-svg"
             id="chart"
             viewBox="0 0 384 188"
             preserveAspectRatio="none"
             role="img"
-            aria-label="15 分钟 K 线：底价、入场、强平参考线"
+            aria-label="K 线"
           ></svg>
           <p class="chart-empty" id="chart-empty" hidden>行情还在算，稍等一下。</p>
           <div class="chart-foot">
             <span class="legend" id="legend"></span>
-            <span class="slot-note" id="slot-note">第 — 根</span>
+            <span class="slot-note" id="slot-note">—</span>
           </div>
+          <p class="chart-settle-hint" id="chart-settle-hint" data-visible="false"></p>
         </section>
 
         <section class="card order-card" aria-labelledby="order-title">
