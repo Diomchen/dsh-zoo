@@ -1,8 +1,8 @@
 /**
- * 盘口小窗的纯视图模型（票 79 / 票 81 / 票 82）。
+ * 盘口小窗的纯视图模型（票 79 / 票 81 / 票 82 / 票 83）。
  *
- * 这层只做「宿主推来的盘口 view → 标题/K 线几何/下单区/持仓卡/历史/真人周榜/空态」的纯计算，
- * 不碰 window、document、IPC，也不改任何数据。渲染页把它当普通 script 加载
+ * 这层只做「宿主推来的盘口 view → 标题/K 线几何/下单区/到价挂单/持仓卡/历史/真人周榜/空态」的
+ * 纯计算，不碰 window、document、IPC，也不改任何数据。渲染页把它当普通 script 加载
  * （`window.dshZooBoardView`），Node 测试用 `require` 同一份文件；DOM 由
  * `desktop/board.js` 建。
  *
@@ -12,6 +12,8 @@
  *
  * 三处「复制了宿主规则」的地方都有注释标出来：15 分钟一根（算倒数第二根的时间轴）、
  * 止损四档（按钮循环），以及下单杠杆/保证金/作物白名单（**不复制**，只吃 payload）。
+ * 票 83 的到价目标价带（0.55–1.75× 底价）也只从 payload 的 `chart.base` 读，
+ * 不在窗口里再写一遍 `PRICE_FLOOR_RATIO`。
  */
 (function (root, factory) {
   'use strict'
@@ -36,10 +38,13 @@
   const CHART_PADDING = Object.freeze({ top: 8, right: 4, bottom: 6, left: 4 })
   /** 兜底白名单：宿主每一包都会带 `limits`，这里只在极端情况下（老宿主/坏包）用。 */
   const FALLBACK_LIMITS = Object.freeze({
-    margins: Object.freeze([50, 100]),
+    margins: Object.freeze([50, 100, 250]),
     leverages: Object.freeze([1]),
     crops: Object.freeze([{ id: 'tomato', name: '小番茄' }]),
-    historyLimit: 50
+    historyLimit: 50,
+    // 老宿主没有「全下」，也没有目标价带；窗口就不画这两样（照样能开仓）。
+    allIn: false,
+    targetRatio: null
   })
   const SIDE_LABELS = Object.freeze({ long: '做多', short: '做空' })
   const REASON_LABELS = Object.freeze({
@@ -166,6 +171,11 @@
   function limitsOf (payload) {
     const limits = payload !== null && typeof payload === 'object' ? payload.limits : null
     if (limits === null || typeof limits !== 'object') return FALLBACK_LIMITS
+    const ratio = limits.targetRatio !== null && typeof limits.targetRatio === 'object'
+      ? limits.targetRatio
+      : null
+    const floor = ratio === null ? null : toNumber(ratio.floor)
+    const ceil = ratio === null ? null : toNumber(ratio.ceil)
     return {
       margins: Array.isArray(limits.margins) && limits.margins.length > 0
         ? limits.margins
@@ -176,7 +186,12 @@
       crops: Array.isArray(limits.crops) && limits.crops.length > 0
         ? limits.crops
         : FALLBACK_LIMITS.crops,
-      historyLimit: Number.isInteger(limits.historyLimit) ? limits.historyLimit : FALLBACK_LIMITS.historyLimit
+      historyLimit: Number.isInteger(limits.historyLimit) ? limits.historyLimit : FALLBACK_LIMITS.historyLimit,
+      // 旧宿主没有这两个字段：不画「全下」、不显示目标价带（宿主照样会校验/拒绝）。
+      allIn: limits.allIn === true,
+      targetRatio: floor === null || ceil === null || floor <= 0 || ceil <= floor
+        ? null
+        : { floor, ceil }
     }
   }
 
@@ -584,18 +599,36 @@
   }
 
   /**
-   * 下单区：方向、保证金、杠杆、能不能点、为什么不能。
+   * 下单区：方向、保证金（50/100/250 + 全下）、杠杆、到价开关、能不能点、为什么不能。
    * 杠杆/保证金白名单**只从 payload 拿**（票 80 把 leverages 换成 [1,5,20] 时窗口不用改）；
    * 老 payload 没有 leverages 时退回 [1]。
    * 「0 硬币 → 去种地」是 SPEC 的明确口径：盘口不给救济，农场是唯一退路。
+   *
+   * 票 83 的到价挂单也在这里算：只有 `limitOpen` 为真时才给输入框/挂单按钮出文案；
+   * 目标价带来自 payload 的 `limits.targetRatio × chart.base`（不抄宿主常量）。
+   * `allIn` 是窗口自己的选择态（点过「全下」），金额永远 = 此刻的可用硬币。
    */
-  function orderView (payload, { side = 'long', margin = 50, leverage = 1, crop = null } = {}) {
+  function orderView (payload, {
+    side = 'long',
+    margin = 50,
+    leverage = 1,
+    crop = null,
+    limitOpen = false,
+    targetText = '',
+    allIn = false
+  } = {}) {
     const limits = limitsOf(payload)
     const coins = coinsOf(payload)
     const chosenSide = SIDE_LABELS[side] === undefined ? 'long' : side
-    const chosenMargin = limits.margins.includes(margin) ? margin : limits.margins[0]
     const chosenLeverage = limits.leverages.includes(leverage) ? leverage : limits.leverages[0]
     const chosenCrop = pickCrop(payload, crop)
+    // 「全下」的金额每包现算（可用硬币），0 硬币时不可选。
+    const allInAmount = Math.floor(coins.available)
+    const allInSupported = limits.allIn === true && allInAmount >= 1
+    const chosenAllIn = allIn === true && allInSupported
+    const chosenMargin = chosenAllIn
+      ? allInAmount
+      : (limits.margins.includes(margin) ? margin : limits.margins[0])
     const preview = previewView({ margin: chosenMargin, leverage: chosenLeverage })
 
     let canSubmit = true
@@ -607,9 +640,60 @@
       canSubmit = false
       hint = '硬币不够，选小一点的保证金或先去卖点作物。'
     }
+
+    const marginChoices = limits.margins.map((candidate) => ({
+      margin: candidate,
+      label: String(candidate),
+      allIn: false,
+      active: !chosenAllIn && candidate === chosenMargin,
+      disabled: candidate > coins.available
+    }))
+    if (limits.allIn === true) {
+      marginChoices.push({
+        margin: allInAmount,
+        label: '全下',
+        allIn: true,
+        active: chosenAllIn,
+        // 0 硬币时「全下」也没有钱可下：和预设一样禁用。
+        disabled: allInAmount < 1
+      })
+    }
+
+    // 目标价：输入框空着时用当前现价当默认值；只在「到价」打开时才显示。
+    const chart = chartOf(payload, chosenCrop)
+    const price = chart !== null && isCurrentLike(chart.current)
+      ? toNumber(chart.current.price)
+      : null
+    const base = chart === null ? null : toNumber(chart.base)
+    const ratio = limits.targetRatio
+    const band = base === null || ratio === null
+      ? null
+      : { min: base * ratio.floor, max: base * ratio.ceil }
+    const defaultTargetText = price === null ? '' : formatPrice(price)
+    const rawTarget = typeof targetText === 'string' ? targetText.trim() : ''
+    const effectiveTargetText = rawTarget === '' ? defaultTargetText : rawTarget
+    const target = toNumber(effectiveTargetText)
+    const targetInBand = target !== null && target > 0 &&
+      (band === null || (target >= band.min && target <= band.max))
+    const bandText = band === null
+      ? ''
+      : formatPrice(band.min) + '–' + formatPrice(band.max)
+    let limitHint = ''
+    if (limitOpen) {
+      if (coins.available <= 0) limitHint = '硬币不够了，先去种地。'
+      else if (coins.available < chosenMargin) limitHint = '硬币不够，选小一点的保证金或先去卖点作物。'
+      else if (!targetInBand) {
+        limitHint = bandText === ''
+          ? '目标价要填一个大于 0 的数字。'
+          : '目标价要在 ' + bandText + ' 之间。'
+      }
+    }
+    const canPlace = limitOpen && targetInBand && coins.available > 0 && coins.available >= chosenMargin
+
     return {
       side: chosenSide,
       margin: chosenMargin,
+      allIn: chosenAllIn,
       leverage: chosenLeverage,
       crop: chosenCrop,
       cropName: cropNameOf(payload, chosenCrop),
@@ -618,12 +702,7 @@
         label: SIDE_LABELS[candidate],
         active: candidate === chosenSide
       })),
-      margins: limits.margins.map((candidate) => ({
-        margin: candidate,
-        label: String(candidate),
-        active: candidate === chosenMargin,
-        disabled: coins.available < candidate
-      })),
+      margins: marginChoices,
       leverages: limits.leverages.map((candidate) => ({
         leverage: candidate,
         label: candidate + '×',
@@ -634,7 +713,21 @@
       preview: preview.text,
       previewParts: preview,
       // 0 硬币时按钮本身就是「去种地」——盘口不给救济，这是唯一的下一步。
-      submitLabel: coins.available <= 0 ? '去种地' : '开一手'
+      submitLabel: coins.available <= 0 ? '去种地' : '开一手',
+      limit: {
+        enabled: limitOpen,
+        toggleLabel: '到价',
+        targetText: effectiveTargetText,
+        target,
+        bandText,
+        canPlace,
+        hint: limitHint,
+        placeLabel: coins.available <= 0 ? '去种地' : '挂单',
+        // 说清做多/做空分别等哪个方向越价，不用玩家自己推。
+        note: chosenSide === 'long'
+          ? '到价成交：价格跌到目标价时做多；收盘没成交自动撤单。'
+          : '到价成交：价格涨到目标价时做空；收盘没成交自动撤单。'
+      }
     }
   }
 
@@ -709,6 +802,40 @@
     return rows
   }
 
+  /**
+   * 到价挂单列表（票 83）：一行一张，写明方向/作物/杠杆、目标价、保证金和「还有多久」。
+   * 剩余时间取 `slot + 1` 的收盘时刻（挂单只活一根）；宿主也会带 `remainingMs`，
+   * 只有缺 slot 的老包才退回它。`canCancel` 永远为真——退款幂等在宿主。
+   */
+  function orderRows (payload, now) {
+    const orders = payload !== null && typeof payload === 'object' && Array.isArray(payload.orders)
+      ? payload.orders
+      : []
+    const current = toNumber(now)
+    const rows = []
+    for (const order of orders) {
+      if (order === null || typeof order !== 'object') continue
+      if (typeof order.id !== 'string' || order.id === '') continue
+      const slot = toNumber(order.slot)
+      // 有 now 且知道 slot 就现算；否则退回宿主给的 remainingMs（第一帧/老包）。
+      const remaining = current === null || slot === null
+        ? toNumber(order.remainingMs) ?? 0
+        : Math.max(0, (slot + 1) * SLOT_MS - current)
+      const leverage = Math.max(1, Math.round(toNumber(order.leverage) ?? 1))
+      rows.push({
+        id: order.id,
+        title: sideLabel(order.side) + ' · ' + cropNameOf(payload, order.crop) + ' · ' + leverage + '×',
+        targetText: formatPrice(order.target),
+        marginText: formatCoins(order.margin),
+        remainingMs: remaining,
+        remainingText: '剩 ' + formatCountdown(remaining),
+        canCancel: true,
+        cancelLabel: '撤单'
+      })
+    }
+    return rows
+  }
+
   /** 空态文案：每一块都要说清「现在能做什么」，不是一句「暂无数据」。 */
   function emptyHints (payload) {
     const coins = coinsOf(payload)
@@ -717,6 +844,10 @@
         ? '还没有持仓。硬币不够开仓时，先去种地。'
         : '还没有持仓。选好方向和保证金，一键开一手。',
       history: '还没有结算记录。收盘或手动平仓后会出现在这里。',
+      // 票 83：到价是可选工具，空态顺便教一次怎么用；收盘没成交自动撤。
+      orders: coins.available <= 0
+        ? '没有挂单。硬币不够，先去种地。'
+        : '没有挂单。点开「到价」设一个目标价，到价自动成交；收盘没成交自动撤单。',
       // 票 82：榜上只有自己时用这一句（空态也要说清「现在能做什么」）。
       neighbors: '还没有邻居上线。等邻居打开 DSH 就会出现在这里；行情照走，一个人也能做单。'
     }
@@ -790,13 +921,24 @@
     margin = 50,
     leverage = 1,
     crop = null,
+    limitOpen = false,
+    targetText = '',
+    allIn = false,
     width = CHART_WIDTH,
     height = CHART_HEIGHT
   } = {}) {
     const safe = payload !== null && typeof payload === 'object' ? payload : null
     const crops = cropsView(safe, crop)
     const selected = crops.find((entry) => entry.active)?.id ?? pickCrop(safe, crop)
-    const order = orderView(safe, { side, margin, leverage, crop: selected })
+    const order = orderView(safe, {
+      side,
+      margin,
+      leverage,
+      crop: selected,
+      limitOpen,
+      targetText,
+      allIn
+    })
     return {
       header: headerView(safe, now, selected),
       week: weekView(safe),
@@ -804,6 +946,7 @@
       crops,
       chart: chartView(safe, { crop: selected, width, height }),
       order,
+      orders: orderRows(safe, now),
       positions: positionCards(safe),
       history: historyRows(safe, now),
       league: leagueView(safe),
@@ -831,6 +974,7 @@
     chartView,
     previewView,
     orderView,
+    orderRows,
     positionCards,
     historyRows,
     leagueView,

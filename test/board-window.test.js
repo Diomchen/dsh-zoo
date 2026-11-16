@@ -200,11 +200,14 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
   assert.deepEqual(state.history, [])
   assert.deepEqual(state.orders, [])
   assert.deepEqual(state.limits, {
-    margins: [50, 100],
+    margins: [50, 100, 250],
     // 杠杆与作物白名单都与纯规则同源：票 80 把杠杆换成 [1,5,20] 时这里不用改。
     leverages: TRADING_LEVERAGES.slice(),
     crops: BOARD_CROPS.map((id) => ({ id, name: boardView.cropNameOf(state, id) })),
-    historyLimit: 50
+    historyLimit: 50,
+    // 票 83：「全下」与目标价带都随包下发，窗口不抄宿主常量。
+    allIn: true,
+    targetRatio: { floor: 0.55, ceil: 1.75 }
   })
   // 这一包能直接喂给窗口的纯视图（窗口只画）。
   const board = boardView.boardView(state, { now: clock.value })
@@ -302,8 +305,8 @@ test('窗口动作：开仓/平仓走 79 的 store；硬币与历史跟着变；
   assert.equal(closed.body.trading.history[0].pnl, expected.pnl)
   assert.equal(closed.body.trading.week.pnl, expected.pnl)
 
-  // 失败也要冒一句人话：250 不在白名单里。
-  desktop.emit({ type: 'action', id: 'board-3', action: 'trading-open-position', side: 'long', margin: 250, leverage: 1, cropId: 'tomato' })
+  // 失败也要冒一句人话：0 保证金 / 带外目标价都不行（票 83 起 250 是合法预设）。
+  desktop.emit({ type: 'action', id: 'board-3', action: 'trading-open-position', side: 'long', margin: 0, leverage: 1, cropId: 'tomato' })
   await waitFor(() => desktop.calls.results.length === 3)
   const refused = desktop.calls.results[2].result
   assert.equal(refused.ok, false)
@@ -339,10 +342,12 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
       coins: { available: 120, locked: 50, total: 172, secret: 1 },
       bar: { crop: 'tomato', price: 5, open: 4.9, end: 1, start: 0, slot: 2, remainingMs: 10, secret: 1 },
       limits: {
-        margins: [50, 100, 100, 'x'],
+        margins: [50, 100, 100, 250, 'x'],
         leverages: [1],
         crops: [{ id: 'tomato', name: '小番茄' }, { id: 'nope', name: '假' }],
-        historyLimit: 50
+        historyLimit: 50,
+        allIn: true,
+        targetRatio: { floor: 0.55, ceil: 1.75 }
       },
       positions: [{ id: 'p1', crop: 'tomato', side: 'long', margin: 50, leverage: 1, entry: 5, mark: 5.1, pnl: 1, secret: 1 }],
       history: [],
@@ -352,7 +357,9 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.equal(normalized.command.state.coins.available, 120)
   assert.equal('secret' in normalized.command.state, false)
   assert.equal('secret' in normalized.command.state.bar, false)
-  assert.deepEqual(normalized.command.state.limits.margins, [50, 100])
+  assert.deepEqual(normalized.command.state.limits.margins, [50, 100, 250])
+  assert.equal(normalized.command.state.limits.allIn, true)
+  assert.deepEqual(normalized.command.state.limits.targetRatio, { floor: 0.55, ceil: 1.75 })
   assert.deepEqual(normalized.command.state.limits.crops, [{ id: 'tomato', name: '小番茄' }])
   assert.equal('secret' in normalized.command.state.positions[0], false)
   assert.equal(normalized.command.state.positions[0].id, 'p1')
@@ -411,6 +418,61 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   }
   // 窗口与 helper 的止损四档是同一组数（改档位时三处一起改）。
   assert.deepEqual(shared.BOARD_STOP_LEVELS, boardView.stopLevels())
+  // 票 83：到价挂单 / 撤单的字段白名单。
+  assert.deepEqual(
+    shared.normalizeBoardAction({
+      action: 'trading-place-order', side: 'short', margin: 250, leverage: 20, cropId: 'tomato', target: 5.5
+    }),
+    { action: 'trading-place-order', side: 'short', margin: 250, leverage: 20, cropId: 'tomato', target: 5.5 }
+  )
+  assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-cancel-order', orderId: positionId }),
+    { action: 'trading-cancel-order', orderId: positionId })
+  for (const bad of [
+    { action: 'trading-place-order', side: 'short', margin: 250, leverage: 20, cropId: 'tomato' },
+    // 2× 是形状合法、宿主按白名单拒（和开仓同一条分工）；这里只测形状。
+    { action: 'trading-place-order', side: 'short', margin: 0, cropId: 'tomato', target: 5.5 },
+    { action: 'trading-place-order', side: 'short', margin: 250, cropId: 'tomato', target: 'x' },
+    { action: 'trading-place-order', side: 'short', margin: 250, cropId: 'tomato', target: -1 },
+    { action: 'trading-cancel-order' },
+    { action: 'trading-cancel-order', orderId: 'p1' }
+  ]) {
+    assert.equal(shared.normalizeBoardAction(bad), null, JSON.stringify(bad))
+  }
+  // helper → 宿主这一跳也要保留盘口字段：以前落到农场窄口，side/target/orderId 会被削掉。
+  assert.deepEqual(
+    shared.normalizeHelperEvent({
+      type: 'action',
+      id: 'board-9',
+      action: 'trading-place-order',
+      side: 'long',
+      margin: 250,
+      leverage: 5,
+      cropId: 'tomato',
+      target: 5.5
+    }).event,
+    {
+      type: 'action',
+      id: 'board-9',
+      action: 'trading-place-order',
+      side: 'long',
+      margin: 250,
+      leverage: 5,
+      cropId: 'tomato',
+      target: 5.5
+    }
+  )
+  assert.deepEqual(
+    shared.normalizeHelperEvent({ type: 'action', id: 'board-10', action: 'trading-cancel-order', orderId: positionId }).event,
+    { type: 'action', id: 'board-10', action: 'trading-cancel-order', orderId: positionId }
+  )
+  assert.equal(shared.normalizeHelperEvent({
+    type: 'action', id: 'board-11', action: 'trading-place-order', side: 'up', margin: 50, leverage: 1, cropId: 'tomato', target: 5
+  }).ok, false)
+  // 盘口动作在 helper → 宿主的动作白名单里（少了这组，窗口的申请会被整条丢掉）。
+  for (const action of ['trading-place-order', 'trading-cancel-order', 'trading-open-position']) {
+    assert.equal(shared.DESKTOP_ACTIONS.includes(action), true, action)
+  }
+
   for (const bad of [
     null,
     'x',
@@ -469,6 +531,36 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.equal(league.rows[1].weekPnlPct, null, '邻居没报收益率就是 null（窗口画「—」）')
   assert.deepEqual(league.sentiment, { long: 1, short: 1, flat: 0 })
   assert.deepEqual(league.self, { weekPnl: 12, weekPnlPct: 0.035 })
+
+  // 票 83：到价挂单穿过 helper 白名单——§9.4 的老坑：宿主发了、窗口永远收不到。
+  const orderId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f2a3b4c5d'
+  const orderView = shared.normalizeBoardView({
+    orders: [
+      {
+        id: orderId,
+        crop: 'tomato',
+        side: 'short',
+        target: 5.5,
+        margin: 250,
+        leverage: 20,
+        placedAt: 1763308800000,
+        slot: 1959232,
+        remainingMs: 600000,
+        secret: 1
+      },
+      { id: 'not-a-uuid', crop: 'tomato', side: 'long', target: 5.5, margin: 50, leverage: 1, placedAt: 1, slot: 1 },
+      { id: orderId, crop: 'nope', side: 'long', target: 5.5, margin: 50, leverage: 1, placedAt: 1, slot: 1 }
+    ]
+  })
+  assert.equal(orderView.orders.length, 2, '坏行只丢自己（crop 不合法）')
+  assert.deepEqual(Object.keys(orderView.orders[0]),
+    ['id', 'crop', 'side', 'target', 'margin', 'leverage', 'placedAt', 'slot', 'remainingMs'])
+  assert.equal(orderView.orders[0].target, 5.5)
+  assert.equal(orderView.orders[1].id, 'not-a-uuid')
+  // 老宿主/坏包没有 orders：空数组，不是 undefined。
+  assert.deepEqual(shared.normalizeBoardView({}).orders, [])
+  assert.equal(shared.normalizeBoardView({ limits: { allIn: 'yes' } }).limits.allIn, false)
+  assert.equal(shared.normalizeBoardView({ limits: { targetRatio: { floor: 0, ceil: 1 } } }).limits.targetRatio, null)
 
   // 读盘归一化（窗口形状）也不认多余字段。
   assert.deepEqual(shared.normalizeBoardView(null), null)
@@ -662,4 +754,89 @@ test('票 81：trading-set-stop 过白名单并到宿主（成败由票 80 的 s
   assert.notEqual(replied.body.error, 'not-implemented')
   // 坏档位在 helper 就被挡掉，根本到不了宿主。
   assert.equal(shared.normalizeBoardAction({ action: 'trading-set-stop', positionId: position.id, level: 0.3 }), null)
+})
+
+test('票 83：到价挂单/撤单穿过 helper 白名单到宿主；payload 带 orders + limits.allIn，窗口画得出来', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 3 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  // 窗口发出来的形状（preload → main IPC → shared.normalizeBoardAction → helper 事件白名单 → 宿主）。
+  const placedEvent = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'board-order-1',
+    action: 'trading-place-order',
+    side: 'long',
+    margin: 100,
+    leverage: 5,
+    cropId: 'tomato',
+    target: 5.5
+  })
+  assert.equal(placedEvent.ok, true, JSON.stringify(placedEvent))
+  desktop.emit(placedEvent.event)
+  await waitFor(() => desktop.calls.results.length === 1)
+  const placed = desktop.calls.results[0].result
+  assert.equal(placed.ok, true, JSON.stringify(placed))
+  assert.match(placed.notice, /到价/)
+
+  const state = await call(service, '/dsh-zoo/state')
+  assert.equal(state.body.farm.coins, 400, '挂单当场锁掉保证金')
+  assert.equal(state.body.trading.coins.available, 400)
+  assert.equal(state.body.trading.coins.locked, 100, '挂单的保证金也算「含锁定」')
+  assert.equal(state.body.trading.orders.length, 1)
+  const order = state.body.trading.orders[0]
+  assert.equal(order.crop, 'tomato')
+  assert.equal(order.side, 'long')
+  assert.equal(order.target, 5.5)
+  assert.equal(order.margin, 100)
+  assert.equal(order.leverage, 5)
+  assert.equal(order.remainingMs, SLOT_MS - 3 * TICK_MS)
+  assert.equal(state.body.trading.limits.allIn, true)
+  assert.deepEqual(state.body.trading.limits.margins, [50, 100, 250])
+
+  // 开着的窗收到刷新包：orders 真的过了 shared 白名单（不是永远空数组）。
+  const pushed = desktop.calls.board.at(-1)
+  assert.equal(pushed.open, false)
+  const normalized = shared.normalizeBoardView(pushed.state)
+  assert.equal(normalized.orders.length, 1)
+  assert.equal(normalized.orders[0].target, 5.5)
+  assert.equal(normalized.limits.allIn, true)
+  const board = boardView.boardView(normalized, { now: clock.value, limitOpen: true })
+  assert.equal(board.orders.length, 1)
+  assert.equal(board.orders[0].targetText, '5.50')
+  assert.equal(board.order.limit.canPlace, true)
+
+  // 撤单：同一条真实 hop，保证金退回，窗口刷新成空列表。
+  const cancelEvent = shared.normalizeHelperEvent({
+    type: 'action', id: 'board-order-2', action: 'trading-cancel-order', orderId: order.id
+  })
+  assert.equal(cancelEvent.ok, true)
+  desktop.emit(cancelEvent.event)
+  await waitFor(() => desktop.calls.results.length === 2)
+  const cancelled = desktop.calls.results[1].result
+  assert.equal(cancelled.ok, true, JSON.stringify(cancelled))
+  assert.match(cancelled.notice, /撤单/)
+  const after = await call(service, '/dsh-zoo/state')
+  assert.equal(after.body.farm.coins, 500)
+  assert.deepEqual(after.body.trading.orders, [])
+  assert.equal(after.body.trading.coins.locked, 0)
+  assert.equal(desktop.calls.board.at(-1).state.orders.length, 0)
+
+  // HTTP 那条路也认这两个动作名（脚本/测试用），坏目标价在 store 被拒。
+  const refused = await callAction(service, {
+    action: 'trading-place-order', side: 'long', margin: 50, leverage: 1, cropId: 'tomato', target: 99
+  })
+  assert.equal(refused.status, 409)
+  assert.equal(refused.body.error, 'bad-target')
 })

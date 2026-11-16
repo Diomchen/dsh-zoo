@@ -67,6 +67,8 @@ import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './
 import { buildLeague } from './trading-league.js'
 import {
   BOARD_CROPS,
+  PRICE_CEIL_RATIO,
+  PRICE_FLOOR_RATIO,
   TRADING_LEVERAGES,
   TRADING_MARGINS,
   boardPrice,
@@ -1133,6 +1135,26 @@ export function createService (ctx, options = {}) {
     if (action === 'trading-set-stop') {
       if (trading === null) return { ok: false, error: 'starting' }
       const result = await trading.setStopLoss(body?.positionId, body?.level)
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+    // 到价挂单（票 83）：窗口只报方向/作物/目标价/保证金/杠杆；白名单、锁币与成交
+    // 全在 `src/trading.js`——价格、硬币、盈亏一概不由窗口决定。
+    if (action === 'trading-place-order') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.placeOrder({
+        crop: body?.cropId,
+        side: body?.side,
+        target: body?.target,
+        margin: body?.margin,
+        leverage: body?.leverage
+      })
+      if (result?.ok === true) refreshTradingWindow()
+      return result
+    }
+    if (action === 'trading-cancel-order') {
+      if (trading === null) return { ok: false, error: 'starting' }
+      const result = await trading.cancelOrder(body?.orderId)
       if (result?.ok === true) refreshTradingWindow()
       return result
     }
@@ -2212,7 +2234,13 @@ export function createService (ctx, options = {}) {
         margins: TRADING_MARGINS.slice(),
         leverages: TRADING_LEVERAGES.slice(),
         crops: BOARD_CROPS.map((id) => ({ id, name: CROPS[id]?.name ?? id })),
-        historyLimit: TRADING_VIEW_HISTORY
+        historyLimit: TRADING_VIEW_HISTORY,
+        // 票 83：窗口在预设之外多画一颗「全下」（金额 = 当前可用硬币）。
+        // 旧宿主没有这个字段 → 窗口不画；保证金本身的校验由 store 按任意金额放行。
+        allIn: true,
+        // 到价目标价带（0.55–1.75× 底价）。把比例随包下发，窗口就不用再抄
+        // `PRICE_FLOOR_RATIO` / `PRICE_CEIL_RATIO` 一份（§9.3 的 drift 坑）。
+        targetRatio: { floor: PRICE_FLOOR_RATIO, ceil: PRICE_CEIL_RATIO }
       }
     }
   }
@@ -5009,6 +5037,11 @@ export function createService (ctx, options = {}) {
         // 票 81：止损档位（0 / 0.25 / 0.5 / 1）只改这一手的平仓线，钱的事全在 store。
         // 少拷这行，票 80 的 store 收到的平台档位永远是 undefined（`trading-set-stop` 白过）。
         level: event.level ?? undefined,
+        // 票 83：到价挂单的目标价与撤单的订单 id。少拷任一字段，小窗的到价按钮
+        // 到了宿主就只剩一句「缺少目标价」——四跳白名单（preload → main IPC →
+        // shared.normalizeBoardAction → 这里）少一跳都会静默丢。
+        target: event.target ?? undefined,
+        orderId: event.orderId ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
         gift: event.gift ?? undefined
       })

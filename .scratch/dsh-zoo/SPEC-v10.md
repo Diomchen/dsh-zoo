@@ -7,7 +7,9 @@
 > 编号说明：本文是**盘口线**；SPEC v9 与 ADR-0024–0026 是同一天另三条线
 > （露水/铲地/自适应行情），票 79–83 才是本线。不要混。
 
-**Status:** ready-for-agent
+**Status:** implemented
+
+**Tickets:** 79–83
 
 原型（只作手感参考，里面的赛季筹码、手续费、NPC 都是占位）：
 [exchange-15m-board.html](prototype/exchange-15m-board.html)

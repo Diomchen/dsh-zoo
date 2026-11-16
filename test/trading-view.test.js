@@ -1,10 +1,11 @@
 /**
- * 票 79 / 票 81：盘口窗的纯视图输出（K 线几何/下单区/持仓卡/历史/周盈亏/空态）。
+ * 票 79 / 票 81 / 票 83：盘口窗的纯视图输出（K 线几何/下单区/到价挂单/持仓卡/历史/周盈亏/空态）。
  *
  * 渲染页和 Node 测试 require 的是同一份 `desktop/trading-view.js`；这里只测数字、坐标与
  * 文案，不测 DOM。几何用例用能整除的价格，断言精确的 viewBox 坐标，不留浮点尾巴。
  */
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import test from 'node:test'
 
@@ -17,15 +18,18 @@ const SLOT_MS = 15 * 60 * 1000
 const SLOT = 1959232
 const SLOT_EDGE = SLOT * SLOT_MS
 const LIMITS = {
-  margins: [50, 100],
+  margins: [50, 100, 250],
   leverages: [1, 5, 20],
   crops: [
     { id: 'tomato', name: '小番茄' },
     { id: 'carrot', name: '胡萝卜' },
     { id: 'pumpkin', name: '南瓜' }
   ],
-  historyLimit: 50
+  historyLimit: 50,
+  allIn: true,
+  targetRatio: { floor: 0.55, ceil: 1.75 }
 }
+const ORDER_ID = '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d'
 
 function bar (slot, overrides = {}) {
   return { slot, open: 5, high: 5.2, low: 4.9, close: 5.1, ...overrides }
@@ -169,8 +173,12 @@ test('票 81：下单区有三档杠杆（来自 payload）、预览句与作物
   assert.equal(order.submitLabel, '开一手')
   assert.equal(order.preview, '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
   assert.deepEqual(order.sides.map((choice) => choice.label), ['做多', '做空'])
-  assert.deepEqual(order.margins.map((choice) => choice.margin), [50, 100])
+  // 票 83：三档预设 + 一颗「全下」（金额 = 此刻可用硬币 120）。
+  assert.deepEqual(order.margins.map((choice) => choice.margin), [50, 100, 250, 120])
+  assert.deepEqual(order.margins.map((choice) => choice.label), ['50', '100', '250', '全下'])
   assert.equal(order.margins[1].active, true)
+  assert.equal(order.margins[3].allIn, true)
+  assert.equal(order.margins[3].disabled, false)
   assert.deepEqual(order.leverages.map((choice) => choice.leverage), [1, 5, 20])
   assert.equal(order.leverages[1].active, true)
   // 白名单之外的方向/保证金/杠杆回到默认值。
@@ -207,11 +215,18 @@ test('票 79：硬币不够时按钮禁用并写明原因；0 硬币写「去种
   assert.match(small.hint, /硬币不够/)
   assert.equal(small.margins[0].disabled, true)
   assert.equal(small.margins[1].disabled, true)
+  assert.equal(small.margins[2].disabled, true)
+  // 全下 49 是合法金额（够不着 50 的预设，但押上全部 49 是可以的）。
+  assert.equal(small.margins[3].margin, 49)
+  assert.equal(small.margins[3].disabled, false)
 
   const broke = view.orderView(payload({ coins: { available: 0, locked: 100, total: 100 } }), { margin: 50 })
   assert.equal(broke.canSubmit, false)
   assert.match(broke.hint, /先去种地/)
   assert.equal(broke.submitLabel, '去种地')
+  assert.equal(broke.margins[3].label, '全下')
+  assert.equal(broke.margins[3].margin, 0)
+  assert.equal(broke.margins[3].disabled, true, '0 硬币时全下也禁用')
   assert.equal(view.emptyHints(payload({ coins: { available: 0, locked: 100, total: 100 } })).positions,
     '还没有持仓。硬币不够开仓时，先去种地。')
 })
@@ -567,4 +582,105 @@ test('票 82：榜的坏输入不抛——缺行/坏行/缺情绪都退回空榜
   assert.equal(nameless.rows[0].nickname, '邻居')
   assert.equal(nameless.rows[0].positionsText, '多 1 · 空 0')
   assert.equal(nameless.sentiment.text, '观望')
+})
+
+test('票 83：到价面板——没点开时只有开关；点开后目标价默认现价、带内可挂、带外写明原因', () => {
+  const closed = view.orderView(payload())
+  assert.equal(closed.limit.enabled, false)
+  assert.equal(closed.limit.toggleLabel, '到价')
+  assert.equal(closed.limit.canPlace, false, '没点开「到价」时挂单按钮不可用')
+  assert.equal(closed.limit.targetText, '5.06', '默认目标价 = 现价（两位小数）')
+  assert.equal(closed.limit.bandText, '2.75–8.75', '0.55–1.75 × 底价 5')
+  assert.equal(closed.limit.placeLabel, '挂单')
+  assert.equal(closed.limit.hint, '')
+
+  const opened = view.orderView(payload(), { limitOpen: true })
+  assert.equal(opened.limit.enabled, true)
+  assert.equal(opened.limit.canPlace, true)
+  assert.equal(opened.limit.target, 5.06)
+  assert.equal(opened.limit.hint, '')
+  assert.match(opened.limit.note, /跌到目标价/)
+  assert.match(opened.limit.note, /收盘没成交自动撤单/)
+
+  // 玩家输到一半的原文原样带回；带外目标价不装成可用。
+  const outside = view.orderView(payload(), { limitOpen: true, targetText: '99' })
+  assert.equal(outside.limit.targetText, '99')
+  assert.equal(outside.limit.canPlace, false)
+  assert.match(outside.limit.hint, /目标价要在 2\.75–8\.75 之间/)
+  const half = view.orderView(payload(), { limitOpen: true, targetText: '5.' })
+  assert.equal(half.limit.targetText, '5.')
+  // 做空等的是「涨到目标价」。
+  const short = view.orderView(payload(), { side: 'short', limitOpen: true, targetText: '5.5' })
+  assert.match(short.limit.note, /涨到目标价/)
+  assert.equal(short.limit.target, 5.5)
+  assert.equal(short.limit.canPlace, true)
+
+  // 硬币不够时：输入框还能填，但挂单按钮禁用并写清原因。
+  const poor = view.orderView(payload({ coins: { available: 40, locked: 0, total: 40 } }), {
+    limitOpen: true,
+    targetText: '5.5'
+  })
+  assert.equal(poor.limit.canPlace, false)
+  assert.match(poor.limit.hint, /硬币不够/)
+})
+
+test('票 83：全下——按钮金额 = 可用硬币，选中后预览/强平按这个金额算', () => {
+  const rich = view.orderView(payload({ coins: { available: 251, locked: 0, total: 251 } }), {
+    leverage: 5,
+    allIn: true
+  })
+  assert.equal(rich.allIn, true)
+  assert.equal(rich.margin, 251)
+  assert.equal(rich.margins[3].margin, 251)
+  assert.equal(rich.margins[3].active, true)
+  assert.equal(rich.margins[0].active, false)
+  assert.equal(rich.preview, '5× · 251 保证金：涨 1% = +12.55；跌 1% = −12.55；强平 −251')
+  // 全下金额不是 50 的整数倍也照算（保证金规则接受任意整数）。
+  assert.equal(rich.previewParts.perPercent, 12.55)
+  assert.equal(rich.canSubmit, true)
+
+  // 硬币花光后「全下」落回预设，不会卡在一个 0 金额上。
+  const broke = view.orderView(payload({ coins: { available: 0, locked: 0, total: 0 } }), { allIn: true })
+  assert.equal(broke.allIn, false)
+  assert.equal(broke.margin, 50)
+  assert.equal(broke.submitLabel, '去种地')
+})
+
+test('票 83：挂单列表——方向/作物/目标价/保证金/距收盘的剩余时间 + 撤单', () => {
+  const order = {
+    id: ORDER_ID,
+    crop: 'carrot',
+    side: 'short',
+    target: 6.5,
+    margin: 100,
+    leverage: 20,
+    placedAt: SLOT_EDGE,
+    slot: SLOT,
+    remainingMs: 600000
+  }
+  const rows = view.orderRows(payload({ orders: [order] }), SLOT_EDGE + 5 * 60 * 1000)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0].id, ORDER_ID)
+  assert.equal(rows[0].title, '做空 · 胡萝卜 · 20×')
+  assert.equal(rows[0].targetText, '6.50')
+  assert.equal(rows[0].marginText, '100')
+  assert.equal(rows[0].remainingMs, 600000)
+  assert.equal(rows[0].remainingText, '剩 10:00')
+  assert.equal(rows[0].canCancel, true)
+  assert.equal(rows[0].cancelLabel, '撤单')
+  // 没有 now 时退回宿主给的 remainingMs（窗口第一帧）。
+  assert.equal(view.orderRows(payload({ orders: [order] })).length, 1)
+  // 坏行只丢自己；缺省是空列表。
+  assert.deepEqual(view.orderRows(payload({ orders: [null, { id: '' }, order] }), SLOT_EDGE).length, 1)
+  assert.deepEqual(view.orderRows(payload({ orders: [] })), [])
+  const board = view.boardView(payload({ orders: [order] }), { now: SLOT_EDGE + 5 * 60 * 1000 })
+  assert.equal(board.orders.length, 1)
+  assert.match(view.emptyHints(payload()).orders, /点开「到价」/)
+  assert.match(view.emptyHints(payload({ coins: { available: 0, locked: 0, total: 0 } })).orders, /先去种地/)
+})
+
+test('User Story 30：盘口窗上写明「没有手续费、没有资金费、没有风险控制」', async () => {
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /没有手续费、没有资金费、没有风险控制/)
+  assert.match(html, /硬币赔光就去种地/)
 })

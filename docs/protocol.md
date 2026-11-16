@@ -59,6 +59,10 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "hire": { "enabled": true, "wagePerHour": 10, "minHours": 2, "maxHours": 8,
             "guard": 0.5, "available": true, "reason": "ready" } }
 
+{ "v": 1, "type": "trading-digest", "deviceId": "<uuid>", "at": 1700000000000,
+  "weekPnl": 42, "weekPnlPct": 0.084,
+  "positions": [{ "crop": "tomato", "side": "long", "leverage": 5 }] }
+
 { "v": 1, "type": "work-request", "deviceId": "<uuid>", "requestId": "<uuid>",
   "hours": 4, "wagePerHour": 10, "fee": 2 }
 { "v": 1, "type": "work-ack", "deviceId": "<uuid>", "requestId": "<uuid>", "ok": true,
@@ -76,7 +80,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -99,7 +103,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `reason`（访客） | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
 | `reason`（合同结束） | `work-end` | 固定枚举 `expired` / `offline` / `recall` / `employer-end` / `denied` / `cancelled` / `shutdown` / `restart` / `completed` |
 | `reason`（结算） | `work-settle` | 固定枚举 `completed` / `recall` / `employer-end` / `offline` / `expired` |
-| `at` | `market-digest` | 发起方时钟的正整数毫秒；接收方只认与本机时钟相差 ≤2 分钟的样本 |
+| `at` | `market-digest`、`trading-digest` | 发起方时钟的正整数毫秒；接收方只认与本机时钟相差 ≤2 分钟的样本 |
 | `prices` | `market-digest` | `{ <cropId>: number }`；只认作物表里的六种、有限数、夹在 `[base×0.5, base×2]`；坏条目只丢那一种 |
 | `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working`（旧版本可能给 `null`）；`available` 只在这只宠物真的能被雇时为 true；坏形状整包丢 |
 | `contractId` | `work-ack`、`work-recall`、`work-end`、`work-settle` | 合同 UUID；`work-end` 在取消一笔还没 ack 的请求时可改用 `requestId` |
@@ -107,10 +111,13 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `startedAt` / `endsAt` | `work-ack` | 正整数毫秒；`endsAt > startedAt` 且差值 ≤8 小时。这是**雇工那台机器的时钟**：雇主只用它核对时长，自己的合同锚点用本机 ack 时刻 + `hours`，两台的时钟差不会漏进倒计时或到期时刻（ticket 61） |
 | `guard` | `work-ack`、`market-digest.hire` | 0..0.8 的有限数；`work-ack` 是雇工贡献的 0.5，`market-digest.hire` 同样是**雇工贡献的 0.5**，不是 `farmGuard()` 的合成值（0.3/0.5/0.8） |
 | `servedMs` / `earned` | `work-settle` | 服务毫秒 0..8 小时；工钱 0..800 的整数；`work-settle-ack` 回的 `earned` 同一范围 |
+| `weekPnl` | `trading-digest` | 本机本周交易盈亏（金币，含未实现，四舍五入到整数）；范围 `[-1,000,000, 1,000,000]` |
+| `weekPnlPct` | `trading-digest` | 可选收益率**比率**（`0.035` = +3.5%）；范围 `[-1000, 1000]`；缺省表示本机没有可用的周起点硬币 |
+| `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20；没有仓位就是空数组 |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
-`farm-action` / `farm-action-result` / 8 种 `work-*`）旧端不认识时整包静默丢弃，既不回复
-也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
+`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*`）旧端不认识时整包
+静默丢弃，既不回复也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
 那一个字段，不整包失败——`anim` 仍然必发，所以新旧两端始终能至少对上动作名。
@@ -715,6 +722,66 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 - 指数过期后保留最后一次值（交易所页画灰），但不再参与定价；邻居被拒绝/移除时
   它的 digest 和指数贡献一起清掉。
 
+### 盘口 gossip（`trading-digest`，票 79–83）
+
+盘口的**唯一**上线报文。每 **30 秒**（第一次到达时立刻发一次）向所有已放行邻居单播一条，
+只带「本周交易盈亏 + 当前持仓方向」，不带任何账户细节：
+
+```json
+{ "v": 1, "type": "trading-digest", "deviceId": "<uuid>", "at": 1700000000000,
+  "weekPnl": 42, "weekPnlPct": 0.084,
+  "positions": [{ "crop": "tomato", "side": "long", "leverage": 5 }] }
+```
+
+- 发送走 `discovery.sendTo`（内部再查 `mayTalkTo`），失败不重试，下一拍自然补；
+  没有已放行邻居时不算“发过”。`weekPnl` 与盘口窗抬头是**同一份数**（已实现 + 未实现），
+  `weekPnlPct` 缺省就不出现在报文里（不拿 0% 冒充）。
+- **明确不携带**：硬币余额、保证金、入场价/强平价、挂单、历史、设备名以外的任何身份信息。
+  邻居只能看到「谁、多少分、几个方向」，看不到家底。这是 User Story 20 的协议层保证。
+- 接收端四道门：① 只认已放行邻居（`mayTalkTo`）；② `at` 与本机时钟相差 ≤**2 分钟**；
+  ③ 同一 peer **30 秒最多 1 条**（接收端独立限速器）；④ 字段白名单——`weekPnl` 夹在
+  ±1,000,000、`weekPnlPct` 夹在 ±1,000、`positions` ≤8 条且作物/方向/杠杆都在白名单里。
+  任一必需字段坏掉**整包丢**（半截的榜比没有更糟），未知字段在解析时丢掉。
+- 每家按 `deviceId` 只留最近一条 digest，只活在 service 内存里、不落盘；超过 2 分钟没新包
+  就从榜上淡出。旧版本邻居不认这个类型，静默丢包——盘口照常，榜里不出现他们。
+- 榜按 `weekPnl` 降序；旁边的收益率只展示（本机用 `weekPnl / weekBase`，邻居用自报的
+  `weekPnlPct`），不参与排序。「LAN 情绪」= 本机 + 邻居当前 `positions` 的多空计数；
+  一条仓位都没有时写「观望」。
+- 不做强防作弊：邻居可以改自己的 `trading.json` / 报文；榜是社交信任（与 ADR-0016 一致）。
+  伪造的 digest 只能骗到榜上的数字，改不了本机硬币、持仓或 `trading.json`。
+
+### 盘口状态与动作（本机，票 79–83）
+
+`GET /dsh-zoo/state` 的 `trading` 字段（窗口拿的是同一份视图，只是经 `board-window` 下发）：
+
+```
+{
+  coins: { available, locked, total },        // available = farm.json 的 coins；locked 含持仓 + 挂单保证金
+  week: { start, pnl, base, unrealized, total },
+  bar: { crop, slot, start, end, remainingMs, open, price },
+  charts: { <crop>: { base, bars[], current } },
+  hint: { <crop>: { direction, confidence } },
+  positions: [{ id, crop, side, margin, leverage, entry, openedAt, slot, liquidation, stopLoss, mark, pnl }],
+  orders: [{ id, crop, side, target, margin, leverage, placedAt, slot, remainingMs }],
+  history: [{ id, crop, side, margin, leverage, entry, exit, pnl, reason, at }],   // reason: close/settle/liquidate/stop
+  league: { rows: [{ deviceId, nickname, weekPnl, weekPnlPct, positions, me }], sentiment: { long, short, flat }, self },
+  limits: { margins, leverages, crops, historyLimit, allIn, targetRatio: { floor, ceil } }
+}
+```
+
+| 动作（`POST /dsh-zoo/action`） | body 字段 | 说明 |
+| --- | --- | --- |
+| `trading-open` / `trading-close` | 无 | 开/关盘口窗（`trading-open` 是开关，开着的就关） |
+| `trading-refresh` | 无 | 让宿主撮合挂单、结算这一根并重推窗口 |
+| `trading-open-position` | `side`、`margin`、`leverage`、`cropId` | 按现价开仓；保证金当场从农场硬币扣 |
+| `trading-close-position` | `positionId` | 按现价手动平仓 |
+| `trading-set-stop` | `positionId`、`level`（0 / 0.25 / 0.5 / 1） | 设止损档，只改这一手，不动钱 |
+| `trading-place-order` | `side`、`margin`、`leverage`、`cropId`、`target` | 到价挂单；保证金当场扣，目标价必须在 `[base×0.55, base×1.75]` |
+| `trading-cancel-order` | `orderId` | 撤单，保证金退回硬币（幂等） |
+
+价格、硬币、盈亏、成交价全部由宿主算；窗口只发上面的窄字段（`shared.normalizeBoardAction`
+再白名单一遍）。盘口动作不会写 `market.json`，现货也不会写 `trading.json`。
+
 ### 运行时作物目录（`crop-catalog-request` / `crop-catalog`，票 59）
 
 `GET /dsh-zoo/state` 里多一项 `crops: { hash, count }`：**目录指纹**（不含内容）。
@@ -814,17 +881,22 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 幂等缓存 | `farm-action` 200 条/10 分钟；`work-*` ack 200 条/10 分钟 |
 | 守卫 | 0.3（主人在家）/ 0.5（雇工）/ 0.8（两者），宠物出门/打工时自家 0 |
 | 快照 | HTTP ≤64 KiB；访客宿主 2 秒超时、60 秒冷却 |
+| 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
+| 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
+| 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
 
 ### 4 KiB、白名单与旧邻居
 
 - **4 KiB**：所有 UDP 报文都是单个 JSON，超过 4 KiB 在解析前丢弃；不回复、不报错。
-  `market-digest` 和 8 种 `work-*` 都很小（价格 3 个数、合同 6 个字段），正常触不到上限。
+  `market-digest`、`trading-digest` 和 8 种 `work-*` 都很小（价格 3 个数、合同 6 个字段、
+  榜上最多 8 条持仓），正常触不到上限。
   农场快照走 HTTP，不受 UDP 4 KiB 限制，但访客客户端仍只收 ≤64 KiB。
 - **字段白名单**：每种类型只重建自己的字段；未知字段、未知作物、未知枚举、越界数字
   一律丢弃或整包拒绝。所有 id 只从校验过的字段拼，不拼路径。
-- **旧邻居**：旧版本只认识自己的报文类型，`market-digest` / `farm-action(-result)` /
-  `work-*` 会被当成未知类型静默丢掉，不报错、不崩。新端收到旧端：缺 `action`/`skin*`/
-  `gift` 都按本文的兼容口径降级；没有农场报文时，本地农场照常运行，只是不能跨机偷/帮/雇。
+- **旧邻居**：旧版本只认识自己的报文类型，`market-digest` / `trading-digest` /
+  `farm-action(-result)` / `work-*` 会被当成未知类型静默丢掉，不报错、不崩。新端收到旧端：
+  缺 `action`/`skin*`/`gift` 都按本文的兼容口径降级；没有农场报文时，本地农场照常运行，
+  只是不能跨机偷/帮/雇；没有盘口报文时，盘口照常运行，只是榜上只有自己。
 - **降级**：旧邻居 → 串门/礼物/记录照常，没有农场入口；对方没开局域网端口 → 串门照常、
   快照取不到、偷/帮/雇不可用；对方离线 → 不能偷/帮/雇，行情过期，合同按最后心跳结束；
   没有桌面层 → HTTP 动作与 `state` 可用，没有农场窗，也没有雇工宠物。
