@@ -32,9 +32,9 @@ const TRADING_ERROR_TEXT = Object.freeze({
 /**
  * 结算原因 → 中文（票 80）：`close` 手动 / `settle` 收盘 / `liquidate` 强平 / `stop` 止损。
  *
- * 枚举本身住在 `src/trading.js`（账本形状的唯一真相），这里只负责说人话。
- * 窗口（票 81）是 UMD 纯视图、拿不到这里的 ESM，它自己那份由 drift 测试盯着；
- * 宿主这一份给 `/state` 之外的文字场合用（toast、日志、将来的通知）。
+ * 枚举本身住在 `src/trading-rules.js`（账本形状的唯一真相），这里只负责说人话；
+ * 两边是四对四，`test/trading.test.js` 盯着它们不许漂（少一个键 = 某一类结算没中文）。
+ * 窗口（票 81）是 UMD 纯视图、拿不到这里的 ESM，它自己那份由 drift 测试盯着。
  */
 const TRADING_REASON_TEXT = Object.freeze({
   close: '手动平仓',
