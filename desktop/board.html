@@ -323,6 +323,17 @@
         color: var(--muted);
         line-height: 1.4;
       }
+      /* 空态紧贴标题，而不是被 flex 撑到卡片底部（列表渲染会清空滚动区，
+         所以不能把 .empty 放进滚动容器里，只能用视觉顺序挪到标题后面）。 */
+      .card > .card-head {
+        order: -2;
+      }
+      .card > .empty {
+        order: -1;
+      }
+      .card > .fine {
+        order: 3;
+      }
       .empty[hidden] {
         display: none;
       }
