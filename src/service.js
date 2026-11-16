@@ -5810,7 +5810,8 @@ export function createService (ctx, options = {}) {
   /**
    * 收到一条盘口周报（票 82）。四道门（SPEC「真人榜与协议」）：
    *   1. 只认已放行邻居——未放行的人连榜都不该上；
-   *   2. `at` 必须在本机时钟 2 分钟内（`isFreshMarketSample` 是通用判据）；
+   *   2. `at` 必须在本机时钟 `TRADING_DIGEST_FRESH_MS` 内（显式传盘口自己的常量，
+   *      不借行情 digest 的 `MARKET_DIGEST_FRESH_MS`——两个节拍将来分开调时不跟着漂）；
    *   3. 同一 peer 一个窗口最多 1 条（`tradingDigestLimiter`）；
    *   4. 协议层已把字段/数组长度/数值范围白名单过一遍，坏字段整包丢。
    * 通过后只写 service 的内存 Map：**不碰硬币、不碰仓位、不写 trading.json**。
@@ -5820,7 +5821,7 @@ export function createService (ctx, options = {}) {
     if (disposed) return
     if (!room.mayTalkTo(packet.deviceId)) return
     const now = tradingClock()
-    if (!isFreshMarketSample(packet.at, now)) return
+    if (!isFreshMarketSample(packet.at, now, TRADING_DIGEST_FRESH_MS)) return
     if (!tradingDigestLimiter.allow(packet.deviceId, now)) return
     try {
       tradingDigests.set(packet.deviceId, {

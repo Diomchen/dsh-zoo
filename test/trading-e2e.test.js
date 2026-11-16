@@ -376,3 +376,26 @@ test('票 82 e2e：同一 peer 一个窗口最多 1 条，重复包不改分也�
   await waitFor(() => peerRow(a, bId).weekPnl === 444)
   assert.equal(leagueOf(a).rows.length, 2)
 })
+
+test('票 82（评审 P2）：3 分钟前的周报被盘口新鲜度门丢掉，随后新鲜包照常收', async (t) => {
+  const { a, b, aId, bId } = await connectedPair(t, {
+    // A 的限速窗口 100ms；B 只在第一拍发一包（下一次 600 秒后），下面手动投包。
+    a: { tradingDigestMs: 100 },
+    b: { tradingDigestMs: 600000 }
+  })
+  await waitForPeerRow(a, bId)
+  await delay(150)
+
+  // 3 分钟前的样本：超过 TRADING_DIGEST_FRESH_MS（2 分钟）→ 整包丢，分数不动。
+  assert.equal(b.sendTo(aId, rawDigest(bId, {
+    weekPnl: 777,
+    at: Date.now() - 3 * 60 * 1000
+  })), true)
+  await delay(120)
+  assert.equal(peerRow(a, bId).weekPnl, 0, '过期样本不能改榜')
+
+  // 再等过限速窗口发一条新鲜的：证明刚才挡它的是新鲜度门，不是限速门。
+  await delay(150)
+  assert.equal(b.sendTo(aId, rawDigest(bId, { weekPnl: 888 })), true)
+  await waitFor(() => peerRow(a, bId).weekPnl === 888)
+})
