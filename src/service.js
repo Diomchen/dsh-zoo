@@ -1450,6 +1450,7 @@ export function createService (ctx, options = {}) {
       return seasonActionError('bad-guards')
     }
     if (choice === 'feed' && guards > 0) return seasonActionError('bad-guards')
+    if (guards > availableGuardPets()) return seasonActionError('no-guard-pet')
     const stakes = omen.stakes ?? {}
     const cost = choice === 'feed'
       ? { crops: 0, dew: 0, coins: 0, ...(stakes.feedCost ?? {}) }
@@ -1580,6 +1581,19 @@ export function createService (ctx, options = {}) {
    * season.json 起不来时仍返回纯日期季节（event/omen 为 null），窗口不会整块空掉。
    * `farmView` 可传农场快照，用来算来客选项是否付得起。
    */
+  // 临时守卫只能从“现在空闲的宠物”里来：在线且互相放行的邻居，扣掉正在
+  // 我家干活的雇工和已经在我家串门的访客。只借人数，不绑定具体身份。
+  function availableGuardPets () {
+    const snap = room.snapshot()
+    const targets = Array.isArray(snap.visitTargets) ? snap.visitTargets : []
+    const workerId = snap.worker?.workerDeviceId ?? null
+    const visitorIds = new Set((snap.visitors ?? []).map((visitor) => visitor.deviceId))
+    const idle = targets.filter((target) =>
+      target.deviceId !== workerId && !visitorIds.has(target.deviceId)
+    ).length
+    return Math.min(MAX_TEMP_GUARDS, Math.max(0, idle))
+  }
+
   function seasonView (farmView = null) {
     const now = seasonNow()
     const computed = seasonAt(now)
@@ -1613,15 +1627,21 @@ export function createService (ctx, options = {}) {
       })
       const feed = choices.find((choice) => choice.id === 'feed')
       const baseGuard = farmGuard().guard
+      const guardPets = availableGuardPets()
       const hire = view.omen.guardHire ?? { cost: GUARD_HIRE_COST, step: GUARD_HIRE_STEP, max: MAX_TEMP_GUARDS }
       const guardOptions = []
       for (let guards = 0; guards <= hire.max; guards += 1) {
         const price = guards * hire.cost
+        const missingPets = guards > guardPets
+        const missingCoins = coins < price
         guardOptions.push({
           guards,
           chance: Math.min(1, baseGuard + guards * hire.step),
           cost: price,
-          affordable: coins >= price
+          affordable: !missingPets && !missingCoins,
+          reason: missingPets
+            ? '没有足够的空闲宠物'
+            : (missingCoins ? '硬币不够' : '')
         })
       }
       view = {
@@ -1631,6 +1651,7 @@ export function createService (ctx, options = {}) {
           choices,
           canFeed: feed?.affordable !== false,
           guardBase: baseGuard,
+          guardPets,
           guardOptions
         }
       }

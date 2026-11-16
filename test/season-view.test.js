@@ -87,10 +87,11 @@ test('omenCard：仓库不够时投喂不可点，已结算时两个选择都不
       { id: 'feed', label: '投喂', affordable: false, reason: '仓库作物不够 3 个' }
     ],
     guardBase: 0.3,
+    guardPets: 0,
     guardOptions: [
       { guards: 0, chance: 0.3, cost: 0, affordable: true },
-      { guards: 1, chance: 0.8, cost: 20, affordable: false },
-      { guards: 2, chance: 1, cost: 40, affordable: false }
+      { guards: 1, chance: 0.8, cost: 20, affordable: false, reason: '没有足够的空闲宠物' },
+      { guards: 2, chance: 1, cost: 40, affordable: false, reason: '没有足够的空闲宠物' }
     ],
     stakes: {
       guardReward: { coins: 40, dew: 3 },
@@ -110,6 +111,8 @@ test('omenCard：仓库不够时投喂不可点，已结算时两个选择都不
     '雇 2 名 · 100% · 40 硬币'
   ])
   assert.equal(card.guardOptions[1].affordable, false)
+  assert.equal(card.guardOptions[1].reason, '没有足够的空闲宠物')
+  assert.equal(card.guardPets, 0)
   assert.match(card.feedText, /1 颗稻米种子/)
 
   const done = view.omenCard({

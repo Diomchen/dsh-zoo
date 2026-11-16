@@ -184,14 +184,17 @@ test('normalizeSeason：临时守卫的 base 与 0～2 人选项不被削掉', (
   const raw = validSeason()
   raw.omen.active = true
   raw.omen.guardBase = 0.3
+  raw.omen.guardPets = 1
   raw.omen.guardOptions = [
     { guards: 0, chance: 0.3, cost: 0, affordable: true },
     { guards: 1, chance: 0.8, cost: 20, affordable: true },
-    { guards: 2, chance: 1, cost: 40, affordable: false }
+    { guards: 2, chance: 1, cost: 40, affordable: false, reason: '没有足够的空闲宠物' }
   ]
   const season = shared.normalizeSeason(raw)
   assert.equal(season.omen.guardBase, 0.3)
+  assert.equal(season.omen.guardPets, 1)
   assert.deepEqual(season.omen.guardOptions.map((option) => option.guards), [0, 1, 2])
   assert.equal(season.omen.guardOptions[2].chance, 1)
   assert.equal(season.omen.guardOptions[2].affordable, false)
+  assert.equal(season.omen.guardOptions[2].reason, '没有足够的空闲宠物')
 })
