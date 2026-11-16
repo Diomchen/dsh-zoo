@@ -67,7 +67,7 @@ import {
   weekStartOf
 } from './trading-rules.js'
 
-/** 结算原因的枚举住在纯规则里（`normalize` 与文案表共用一份）；这里原样转出给老调用方。 */
+/** 结算原因的枚举住在纯规则里；这里原样转出，票 79 的调用方不用改 import。 */
 export { TRADING_CLOSE_REASONS }
 
 export const TRADING_FILE = 'trading.json'
