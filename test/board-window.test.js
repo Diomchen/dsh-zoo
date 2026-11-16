@@ -1094,16 +1094,19 @@ test('票 90：桌面层健康但指令发不出去 → board-send-failed（不�
   assert.equal(opened.body.notice, '盘口窗指令发不出去（盘口数据可能太大），这次没打开。')
   assert.notEqual(opened.body.error, 'desktop-off', '桌面层明明是好的，不许再误报没在运行')
   // 诊断只留一条，而且要带得上尺寸/上限（现场就是 308 KiB > 256 KiB）。
-  assert.equal(service.warnings.length, 1, service.warnings.join(' / '))
-  assert.match(service.warnings[0], /308 KiB/)
-  assert.match(service.warnings[0], /256 KiB/)
-  assert.match(service.warnings[0], /board-window/)
+  // 只筛「发送失败」这一类：CI 环境可能多一条与本次无关的启动告警（素材目录等），
+  // 用总条数断言会把环境差异误判成回归。
+  const sendWarnings = () => service.warnings.filter((line) => /盘口窗指令发不出去/.test(line))
+  assert.equal(sendWarnings().length, 1, service.warnings.join(' / '))
+  assert.match(sendWarnings()[0], /308 KiB/)
+  assert.match(sendWarnings()[0], /256 KiB/)
+  assert.match(sendWarnings()[0], /board-window/)
 
   // 关窗指令同样发不出去：同一个错误码，诊断不再刷第二条。
   const closed = await callAction(service, { action: 'trading-close' })
   assert.equal(closed.body.error, 'board-send-failed')
   assert.equal(closed.body.notice, tradingErrorText('board-send-failed'))
-  assert.equal(service.warnings.length, 1, 'warnOnce：同一类发送失败只记一次')
+  assert.equal(sendWarnings().length, 1, 'warnOnce：同一类发送失败只记一次')
 })
 
 test('票 90：真的没有桌面层时仍然报 desktop-off（别把两种失败混成一种）', async (t) => {
@@ -1119,7 +1122,7 @@ test('票 90：真的没有桌面层时仍然报 desktop-off（别把两种失�
   assert.equal(opened.status, 409)
   assert.equal(opened.body.error, 'desktop-off')
   assert.equal(opened.body.notice, tradingErrorText('desktop-off'))
-  assert.equal(service.warnings.length, 0, '没有桌面层不是 size 问题，不刷发送失败诊断')
+  assert.equal(service.warnings.filter((line) => /盘口窗指令发不出去/.test(line)).length, 0, '没有桌面层不是 size 问题，不刷发送失败诊断')
 })
 
 test('票 84：timeframes 白名单——未知周期/坏数字/超量都不抛，start/end 原样放行', () => {
