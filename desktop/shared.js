@@ -2734,7 +2734,14 @@
         return { ok: true, command: { type, id } }
       case 'debug-farm-spark':
         // 冒烟用：真发一次 mouseenter，读成交价曲线的悬停气泡。
-        return { ok: true, command: { type, id } }
+        return {
+          ok: true,
+          command: {
+            type,
+            id,
+            index: Math.max(-1, Math.min(9, Math.floor(Number(raw.index) || 0)))
+          }
+        }
       case 'debug-farm-block': {
         // 冒烟用：阻塞渲染进程 N 毫秒，模拟 setInterval 被延迟/后台节流。
         const ms = Math.min(15000, Math.max(0, Math.floor(Number(raw.ms) || 0)))
@@ -2949,7 +2956,8 @@
             tip: normalizeLabel(raw.tip, ''),
             show: raw.show === true,
             note: normalizeLabel(raw.note, ''),
-            near: raw.near === true
+            near: raw.near === true,
+            inside: raw.inside === true
           }
         }
       }
