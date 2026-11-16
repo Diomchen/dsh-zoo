@@ -25,6 +25,8 @@ contextBridge.exposeInMainWorld('dshZooGift', {
       kind: gift.kind,
       text: gift.text,
       path: gift.path,
+      packet: gift.packet,
+      note: gift.note,
       pick: gift.pick === true
     })
   },
