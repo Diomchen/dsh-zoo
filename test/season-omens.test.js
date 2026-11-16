@@ -18,7 +18,10 @@ import {
 } from '../src/season-omens.js'
 
 const DAY = 24 * HOUR_MS
-const AUTUMN = { id: 'autumn', start: 1_700_000_000_000, end: 1_700_000_000_000 + DAY }
+// 用本地午夜做季节起点，和真实 seasonAt 一致；固定 15:00 的窗口才不会被
+// clamp 到 start（CI 的 UTC 时区下尤其明显）。
+const AUTUMN_START = new Date(2026, 10, 17, 0, 0, 0, 0).getTime()
+const AUTUMN = { id: 'autumn', start: AUTUMN_START, end: AUTUMN_START + DAY }
 
 test('四季各有一位来客；未知季节没有', () => {
   const expected = {
