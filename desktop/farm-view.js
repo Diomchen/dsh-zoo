@@ -904,12 +904,14 @@
       .map((entry) => ({ at: Number(entry.at), price: Number(entry.price) }))
       .filter((entry) => Number.isFinite(entry.at) && entry.at >= cutoff && Number.isFinite(entry.price) && entry.price >= 0)
       .sort((left, right) => left.at - right.at)
-      .map((entry) => ({ at: entry.at, price: entry.price }))
+      .map((entry) => ({ at: entry.at, price: entry.price, current: false, synthetic: false }))
     const hasTrades = points.length > 0
     const price = Number(currentPrice)
-    if (Number.isFinite(price) && price >= 0) points.push({ at: Number.isFinite(stamp) ? stamp : Date.now(), price })
-    if (points.length === 0) return { points: [], path: '', trend: 'flat', empty: true, min: 0, max: 0 }
-    if (points.length === 1) points.unshift({ at: points[0].at - span, price: points[0].price })
+    if (Number.isFinite(price) && price >= 0) {
+      points.push({ at: Number.isFinite(stamp) ? stamp : Date.now(), price, current: true, synthetic: false })
+    }
+    if (points.length === 0) return { points: [], marks: [], path: '', trend: 'flat', empty: true, min: 0, max: 0 }
+    if (points.length === 1) points.unshift({ at: points[0].at - span, price: points[0].price, current: false, synthetic: true })
     const min = Math.min(...points.map((entry) => entry.price))
     const max = Math.max(...points.map((entry) => entry.price))
     const range = max - min
@@ -921,8 +923,18 @@
       ? 'up'
       : points[points.length - 1].price < points[0].price ? 'down' : 'flat'
     const path = coords.map((point) => point.x.toFixed(2) + ',' + point.y.toFixed(2)).join(' ')
+    const marks = hasTrades
+      ? coords.map((coord, index) => ({
+        x: coord.x,
+        y: coord.y,
+        at: points[index].at,
+        price: points[index].price,
+        current: points[index].current
+      })).filter((mark, index) => !points[index].synthetic)
+      : []
     return {
       points,
+      marks,
       path,
       area: '0,24 ' + path + ' 100,24',
       last: coords[coords.length - 1],
