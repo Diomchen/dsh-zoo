@@ -817,6 +817,30 @@
       .sentiment-value[data-tone='down'] {
         color: var(--rose-ink);
       }
+      /* US19：邻居的当前持仓画成小 chip（作物 + 多/空 + 杠杆），摘要仍保留多空计数。 */
+      .league-chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+        margin-top: 3px;
+      }
+      .league-chip {
+        padding: 1px 6px;
+        border-radius: 999px;
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+        font-size: 10px;
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .league-chip[data-tone='short'] {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .league-chip.more {
+        background: rgba(47, 58, 52, 0.06);
+        color: var(--muted);
+      }
       /* 本机那一行一直高亮：榜上第一眼要找的是自己的名次，不是邻居。 */
       .league-row.me {
         margin: 0 -6px;

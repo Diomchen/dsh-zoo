@@ -437,6 +437,25 @@ function renderLeague (board) {
     const meta = document.createElement('div')
     meta.className = 'row-meta'
     meta.textContent = row.positionsText
+    // US19：持仓摘要下面再画一排 chip（作物 + 多/空 + 杠杆），最多 3 条 + 「+N」。
+    if (row.chips.length > 0) {
+      const chips = document.createElement('div')
+      chips.className = 'league-chips'
+      for (const chip of row.chips) {
+        const item = document.createElement('span')
+        item.className = 'league-chip'
+        item.dataset.tone = chip.tone
+        item.textContent = chip.text
+        chips.append(item)
+      }
+      if (row.chipOverflowText !== '') {
+        const more = document.createElement('span')
+        more.className = 'league-chip more'
+        more.textContent = row.chipOverflowText
+        chips.append(more)
+      }
+      meta.append(chips)
+    }
     main.append(title, meta)
 
     const score = document.createElement('div')

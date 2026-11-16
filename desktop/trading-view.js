@@ -891,10 +891,23 @@
       const pct = toNumber(entry.weekPnlPct)
       let long = 0
       let short = 0
+      const chips = []
       for (const position of Array.isArray(entry.positions) ? entry.positions : []) {
         if (position === null || typeof position !== 'object') continue
-        if (position.side === 'long') long += 1
-        else if (position.side === 'short') short += 1
+        const positionSide = position.side === 'long'
+          ? 'long'
+          : position.side === 'short' ? 'short' : null
+        if (positionSide === null) continue
+        if (positionSide === 'long') long += 1
+        else short += 1
+        // US19：邻居的「当前持仓」不能只有一个计数；作物 + 多/空 + 杠杆一眼能读。
+        // 作物名来自 payload.limits.crops；杠杆坏了按 1× 兜底，不画 NaN。
+        const positionLeverage = Math.max(1, Math.round(toNumber(position.leverage) ?? 1))
+        chips.push({
+          text: cropNameOf(safe, position.crop) + (positionSide === 'long' ? '多' : '空') +
+            ' ' + positionLeverage + '×',
+          tone: positionSide
+        })
       }
       const nickname = typeof entry.nickname === 'string' && entry.nickname.trim() !== ''
         ? entry.nickname.trim()
@@ -906,7 +919,10 @@
         pnlTone: toneOf(weekPnl),
         pctText: pct === null ? '—' : formatSigned(pct * 100, 2) + '%',
         pctTone: pct === null ? 'flat' : toneOf(pct * 100, 2),
-        positionsText: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short
+        positionsText: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
+        // US19：一屏最多画 3 条持仓；多出来的写「+N」，摘要仍保留完整计数。
+        chips: chips.slice(0, 3),
+        chipOverflowText: chips.length > 3 ? '+' + (chips.length - 3) : ''
       })
     }
     const counts = league.sentiment !== null && typeof league.sentiment === 'object'

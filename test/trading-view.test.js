@@ -560,6 +560,10 @@ test('票 82：真人周榜画分数/收益率/持仓摘要；收益率是比率
   // 0.035 是比率 → +3.50%；邻居没报就是「—」，不拿 0% 冒充。
   assert.equal(win.pctText, '+3.50%')
   assert.equal(win.positionsText, '多 2 · 空 0')
+  // US19：邻居的持仓也画成 chip（作物名来自 payload.limits.crops）。
+  assert.deepEqual(win.chips.map((chip) => chip.text), ['小番茄多 5×', '胡萝卜多 1×'])
+  assert.deepEqual(win.chips.map((chip) => chip.tone), ['long', 'long'])
+  assert.equal(win.chipOverflowText, '')
   assert.equal(own.me, true)
   assert.equal(own.pnlText, '-8')
   assert.equal(own.pnlTone, 'down')
@@ -568,6 +572,58 @@ test('票 82：真人周榜画分数/收益率/持仓摘要；收益率是比率
   assert.equal(own.positionsText, '多 0 · 空 1')
   // LAN 情绪数的是仓位：2 多 + 1 空。
   assert.deepEqual(board.league.sentiment, { long: 2, short: 1, text: '多 2 · 空 1', tone: 'long' })
+})
+
+test('术语 US19：邻居持仓 chips——最多 3 条 + 「+N」，空仓仍是观望', () => {
+  const crowded = view.leagueView(payload({
+    league: league({
+      rows: [{
+        deviceId: '00000000-0000-4000-8000-0000000000bb',
+        nickname: '满仓',
+        weekPnl: 9,
+        weekPnlPct: 0.02,
+        positions: [
+          { crop: 'tomato', side: 'long', leverage: 20 },
+          { crop: 'carrot', side: 'short', leverage: 5 },
+          { crop: 'pumpkin', side: 'long', leverage: 1 },
+          { crop: 'tomato', side: 'short', leverage: 5 },
+          { crop: 'carrot', side: 'long', leverage: 20 }
+        ],
+        me: false
+      }],
+      sentiment: { long: 3, short: 2, flat: 0 }
+    })
+  }))
+  const row = crowded.rows[0]
+  assert.deepEqual(row.chips.map((chip) => chip.text), ['小番茄多 20×', '胡萝卜空 5×', '南瓜多 1×'])
+  assert.deepEqual(row.chips.map((chip) => chip.tone), ['long', 'short', 'long'])
+  assert.equal(row.chipOverflowText, '+2')
+  assert.equal(row.positionsText, '多 3 · 空 2', '摘要仍保留完整计数')
+
+  // 空仓 = 观望：没有 chip，也没有「+0」。
+  const flat = view.leagueView(payload({
+    league: league({
+      rows: [{ deviceId: '00000000-0000-4000-8000-0000000000cc', nickname: '观望', weekPnl: 0, positions: [], me: false }],
+      sentiment: { long: 0, short: 0, flat: 1 }
+    })
+  }))
+  assert.deepEqual(flat.rows[0].chips, [])
+  assert.equal(flat.rows[0].chipOverflowText, '')
+  assert.equal(flat.rows[0].positionsText, '观望')
+  // 坏持仓条目只丢自己：不能把整行 chips 画成 NaN。
+  const mixed = view.leagueView(payload({
+    league: league({
+      rows: [{
+        deviceId: '00000000-0000-4000-8000-0000000000dd',
+        nickname: '坏行',
+        weekPnl: 1,
+        positions: [null, { side: 'up' }, { crop: 'tomato', side: 'long', leverage: 'x' }],
+        me: false
+      }],
+      sentiment: { long: 0, short: 0, flat: 1 }
+    })
+  }))
+  assert.deepEqual(mixed.rows[0].chips.map((chip) => chip.text), ['小番茄多 1×'])
 })
 
 test('票 82：只有自己时写「观望」，并保留「还没有邻居上线…行情照走」', () => {
@@ -722,4 +778,7 @@ test('User Story 30：盘口窗上写明「没有手续费、没有资金费、�
   const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
   assert.match(script, /order-liquidation/)
   assert.match(script, /order\.liquidationText/)
+  // US19：榜行把 view 给的 chips 画出来（不是只画「多 N · 空 M」计数）。
+  assert.match(script, /league-chips/)
+  assert.match(script, /chipOverflowText/)
 })
