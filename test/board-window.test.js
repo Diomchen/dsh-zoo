@@ -26,6 +26,7 @@ import {
   SLOT_MS,
   TICK_MS,
   TRADING_LEVERAGES,
+  TRADING_STOP_LEVELS,
   markPrice,
   settlementOf,
   slotIndexAt
@@ -427,8 +428,11 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   ]) {
     assert.equal(shared.normalizeBoardAction(bad), null, JSON.stringify(bad))
   }
-  // 窗口与 helper 的止损四档是同一组数（改档位时三处一起改）。
+  // 窗口 / helper / 宿主三处的止损四档是同一组数（改档位时一起改）。
   assert.deepEqual(shared.BOARD_STOP_LEVELS, boardView.stopLevels())
+  assert.deepEqual(shared.BOARD_STOP_LEVELS, TRADING_STOP_LEVELS)
+  // 杠杆的形状上限也同源（helper 不再各写一个 20）。
+  assert.equal(shared.BOARD_MAX_LEVERAGE, 20)
   // 票 83：到价挂单 / 撤单的字段白名单。
   assert.deepEqual(
     shared.normalizeBoardAction({
