@@ -12,6 +12,10 @@
  * 禁用、滚轮横滚、键盘 ←/→/Home/End 切作物、选中 chip 滚进视野；所有滚动都只发生在
  * 列表内部，页面本身不滚。下单卡不套滚动容器，主按钮固定在卡片底部。
  *
+ * 票 90：图按需拉取。宿主一包只带当前作物的四个周期；切作物先看本地缓存（最近 4 种），
+ * 命中就本地换图，没有就先画「正在加载这张图…」再提交 `trading-charts { cropId }`，
+ * 回执到了并进本地 state 重画。宿主的推送不会把用户正在看的作物打回默认。
+ *
  * 键盘：Tab 顺序由 `view.focusOrder()` 落到 tabindex（箭头 → 作物 chip → 周期 → 方向 →
  * 保证金 → 杠杆 → 到价 → 开一手 → 挂单撤单 → 持仓止损/平仓）；Enter/Space 是原生按钮
  * 行为；Esc 关窗。失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
@@ -92,6 +96,17 @@ const RESULT_CODE_TEXT = {
 
 /** 宿主推来的最后一份视图；null = 还没收到（窗口先画空态）。 */
 let payload = null
+/**
+ * 票 90：按需拉图的本地缓存（最近 4 种作物）。切作物先看它；命中就本地换图，
+ * 不再发 IPC——宿主一包只带当前作物的四个周期。
+ */
+const chartCache = view.createChartCache()
+/** 正在等哪一位作物的图（null = 没有在飞）；主进程一次只收一条申请。 */
+let chartsPending = null
+/** 当前屏缺图、正在等宿主：视图画「正在加载这张图…」。 */
+let chartsLoading = false
+/** 拉图失败过的那一种作物（同一屏不自动重试，等下一次推送或用户再点一下）。 */
+let chartsFailed = null
 /** 当前选择（只活在窗口里，开仓成功后保持不变，方便连做）。 */
 let side = 'long'
 let margin = 50
@@ -107,6 +122,8 @@ let limitOpen = false
 let targetText = ''
 /** 有申请在飞：连点不会串单（主进程也会挡，这里只是立刻反馈）。 */
 let pending = false
+/** 这条在飞的申请是什么动作（票 90：靠它把 `trading-charts` 的回执和图对上）。 */
+let pendingAction = null
 /** 这一根的收盘时刻（本地倒计时基线，每次宿主推包都重置）。 */
 let barEnd = 0
 /** 这一根已经问过「到点了，重推一拍」没有；每根只问一次。 */
@@ -557,7 +574,7 @@ function renderOrder (board) {
   previewEl.textContent = order.preview
   // 强平价单独一行（US7）：预览句保持 SPEC v10 的原文不动。
   liquidationEl.textContent = order.liquidationText
-  submitEl.textContent = pending ? '下单中…' : order.submitLabel
+  submitEl.textContent = pending && chartsPending === null ? '下单中…' : order.submitLabel
   submitEl.dataset.side = order.side
   submitEl.disabled = pending || !order.canSubmit
   orderHintEl.textContent = order.hint
@@ -903,9 +920,60 @@ function applyTabOrder (payload) {
   }
 }
 
+/**
+ * 票 90：这一屏要画的 payload——把当前作物缓存的图并进宿主最后推来的那份。
+ * 缓存/推包里都没有就原样返回（视图画「正在加载」或空态），绝不自己编图。
+ */
+function renderPayload () {
+  if (payload === null || typeof crop !== 'string' || crop === '') return payload
+  const charts = view.chartsFor(payload, chartCache, crop)
+  if (charts.timeframes === null) return payload
+  return view.withCropCharts(payload, charts)
+}
+
+/**
+ * 票 90：当前作物缺图就去问宿主。主进程同一时间只收一条申请，
+ * 所以有别的申请在飞时只是把状态留在「加载中」，等回执后 `followUpCharts()` 再补。
+ */
+function requestCharts (cropId) {
+  if (typeof cropId !== 'string' || cropId === '') return
+  if (chartsPending === cropId) return
+  if (pending || chartsPending !== null) return
+  if (api === undefined || typeof api.submit !== 'function') {
+    chartsLoading = false
+    return
+  }
+  chartsPending = cropId
+  submitAction({ action: 'trading-charts', cropId })
+}
+
+/** 推包/切作物/回执之后统一算一次：有图就退出加载态，没图就拉（失败过的这一种不自动重试）。 */
+function ensureCharts () {
+  if (payload === null || typeof crop !== 'string' || crop === '') {
+    chartsLoading = false
+    return
+  }
+  if (view.chartsFor(payload, chartCache, crop).timeframes !== null) {
+    chartsLoading = false
+    return
+  }
+  if (chartsFailed === crop) {
+    chartsLoading = false
+    return
+  }
+  chartsLoading = true
+  requestCharts(crop)
+}
+
+/** 一条回执结束后再看一眼：用户可能在这期间又切了一种作物。 */
+function followUpCharts () {
+  if (pending || chartsPending !== null) return
+  ensureCharts()
+}
+
 function render () {
   const focused = focusKeyOf(document.activeElement)
-  const board = view.boardView(payload, {
+  const board = view.boardView(renderPayload(), {
     now: Date.now(),
     side,
     margin,
@@ -914,7 +982,8 @@ function render () {
     timeframe,
     limitOpen,
     targetText,
-    allIn
+    allIn,
+    chartsLoading
   })
   lastBoard = board
   renderHeader(board)
@@ -928,7 +997,9 @@ function render () {
   margin = board.order.margin
   leverage = board.order.leverage
   allIn = board.order.allIn
-  crop = board.chart.crop
+  // 票 90：还没收到任何一包时 `boardView` 用的是兜底白名单（番茄…），不能把它当成
+  // 用户的选择——否则首包一到，窗口会去请求一种宿主根本没在看的作物。
+  if (payload !== null) crop = board.chart.crop
   timeframe = board.chart.timeframe
   // Tab 顺序按纯视图给的逻辑顺序落到 tabindex（DOM 已全部建好）。
   applyTabOrder(payload)
@@ -979,6 +1050,7 @@ function submitAction (action) {
     return
   }
   pending = true
+  pendingAction = action !== null && typeof action?.action === 'string' ? action.action : null
   render()
   api.submit(action)
 }
@@ -1000,7 +1072,9 @@ chartEl.addEventListener('pointerleave', () => {
 cropTabsEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-crop]')
   if (button === null || button.dataset.crop === '') return
+  if (button.dataset.crop !== crop) chartsFailed = null
   crop = button.dataset.crop
+  ensureCharts()
   render()
 })
 
@@ -1020,7 +1094,9 @@ cropTabsEl.addEventListener('keydown', (event) => {
   event.preventDefault()
   if (next === index) return
   const id = buttons[next].dataset.crop
+  if (id !== crop) chartsFailed = null
   crop = id
+  ensureCharts()
   render()
   // 重画把 chip 换掉了：把焦点放回**新的**那一颗（render 里的 focusByKey 只认得旧键）。
   const target = Array.from(cropTabsEl.querySelectorAll('[data-crop]'))
@@ -1144,18 +1220,57 @@ document.addEventListener('keydown', (event) => {
 api?.onState((next) => {
   if (next === null || typeof next !== 'object') return
   payload = next
+  // 票 90：推包里带的图先收进缓存——宿主沿用的选择、以及刚拉过的那一种，
+  // 切回来都能本地换图；新一包也可能正好带来用户等着的那一种。
+  const pushedCrop = view.chartsCropOf(next)
+  if (pushedCrop !== null) {
+    const charts = view.chartsFromPayload(next, pushedCrop)
+    if (charts !== null) chartCache.set(pushedCrop, charts)
+  }
+  // 新数据到了：之前拉图失败的那一种可以再试（不是同一个死循环）。
+  chartsFailed = null
   // 倒计时基线：宿主给的是 epoch，窗口只减法算剩余；没有就退回 remainingMs。
   const end = Number(next.bar?.end)
   barEnd = Number.isFinite(end) && end > 0
     ? end
     : Date.now() + Math.max(0, Number(next.bar?.remainingMs) || 0)
   refreshAsked = false
+  ensureCharts()
   render()
 })
 
 api?.onResult((result) => {
+  const sentAction = pendingAction
   pending = false
+  pendingAction = null
   if (result === null || typeof result !== 'object') {
+    followUpCharts()
+    render()
+    return
+  }
+  // 票 90：按需拉图的回执——把图并进缓存，当前屏再重画一次。
+  if (sentAction === 'trading-charts') {
+    chartsPending = null
+    const cropId = typeof result.crop === 'string' ? result.crop : null
+    if (result.ok === true && cropId !== null &&
+      result.timeframes !== null && typeof result.timeframes === 'object') {
+      chartCache.set(cropId, { timeframes: result.timeframes, hint: result.hint ?? null })
+      chartsFailed = null
+    } else {
+      // 这一种拉不到（坏作物/超时）：先退出加载态，别让风扇一直转；用户再点一下可以重试。
+      chartsFailed = cropId ?? crop
+    }
+    if (result.ok === true) {
+      render()
+      followUpCharts()
+      return
+    }
+    render()
+    const notice = typeof result.notice === 'string' && result.notice.trim() !== ''
+      ? result.notice
+      : (RESULT_CODE_TEXT[result.code] ?? '这张图没有拉下来，稍后再试。')
+    showToast(notice, 'error')
+    followUpCharts()
     render()
     return
   }
@@ -1164,6 +1279,7 @@ api?.onResult((result) => {
       ? result.notice
       : '完成了。'
     render()
+    followUpCharts()
     // 成功不关窗：宿主紧接着会推一份新视图（硬币/持仓都变了）。
     showToast(notice)
     return
@@ -1173,6 +1289,8 @@ api?.onResult((result) => {
     ? result.notice
     : (RESULT_CODE_TEXT[result.code] ?? '这次没有完成，稍后再试。')
   showToast(notice, 'error')
+  followUpCharts()
+  render()
 })
 
 // 切走/失焦后 interval 可能被节流；回来先按真实时间补一帧。

@@ -1718,4 +1718,11 @@ test('票 90：图缓存最多 4 种作物，命中就不再请求；推包里�
   assert.equal(view.chartsCropOf(null), null)
   assert.equal(view.hasCropCharts(lazy, 'tomato'), true)
   assert.equal(view.hasCropCharts(lazy, 'carrot'), false)
+
+  // 没有显式选择时（窗口刚收到第一包）跟着推包走：按需包只有番茄，
+  // 视图不能默认白名单第一种（那样会为一张宿主根本没发的图去拉数据）。
+  const followed = view.boardView(lazy, { now: SLOT_EDGE + 5 * 60 * 1000 })
+  assert.equal(followed.chart.crop, 'tomato')
+  assert.equal(followed.chart.hasChart, true)
+  assert.equal(followed.header.priceText, '5.06')
 })
