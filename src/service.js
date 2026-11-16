@@ -122,6 +122,8 @@ import {
   MAX_GIFT_BYTES,
   MAX_RAID_PLOTS,
   MAX_TRADING_POSITIONS,
+  MAX_WEEK_PNL,
+  MAX_WEEK_PNL_PCT,
   PLOT_ID_RE,
   TRADING_DIGEST_INTERVAL_MS,
   normalizeCaps,
@@ -2163,6 +2165,11 @@ export function createService (ctx, options = {}) {
    * `weekPnl` 是四舍五入后的金币（榜按它排序）；`weekPnlPct` 是比率（0.035 = +3.5%），
    * `week.base` 为 0（新账本/坏文件）时返回 null，编码层就不带这个键。
    * 只投影持仓的三个公开字段：硬币、保证金、入场价、历史一概不出本机。
+   *
+   * 分数在出口夹到协议边界（评审 P0）：线上字段是**展示上限**，不是本地账本的真相。
+   * 1,000,000 硬币 × 20× 的浮盈、或一个很小的 `week.base`，都能让真实值超出
+   * `MAX_WEEK_PNL` / `MAX_WEEK_PNL_PCT`；不夹的话编码层整包拒绝，这位玩家会从
+   * 每个邻居的榜上消失——比「分数封顶」糟得多。硬币、持仓、`trading.json` 一分不动。
    */
   function tradingSelfDigest (view, week, now) {
     const positions = []
@@ -2171,10 +2178,14 @@ export function createService (ctx, options = {}) {
       if (positions.length >= MAX_TRADING_POSITIONS) break
       positions.push({ crop: position.crop, side: position.side, leverage: position.leverage })
     }
+    const weekPnl = Math.round(week.total)
+    const weekPnlPct = week.base > 0 ? week.total / week.base : null
     return {
       at: now,
-      weekPnl: Math.round(week.total),
-      weekPnlPct: week.base > 0 ? week.total / week.base : null,
+      weekPnl: Math.min(MAX_WEEK_PNL, Math.max(-MAX_WEEK_PNL, weekPnl)),
+      weekPnlPct: weekPnlPct === null
+        ? null
+        : Math.min(MAX_WEEK_PNL_PCT, Math.max(-MAX_WEEK_PNL_PCT, weekPnlPct)),
       positions
     }
   }
@@ -5749,8 +5760,10 @@ export function createService (ctx, options = {}) {
         weekPnlPct: digest.weekPnlPct,
         positions: digest.positions
       })
-    } catch {
-      // 本机盘口数据坏了只停这一轮广播，不影响盘口本身。
+    } catch (error) {
+      // 本机盘口数据坏了只停这一轮广播，不影响盘口本身；日志去重，别每 30 秒刷一条。
+      // 出口已经把分数夹进协议范围，走到这里说明是真坏了（不是「赢太多」）。
+      warnOnce('trading-digest-encode', '盘口周报没编出来，本轮跳过：' + message(error))
       return 0
     }
     let sent = 0
