@@ -37,9 +37,9 @@
   导出常量 `CHART_WIDTH = 384`、`CHART_HEIGHT = 188`。
 - **窗口尺寸**：`BOARD_WIDTH = 760` / `BOARD_HEIGHT = 700` 在 `desktop/main.js`（票 79 已定），本票不改 `main.js`，只把布局填满它。
 - **止损**：窗口按钮循环 `关 → −25% → −50% → −100% → 关`，提交 `trading-set-stop { positionId, level }`
-  （`desktop/shared.js` 白名单 + `board-preload.js` 转发 + `src/service.js` 分发到 `trading.setStop`）。
-  **票 80 的 store 提供 `setStop`**；两票并行期间 `src/service.js` 里有一行 `typeof trading.setStop !== 'function'`
-  的保护（返回 `action-failed`），合并后可以删掉；若票 80 也加了同一段分发，保留一份即可。
+  （`desktop/shared.js` 白名单 + `board-preload.js` 转发 + `src/service.js` 分发到 `trading.setStopLoss`）。
+  **票 80 的 store 提供 `setStopLoss(positionId, level)`**；两票并行期间 `src/service.js` 里那行
+  `typeof trading.setStop !== 'function'` 的保护是并行的临时挡板，合并时已删掉（保留一份分发即可）。
 - **`src/service.js` 的 `handleDesktopAction` 多拷了一个 `level` 字段**（不加这一行，票 80 的 store 永远收到
   `undefined`）；这是唯一一处超出「payload 组装 + tick 刷新」的改动。
 - **没做（留给后面）**：真人周榜 / LAN 情绪 / trading-digest（票 82，窗口右下已留「邻居」卡与
