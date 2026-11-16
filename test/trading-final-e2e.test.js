@@ -20,7 +20,9 @@ import { createService } from '../src/service.js'
 import { TRADING_FILE } from '../src/trading.js'
 import {
   SLOT_MS,
+  SLOT_TICKS,
   TICK_MS,
+  boardPrice,
   markPrice,
   settlementOf,
   slotClosePrice,
@@ -33,7 +35,7 @@ const boardView = require('../desktop/trading-view.js')
 
 const SLOT_EDGE = 1763308800000
 const SLOT = SLOT_EDGE / SLOT_MS
-/** 这一根 tick 1→15 一路下跌（6.10 → 5.79）；tick 2 开仓、tick 10 到价、收盘 5.787。 */
+/** 这一根 tick 1→15 一路下跌（价格由行情算，board-v2 下 3.47 → 3.32）；tick 2 开仓、tick 10 到价。 */
 const OPEN_AT = SLOT_EDGE + 2 * TICK_MS
 const FILL_AT = SLOT_EDGE + 10 * TICK_MS
 const CLOSE_AT = SLOT_EDGE + SLOT_MS
@@ -325,8 +327,14 @@ test('票 83 降级：离线跨过收盘会补结算；未知/旧报文在协议
   })
   assert.equal(opened.body.ok, true)
   // 挂一张这一根绝不会成交的目标价（做多、目标价在这根所有 tick 之下），离线期间应该到期退回。
+  // 目标价由行情现算：写死 5 在 board-v2 的行情里会被当场越价成交（这一根在 3.3 附近）。
+  let noFillTarget = Infinity
+  for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+    noFillTarget = Math.min(noFillTarget, boardPrice({ crop: 'tomato', slot: SLOT, tick }))
+  }
+  noFillTarget *= 0.999
   const placed = await action(service, {
-    action: 'trading-place-order', side: 'long', margin: 50, leverage: 1, cropId: 'tomato', target: 5
+    action: 'trading-place-order', side: 'long', margin: 50, leverage: 1, cropId: 'tomato', target: noFillTarget
   })
   assert.equal(placed.body.ok, true)
   assert.equal((await state(service)).body.farm.coins, 350)

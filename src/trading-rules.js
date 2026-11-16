@@ -5,6 +5,8 @@
  * 同一套代码在任何机器上算出同一张图（ADR-0028：不做对手盘、不做服务器）。
  * 票 84 的 1 时/1 日/1 周只是把**同一条**曲线按更粗的桶采样来画趋势（显示用近似）；
  * 合约结算仍然只认 15 分钟收盘，粗周期一根都不参与（见 `barsForTimeframe`）。
+ * 票 86 把这条曲线从「两条 2–3 小时波」换成**多尺度慢波**（2–3 小时 → 16 周）：
+ * 日/周线要读出趋势，只能让长周期真的进价格公式，而不是在渲染层补形状（ADR-0030）。
  *
  * 行情只有 `boardPrice()` 一个入口：当前价、收盘结算价、K 线（票 81）、
  * 离线补算与强平（票 80）都必须调它。多写一个价格公式，就会出现「图上没插针、
@@ -34,8 +36,9 @@ export const MAX_PATH_SCAN_MS = MAX_PATH_SCAN_SLOTS * SLOT_MS
 /**
  * 行情版本盐：调价格手感（幅度/波形）时一起改它，老图当场作废，
  * 而不是邻居算一份新、我算一份旧。它只进散列种子，不落盘。
+ * v1 → v2（票 86）：慢波从两条换成多尺度，旧图作废；确定性不变，所有机器仍是同一张图。
  */
-export const PRICE_SALT = 'board-v1'
+export const PRICE_SALT = 'board-v2'
 /** 价格锚在作物底价，夹在 [0.55, 1.75] 倍（SPEC v10「行情」）。 */
 export const PRICE_FLOOR_RATIO = 0.55
 export const PRICE_CEIL_RATIO = 1.75
@@ -74,14 +77,39 @@ export const TRADING_STOP_LEVELS = Object.freeze([0, 0.25, 0.5, 1])
 export const TRADING_CLOSE_REASONS = Object.freeze(['close', 'settle', 'liquidate', 'stop'])
 
 /**
- * 慢趋势 = 两三条正弦叠加，半个周期（一波涨/一波跌）约 4–6 根。
- * 权重和 = 1，所以慢趋势的幅度上限是 `SLOW_AMPLITUDE`（对数口径，约 ±20%）。
+ * 多尺度慢趋势（票 86 / ADR-0030）：六条正弦叠在**同一条**对数价格上。
+ *
+ * 每条波**单独给对数振幅**，不再用「权重和 = 1 × 一个总幅度」：它们服务的图表周期不一样，
+ * 用同一个幅度均分，等于把长波饿死（旧模型只有两条 2–3 小时波，日/周线就是纯噪声）。
+ * 幅度按「谁的周期长谁说话」排：短波只负责盘面的呼吸，日/周线的趋势必须由长波扛。
+ *
+ *   9 / 11.4 slot（2.25 / 2.85 小时）→ 15 分钟图的风向：6 小时里两三个来回；
+ *   33 slot（8.25 小时）             → 1 时图的波段；故意比 8 小时多半根，日线/周线的形态
+ *                                      才不逐根复读（正好整除一天/一周会让高低点永远落在同一点）；
+ *   688 slot（7.17 天）              → 1 日图的主趋势（一周一次涨跌），1 周图的形状；
+ *                                      同样故意不完全等于 672（日历周）；
+ *   2816 slot（29.3 天，约 4 周）    → 1 日/1 周图的波段：24 根日线正好走完一个来回；
+ *   8064 slot（84 天）               → 1 周图的宏观底/顶：票 86/ADR-0030 写「约 16 周（≈8064 slot）」，
+ *                                      按 slot 数算其实是 84 天（12 周）；照 ticket 给的 slot 数实现，
+ *                                      量级不变——24 根周线里只走半圈，「这半年在涨还是在跌」看它。
+ *
+ * 六条振幅之和 = 0.52（对数口径）；只有六条同相时才会叠满，实测最坏（含快噪声）约 ±0.53，
+ * 价格落在 0.59–1.69 × 底价——仍在 [0.55, 1.75] 的夹子之内，不去撞夹子，夹子只兜底（票 86 验收）。
+ * 相位仍由 `phaseOf(crop, index)` 按作物 + 序号散列，确定性不变：同一台机器、同一刻一张图。
  */
 const SLOW_WAVES = Object.freeze([
-  Object.freeze({ slots: 9, weight: 0.68 }),
-  Object.freeze({ slots: 11.4, weight: 0.32 })
+  // 2–3 小时：15 分钟图的「风」。票 86 保留这两条周期，只把幅度从 ±19% 收到 ±7%。
+  Object.freeze({ slots: 9, amplitude: 0.04 }),
+  Object.freeze({ slots: 11.4, amplitude: 0.028 }),
+  // 8 小时：1 时图一段能看出涨跌；1 日图里走三个来回，只进影线，几乎不进日线收盘。
+  Object.freeze({ slots: 33, amplitude: 0.032 }),
+  // 1 周：1 日图的主趋势——连着三四根日线同向，靠的就是这一条。
+  Object.freeze({ slots: 688, amplitude: 0.12 }),
+  // 4 周：1 日/1 周图的波段，也是周线实体的主要来源（周线收盘 = 4 周波走了 1/4 圈）。
+  Object.freeze({ slots: 2816, amplitude: 0.21 }),
+  // 12 周：1 周图的宏观底/顶，24 根周线里只走半圈，负责「这半年在涨还是在跌」。
+  Object.freeze({ slots: 8064, amplitude: 0.09 })
 ])
-const SLOW_AMPLITUDE = 0.19
 /** 快噪声：每个 slot 一个散列值、tick 之间平滑插值，幅度约 ±2.2%。 */
 const FAST_AMPLITUDE = 0.022
 const TWO_PI = Math.PI * 2
@@ -105,7 +133,9 @@ export const BOARD_TIMEFRAMES = Object.freeze([
   Object.freeze({ id: '1w', label: '1周' })
 ])
 /**
- * 粗周期的采样步长（票 84）：1 时每 5 分钟、1 日每小时、1 周每 6 小时。
+ * 粗周期的采样步长（票 84，票 86 加密）：1 时每 5 分钟、1 日每小时、1 周每 3 小时。
+ * 首尾两针正好落在桶边界上（`sampledPrices` 末尾补 `limit` 那一针），所以每根的
+ * 开/收就是边界价，周线的影线不再被 6 小时抽样糊掉。
  * **采样只用于画图**：粗周期看不出 15 分钟里的插针，而合约结算仍然只认
  * `slotClosePrice()`（15 分钟收盘）。所以这里只决定「看哪几个点」，
  * 不引入第二种价格公式——每一针还是 `markPrice()`。
@@ -113,7 +143,7 @@ export const BOARD_TIMEFRAMES = Object.freeze([
 const TIMEFRAME_SAMPLE_MS = Object.freeze({
   '1h': 5 * TICK_MS,
   '1d': 60 * TICK_MS,
-  '1w': 6 * 60 * TICK_MS
+  '1w': 3 * 60 * TICK_MS
 })
 /**
  * 风向 = 慢趋势在本根的斜率（本根起点 → 下一根起点），**快噪声不参与**。
@@ -124,8 +154,11 @@ const TIMEFRAME_SAMPLE_MS = Object.freeze({
 const HINT_FLAT_SLOPE = 0.002
 const HINT_MIN_CONFIDENCE = 0.55
 const HINT_MAX_CONFIDENCE = 0.68
-/** 慢趋势（两条正弦叠加）的斜率最大约 0.12/根；达到 0.08 就算顶格。 */
-const HINT_FULL_SLOPE = 0.08
+/**
+ * 多尺度慢波叠起来，单根斜率最大约 0.051（六条同相时）；到 0.04 就算顶格——
+ * 再陡的坡度多半是短波凑出来的，不该让玩家觉得「这一根特别有把握」。
+ */
+const HINT_FULL_SLOPE = 0.04
 
 function finiteNumber (value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -171,28 +204,33 @@ function baseOf (crop) {
 
 /**
  * 慢趋势分量（对数口径）：`x = slot + tick / 15`，按「根」为单位连续变化。
+ * 多尺度波各自带振幅直接相加（见 `SLOW_WAVES` 的注释：短波是呼吸、长波是趋势）。
  * 相位由作物决定，所以三个作物将来是三条不同的曲线，但同一条在所有机器上一样。
  */
 function slowLevel (crop, x) {
   let sum = 0
   for (let index = 0; index < SLOW_WAVES.length; index += 1) {
     const wave = SLOW_WAVES[index]
-    sum += wave.weight * Math.sin((TWO_PI * x) / wave.slots + phaseOf(crop, index))
+    sum += wave.amplitude * Math.sin((TWO_PI * x) / wave.slots + phaseOf(crop, index))
   }
-  return sum * SLOW_AMPLITUDE
+  return sum
 }
 
 /**
- * 快噪声分量：格点在**整数 slot** 上，tick 之间用 smoothstep 插值。
- * 这样 `tick = 0` 正好落在格点上，`tick = 15` 正好落在下一个格点上——
+ * 快噪声分量：格点在**半根**（slot 的 1/2，即 tick 7.5）上，tick 之间用 smoothstep 插值。
+ *
+ * 为什么不是整根一格：整根一格时一根里的 1 分钟路径是**单调**的（smoothstep 从 a 到 b
+ * 不回弯），现实里不存在的「插针→收回」「同一根里先破止损再站回去」这些场景就一个都没有了
+ * （票 86 实测：20k 根里 0 根能先跌破 1.25% 再收回）。半根一格之后 1 分钟图会拐一次弯，
+ * 而整根边界仍然是格点（`tick = 0` / `tick = 15` 都落在格点上）——
  * 一根的收盘价天然等于下一根的开盘价，不需要额外对齐。
  */
 function fastLevel (crop, x) {
-  const slot = Math.floor(x)
-  const frac = x - slot
+  const cell = Math.floor(x * 2)
+  const frac = x * 2 - cell
   const smooth = frac * frac * (3 - 2 * frac)
-  const a = unitHash(PRICE_SALT + ':' + crop + ':fast:' + slot) * 2 - 1
-  const b = unitHash(PRICE_SALT + ':' + crop + ':fast:' + (slot + 1)) * 2 - 1
+  const a = unitHash(PRICE_SALT + ':' + crop + ':fast:' + cell) * 2 - 1
+  const b = unitHash(PRICE_SALT + ':' + crop + ':fast:' + (cell + 1)) * 2 - 1
   return (a * (1 - smooth) + b * smooth) * FAST_AMPLITUDE
 }
 
