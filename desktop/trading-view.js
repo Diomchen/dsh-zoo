@@ -1,7 +1,7 @@
 /**
- * 盘口小窗的纯视图模型（票 79 / 票 81 / 票 82 / 票 83）。
+ * 盘口小窗的纯视图模型（票 79 / 票 81 / 票 82 / 票 83 / 票 89）。
  *
- * 这层只做「宿主推来的盘口 view → 标题/K 线几何/下单区/到价挂单/持仓卡/历史/真人周榜/空态」的
+ * 这层只做「宿主推来的盘口 view → 标题/K 线几何/作物条/下单区/到价挂单/持仓卡/历史/真人周榜/空态」的
  * 纯计算，不碰 window、document、IPC，也不改任何数据。渲染页把它当普通 script 加载
  * （`window.dshZooBoardView`），Node 测试用 `require` 同一份文件；DOM 由
  * `desktop/board.js` 建。
@@ -39,17 +39,34 @@
    */
   const SLOT_MS = 15 * MINUTE_MS
   /**
-   * 票 87：图占满窗口宽度（盘口窗固定 760×700，左右各留 8px 外框 + 12px 内边距），
-   * 1 单位≈1px。`CHART_PADDING` 仍是纯价格映射的旧默认值（老测试/调用直接量 viewBox 时用它），
-   * 轴与价格标签的留白由 `CHART_AXIS_PADDING` 在 `chartView` 里显式传入。
+   * 票 89：版面重做后图是「作物条下面的一条横带」。窗口 760×700、纸卡贴边（2px 墨线），
+   * 图占满整宽（viewBox 720 宽）；图高按 760×700 下留出两列列表的余量定，
+   * 轴/字/十字线仍是票 87 那一套。`BOARD_WIDTH/BOARD_HEIGHT` 是窗口尺寸，不是图。
    */
   const BOARD_WIDTH = 760
   const BOARD_HEIGHT = 700
   const CHART_WIDTH = 720
-  const CHART_HEIGHT = 280
+  const CHART_HEIGHT = 198
   const CHART_PADDING = Object.freeze({ top: 8, right: 4, bottom: 6, left: 4 })
   /** 右侧价格轴 + 底部时间轴的留白；文字不套滤镜，所以轴标签不会被画出锯齿。 */
   const CHART_AXIS_PADDING = Object.freeze({ top: 14, right: 62, bottom: 26, left: 10 })
+  /**
+   * 票 89 的固定版面（760×700，页面不滚）：
+   *   顶栏 52 → 图带 286（作物条 42 + 图 244）→ 下半区 minmax(0,1fr)。
+   * 下半区两列：左 minmax(0,1fr) = 持仓（滚）+ 最近结算 120；右 300 = 下单（不滚）+ 周榜（滚）。
+   * 这些数字是窗口 CSS 与测试共用的唯一来源；改版面时两边一起改。
+   */
+  const HEADER_HEIGHT = 52
+  const CROP_STRIP_HEIGHT = 42
+  const CHART_CARD_HEIGHT = 286
+  const ORDER_COLUMN_WIDTH = 300
+  const CONTROL_ROW_HEIGHT = 34
+  const HISTORY_HEIGHT = 120
+  /**
+   * 作物条一屏大概放得下 6 颗 chip（718px 宽减去左右箭头与 4 档周期）。
+   * 只是「初始窗口」的估算：真实滚动位置由 DOM 量出来，纯视图用它算箭头初始禁用态。
+   */
+  const CROP_STRIP_VISIBLE = 6
   /**
    * 手绘笔触：`feTurbulence` 出噪声、`feDisplacementMap` 把线条轻微推歪。
    * 种子/幅度固定（不随重画变化），所以同一张图每次截图都一样；文字不进这层滤镜。
@@ -62,9 +79,12 @@
     numOctaves: 2,
     lineCap: 'round'
   })
-  /** 版面：图表独占一行，下面两列（左持仓/结算，右下单/周榜）。DOM 顺序仍按 Tab 顺序。 */
+  /** 版面：图带独占一行，下面两列（左持仓/结算，右下单/周榜）。DOM 顺序仍按 Tab 顺序。 */
   const LAYOUT = Object.freeze({
     board: Object.freeze({ width: BOARD_WIDTH, height: BOARD_HEIGHT }),
+    headerHeight: HEADER_HEIGHT,
+    cropStripHeight: CROP_STRIP_HEIGHT,
+    chartCardHeight: CHART_CARD_HEIGHT,
     chart: Object.freeze({
       width: CHART_WIDTH,
       height: CHART_HEIGHT,
@@ -73,6 +93,17 @@
     columns: Object.freeze({
       left: Object.freeze(['positions', 'history']),
       right: Object.freeze(['order', 'league'])
+    }),
+    bottom: Object.freeze({
+      // 下单列固定 300：四档保证金 / 三档杠杆的 grid 就是按这个宽度量的（minmax(0,1fr) 防溢出）。
+      rightWidth: ORDER_COLUMN_WIDTH,
+      controlRow: CONTROL_ROW_HEIGHT,
+      historyHeight: HISTORY_HEIGHT,
+      // 方向/保证金/杠杆三行固定 34；到价开关放在卡片头部，展开后多一行 34 的目标价。
+      selectorRows: 3,
+      limitRow: CONTROL_ROW_HEIGHT,
+      marginColumns: 4,
+      leverageColumns: 3
     })
   })
   /** 兜底白名单：宿主每一包都会带 `limits`，这里只在极端情况下（老宿主/坏包）用。 */
@@ -92,8 +123,8 @@
    * 其余周期是看趋势用的粗桶，结算口径不变。
    */
   const CONTRACT_TIMEFRAME = '15m'
-  /** 切到别的周期时的那句提示（产品文案：结算仍只认 15 分钟收盘）。 */
-  const SETTLE_NOTE_TEXT = '合约仍按 15 分钟收盘结算；其它周期只看趋势'
+  /** 切到别的周期时的那句提示（票 89 瘦身成最短口径：结算仍只认 15 分钟收盘）。 */
+  const SETTLE_NOTE_TEXT = '15 分钟结算'
   const SIDE_LABELS = Object.freeze({ long: '做多', short: '做空' })
   const REASON_LABELS = Object.freeze({
     close: '手动平仓',
@@ -148,6 +179,16 @@
     if (rounded > 0) return '+' + text
     if (rounded < 0) return '-' + text
     return text
+  }
+
+  /**
+   * 产品文案里的负数用 U+2212（`−`），不用 ASCII 连字符（票 89）。
+   * 只给「句子里的数字」用（周盈亏胶囊/收益率）；持仓/榜单的裸数字仍走 `formatSigned`，
+   * 这样表格里正负号宽度一致，也不影响既有断言。
+   */
+  function formatSignedMinus (value, digits = 1) {
+    const text = formatSigned(value, digits)
+    return text.startsWith('-') ? MINUS + text.slice(1) : text
   }
 
   /** 预览句里的小额：5 → '5'，0.5 → '0.5'，0.25 → '0.25'（不画多余的 0）。 */
@@ -353,7 +394,7 @@
     }
   }
 
-  /** 作物页签：三作物可切；没图的作物也画出来（切过去是空态，不是消失）。 */
+  /** 作物页签：任意数量都可切；没图的作物也画出来（切过去是空态，不是消失）。 */
   function cropsView (payload, crop) {
     const selected = pickCrop(payload, crop)
     return limitsOf(payload).crops.map((entry) => {
@@ -369,6 +410,41 @@
         hasChart: chartOf(payload, id) !== null
       }
     })
+  }
+
+  /**
+   * 作物条（票 89）：单行横向滚动，一屏放 `visible` 颗 chip，左右箭头按「当前窗口」禁用。
+   *
+   * 纯函数只估算**初始窗口**：选中项尽量居中；真实滚动位置由 `board.js` 量 DOM 再校正。
+   * 测试用 10 种作物断言「首尾箭头禁用态 + 选中索引」，窗口用同一份 items。
+   */
+  function cropStripView (payload, crop, { visible = CROP_STRIP_VISIBLE } = {}) {
+    const items = cropsView(payload, crop)
+    const count = Math.max(1, Math.floor(toNumber(visible) ?? CROP_STRIP_VISIBLE))
+    const selectedIndex = Math.max(0, items.findIndex((item) => item.active))
+    const maxStart = Math.max(0, items.length - count)
+    const windowStart = Math.min(maxStart, Math.max(0, selectedIndex - Math.floor(count / 2)))
+    const overflow = items.length > count
+    return {
+      items,
+      selectedIndex,
+      count: items.length,
+      visibleCount: count,
+      overflow,
+      windowStart,
+      arrows: {
+        prev: {
+          enabled: windowStart > 0,
+          label: '上一组作物',
+          disabledReason: '已经是第一组'
+        },
+        next: {
+          enabled: windowStart < maxStart,
+          label: '下一组作物',
+          disabledReason: '已经是最后一组'
+        }
+      }
+    }
   }
 
   /**
@@ -427,6 +503,10 @@
   /**
    * 本周盈亏（票 81）：显示「已实现 + 未实现」，收益率 = 合计 / 周起点硬币。
    * `base` 是 0（新账本/坏文件）时收益率画「—」：除零没有意义，不编一个 0%。
+   *
+   * 票 89 瘦身：顶栏只留一颗胶囊 `本周 −1.0 (−4.6%)`——盈亏一位小数、收益率一位小数
+   * 放在括号里，负号用 U+2212。`pnlText`/`pctText` 保留旧口径给榜单/旧测试用，
+   * 窗口顶栏读 `pnlMinusText` + `pctParenText`。
    */
   function weekView (payload) {
     const week = payload !== null && typeof payload === 'object' && payload.week !== null &&
@@ -438,6 +518,8 @@
     const total = toNumber(week.total) ?? realized + unrealized
     const base = toNumber(week.base)
     const pct = base === null || base <= 0 ? null : (total / base) * 100
+    const pnlMinusText = formatSignedMinus(total)
+    const pctParenText = pct === null ? '(—)' : '(' + formatSignedMinus(pct, 1) + '%)'
     return {
       pnl: total,
       realized,
@@ -445,8 +527,12 @@
       base,
       pnlText: formatSigned(total),
       pnlTone: toneOf(total),
+      pnlMinusText,
       pctText: pct === null ? '—' : formatSigned(pct, 2) + '%',
+      pctParenText,
       pctTone: toneOf(pct, 2),
+      // 顶栏胶囊的完整文案：`本周 −1.0 (−4.6%)`。
+      pillText: '本周 ' + pnlMinusText + ' ' + pctParenText,
       baseText: formatCoins(base ?? 0),
       hasBase: base !== null && base > 0
     }
@@ -557,6 +643,7 @@
       const centerX = plot.left + slotWidth * (index + 0.5)
       const openY = yOf(open)
       const closeY = yOf(close)
+      const up = close >= open
       return {
         index,
         slot,
@@ -567,7 +654,9 @@
         width: bodyWidth,
         bodyTop: Math.min(openY, closeY),
         bodyHeight: Math.max(1, Math.abs(closeY - openY)),
-        up: close >= open,
+        up,
+        // 票 89：跌蜡烛画空心（纸色填充 + 玫红描边），不只靠颜色区分涨跌。
+        hollow: !up,
         // 票 87：每根蜡烛的墨水参数（粗细/圆角/倾斜）都由确定性哈希给出。
         sketch: candleSketchOf(index, slot)
       }
@@ -614,6 +703,19 @@
         visible
       }
     })
+    // 票 89：参考线标签也在这里算好 y。底价/入场/强平挨得近时（比如入场离底价 1%），
+    // 三个标签不能叠在一起；按 y 排序后每个至少错开 13px，并夹在绘图区里。
+    const visibleLines = lines.filter((line) => line.visible).sort((left, right) => left.y - right.y)
+    let previousLabelY = -Infinity
+    for (const line of visibleLines) {
+      let labelY = Math.max(line.y - 4, plot.top + 10, previousLabelY + 13)
+      labelY = Math.min(labelY, plot.top + plot.height - 4)
+      line.labelY = labelY
+      previousLabelY = labelY
+    }
+    for (const line of lines) {
+      if (line.visible !== true) line.labelY = null
+    }
     const geometry = {
       width,
       height,
@@ -767,7 +869,8 @@
    * 文案统一走 `formatPrice`，与图例、持仓卡的数字口径一致。
    */
   function priceTicksOf (plot, domain) {
-    const count = plot.height >= 240 ? 5 : 4
+    // 票 89：图变矮（198）后绘图区约 158px，5 档仍够排（每档约 40px），保留 5 档更好读。
+    const count = plot.height >= 150 ? 5 : 4
     const ticks = []
     for (let index = 0; index < count; index += 1) {
       const ratio = index / (count - 1)
@@ -837,8 +940,9 @@
       ? geometry.plot.top + geometry.plot.height / 2
       : geometry.plot.top + ((geometry.domain.max - value) / span) * geometry.plot.height
     const text = formatPrice(value)
-    const width = Math.max(42, text.length * 6.2 + 14)
-    const height = 19
+    // 票 89：轴字 11px，胶囊跟着放宽/放高一点，价格读起来不挤。
+    const width = Math.max(44, text.length * 7.2 + 16)
+    const height = 22
     const left = Math.min(
       geometry.width - width - 3,
       geometry.plot.left + geometry.plot.width + 5
@@ -912,8 +1016,9 @@
     ]
     const text = timeText + ' 开 ' + formatPrice(values.open) + ' 高 ' + formatPrice(values.high) +
       ' 低 ' + formatPrice(values.low) + ' 收 ' + formatPrice(values.close)
-    const cardWidth = Math.min(188, Math.max(96, plot.width - 8))
-    const cardHeight = Math.min(66, Math.max(40, plot.height - 8))
+    // 票 89：轴/便签字号提到 11px 后，便签要宽一点、高一点才不挤；仍整体夹在绘图区里。
+    const cardWidth = Math.min(210, Math.max(96, plot.width - 8))
+    const cardHeight = Math.min(78, Math.max(40, plot.height - 8))
     // 便签放指针右上方；靠右就翻到左边，靠上就翻到下面，最后再整体夹进绘图区。
     let left = nearest.centerX + 12
     if (left + cardWidth > plot.left + plot.width - 4) left = nearest.centerX - cardWidth - 12
@@ -999,7 +1104,8 @@
       timeframeLabel: label,
       timeframes: timeframesView(payload, period),
       hasChart: geometry !== null,
-      emptyText: '行情还在算，稍等一下。K 线一分钟才动一格。',
+      // 票 89：空态一行；「K 线一分钟才动一格」这类解释不再挂在窗口上。
+      emptyText: '行情还在算',
       base: chartBaseOf(payload, selected, period),
       baseText: formatPrice(chartBaseOf(payload, selected, period)),
       priceText: formatPrice(current === null ? null : current.price),
@@ -1078,21 +1184,27 @@
 
     let canSubmit = true
     let hint = ''
+    // 票 89：禁用原因压成一句「差 N 硬币」；0 硬币时按钮本身就是「去种地」。
     if (coins.available <= 0) {
       canSubmit = false
-      hint = '硬币不够了，先去种地。'
+      hint = '去种地'
     } else if (coins.available < chosenMargin) {
       canSubmit = false
-      hint = '硬币不够，选小一点的保证金或先去卖点作物。'
+      hint = '差 ' + formatCoins(Math.ceil(chosenMargin - coins.available)) + ' 硬币'
     }
 
-    const marginChoices = limits.margins.map((candidate) => ({
-      margin: candidate,
-      label: String(candidate),
-      allIn: false,
-      active: !chosenAllIn && candidate === chosenMargin,
-      disabled: candidate > coins.available
-    }))
+    const marginChoices = limits.margins.map((candidate) => {
+      const shortfall = Math.max(0, Math.ceil(candidate - coins.available))
+      return {
+        margin: candidate,
+        label: String(candidate),
+        allIn: false,
+        active: !chosenAllIn && candidate === chosenMargin,
+        disabled: candidate > coins.available,
+        // 票 89：禁用 chip 的可见理由（title），和下方 order-hint 同一句。
+        disabledReason: shortfall > 0 ? '差 ' + formatCoins(shortfall) + ' 硬币' : ''
+      }
+    })
     if (limits.allIn === true) {
       marginChoices.push({
         margin: allInAmount,
@@ -1100,7 +1212,8 @@
         allIn: true,
         active: chosenAllIn,
         // 0 硬币时「全下」也没有钱可下：和预设一样禁用。
-        disabled: allInAmount < 1
+        disabled: allInAmount < 1,
+        disabledReason: allInAmount < 1 ? '去种地' : ''
       })
     }
 
@@ -1137,12 +1250,13 @@
       : formatPrice(band.min) + '–' + formatPrice(band.max)
     let limitHint = ''
     if (limitOpen) {
-      if (coins.available <= 0) limitHint = '硬币不够了，先去种地。'
-      else if (coins.available < chosenMargin) limitHint = '硬币不够，选小一点的保证金或先去卖点作物。'
-      else if (!targetInBand) {
+      if (coins.available <= 0) limitHint = '去种地'
+      else if (coins.available < chosenMargin) {
+        limitHint = '差 ' + formatCoins(Math.ceil(chosenMargin - coins.available)) + ' 硬币'
+      } else if (!targetInBand) {
         limitHint = bandText === ''
-          ? '目标价要填一个大于 0 的数字。'
-          : '目标价要在 ' + bandText + ' 之间。'
+          ? '目标价要大于 0'
+          : '目标价要在 ' + bandText + ' 之间'
       }
     }
     const canPlace = limitOpen && targetInBand && coins.available > 0 && coins.available >= chosenMargin
@@ -1183,10 +1297,11 @@
         canPlace,
         hint: limitHint,
         placeLabel: coins.available <= 0 ? '去种地' : '挂单',
-        // 说清做多/做空分别等哪个方向越价，不用玩家自己推。
-        note: chosenSide === 'long'
-          ? '到价成交：价格跌到目标价时做多；收盘没成交自动撤单。'
-          : '到价成交：价格涨到目标价时做空；收盘没成交自动撤单。'
+        // 票 89：到价行只留一句状态提示。开：可挂价格带；关：不写（「关：直接按现价开仓」已删）。
+        noteText: limitOpen ? (bandText === '' ? '到价才成交' : '可挂 ' + bandText) : '',
+        // 方向与自动撤单放 title，不再占一屏小字。
+        noteTitle: (chosenSide === 'long' ? '价格跌到目标价才成交' : '价格涨到目标价才成交') +
+          '；收盘没成交自动撤单'
       }
     }
   }
@@ -1296,20 +1411,17 @@
     return rows
   }
 
-  /** 空态文案：每一块都要说清「现在能做什么」，不是一句「暂无数据」。 */
-  function emptyHints (payload) {
-    const coins = coinsOf(payload)
+  /**
+   * 空态文案（票 89）：一行就够，不再解释「收盘或手动平仓后会出现在这里」。
+   * 每一块只回答「现在是什么状态」；怎么操作由旁边的按钮自己说。
+   */
+  function emptyHints () {
     return {
-      positions: coins.available <= 0
-        ? '还没有持仓。硬币不够开仓时，先去种地。'
-        : '还没有持仓。选好方向和保证金，一键开一手。',
-      history: '还没有结算记录。收盘或手动平仓后会出现在这里。',
-      // 票 83：到价是可选工具，空态顺便教一次怎么用；收盘没成交自动撤。
-      orders: coins.available <= 0
-        ? '没有挂单。硬币不够，先去种地。'
-        : '没有挂单。点开「到价」设一个目标价，到价自动成交；收盘没成交自动撤单。',
-      // 票 82：榜上只有自己时用这一句（空态也要说清「现在能做什么」）。
-      neighbors: '还没有邻居上线。等邻居打开 DSH 就会出现在这里；行情照走，一个人也能做单。'
+      positions: '还没有持仓',
+      history: '还没有结算',
+      orders: '没有挂单',
+      // 榜上只有自己时也只用这一句（旧版本邻居有单独一句，见 `leagueView`）。
+      neighbors: '等邻居上线'
     }
   }
 
@@ -1405,22 +1517,24 @@
   }
 
   /**
-   * Tab 顺序（票 81 / 评审 P2）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
+   * Tab 顺序（票 81 / 评审 P2 / 票 89）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
    *
-   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物页签 → 周期页签 → 方向 → 保证金
-   * （预设 + 全下）→ 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单卡的撤单 →
-   * 持仓卡的止损/平仓。
+   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物条左右箭头 → 作物 chip → 周期页签 →
+   * 方向 → 保证金（预设 + 全下）→ 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 →
+   * 挂单卡的撤单 → 持仓卡的止损/平仓。
    * 每项都是 `board.js` 的 `focusKeyOf` 能认出的键，且**不重复**（tabindex 只能给一个元素）。
    * 纯函数：不碰 DOM，测试能直接断言；老/坏 payload 退回兜底白名单，不抛。
    */
   function focusOrder (payload) {
     const limits = limitsOf(payload)
-    const order = ['close-button']
+    // 票 89：左右箭头是作物条的滚动助手，排在作物 chip 两边（DOM 里也是这样）。
+    const order = ['close-button', 'crop-prev']
     for (const crop of limits.crops) {
       if (crop !== null && typeof crop === 'object' && typeof crop.id === 'string') {
         order.push('crop:' + crop.id)
       }
     }
+    order.push('crop-next')
     // 票 84：周期页签紧跟在作物页签后面（DOM 里也是这样），键盘能直接切周期。
     for (const timeframe of limits.timeframes) order.push('timeframe:' + timeframe.id)
     for (const side of Object.keys(SIDE_LABELS)) order.push('side:' + side)
@@ -1474,7 +1588,8 @@
     height = CHART_HEIGHT
   } = {}) {
     const safe = payload !== null && typeof payload === 'object' ? payload : null
-    const crops = cropsView(safe, crop)
+    const cropStrip = cropStripView(safe, crop)
+    const crops = cropStrip.items
     const selected = crops.find((entry) => entry.active)?.id ?? pickCrop(safe, crop)
     const order = orderView(safe, {
       side,
@@ -1492,6 +1607,7 @@
       week: weekView(safe),
       hint: hintView(safe, selected),
       crops,
+      cropStrip,
       chart: chartView(safe, { crop: selected, timeframe, width, height }),
       order,
       orders,
@@ -1511,12 +1627,14 @@
     CHART_HEIGHT,
     CHART_PADDING,
     CHART_AXIS_PADDING,
+    CROP_STRIP_VISIBLE,
     LAYOUT,
     SKETCH,
     formatCoins,
     formatCountdown,
     formatPrice,
     formatSigned,
+    formatSignedMinus,
     formatTrim,
     reasonText,
     cropNameOf,
@@ -1543,6 +1661,7 @@
     leagueView,
     emptyHints,
     cropsView,
+    cropStripView,
     boardView
   }
 })

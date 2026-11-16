@@ -66,12 +66,12 @@ import {
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
 import { buildLeague, watcherCounts } from './trading-league.js'
 import {
-  BOARD_CROPS,
   BOARD_TIMEFRAMES,
   PRICE_CEIL_RATIO,
   PRICE_FLOOR_RATIO,
   TRADING_LEVERAGES,
   TRADING_MARGINS,
+  boardCrops,
   boardPrice,
   barsFor,
   barsForTimeframe,
@@ -2108,13 +2108,14 @@ export function createService (ctx, options = {}) {
   /**
    * 当前这一根：价格与倒计时。公式只有 `src/trading-rules.js` 一份——
    * 窗口、收盘结算、K 线（票 81）与强平（票 80）都调它。
-   * 这里是**第一个作物**的那一根（`payload.bar`，票 79 的窗口认它）；
-   * 三个作物各自的完整 OHLC 在 `payload.charts` 里。
+   * 这里是**目录里第一个作物**的那一根（`payload.bar`，票 79 的窗口认它）；
+   * 全部盘口作物各自的完整 OHLC 在 `payload.timeframes['15m']` 里。
+   * 目录一个可交易作物都没有时返回 null：宁可让窗口画空态，也不编一根没有底价的图。
    */
-  function tradingBarView (now) {
+  function tradingBarView (now, crops) {
     const bounds = slotBounds(now)
-    if (bounds === null) return null
-    const crop = BOARD_CROPS[0]
+    if (bounds === null || crops.length === 0) return null
+    const crop = crops[0]
     return {
       crop,
       cropName: CROPS[crop]?.name ?? crop,
@@ -2129,14 +2130,30 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 三个作物各一份「最近 24 根 + 当前一根」（票 81）。一次算齐：
-   * 窗口切页签是本地换图，不再找宿主；一分钟一包的推送成本也不到一千次纯散列。
+   * 紧凑 K 线（票 88）：10 种作物 × 4 周期 × 24 根时，对象形的键名会把盘口包
+   * 顶到 IPC 上限（实测对象形 ≈ 200 KiB）。一根只留 7 个数字：
+   *   `[slot, start, end, open, high, low, close]`
+   * 窗口不直接读它——`desktop/shared.js` 的 `normalizeBoardBar()` 会还原成对象
+   * （老宿主仍可发对象形，两种都认）；`current` 只有一根，保持对象。
+   */
+  function compactBoardBar (bar) {
+    return [bar.slot, bar.start, bar.end, bar.open, bar.high, bar.low, bar.close]
+  }
+
+  function compactBoardChart (chart) {
+    if (chart === null) return null
+    return { base: chart.base, bars: chart.bars.map(compactBoardBar), current: chart.current }
+  }
+
+  /**
+   * 盘口作物各一份「最近 24 根 + 当前一根」（票 81，票 88 起数量跟随目录）。
+   * 一次算齐：窗口切页签是本地换图，不再找宿主；一分钟一包的推送成本也不到一千次纯散列。
    * 单个作物算不出来（作物目录坏了）就跳过它，窗口画空态而不是整窗失败。
    */
-  function tradingChartsView (now) {
+  function tradingChartsView (now, crops) {
     const charts = {}
-    for (const crop of BOARD_CROPS) {
-      const chart = barsFor({ crop, now })
+    for (const crop of crops) {
+      const chart = compactBoardChart(barsFor({ crop, now }))
       if (chart !== null) charts[crop] = chart
     }
     return charts
@@ -2144,18 +2161,19 @@ export function createService (ctx, options = {}) {
 
   /**
    * 四个周期的 K 线（票 84）：`15m` 直接复用上面那份（精确到 1 分钟，
-   * 也是窗口旧字段 `charts` 的那一份），`1h`/`1d`/`1w` 由同一条 `boardPrice()`
+   * 也就是旧窗口认的 15 分图），`1h`/`1d`/`1w` 由同一条 `boardPrice()`
    * 曲线按粗桶采样。四个周期一次算齐，窗口切周期只是本地换图，不再找宿主。
-   * 一包的上限是 4 周期 × 3 作物 ×（24 根 + 当前一根），和 `desktop/shared.js` 的白名单对上。
+   * 票 88：不再把 15 分图额外塞进 `charts` 重复下发（同一份数据序列化两遍白占带宽）；
+   * 旧字段由 helper 的 `normalizeBoardView()` 从 `timeframes['15m']` 补回来。
    */
-  function tradingTimeframesView (now, charts) {
-    const timeframes = { '15m': charts }
+  function tradingTimeframesView (now, crops) {
+    const timeframes = { '15m': tradingChartsView(now, crops) }
     for (const { id } of BOARD_TIMEFRAMES) {
       // 15m 已经在上面复用；其余周期各采一份，算不出来（作物目录坏了）就跳过。
       if (id === '15m') continue
       const period = {}
-      for (const crop of BOARD_CROPS) {
-        const chart = barsForTimeframe({ crop, now, timeframe: id })
+      for (const crop of crops) {
+        const chart = compactBoardChart(barsForTimeframe({ crop, now, timeframe: id }))
         if (chart !== null) period[crop] = chart
       }
       timeframes[id] = period
@@ -2164,9 +2182,9 @@ export function createService (ctx, options = {}) {
   }
 
   /** 风向（票 81）：慢趋势方向 + 55–68% 置信度。窗口只展示，必须写「不是保证」。 */
-  function tradingHintView (now) {
+  function tradingHintView (now, crops) {
     const hints = {}
-    for (const crop of BOARD_CROPS) {
+    for (const crop of crops) {
       const hint = hintOf({ crop, now })
       if (hint !== null) hints[crop] = hint
     }
@@ -2283,16 +2301,15 @@ export function createService (ctx, options = {}) {
       : trading.view({ now, historyLimit: TRADING_VIEW_HISTORY })
     const week = tradingWeekView(view)
     const self = tradingSelfDigest(view, week, now)
-    // 15 分钟那份图既留在 `charts`（旧窗口/旧测试认它），也是 `timeframes['15m']`：
-    // 同一份数据，不重复算，也不会两边出现细微差别。
-    const charts = tradingChartsView(now)
+    // 作物清单在**一份 payload 里只取一次**：四张图、风向、limits 用的是同一份目录快照，
+    // 不会出现「limits 里有、图里没有」的半截包（票 88 / ADR-0031）。
+    const crops = boardCrops()
     return {
       coins: tradingCoinsView(view),
       week,
-      bar: tradingBarView(now),
-      charts,
-      timeframes: tradingTimeframesView(now, charts),
-      hint: tradingHintView(now),
+      bar: tradingBarView(now, crops),
+      timeframes: tradingTimeframesView(now, crops),
+      hint: tradingHintView(now, crops),
       positions: newestFirst(view.positions, 'openedAt'),
       // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
       // 不会把 240 手假装成 200 手（评审 P1）。
@@ -2305,7 +2322,7 @@ export function createService (ctx, options = {}) {
       limits: {
         margins: TRADING_MARGINS.slice(),
         leverages: TRADING_LEVERAGES.slice(),
-        crops: BOARD_CROPS.map((id) => ({ id, name: CROPS[id]?.name ?? id })),
+        crops: crops.map((id) => ({ id, name: CROPS[id]?.name ?? id })),
         // 票 84：周期清单只从 `src/trading-rules.js` 下发，窗口不硬编码
         // 「15分/1时/1日/1周」——加周期只改规则层一处。
         timeframes: BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })),

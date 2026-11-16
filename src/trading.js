@@ -59,10 +59,10 @@ import { join } from 'node:path'
 import { MAX_COINS } from './farm.js'
 import { parseJsonText } from './json-text.js'
 import {
-  BOARD_CROPS,
   MAX_MARGIN,
   SLOT_MS,
   TRADING_CLOSE_REASONS,
+  boardCrops,
   isBoardCrop,
   isBoardSide,
   isMarginAmount,
@@ -642,7 +642,8 @@ class TradingStore {
     if (!isMarginAmount(raw?.margin)) return tradingError('bad-margin')
     const leverage = raw?.leverage === undefined || raw?.leverage === null ? 1 : raw.leverage
     if (!isTradingLeverage(leverage)) return tradingError('bad-leverage')
-    const crop = raw?.crop === undefined || raw?.crop === null ? BOARD_CROPS[0] : raw.crop
+    // 没指定作物时用目录里的第一个（票 88）：默认值不再是写死的 tomato。
+    const crop = raw?.crop === undefined || raw?.crop === null ? boardCrops()[0] : raw.crop
     if (!isBoardCrop(crop)) return tradingError('bad-crop')
     const farm = this.#farm
     if (farm === null) return tradingError('starting')
@@ -722,7 +723,7 @@ class TradingStore {
   }
 
   async #placeOrder (raw) {
-    const crop = raw?.crop === undefined || raw?.crop === null ? BOARD_CROPS[0] : raw.crop
+    const crop = raw?.crop === undefined || raw?.crop === null ? boardCrops()[0] : raw.crop
     if (!isBoardCrop(crop)) return tradingError('bad-crop')
     const side = raw?.side
     if (!isBoardSide(side)) return tradingError('bad-side')

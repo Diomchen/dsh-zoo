@@ -206,7 +206,7 @@ test('票 83：坏挂单/硬币不够都不扣钱；同一价位连挂两张各�
   const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
 
   const bads = [
-    [{ crop: 'corn', side: 'long', target, margin: 50, leverage: 5 }, 'bad-crop'],
+    [{ crop: 'dragonfruit', side: 'long', target, margin: 50, leverage: 5 }, 'bad-crop'],
     [{ crop: 'tomato', side: 'up', target, margin: 50, leverage: 5 }, 'bad-side'],
     [{ crop: 'tomato', side: 'long', target, margin: 0, leverage: 5 }, 'bad-margin'],
     [{ crop: 'tomato', side: 'long', target, margin: 50.5, leverage: 5 }, 'bad-margin'],
@@ -396,7 +396,7 @@ test('票 83：坏挂单行只丢自己并计修补；缺省 orders 不算修补
       { ...good, id: 'o-no-band', target: 99 },
       { ...good, id: 'o-bad-lev', leverage: 2 },
       { ...good, id: 'o-bad-margin', margin: 0 },
-      { ...good, id: 'o-bad-crop', crop: 'corn' }
+      { ...good, id: 'o-bad-crop', crop: 'dragonfruit' }
     ],
     history: []
   })
