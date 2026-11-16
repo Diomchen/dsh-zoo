@@ -46,22 +46,28 @@
   const BOARD_WIDTH = 760
   const BOARD_HEIGHT = 700
   const CHART_WIDTH = 720
-  const CHART_HEIGHT = 198
+  const CHART_HEIGHT = 228
   const CHART_PADDING = Object.freeze({ top: 8, right: 4, bottom: 6, left: 4 })
   /** 右侧价格轴 + 底部时间轴的留白；文字不套滤镜，所以轴标签不会被画出锯齿。 */
   const CHART_AXIS_PADDING = Object.freeze({ top: 14, right: 62, bottom: 26, left: 10 })
   /**
-   * 票 89 的固定版面（760×700，页面不滚）：
-   *   顶栏 52 → 图带 286（作物条 42 + 图 244）→ 下半区 minmax(0,1fr)。
-   * 下半区两列：左 minmax(0,1fr) = 持仓（滚）+ 最近结算 120；右 300 = 下单（不滚）+ 周榜（滚）。
+   * 票 91 的固定版面（760×700，页面不滚）：
+   *   顶栏 50 → 作物条 40 → 图卡 268（图头 + 手绘图）→ 下单横条 104 → 底部剩余（760×700 下 196）。
+   * 下半区两列：左 minmax(0,1fr) = 持仓（滚）+ 最近结算 88（滚）；右 300 = 真人周榜（滚）。
+   * 下单从 300px 的窄列里搬出来，成为图下的整宽横条——拥挤感就是这么消掉的。
    * 这些数字是窗口 CSS 与测试共用的唯一来源；改版面时两边一起改。
    */
-  const HEADER_HEIGHT = 52
-  const CROP_STRIP_HEIGHT = 42
-  const CHART_CARD_HEIGHT = 286
-  const ORDER_COLUMN_WIDTH = 300
-  const CONTROL_ROW_HEIGHT = 34
-  const HISTORY_HEIGHT = 120
+  const HEADER_HEIGHT = 50
+  const CROP_STRIP_HEIGHT = 40
+  const CHART_CARD_HEIGHT = 268
+  const LEAGUE_COLUMN_WIDTH = 300
+  /** 下单横条：整宽，两行（方向/保证金/杠杆/主按钮 + 预览/到价/短提示），不滚不裁。 */
+  const ORDER_BAR_HEIGHT = 104
+  const ORDER_BAR_CONTROL_HEIGHT = 32
+  const ORDER_BAR_SUBMIT_WIDTH = 132
+  const ORDER_BAR_SUBMIT_HEIGHT = 36
+  const ORDER_BAR_GAP = 10
+  const HISTORY_HEIGHT = 88
   /**
    * 作物条一屏大概放得下 6 颗 chip（718px 宽减去左右箭头与 4 档周期）。
    * 只是「初始窗口」的估算：真实滚动位置由 DOM 量出来，纯视图用它算箭头初始禁用态。
@@ -79,12 +85,13 @@
     numOctaves: 2,
     lineCap: 'round'
   })
-  /** 版面：图带独占一行，下面两列（左持仓/结算，右下单/周榜）。DOM 顺序仍按 Tab 顺序。 */
+  /** 版面：图卡独占一行，图下是整宽下单横条，再下面两列（左持仓/结算，右周榜）。 */
   const LAYOUT = Object.freeze({
     board: Object.freeze({ width: BOARD_WIDTH, height: BOARD_HEIGHT }),
     headerHeight: HEADER_HEIGHT,
     cropStripHeight: CROP_STRIP_HEIGHT,
     chartCardHeight: CHART_CARD_HEIGHT,
+    orderBarHeight: ORDER_BAR_HEIGHT,
     chart: Object.freeze({
       width: CHART_WIDTH,
       height: CHART_HEIGHT,
@@ -92,20 +99,42 @@
     }),
     columns: Object.freeze({
       left: Object.freeze(['positions', 'history']),
-      right: Object.freeze(['order', 'league'])
+      right: Object.freeze(['league'])
     }),
-    bottom: Object.freeze({
-      // 下单列固定 300：四档保证金 / 三档杠杆的 grid 就是按这个宽度量的（minmax(0,1fr) 防溢出）。
-      rightWidth: ORDER_COLUMN_WIDTH,
-      controlRow: CONTROL_ROW_HEIGHT,
-      historyHeight: HISTORY_HEIGHT,
-      // 方向/保证金/杠杆三行固定 34；到价开关放在卡片头部，展开后多一行 34 的目标价。
-      selectorRows: 3,
-      limitRow: CONTROL_ROW_HEIGHT,
+    // 下单横条的几何契约：窗口 CSS 按这些数排，测试盯着它们别把控件挤回 300px 宽。
+    orderBar: Object.freeze({
+      height: ORDER_BAR_HEIGHT,
+      controlHeight: ORDER_BAR_CONTROL_HEIGHT,
+      submitWidth: ORDER_BAR_SUBMIT_WIDTH,
+      submitHeight: ORDER_BAR_SUBMIT_HEIGHT,
+      gap: ORDER_BAR_GAP,
+      rows: 2,
       marginColumns: 4,
       leverageColumns: 3
+    }),
+    bottom: Object.freeze({
+      // 右列只剩周榜，宽度仍是 300（真人周榜的盈亏/收益率按它排）。
+      rightWidth: LEAGUE_COLUMN_WIDTH,
+      historyHeight: HISTORY_HEIGHT
     })
   })
+  /**
+   * 票 91：显示偏好（图表类型 / 配色）只活在本机窗口里，宿主完全不知道。
+   * 存储键固定成 `dsh-zoo-board-prefs`，读写失败一律静默退默认——file:// 页面在
+   * 某些策略下 localStorage 会直接抛，盘口不能因为存不了偏好就打不开。
+   */
+  const DISPLAY_STORAGE_KEY = 'dsh-zoo-board-prefs'
+  const CHART_TYPES = Object.freeze(['candle', 'line'])
+  const THEMES = Object.freeze(['color', 'mono'])
+  const DISPLAY_DEFAULTS = Object.freeze({ chartType: 'candle', theme: 'color' })
+  const CHART_TYPE_LABELS = Object.freeze({ candle: '蜡烛', line: '折线' })
+  const THEME_LABELS = Object.freeze({ color: '彩色', mono: '黑白' })
+  /** 折线面积填充的不透明度（12%）：看得出趋势，又不抢走坐标轴/参考线的注意力。 */
+  const LINE_AREA_OPACITY = 0.12
+  /** 快捷键只吃字母键：输入框聚焦时窗口不拦（board.js 判断焦点）。 */
+  const DISPLAY_SHORTCUTS = Object.freeze({ chartType: 'l', theme: 'm' })
+  /** 黑白模式下给数字补的方向记号：去掉颜色以后，▲▼ 是第二眼就能读的信号。 */
+  const MONO_MARKS = Object.freeze({ up: '▲', down: '▼', flat: '' })
   /** 兜底白名单：宿主每一包都会带 `limits`，这里只在极端情况下（老宿主/坏包）用。 */
   const FALLBACK_LIMITS = Object.freeze({
     margins: Object.freeze([50, 100, 250]),
@@ -240,6 +269,113 @@
 
   function stopLevels () {
     return STOP_LEVELS
+  }
+
+  // ---------------------------------------------------------------------------
+  // 票 91：显示偏好（蜡烛/折线、彩色/黑白）——纯函数，存储由调用方注入
+  // ---------------------------------------------------------------------------
+
+  /**
+   * 把任意来源（localStorage / 调用参数）夹成合法偏好。
+   * 认不出的值一律退回默认（蜡烛 + 彩色），不把坏偏好带进渲染；
+   * 返回新对象，调用方可以安全地写回存储。
+   */
+  function displayPrefs (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    return {
+      chartType: CHART_TYPES.includes(source.chartType)
+        ? source.chartType
+        : DISPLAY_DEFAULTS.chartType,
+      theme: THEMES.includes(source.theme) ? source.theme : DISPLAY_DEFAULTS.theme
+    }
+  }
+
+  /**
+   * 从注入的 storage 读偏好（Node 测试塞假 storage，窗口传 localStorage）：
+   * 没有、坏 JSON、getItem 抛错都静默退默认——偏好不值得让盘口打不开。
+   */
+  function readDisplayPrefs (storage) {
+    if (storage === null || typeof storage !== 'object' || typeof storage.getItem !== 'function') {
+      return { ...DISPLAY_DEFAULTS }
+    }
+    try {
+      const raw = storage.getItem(DISPLAY_STORAGE_KEY)
+      if (typeof raw !== 'string' || raw === '') return { ...DISPLAY_DEFAULTS }
+      return displayPrefs(JSON.parse(raw))
+    } catch {
+      return { ...DISPLAY_DEFAULTS }
+    }
+  }
+
+  /** 写偏好：只写两个白名单键；存不了（隐私模式/配额满）就返回 false，不抛。 */
+  function writeDisplayPrefs (storage, prefs) {
+    if (storage === null || typeof storage !== 'object' || typeof storage.setItem !== 'function') {
+      return false
+    }
+    try {
+      storage.setItem(DISPLAY_STORAGE_KEY, JSON.stringify(displayPrefs(prefs)))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 快捷键 `L` / 菜单点「折线」：在两种图表之间来回，返回新偏好（不改入参）。 */
+  function toggleChartType (prefs) {
+    const current = displayPrefs(prefs)
+    return {
+      ...current,
+      chartType: current.chartType === 'candle' ? 'line' : 'candle'
+    }
+  }
+
+  /** 快捷键 `M` / 菜单点「黑白」：在彩色与黑白之间来回，返回新偏好（不改入参）。 */
+  function toggleTheme (prefs) {
+    const current = displayPrefs(prefs)
+    return {
+      ...current,
+      theme: current.theme === 'color' ? 'mono' : 'color'
+    }
+  }
+
+  /**
+   * 显示偏好的渲染视图：`board.js` 只照着设属性、画按钮，不在渲染端判断。
+   * `body` 为空对象 = 彩色；黑白时是 `{'data-mono':'1'}`（窗口把它落到 body 属性上）。
+   */
+  function displayView (prefs) {
+    const normalized = displayPrefs(prefs)
+    const mono = normalized.theme === 'mono'
+    const line = normalized.chartType === 'line'
+    return {
+      ...normalized,
+      mono,
+      line,
+      body: mono ? { 'data-mono': '1' } : {},
+      labels: {
+        toggle: '显示',
+        chartType: CHART_TYPE_LABELS[normalized.chartType],
+        theme: THEME_LABELS[normalized.theme],
+        chartGroup: '图表',
+        themeGroup: '配色'
+      },
+      // 弹层里的两组分段控件：文案/顺序/选中态都由纯视图给，DOM 只负责画。
+      chartOptions: CHART_TYPES.map((id) => ({
+        id,
+        label: CHART_TYPE_LABELS[id],
+        active: id === normalized.chartType
+      })),
+      themeOptions: THEMES.map((id) => ({
+        id,
+        label: THEME_LABELS[id],
+        active: id === normalized.theme
+      }))
+    }
+  }
+
+  /** 黑白模式下给盈亏数字补 ▲/▼；彩色模式原样返回（第二眼才需要记号）。 */
+  function monoNumber (text, tone) {
+    const mark = MONO_MARKS[tone] ?? ''
+    return mark === '' ? text : mark + ' ' + text
   }
 
   /** 认不出的档位当「关」：宁可少一道自动平仓，也不替玩家猜一档。 */
@@ -704,6 +840,8 @@
       pnlText: formatSigned(total),
       pnlTone: toneOf(total),
       pnlMinusText,
+      // 票 91：黑白模式下顶栏数字补 ▲/▼（颜色没了，方向还得读得出来）。
+      pnlMonoText: monoNumber(pnlMinusText, toneOf(total)),
       pctText: pct === null ? '—' : formatSigned(pct, 2) + '%',
       pctParenText,
       pctTone: toneOf(pct, 2),
@@ -828,6 +966,8 @@
         centerX,
         x: centerX - bodyWidth / 2,
         width: bodyWidth,
+        openY,
+        closeY,
         bodyTop: Math.min(openY, closeY),
         bodyHeight: Math.max(1, Math.abs(closeY - openY)),
         up,
@@ -915,6 +1055,62 @@
     geometry.timeTicks = geometry.axes.time
     geometry.priceTag = priceTagOf(geometry)
     return geometry
+  }
+
+  /**
+   * 折线图几何（票 91）：与蜡烛共用同一份 `chartGeometry`（坐标轴/参考线/十字线/现价胶囊
+   * 全部不变），只把「每根的收盘价」连成一条手绘折线，并给 12% 面积与现价圆点。
+   *
+   * 为什么从几何里取而不是重算价格：定义域、绘图区、y 映射只有一份；收盘价在
+   * `chartGeometry` 里已经算成 `closeY`（形成中的那根是现价），窗口照着画就不会和
+   * 蜡烛/胶囊/十字线对不上。
+   */
+  function lineSeries (geometry) {
+    if (geometry === null || typeof geometry !== 'object') return null
+    // 坏几何（空对象/缺 bars）不造 NaN 路径：没有蜡烛就返回 null，窗口画空态。
+    const bars = Array.isArray(geometry.bars) ? geometry.bars : []
+    const forming = geometry.forming !== null && typeof geometry.forming === 'object'
+      ? geometry.forming
+      : null
+    const candles = forming === null ? bars : bars.concat([forming])
+    if (candles.length === 0) return null
+    const plot = geometry.plot
+    if (plot === null || typeof plot !== 'object') return null
+    const bottom = plot.top + plot.height
+    const points = candles.map((candle) => {
+      const isForming = forming === candle
+      return {
+        index: candle.index,
+        slot: candle.slot,
+        x: candle.centerX,
+        y: candle.closeY,
+        close: isForming ? candle.price : candle.close,
+        tone: candle.up ? 'up' : 'down',
+        forming: isForming
+      }
+    })
+    const first = points[0]
+    const last = points[points.length - 1]
+    const segments = points.map((point) => point.x + ' ' + point.y)
+    return {
+      points,
+      // 折线本体：M/L 连到尾点；面积从首点落到绘图区底、沿底走到末点再收口。
+      path: 'M ' + segments.join(' L '),
+      area: 'M ' + first.x + ' ' + bottom + ' L ' + segments.join(' L ') +
+        ' L ' + last.x + ' ' + bottom + ' Z',
+      areaOpacity: LINE_AREA_OPACITY,
+      // 现价圆点：坐标已在绘图区里（收盘价映射）；窗口只画，不再夹取。
+      dot: {
+        x: last.x,
+        y: last.y,
+        radius: 4.2,
+        value: last.close,
+        tone: last.tone
+      },
+      firstX: first.x,
+      lastX: last.x,
+      bottom
+    }
   }
 
   /**
@@ -1045,7 +1241,7 @@
    * 文案统一走 `formatPrice`，与图例、持仓卡的数字口径一致。
    */
   function priceTicksOf (plot, domain) {
-    // 票 89：图变矮（198）后绘图区约 158px，5 档仍够排（每档约 40px），保留 5 档更好读。
+    // 票 91：图 228 后绘图区约 188px，5 档每档约 47px，保留 5 档更好读。
     const count = plot.height >= 150 ? 5 : 4
     const ticks = []
     for (let index = 0; index < count; index += 1) {
@@ -1244,12 +1440,14 @@
     timeframe = CONTRACT_TIMEFRAME,
     width = CHART_WIDTH,
     height = CHART_HEIGHT,
-    loading = false
+    loading = false,
+    chartType = DISPLAY_DEFAULTS.chartType
   } = {}) {
     const selected = pickCrop(payload, crop)
     const period = pickTimeframe(payload, timeframe)
     const onContractBar = period === CONTRACT_TIMEFRAME
     const label = limitsOf(payload).timeframes.find((entry) => entry.id === period)?.label ?? period
+    const display = displayView({ chartType })
     const chart = chartOf(payload, selected, period)
     const current = chart !== null && isFormingBarLike(chart.current) ? chart.current : null
     const references = chartReferences(payload, selected, {
@@ -1297,8 +1495,15 @@
         text: SETTLE_NOTE_TEXT,
         visible: !onContractBar
       },
-      ariaLabel: label + ' K 线：' + (onContractBar ? '底价、入场、强平参考线' : '只画底价线，看趋势') +
-        '；右侧价格轴、底部时间轴，悬停看每根 OHLC',
+      // 票 91：图表类型是窗口本地偏好；折线的几何与蜡烛共用同一份坐标轴。
+      chartType: display.chartType,
+      chartTypeLabel: display.labels.chartType,
+      line: display.chartType === 'line' ? lineSeries(geometry) : null,
+      ariaLabel: display.chartType === 'line'
+        ? label + ' 折线：收盘价走势' + (onContractBar ? '，底价、入场、强平参考线' : '，只画底价线') +
+          '；右侧价格轴、底部时间轴，悬停看每根 OHLC'
+        : label + ' K 线：' + (onContractBar ? '底价、入场、强平参考线' : '只画底价线，看趋势') +
+          '；右侧价格轴、底部时间轴，悬停看每根 OHLC',
       reference: references.reference,
       entry: references.entry,
       liquidation: references.liquidation,
@@ -1461,6 +1666,10 @@
       canSubmit,
       hint,
       preview: preview.text,
+      // 票 91：下单横条第二行只放这一句（不写杠杆/保证金——上面两排 chip 已经选着了）；
+      // 强平价由 `liquidationText` 接在后面，窗口用 · 连成一行。
+      previewShort: '涨 1% +' + formatTrim(preview.perPercent) +
+        ' · 跌 1% ' + MINUS + formatTrim(preview.perPercent),
       previewParts: preview,
       // 下单前的强平价（US7）：数字给 drift 测试，文案给窗口。
       liquidationPrice,
@@ -1513,6 +1722,8 @@
         title: sideLabel(position.side) + ' · ' + cropNameOf(payload, position.crop) + ' · ' + leverage + '×',
         pnlText: formatSigned(pnl),
         pnlTone: toneOf(pnl),
+        // 票 91：黑白模式用 ▲/▼ + 正负号代替涨跌颜色。
+        pnlMonoText: monoNumber(formatSigned(pnl), toneOf(pnl)),
         marginText: formatCoins(position.margin),
         entryText: formatPrice(position.entry),
         markText: formatPrice(position.mark),
@@ -1547,6 +1758,8 @@
         title: sideLabel(entry.side) + ' · ' + cropNameOf(payload, entry.crop) + ' · ' + leverage + '×',
         pnlText: formatSigned(pnl),
         pnlTone: toneOf(pnl),
+        // 票 91：黑白模式用 ▲/▼ 补上被去掉的颜色语义。
+        pnlMonoText: monoNumber(formatSigned(pnl), toneOf(pnl)),
         entryText: formatPrice(entry.entry),
         exitText: formatPrice(entry.exit),
         reasonText: reasonText(entry.reason),
@@ -1647,13 +1860,20 @@
       const nickname = typeof entry.nickname === 'string' && entry.nickname.trim() !== ''
         ? entry.nickname.trim()
         : '邻居'
+      const pnlText = formatSigned(weekPnl, 0)
+      const pnlTone = toneOf(weekPnl)
+      const pctText = pct === null ? '—' : formatSigned(pct * 100, 2) + '%'
+      const pctTone = pct === null ? 'flat' : toneOf(pct * 100, 2)
       rows.push({
         nickname,
         me: entry.me === true,
-        pnlText: formatSigned(weekPnl, 0),
-        pnlTone: toneOf(weekPnl),
-        pctText: pct === null ? '—' : formatSigned(pct * 100, 2) + '%',
-        pctTone: pct === null ? 'flat' : toneOf(pct * 100, 2),
+        pnlText,
+        pnlTone,
+        // 票 91：黑白榜同样靠 ▲/▼ 读方向，不靠红绿。
+        pnlMonoText: monoNumber(pnlText, pnlTone),
+        pctText,
+        pctTone,
+        pctMonoText: pct === null ? '—' : monoNumber(pctText, pctTone),
         positionsText: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
         // US19：一屏最多画 3 条持仓；多出来的写「+N」，摘要仍保留完整计数。
         chips: chips.slice(0, 3),
@@ -1696,18 +1916,27 @@
   }
 
   /**
-   * Tab 顺序（票 81 / 评审 P2 / 票 89）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
+   * Tab 顺序（票 81 / 评审 P2 / 票 89 / 票 91）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
    *
-   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物条左右箭头 → 作物 chip → 周期页签 →
-   * 方向 → 保证金（预设 + 全下）→ 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 →
-   * 挂单卡的撤单 → 持仓卡的止损/平仓。
+   * 顺序 = DOM 顺序（行为不变）：显示弹层（开关 + 两组分段；收起时被 display:none 跳过）→
+   * ×（顶栏）→ 作物条左右箭头 → 作物 chip → 周期页签 → 方向 → 保证金（预设 + 全下）→
+   * 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单卡的撤单 → 持仓卡的止损/平仓。
    * 每项都是 `board.js` 的 `focusKeyOf` 能认出的键，且**不重复**（tabindex 只能给一个元素）。
    * 纯函数：不碰 DOM，测试能直接断言；老/坏 payload 退回兜底白名单，不抛。
    */
   function focusOrder (payload) {
     const limits = limitsOf(payload)
+    // 票 91：顶栏「显示」在 × 左边；弹层里的四个选项紧跟开关（收起时不可聚焦）。
     // 票 89：左右箭头是作物条的滚动助手，排在作物 chip 两边（DOM 里也是这样）。
-    const order = ['close-button', 'crop-prev']
+    const order = [
+      'display-toggle',
+      'chart-type:candle',
+      'chart-type:line',
+      'theme:color',
+      'theme:mono',
+      'close-button',
+      'crop-prev'
+    ]
     for (const crop of limits.crops) {
       if (crop !== null && typeof crop === 'object' && typeof crop.id === 'string') {
         order.push('crop:' + crop.id)
@@ -1764,10 +1993,14 @@
     targetText = '',
     allIn = false,
     chartsLoading = false,
+    chartType = DISPLAY_DEFAULTS.chartType,
+    theme = DISPLAY_DEFAULTS.theme,
     width = CHART_WIDTH,
     height = CHART_HEIGHT
   } = {}) {
     const safe = payload !== null && typeof payload === 'object' ? payload : null
+    // 票 91：图表类型/配色是窗口本地偏好——只影响画法，不碰价格、持仓、结算。
+    const display = displayView({ chartType, theme })
     const cropStrip = cropStripView(safe, crop)
     const crops = cropStrip.items
     const selected = crops.find((entry) => entry.active)?.id ?? pickCrop(safe, crop)
@@ -1788,7 +2021,16 @@
       hint: hintView(safe, selected),
       crops,
       cropStrip,
-      chart: chartView(safe, { crop: selected, timeframe, width, height, loading: chartsLoading === true }),
+      chart: chartView(safe, {
+        crop: selected,
+        timeframe,
+        width,
+        height,
+        loading: chartsLoading === true,
+        chartType: display.chartType
+      }),
+      // 票 91：显示弹层的按钮/文案/黑白标记都来自这里；`board.js` 只照着画。
+      display,
       order,
       orders,
       ordersMetaText: listMetaText('挂单', orders.length, safe === null ? null : safe.ordersTotal),
@@ -1809,6 +2051,13 @@
     CHART_AXIS_PADDING,
     CHART_CACHE_LIMIT,
     CROP_STRIP_VISIBLE,
+    ORDER_BAR_HEIGHT,
+    DISPLAY_STORAGE_KEY,
+    DISPLAY_DEFAULTS,
+    DISPLAY_SHORTCUTS,
+    CHART_TYPES,
+    THEMES,
+    LINE_AREA_OPACITY,
     LAYOUT,
     SKETCH,
     formatCoins,
@@ -1828,11 +2077,19 @@
     hintView,
     headerView,
     chartGeometry,
+    lineSeries,
     chartAxes,
     priceTagOf,
     crosshairAt,
     candleSketchOf,
     chartView,
+    displayPrefs,
+    displayView,
+    readDisplayPrefs,
+    writeDisplayPrefs,
+    toggleChartType,
+    toggleTheme,
+    monoNumber,
     previewView,
     orderView,
     focusOrder,

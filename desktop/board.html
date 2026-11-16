@@ -3,32 +3,34 @@
   <head>
     <meta charset="utf-8" />
     <!--
-      盘口小窗（票 79–85 / 87 / 89）：固定 760×700，页面本身不滚动。
+      盘口小窗（票 79–85 / 87 / 89 / 90 / 91）：固定 760×700，页面本身不滚动。
 
-      版面（票 89 重做）：
-        顶栏 52：盘口 + 当前作物 / 本周胶囊 / 可用·锁定 / 收盘倒计时 / ×。
-        图带 286：作物条 42（任意数量作物单行横向滚动，左右箭头 + 滚轮 + 键盘，
-                  右侧 4 档周期分段控件）+ 图头 30 + 手绘 K 线 198（票 87 的 SVG/轴/十字线）。
-        下半区：左 minmax(0,1fr) = 持仓 + 到价挂单（同一个滚动区）+ 最近结算 120（滚）；
-                右 300 = 下单（不滚、不裁切）+ 周榜（滚）。
+      版面（票 91 重做）：
+        顶栏 50：盘口 + 本周胶囊 + 可用·锁定 + 显示（图表/配色弹层）+ 收盘倒计时 + ×。
+        作物条 40：任意数量作物单行横向滚动（左右箭头 + 滚轮 + 键盘），右侧 4 档周期分段控件。
+        图卡 268：图头 26 + 手绘 SVG 228（蜡烛或折线；轴/参考线/十字线/现价胶囊共用）。
+        下单横条 104：整宽、两行——方向 / 保证金 / 杠杆 / 开一手（132×36）；
+                    预览 + 到价开关 + 一句短提示。到价面板是横条下方的小浮层，不推页面、不裁切。
+        底部 196：左列 = 持仓（滚）+ 最近结算 88（滚）；右列 300 = 真人周榜（滚）。
       所有卡片都是 2px 墨线 + 硬投影 + wobbly 圆角（手绘 token）；跌蜡烛空心，
       不只靠颜色；焦点环在每颗控件上都看得见。
 
-      下单区为什么拆成 label 40 + 控件 minmax(0,1fr) 的 grid：旧版把「方向/杠杆」塞进同一
-      flex 行，760×700 下 20×、全下、到价整行被横向裁掉（票 89 的实机截图）。四档保证金 /
-      三档杠杆用 repeat(N, minmax(0,1fr))，300px 宽度下也不会把 chip 挤出去；
-      控件区不套滚动容器，主按钮固定在卡片底部。
+      为什么下单要改成图下横条：旧版把它塞进 300px 右列，四档保证金 + 三档杠杆 + 到价
+      在 760×700 下永远显得挤（票 89 只是保证不裁，拥挤感还在）。整宽横条一行排完，
+      控件 ≥30px 高、间距 10px，和图表上下相邻——「看涨看跌 → 开仓」是一条视线。
 
-      文案（票 89）：删掉副标题、长提示和长空态；只留预览句、差 N 硬币/去种地、
-      非 15 分周期的「15 分钟结算」。正文/标签 ≥12px，只有图轴/参考线标签/便签 11px。
+      黑白模式（防老板）：`body[data-mono='1']` 把 emerald/rose/amber 全换成墨色/石墨灰，
+      卡片、chip、周榜、盈亏一起失饱和；涨跌靠「实心/空心 + ▲▼ + 正负号」区分，不靠颜色。
+      图表类型/配色只存在本机（localStorage['dsh-zoo-board-prefs']），宿主完全不知道。
 
       和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
       /state。行情、硬币、持仓、挂单、历史、周盈亏、风向、真人周榜全部由宿主随
       `board-window` 命令推过来，这里只画、只把「申请」交回主进程。窗口能收键盘
       （focusable），失焦策略见 ADR-0029：点窗口外面会收起所有插件窗，输入法合成期间例外。
 
-      Tab 顺序 = `focusOrder()`（trading-view.js）：× → 作物条箭头 → 作物 chip → 周期
-      → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单撤单 → 持仓止损/平仓。
+      Tab 顺序 = `focusOrder()`（trading-view.js）：显示开关/两组分段 → × → 作物条箭头 →
+      作物 chip → 周期 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 →
+      挂单撤单 → 持仓止损/平仓。
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -61,6 +63,39 @@
         --rose-soft: #fbeae7;
         --disabled-bg: #f2efe8;
         --disabled-ink: #8d8b82;
+      }
+      /*
+        票 91 黑白模式（防老板）：只换 token，不重写每条规则。emerald/rose/amber 全部落到
+        墨色与石墨灰，soft 背景落到纸灰；对比度按 #18181b/#52525b on #fafafa 量，正文 ≥4.5:1。
+        是否生效只看 body[data-mono='1']——由 board.js 按本机偏好设置，宿主不知道。
+      */
+      body[data-mono='1'] {
+        --paper: #fafafa;
+        --card: #ffffff;
+        --ink: #18181b;
+        --ink-soft: #3f3f46;
+        --muted: #52525b;
+        --line: #d4d4d8;
+        --line-strong: #a1a1aa;
+        --shadow: 2px 2px 0 rgba(24, 24, 27, 0.08);
+        --shadow-card: 3px 3px 0 rgba(24, 24, 27, 0.06);
+        --emerald: #18181b;
+        --emerald-btn: #18181b;
+        --emerald-deep: #18181b;
+        --emerald-soft: #f4f4f5;
+        --amber: #52525b;
+        --amber-ink: #27272a;
+        --amber-soft: #f4f4f5;
+        --rose: #52525b;
+        --rose-ink: #18181b;
+        --rose-soft: #f4f4f5;
+        --disabled-bg: #f4f4f5;
+        --disabled-ink: #3f3f46;
+      }
+      /* 黑白下禁用态仍要读得出：提高不透明度，靠纸灰底 + 墨字而不是靠掉色。 */
+      body[data-mono='1'] button:disabled,
+      body[data-mono='1'] input:disabled {
+        opacity: 0.75;
       }
       * {
         box-sizing: border-box;
@@ -112,8 +147,11 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        height: 52px;
+        height: 50px;
         padding: 0 12px;
+        /* 票 91：显示弹层要盖在图卡上；顶栏自己成为层叠上下文，别被后面的卡片压住。 */
+        position: relative;
+        z-index: 20;
         background: rgba(255, 254, 250, 0.72);
         border-bottom: 2px solid var(--line);
         /* 票 85 / ADR-0029：只有标题栏是拖动区；下面的按钮/页签/输入必须 no-drag，
@@ -258,16 +296,120 @@
         border-color: var(--rose);
         color: var(--rose-ink);
       }
+      /* ------------------------------ 显示弹层（票 91） ------------------------------ */
+      .display-wrap {
+        position: relative;
+        flex: none;
+      }
+      .display-toggle {
+        height: 30px;
+        padding: 0 10px;
+        border: 2px solid var(--line-strong);
+        border-radius: 9px 8px 10px 7px;
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .display-toggle:hover {
+        border-color: var(--emerald);
+        color: var(--emerald-deep);
+      }
+      .display-toggle[aria-expanded='true'] {
+        border-color: var(--ink);
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      /* 小弹层贴着「显示」往下开：不推顶栏、不推页面；外点/Esc 关闭（board.js 接线）。 */
+      .display-pop {
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 0;
+        z-index: 40;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        width: 208px;
+        padding: 9px 10px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius);
+        background: var(--card);
+        box-shadow: 0 8px 20px rgba(47, 58, 52, 0.16);
+        -webkit-app-region: no-drag;
+      }
+      .display-pop[hidden] {
+        display: none;
+      }
+      .display-group {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .display-label {
+        flex: none;
+        width: 28px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .segmented {
+        flex: 1;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 4px;
+      }
+      .seg {
+        height: 30px;
+        padding: 0 4px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius-sm);
+        background: var(--card);
+        color: var(--ink);
+        font-size: 12px;
+        font-weight: 600;
+        white-space: nowrap;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .seg:hover:enabled {
+        border-color: var(--emerald);
+      }
+      .seg[aria-pressed='true'] {
+        border-color: var(--ink);
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .display-hint {
+        margin: 0;
+        font-size: 12px;
+        color: var(--muted);
+        text-align: center;
+        white-space: nowrap;
+      }
       /* ------------------------------ 版面 ------------------------------ */
       .body {
         flex: 1;
         min-height: 0;
         display: grid;
-        /* 图带 286 固定；下半区吃掉剩余高度（760×700 下约 336）。 */
-        grid-template-rows: 286px minmax(0, 1fr);
+        /* 票 91：作物条 40 / 图卡 268 / 下单横条 104 / 底部吃掉剩余（760×700 下 196）。 */
+        grid-template-rows: 40px 268px 104px minmax(0, 1fr);
         gap: 8px;
         padding: 6px 12px 8px;
         overflow: hidden;
+      }
+      /* 视觉隐藏但保留给读屏/aria-labelledby 的标题（下单横条不再有卡片头）。 */
+      .sr-only {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        white-space: nowrap;
+        border: 0;
       }
       .card {
         min-width: 0;
@@ -341,7 +483,7 @@
       .chart-card {
         display: flex;
         flex-direction: column;
-        padding: 6px 10px;
+        padding: 5px 10px;
         overflow: hidden;
       }
       /* 作物条 42：单行横滚，任意数量；右侧周期分段控件固定。 */
@@ -350,7 +492,8 @@
         display: flex;
         align-items: center;
         gap: 8px;
-        height: 42px;
+        /* 票 91：作物条单独占一行 40（不再是图卡内部的一部分）。 */
+        height: 40px;
         min-width: 0;
       }
       .strip-arrow {
@@ -487,7 +630,7 @@
         display: flex;
         align-items: center;
         gap: 6px;
-        height: 30px;
+        height: 26px;
         min-width: 0;
       }
       .chart-price {
@@ -554,12 +697,12 @@
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
       }
-      /* 图 198：viewBox 720×198；轴字/便签 11px（全窗唯一允许的 11px）。 */
+      /* 图 228：viewBox 720×228；轴字/便签 11px（全窗唯一允许的 11px）。 */
       .chart-svg {
         display: block;
         flex: none;
         width: 100%;
-        height: 198px;
+        height: 228px;
         font-family: inherit;
         shape-rendering: geometricPrecision;
       }
@@ -611,6 +754,24 @@
       }
       .chart-svg .body.forming {
         opacity: 0.55;
+      }
+      /* 票 91 折线：收盘价连成一条手绘墨线 + 12% 面积 + 现价圆点；轴/参考线/十字线不变。 */
+      .chart-svg .line-area {
+        fill: var(--emerald);
+        stroke: none;
+        opacity: 0.12;
+      }
+      .chart-svg .line-path {
+        fill: none;
+        stroke: var(--emerald-deep);
+        stroke-width: 2.2;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+      .chart-svg .line-dot {
+        fill: var(--emerald-deep);
+        stroke: var(--paper);
+        stroke-width: 2;
       }
       .chart-svg .price-line {
         stroke: var(--ink-soft);
@@ -720,7 +881,7 @@
       }
       .chart-empty {
         margin: 0;
-        height: 198px;
+        height: 228px;
         display: grid;
         place-items: center;
         font-size: 12px;
@@ -734,7 +895,7 @@
       .bottom {
         min-height: 0;
         display: grid;
-        /* 票 89：左列吃掉剩余宽度，右侧下单列固定 300（四档保证金按它量）。 */
+        /* 票 91：下单搬走后，左列吃剩余宽度，右列 300 只放真人周榜。 */
         grid-template-columns: minmax(0, 1fr) 300px;
         gap: 8px;
         overflow: hidden;
@@ -743,7 +904,8 @@
         min-width: 0;
         min-height: 0;
         display: grid;
-        grid-template-rows: minmax(0, 1fr) 120px;
+        /* 持仓吃掉剩余高度，最近结算固定 88（两行左右，超出内部滚）。 */
+        grid-template-rows: minmax(0, 1fr) 88px;
         gap: 8px;
       }
       .right-col {
@@ -752,6 +914,9 @@
         display: flex;
         flex-direction: column;
         gap: 8px;
+      }
+      .right-col .league-card {
+        flex: 1;
       }
       .positions-card,
       .history-card,
@@ -880,7 +1045,7 @@
         overflow: hidden;
         text-overflow: ellipsis;
       }
-      /* 结算行压成一行：标题 + 价格/原因/时间 + 盈亏。3 笔在 120px 的卡片里也看得全。 */
+      /* 结算行压成一行：标题 + 价格/原因/时间 + 盈亏。88px 的卡片里两行、其余内部滚。 */
       .history-row {
         padding: 1px 0;
       }
@@ -903,94 +1068,68 @@
         font-size: 14px;
         min-width: 46px;
       }
-      /* ------------------------------ 下单（不滚、不裁） ------------------------------ */
-      .order-card {
-        flex: none;
+      /* ------------------------ 下单横条（整宽、不滚、不裁，票 91） ------------------------ */
+      /*
+        横条是图卡下面的一整行，两排控件而不是 300px 窄列里的五行：
+          第一排 36px：方向 / 保证金 / 杠杆 / 开一手（132×36，靠右）；
+          第二排 32px：预览句 · 强平价 / 到价开关 / 一句短提示。
+        控件都 ≥30px 高、间距 10px；横条自己不套滚动容器——到价面板是浮层（见下），
+        展开时既不推页面高度，也不会被卡片裁掉。
+      */
+      .order-bar {
+        position: relative;
         display: flex;
         flex-direction: column;
-        gap: 2px;
-        padding: 5px 8px;
-        /* 票 89 的硬要求：下单卡自己绝不出现滚动条；内容按 300px 宽 + 真实高度排。 */
+        justify-content: center;
+        gap: 12px;
+        padding: 6px 10px;
         overflow: visible;
       }
-      .order-head {
-        height: 26px;
-        margin-bottom: 0;
-      }
-      .order-head h2 {
-        flex: none;
-      }
-      .order-head .order-crop {
-        flex: 1;
-        font-size: 12px;
-        color: var(--muted);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      .limit-toggle {
-        flex: none;
-        height: 26px;
-        padding: 0 9px;
-        border: 2px solid var(--line-strong);
-        border-radius: var(--radius-sm);
-        background: var(--card);
-        color: var(--ink-soft);
-        font-size: 12px;
-        font-weight: 600;
-        cursor: pointer;
-        box-shadow: var(--shadow);
-      }
-      .limit-toggle:hover {
-        border-color: var(--amber);
-        color: var(--amber-ink);
-      }
-      .limit-toggle[aria-pressed='true'] {
-        border-color: var(--amber);
-        background: var(--amber-soft);
-        color: var(--amber-ink);
-      }
-      .limit-note {
-        flex: none;
-        max-width: 96px;
-        font-size: 12px;
-        color: var(--muted);
-        font-variant-numeric: tabular-nums;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-      }
-      /* 两列行：标签 40 + 控件 minmax(0,1fr)。34px 行高留足点击面积。 */
-      .field-row {
-        display: grid;
-        grid-template-columns: 40px minmax(0, 1fr);
+      .order-row {
+        display: flex;
         align-items: center;
-        gap: 8px;
-        min-height: 34px;
-      }
-      .field-label {
-        font-size: 12px;
-        color: var(--muted);
-        white-space: nowrap;
-      }
-      .chip-row {
-        display: grid;
-        gap: 8px;
+        gap: 10px;
         min-width: 0;
       }
-      .chip-row.side {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+      .order-row-primary {
+        height: 36px;
       }
-      .chip-row.margins {
-        grid-template-columns: repeat(4, minmax(0, 1fr));
+      .order-row-secondary {
+        height: 32px;
       }
-      .chip-row.leverages {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+      .order-row .field-label {
+        flex: none;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+      }
+      .order-row .chip-row {
+        flex: none;
+        display: grid;
+        /* 同一组内相邻 chip 至少 8px（票 89 的点击目标规则）；组与组之间是 10px。 */
+        gap: 8px;
+      }
+      /* 档位数固定（4 档保证金 / 3 档杠杆），整宽横条里给每颗 chip 一个固定的舒适宽度，
+         比 minmax(0,1fr) 更好读——不再需要迁就 300px 的窄列。 */
+      .order-row .chip-row.side {
+        grid-template-columns: repeat(2, 42px);
+      }
+      .order-row .chip-row.margins {
+        grid-template-columns: repeat(4, 42px);
+      }
+      .order-row .chip-row.leverages {
+        grid-template-columns: repeat(3, 42px);
+      }
+      .order-sep {
+        flex: none;
+        width: 1px;
+        height: 18px;
+        background: var(--line-strong);
       }
       .chip {
         min-width: 0;
-        height: 28px;
-        padding: 0 6px;
+        height: 32px;
+        padding: 0 4px;
         border: 2px solid var(--line-strong);
         border-radius: var(--radius-sm);
         background: var(--card);
@@ -1020,7 +1159,9 @@
         color: var(--disabled-ink);
       }
       .preview {
+        flex: none;
         margin: 0;
+        max-width: 300px;
         font-size: 12px;
         color: var(--ink-soft);
         font-variant-numeric: tabular-nums;
@@ -1031,6 +1172,7 @@
         text-overflow: ellipsis;
       }
       .liquidation {
+        flex: none;
         margin: 0;
         font-size: 12px;
         color: var(--muted);
@@ -1039,18 +1181,45 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        max-width: 220px;
       }
-      .order-actions {
-        margin-top: auto;
-        padding-top: 3px;
-        border-top: 1px dashed var(--line);
-        display: flex;
-        flex-direction: column;
-        gap: 3px;
+      .order-dot {
+        flex: none;
+        font-size: 12px;
+        color: var(--muted);
+        line-height: 1.25;
+      }
+      .order-spacer {
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .limit-toggle {
+        flex: none;
+        height: 32px;
+        padding: 0 10px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius-sm);
+        background: var(--card);
+        color: var(--ink-soft);
+        font-size: 12px;
+        font-weight: 600;
+        cursor: pointer;
+        box-shadow: var(--shadow);
+      }
+      .limit-toggle:hover {
+        border-color: var(--amber);
+        color: var(--amber-ink);
+      }
+      .limit-toggle[aria-pressed='true'] {
+        border-color: var(--amber);
+        background: var(--amber-soft);
+        color: var(--amber-ink);
       }
       .submit {
-        width: 100%;
-        height: 32px;
+        flex: none;
+        width: 132px;
+        height: 36px;
+        margin-left: auto;
         border: 2px solid var(--emerald-deep);
         border-radius: 10px 8px 11px 7px;
         background: var(--emerald-btn);
@@ -1076,15 +1245,17 @@
         color: var(--disabled-ink);
       }
       .hint {
+        flex: none;
         margin: 0;
         font-size: 12px;
         color: var(--amber-ink);
         line-height: 1.2;
+        white-space: nowrap;
       }
       .hint:empty {
         display: none;
       }
-      /* 票 89：fine print 一整段压成一行，放在左列最底（结算卡页脚），不占下单卡的高度。 */
+      /* 票 89：fine print 一整段压成一行，放在左列最底（结算卡页脚），不占下单横条的高度。 */
       .fine {
         margin: 2px 0 0;
         padding-top: 2px;
@@ -1095,18 +1266,59 @@
         text-align: center;
         white-space: nowrap;
       }
-      /* 到价展开：只多一行目标价（34）；带子/错误各一行，错误为空就不占位。 */
+      /*
+        到价面板（票 91）：从横条向下的浮层，不再把目标价塞进下单卡内部。
+        `top: 100% + 6px` 落在底部两列上方，仍在 .body 的 760×700 里，所以不裁、不撑高页面；
+        外点 / Esc 关闭（board.js），Tab 顺序仍是 到价开关 → 目标价 → 挂单。
+      */
       .limit-box {
+        position: absolute;
+        top: calc(100% + 6px);
+        right: 10px;
+        z-index: 30;
         display: flex;
         flex-direction: column;
-        gap: 3px;
+        gap: 6px;
+        width: 360px;
+        padding: 8px 10px;
+        border: 2px solid var(--line-strong);
+        border-radius: var(--radius);
+        background: var(--card);
+        box-shadow: 0 8px 20px rgba(47, 58, 52, 0.16);
       }
       .limit-box[hidden] {
         display: none;
       }
+      .limit-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 12px;
+      }
+      .limit-title {
+        flex: none;
+        font-weight: 700;
+        color: var(--ink-soft);
+      }
+      .limit-note {
+        min-width: 0;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .limit-row {
+        display: grid;
+        grid-template-columns: 48px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 10px;
+      }
       .limit-input {
         min-width: 0;
-        height: 28px;
+        height: 32px;
         padding: 0 8px;
         border: 2px solid var(--line-strong);
         border-radius: 9px 7px 10px 6px;
@@ -1116,15 +1328,8 @@
         font-variant-numeric: tabular-nums;
         box-shadow: var(--shadow);
       }
-      .limit-row {
-        display: grid;
-        grid-template-columns: 40px minmax(0, 1fr) auto;
-        align-items: center;
-        gap: 8px;
-        min-height: 34px;
-      }
       .limit-place {
-        height: 28px;
+        height: 32px;
       }
       .limit-hint {
         margin: 0;
@@ -1297,6 +1502,128 @@
       .toast.error {
         background: var(--rose-ink);
       }
+      /* ------------------------- 黑白模式（防老板，票 91） ------------------------- */
+      /*
+        只覆盖「写死的颜色」：token 已经把 emerald/rose/amber 换成墨色/石墨灰，
+        这里补图表里那几处纸色/贴纸色，保证整窗真正去饱和。
+        涨跌语义不靠颜色：涨=实心墨色、跌=空心墨色（描边墨色），数字带 ▲▼/±。
+      */
+      /* 品牌图标是 emoji：彩色会漏出来，黑白模式统一压成灰度。 */
+      body[data-mono='1'] .brand-mark {
+        filter: grayscale(1);
+      }
+      body[data-mono='1'] .position {
+        background: linear-gradient(180deg, #ffffff, #f4f4f5);
+      }
+      body[data-mono='1'] .chart-svg .chart-paper {
+        fill: #ffffff;
+        stroke: #e4e4e7;
+      }
+      body[data-mono='1'] .chart-svg .ref[data-key='base'] {
+        stroke: var(--muted);
+      }
+      body[data-mono='1'] .chart-svg .ref[data-key='entry'] {
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .ref[data-key='liquidation'] {
+        stroke: var(--ink-soft);
+      }
+      body[data-mono='1'] .chart-svg .ref-label {
+        stroke: #ffffff;
+      }
+      body[data-mono='1'] .chart-svg .ref-label-base,
+      body[data-mono='1'] .chart-svg .ref-label-liquidation {
+        fill: var(--muted);
+      }
+      body[data-mono='1'] .chart-svg .ref-label-entry {
+        fill: var(--ink);
+      }
+      /* 蜡烛：涨=实心墨，跌=空心墨；区别来自填充而不是色相。 */
+      body[data-mono='1'] .chart-svg .body.up {
+        fill: var(--ink);
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .body.down,
+      body[data-mono='1'] .chart-svg .body[data-hollow='true'] {
+        fill: var(--card);
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .wick.up,
+      body[data-mono='1'] .chart-svg .wick.down {
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .price-tag.up,
+      body[data-mono='1'] .chart-svg .price-tag.down {
+        fill: var(--card);
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .price-tag-text.up,
+      body[data-mono='1'] .chart-svg .price-tag-text.down {
+        fill: var(--ink);
+      }
+      /* 折线：墨色线 + 12% 墨色面积 + 墨点；彩色模式的 green 线不进黑白模式。 */
+      body[data-mono='1'] .chart-svg .line-area {
+        fill: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .line-path {
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .line-dot {
+        fill: var(--ink);
+        stroke: var(--card);
+      }
+      /* 十字线便签：纸灰底 + 墨线，不再用黄纸贴纸色。 */
+      body[data-mono='1'] .chart-svg .crosshair-line {
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .crosshair-highlight {
+        fill: rgba(24, 24, 27, 0.08);
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .crosshair-card {
+        fill: #f4f4f5;
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .crosshair-fold {
+        fill: #e4e4e7;
+        stroke: var(--ink);
+      }
+      body[data-mono='1'] .chart-svg .crosshair-title {
+        fill: var(--ink);
+      }
+      /* 选中态不靠色相：黑白下反相（墨底白字）+ 墨线，和未选中的白底一眼分得开。 */
+      body[data-mono='1'] .chip[aria-pressed='true'],
+      body[data-mono='1'] .crop-tab[aria-pressed='true'],
+      body[data-mono='1'] .timeframe-tab[aria-pressed='true'],
+      body[data-mono='1'] .seg[aria-pressed='true'],
+      body[data-mono='1'] .limit-toggle[aria-pressed='true'] {
+        border-color: var(--ink);
+        background: var(--ink);
+        color: #ffffff;
+      }
+      body[data-mono='1'] .chip.short[aria-pressed='true'] {
+        border-color: var(--ink);
+        background: var(--ink);
+        color: #ffffff;
+      }
+      /* 自己那一行在黑白榜里也要一眼认出：纸灰底 + 左边一道墨线。 */
+      body[data-mono='1'] .league-row.me {
+        background: #e4e4e7;
+        box-shadow: inset 2px 0 0 var(--ink);
+      }
+      body[data-mono='1'] .submit,
+      body[data-mono='1'] .submit[data-side='short'] {
+        border-color: var(--ink);
+        background: var(--ink);
+        color: #ffffff;
+      }
+      body[data-mono='1'] .submit:hover:not(:disabled),
+      body[data-mono='1'] .submit[data-side='short']:hover:not(:disabled) {
+        background: #3f3f46;
+      }
+      body[data-mono='1'] .toast.error {
+        background: var(--ink);
+      }
       /* 每屏最多一两处动效：除 hover/选中过渡外不加动画；用户要求减少动态时直接关掉。 */
       @media (prefers-reduced-motion: reduce) {
         .crop-tab,
@@ -1334,6 +1661,39 @@
             <small>锁定</small><b id="coins-locked">0</b>
           </span>
         </div>
+        <!-- 票 91：显示选项（图表类型/配色）只存在本机，不发给宿主。 -->
+        <div class="display-wrap">
+          <button
+            class="display-toggle"
+            id="display-toggle"
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+            aria-controls="display-pop"
+            title="显示选项（L 切图 / M 切配色）"
+          >显示</button>
+          <div class="display-pop" id="display-pop" role="dialog" aria-label="显示选项" hidden>
+            <div class="display-group">
+              <span class="display-label" id="chart-type-label">图表</span>
+              <div
+                class="segmented"
+                id="chart-type-options"
+                role="group"
+                aria-labelledby="chart-type-label"
+              ></div>
+            </div>
+            <div class="display-group">
+              <span class="display-label" id="theme-label">配色</span>
+              <div
+                class="segmented"
+                id="theme-options"
+                role="group"
+                aria-labelledby="theme-label"
+              ></div>
+            </div>
+            <p class="display-hint">L 切图 · M 切配色</p>
+          </div>
+        </div>
         <div class="countdown" title="距这一根收盘">
           <span>距收盘</span>
           <b id="countdown">15:00</b>
@@ -1342,34 +1702,36 @@
       </header>
 
       <div class="body">
-        <section class="card chart-card" aria-label="行情 K 线">
-          <div class="crop-strip">
-            <button
-              class="strip-arrow"
-              id="crop-prev"
-              type="button"
-              aria-label="上一组作物"
-              title="上一组作物"
-            >‹</button>
-            <div class="crop-viewport" id="crop-viewport">
-              <div class="crop-scroll" id="crop-scroll">
-                <div class="crop-tabs" id="crop-tabs" role="group" aria-label="作物"></div>
-              </div>
+        <!-- 作物条单独一行（票 91）：单行横滚，任意数量作物；右侧 4 档周期分段。 -->
+        <div class="crop-strip">
+          <button
+            class="strip-arrow"
+            id="crop-prev"
+            type="button"
+            aria-label="上一组作物"
+            title="上一组作物"
+          >‹</button>
+          <div class="crop-viewport" id="crop-viewport">
+            <div class="crop-scroll" id="crop-scroll">
+              <div class="crop-tabs" id="crop-tabs" role="group" aria-label="作物"></div>
             </div>
-            <button
-              class="strip-arrow"
-              id="crop-next"
-              type="button"
-              aria-label="下一组作物"
-              title="下一组作物"
-            >›</button>
-            <div
-              class="timeframe-tabs"
-              id="timeframe-tabs"
-              role="group"
-              aria-label="K 线周期"
-            ></div>
           </div>
+          <button
+            class="strip-arrow"
+            id="crop-next"
+            type="button"
+            aria-label="下一组作物"
+            title="下一组作物"
+          >›</button>
+          <div
+            class="timeframe-tabs"
+            id="timeframe-tabs"
+            role="group"
+            aria-label="K 线周期"
+          ></div>
+        </div>
+
+        <section class="card chart-card" aria-label="行情图表">
           <div class="chart-head">
             <b class="chart-price" id="chart-price" data-tone="flat">—</b>
             <span class="chart-change" id="chart-change">—</span>
@@ -1380,12 +1742,64 @@
           <svg
             class="chart-svg"
             id="chart"
-            viewBox="0 0 720 198"
+            viewBox="0 0 720 228"
             preserveAspectRatio="none"
             role="img"
             aria-label="K 线"
           ></svg>
           <p class="chart-empty" id="chart-empty" hidden>行情还在算</p>
+        </section>
+
+        <!-- 票 91 下单横条：整宽两排，图下直接开仓；到价面板是向下的浮层。 -->
+        <section class="card order-bar" aria-labelledby="order-title">
+          <h2 class="sr-only" id="order-title">下单</h2>
+          <div class="order-row order-row-primary">
+            <span class="field-label">方向</span>
+            <div class="chip-row side" id="side-row" role="group" aria-label="方向"></div>
+            <span class="order-sep" aria-hidden="true"></span>
+            <span class="field-label">保证金</span>
+            <div class="chip-row margins" id="margin-row" role="group" aria-label="保证金"></div>
+            <span class="order-sep" aria-hidden="true"></span>
+            <span class="field-label">杠杆</span>
+            <div class="chip-row leverages" id="leverage-row" role="group" aria-label="杠杆"></div>
+            <button class="submit" id="submit" type="button">开一手</button>
+          </div>
+          <div class="order-row order-row-secondary">
+            <p class="preview" id="preview"></p>
+            <span class="order-dot" aria-hidden="true">·</span>
+            <p class="liquidation" id="order-liquidation"></p>
+            <span class="order-spacer" aria-hidden="true"></span>
+            <button
+              class="limit-toggle"
+              id="limit-toggle"
+              type="button"
+              aria-pressed="false"
+              aria-controls="limit-box"
+              aria-expanded="false"
+            >到价</button>
+            <p class="hint" id="order-hint"></p>
+          </div>
+          <div class="limit-box" id="limit-box" hidden>
+            <div class="limit-head">
+              <span class="limit-title">到价挂单</span>
+              <span class="limit-note" id="limit-note"></span>
+            </div>
+            <div class="limit-row">
+              <label class="field-label" for="limit-target">目标价</label>
+              <input
+                class="limit-input"
+                id="limit-target"
+                type="text"
+                inputmode="decimal"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="5.00"
+                aria-describedby="limit-note limit-hint"
+              />
+              <button class="ghost limit-place" id="limit-place" type="button">挂单</button>
+            </div>
+            <p class="limit-hint" id="limit-hint"></p>
+          </div>
         </section>
 
         <div class="bottom">
@@ -1395,8 +1809,7 @@
                 <h2 id="positions-title">持仓</h2>
                 <span id="positions-meta">持仓 0</span>
               </div>
-              <!-- 票 89：到价挂单跟持仓同属「还开着的仓」，放在同一个滚动区里；
-                   下单卡因此永远不滚、不裁，右列只留下单 + 周榜。 -->
+              <!-- 票 89：到价挂单跟持仓同属「还开着的仓」，放在同一个滚动区里。 -->
               <div class="scroll" id="blotter">
                 <div class="orders-wrap" id="orders-wrap" hidden>
                   <div class="orders-head">
@@ -1422,55 +1835,6 @@
           </div>
 
           <div class="right-col">
-            <section class="card order-card" aria-labelledby="order-title">
-              <div class="card-head order-head">
-                <h2 id="order-title">下单</h2>
-                <span class="order-crop" id="order-crop">小番茄</span>
-                <button
-                  class="limit-toggle"
-                  id="limit-toggle"
-                  type="button"
-                  aria-pressed="false"
-                >到价</button>
-                <span class="limit-note" id="limit-note"></span>
-              </div>
-              <div class="field-row">
-                <span class="field-label">方向</span>
-                <div class="chip-row side" id="side-row" role="group" aria-label="方向"></div>
-              </div>
-              <div class="field-row">
-                <span class="field-label">保证金</span>
-                <div class="chip-row margins" id="margin-row" role="group" aria-label="保证金"></div>
-              </div>
-              <div class="field-row">
-                <span class="field-label">杠杆</span>
-                <div class="chip-row leverages" id="leverage-row" role="group" aria-label="杠杆"></div>
-              </div>
-              <div class="limit-box" id="limit-box" hidden>
-                <div class="limit-row">
-                  <label class="field-label" for="limit-target">目标价</label>
-                  <input
-                    class="limit-input"
-                    id="limit-target"
-                    type="text"
-                    inputmode="decimal"
-                    autocomplete="off"
-                    spellcheck="false"
-                    placeholder="5.00"
-                    aria-describedby="limit-note limit-hint"
-                  />
-                  <button class="ghost limit-place" id="limit-place" type="button">挂单</button>
-                </div>
-                <p class="limit-hint" id="limit-hint"></p>
-              </div>
-              <p class="preview" id="preview"></p>
-              <p class="liquidation" id="order-liquidation"></p>
-              <div class="order-actions">
-                <p class="hint" id="order-hint"></p>
-                <button class="submit" id="submit" type="button">开一手</button>
-              </div>
-            </section>
-
             <section class="card league-card" aria-labelledby="league-title">
               <div class="card-head">
                 <h2 id="league-title">真人周榜</h2>
