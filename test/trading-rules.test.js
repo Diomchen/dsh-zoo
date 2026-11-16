@@ -3,12 +3,13 @@
  *
  * 只测外部行为——同一 seed 同一根的价格、slot/tick 边界、夹取范围、盈亏与结算取整、
  * 强平价与触线边界、止损档、逐 tick 路径检查（插针/跳 slot/离线补算的上限）、本周起点。
- * 不碰磁盘、不碰时钟、不联网。
+ * 票 81 追加 K 线与风向。不碰磁盘、不碰时钟、不联网。
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  BOARD_BAR_COUNT,
   BOARD_CROPS,
   BOARD_SIDES,
   MAX_LEVERAGE,
@@ -24,7 +25,9 @@ import {
   TRADING_MARGINS,
   TRADING_STOP_LEVELS,
   boardPrice,
+  barsFor,
   hash32,
+  hintOf,
   isBoardCrop,
   isBoardSide,
   isLiquidated,
@@ -177,8 +180,9 @@ test('票 79：本周起点是本地周一 00:00（周一自己、周日深夜�
   assert.equal(weekStartOf('nope'), null)
 })
 
-test('票 80：下单白名单是 1×/5×/20×、50/100、小番茄、多空；止损四档含 0=关', () => {
-  assert.deepEqual(BOARD_CROPS, ['tomato'])
+test('票 80/81：下单白名单是 1×/5×/20×、50/100、三个作物、多空；止损四档含 0=关', () => {
+  // 票 81 起盘口有三个作物：顺序就是窗口页签的顺序，tomato 是 payload.bar 的来源。
+  assert.deepEqual(BOARD_CROPS, ['tomato', 'carrot', 'pumpkin'])
   assert.deepEqual(TRADING_MARGINS, [50, 100])
   assert.deepEqual(TRADING_LEVERAGES, [1, 5, 20])
   assert.deepEqual(BOARD_SIDES, ['long', 'short'])
@@ -187,6 +191,8 @@ test('票 80：下单白名单是 1×/5×/20×、50/100、小番茄、多空；�
   // 0 是「关」，不是「−0%」：默认不设止损也能玩。
   assert.deepEqual(TRADING_STOP_LEVELS, [0, 0.25, 0.5, 1])
   assert.equal(isBoardCrop('tomato'), true)
+  assert.equal(isBoardCrop('carrot'), true)
+  assert.equal(isBoardCrop('pumpkin'), true)
   assert.equal(isBoardCrop('corn'), false)
   assert.equal(isBoardSide('long'), true)
   assert.equal(isBoardSide('up'), false)
@@ -441,4 +447,101 @@ test('票 80：离线补算的循环有界——超过 3 天的部分不逐 tick
   assert.equal(pathScan({ crop: 'tomato', side: 'long', entry, margin: 50, from, to: from }), null)
   assert.equal(pathScan({ crop: 'nope', side: 'long', entry, margin: 50, leverage: 20, from, to: from + SLOT_MS }), null)
   assert.equal(pathScan({ crop: 'tomato', side: 'up', entry, margin: 50, from, to: from + SLOT_MS }), null)
+})
+
+test('票 81：K 线是最近 24 根整根 + 当前一根；开=上一根收，高低夹住开收', () => {
+  const now = SLOT_EDGE + 5 * TICK_MS + 20 * 1000
+  const chart = barsFor({ crop: 'tomato', now })
+  assert.equal(chart.base, BASE)
+  assert.equal(chart.bars.length, BOARD_BAR_COUNT)
+  assert.equal(chart.bars.length, 24)
+  // 同一时刻算两次是同一张图（纯散列，没有隐藏状态）。
+  assert.deepEqual(barsFor({ crop: 'tomato', now }), chart)
+  for (let index = 0; index < chart.bars.length; index += 1) {
+    const bar = chart.bars[index]
+    assert.equal(bar.open, boardPrice({ crop: 'tomato', slot: bar.slot, tick: 0 }))
+    assert.equal(bar.close, boardPrice({ crop: 'tomato', slot: bar.slot, tick: SLOT_TICKS }))
+    assert.ok(bar.high >= Math.max(bar.open, bar.close), '最高价要盖住开盘和收盘：' + bar.slot)
+    assert.ok(bar.low <= Math.min(bar.open, bar.close), '最低价要盖住开盘和收盘：' + bar.slot)
+    assert.ok(bar.low <= bar.high, '最低不高于最高：' + bar.slot)
+    if (index > 0) {
+      // slot 连续 + 收盘 = 下一根开盘：图上的两根之间没有缝。
+      assert.equal(bar.slot, chart.bars[index - 1].slot + 1)
+      assert.equal(bar.open, chart.bars[index - 1].close)
+    }
+  }
+  // 最后一根是「刚刚收掉」的那根，它的收盘就是当前根的开盘。
+  assert.equal(chart.bars.at(-1).slot, chart.current.slot - 1)
+  assert.equal(chart.bars.at(-1).close, chart.current.open)
+  // 当前一根的 slot / tick / 倒计时。
+  assert.equal(chart.current.slot, slotIndexAt(now))
+  // tick 保留两位小数：窗口只用它画「本根第几分钟」，不需要毫秒级。
+  assert.equal(chart.current.tick, 5.33)
+  assert.equal(chart.current.remainingMs, SLOT_MS - 5 * TICK_MS - 20 * 1000)
+  assert.equal(chart.current.price, markPrice({ crop: 'tomato', now }))
+  assert.ok(chart.current.high <= BASE * PRICE_CEIL_RATIO, '现价也要被夹在底价的 1.75 倍里')
+  assert.ok(chart.current.low >= BASE * PRICE_FLOOR_RATIO)
+  // 根数可选，但坏输入不抛：窗口按 payload 画，坏包只是空态。
+  assert.equal(barsFor({ crop: 'tomato', now, count: 3 }).bars.length, 3)
+  assert.equal(barsFor({ crop: 'tomato', now, count: 0 }).bars.length, 1)
+  assert.equal(barsFor({ crop: 'tomato', now, count: 999 }).bars.length < 999, true)
+  assert.equal(barsFor({ crop: 'tomato', now, count: 'x' }).bars.length, 24)
+  assert.equal(barsFor({ crop: 'nope', now }), null)
+  assert.equal(barsFor({ crop: 'tomato', now: 'x' }), null)
+  assert.equal(barsFor(), null)
+})
+
+test('票 81：当前一根按 1 分钟 tick 前进，收盘那一毫秒换成下一根', () => {
+  const atOpen = SLOT_EDGE
+  const open = barsFor({ crop: 'tomato', now: atOpen })
+  assert.equal(open.current.tick, 0)
+  assert.equal(open.current.price, open.current.open)
+  assert.equal(open.current.remainingMs, SLOT_MS)
+  // 过一分钟：tick +1，价格与倒计时都跟着走，但 slot 不变。
+  const afterMinute = barsFor({ crop: 'tomato', now: atOpen + TICK_MS })
+  assert.equal(afterMinute.current.slot, open.current.slot)
+  assert.equal(afterMinute.current.tick, 1)
+  assert.equal(afterMinute.current.price, boardPrice({ crop: 'tomato', slot: open.current.slot, tick: 1 }))
+  assert.equal(afterMinute.current.remainingMs, SLOT_MS - TICK_MS)
+  // 半分钟也算得出小数 tick（窗口每秒重画，价格不会一分钟一跳）。
+  const half = barsFor({ crop: 'tomato', now: atOpen + 7.5 * TICK_MS })
+  assert.equal(half.current.tick, 7.5)
+  assert.ok(half.current.high >= half.current.price && half.current.low <= half.current.price)
+  // 收盘那一毫秒属于下一根：旧根的收盘价就是新根的开盘价。
+  const next = barsFor({ crop: 'tomato', now: SLOT_EDGE + SLOT_MS })
+  assert.equal(next.current.slot, open.current.slot + 1)
+  assert.equal(next.current.tick, 0)
+  assert.equal(next.current.open, slotClosePrice('tomato', open.current.slot))
+})
+
+test('票 81：风向是确定性的 55–68% 弱信号，同一根内不变', () => {
+  const now = SLOT_EDGE + 3 * TICK_MS
+  const hint = hintOf({ crop: 'tomato', now })
+  assert.deepEqual(hintOf({ crop: 'tomato', now }), hint)
+  assert.ok(hint.confidence >= 0.55 && hint.confidence <= 0.68, '置信度落在 55–68%：' + hint.confidence)
+  assert.ok(['up', 'down', 'flat'].includes(hint.direction))
+  // 同一根内（开根/中间/差 1 毫秒收盘）风向不闪：斜率取的是本根起点。
+  for (const offset of [0, 7 * TICK_MS, SLOT_MS - 1]) {
+    assert.deepEqual(hintOf({ crop: 'tomato', now: SLOT_EDGE + offset }), hint)
+  }
+  // 一整天扫过去：方向有涨有跌，置信度是 0.01 一格的离散值，都夹在区间里。
+  const directions = new Set()
+  const confidences = new Set()
+  for (let index = 0; index < 96; index += 1) {
+    const sample = hintOf({ crop: 'tomato', now: now + index * SLOT_MS })
+    directions.add(sample.direction)
+    confidences.add(sample.confidence)
+    assert.ok(sample.confidence >= 0.55 && sample.confidence <= 0.68, '置信度越界：' + sample.confidence)
+  }
+  assert.equal(directions.has('up'), true, '一天里应该出现过偏多')
+  assert.equal(directions.has('down'), true, '一天里应该出现过偏空')
+  assert.ok(confidences.size > 3, '置信度不该是同一个数')
+  // 三个作物各算一份（相位不同），坏输入是 null。
+  assert.notDeepEqual(
+    [hintOf({ crop: 'carrot', now }), hintOf({ crop: 'pumpkin', now })],
+    [hint, hint]
+  )
+  assert.equal(hintOf({ crop: 'nope', now }), null)
+  assert.equal(hintOf({ crop: 'tomato', now: 'x' }), null)
+  assert.equal(hintOf(), null)
 })
