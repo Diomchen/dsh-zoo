@@ -109,9 +109,11 @@
 
   const WATER_COST = 1
   const FERTILIZE_COST = 5
+  // 票 75：生火解冻的固定成本，必须和宿主 THAW_COST 一致。
+  const THAW_COST = Object.freeze({ dew: 2, coins: 5 })
   /** 解锁后至少留一颗最便宜种子的钱；与宿主 PLOT_UNLOCK_RESERVE 同源（drift 测试会读）。 */
   const UNLOCK_RESERVE = 6
-  const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割', withered: '枯萎了' }
+  const STAGE_TEXT = { empty: '空地', growing: '生长中', mature: '可收割', withered: '枯萎了', frozen: '冻住了' }
 
   function cropMeta (cropId) {
     return Object.prototype.hasOwnProperty.call(CROP_META, cropId) ? CROP_META[cropId] : null
@@ -278,7 +280,7 @@
   /** 进度条 = 已生长 / 总生长。剩余时间是宿主算的权威值，这里只做显示。 */
   function progressOf (plot) {
     if (plot === null || typeof plot !== 'object') return 0
-    if (plot.stage === 'empty' || plot.stage === 'withered') return 0
+    if (plot.stage === 'empty' || plot.stage === 'withered' || plot.stage === 'frozen') return 0
     if (plot.stage === 'mature' || plot.mature === true) return 1
     const meta = cropMeta(plot.crop)
     if (meta === null) return 0
@@ -364,28 +366,91 @@
     }
   }
 
-  /** 票 69：秋天来客卡。选择与代价来自宿主，窗口不自己算概率。 */
+  /** 票 69/74：来客卡。四季共用同一张卡，文案/成本/代价全部由宿主给。 */
   function omenCard (omen) {
     if (omen === null || typeof omen !== 'object') return null
     const stakes = omen.stakes ?? {}
     const resolved = omen.resolved === true
-    const canFeed = omen.canFeed !== false
+    const active = omen.active === true
+    const choices = Array.isArray(omen.choices) ? omen.choices : []
+    const guardChoice = choices.find((choice) => choice.id === 'guard') ?? { id: 'guard', label: '守卫' }
+    const feedChoice = choices.find((choice) => choice.id === 'feed') ?? { id: 'feed', label: '安抚' }
+    const costText = (cost) => {
+      const parts = []
+      if (Number(cost?.crops) > 0) parts.push(Number(cost.crops) + ' 个仓库作物')
+      if (Number(cost?.dew) > 0) parts.push(Number(cost.dew) + ' 露水')
+      if (Number(cost?.coins) > 0) parts.push(Number(cost.coins) + ' 硬币')
+      return parts.join(' + ')
+    }
+    const rewardText = (reward) => {
+      const parts = []
+      if (Number(reward?.coins) > 0) parts.push('+' + Number(reward.coins) + ' 硬币')
+      if (Number(reward?.dew) > 0) parts.push('+' + Number(reward.dew) + ' 露水')
+      for (const [crop, qty] of Object.entries(reward?.seeds ?? {})) {
+        if (Number(qty) > 0) parts.push('+' + Number(qty) + ' 颗' + (cropMeta(crop)?.name ?? crop) + '种子')
+      }
+      return parts.join(' ')
+    }
+    const failText = (() => {
+      const parts = []
+      if (Number(stakes.failLoss) > 0) parts.push(Number(stakes.failLoss) + ' 个仓库作物')
+      if (Number(stakes.failWither) > 0) parts.push(Number(stakes.failWither) + ' 块' + (stakes.failMatureOnly === true ? '成熟' : '') + '地')
+      if (Number(stakes.failFreeze) > 0) parts.push(Number(stakes.failFreeze) + ' 块地冻住')
+      return parts.length === 0 ? '没有额外损失' : parts.join(' + ')
+    })()
+    const ignore = stakes.ignoreLoss ?? {}
+    const ignoreParts = []
+    if (Number(ignore.crops) > 0) ignoreParts.push(Number(ignore.crops) + ' 个作物')
+    if (Number(ignore.witherPlots) > 0) ignoreParts.push(Number(ignore.witherPlots) + ' 块地')
+    if (Number(ignore.freezePlots) > 0) ignoreParts.push(Number(ignore.freezePlots) + ' 块地冻住')
+    const cost = costText(stakes.feedCost)
+    const feedReward = rewardText(stakes.feedReward)
+    const guardReward = rewardText(stakes.guardReward)
+    const remaining = Number(omen.remainingMs)
+    const guardOptions = (Array.isArray(omen.guardOptions) ? omen.guardOptions : []).map((option) => {
+      const guards = Math.max(0, Math.min(2, Math.floor(Number(option?.guards) || 0)))
+      const chance = Math.min(1, Math.max(0, Number(option?.chance) || 0))
+      const cost = Math.max(0, Math.floor(Number(option?.cost) || 0))
+      return {
+        guards,
+        chance,
+        cost,
+        affordable: option?.affordable !== false,
+        label: (guards === 0 ? '不另雇' : '雇 ' + guards + ' 名') + ' · ' +
+          Math.round(chance * 100) + '%' + (cost > 0 ? ' · ' + cost + ' 硬币' : '')
+      }
+    })
     return {
       id: typeof omen.id === 'string' ? omen.id : '',
       name: typeof omen.name === 'string' ? omen.name : '来客',
       emoji: typeof omen.emoji === 'string' ? omen.emoji : '🐻',
+      tag: typeof omen.tag === 'string' ? omen.tag : '季候来客',
+      active,
       resolved,
       choice: typeof omen.choice === 'string' ? omen.choice : null,
-      canFeed,
-      detail: '秋夜来了位不速之客。守夜可能失败；投喂 3 个仓库作物稳过。',
-      guardText: '守夜成功 +' + (Number(stakes.guardReward?.coins) || 0) + ' 硬币 +' +
-        (Number(stakes.guardReward?.dew) || 0) + ' 露水；失败被搬走最多 ' + (Number(stakes.failLoss) || 0) + ' 个作物。',
-      feedText: '投喂 ' + (Number(stakes.feedCost) || 0) + ' 个仓库作物，换 ' +
-        (Number(stakes.feedReward?.seeds?.rice) || 0) + ' 颗稻种 +' +
-        (Number(stakes.feedReward?.dew) || 0) + ' 露水。',
+      canFeed: omen.canFeed !== false,
+      remainingText: active && Number.isFinite(remaining) && remaining > 0
+        ? '还剩 ' + formatRemaining(remaining)
+        : active ? '马上就走' : '窗口已关',
+      detail: active ? (omen.name + '在田边出现了。') : '它已经离开了。',
+      guardText: guardReward === '' ? '守卫成功没有奖励；失败损失 ' + failText + '。' : '守卫成功 ' + guardReward + '；失败损失 ' + failText + '。',
+      guardOptions,
+      guardBase: Number.isFinite(Number(omen.guardBase)) ? Math.min(1, Math.max(0, Number(omen.guardBase))) : 0,
+      feedText: cost === '' ? feedChoice.label + '不花资源，稳过。' : feedChoice.label + ' ' + cost + (feedReward === '' ? '，稳过。' : '，换 ' + feedReward + '。'),
+      ignoreText: ignoreParts.length === 0 ? '' : '不管它：' + ignoreParts.join(' + ') + '。',
       actions: [
-        { id: 'guard', label: '守夜', disabled: resolved },
-        { id: 'feed', label: '投喂', disabled: resolved || !canFeed, reason: !canFeed ? '仓库作物不够 3 个' : '' }
+        {
+          id: 'guard',
+          label: guardChoice.label,
+          disabled: !active || resolved || guardChoice.affordable === false,
+          reason: guardChoice.reason ?? ''
+        },
+        {
+          id: 'feed',
+          label: feedChoice.label,
+          disabled: !active || resolved || feedChoice.affordable === false,
+          reason: feedChoice.reason ?? ''
+        }
       ]
     }
   }
@@ -518,6 +583,7 @@
     const opts = options !== null && typeof options === 'object' ? options : {}
     const plots = farm !== null && typeof farm === 'object' && Array.isArray(farm.plots) ? farm.plots : []
     const dew = Number.isFinite(Number(opts.dew)) ? Number(opts.dew) : Number(farm?.dew) || 0
+    const coins = Number.isFinite(Number(farm?.coins)) ? Math.max(0, Number(farm.coins)) : 0
     const busy = opts.busy === true
     const selected = typeof opts.selectedPlot === 'string' ? opts.selectedPlot : null
     return plots.map((plot, index) => {
@@ -525,16 +591,21 @@
         ? plot.stage
         : 'empty'
       const meta = cropMeta(plot?.crop)
+      const frozen = stage === 'frozen'
       const withered = stage === 'withered'
       const mature = stage === 'mature'
       const growing = stage === 'growing'
-      const displayStage = withered ? 'withered' : mature ? 'mature' : growing ? 'growing' : 'empty'
+      const displayStage = frozen
+        ? 'frozen'
+        : withered ? 'withered' : mature ? 'mature' : growing ? 'growing' : 'empty'
       const card = {
         plotId: typeof plot?.id === 'string' ? plot.id : '',
         label: plotLabel(plot, index),
         stage: displayStage,
         crop: meta === null ? null : plot.crop,
-        cropName: meta === null ? '空地' : withered ? meta.name + '（枯萎）' : meta.name,
+        cropName: meta === null
+          ? '空地'
+          : frozen ? meta.name + '（冻住）' : withered ? meta.name + '（枯萎）' : meta.name,
         emoji: meta === null ? '＋' : meta.emoji,
         art: meta === null ? '' : meta.art,
         badge: STAGE_TEXT[displayStage],
@@ -546,7 +617,20 @@
         selected: selected !== null && plot?.id === selected,
         actions: []
       }
-      if (card.openPlant) {
+      if (frozen) {
+        const affordable = dew >= THAW_COST.dew && coins >= THAW_COST.coins
+        card.detailText = '生火解冻：' + THAW_COST.dew + ' 露水 + ' + THAW_COST.coins + ' 硬币'
+        card.actions.push(action({
+          action: 'thaw',
+          plotId: card.plotId,
+          label: '生火解冻',
+          className: 'thaw',
+          disabled: busy || !affordable,
+          ...(affordable
+            ? {}
+            : { reason: dew < THAW_COST.dew ? '露水不够（需要 ' + THAW_COST.dew + '）' : '硬币不够（需要 ' + THAW_COST.coins + '）' })
+        }))
+      } else if (card.openPlant) {
         card.detailText = withered ? '换季枯了，点一下重种' : '点一下选种子'
       } else if (mature) {
         card.detailText = plot?.fertilized === true ? '已施肥 · 可以收了' : '已经成熟，可以收了'
@@ -797,6 +881,7 @@
     setCrops,
     WATER_COST,
     FERTILIZE_COST,
+    THAW_COST,
     UNLOCK_RESERVE,
     MIN_TRADE_QTY,
     MAX_TRADE_QTY,

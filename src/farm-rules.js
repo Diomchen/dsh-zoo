@@ -221,6 +221,8 @@ export const MAX_DEW = 48
 /** 浇水 / 施肥的露水价（各一次）。 */
 export const WATER_COST = 1
 export const FERTILIZE_COST = 5
+/** 票 75：冻住的地要生火解冻，成本比浇水高一档，避免零代价解冻。 */
+export const THAW_COST = Object.freeze({ dew: 2, coins: 5 })
 
 /** 一次离线最多补 12 小时生长；运行中按真实时间走，不设上限。 */
 export const OFFLINE_GROWTH_CAP_MS = 12 * HOUR_MS
@@ -247,7 +249,7 @@ export function growMsOf (value) {
 
 /** 地块成熟：`grownMs >= growMs`；空地永远不成熟。成熟后停止生长，也不枯萎。 */
 export function isMature (plot) {
-  if (plot?.withered === true) return false
+  if (plot?.withered === true || plot?.frozen === true) return false
   if (!isCropId(plot?.crop)) return false
   const growMs = Number(plot.growMs)
   const grownMs = Number(plot.grownMs)
@@ -260,14 +262,15 @@ export function isMature (plot) {
  * 枯萎优先于一切：地已经不能收、不能浇，只能重种。
  */
 export function plotStage (plot) {
+  if (plot?.frozen === true) return 'frozen'
   if (plot?.withered === true) return 'withered'
   if (!isCropId(plot?.crop)) return 'empty'
   return isMature(plot) ? 'mature' : 'growing'
 }
 
-/** 还差多少毫秒成熟；空地/成熟/枯萎都是 0。 */
+/** 还差多少毫秒成熟；空地/成熟/枯萎/冻住都是 0。 */
 export function plotRemainingMs (plot) {
-  if (plot?.withered === true) return 0
+  if (plot?.withered === true || plot?.frozen === true) return 0
   if (!isCropId(plot?.crop) || isMature(plot)) return 0
   return Math.max(0, Number(plot.growMs) - Number(plot.grownMs))
 }
@@ -278,7 +281,7 @@ export function plotRemainingMs (plot) {
  * 票 66：第三参是本段季节的生长系数（当季四季作物 1.1，其余 1）。
  */
 export function advanceGrowth (plot, elapsedMs, factor = 1) {
-  if (plot?.withered === true || !isCropId(plot?.crop) || isMature(plot)) return plot
+  if (plot?.withered === true || plot?.frozen === true || !isCropId(plot?.crop) || isMature(plot)) return plot
   const elapsed = Number(elapsedMs)
   if (!Number.isFinite(elapsed) || elapsed <= 0) return plot
   const rate = Number.isFinite(factor) && factor > 0 ? factor : 1
@@ -289,7 +292,7 @@ export function advanceGrowth (plot, elapsedMs, factor = 1) {
 
 /** 还能浇水吗：有作物、没成熟、这一株还没浇过；枯萎不可浇。 */
 export function canWater (plot) {
-  if (plot?.withered === true) return false
+  if (plot?.withered === true || plot?.frozen === true) return false
   if (!isCropId(plot?.crop) || isMature(plot)) return false
   return Number(plot.waterings) < 1
 }
@@ -314,7 +317,7 @@ export function waterPlot (plot) {
  * 空地/成熟地没有可帮的生长，返回 null。
  */
 export function helpPlot (plot) {
-  if (plot?.withered === true || !isCropId(plot?.crop) || isMature(plot)) return null
+  if (plot?.withered === true || plot?.frozen === true || !isCropId(plot?.crop) || isMature(plot)) return null
   const bonus = Math.max(1, Math.floor(Number(plot.growMs) * 0.1))
   const grownMs = Math.min(Number(plot.growMs), Number(plot.grownMs) + bonus)
   return { ...plot, grownMs }
@@ -322,7 +325,7 @@ export function helpPlot (plot) {
 
 /** 还能施肥吗：有作物、这一株还没施过；枯萎不可施。成熟后仍可施（收获前最后一个加成）。 */
 export function canFertilize (plot) {
-  return plot?.withered !== true && isCropId(plot?.crop) && plot.fertilized !== true
+  return plot?.withered !== true && plot?.frozen !== true && isCropId(plot?.crop) && plot.fertilized !== true
 }
 
 /** 施肥：把 `fertilized` 置真，收获时 +1 产量；不可施时返回 null。 */
@@ -336,7 +339,7 @@ export function fertilizePlot (plot) {
  * `stolenBy` 按去重后的访客数算（每块地每轮每位访客只偷 1 个）。
  */
 export function harvestYield (plot) {
-  if (plot?.withered === true) return 0
+  if (plot?.withered === true || plot?.frozen === true) return 0
   const crop = cropOf(plot?.crop)
   if (crop === null) return 0
   const stolen = Array.isArray(plot.stolenBy) ? plot.stolenBy.length : 0
@@ -497,9 +500,10 @@ export function guardValue ({ ownerHome = false, worker = false } = {}) {
  * 偷菜判定（纯函数，随机源可注入）：成功率 = 1 − 守卫。
  * `random` 返回 [0,1)，落在守卫区间内就是被抓住；返回 true 表示这次偷到了。
  */
-export function stealSucceeds (guard, random = Math.random) {
+export function stealSucceeds (guard, random = Math.random, maxGuard = MAX_GUARD) {
   const value = Number(guard)
-  const safeGuard = Number.isFinite(value) ? Math.min(MAX_GUARD, Math.max(0, value)) : 0
+  const cap = Number.isFinite(Number(maxGuard)) ? Math.min(1, Math.max(0, Number(maxGuard))) : MAX_GUARD
+  const safeGuard = Number.isFinite(value) ? Math.min(cap, Math.max(0, value)) : 0
   const roll = typeof random === 'function' ? Number(random()) : Number.NaN
   // 随机源坏了也不能回落到全局 Math.random()（那不是注入的判定）：按 0 处理＝必被抓住。
   const dice = Number.isFinite(roll) ? Math.min(1, Math.max(0, roll)) : 0
