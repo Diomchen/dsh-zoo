@@ -238,6 +238,8 @@ test('票 82 e2e：榜里出现邻居自报的盈亏与持仓，且没有硬币/
   // 本机的收益率由本机的 base 算：这周还没做单，0 / base = 0。
   assert.equal(leagueOf(a).self.weekPnl, 0)
   assert.equal(leagueOf(a).self.weekPnlPct, 0)
+  // 旧版本邻居的可见状态由宿主播出：一位放行在线邻居，且已经报过新鲜周报。
+  assert.deepEqual(leagueOf(a).watchers, { online: 1, reported: 1 })
 
   // B 用真的动作开一手 5× 多单：下一包 digest 里应该出现这条持仓。
   const opened = await callAction(b, {

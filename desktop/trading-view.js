@@ -930,11 +930,23 @@
       : {}
     const long = Math.max(0, Math.round(toNumber(counts.long) ?? 0))
     const short = Math.max(0, Math.round(toNumber(counts.short) ?? 0))
+    // 旧版本邻居（评审 P1）：宿主说「有人在线、但一条周报都没发」时，空态要明说
+    // 「旧版本」——「还没有邻居上线」会让人以为是自己网络坏了。
+    const watchersRaw = league.watchers !== null && typeof league.watchers === 'object'
+      ? league.watchers
+      : {}
+    const countOf = (value) => Math.max(0, Math.round(toNumber(value) ?? 0))
+    const watchers = {
+      online: countOf(watchersRaw.online),
+      reported: countOf(watchersRaw.reported)
+    }
+    const oldVersion = watchers.online > 0 && watchers.reported === 0
     return {
       rows,
       // 只有自己一行：窗口要在榜下面补一句「还没有邻居上线…行情照走」。
       hasPeers: rows.some((row) => !row.me),
       countText: rows.length + ' 人',
+      watchers,
       sentiment: {
         long,
         short,
@@ -942,7 +954,9 @@
         text: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
         tone: long === 0 && short === 0 ? 'flat' : long >= short ? 'long' : 'short'
       },
-      empty: emptyHints(safe).neighbors
+      empty: oldVersion
+        ? '邻居是旧版本，还没有周报'
+        : emptyHints(safe).neighbors
     }
   }
 

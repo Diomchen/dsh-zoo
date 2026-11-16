@@ -199,6 +199,8 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
   assert.deepEqual(state.positions, [])
   assert.deepEqual(state.history, [])
   assert.deepEqual(state.orders, [])
+  // 没有邻居时 watchers 是 0/0：窗口照旧画「还没有邻居上线」。
+  assert.deepEqual(state.league.watchers, { online: 0, reported: 0 })
   assert.deepEqual(state.limits, {
     margins: [50, 100, 250],
     // 杠杆与作物白名单都与纯规则同源：票 80 把杠杆换成 [1,5,20] 时这里不用改。
@@ -517,10 +519,12 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
       ],
       sentiment: { long: 1, short: 1, flat: 0, secret: 1 },
       self: { weekPnl: 12, weekPnlPct: 0.035, coins: 999, secret: 1 },
+      // 旧版本邻居的可见计数（评审 P1）：只认两个非负整数。
+      watchers: { online: 2, reported: 1, secret: 1 },
       secret: 1
     }
   }).league
-  assert.deepEqual(Object.keys(league), ['rows', 'sentiment', 'self'])
+  assert.deepEqual(Object.keys(league), ['rows', 'sentiment', 'self', 'watchers'])
   assert.equal(league.rows.length, 2)
   assert.deepEqual(league.rows.map((row) => row.nickname), ['小米', '邻居'])
   assert.equal(league.rows[0].me, true)
@@ -531,6 +535,13 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.equal(league.rows[1].weekPnlPct, null, '邻居没报收益率就是 null（窗口画「—」）')
   assert.deepEqual(league.sentiment, { long: 1, short: 1, flat: 0 })
   assert.deepEqual(league.self, { weekPnl: 12, weekPnlPct: 0.035 })
+  assert.deepEqual(league.watchers, { online: 2, reported: 1 })
+  // 缺/坏 watchers 归零，而不是把 NaN 画到窗口上。
+  assert.deepEqual(shared.normalizeBoardView({}).league.watchers, { online: 0, reported: 0 })
+  assert.deepEqual(
+    shared.normalizeBoardView({ league: { watchers: { online: 'x', reported: -1 } } }).league.watchers,
+    { online: 0, reported: 0 }
+  )
 
   // 票 83：到价挂单穿过 helper 白名单——§9.4 的老坑：宿主发了、窗口永远收不到。
   const orderId = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f2a3b4c5d'

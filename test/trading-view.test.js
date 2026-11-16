@@ -658,6 +658,40 @@ test('票 82：只有自己时写「观望」，并保留「还没有邻居上�
   assert.equal(both.sentiment.text, '观望')
 })
 
+test('术语 SPEC 旧邻居：有人在线但没周报时，空态写「旧版本」；其余不变', () => {
+  const own = {
+    deviceId: '00000000-0000-4000-8000-0000000000aa',
+    nickname: '小米',
+    weekPnl: 0,
+    weekPnlPct: 0,
+    positions: [],
+    me: true
+  }
+  const alone = (watchers) => view.boardView(payload({
+    league: league({
+      rows: [own],
+      sentiment: { long: 0, short: 0, flat: 1 },
+      watchers
+    })
+  }), { now: SLOT_EDGE })
+  // 邻居在线、但一条周报都没发 → 旧版本。
+  const old = alone({ online: 2, reported: 0 })
+  assert.deepEqual(old.league.watchers, { online: 2, reported: 0 })
+  assert.equal(old.league.empty, '邻居是旧版本，还没有周报')
+  assert.doesNotMatch(old.league.empty, /还没有邻居上线/)
+  // 没有在线邻居 → 原来的「还没有邻居上线…行情照走」。
+  assert.match(alone({ online: 0, reported: 0 }).league.empty, /还没有邻居上线/)
+  assert.match(alone({ online: 0, reported: 0 }).league.empty, /行情照走/)
+  // 有人在线、也确实发过周报（只是行还没到/被过滤）→ 不冒充旧版本。
+  assert.match(alone({ online: 2, reported: 1 }).league.empty, /还没有邻居上线/)
+  // 坏 watchers 不抛，按 0/0 处理。
+  for (const bad of [null, 'x', 42, [], { online: 'x', reported: -1 }]) {
+    const board = alone(bad)
+    assert.deepEqual(board.league.watchers, { online: 0, reported: 0 }, JSON.stringify(bad))
+    assert.match(board.league.empty, /还没有邻居上线/)
+  }
+})
+
 test('票 82：榜的坏输入不抛——缺行/坏行/缺情绪都退回空榜', () => {
   for (const bad of [null, 42, 'x', [], { rows: 'x' }, { rows: [null, 42, { weekPnl: 'x' }] }]) {
     const board = view.boardView(payload({ league: bad }), { now: SLOT_EDGE })

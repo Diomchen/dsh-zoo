@@ -64,7 +64,7 @@ import {
   stealSucceeds
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
-import { buildLeague } from './trading-league.js'
+import { buildLeague, watcherCounts } from './trading-league.js'
 import {
   BOARD_CROPS,
   PRICE_CEIL_RATIO,
@@ -125,6 +125,7 @@ import {
   MAX_WEEK_PNL,
   MAX_WEEK_PNL_PCT,
   PLOT_ID_RE,
+  TRADING_DIGEST_FRESH_MS,
   TRADING_DIGEST_INTERVAL_MS,
   normalizeCaps,
   createRateLimiter,
@@ -2196,11 +2197,22 @@ export function createService (ctx, options = {}) {
    * 与排序（见 `src/trading-league.js`）。邻居不落盘、不发请求，榜过期就淡出。
    */
   function tradingLeagueView (now, self, week) {
-    const me = room.snapshot().self
+    const snapshot = room.snapshot()
+    const me = snapshot.self
     const peers = []
     for (const [deviceId, digest] of tradingDigests) {
       peers.push({ deviceId, ...digest })
     }
+    // 旧版本邻居（评审 P1）：放行且在线，但一条新鲜周报都没有。窗口据此把空态
+    // 从「还没有邻居上线」换成「邻居是旧版本，还没有周报」——两种空态不能混。
+    const watchers = watcherCounts({
+      neighbors: snapshot.neighbors,
+      digests: [...tradingDigests].map(([deviceId, digest]) => ({
+        deviceId,
+        seenAt: digest.seenAt
+      })),
+      now
+    })
     return buildLeague({
       self: {
         deviceId: me.deviceId ?? identity?.deviceId ?? '',
@@ -2213,6 +2225,7 @@ export function createService (ctx, options = {}) {
         positions: self.positions
       },
       peers,
+      watchers,
       now
     })
   }

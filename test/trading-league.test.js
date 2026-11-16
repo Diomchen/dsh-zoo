@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto'
 import test from 'node:test'
 
 import { TRADING_DIGEST_FRESH_MS } from '../src/protocol.js'
-import { buildLeague } from '../src/trading-league.js'
+import { buildLeague, watcherCounts } from '../src/trading-league.js'
 
 const NOW = 1700000000000
 
@@ -181,4 +181,58 @@ test('票 82：本机行坏了不挡邻居；昵称缺失有兜底，不是空�
   // 本机行正常时昵称兜底是「我」。
   const own = buildLeague({ self: self({ nickname: null }), peers: [], now: NOW })
   assert.equal(own.rows[0].nickname, '我')
+})
+
+test('票 82/SPEC 旧邻居：watcherCounts 只数放行在线邻居与新鲜周报', () => {
+  const allowedOnline = { deviceId: 'a', status: 'allowed', heartbeatAt: 1 }
+  const allowedOffline = { deviceId: 'b', status: 'allowed', heartbeatAt: 0 }
+  const pendingOnline = { deviceId: 'c', status: 'pending', heartbeatAt: 1 }
+  const digests = [
+    { deviceId: 'a', seenAt: NOW - 1000 },
+    // 未放行 / 不在线的周报不能算进「有人报了」。
+    { deviceId: 'c', seenAt: NOW },
+    { deviceId: 'b', seenAt: NOW },
+    { deviceId: 'a', seenAt: NOW - TRADING_DIGEST_FRESH_MS - 1 }
+  ]
+  assert.deepEqual(
+    watcherCounts({ neighbors: [allowedOnline, allowedOffline, pendingOnline], digests, now: NOW }),
+    { online: 1, reported: 1 }
+  )
+  // 唯一在线的邻居周报过期：reported 归零 —— 这正是窗口画「旧版本」的那种状态。
+  assert.deepEqual(
+    watcherCounts({
+      neighbors: [allowedOnline],
+      digests: [{ deviceId: 'a', seenAt: NOW - TRADING_DIGEST_FRESH_MS - 1 }],
+      now: NOW
+    }),
+    { online: 1, reported: 0 }
+  )
+  // 坏输入不抛；没有邻居就是 0/0（窗口照旧画「还没有邻居上线」）。
+  assert.deepEqual(
+    watcherCounts({
+      neighbors: [null, 'x', { deviceId: 'z', status: 'allowed', heartbeatAt: 1 }],
+      digests: 'x',
+      now: NOW
+    }),
+    { online: 1, reported: 0 }
+  )
+  assert.deepEqual(watcherCounts({ now: NOW }), { online: 0, reported: 0 })
+})
+
+test('票 82：buildLeague 透传 watchers；坏计数归零、reported 不超过 online', () => {
+  const fresh = buildLeague({
+    self: self(),
+    peers: [],
+    now: NOW,
+    watchers: { online: 3, reported: 1 }
+  })
+  assert.deepEqual(fresh.watchers, { online: 3, reported: 1 })
+  assert.deepEqual(buildLeague({ now: NOW }).watchers, { online: 0, reported: 0 })
+  assert.deepEqual(
+    buildLeague({ now: NOW, watchers: { online: 2, reported: 5 } }).watchers,
+    { online: 2, reported: 2 }
+  )
+  for (const bad of [null, 'x', 42, [], { online: -1, reported: 'x' }]) {
+    assert.deepEqual(buildLeague({ now: NOW, watchers: bad }).watchers, { online: 0, reported: 0 })
+  }
 })
