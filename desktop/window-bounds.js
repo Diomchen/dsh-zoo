@@ -59,35 +59,6 @@ function isInsideArea (point, area) {
     normalizedPoint.y <= normalizedArea.y + normalizedArea.height
 }
 
-/** 点到矩形的最短距离平方；在矩形里就是 0。用来在多屏里挑最近的一块。 */
-function squaredDistanceToArea (point, area) {
-  const dx = point.x < area.x
-    ? area.x - point.x
-    : point.x > area.x + area.width ? point.x - (area.x + area.width) : 0
-  const dy = point.y < area.y
-    ? area.y - point.y
-    : point.y > area.y + area.height ? point.y - (area.y + area.height) : 0
-  return dx * dx + dy * dy
-}
-
-/** 最近的一块工作区；坏区域直接跳过，一块都没有时返回 null。 */
-function nearestWorkArea (point, areas) {
-  const normalizedPoint = normalizePoint(point)
-  if (normalizedPoint === null || !Array.isArray(areas)) return null
-  let nearest = null
-  let nearestDistance = Infinity
-  for (const candidate of areas) {
-    const area = normalizeArea(candidate)
-    if (area === null) continue
-    const distance = squaredDistanceToArea(normalizedPoint, area)
-    if (distance < nearestDistance) {
-      nearest = area
-      nearestDistance = distance
-    }
-  }
-  return nearest
-}
-
 /** 把窗口整体夹进这块工作区；窗口比工作区还大时贴左上角留一个边距。 */
 function clampToWorkArea (point, area, size, margin = DEFAULT_EDGE_MARGIN) {
   const normalizedPoint = normalizePoint(point)
@@ -126,7 +97,7 @@ function centerInArea (area, size, margin = DEFAULT_EDGE_MARGIN) {
  *
  * @param {object} options
  * @param {{x:number,y:number}|null} options.saved 上次保存的位置
- * @param {Array<object>} [options.areas] 所有显示器的工作区（多屏时用来挑最近那块）
+ * @param {Array<object>} [options.areas] 所有显示器的工作区（多屏时用来挑保存点所在的那块）
  * @param {object} options.area 主工作区；所有工作区都拿不到时的兜底
  * @param {number} options.width 窗口宽
  * @param {number} options.height 窗口高
@@ -148,19 +119,26 @@ function pickBounds ({ saved, areas, area, width, height, margin = DEFAULT_EDGE_
       if (normalized !== null) candidates.push(normalized)
     }
   }
-  // 主工作区始终参与：宿主只报一块屏时也能用；多屏时它只是候选之一。
-  const hasFallback = candidates.some((candidate) => candidate.x === fallbackArea.x &&
-    candidate.y === fallbackArea.y &&
-    candidate.width === fallbackArea.width &&
-    candidate.height === fallbackArea.height)
-  if (!hasFallback) candidates.push(fallbackArea)
+  // 一块真实显示器都没拿到（旧宿主/极端环境）才用兜底区；**不能**把多屏并集塞进来——
+  // 并集包含屏幕之间的空隙和菜单栏上沿，会让“离屏”的保存点被误判成在屏里。
+  if (candidates.length === 0) candidates.push(fallbackArea)
 
-  const target = nearestWorkArea(savedPoint, candidates)
-  // 保存点不在任何工作区里 = 离屏（票 85 的明确回落条件），不是“夹到最近的边上”。
-  if (target === null || !isInsideArea(savedPoint, target)) {
-    return centerInArea(fallbackArea, size, margin)
+  // 保存点必须在某块真实工作区里；在两块屏的接缝上时两块都“包含”它，
+  // 这时选位移最小的那块（接缝属于副屏，不能被主屏的右边缘夹回去）。
+  let best = null
+  let bestDistance = Infinity
+  for (const candidate of candidates) {
+    if (!isInsideArea(savedPoint, candidate)) continue
+    const clamped = clampToWorkArea(savedPoint, candidate, size, margin)
+    const distance = (clamped.x - savedPoint.x) ** 2 + (clamped.y - savedPoint.y) ** 2
+    if (distance < bestDistance) {
+      best = clamped
+      bestDistance = distance
+    }
   }
-  return clampToWorkArea(savedPoint, target, size, margin)
+  // 保存点不在任何工作区里 = 离屏（票 85 的明确回落条件），不是“夹到最近的边上”。
+  if (best === null) return centerInArea(fallbackArea, size, margin)
+  return best
 }
 
 /**
@@ -195,7 +173,6 @@ module.exports = {
   DEFAULT_EDGE_MARGIN,
   normalizePoint,
   isInsideArea,
-  nearestWorkArea,
   clampToWorkArea,
   centerInArea,
   pickBounds,
