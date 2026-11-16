@@ -10,7 +10,11 @@
  *         "entry": 5.12, "openedAt": 1763308800000, "slot": 1959232, "stopLoss": 0.5,
  *         "settling": { "at": 1763309700000, "exit": 5.3, "pnl": 8, "credit": 58, "reason": "close" } }
  *     ],
- *     "orders": [],
+ *     "orders": [
+ *       { "id": "…", "crop": "tomato", "side": "long", "target": 4.8, "margin": 50,
+ *         "leverage": 5, "placedAt": 1763308800000, "slot": 1959232,
+ *         "refunding": { "at": 1763309700000 } }
+ *     ],
  *     "history": [
  *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
  *         "entry": 5.12, "exit": 5.3, "pnl": 8, "reason": "liquidate", "at": 1763309700000 }
@@ -32,6 +36,13 @@
  * 存一份就会和改过的 entry/杠杆对不上。逐分钟的强平/止损检查全在 `pathScan()`：
  * tick、插针、快进时钟、离线补算走同一条路，账本这里只负责「先写意图再动钱」。
  *
+ * 票 83 的到价挂单同样是**加法**（`version` 仍为 1，老文件 orders 缺省 = 空数组）：
+ * 挂单在**下单那一刻**就 `spendCoins(margin)` 把保证金锁进农场，所以成交时不用再动钱，
+ * 也不可能出现「到价了但硬币不够」；成交只把订单换成仓位（同一次写盘，原子）。
+ * 退款是跨文件的（farm.json），照抄结算的意图模式：先写 `refunding` 再 `addCoins`，
+ * 再删单落盘；启动时看到 `refunding` 只补删单、**绝不再退一次**。
+ * 挂单/撤单/到期都不进历史——历史只记「平掉的仓位」。
+ *
  * 容错与 `src/farm.js` / `src/market.js` 同一套路：
  *   - 文件不存在：空盘口（本周从此刻起算），不告警；
  *   - 文件损坏/形状不对：空盘口 + 只告警一次；**农场硬币不动**（锁定中的保证金按坏账处理）；
@@ -49,14 +60,17 @@ import { MAX_COINS } from './farm.js'
 import { parseJsonText } from './json-text.js'
 import {
   BOARD_CROPS,
+  MAX_MARGIN,
   SLOT_MS,
   TRADING_CLOSE_REASONS,
   isBoardCrop,
   isBoardSide,
+  isMarginAmount,
+  isOrderTarget,
   isStopLossLevel,
   isStoredLeverage,
   isTradingLeverage,
-  isTradingMargin,
+  limitFillScan,
   liquidationPriceOf,
   markPrice,
   pathScan,
@@ -151,6 +165,12 @@ function copyPosition (position) {
   return position.settling === undefined
     ? { ...position }
     : { ...position, settling: { ...position.settling } }
+}
+
+function copyOrder (order) {
+  return order.refunding === undefined
+    ? { ...order }
+    : { ...order, refunding: { ...order.refunding } }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,11 +328,76 @@ function normalizeHistory (value) {
   return { history, repaired }
 }
 
+/**
+ * 退款意图（票 83）：和仓位的 `settling` 同一个思路——先落盘「这笔钱要退」，
+ * 再动 farm.json，再删单。启动时看到它只补删单，绝不重复 addCoins。
+ * 没写 = 没有在退款；写了但 at 坏了 = 当坏字段（丢意图、记一处修补）：
+ * 删除本身是幂等的，宁可少退一次也绝不重复发钱。
+ */
+function normalizeRefunding (value) {
+  if (value === undefined) return { refunding: null, repaired: 0 }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { refunding: null, repaired: 1 }
+  }
+  const at = timestamp(value.at)
+  if (at === null) return { refunding: null, repaired: 1 }
+  return { refunding: { at }, repaired: 0 }
+}
+
+/**
+ * 到价挂单（票 83）：`{ id, crop, side, target, margin, leverage, placedAt, slot }`。
+ * 读盘时**能成交的形状才算数**：目标价落在带外、杠杆不在 1/5/20、保证金不是正整数的
+ * 条目一律丢掉（那张单永远成交不了，留着只会一直占着锁定的保证金当坏账）。
+ * 坏一条只丢自己——和坏持仓/坏历史同一条纪律。
+ */
+function normalizeOrder (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const id = normalizeId(value.id)
+  if (id === null) return null
+  if (!isBoardCrop(value.crop)) return null
+  if (!isBoardSide(value.side)) return null
+  const margin = strictInt(value.margin, 1, MAX_MARGIN)
+  if (margin === null) return null
+  if (!isTradingLeverage(value.leverage)) return null
+  if (!isOrderTarget({ crop: value.crop, target: value.target })) return null
+  const target = positiveNumber(value.target)
+  if (target === null) return null
+  const placedAt = timestamp(value.placedAt)
+  if (placedAt === null) return null
+  const refunding = normalizeRefunding(value.refunding)
+  return {
+    order: {
+      id,
+      crop: value.crop,
+      side: value.side,
+      target,
+      margin,
+      leverage: value.leverage,
+      placedAt,
+      slot: slotIndexAt(placedAt),
+      ...(refunding.refunding === null ? {} : { refunding: refunding.refunding })
+    },
+    repaired: refunding.repaired
+  }
+}
+
 function normalizeOrders (value) {
-  // 票 83 才写 orders；v1 只保住形状，读到时按「不认识的内容」丢掉并计一处修补。
   if (value === undefined) return { orders: [], repaired: 0 }
   if (!Array.isArray(value)) return { orders: [], repaired: 1 }
-  return { orders: [], repaired: value.length }
+  const orders = []
+  let repaired = 0
+  for (const candidate of value) {
+    const normalized = normalizeOrder(candidate)
+    if (normalized === null) {
+      repaired += 1
+      continue
+    }
+    // 和持仓一样：slot 是派生字段（按 placedAt 重算），写错只算一处修补。
+    if (candidate.slot !== undefined && candidate.slot !== normalized.order.slot) repaired += 1
+    orders.push(normalized.order)
+    repaired += normalized.repaired
+  }
+  return { orders, repaired }
 }
 
 /**
@@ -354,7 +439,7 @@ function toFileState (state) {
       base: state.week.base
     },
     positions: state.positions.map(copyPosition),
-    orders: [],
+    orders: state.orders.map(copyOrder),
     history: state.history.map(copyHistory)
   }
 }
@@ -443,11 +528,24 @@ class TradingStore {
       this.#finishSettle(position, position.settling)
       resumed = true
     }
+    // `refunding` = 上次写完「要退挂单保证金」就崩了。钱可能已经退过，
+    // 这里只补删单，绝不重复 addCoins（和 settling 同一条取舍）。
+    let refunded = false
+    for (const order of [...this.#state.orders]) {
+      if (order.refunding === undefined) continue
+      const index = this.#state.orders.indexOf(order)
+      if (index >= 0) this.#state.orders.splice(index, 1)
+      refunded = true
+    }
+    // 离线期间挂单可能已经越价成交、也可能已经过了那一根：先撮合，再结算。
+    // 成交出来的仓位属于它成交那一刻的 slot，下面 `#settleDue` 会照常补收盘价。
+    const matched = this.#farm === null ? false : await this.#matchOrders(now)
     // 离线跨过收盘/撞过强平线：启动就把这些仓位结掉（先路径、后收盘），
     // 用户打开盘口时看到的不是「昨天还开着」的旧仓位。
     const closed = await this.#settleDue(now)
     // 坏文件不覆盖（等下一次动作/tick 再写）；补出来的补结算、跨周与修补要立刻落盘。
-    if (!normalized.corrupt && (resumed || rolled || closed || normalized.repaired > 0)) {
+    if (!normalized.corrupt &&
+      (resumed || refunded || matched || rolled || closed || normalized.repaired > 0)) {
       await this.#persist(true)
     }
   }
@@ -461,19 +559,23 @@ class TradingStore {
     const stamp = Number(now)
     const at = Number.isFinite(stamp) ? stamp : this.#nowMs()
     const positions = this.#state.positions.map((position) => this.#positionView(position, at))
+    const orders = this.#state.orders.map((order) => this.#orderView(order, at))
     let locked = 0
     let unrealized = 0
     for (const position of positions) {
       locked += position.margin
       unrealized += position.pnl ?? 0
     }
+    // 挂单的保证金已经花出去了，但还没成交/没退：展示层要把它算回「含锁定」，
+    // 否则挂一张单，顶部的「含锁定」会凭空少一笔（farm.json 里同样只有可用硬币）。
+    for (const order of orders) locked += order.margin
     const limit = Number.isInteger(historyLimit) && historyLimit >= 0
       ? historyLimit
       : TRADING_VIEW_HISTORY
     return {
       week: { ...this.#state.week },
       positions,
-      orders: [],
+      orders,
       history: this.#state.history.slice(0, limit).map(copyHistory),
       locked,
       unrealized
@@ -503,6 +605,20 @@ class TradingStore {
   }
 
   /**
+   * 挂一张到价单（票 83）：先 `spendCoins(margin)` 把保证金锁进农场，再记订单，
+   * 最后写一次盘。这样成交时不用再动钱，也不会出现「到价了但硬币不够」。
+   * 扣钱成功而落盘失败仍算成功（`persisted:false`）——与 `openPosition` 同一条口径。
+   */
+  placeOrder (raw = {}) {
+    return this.#enqueue(() => this.#placeOrder(raw))
+  }
+
+  /** 手动撤单：走和到期退款同一条意图路径（先写 refunding，再退钱，再删单）。 */
+  cancelOrder (orderId) {
+    return this.#enqueue(() => this.#cancelOrder(orderId))
+  }
+
+  /**
    * 每分钟一拍：跨周就重设本周；还没结算的仓位先逐分钟走一遍路径（强平/止损），
    * 收过盘的再按收盘价结。返回本次是否改动了盘面（宿主据此决定要不要重推窗口）。
    */
@@ -513,7 +629,8 @@ class TradingStore {
   async #openPosition (raw) {
     const side = raw?.side
     if (!isBoardSide(side)) return tradingError('bad-side')
-    if (!isTradingMargin(raw?.margin)) return tradingError('bad-margin')
+    // 票 83 起保证金是任意整数金额（50/100/250/全下只是窗口的预设）。
+    if (!isMarginAmount(raw?.margin)) return tradingError('bad-margin')
     const leverage = raw?.leverage === undefined || raw?.leverage === null ? 1 : raw.leverage
     if (!isTradingLeverage(leverage)) return tradingError('bad-leverage')
     const crop = raw?.crop === undefined || raw?.crop === null ? BOARD_CROPS[0] : raw.crop
@@ -594,11 +711,78 @@ class TradingStore {
     }
   }
 
+  async #placeOrder (raw) {
+    const crop = raw?.crop === undefined || raw?.crop === null ? BOARD_CROPS[0] : raw.crop
+    if (!isBoardCrop(crop)) return tradingError('bad-crop')
+    const side = raw?.side
+    if (!isBoardSide(side)) return tradingError('bad-side')
+    if (!isMarginAmount(raw?.margin)) return tradingError('bad-margin')
+    const leverage = raw?.leverage === undefined || raw?.leverage === null ? 1 : raw.leverage
+    if (!isTradingLeverage(leverage)) return tradingError('bad-leverage')
+    // 带外的目标价永远成交不了：下单就拒，别让玩家挂一张死单还占着保证金。
+    if (!isOrderTarget({ crop, target: raw?.target })) return tradingError('bad-target')
+    const target = Number(raw.target)
+    const farm = this.#farm
+    if (farm === null) return tradingError('starting')
+
+    const now = this.#nowMs()
+    this.#rollWeek(now)
+    if (this.#coinBase() < raw.margin) return tradingError('no-coin')
+    const spent = await farm.spendCoins(raw.margin)
+    if (spent?.ok !== true) {
+      return tradingError(spent?.error === 'no-coin' ? 'no-coin' : 'action-failed')
+    }
+    const order = {
+      id: randomUUID(),
+      crop,
+      side,
+      target,
+      margin: raw.margin,
+      leverage,
+      placedAt: now,
+      slot: slotIndexAt(now)
+    }
+    this.#state.orders.push(order)
+    const persisted = await this.#persist(true)
+    return {
+      ok: true,
+      action: 'trading-place-order',
+      order: this.#orderView(order, now),
+      coins: this.#coinBase(),
+      // 宿主的 toast：说清「挂在哪个价、什么时候会撤」，不只回一个 ok。
+      notice: '已挂到价单：' + (side === 'long' ? '做多' : '做空') + ' · 目标 ' +
+        target.toFixed(2) + ' · 保证金 ' + raw.margin + '；收盘没成交就自动撤单并退回保证金。',
+      persisted
+    }
+  }
+
+  async #cancelOrder (orderId) {
+    if (this.#farm === null) return tradingError('starting')
+    if (typeof orderId !== 'string' || orderId === '') return tradingError('no-order')
+    const order = this.#state.orders.find((candidate) => candidate.id === orderId)
+    if (order === undefined) return tradingError('no-order')
+    // 已经在退款的单：钱大概率已到账，这次只等它被删掉，不能再退一次。
+    if (order.refunding !== undefined) return tradingError('no-order')
+    const refunded = await this.#refundOrder(order, { at: this.#nowMs() })
+    if (refunded.ok !== true) return refunded
+    return {
+      ok: true,
+      action: 'trading-cancel-order',
+      orderId: order.id,
+      coins: refunded.coins,
+      notice: '已撤单，保证金 ' + order.margin + ' 退回硬币。',
+      persisted: refunded.persisted
+    }
+  }
+
   async #tick () {
     const now = this.#nowMs()
     const rolled = this.#rollWeek(now)
+    // 先撮合挂单、再结算仓位：同一拍里刚成交的仓位，如果它那一根已经收盘，
+    // 会在下面的 `#settleDue` 里按收盘价结掉——顺序反了就会多留一拍。
+    const matched = await this.#matchOrders(now)
     const settled = await this.#settleDue(now)
-    if (!rolled && !settled) return false
+    if (!rolled && !matched && !settled) return false
     await this.#persist(settled)
     return true
   }
@@ -640,6 +824,98 @@ class TradingStore {
       if (result.ok === true) settled = true
     }
     return settled
+  }
+
+  /**
+   * 撮合挂单（票 83）：
+   *   - 成交：从 `placedAt` 扫到「此刻与本根收盘的较早者」，第一处越价就按**目标价**成交；
+   *     删单 + 推仓位在内存里一起改、只写一次盘（两边都在 `trading.json`，要么都成要么都不成）；
+   *   - 到期：第一拍发现 `slotIndexAt(now) > order.slot` 且没成交，就退回保证金并删单；
+   *   - 退款是跨文件的，走 `#refundOrder` 的意图路径（先写 refunding，再 addCoins，再删单）。
+   * 关掉 DSH 很久再回来时，老单也走同一条路：先看看那一根里有没有越过目标价（有可能成交），
+   * 没越过才退款——不会因为「离线太久」直接当成过期丢掉。
+   */
+  async #matchOrders (now) {
+    let filled = false
+    for (const order of [...this.#state.orders]) {
+      // 已经在退款中的单由 `load()` 补完删单，这里不重复动钱。
+      if (order.refunding !== undefined) continue
+      const end = (order.slot + 1) * SLOT_MS
+      const horizon = Math.min(now, end)
+      const crossing = limitFillScan({
+        crop: order.crop,
+        side: order.side,
+        target: order.target,
+        from: order.placedAt,
+        to: horizon
+      })
+      if (crossing !== null) {
+        const index = this.#state.orders.indexOf(order)
+        if (index >= 0) this.#state.orders.splice(index, 1)
+        this.#state.positions.push({
+          id: randomUUID(),
+          crop: order.crop,
+          side: order.side,
+          margin: order.margin,
+          leverage: order.leverage,
+          // SPEC：成交价 = 目标价，不是越过那一刻的现价。
+          entry: order.target,
+          openedAt: crossing.at,
+          slot: crossing.slot,
+          // 止损默认关；挂单成交的仓位也一样，玩家可以成交后再设。
+          stopLoss: 0
+        })
+        filled = true
+        continue
+      }
+      // 这一根已经收盘还没成交：撤单退钱。没有农场（启动早期）时留着，下一拍再说。
+      if (slotIndexAt(now) > order.slot && this.#farm !== null) {
+        await this.#refundOrder(order, { at: now })
+      }
+    }
+    // 成交必须立刻落盘（订单和仓位一起）；退款在 #refundOrder 里各自写过意图与删单。
+    if (filled) await this.#persist(true)
+    return filled
+  }
+
+  /**
+   * 退款的两段式（幂等）：先写 `refunding` 意图，再 `addCoins(margin)`，最后删单落盘。
+   * 第 2 步失败时订单保持 `refunding`：本次运行不会再动它，重启后只补删单。
+   * 这样和仓位的 `settling` 同一个取舍：宁可少退一次，也绝不重复发钱。
+   */
+  async #refundOrder (order, { at }) {
+    const farm = this.#farm
+    if (farm === null) return tradingError('starting')
+    order.refunding = { at }
+    const intent = await this.#persist(true)
+    if (intent !== true) {
+      delete order.refunding
+      return { ok: false, error: 'write-failed', persisted: false }
+    }
+    const credited = await farm.addCoins(order.margin)
+    if (credited?.ok !== true) {
+      // 钱没进去：意图留在盘上，重启后只补删单（不重复加钱）。本次运行到此为止。
+      return { ok: false, error: 'action-failed', persisted: false }
+    }
+    const index = this.#state.orders.indexOf(order)
+    if (index >= 0) this.#state.orders.splice(index, 1)
+    const persisted = await this.#persist(true)
+    return { ok: true, order, coins: this.#coinBase(), persisted }
+  }
+
+  /** 挂单的展示形状：不落盘的 `remainingMs` 让窗口能画倒计时（到本根收盘为止）。 */
+  #orderView (order, now) {
+    return {
+      id: order.id,
+      crop: order.crop,
+      side: order.side,
+      target: order.target,
+      margin: order.margin,
+      leverage: order.leverage,
+      placedAt: order.placedAt,
+      slot: order.slot,
+      remainingMs: Math.max(0, (order.slot + 1) * SLOT_MS - now)
+    }
   }
 
   /**

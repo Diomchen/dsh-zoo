@@ -1,9 +1,9 @@
 /**
- * 票 79/80：盘口纯规则的确定性。
+ * 票 79/80/83：盘口纯规则的确定性。
  *
  * 只测外部行为——同一 seed 同一根的价格、slot/tick 边界、夹取范围、盈亏与结算取整、
- * 强平价与触线边界、止损档、逐 tick 路径检查（插针/跳 slot/离线补算的上限）、本周起点。
- * 票 81 追加 K 线与风向。不碰磁盘、不碰时钟、不联网。
+ * 强平价与触线边界、止损档、逐 tick 路径检查（插针/跳 slot/离线补算的上限）、本周起点、
+ * 到价挂单的目标价带与成交扫描。票 81 追加 K 线与风向。不碰磁盘、不碰时钟、不联网。
  */
 import assert from 'node:assert/strict'
 import test from 'node:test'
@@ -13,6 +13,7 @@ import {
   BOARD_CROPS,
   BOARD_SIDES,
   MAX_LEVERAGE,
+  MAX_MARGIN,
   MAX_PATH_SCAN_MS,
   MAX_PATH_SCAN_SLOTS,
   PRICE_CEIL_RATIO,
@@ -33,10 +34,12 @@ import {
   isLiquidated,
   isStopLossHit,
   isStopLossLevel,
+  isMarginAmount,
+  isOrderTarget,
   isStoredLeverage,
   isTradingLeverage,
-  isTradingMargin,
   liquidationPriceOf,
+  limitFillScan,
   markPrice,
   pathScan,
   pnlOf,
@@ -44,6 +47,7 @@ import {
   slotBounds,
   slotClosePrice,
   slotIndexAt,
+  targetBandOf,
   weekStartOf
 } from '../src/trading-rules.js'
 import { CROPS } from '../src/farm-rules.js'
@@ -180,10 +184,11 @@ test('票 79：本周起点是本地周一 00:00（周一自己、周日深夜�
   assert.equal(weekStartOf('nope'), null)
 })
 
-test('票 80/81：下单白名单是 1×/5×/20×、50/100、三个作物、多空；止损四档含 0=关', () => {
+test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、三个作物、多空；止损四档含 0=关', () => {
   // 票 81 起盘口有三个作物：顺序就是窗口页签的顺序，tomato 是 payload.bar 的来源。
   assert.deepEqual(BOARD_CROPS, ['tomato', 'carrot', 'pumpkin'])
-  assert.deepEqual(TRADING_MARGINS, [50, 100])
+  // 票 83：三档预设 + 窗口的「全下」；保证金规则本身接受任意整数（见下一条）。
+  assert.deepEqual(TRADING_MARGINS, [50, 100, 250])
   assert.deepEqual(TRADING_LEVERAGES, [1, 5, 20])
   assert.deepEqual(BOARD_SIDES, ['long', 'short'])
   // 结算原因固定四种：手动 / 收盘 / 强平 / 止损（历史行就按这个写）。
@@ -196,9 +201,15 @@ test('票 80/81：下单白名单是 1×/5×/20×、50/100、三个作物、多�
   assert.equal(isBoardCrop('corn'), false)
   assert.equal(isBoardSide('long'), true)
   assert.equal(isBoardSide('up'), false)
-  assert.equal(isTradingMargin(50), true)
-  assert.equal(isTradingMargin(51), false)
-  assert.equal(isTradingMargin('50'), false)
+  assert.equal(isMarginAmount(50), true)
+  // 票 83：不限于预设——「全下」/自定义整数金额都是合法形状。
+  assert.equal(isMarginAmount(51), true)
+  assert.equal(isMarginAmount(MAX_MARGIN), true)
+  assert.equal(isMarginAmount(MAX_MARGIN + 1), false)
+  assert.equal(isMarginAmount(0), false)
+  assert.equal(isMarginAmount(-50), false)
+  assert.equal(isMarginAmount(50.5), false)
+  assert.equal(isMarginAmount('50'), false)
   assert.equal(isTradingLeverage(1), true)
   assert.equal(isTradingLeverage(5), true)
   assert.equal(isTradingLeverage(20), true)
@@ -544,4 +555,61 @@ test('票 81：风向是确定性的 55–68% 弱信号，同一根内不变', (
   assert.equal(hintOf({ crop: 'nope', now }), null)
   assert.equal(hintOf({ crop: 'tomato', now: 'x' }), null)
   assert.equal(hintOf(), null)
+})
+
+test('票 83：到价目标价带 = 0.55–1.75× 底价，带外/坏数字一律拒绝', () => {
+  const band = targetBandOf({ crop: 'tomato' })
+  assert.equal(band.min, CROPS.tomato.base * PRICE_FLOOR_RATIO)
+  assert.equal(band.max, CROPS.tomato.base * PRICE_CEIL_RATIO)
+  // 边界算带内（图上摸到就能成交），带外一毫都不行。
+  assert.equal(isOrderTarget({ crop: 'tomato', target: band.min }), true)
+  assert.equal(isOrderTarget({ crop: 'tomato', target: band.max }), true)
+  assert.equal(isOrderTarget({ crop: 'tomato', target: band.min - 0.0001 }), false)
+  assert.equal(isOrderTarget({ crop: 'tomato', target: band.max + 0.0001 }), false)
+  assert.equal(isOrderTarget({ crop: 'tomato', target: 'not-a-price' }), false)
+  assert.equal(isOrderTarget({ crop: 'nope', target: 5 }), false)
+  assert.equal(isOrderTarget({ crop: 'tomato', target: Number.NaN }), false)
+  assert.equal(targetBandOf({ crop: 'nope' }), null)
+})
+
+test('票 83：到价成交扫描——做多跌到目标、做空涨到目标，成交价永远是目标价', () => {
+  const start = SLOT_EDGE
+  // 这一根的 tick 1–15 是一路下跌的（见 slot 1959232 的确定性路径）。
+  const longTarget = markPrice({ crop: 'tomato', now: start + 14 * TICK_MS })
+  const longFill = limitFillScan({
+    crop: 'tomato',
+    side: 'long',
+    target: longTarget,
+    from: start,
+    to: start + SLOT_MS
+  })
+  assert.deepEqual(longFill, { at: start + 14 * TICK_MS, slot: SLOT })
+  // 目标价刚好等于第 14 分钟的价：第 14 分钟成交，不是收盘，也不是更早。
+  assert.ok(markPrice({ crop: 'tomato', now: start + 13 * TICK_MS }) > longTarget)
+
+  const shortTarget = markPrice({ crop: 'tomato', now: start + TICK_MS })
+  const shortFill = limitFillScan({
+    crop: 'tomato',
+    side: 'short',
+    target: shortTarget,
+    from: start,
+    to: start + SLOT_MS
+  })
+  assert.deepEqual(shortFill, { at: start + TICK_MS, slot: SLOT })
+
+  // 终点在收盘那一刻：收盘价也参与扫描（图上摸到就算）。
+  const closeTarget = slotClosePrice('tomato', SLOT)
+  const atClose = limitFillScan({
+    crop: 'tomato',
+    side: 'long',
+    target: closeTarget,
+    from: start,
+    to: start + SLOT_MS
+  })
+  assert.equal(atClose.at, start + SLOT_MS)
+  // 扫描区间为空、目标价/作物坏掉：不成交，也不凭空造一个时刻。
+  assert.equal(limitFillScan({ crop: 'tomato', side: 'long', target: 1, from: start, to: start }), null)
+  assert.equal(limitFillScan({ crop: 'tomato', side: 'long', target: 'x', from: start, to: start + SLOT_MS }), null)
+  assert.equal(limitFillScan({ crop: 'tomato', side: 'up', target: longTarget, from: start, to: start + SLOT_MS }), null)
+  assert.equal(limitFillScan({ crop: 'nope', side: 'long', target: longTarget, from: start, to: start + SLOT_MS }), null)
 })

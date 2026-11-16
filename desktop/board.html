@@ -3,16 +3,18 @@
   <head>
     <meta charset="utf-8" />
     <!--
-      盘口小窗（票 79 / 票 81 / 票 82）：三作物 K 线、下单、持仓/止损、最近结算、本周盈亏、
-      真人周榜与 LAN 情绪。
+      盘口小窗（票 79 / 票 81 / 票 82 / 票 83）：三作物 K 线、下单、到价挂单/撤单、
+      持仓/止损、最近结算、本周盈亏、真人周榜与 LAN 情绪。
 
       和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
-      /state。行情、硬币、持仓、历史、周盈亏、风向、真人周榜全部由宿主随 `board-window` 命令推过来，
-      这里只画、只把「申请」交回主进程。窗口能收键盘（focusable），但**不按失焦关窗**：
-      macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
+      /state。行情、硬币、持仓、挂单、历史、周盈亏、风向、真人周榜全部由宿主随
+      `board-window` 命令推过来，这里只画、只把「申请」交回主进程。窗口能收键盘
+      （focusable），但**不按失焦关窗**：macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
 
-      Tab 顺序 = DOM 顺序：作物页签 → 方向 → 保证金 → 杠杆 → 开一手 → 每手仓位的止损/平仓。
-      右栏（下单）在 DOM 里紧跟在图表之后，靠 grid-area 放到视觉右侧，键盘走起来才顺。
+      Tab 顺序 = DOM 顺序：作物页签 → 方向 → 保证金 → 杠杆 → 到价开关 → 目标价输入框
+      → 挂单按钮（后两个只在「到价」点开时出现）→ 开一手 → 每张挂单的撤单 → 每手仓位的
+      止损/平仓。右栏（下单）在 DOM 里紧跟在图表之后，靠 grid-area 放到视觉右侧，
+      键盘走起来才顺。
     -->
     <meta
       http-equiv="Content-Security-Policy"
@@ -432,7 +434,9 @@
         grid-area: order;
         display: flex;
         flex-direction: column;
-        gap: 8px;
+        gap: 7px;
+        /* 到价面板展开后内容会变高：极端字号/缩放时宁可让这一栏自己滚，也不挤掉开仓按钮。 */
+        overflow-y: auto;
       }
       .order-card .card-head {
         margin-bottom: 0;
@@ -520,6 +524,123 @@
       }
       .hint:empty {
         display: none;
+      }
+      /* ------------------------------ 到价挂单（票 83） ------------------------------ */
+      .limit {
+        display: flex;
+        flex-direction: column;
+        gap: 5px;
+      }
+      .limit-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .limit-toggle {
+        flex: none;
+      }
+      .limit-toggle[aria-pressed='true'] {
+        border-color: var(--amber);
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+      }
+      .limit-note {
+        min-width: 0;
+        font-size: 10px;
+        color: var(--muted);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .limit-box {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 7px 8px;
+        border: 1px dashed var(--line-strong);
+        border-radius: 10px;
+        background: rgba(231, 162, 58, 0.05);
+      }
+      .limit-box[hidden] {
+        display: none;
+      }
+      .limit-input-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .limit-input-row .field-label {
+        margin: 0;
+        flex: none;
+      }
+      .limit-input {
+        flex: 1;
+        min-width: 0;
+        padding: 6px 8px;
+        border-radius: 9px;
+        border: 1px solid var(--line-strong);
+        background: var(--card);
+        color: var(--ink);
+        font-family: inherit;
+        font-size: 13px;
+        font-variant-numeric: tabular-nums;
+      }
+      .limit-input:focus-visible {
+        outline: 2px solid var(--focus);
+        outline-offset: 1px;
+      }
+      .limit-place {
+        flex: none;
+      }
+      .limit-band {
+        margin: 0;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .limit-hint {
+        margin: 0;
+        font-size: 10px;
+        color: var(--amber-ink);
+        line-height: 1.5;
+      }
+      .limit-hint:empty {
+        display: none;
+      }
+      .orders-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        padding-top: 6px;
+        border-top: 1px dashed var(--line);
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .orders {
+        flex: 0 1 auto;
+        max-height: 64px;
+        min-height: 0;
+      }
+      .order-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 4px 0;
+        font-size: 12px;
+      }
+      .order-row + .order-row {
+        border-top: 1px dashed var(--line);
+      }
+      .order-row .row-title {
+        font-size: 12px;
+      }
+      .order-row .row-meta {
+        font-variant-numeric: tabular-nums;
+      }
+      .order-cancel {
+        flex: none;
       }
       .fine {
         margin: auto 0 0;
@@ -824,9 +945,41 @@
             <div class="field-label">杠杆</div>
             <div class="chip-row" id="leverage-row" role="group" aria-label="杠杆"></div>
           </div>
+          <div class="limit">
+            <div class="limit-head">
+              <button class="ghost limit-toggle" id="limit-toggle" type="button" aria-pressed="false">
+                到价
+              </button>
+              <span class="limit-note" id="limit-note">关：直接按现价开仓</span>
+            </div>
+            <div class="limit-box" id="limit-box" hidden>
+              <div class="limit-input-row">
+                <label class="field-label" for="limit-target">目标价</label>
+                <input
+                  class="limit-input"
+                  id="limit-target"
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="5.00"
+                  aria-describedby="limit-band limit-hint"
+                />
+                <button class="ghost limit-place" id="limit-place" type="button">挂单</button>
+              </div>
+              <p class="limit-band" id="limit-band"></p>
+              <p class="limit-hint" id="limit-hint"></p>
+            </div>
+          </div>
           <p class="preview" id="preview"></p>
           <button class="submit" id="submit" type="button">开一手</button>
           <p class="hint" id="order-hint"></p>
+          <div class="orders-head">
+            <span>到价挂单</span>
+            <span id="orders-meta">0 张</span>
+          </div>
+          <div class="scroll orders" id="orders"></div>
+          <p class="empty" id="orders-empty">没有挂单。</p>
           <p class="fine">
             没有手续费、没有资金费、没有风险控制。关掉窗口也会照常收盘结算；硬币赔光就去种地。
           </p>

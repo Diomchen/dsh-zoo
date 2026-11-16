@@ -173,11 +173,14 @@ test('票 79：硬币不够（含 0 硬币）拒绝开仓，硬币一分不动',
   assert.deepEqual(broke.calls, [], '没钱就不该碰钱包')
 })
 
-test('票 79：白名单之外的作物/方向/保证金/杠杆都不开仓', async (t) => {
+test('票 79/83：白名单之外的作物/方向/保证金/杠杆都不开仓', async (t) => {
   const dir = await tempDir(t)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock: makeClock(), farm })
-  assert.equal((await store.openPosition({ side: 'long', margin: 250 })).error, 'bad-margin')
+  // 票 83：250 已经是预设之一；坏保证金的边界改成 0 / 小数 / 超过硬币上限。
+  assert.equal((await store.openPosition({ side: 'long', margin: 0 })).error, 'bad-margin')
+  assert.equal((await store.openPosition({ side: 'long', margin: 50.5 })).error, 'bad-margin')
+  assert.equal((await store.openPosition({ side: 'long', margin: 1_000_001 })).error, 'bad-margin')
   // 2× 不在白名单里（只有 1× / 5× / 20×）。
   assert.equal((await store.openPosition({ side: 'long', margin: 50, leverage: 2 })).error, 'bad-leverage')
   assert.equal((await store.openPosition({ side: 'up', margin: 50 })).error, 'bad-side')
@@ -425,7 +428,7 @@ test('票 79：单条坏持仓只丢自己；本周从本地周一算起，跨�
   assert.equal(view.positions[0].id, 'ok')
   assert.equal(view.history.length, 1, '坏历史只丢自己')
   assert.equal(view.history[0].id, 'h1')
-  assert.deepEqual(view.orders, [], '票 83 之前 orders 只有空形状')
+  assert.deepEqual(view.orders, [], '两条坏挂单只丢自己')
   assert.equal(logger.warnings.length, 1, '修补只告警一次')
   assert.match(logger.warnings[0], /修补/)
   // 上周的 42 不能带进本周；base 换成此刻的可用硬币。
