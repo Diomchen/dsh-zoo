@@ -18,6 +18,7 @@ import {
   BOARD_CROPS,
   BOARD_TIMEFRAMES,
   SLOT_MS,
+  SLOT_TICKS,
   TICK_MS,
   TRADING_LEVERAGES,
   boardPrice,
@@ -252,14 +253,39 @@ test('票 79 e2e：硬币不够（含 0 硬币）拒绝开仓，硬币不为负'
 })
 
 /**
- * 票 80 的那一根：`SLOT_EDGE + SLOT_MS`（下一根）在 tick 5 开仓，之后一路跌到收盘。
- * 20× 做多在这里 tick 12 撞强平线（−5%），5× 做多 + −25% 止损也在 tick 12 撞线；
- * 收盘价离得更远，所以「平在撞线那一刻」和「按收盘价结」拿到的价不一样。
+ * 票 80 的那一根：tick 5 开仓，之后**第一次**跌穿 −5% 在 `TICK_80`（20× 的强平线，
+ * 也正好是 5× 的 −25% 止损线），收盘还在更下面，所以「平在撞线那一刻」和
+ * 「按收盘价结」拿到的价不一样。
+ *
+ * 票 86 把价格盐升到 board-v2 后行情全变，这一根按新行情现找（20× 需要单根 5% 的
+ * 波动，不是每根都有），不再写死「下一根 / tick 12」。
  */
-const OPEN_80 = SLOT_EDGE + SLOT_MS + 5 * TICK_MS
-const AFTER_80 = SLOT_EDGE + 2 * SLOT_MS + 1000
-const TICK_80 = 12
-const EXIT_80 = boardPrice({ crop: 'tomato', slot: slotIndexAt(OPEN_80), tick: TICK_80 })
+function breachBar (fromSlot) {
+  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+    const prices = []
+    for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+      prices.push(boardPrice({ crop: 'tomato', slot, tick }))
+    }
+    const entry = prices[5]
+    let breachTick = -1
+    for (let tick = 6; tick <= 14; tick += 1) {
+      if (prices[tick] <= entry * 0.95) {
+        breachTick = tick
+        break
+      }
+    }
+    if (breachTick < 0) continue
+    if (prices[SLOT_TICKS] >= prices[breachTick]) continue
+    if (Math.min(...prices.slice(5)) <= entry * 0.8) continue
+    return { slot, breachTick }
+  }
+  throw new Error('找不到「tick 5 开仓、之后跌穿 −5%、收盘更低」的行情（行情规则改了？）')
+}
+const BAR_80 = breachBar(Math.floor(SLOT_EDGE / SLOT_MS) + 1)
+const OPEN_80 = BAR_80.slot * SLOT_MS + 5 * TICK_MS
+const AFTER_80 = (BAR_80.slot + 1) * SLOT_MS + 1000
+const TICK_80 = BAR_80.breachTick
+const EXIT_80 = boardPrice({ crop: 'tomato', slot: BAR_80.slot, tick: TICK_80 })
 
 test('票 80 e2e：20× 开仓 → 跳过时钟 → 强平；只亏保证金，杠杆白名单是 [1,5,20]', async (t) => {
   const dir = await tempDir(t)
@@ -294,7 +320,7 @@ test('票 80 e2e：20× 开仓 → 跳过时钟 → 强平；只亏保证金，�
     leverage: 20
   }))
 
-  // 3) 时钟跳过这一根：强平线在 tick 12 就被跌穿，收盘价还在更下面。
+  // 3) 时钟跳过这一根：强平线在 TICK_80 那一分钟就被跌穿，收盘价还在更下面。
   clock.value = AFTER_80
   const refreshed = await action(service, { action: 'trading-refresh' })
   assert.equal(refreshed.status, 200)
@@ -357,7 +383,7 @@ test('票 80 e2e：一键止损 → /state 反映档位 → 到线平，原因�
   assert.equal((await state(service)).body.trading.positions[0].stopLoss, 0.25)
   assert.equal((await action(service, { action: 'trading-set-stop', positionId: 'nope', level: 0.5 })).body.error, 'no-position')
 
-  // 时钟跳过这一根：−25% 保证金（−5% 价格）在 tick 12 撞到，按那一刻的价平。
+  // 时钟跳过这一根：−25% 保证金（−5% 价格）在 TICK_80 撞到，按那一刻的价平。
   clock.value = AFTER_80
   assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
   const settled = await state(service)
