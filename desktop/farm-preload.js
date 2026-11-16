@@ -10,12 +10,28 @@
  *   - onResult：宿主的 action-result；成功不关窗（toast 一下，继续种/继续买）。
  *
  * 和主窗/带派窗的 preload 是三份文件：这扇窗能收键盘，但同样**不能**自己改状态。
- * 这里刻意**不**在失焦时关窗（主进程也没有 blur 处理器）：macOS 中文输入法候选窗会
- * 抢焦点，blur 关窗会变成「打中文时窗消失」。
+ * 失焦策略见 ADR-0029：真正点窗口外面会收起所有插件窗；只有输入法合成期间例外，
+ * 由下面的 composition 监听过桥给主进程。
  */
 'use strict'
 
 const { contextBridge, ipcRenderer } = require('electron')
+
+/**
+ * 输入法合成期间不收起（ADR-0029）：候选窗抢焦点会触发 blur，但用户还在打中文。
+ * 只上报一个布尔，主进程不认任何其它字段；捕获阶段才能稳定收到从输入框冒上来的事件。
+ */
+let composing = false
+window.addEventListener('compositionstart', () => {
+  if (composing) return
+  composing = true
+  ipcRenderer.send('dsh-zoo:composing', true)
+}, true)
+window.addEventListener('compositionend', () => {
+  if (!composing) return
+  composing = false
+  ipcRenderer.send('dsh-zoo:composing', false)
+}, true)
 
 contextBridge.exposeInMainWorld('dshZooFarm', {
   /** 监听器就位：主进程可以把当前农场推过来了。 */
