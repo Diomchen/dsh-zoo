@@ -951,10 +951,10 @@ export function createService (ctx, options = {}) {
       return handleVisitFarmAction(action, body?.plotId, body?.visitId)
     }
 
-    // 农场（ticket 39）：四个本地动作。规则在 src/farm-rules.js（纯），
+    // 农场（ticket 39）：本地地块动作。规则在 src/farm-rules.js（纯），
     // 落盘/串行化在 src/farm.js；UDP 报文没有入口，访客的偷/帮走 ticket 43。
-    if (action === 'plant' || action === 'harvest' || action === 'water' || action === 'fertilize' ||
-      action === 'farm-plant' || action === 'farm-harvest' || action === 'farm-water' || action === 'farm-fertilize') {
+    if (action === 'plant' || action === 'harvest' || action === 'water' || action === 'fertilize' || action === 'clear' ||
+      action === 'farm-plant' || action === 'farm-harvest' || action === 'farm-water' || action === 'farm-fertilize' || action === 'farm-clear') {
       if (farm === null) return { ok: false, error: 'starting' }
       // 桌面小窗发的是 farm-* 前缀（和菜单/客户端动作族一致）；HTTP 仍是 SPEC 里的四种。
       const kind = action.startsWith('farm-') ? action.slice('farm-'.length) : action

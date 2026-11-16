@@ -359,6 +359,11 @@ test('交易所页：farm-window 带 market；买种/卖作物走同一 store �
   assert.equal(event.event.qty, 3)
   assert.equal(event.event.cropId, 'carrot')
   assert.equal(shared.FARM_ACTIONS.includes('farm-buy-seed'), true)
+  assert.equal(shared.FARM_ACTIONS.includes('farm-clear'), true)
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'farm-clear', plotId: 'p1' }),
+    { action: 'farm-clear', plotId: 'p1' }
+  )
   // helper 侧同样夹价格/重算 bid：宿主多给一个字段也不会让窗口画错价。
   const normalizedWindow = shared.normalizeFarmWindow({
     open: true,
@@ -1235,6 +1240,27 @@ test('地块卡模型：认识十种作物，每种都带图路径', () => {
     assert.equal(card.art, 'crops/' + card.crop + '.svg')
     assert.equal(JSON.stringify(card.emoji).length > 2, true)
   }
+})
+
+test('地块卡：生长中和冻住有铲除，成熟/枯萎/空地没有', () => {
+  const plots = [
+    { id: 'p1', crop: 'tomato', stage: 'growing', remainingMs: 60 * 1000, waterings: 0, fertilized: false },
+    { id: 'p2', crop: 'tomato', stage: 'frozen', remainingMs: 0, waterings: 0, fertilized: false, frozen: true },
+    { id: 'p3', crop: 'tomato', stage: 'mature', remainingMs: 0, waterings: 0, fertilized: false },
+    { id: 'p4', crop: 'tomato', stage: 'withered', remainingMs: 0, waterings: 0, fertilized: false, withered: true },
+    { id: 'p5', crop: null, stage: 'empty', remainingMs: 0 }
+  ]
+  const cards = farmView.plotCards({ plots, dew: 0, coins: 0 }, {})
+  const growing = cards[0].actions.find((entry) => entry.action === 'clear')
+  assert.ok(growing, '生长中应能铲除')
+  assert.equal(growing.label, '铲除')
+  assert.equal(growing.className, 'clear')
+  const frozen = cards[1].actions.find((entry) => entry.action === 'clear')
+  assert.ok(frozen, '冻住也应能铲除')
+  assert.equal(cards[1].actions.some((entry) => entry.action === 'thaw'), true)
+  assert.equal(cards[2].actions.some((entry) => entry.action === 'clear'), false, '成熟先收割')
+  assert.equal(cards[3].actions.some((entry) => entry.action === 'clear'), false, '枯萎直接重种')
+  assert.equal(cards[4].actions.some((entry) => entry.action === 'clear'), false, '空地没有铲除')
 })
 
 // ---------------------------------------------------------------------------

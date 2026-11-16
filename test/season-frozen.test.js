@@ -108,3 +108,22 @@ test('冻结：只挑有作物的地，成熟地优先保护，最多冻 qty 块
   assert.equal(result.qty, 1, '只有一块有作物')
   assert.equal(result.plots[0], 'p1')
 })
+
+test('铲除：冻住的地可以直接清空，不付解冻费', async (t) => {
+  const dir = await tempDir(t)
+  const clock = clockAt(WINTER)
+  const store = await createFarmStore(dir, { now: clock.now, market: fakeMarket() })
+  await store.buySeed('radish', 1)
+  await store.plant('p1', 'radish')
+  assert.equal((await store.freezePlots(1)).ok, true)
+  const before = store.snapshot()
+
+  const cleared = await store.clear('p1')
+  assert.equal(cleared.ok, true)
+  assert.equal(cleared.crop, 'radish')
+  assert.equal(cleared.plot.crop, null)
+  assert.equal(cleared.dew, before.dew, '不扣解冻露水')
+  assert.equal(cleared.coins, before.coins, '不扣解冻硬币')
+  assert.equal(cleared.seeds.radish, before.seeds.radish, '不退种子')
+  assert.equal((await store.clear('p1')).error, 'plot-empty')
+})

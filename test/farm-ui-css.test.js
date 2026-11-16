@@ -151,3 +151,12 @@ test('票 58：作物图是包内 SVG —— CSP 放行同源图片，卡片尺�
   assert.match(css, /\.plot-card\[data-stage='mature'\] \.crop-emoji \{[^}]*animation:/)
   assert.match(css, /\.plot-card\[data-stage='growing'\] \{/)
 })
+
+test('clear button has danger color and two-click confirmation', () => {
+  const rule = bodyOf('.chip-btn.clear')
+  assert.match(rule, /var\(--rose-soft\)/)
+  assert.match(rule, /var\(--rose-ink\)/)
+  assert.match(renderer, /farm-clear/)
+  assert.match(renderer, /clearArmed/)
+  assert.match(renderer, /dataset\.armed/)
+})

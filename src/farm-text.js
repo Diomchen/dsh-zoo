@@ -36,6 +36,8 @@ const FARM_ERROR_TEXT = Object.freeze({
   'event-not-ready': '节日任务还没完成，再忙一会儿。',
   'event-claimed': '今天的节日奖励已经领过了。',
   'plot-occupied': '这块地已经种上了，先收掉再种。',
+  'plot-empty': '这块地本来就是空的。',
+  'plot-mature': '已经成熟了，先收割吧。',
   'not-mature': '还没熟呢，再等一会儿。',
   'no-seed': '没有这种种子了，先去交易所买。',
   'no-crop': '没有这种作物了，先种一点再来卖。',
