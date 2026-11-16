@@ -253,8 +253,14 @@
   const BOARD_MAX_POSITIONS = 200
   const BOARD_MAX_ORDERS = 200
   const BOARD_MAX_HISTORY = 50
-  const BOARD_MAX_LIMITS = 8
-  const BOARD_MAX_CHARTS = 8
+  /**
+   * 盘口白名单的长度上限（票 88 / ADR-0031）：作物清单跟随宿主运行时目录，
+   * 可能远多于内置十种（目录上限 64）。8 会正好削掉第 9/10 种作物；
+   * 32 与 `src/crop-catalog.js` 的目录量级同阶，够用又不至于让坏包无限大。
+   * `limits` 里还有保证金/杠杆两列（各 3 档），同一把尺子一起放宽不会损失校验。
+   */
+  const BOARD_MAX_LIMITS = 32
+  const BOARD_MAX_CHARTS = 32
   /** 宿主给 24 根 + 当前一根；留一点余量，换根数时不必两边同改。 */
   const BOARD_MAX_BARS = 40
   const BOARD_MAX_TICK = 15
@@ -1733,10 +1739,27 @@
     return num
   }
 
+  /**
+   * 盘口作物 id（票 88 / ADR-0031）：先认 helper 当前目录（`CROP_IDS`），
+   * 再放行**和目录同一形状**的新 id。
+   *
+   * 为什么不用 `normalizeCropId()`：盘口清单跟随宿主运行时目录，LAN 同步来的新作物
+   * 可能还没经过农场窗的 `applyCropCatalog()`；而盘口 payload 本身就是宿主的权威清单，
+   * 只认内置目录会把新作物的图/持仓/hint 全削掉（§9.4 的老坑）。形状校验保留
+   * （与 `src/crop-catalog.js` 的 `CROP_ID_RE` 同源），不是任意字符串都能当作物。
+   */
+  const BOARD_CROP_ID_RE = /^[a-z][a-z0-9_-]{1,23}$/
+  function normalizeBoardCropId (value) {
+    if (typeof value !== 'string') return null
+    const id = value.trim().toLowerCase()
+    if (id === '') return null
+    return CROP_IDS.includes(id) || BOARD_CROP_ID_RE.test(id) ? id : null
+  }
+
   function normalizeBoardPosition (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const id = normalizeId(raw.id)
-    const crop = normalizeCropId(raw.crop)
+    const crop = normalizeBoardCropId(raw.crop)
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     if (id === null || crop === null || side === null) return null
     const margin = normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS)
@@ -1769,7 +1792,7 @@
   function normalizeBoardHistory (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const id = normalizeId(raw.id)
-    const crop = normalizeCropId(raw.crop)
+    const crop = normalizeBoardCropId(raw.crop)
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     if (id === null || crop === null || side === null) return null
     if (!BOARD_REASONS.includes(raw.reason)) return null
@@ -1800,7 +1823,7 @@
   function normalizeBoardOrder (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const id = normalizeId(raw.id)
-    const crop = normalizeCropId(raw.crop)
+    const crop = normalizeBoardCropId(raw.crop)
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     if (id === null || crop === null || side === null) return null
     const target = normalizeBoardNumber(raw.target, 0, BOARD_MAX_PRICE)
@@ -1852,7 +1875,7 @@
     for (const candidate of Array.isArray(raw.crops) ? raw.crops : []) {
       if (crops.length >= BOARD_MAX_LIMITS) break
       if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
-      const id = normalizeCropId(candidate.id)
+      const id = normalizeBoardCropId(candidate.id)
       if (id === null || crops.some((crop) => crop.id === id)) continue
       crops.push({ id, name: normalizeLabel(candidate.name, id) })
     }
@@ -1889,21 +1912,51 @@
     return { floor, ceil }
   }
 
-  /** 一根 K 线：开高低收都是价格；slot 只当横轴的键。坏一根丢一根，图少一根不影响别的。 */
+  /**
+   * 一根 K 线：开高低收都是价格；slot 只当横轴的键。坏一根丢一根，图少一根不影响别的。
+   *
+   * 票 88 的紧凑形（宿主为省 IPC 带宽改成数组）：`[slot, start, end, open, high, low, close]`；
+   * 老宿主仍然发对象形，两种都认。窗口拿到的**永远是对象**，视图层不用知道传输形状。
+   */
+  const BOARD_BAR_INDEX = Object.freeze({
+    slot: 0,
+    start: 1,
+    end: 2,
+    open: 3,
+    high: 4,
+    low: 5,
+    close: 6
+  })
+  function boardBarFields (raw) {
+    if (!Array.isArray(raw)) {
+      return raw !== null && typeof raw === 'object' ? raw : null
+    }
+    if (raw.length < 7) return null
+    return {
+      slot: raw[BOARD_BAR_INDEX.slot],
+      start: raw[BOARD_BAR_INDEX.start],
+      end: raw[BOARD_BAR_INDEX.end],
+      open: raw[BOARD_BAR_INDEX.open],
+      high: raw[BOARD_BAR_INDEX.high],
+      low: raw[BOARD_BAR_INDEX.low],
+      close: raw[BOARD_BAR_INDEX.close]
+    }
+  }
   function normalizeBoardBar (raw) {
-    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
-    const open = normalizeBoardNumber(raw.open, 0, BOARD_MAX_PRICE)
-    const high = normalizeBoardNumber(raw.high, 0, BOARD_MAX_PRICE)
-    const low = normalizeBoardNumber(raw.low, 0, BOARD_MAX_PRICE)
-    const close = normalizeBoardNumber(raw.close, 0, BOARD_MAX_PRICE)
+    const fields = boardBarFields(raw)
+    if (fields === null) return null
+    const slot = normalizeBoardInt(fields.slot, 0, Number.MAX_SAFE_INTEGER)
+    const open = normalizeBoardNumber(fields.open, 0, BOARD_MAX_PRICE)
+    const high = normalizeBoardNumber(fields.high, 0, BOARD_MAX_PRICE)
+    const low = normalizeBoardNumber(fields.low, 0, BOARD_MAX_PRICE)
+    const close = normalizeBoardNumber(fields.close, 0, BOARD_MAX_PRICE)
     if (slot === null || open === null || high === null || low === null || close === null) return null
     // 票 84：`start`/`end` 是这一根的真实毫秒边界（窗口的时间标签靠它）。
     // 老宿主没有这两个字段时保留 null，不因为少一个标签就把整根丢掉。
     return {
       slot,
-      start: normalizeBoardInt(raw.start, 0, Number.MAX_SAFE_INTEGER),
-      end: normalizeBoardInt(raw.end, 0, Number.MAX_SAFE_INTEGER),
+      start: normalizeBoardInt(fields.start, 0, Number.MAX_SAFE_INTEGER),
+      end: normalizeBoardInt(fields.end, 0, Number.MAX_SAFE_INTEGER),
       open,
       high,
       low,
@@ -1948,13 +2001,16 @@
     return { base, bars, current: normalizeBoardCurrentBar(raw.current) }
   }
 
-  /** `charts: { tomato: {…}, … }`：只认运行时目录里的作物 id，多余的键丢掉。 */
+  /**
+   * `charts: { tomato: {…}, … }`：键必须是盘口作物 id（目录里的 + 同形新作物，
+   * 见 `normalizeBoardCropId()`），多余的键丢掉；最多 `BOARD_MAX_CHARTS` 张。
+   */
   function normalizeBoardCharts (raw) {
     const charts = {}
     let count = 0
     for (const key of Object.keys(raw)) {
       if (count >= BOARD_MAX_CHARTS) break
-      const crop = normalizeCropId(key)
+      const crop = normalizeBoardCropId(key)
       if (crop === null) continue
       const chart = normalizeBoardChart(raw[key])
       if (chart === null) continue
@@ -1988,7 +2044,7 @@
     let count = 0
     for (const key of Object.keys(raw)) {
       if (count >= BOARD_MAX_CHARTS) break
-      const crop = normalizeCropId(key)
+      const crop = normalizeBoardCropId(key)
       if (crop === null) continue
       const entry = raw[key]
       if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
@@ -2006,7 +2062,7 @@
   /** 榜上一条持仓（票 82）：只有作物/方向/杠杆——保证金与入场价根本不在报文里。 */
   function normalizeBoardLeaguePosition (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
-    const crop = normalizeCropId(raw.crop)
+    const crop = normalizeBoardCropId(raw.crop)
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     if (crop === null || side === null || leverage === null) return null
@@ -2117,6 +2173,15 @@
       const entry = normalizeBoardHistory(candidate)
       if (entry !== null) history.push(entry)
     }
+    // 票 88：四个周期的图只归一化一次，下面 `charts` 的旧字段兜底也读这一份。
+    const timeframes = normalizeBoardTimeframes(
+      raw.timeframes !== null && typeof raw.timeframes === 'object' && !Array.isArray(raw.timeframes)
+        ? raw.timeframes
+        : {}
+    )
+    const rawCharts = raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
+      ? normalizeBoardCharts(raw.charts)
+      : {}
     return {
       coins: {
         available: normalizeBoardInt(coinsRaw.available, 0, MAX_FARM_COINS) ?? 0,
@@ -2133,18 +2198,12 @@
         total: normalizeBoardInt(weekRaw.total, -MAX_FARM_COINS, MAX_FARM_COINS) ?? 0
       },
       limits: normalizeBoardLimits(limitsRaw),
-      // 票 81：三作物各自的 K 线与风向；缺了就画空态（老宿主/坏包都走这条路）。
-      charts: normalizeBoardCharts(
-        raw.charts !== null && typeof raw.charts === 'object' && !Array.isArray(raw.charts)
-          ? raw.charts
-          : {}
-      ),
+      // 票 81/88：盘口作物各自的 K 线；缺了就画空态（老宿主/坏包都走这条路）。
+      // 新宿主不再重复下发 15 分图（`timeframes['15m']` 就是它），这里补回旧字段，
+      // 窗口视图仍然可以用 `payload.charts` 画 15 分，不感知传输层的变化。
+      charts: Object.keys(rawCharts).length > 0 ? rawCharts : (timeframes['15m'] ?? {}),
       // 票 84：四个周期的 K 线。老宿主没有这一块时是空对象，窗口退回 `charts`（15 分）。
-      timeframes: normalizeBoardTimeframes(
-        raw.timeframes !== null && typeof raw.timeframes === 'object' && !Array.isArray(raw.timeframes)
-          ? raw.timeframes
-          : {}
-      ),
+      timeframes,
       hint: normalizeBoardHints(
         raw.hint !== null && typeof raw.hint === 'object' && !Array.isArray(raw.hint)
           ? raw.hint
@@ -2153,7 +2212,7 @@
       bar: barRaw === null
         ? null
         : {
-          crop: normalizeCropId(barRaw.crop),
+          crop: normalizeBoardCropId(barRaw.crop),
           slot: normalizeBoardInt(barRaw.slot, 0, Number.MAX_SAFE_INTEGER),
           start: normalizeBoardInt(barRaw.start, 0, Number.MAX_SAFE_INTEGER),
           end: normalizeBoardInt(barRaw.end, 0, Number.MAX_SAFE_INTEGER),
@@ -2215,7 +2274,9 @@
       const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
       const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
       const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
-      const cropId = normalizeCropId(raw.cropId)
+      // 盘口作物走 `normalizeBoardCropId()`（票 88）：目录里新增的作物也能下单；
+      // 宿主照样按 `isBoardCrop()` 再判一次，这一层只守形状。
+      const cropId = normalizeBoardCropId(raw.cropId)
       const target = Number(raw.target)
       if (side === null || margin === null || leverage === null || cropId === null) return null
       if (!Number.isFinite(target) || target <= 0 || target > BOARD_MAX_PRICE) return null
@@ -2225,7 +2286,8 @@
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
     const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
-    const cropId = normalizeCropId(raw.cropId)
+    // 与到价挂单同一把尺子：新增作物能在盘口开仓，未知作物仍由宿主拒掉。
+    const cropId = normalizeBoardCropId(raw.cropId)
     if (side === null || margin === null || leverage === null || cropId === null) return null
     return { action, side, margin, leverage, cropId }
   }
