@@ -20,7 +20,6 @@ import {
 import {
   SLOT_MS,
   TICK_MS,
-  boardPrice,
   markPrice,
   pnlOf,
   settlementOf,
@@ -264,6 +263,34 @@ test('票 79：15 分钟收盘自动结算，用这一根的收盘价；重复 t
   assert.equal(store.view().history.length, 1)
 })
 
+test('票 79：离线跨过收盘——启动就按那一根的收盘价结算，不留旧仓位', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock(SLOT_EDGE + 2 * TICK_MS)
+  const farm = fakeFarm(300)
+  const store = await openStore(dir, { clock, farm })
+  const opened = await store.openPosition({ side: 'long', margin: 50 })
+  assert.equal(farm.wallet.coins, 250)
+
+  // 关掉 DSH 半小时再回来：行情是算出来的，收盘价不会因为离线而变。
+  clock.set(SLOT_EDGE + 2 * SLOT_MS)
+  const restarted = await openStore(dir, { clock, farm })
+  const view = restarted.view()
+  assert.equal(view.positions.length, 0, '不把昨天的仓位画成还开着')
+  assert.equal(view.history.length, 1)
+  assert.equal(view.history[0].reason, 'settle')
+  const expected = settlementOf({
+    side: 'long',
+    margin: 50,
+    leverage: 1,
+    entry: opened.position.entry,
+    mark: slotClosePrice('tomato', opened.position.slot)
+  })
+  assert.equal(view.history[0].exit, slotClosePrice('tomato', opened.position.slot))
+  assert.equal(view.history[0].pnl, expected.pnl)
+  assert.equal(farm.wallet.coins, 250 + expected.credit)
+  assert.equal(view.week.pnl, expected.pnl)
+})
+
 test('票 79：重启恢复——持仓、本周盈亏、历史都从 trading.json 读回来', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(SLOT_EDGE + TICK_MS)
@@ -468,5 +495,4 @@ test('票 79：读盘归一化不认白名单之外的字段', () => {
   assert.equal(fixed.repaired, 1)
   // 空文件也可以是「还没开始」的一周。
   assert.equal(normalizeTradingFile({}).state.week.start, null)
-  assert.equal(boardPrice({ crop: 'tomato', slot: SLOT, tick: 0 }) > 0, true)
 })

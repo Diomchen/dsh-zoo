@@ -404,6 +404,8 @@ class TradingStore {
       this.#warnOnce('entries', '盘口里有 ' + normalized.repaired + ' 处格式不对，已按默认值修补')
     }
 
+    // 先跨周（只清本周盈亏，硬币不动），再补结算：这次补出来的盈亏算本周的。
+    const rolled = this.#rollWeek(now)
     // `settling` = 上次写完「要结算」就崩了。钱可能已经退过，按已入账处理：
     // 只补历史与本周盈亏，**绝不 addCoins**（和 contracts 的取舍一致）。
     let resumed = false
@@ -412,9 +414,11 @@ class TradingStore {
       this.#finishSettle(position, position.settling)
       resumed = true
     }
-    const rolled = this.#rollWeek(now)
+    // 离线跨过收盘：启动就把这些仓位按它们各自那一根的收盘价结掉，
+    // 用户打开盘口时看到的不是「昨天还开着」的旧仓位。
+    const closed = await this.#settleClosed(now)
     // 坏文件不覆盖（等下一次动作/tick 再写）；补出来的补结算、跨周与修补要立刻落盘。
-    if (!normalized.corrupt && (resumed || rolled || normalized.repaired > 0)) {
+    if (!normalized.corrupt && (resumed || rolled || closed || normalized.repaired > 0)) {
       await this.#persist(true)
     }
   }
@@ -528,12 +532,23 @@ class TradingStore {
 
   async #tick () {
     const now = this.#nowMs()
-    let changed = this.#rollWeek(now)
+    const rolled = this.#rollWeek(now)
+    const settled = await this.#settleClosed(now)
+    if (!rolled && !settled) return false
+    await this.#persist(settled)
+    return true
+  }
+
+  /**
+   * 把已经收盘的仓位按「它们各自那一根的收盘价」结掉——在线的 tick 与启动补算
+   * 走同一个函数，所以离线补出来的价和图上最后一根永远一致。
+   */
+  async #settleClosed (now) {
     const currentSlot = slotIndexAt(now)
     let settled = false
     for (const position of [...this.#state.positions]) {
+      // 已经收盘才结；结算中的仓位等重启补后半段，不重复动钱。
       if (position.slot >= currentSlot) continue
-      // 已经收盘：用这一根的收盘价结算，和窗口里最后一根对得上。
       if (position.settling !== undefined) continue
       const exit = slotClosePrice(position.crop, position.slot)
       if (exit === null) continue
@@ -544,10 +559,7 @@ class TradingStore {
       })
       if (result.ok === true) settled = true
     }
-    if (settled) changed = true
-    if (!changed) return false
-    await this.#persist(settled)
-    return true
+    return settled
   }
 
   /**
