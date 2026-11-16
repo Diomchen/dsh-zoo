@@ -22,7 +22,7 @@ test('FARM_ACTIONS 只装动作名：非空字符串、不重复、交易所两�
     assert.ok(action.trim() !== '', '白名单里不该有空动作')
   }
   assert.equal(new Set(shared.FARM_ACTIONS).size, shared.FARM_ACTIONS.length, '白名单不应有重复')
-  for (const action of ['farm-buy-seed', 'farm-sell-crop', 'hire', 'hire-listing', 'farm-look', 'farm-raid', 'farm-unlock']) {
+  for (const action of ['farm-buy-seed', 'farm-sell-crop', 'hire', 'hire-listing', 'farm-look', 'farm-raid', 'farm-unlock', 'farm-refresh', 'farm-own']) {
     assert.ok(shared.FARM_ACTIONS.includes(action), action + ' 应该在 FARM_ACTIONS 里')
   }
 })

@@ -66,7 +66,7 @@ import {
 import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
 import { GUARD_HIRE_COST, GUARD_HIRE_STEP, MAX_TEMP_GUARDS } from './season-omens.js'
-import { createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
+import { FARM_FETCH_COOLDOWN_MS, createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
 import { openFarmView } from './farm-open.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
@@ -680,6 +680,17 @@ export function createService (ctx, options = {}) {
   let farmWindowOpened = false
   let farmWindowVisitView = null
   /**
+   * 农场窗此刻在看的邻居（票 52 的只读模式）：`{ deviceId, view }`，`null` = 没在看别人家。
+   *
+   * 以前只记得访客视图、不记得"正在看谁家"，于是每一次 `refreshFarmWindow()` 都按
+   * `self.out` 重算模式：行情摘要（每 30 秒一轮）、自家作物到点、邻居来偷，随便哪一件
+   * 都会推一包 `mode:'owner'`，把看田窗口打回自己农场——现场就是"稍微看一下就回去了"。
+   * 只读视图和主人那一包没有任何关系，所以它在的时候**不发**主人视图。
+   */
+  let farmWindowLook = null
+  /** 看田窗口自动重拉失败后的静默期（见 `refreshLookWindow`）；用户重新点一次就清零。 */
+  let lookRefreshBlockedUntil = 0
+  /**
    * 入站礼物的频率限额（ticket 27）：同一邻居 ≤10 件/小时、≤50 件/天。
    * 只活在本次运行的内存里；字条与文件两条接收路径共用它。
    * 单测可以注入更小的额度（生产不传，就是 SPEC 的 10 / 50）。
@@ -1021,6 +1032,7 @@ export function createService (ctx, options = {}) {
     if (action === 'farm-close') return closeFarmWindow('farm-close')
     // ticket 47.1：窗口倒计时到 0 时请宿主重推当前视图，由宿主 stage 决定是否成熟。
     // 窗口不自己标 mature，避免本地时钟早几毫秒时收获被回 not-mature。
+    // 票 52 回归：它**保持当前模式**——看田期间回的是邻居家的新一份，不是自己农场。
     if (action === 'farm-refresh') {
       if (desktop === null || typeof desktop.farmWindow !== 'function') {
         return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
@@ -1028,9 +1040,15 @@ export function createService (ctx, options = {}) {
       if (farmWindowOpenNow() !== true) {
         return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
       }
+      if (farmWindowLook !== null) {
+        await refreshLookWindow()
+        return { ok: true, action: 'farm-refresh' }
+      }
       refreshFarmWindow()
       return { ok: true, action: 'farm-refresh' }
     }
+    // 票 52 回归：窗口里「我的农场」那颗圆片——从只读视图切回自己农场的唯一出口。
+    if (action === 'farm-own') return handleFarmOwn()
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') return recallPet()
@@ -1883,6 +1901,9 @@ export function createService (ctx, options = {}) {
     // ticket 46：再点一次「农场」= 关窗。返回 action 仍是 farm-open，窗口字段说明发生了什么。
     if (farmWindowOpenNow()) return closeFarmWindow('farm-open')
     const plotId = typeof rawPlotId === 'string' ? rawPlotId : null
+    // 菜单打开的永远是"我家的农场"（或访客视图）：上一次的只读视图到此为止。
+    farmWindowLook = null
+    lookRefreshBlockedUntil = 0
     const out = outboundVisitForWindow()
     const visit = out === null ? null : loadingVisitView(out)
     if (out === null) {
@@ -1937,6 +1958,9 @@ export function createService (ctx, options = {}) {
       sent = false
     }
     farmWindowOpened = false
+    // 窗都关了，就没有"正在看谁家"这回事；下次开窗从主人视图开始。
+    farmWindowLook = null
+    lookRefreshBlockedUntil = 0
     if (sent !== true) {
       return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
     }
@@ -2018,17 +2042,80 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 把一份新视图推给已经开着的窗口（`open:false` 不会新开窗）。
+   * 调用方自己确认"窗口在"：`refreshFarmWindow` 按宿主记录节流，`handleFarmOwn` 已经问过 helper。
+   */
+  function pushFarmWindow (overrides = {}) {
+    if (desktop === null || typeof desktop.farmWindow !== 'function') return false
+    try {
+      return desktop.farmWindow(farmWindowPayload({ open: false, ...overrides })) === true
+    } catch {
+      // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
+      return false
+    }
+  }
+
+  /**
    * 成交/动作后刷新已经开着的窗口（`open:false` 不会新开窗）。
    * 正在串门时保留访客块，别把窗口打回主人模式。
+   *
+   * 正在**看田**时什么都不发：只读视图里没有一处来自我家的农场，这一包刷新对它没有意义，
+   * 而载荷里没有 `look` 就会被窗口当成"回我的农场"（字段就是这么判的）。
+   * 它要的新鲜数据走 `refreshLookWindow()`。
    */
   function refreshFarmWindow () {
     if (farmWindowOpened !== true) return
-    if (desktop === null || typeof desktop.farmWindow !== 'function') return
-    try {
-      desktop.farmWindow(farmWindowPayload({ open: false }))
-    } catch {
-      // 刷新失败只影响这一帧；下一次开窗/动作会再推一份。
+    if (farmWindowLook !== null) return
+    pushFarmWindow()
+  }
+
+  /**
+   * 看田窗口要一份新的邻居视图（倒计时到点、或用户重新点同一个圆片）。
+   * 拉不到就什么都不推——窗口停在上一份只读视图，绝不因此滑回自己农场。
+   *
+   * 失败后按 `FARM_FETCH_COOLDOWN_MS` 停一会儿：窗口的倒计时到 0 会每拍来问一次，
+   * 对面掉线时不能变成每秒敲一台坏邻居（`open` 本身没有失败冷却，它是给"用户点出来的"用的）。
+   */
+  async function refreshLookWindow () {
+    const current = farmWindowLook
+    if (current === null || farmFetcher === null || discovery === null || identity === null) return false
+    if (Date.now() < lookRefreshBlockedUntil) return false
+    const endpoint = discovery.addressOf(current.deviceId)
+    const port = freshPeerLanPort(current.deviceId)
+    if (endpoint === null || port === null) return false
+    const result = await farmFetcher.open({
+      address: endpoint.address,
+      port,
+      deviceId: identity.deviceId
+    })
+    if (result.ok !== true) {
+      lookRefreshBlockedUntil = Date.now() + FARM_FETCH_COOLDOWN_MS
+      return false
     }
+    // 期间用户可能已经切走（关窗 / 点了我的农场 / 换了邻居）：迟到的这一份不许再推。
+    if (farmWindowLook !== current) return false
+    farmWindowLook = { deviceId: current.deviceId, view: result.view }
+    return pushFarmWindow({
+      mode: 'look',
+      look: { ...result.view, deviceId: current.deviceId }
+    })
+  }
+
+  /**
+   * 窗口里「我的农场」那颗圆片：显式离开只读视图，回到主人/访客视图。
+   * 以前它挤在 `farm-refresh` 里，导致"到点确认"与"切回我家"共用一条申请。
+   */
+  function handleFarmOwn () {
+    if (desktop === null || typeof desktop.farmWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+    }
+    if (farmWindowOpenNow() !== true) {
+      return { ok: false, error: 'desktop-off', notice: farmErrorText('desktop-off') }
+    }
+    farmWindowLook = null
+    lookRefreshBlockedUntil = 0
+    pushFarmWindow()
+    return { ok: true, action: 'farm-own' }
   }
 
 
@@ -3201,6 +3288,10 @@ export function createService (ctx, options = {}) {
     })
     if (result.ok !== true) return { ok: false, error: result.error }
     // 顺手把那扇窗切到只读模式：`farm-look` 既是一次查询，也是"打开看田"这个动作。
+    // 宿主从此记得"在看谁家"（`farmWindowLook`）：后面的行情摘要/动作刷新都不能把它推走。
+    farmWindowLook = { deviceId, view: result.view }
+    // 用户亲手点的这一下不受"上一次自动重拉失败"的静默期影响。
+    lookRefreshBlockedUntil = 0
     farmWindowOpened = false
     const opened = desktop?.farmWindow?.(farmWindowPayload({
       open: true,
@@ -3339,6 +3430,8 @@ export function createService (ctx, options = {}) {
     }
     farmWindowVisitView = visit
     farmWindowVisitId = out.visitId
+    // 票 52 回归：窗口正停在邻居家的只读视图上，别用访客视图把它顶掉（状态仍照记）。
+    if (farmWindowLook !== null) return true
     try {
       return desktop.farmWindow(farmWindowPayload({
         open: false,
@@ -3356,6 +3449,8 @@ export function createService (ctx, options = {}) {
     farmWindowVisitId = null
     farmWindowVisitView = null
     if (desktop === null || typeof desktop.farmWindow !== 'function') return false
+    // 票 52 回归：窗口还停在邻居家的只读视图上，就别用「串门结束」把它顶掉。
+    if (farmWindowLook !== null) return true
     const visit = {
       nickname: previous?.nickname ?? null,
       state: 'ended',
@@ -3452,6 +3547,8 @@ export function createService (ctx, options = {}) {
     farmWindowVisitId = out.visitId
     farmWindowVisitView = visit
     if (desktop === null || typeof desktop.farmWindow !== 'function') return visit
+    // 票 52 回归：看田视图还开着，这份访客快照只记状态，不推给窗口。
+    if (farmWindowLook !== null) return visit
     try {
       desktop.farmWindow(farmWindowPayload({ open: false, mode: 'visitor', visit }))
     } catch {
@@ -4406,6 +4503,8 @@ export function createService (ctx, options = {}) {
           } else if (event?.type === 'farm-window-state') {
             // ticket 46：小窗真的开了/关了（含用户点 ×/Esc）。右键「农场」靠它决定开还是关。
             farmWindowOpened = event.open === true
+            // 票 52 回归：用户自己关掉的窗，不该在下次开窗时还记得"在看谁家"。
+            if (farmWindowOpened !== true) farmWindowLook = null
           } else if (event?.type === 'action') {
             // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
             // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。
@@ -6239,6 +6338,8 @@ export function createService (ctx, options = {}) {
       farmWindowVisitId = null
       farmWindowVisitView = null
       farmWindowOpened = false
+      farmWindowLook = null
+      lookRefreshBlockedUntil = 0
       // 回执不再发了；还没回执的礼物先写回 idle，再放开背包引用。
       receipts.clear()
       releaseOutboundGiftsOnDispose()
