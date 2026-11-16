@@ -2158,7 +2158,7 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 真人周榜 + LAN 情绪（票 82）：自己 + 内存里的邻居 digested。
+   * 真人周榜 + LAN 情绪（票 82）：自己 + 内存里的邻居周报。
    * 四道门已经在接收端判过（放行/新鲜度/限流/白名单），这里只做「还活着吗」
    * 与排序（见 `src/trading-league.js`）。邻居不落盘、不发请求，榜过期就淡出。
    */
