@@ -11,6 +11,13 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.6.6 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.6.md`](releases/1.6.6.md)。
+
+修 1.6.5 红包页看不到作物/种子：宿主下发的 `packet` 底数在 helper 主进程组装
+`giftState` 时被削掉了，现在原样转发；旧宿主不发时窗口仍退回「字条」页。
+
 ## 1.6.5 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.5.md`](releases/1.6.5.md)。

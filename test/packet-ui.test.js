@@ -128,3 +128,25 @@ test('红包小窗与卡片的源码契约：面板、按钮、动作都得在',
   assert.match(preload, /packet: gift\.packet/)
   assert.match(preload, /note: gift\.note/)
 })
+
+test('bring-window 的红包底数要穿过白名单和主进程，不能在中途被削掉', async () => {
+  // 票 79 的真实故障：宿主发了 packet，shared 也认，但 main.js 组装 giftState 时
+  // 只抄了 items/count/...，红包页拿不到底数，只能显示「宿主还没把红包底数据过来」。
+  const packet = {
+    limits: { maxCoins: 200, maxPerCrop: 20, maxKinds: 5, maxNoteChars: 60 },
+    left: 2,
+    coins: 30,
+    crops: [{ id: 'tomato', name: '小番茄', have: 2 }],
+    seeds: [{ id: 'rice', name: '稻米', have: 1 }]
+  }
+  const normalized = shared.normalizeHostCommand({ type: 'bring-window', open: true, items: [], packet })
+  assert.equal(normalized.ok, true)
+  assert.deepEqual(normalized.command.packet, packet)
+
+  // 旧宿主不发 packet 时不能凭空造一个，窗口自己会退回「字条」。
+  const legacy = shared.normalizeHostCommand({ type: 'bring-window', open: true, items: [] })
+  assert.equal(legacy.command.packet, undefined)
+
+  const main = await readFile(path.join(root, 'desktop/main.js'), 'utf8')
+  assert.match(main, /packet: command\.packet/)
+})
