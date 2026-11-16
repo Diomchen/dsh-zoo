@@ -219,6 +219,12 @@
   const BOARD_SIDES = ['long', 'short']
   const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
   /**
+   * 盘口杠杆的形状上限（票 81 / 评审 P2）：与 `src/trading-rules.js` 的 `MAX_LEVERAGE` 同值。
+   * 这一层只守形状（读盘/白名单），1×/5×/20× 的产品白名单由宿主按 `TRADING_LEVERAGES` 校验；
+   * `test/farm-constants-drift.test.js` 有 drift 断言盯着两个数相等。
+   */
+  const BOARD_MAX_LEVERAGE = 20
+  /**
    * 止损档位（票 81）：0 = 关，其余是「亏掉保证金的这个比例就平仓」。
    * 窗口的按钮循环「关 → −25% → −50% → −100% → 关」，宿主的 store（票 80）
    * 按同一组数校验；两边各留一份，靠 `test/board-window.test.js` 的 drift 断言对齐。
@@ -1614,7 +1620,7 @@
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     if (id === null || crop === null || side === null) return null
     const margin = normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS)
-    const leverage = normalizeBoardInt(raw.leverage, 1, 20)
+    const leverage = normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     const entry = normalizeBoardNumber(raw.entry, 0, BOARD_MAX_PRICE)
     if (margin === null || leverage === null || entry === null) return null
     return {
@@ -1657,7 +1663,7 @@
       crop,
       side,
       margin: normalizeBoardInt(raw.margin, 0, MAX_FARM_COINS) ?? 0,
-      leverage: normalizeBoardInt(raw.leverage, 1, 20) ?? 1,
+      leverage: normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE) ?? 1,
       entry,
       exit,
       pnl,
@@ -1679,7 +1685,7 @@
     if (id === null || crop === null || side === null) return null
     const target = normalizeBoardNumber(raw.target, 0, BOARD_MAX_PRICE)
     const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
-    const leverage = normalizeBoardInt(raw.leverage, 1, 20)
+    const leverage = normalizeBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     const placedAt = normalizeBoardInt(raw.placedAt, 0, Number.MAX_SAFE_INTEGER)
     const slot = normalizeBoardInt(raw.slot, 0, Number.MAX_SAFE_INTEGER)
     if (target === null || target <= 0 || margin === null || leverage === null ||
@@ -1719,7 +1725,7 @@
     const leverages = []
     for (const candidate of Array.isArray(raw.leverages) ? raw.leverages : []) {
       if (leverages.length >= BOARD_MAX_LIMITS) break
-      const leverage = strictBoardInt(candidate, 1, 20)
+      const leverage = strictBoardInt(candidate, 1, BOARD_MAX_LEVERAGE)
       if (leverage !== null && !leverages.includes(leverage)) leverages.push(leverage)
     }
     const crops = []
@@ -1840,7 +1846,7 @@
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const crop = normalizeCropId(raw.crop)
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
-    const leverage = strictBoardInt(raw.leverage, 1, 20)
+    const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     if (crop === null || side === null || leverage === null) return null
     return { crop, side, leverage }
   }
@@ -2040,7 +2046,7 @@
     if (action === 'trading-place-order') {
       const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
       const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
-      const leverage = strictBoardInt(raw.leverage, 1, 20)
+      const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
       const cropId = normalizeCropId(raw.cropId)
       const target = Number(raw.target)
       if (side === null || margin === null || leverage === null || cropId === null) return null
@@ -2050,7 +2056,7 @@
     // 开仓：形状合法即可；保证金/杠杆白名单由宿主按 trading-rules 再判一次（并回人话）。
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, MAX_FARM_COINS)
-    const leverage = strictBoardInt(raw.leverage, 1, 20)
+    const leverage = strictBoardInt(raw.leverage, 1, BOARD_MAX_LEVERAGE)
     const cropId = normalizeCropId(raw.cropId)
     if (side === null || margin === null || leverage === null || cropId === null) return null
     return { action, side, margin, leverage, cropId }
@@ -4180,6 +4186,7 @@
     BOARD_SUBMIT_ACTIONS,
     BOARD_SIDES,
     BOARD_STOP_LEVELS,
+    BOARD_MAX_LEVERAGE,
     normalizeBoardOrders,
     FARM_PLOT_ACTIONS,
     FARM_MARKET_ACTIONS,
