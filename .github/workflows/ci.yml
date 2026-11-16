@@ -70,8 +70,18 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          version="${TAG#v}"
+          notes="docs/releases/${version}.md"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.tgz --clobber
+            if [ -f "$notes" ]; then
+              gh release edit "$TAG" --title "dsh-zoo $TAG" --notes-file "$notes"
+            fi
+          elif [ -f "$notes" ]; then
+            gh release create "$TAG" dist/*.tgz \
+              --verify-tag \
+              --title "dsh-zoo $TAG" \
+              --notes-file "$notes"
           else
             gh release create "$TAG" dist/*.tgz \
               --verify-tag \
