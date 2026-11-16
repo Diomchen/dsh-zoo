@@ -20,7 +20,7 @@ import shared from '../desktop/shared.js'
 import { FARM_FILE } from '../src/farm.js'
 import { resetCropCatalog } from '../src/farm-rules.js'
 import { createService } from '../src/service.js'
-import { SLOT_MS, TICK_MS, markPrice, settlementOf } from '../src/trading-rules.js'
+import { BOARD_CROPS, SLOT_MS, TICK_MS, TRADING_LEVERAGES, markPrice, settlementOf } from '../src/trading-rules.js'
 
 const require = createRequire(import.meta.url)
 // 渲染页和 Node 测试共用同一份纯视图模型（desktop/ 是 CommonJS）。
@@ -201,14 +201,15 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
   assert.deepEqual(state.orders, [])
   assert.deepEqual(state.limits, {
     margins: [50, 100],
-    leverages: [1],
-    crops: [{ id: 'tomato', name: '小番茄' }],
+    // 杠杆与作物白名单都与纯规则同源：票 80 把杠杆换成 [1,5,20] 时这里不用改。
+    leverages: TRADING_LEVERAGES.slice(),
+    crops: BOARD_CROPS.map((id) => ({ id, name: boardView.cropNameOf(state, id) })),
     historyLimit: 50
   })
   // 这一包能直接喂给窗口的纯视图（窗口只画）。
   const board = boardView.boardView(state, { now: clock.value })
   assert.equal(board.header.priceText, state.bar.price.toFixed(2))
-  assert.equal(board.order.preview, '涨 1% = +0.5 币；跌 1% = -0.5 币；强平 —')
+  assert.equal(board.order.preview, '1× · 50 保证金：涨 1% = +0.5；跌 1% = −0.5；强平 —')
 
   // 再点一次「盘口」= 关窗；宿主按 helper 报的真实窗口状态决定。
   const toggled = await callAction(service, { action: 'trading-open' })
@@ -355,6 +356,21 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.deepEqual(normalized.command.state.limits.crops, [{ id: 'tomato', name: '小番茄' }])
   assert.equal('secret' in normalized.command.state.positions[0], false)
   assert.equal(normalized.command.state.positions[0].id, 'p1')
+  // 票 81：强平价与止损档位过白名单；1× 的 null 必须还是 null（窗口显示「—」）。
+  const pinned = shared.normalizeBoardView({
+    positions: [{ id: 'p1', crop: 'tomato', side: 'long', margin: 50, leverage: 1, entry: 5, liquidation: null, stopLoss: 0.5 }]
+  })
+  assert.equal(pinned.positions[0].liquidation, null)
+  assert.equal(pinned.positions[0].stopLoss, 0.5)
+  const noStop = shared.normalizeBoardView({
+    positions: [{ id: 'p2', crop: 'tomato', side: 'long', margin: 50, leverage: 5, entry: 5, liquidation: 4.1 }]
+  })
+  assert.equal(noStop.positions[0].stopLoss, 0, '没有字段就是关')
+  assert.equal(noStop.positions[0].liquidation, 4.1)
+  // 认不出的止损档位退成「关」，不替玩家猜一档。
+  assert.equal(shared.normalizeBoardView({
+    positions: [{ id: 'p3', crop: 'tomato', side: 'long', margin: 50, leverage: 5, entry: 5, stopLoss: 0.3 }]
+  }).positions[0].stopLoss, 0)
 
   // helper → 宿主：status 与窗口开关事件。
   const status = shared.normalizeHelperEvent({
@@ -379,6 +395,22 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-close-position', positionId }),
     { action: 'trading-close-position', positionId })
   assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-refresh' }), { action: 'trading-refresh' })
+  // 票 81：止损循环只认四档；档位缺一个或不在表里，整条拒绝。
+  for (const level of [0, 0.25, 0.5, 1]) {
+    assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-set-stop', positionId, level }),
+      { action: 'trading-set-stop', positionId, level })
+  }
+  for (const bad of [
+    { action: 'trading-set-stop', positionId, level: 0.3 },
+    { action: 'trading-set-stop', positionId, level: -25 },
+    { action: 'trading-set-stop', positionId, level: 'x' },
+    { action: 'trading-set-stop', positionId: 'p1', level: 0.5 },
+    { action: 'trading-set-stop', level: 0.5 }
+  ]) {
+    assert.equal(shared.normalizeBoardAction(bad), null, JSON.stringify(bad))
+  }
+  // 窗口与 helper 的止损四档是同一组数（改档位时三处一起改）。
+  assert.deepEqual(shared.BOARD_STOP_LEVELS, boardView.stopLevels())
   for (const bad of [
     null,
     'x',
@@ -393,4 +425,136 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   }
   // 读盘归一化（窗口形状）也不认多余字段。
   assert.deepEqual(shared.normalizeBoardView(null), null)
+})
+
+test('票 81：整份 payload 带三作物 K 线 + 风向，并能穿过 helper 的白名单', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 4 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+
+  const state = desktop.calls.board[0].state
+  // 三个作物各一张图：24 根整根 + 当前一根（1 分钟 tick）。
+  assert.deepEqual(Object.keys(state.charts), ['tomato', 'carrot', 'pumpkin'])
+  for (const crop of BOARD_CROPS) {
+    const chart = state.charts[crop]
+    assert.equal(chart.bars.length, 24, crop + ' 应该有 24 根')
+    assert.equal(chart.current.slot, state.bar.slot)
+    assert.equal(chart.current.tick, 4)
+    assert.equal(chart.current.price, markPrice({ crop, now: clock.value }))
+    assert.ok(chart.base > 0)
+  }
+  // 风向：三作物各一份，置信度落在 55–68%。
+  assert.deepEqual(Object.keys(state.hint), ['tomato', 'carrot', 'pumpkin'])
+  for (const crop of BOARD_CROPS) {
+    assert.ok(['up', 'down', 'flat'].includes(state.hint[crop].direction))
+    assert.ok(state.hint[crop].confidence >= 0.55 && state.hint[crop].confidence <= 0.68)
+  }
+  // 票 79 的窗口还认 `payload.bar`：它是第一个作物的当前一根。
+  assert.equal(state.bar.crop, 'tomato')
+  assert.equal(state.bar.price, state.charts.tomato.current.price)
+
+  // 窗口拿到的是 helper 白名单之后的形状：charts/hint 不能被削掉（§9.4 的老坑）。
+  const hop = shared.normalizeHostCommand({ type: 'board-window', open: false, state })
+  assert.equal(hop.ok, true)
+  assert.deepEqual(Object.keys(hop.command.state.charts), ['tomato', 'carrot', 'pumpkin'])
+  assert.equal(hop.command.state.charts.tomato.bars.length, 24)
+  assert.deepEqual(hop.command.state.charts.tomato.bars[0],
+    state.charts.tomato.bars[0])
+  assert.equal(hop.command.state.hint.tomato.confidence, state.hint.tomato.confidence)
+  assert.equal(hop.command.state.charts.tomato.current.tick, 4)
+
+  // 窗口的纯视图能直接吃这一包：K 线、图例、风向都画得出来。
+  const board = boardView.boardView(hop.command.state, { now: clock.value })
+  assert.equal(board.chart.hasChart, true)
+  assert.equal(board.chart.geometry.bars.length, 24)
+  assert.equal(board.chart.geometry.forming.slot, state.bar.slot)
+  assert.equal(board.chart.legend[0].text, state.charts.tomato.base.toFixed(2))
+  assert.equal(board.hint.note, '不是保证')
+  assert.equal(board.crops.length, 3)
+})
+
+test('票 81：一分钟一拍会把新的成形 K 线推到窗口（不用重开窗）', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 2 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value,
+    farmTickMs: 15
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+  const before = desktop.calls.board.at(-1)
+  assert.equal(before.open, true)
+  assert.equal(before.state.charts.tomato.current.tick, 2)
+
+  // 过一分钟：宿主 tick 一次，把 tick=3 的成形 K 线推给已经开着的窗。
+  clock.value += TICK_MS
+  await waitFor(() => {
+    const pushed = desktop.calls.board.at(-1)
+    return pushed.open === false && pushed.state?.charts?.tomato?.current?.tick === 3
+  })
+  const pushed = desktop.calls.board.at(-1)
+  assert.equal('close' in pushed, false, '刷新不能关窗')
+  assert.equal(pushed.state.bar.price, markPrice({ crop: 'tomato', now: clock.value }))
+  assert.equal(pushed.state.charts.tomato.current.remainingMs, SLOT_MS - 3 * TICK_MS)
+})
+
+test('票 81：trading-set-stop 过白名单并到宿主（成败由票 80 的 store 决定）', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir)
+  const clock = { value: SLOT_EDGE + 2 * TICK_MS }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  assert.equal((await callAction(service, { action: 'trading-open' })).body.window, 'opened')
+  assert.equal((await callAction(service, {
+    action: 'trading-open-position', side: 'long', margin: 50, leverage: 1, cropId: 'tomato'
+  })).body.ok, true)
+  const position = (await call(service, '/dsh-zoo/state')).body.trading.positions[0]
+
+  // 窗口发出来的形状（preload → main → helper 白名单 → 宿主分发）。
+  desktop.emit({
+    type: 'action',
+    id: 'board-stop-1',
+    action: 'trading-set-stop',
+    positionId: position.id,
+    level: 0.5
+  })
+  await waitFor(() => desktop.calls.results.length === 1)
+  const result = desktop.calls.results[0].result
+  // 不能是「helper 白名单不认识」（bad-board-action）或「宿主不认识这条动作」（not-implemented）。
+  assert.equal(result.ok === true || ['action-failed', 'no-position'].includes(result.error), true,
+    '止损申请应该到宿主，实际：' + JSON.stringify(result))
+  // HTTP 那条路同样认得出这个动作名。
+  const replied = await callAction(service, {
+    action: 'trading-set-stop', positionId: position.id, level: 0.25
+  })
+  assert.notEqual(replied.body.error, 'bad-board-action')
+  assert.notEqual(replied.body.error, 'not-implemented')
+  // 坏档位在 helper 就被挡掉，根本到不了宿主。
+  assert.equal(shared.normalizeBoardAction({ action: 'trading-set-stop', positionId: position.id, level: 0.3 }), null)
 })
