@@ -11,6 +11,36 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.6.4 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.4.md`](releases/1.6.4.md)。代码只动桌面 helper 的输入兜底。
+
+**修复：Windows 上可交互态粘住，左键进不了窗口**
+
+- 现场（2026-11-16，`DESKTOP-699DN63`）：宠物可见、右键菜单能开、拖拽完全不动，左键单击宠物
+  也没反应。`helperStatus.trustedInputs` 累计为 0，而 `lastTrustedInputAgeMs` 有一次约 29ms
+  —— 只收到 up、没收到 down；窗口 exstyle `0x08200008` 里没有 `WS_EX_TRANSPARENT`，
+  `WindowFromPoint` 命中的也是 helper 的渲染子窗。同一天没改代码又自行恢复（`trustedInputs`
+  1→2），说明是**可自行解除的粘滞态**，不是硬故障。
+- 根因：`setIgnore()` 在状态没变时直接 return —— 一次没落成功的 `setIgnoreMouseEvents(false)`
+  之后，主进程认为窗口可交互、OS 却仍把左键交给下层，看门狗每拍都因「状态没变」跳过，
+  永不重试；只能等一次真正的 `true → false` 翻转或 helper 重启（票 30 现场靠「重载配置」恢复）。
+- 修法一：可交互期间每 `INTERACTIVE_REASSERT_MS`（2s）把同一个值重放给 native 层
+  （`reassertInteractive()`），落不上就自己补上；穿透态不重放。
+- 修法二：渲染端发现「`pointerup` 却没有对应的 `pointerdown`」时上报 `{type:'lost-down'}`，
+  主进程立刻重放一次「穿透 → 可交互」（`healLostDown()`，1s 冷却），等价于 `debug-kick-input`
+  的生产版，不重启 helper。
+- 观测：`status` 新增 `lostDowns` / `lastLostDownAgeMs` / `reasserts` / `windowMessages`
+  （Windows 上 `hookWindowMessage` 数 `WM_LBUTTONDOWN/UP`、`WM_RBUTTONDOWN/UP`）；宿主
+  `normalizeStatus` 白名单同步放行。`WM_NCHITTEST` 的返回值拿不到（钩子只读），所以不数它。
+- 回归：`test/desktop-input.test.js` 补 `lost-down`、status 白名单、`shouldReassert` 的用例。
+
+**没改什么**
+
+- 不改 LAN 协议、不加 UDP 报文；`farm.json` / `season.json` / `contracts.json` 都不升版本。
+- 不改命中几何（没有把命中矩形外扩），避免在宠物旁边多吞掉一块点击。
+- 回退到 1.6.3 即可，没有数据变更。
+
 ## 1.6.3 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.3.md`](releases/1.6.3.md)。
