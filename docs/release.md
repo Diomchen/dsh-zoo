@@ -11,6 +11,14 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.6.7 版本记录
+
+GitHub Release 正文就是 [`releases/1.6.7.md`](releases/1.6.7.md)。
+
+补上 1.6.6 漏掉的那一跳：宿主 `src/desktop.js` 的 `bringWindow` 白名单没转发
+`packet`，所以窗口拿到的仍是没有红包底数的命令。现在 `packet` 原样随命令下发，
+真窗口里能按自己有的作物/种子加减。
+
 ## 1.6.6 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.6.md`](releases/1.6.6.md)。
