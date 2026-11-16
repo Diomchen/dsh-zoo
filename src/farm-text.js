@@ -27,6 +27,7 @@ const FARM_ERROR_TEXT = Object.freeze({
   frozen: '这块地冻住了，先生火解冻。',
   'not-frozen': '这块地没有冻住。',
   'not-enough-crops': '仓库里的作物不够。',
+  'not-enough-seeds': '种子袋里的种子不够。',
   'omen-resolved': '这位来客已经打发走了。',
   'omen-inactive': '这位来客已经走了，下次来早点。',
   'bad-choice': '这个应对方式不成立。',

@@ -7,9 +7,15 @@ import {
   isDeviceId,
   isVisitId,
   normalizeNickname,
+  normalizePacketContents,
   sanitizeGiftName,
   sanitizeNote
 } from './protocol.js'
+
+/** 红包未拆开的存留时间：24 小时后原路退回（票 79）。 */
+export const PACKET_TTL_MS = 24 * 60 * 60 * 1000
+/** 红包祝福语上限，与协议层一致。 */
+const PACKET_NOTE_MAX = 60
 
 /**
  * 入站礼物的落盘：`<dataDir>/gifts/<dir>/note.txt` + `meta.json`。
@@ -148,7 +154,36 @@ export function normalizeGiftMeta (value) {
     }
   }
 
+  if (value.kind === 'packet') {
+    const packet = normalizePacketContents(value.packet)
+    if (packet === null) return null
+    const note = normalizePacketNote(value.note)
+    if (note === null) return null
+    const claimedAt = Number(value.claimedAt)
+    const returnedAt = Number(value.returnedAt)
+    return {
+      id: value.id.toLowerCase(),
+      dir: value.dir,
+      from: sender,
+      kind: 'packet',
+      packet,
+      ...(note === '' ? {} : { note }),
+      receivedAt: Math.floor(receivedAt),
+      opened: value.opened === true,
+      claimedAt: Number.isFinite(claimedAt) && claimedAt > 0 ? Math.floor(claimedAt) : 0,
+      returnedAt: Number.isFinite(returnedAt) && returnedAt > 0 ? Math.floor(returnedAt) : 0
+    }
+  }
+
   return null
+}
+
+/** 红包祝福语：可以是空；有就必须是清洗后不超过 60 字的短句。 */
+function normalizePacketNote (value) {
+  if (value === undefined || value === null) return ''
+  const text = sanitizeNote(value)
+  if (text === null) return null
+  return [...text].length > PACKET_NOTE_MAX ? null : text
 }
 
 /**
@@ -427,6 +462,177 @@ class GiftStore {
     }
   }
 
+  /**
+   * 收下一只红包（票 79）：只落盘，不动农场——东西要等收件人点「拆开」才真正到账。
+   * 同一 giftId 的重发是幂等的：已经拆过/退回过的状态不会被覆盖回去。
+   */
+  receivePacket (input = {}) {
+    return this.#enqueue(() => this.#receivePacket(input))
+  }
+
+  async #receivePacket ({ id, from, packet: rawPacket, note: rawNote, receivedAt } = {}) {
+    if (!isVisitId(id)) return { ok: false, error: 'bad-gift' }
+    const giftId = id.toLowerCase()
+    const packet = normalizePacketContents(rawPacket)
+    const deviceId = isDeviceId(from?.deviceId) ? from.deviceId.toLowerCase() : null
+    const note = normalizePacketNote(rawNote)
+    if (packet === null || deviceId === null || note === null) return { ok: false, error: 'bad-gift' }
+    const nickname = normalizeNickname(from?.nickname) ?? FALLBACK_NICKNAME
+    const at = Number.isFinite(receivedAt) && receivedAt > 0 ? Math.floor(receivedAt) : Date.now()
+
+    const existing = this.#index.get(giftId)
+    if (existing !== undefined && existing.kind === 'packet') {
+      // 重试：原样保留 claimedAt / returnedAt，绝不把已经到账的红包变回未拆。
+      return { ok: true, gift: copyRecord(existing) }
+    }
+
+    let allocated = null
+    try {
+      if (existing !== undefined) {
+        allocated = { dirPath: existing.dirPath, dirName: existing.dirName, created: false }
+      } else {
+        await mkdir(join(this.#dir, GIFTS_DIR), { recursive: true, mode: 0o700 })
+        allocated = await allocateDir(join(this.#dir, GIFTS_DIR), giftDirName(giftId, at), giftId)
+      }
+      const meta = {
+        version: GIFT_META_VERSION,
+        id: giftId,
+        dir: allocated.dirName,
+        from: { deviceId, nickname },
+        kind: 'packet',
+        packet,
+        ...(note === '' ? {} : { note }),
+        receivedAt: at,
+        opened: false,
+        claimedAt: 0,
+        returnedAt: 0
+      }
+      await writeFileAtomic(join(allocated.dirPath, META_FILE), JSON.stringify(meta, null, 2) + '\n')
+      const record = this.#record(giftId, meta)
+      this.#index.set(giftId, record)
+      await this.#pruneDisk(allocated.dirName)
+      this.#pruneIndex()
+      return { ok: true, gift: copyRecord(record) }
+    } catch (error) {
+      if (allocated?.created === true) {
+        await rm(allocated.dirPath, { recursive: true, force: true }).catch(() => {})
+      }
+      this.#warnOnce('write', '红包写不进去，这张卡片会显示“没取到”（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+  }
+
+  /**
+   * 拆红包：先把「已拆」落盘，再执行 `apply(packet)` 把东西记到农场。
+   * 顺序是刻意的——崩溃时宁可少给（可重试一次），也不能重试一次就翻倍给。
+   * `apply` 失败就把 claimedAt 撤回，红包回到未拆状态。
+   */
+  claimPacket (giftId, apply) {
+    return this.#enqueue(() => this.#claimPacket(giftId, apply))
+  }
+
+  async #claimPacket (giftId, apply) {
+    if (!isVisitId(giftId)) return { ok: false, error: 'bad-gift' }
+    const id = giftId.toLowerCase()
+    const record = this.#index.get(id)
+    if (record === undefined) return { ok: false, error: 'gift-not-found' }
+    if (record.kind !== 'packet') return { ok: false, error: 'not-a-packet' }
+    if (record.claimedAt > 0) return { ok: false, error: 'packet-claimed' }
+    if (record.returnedAt > 0) return { ok: false, error: 'packet-returned' }
+    if (typeof apply !== 'function') return { ok: false, error: 'bad-gift' }
+
+    const now = Date.now()
+    const before = { claimedAt: record.claimedAt, opened: record.opened }
+    record.claimedAt = now
+    record.opened = true
+    try {
+      const meta = this.#metaOf(record)
+      await writeFileAtomic(record.metaPath, JSON.stringify(meta, null, 2) + '\n')
+    } catch (error) {
+      record.claimedAt = before.claimedAt
+      record.opened = before.opened
+      this.#warnOnce('claim', '红包标记没写进去，先不拆（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+
+    const result = await apply({
+      packet: {
+        coins: record.packet.coins,
+        crops: { ...record.packet.crops },
+        seeds: { ...record.packet.seeds }
+      },
+      from: { ...record.from }
+    })
+    if (!result?.ok) {
+      // 东西没记上：撤回「已拆」，让用户还能再点一次。
+      record.claimedAt = before.claimedAt
+      record.opened = before.opened
+      await writeFileAtomic(record.metaPath, JSON.stringify(this.#metaOf(record), null, 2) + '\n')
+        .catch(() => {})
+      return { ok: false, error: result?.error ?? 'claim' }
+    }
+    return { ok: true, gift: copyRecord(record), result }
+  }
+
+  /** 24 小时没人拆：标记退回（内容由 service 通过 `packet-return` 送回发送端）。 */
+  markReturned (giftId, at = Date.now()) {
+    return this.#enqueue(() => this.#markReturned(giftId, at))
+  }
+
+  async #markReturned (giftId, at) {
+    if (!isVisitId(giftId)) return { ok: false, error: 'bad-gift' }
+    const id = giftId.toLowerCase()
+    const record = this.#index.get(id)
+    if (record === undefined) return { ok: false, error: 'gift-not-found' }
+    if (record.kind !== 'packet') return { ok: false, error: 'not-a-packet' }
+    if (record.claimedAt > 0) return { ok: false, error: 'packet-claimed' }
+    if (record.returnedAt > 0) return { ok: true, gift: copyRecord(record) }
+    record.returnedAt = Math.floor(Number(at) || Date.now())
+    try {
+      await writeFileAtomic(record.metaPath, JSON.stringify(this.#metaOf(record), null, 2) + '\n')
+    } catch (error) {
+      record.returnedAt = 0
+      this.#warnOnce('return', '红包退回标记没写进去（' + errorName(error) + '）')
+      return { ok: false, error: 'write' }
+    }
+    return { ok: true, gift: copyRecord(record) }
+  }
+
+  /** 由内存记录重建一份 meta.json（只用于改写状态）。 */
+  #metaOf (record) {
+    const meta = {
+      version: GIFT_META_VERSION,
+      id: record.id,
+      dir: record.dirName,
+      from: { ...record.from },
+      kind: record.kind
+    }
+    if (record.kind === 'packet') {
+      // 红包多三个时间戳：拆开/退回都要落盘，否则重启后能再拆一次。
+      meta.packet = {
+        coins: record.packet.coins,
+        crops: { ...record.packet.crops },
+        seeds: { ...record.packet.seeds }
+      }
+      if (record.note !== undefined) meta.note = record.note
+      meta.receivedAt = record.receivedAt
+      meta.opened = record.opened === true
+      meta.claimedAt = record.claimedAt ?? 0
+      meta.returnedAt = record.returnedAt ?? 0
+    } else {
+      if (record.kind === 'file') {
+        meta.name = record.name
+        meta.size = record.size
+        meta.sha256 = record.sha256
+      } else {
+        meta.text = record.text
+      }
+      meta.receivedAt = record.receivedAt
+      if (record.opened === true) meta.opened = true
+    }
+    return meta
+  }
+
   /** 下载失败：把这次新开的目录整目录删掉（已有礼物/别的目录一概不动）。 */
   abortFile (giftId) {
     return this.#enqueue(() => this.#abortFile(giftId))
@@ -454,29 +660,7 @@ class GiftStore {
     const record = this.#index.get(giftId.toLowerCase())
     if (record === undefined) return false
     if (record.opened) return true
-    const meta = record.kind === 'file'
-      ? {
-          version: GIFT_META_VERSION,
-          id: record.id,
-          dir: record.dirName,
-          from: { ...record.from },
-          kind: 'file',
-          name: record.name,
-          size: record.size,
-          sha256: record.sha256,
-          receivedAt: record.receivedAt,
-          opened: true
-        }
-      : {
-          version: GIFT_META_VERSION,
-          id: record.id,
-          dir: record.dirName,
-          from: { ...record.from },
-          kind: 'text',
-          text: record.text,
-          receivedAt: record.receivedAt,
-          opened: true
-        }
+    const meta = this.#metaOf({ ...record, opened: true })
     try {
       await writeFileAtomic(record.metaPath, JSON.stringify(meta, null, 2) + '\n')
       record.opened = true
@@ -537,6 +721,22 @@ class GiftStore {
         sha256: meta.sha256,
         // 本体就是目录里的同名文件；名字已经过 sanitizeGiftName，绝不含路径分隔符。
         filePath: join(dirPath, meta.name)
+      }
+    }
+    if (meta.kind === 'packet') {
+      return {
+        ...base,
+        kind: 'packet',
+        packet: {
+          coins: meta.packet.coins,
+          crops: { ...meta.packet.crops },
+          seeds: { ...meta.packet.seeds }
+        },
+        ...(meta.note === undefined ? {} : { note: meta.note }),
+        claimedAt: meta.claimedAt ?? 0,
+        returnedAt: meta.returnedAt ?? 0,
+        filePath: null,
+        notePath: join(dirPath, NOTE_FILE)
       }
     }
     return { ...base, kind: 'text', text: meta.text, filePath: null }
@@ -714,6 +914,16 @@ function copyRecord (record) {
     size: record.size,
     sha256: record.sha256,
     filePath: record.filePath,
+    packet: record.packet === undefined
+      ? undefined
+      : {
+          coins: record.packet.coins,
+          crops: { ...record.packet.crops },
+          seeds: { ...record.packet.seeds }
+        },
+    note: record.note,
+    claimedAt: record.claimedAt,
+    returnedAt: record.returnedAt,
     receivedAt: record.receivedAt,
     opened: record.opened
   }

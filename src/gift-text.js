@@ -120,6 +120,20 @@ export function backpackErrorText (error) {
   return '这次没有放进背包。'
 }
 
+/** 红包（票 79）的错误码 → 人话。寄出、拆开、退回共用一张表。 */
+export function packetErrorText (error) {
+  if (error === 'packet-daily-limit') return '今天已经寄出 3 只红包了，明天再来。'
+  if (error === 'not-enough-coins') return '硬币不够包这个红包。'
+  if (error === 'not-enough-crops') return '仓库里的作物不够包这个红包。'
+  if (error === 'not-enough-seeds') return '种子袋里的种子不够包这个红包。'
+  if (error === 'packet-claimed') return '这只红包已经拆开了。'
+  if (error === 'packet-returned') return '这只红包已经退回给寄的人了。'
+  if (error === 'not-a-packet') return '这件不是红包。'
+  if (error === 'starting') return '农场还没准备好，稍后再试。'
+  if (error === 'bad-qty') return '红包里的数量不对。'
+  return '这次红包没成。'
+}
+
 // ---------------------------------------------------------------------------
 // ticket 26：送达回执与退包的三句话
 // 追加在表尾，不改上面任何一条——票 25 也在改这个文件，冲突留给 merger 解。
