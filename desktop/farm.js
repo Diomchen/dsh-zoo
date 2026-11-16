@@ -243,6 +243,16 @@ function formatTime (at) {
   return pad(date.getHours()) + ':' + pad(date.getMinutes())
 }
 
+/** 折线点的悬停时间：24 小时窗口跨天，带月日更好认。 */
+function formatSparkTime (at) {
+  const value = Number(at)
+  if (!Number.isFinite(value) || value <= 0) return ''
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  const pad = (number) => String(number).padStart(2, '0')
+  return (date.getMonth() + 1) + '-' + date.getDate() + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
+}
+
 /** toast 栈：批量动作逐条提示，最多留 4 条，不互相覆盖。 */
 function showToast (text, tone = 'ok') {
   if (typeof text !== 'string' || text.trim() === '') return
@@ -1246,6 +1256,9 @@ function renderMarket () {
     const spark = view.marketSpark(market.history, cropId, { currentPrice: bidValue })
     const sparkWrap = document.createElement('div')
     sparkWrap.className = 'market-spark-wrap'
+    const sparkNote = document.createElement('span')
+    sparkNote.className = 'market-spark-note'
+    sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h · 悬停看价'
     const sparkSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
     sparkSvg.setAttribute('class', 'market-spark ' + spark.trend + (spark.empty ? ' empty' : ''))
     sparkSvg.setAttribute('viewBox', '0 0 100 24')
@@ -1259,23 +1272,41 @@ function renderMarket () {
       sparkArea.setAttribute('points', spark.area)
       sparkSvg.appendChild(sparkArea)
       sparkSvg.appendChild(sparkLine)
-      const sparkEnd = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
-      sparkEnd.setAttribute('class', 'market-spark-end')
-      sparkEnd.setAttribute('cx', String(spark.last.x))
-      sparkEnd.setAttribute('cy', String(spark.last.y))
-      sparkEnd.setAttribute('r', '1.8')
-      sparkSvg.appendChild(sparkEnd)
+      for (const mark of spark.marks) {
+        const group = document.createElementNS('http://www.w3.org/2000/svg', 'g')
+        group.setAttribute('class', 'market-spark-point-group')
+        const sparkPoint = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+        sparkPoint.setAttribute('class', 'market-spark-point' + (mark.current ? ' market-spark-end' : ''))
+        sparkPoint.setAttribute('cx', String(mark.x))
+        sparkPoint.setAttribute('cy', String(mark.y))
+        sparkPoint.setAttribute('r', mark.current ? '2.8' : '2.4')
+        const sparkHit = document.createElementNS('http://www.w3.org/2000/svg', 'circle')
+        sparkHit.setAttribute('class', 'market-spark-hit')
+        sparkHit.setAttribute('cx', String(mark.x))
+        sparkHit.setAttribute('cy', String(mark.y))
+        sparkHit.setAttribute('r', '3')
+        const sparkTitle = document.createElementNS('http://www.w3.org/2000/svg', 'title')
+        sparkTitle.textContent = formatSparkTime(mark.at) + ' · '
+          + Math.round(mark.price) + ' 硬币' + (mark.current ? '（当前卖价）' : '')
+        sparkHit.appendChild(sparkTitle)
+        sparkHit.addEventListener('mouseenter', () => {
+          sparkNote.textContent = formatSparkTime(mark.at) + ' · ' + Math.round(mark.price) + ' 硬币'
+        })
+        sparkHit.addEventListener('mouseleave', () => {
+          sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h · 悬停看价'
+        })
+        group.appendChild(sparkPoint)
+        group.appendChild(sparkHit)
+        sparkSvg.appendChild(group)
+      }
     } else {
       sparkSvg.appendChild(sparkLine)
     }
-    const sparkNote = document.createElement('span')
-    sparkNote.className = 'market-spark-note'
-    sparkNote.textContent = spark.empty ? '24h · 暂无成交' : '24h 卖价'
     sparkWrap.appendChild(sparkSvg)
     sparkWrap.appendChild(sparkNote)
     sparkWrap.title = spark.empty
       ? '最近 24 小时还没有这个作物的成交；卖出第一笔后这里会出现曲线'
-      : '最近 24 小时成交价与当前卖价，共 ' + spark.points.length + ' 个点'
+      : '最近 24 小时成交价与当前卖价，共 ' + spark.points.length + ' 个点；悬停每个点看时间和价格'
     row.appendChild(sparkWrap)
 
     const trade = document.createElement('div')
