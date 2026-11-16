@@ -957,6 +957,19 @@
       active: raw.active === true,
       resolved: raw.resolved === true,
       choice,
+      // 处理过之后卡片只显示一句结论，这句话要靠 result 拼；丢掉它就只能写“已处理”。
+      result: raw.result !== null && typeof raw.result === 'object' && !Array.isArray(raw.result)
+        ? {
+            success: raw.result.success === true,
+            ignored: raw.result.ignored === true,
+            loss: {
+              crops: number(raw.result.loss?.crops, MAX_FARM_STACK),
+              witherPlots: number(raw.result.loss?.witherPlots, MAX_FARM_PLOTS),
+              freezePlots: number(raw.result.loss?.freezePlots, MAX_FARM_PLOTS)
+            },
+            reward: normalizeSeasonReward(raw.result.reward) ?? { coins: 0, dew: 0 }
+          }
+        : null,
       choices,
       canFeed: raw.canFeed === true,
       guardBase: Number.isFinite(Number(raw.guardBase)) ? Math.min(1, Math.max(0, Number(raw.guardBase))) : 0,
@@ -2732,6 +2745,9 @@
       case 'debug-farm-read':
         // 冒烟用：读农场小窗里每张卡的 stage / countdown 文本，验多地块倒计时。
         return { ok: true, command: { type, id } }
+      case 'debug-farm-season':
+        // 冒烟用：读来客卡的状态（有没有下拉框/按钮、结论那句话）。
+        return { ok: true, command: { type, id } }
       case 'debug-farm-spark':
         // 冒烟用：真发一次 mouseenter，读成交价曲线的悬停气泡。
         return {
@@ -2942,6 +2958,20 @@
           }
         }
         return { ok: true, event: { type, id, plots } }
+      }
+      case 'farm-season': {
+        // 冒烟用：来客卡处理后只剩结论，下拉框/按钮数量应为 0。
+        return {
+          ok: true,
+          event: {
+            type,
+            id,
+            hidden: raw.hidden === true,
+            done: normalizeText(raw.done, '', 80),
+            selects: Math.max(0, Math.floor(Number(raw.selects) || 0)),
+            buttons: Math.max(0, Math.floor(Number(raw.buttons) || 0))
+          }
+        }
       }
       case 'farm-spark': {
         // 冒烟用：成交价曲线的悬停结果（气泡文本/是否显示/是否贴着点）。

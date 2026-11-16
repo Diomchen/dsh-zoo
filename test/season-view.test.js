@@ -118,7 +118,58 @@ test('omenCard：仓库不够时投喂不可点，已结算时两个选择都不
   const done = view.omenCard({
     id: 'autumn-bearger', name: '熊獾', active: true, resolved: true, choice: 'guard', canFeed: true, stakes: {}
   })
-  assert.equal(done.actions.every((entry) => entry.disabled), true)
+  assert.equal(done.finished, true)
+  // 处理过就只剩一句结论：不能再出现下拉框（guardOptions 空）和按钮（actions 空）。
+  assert.deepEqual(done.actions, [])
+  assert.deepEqual(done.guardOptions, [])
+  assert.equal(done.resultText, '已处理。')
+})
+
+test('omenCard：已处理的来客用 result 拼出结果，没来得及处理也有话说', () => {
+  const guarded = view.omenCard({
+    id: 'autumn-bearger',
+    name: '熊獾',
+    active: true,
+    resolved: true,
+    choice: 'guard',
+    choices: [{ id: 'guard', label: '守夜' }, { id: 'feed', label: '投喂' }],
+    result: {
+      success: true,
+      loss: { crops: 0, witherPlots: 0, freezePlots: 0 },
+      reward: { coins: 70, dew: 5, seeds: { rice: 1 } }
+    },
+    stakes: {}
+  })
+  assert.equal(guarded.finished, true)
+  assert.match(guarded.resultText, /^已处理：守夜成功/)
+  assert.match(guarded.resultText, /\+70 硬币/)
+  assert.match(guarded.resultText, /1 颗稻米种子/)
+  assert.deepEqual(guarded.guardOptions, [])
+
+  const failed = view.omenCard({
+    id: 'spring-frog-rain',
+    name: '蛙雨',
+    active: true,
+    resolved: true,
+    choice: 'guard',
+    choices: [{ id: 'guard', label: '赶走' }],
+    result: { success: false, loss: { crops: 0, witherPlots: 2, freezePlots: 0 }, reward: { coins: 0, dew: 0 } },
+    stakes: {}
+  })
+  assert.match(failed.resultText, /赶走失败/)
+  assert.match(failed.resultText, /2 块地枯萎/)
+
+  const ignored = view.omenCard({
+    id: 'winter-deerclops',
+    name: '巨鹿',
+    active: true,
+    resolved: true,
+    choice: null,
+    result: { success: false, ignored: true },
+    stakes: {}
+  })
+  assert.match(ignored.resultText, /没来得及应对/)
+  assert.deepEqual(ignored.actions, [])
 })
 
 test('plotCards：枯萎地显示枯萎、可点重种，没有收获/浇水按钮', () => {
