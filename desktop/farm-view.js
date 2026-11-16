@@ -370,8 +370,10 @@
   function omenCard (omen) {
     if (omen === null || typeof omen !== 'object') return null
     const stakes = omen.stakes ?? {}
-    const resolved = omen.resolved === true
+    // 处理过就是“已完成”：不再给下拉框和按钮，只留一句结果。
+    const finished = omen.resolved === true
     const active = omen.active === true
+    const result = omen.result !== null && typeof omen.result === 'object' ? omen.result : null
     const choices = Array.isArray(omen.choices) ? omen.choices : []
     const guardChoice = choices.find((choice) => choice.id === 'guard') ?? { id: 'guard', label: '守卫' }
     const feedChoice = choices.find((choice) => choice.id === 'feed') ?? { id: 'feed', label: '安抚' }
@@ -423,13 +425,32 @@
           Math.round(chance * 100) + '%' + (cost > 0 ? ' · ' + cost + ' 硬币' : '')
       }
     })
+    // 已完成的那一句：谁说、成没成、最后拿到/赔了什么。宿主没给 result 时退回“已处理”。
+    const resultText = (() => {
+      if (!finished) return ''
+      if (result === null) return '已处理。'
+      if (result.ignored === true) {
+        return '已处理：没来得及应对，来客已经走了。'
+      }
+      const label = omen.choice === 'feed' ? feedChoice.label : guardChoice.label
+      const head = label + (result.success === true ? '成功' : '失败')
+      const loss = result.loss ?? {}
+      const parts = []
+      const reward = rewardText(result.reward)
+      if (reward !== '') parts.push(reward)
+      if (Number(loss.crops) > 0) parts.push('损失 ' + Number(loss.crops) + ' 个仓库作物')
+      if (Number(loss.witherPlots) > 0) parts.push(Number(loss.witherPlots) + ' 块地枯萎')
+      if (Number(loss.freezePlots) > 0) parts.push(Number(loss.freezePlots) + ' 块地冻住')
+      return '已处理：' + head + (parts.length === 0 ? '。' : ' · ' + parts.join(' · ') + '。')
+    })()
     return {
       id: typeof omen.id === 'string' ? omen.id : '',
       name: typeof omen.name === 'string' ? omen.name : '来客',
       emoji: typeof omen.emoji === 'string' ? omen.emoji : '🐻',
       tag: typeof omen.tag === 'string' ? omen.tag : '季候来客',
       active,
-      resolved,
+      finished,
+      resultText,
       choice: typeof omen.choice === 'string' ? omen.choice : null,
       canFeed: omen.canFeed !== false,
       remainingText: active && Number.isFinite(remaining) && remaining > 0
@@ -437,25 +458,28 @@
         : active ? '马上就走' : '窗口已关',
       detail: active ? (omen.name + '在田边出现了。') : '它已经离开了。',
       guardText: guardReward === '' ? '守卫成功没有奖励；失败损失 ' + failText + '。' : '守卫成功 ' + guardReward + '；失败损失 ' + failText + '。',
-      guardOptions,
+      guardOptions: finished ? [] : guardOptions,
       guardBase: Number.isFinite(Number(omen.guardBase)) ? Math.min(1, Math.max(0, Number(omen.guardBase))) : 0,
       guardPets: Number.isFinite(Number(omen.guardPets)) ? Math.min(2, Math.max(0, Math.floor(Number(omen.guardPets)))) : 0,
       feedText: cost === '' ? feedChoice.label + '不花资源，稳过。' : feedChoice.label + ' ' + cost + (feedReward === '' ? '，稳过。' : '，换 ' + feedReward + '。'),
       ignoreText: ignoreParts.length === 0 ? '' : '不管它：' + ignoreParts.join(' + ') + '。',
-      actions: [
-        {
-          id: 'guard',
-          label: guardChoice.label,
-          disabled: !active || resolved || guardChoice.affordable === false,
-          reason: guardChoice.reason ?? ''
-        },
-        {
-          id: 'feed',
-          label: feedChoice.label,
-          disabled: !active || resolved || feedChoice.affordable === false,
-          reason: feedChoice.reason ?? ''
-        }
-      ]
+      // 已经处理过的来客不再给可点的选项：卡上只留 resultText 一句。
+      actions: finished
+        ? []
+        : [
+            {
+              id: 'guard',
+              label: guardChoice.label,
+              disabled: !active || guardChoice.affordable === false,
+              reason: guardChoice.reason ?? ''
+            },
+            {
+              id: 'feed',
+              label: feedChoice.label,
+              disabled: !active || feedChoice.affordable === false,
+              reason: feedChoice.reason ?? ''
+            }
+          ]
     }
   }
 
