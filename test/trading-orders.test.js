@@ -482,3 +482,26 @@ test('票 83：到价成交后收盘照常结算（用这一根的收盘价）',
   assert.equal(view.history[0].openedAt, undefined, '历史行不复制开盘时刻（契约只有 at）')
   assert.equal(view.week.pnl + 0, view.history[0].pnl + 0)
 })
+
+test('票 83：保证金接受任意整数（全下/自定义金额），不只 50/100/250', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock(SLOT_EDGE + TICK_MS)
+  const farm = fakeFarm(500)
+  const store = await openStore(dir, { clock, farm })
+  const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
+
+  // 开仓 73：不是预设，但仍是合法金额（规则只守 1..MAX_MARGIN 的整数形状）。
+  const opened = await store.openPosition({ side: 'long', margin: 73, leverage: 1 })
+  assert.equal(opened.ok, true, JSON.stringify(opened))
+  assert.equal(opened.position.margin, 73)
+  assert.equal(farm.wallet.coins, 427)
+
+  // 挂单 127：同上；撤单后原样退回。
+  const placed = await store.placeOrder({ crop: 'tomato', side: 'long', target, margin: 127, leverage: 5 })
+  assert.equal(placed.ok, true, JSON.stringify(placed))
+  assert.equal(placed.order.margin, 127)
+  assert.equal(farm.wallet.coins, 300)
+  const cancelled = await store.cancelOrder(placed.order.id)
+  assert.equal(cancelled.ok, true)
+  assert.equal(farm.wallet.coins, 427)
+})
