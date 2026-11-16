@@ -962,6 +962,47 @@
   }
 
   /**
+   * Tab 顺序（票 81 / 评审 P2）：返回窗口控件的逻辑顺序，`board.js` 按它写 tabindex。
+   *
+   * 顺序 = DOM 顺序（行为不变）：×（顶栏）→ 作物页签 → 方向 → 保证金（预设 + 全下）→
+   * 杠杆 → 到价开关 → 目标价 → 挂单 → 开一手 → 挂单卡的撤单 → 持仓卡的止损/平仓。
+   * 每项都是 `board.js` 的 `focusKeyOf` 能认出的键，且**不重复**（tabindex 只能给一个元素）。
+   * 纯函数：不碰 DOM，测试能直接断言；老/坏 payload 退回兜底白名单，不抛。
+   */
+  function focusOrder (payload) {
+    const limits = limitsOf(payload)
+    const order = ['close-button']
+    for (const crop of limits.crops) {
+      if (crop !== null && typeof crop === 'object' && typeof crop.id === 'string') {
+        order.push('crop:' + crop.id)
+      }
+    }
+    for (const side of Object.keys(SIDE_LABELS)) order.push('side:' + side)
+    for (const margin of limits.margins) order.push('margin:' + margin)
+    // 「全下」按钮的金额每包变，用语义键 `margin:all-in`（focusKeyOf 认 data-all-in）。
+    if (limits.allIn) order.push('margin:all-in')
+    for (const leverage of limits.leverages) order.push('leverage:' + leverage)
+    order.push('limit-toggle', 'limit-input', 'limit-place', 'submit')
+    const orders = payload !== null && typeof payload === 'object' && Array.isArray(payload.orders)
+      ? payload.orders
+      : []
+    for (const entry of orders) {
+      if (entry !== null && typeof entry === 'object' && typeof entry.id === 'string' && entry.id !== '') {
+        order.push('cancel:' + entry.id)
+      }
+    }
+    const positions = payload !== null && typeof payload === 'object' && Array.isArray(payload.positions)
+      ? payload.positions
+      : []
+    for (const position of positions) {
+      if (position === null || typeof position !== 'object') continue
+      if (typeof position.id !== 'string' || position.id === '') continue
+      order.push('stop:' + position.id, 'close:' + position.id)
+    }
+    return order
+  }
+
+  /**
    * 列表头（评审 P1）：`持仓 240 · 显示最近 200`。
    * `shown` 是窗口真正收到的条数（宿主按最新在前下发，上限在 `desktop/shared.js`），
    * 合计来自 payload 的 `positionsTotal`/`ordersTotal`。这样截断时玩家知道还有更早的，
@@ -1036,6 +1077,7 @@
     chartView,
     previewView,
     orderView,
+    focusOrder,
     orderRows,
     positionCards,
     historyRows,
