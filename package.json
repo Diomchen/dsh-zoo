@@ -18,7 +18,7 @@
   ],
   "scripts": {
     "test": "node scripts/run-tests.mjs",
-    "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --check desktop/farm-view.js && node --check desktop/farm.js && node --check desktop/farm-preload.js && node --check desktop/trading-view.js && node --check desktop/board.js && node --check desktop/board-preload.js && node --check desktop/crop-path.js && node --check scripts/lib/pet.mjs && node --check scripts/two-pets.mjs && node --check scripts/run-tests.mjs && node --check scripts/peer-probe.mjs && node --check scripts/verify-catalog-sync.mjs && npm test",
+    "check": "node --check desktop/main.js && node --check desktop/preload.js && node --check desktop/renderer.js && node --check desktop/shared.js && node --check desktop/gift.js && node --check desktop/gift-preload.js && node --check desktop/farm-view.js && node --check desktop/farm.js && node --check desktop/farm-preload.js && node --check desktop/trading-view.js && node --check desktop/board.js && node --check desktop/board-preload.js && node --check desktop/crop-path.js && node --check desktop/window-bounds.js && node --check desktop/window-dismiss.js && node --check scripts/lib/pet.mjs && node --check scripts/two-pets.mjs && node --check scripts/run-tests.mjs && node --check scripts/peer-probe.mjs && node --check scripts/verify-catalog-sync.mjs && npm test",
     "install:profile": "node scripts/install.mjs",
     "uninstall:profile": "node scripts/uninstall.mjs",
     "stop-helper": "node scripts/stop-helper.mjs",

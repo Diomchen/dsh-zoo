@@ -8,12 +8,28 @@
  *   - close()：显式关窗（Esc / 右上角 ×）；
  *   - onResult：宿主的 action-result；成功不关窗（toast 一下，继续做下一单）。
  *
- * 这里和农场窗一样**不**在失焦时关窗（主进程也没有 blur 处理器）：macOS 中文输入法
- * 候选窗会抢焦点，blur 关窗会变成「打中文时窗消失」。
+ * 这里和农场窗一样不在**输入法合成**时收起窗口（ADR-0029）：主进程按本文件上报的
+ * `compositionstart` / `compositionend` 跳过这次失焦。真正点窗口外面会收起所有插件窗。
  */
 'use strict'
 
 const { contextBridge, ipcRenderer } = require('electron')
+
+/**
+ * 输入法合成期间不收起（ADR-0029）：候选窗抢焦点会触发 blur，但用户还在打中文。
+ * 只上报一个布尔，主进程不认任何其它字段；捕获阶段才能稳定收到从输入框冒上来的事件。
+ */
+let composing = false
+window.addEventListener('compositionstart', () => {
+  if (composing) return
+  composing = true
+  ipcRenderer.send('dsh-zoo:composing', true)
+}, true)
+window.addEventListener('compositionend', () => {
+  if (!composing) return
+  composing = false
+  ipcRenderer.send('dsh-zoo:composing', false)
+}, true)
 
 contextBridge.exposeInMainWorld('dshZooBoard', {
   /** 监听器就位：主进程可以把当前盘口推过来了。 */
