@@ -581,7 +581,7 @@ test('票 82 e2e：/state 带真人周榜；只有自己时「观望」，开仓
   const empty = boardView.boardView(alone.body.trading, { now: clock.value })
   assert.equal(empty.league.sentiment.text, '观望')
   assert.equal(empty.league.hasPeers, false)
-  assert.match(empty.league.empty, /还没有邻居上线/)
+  assert.equal(empty.league.empty, '等邻居上线')
 
   // 开一手 20× 空南瓜：榜里自己那行出现持仓，情绪变「多 0 · 空 1」。
   const opened = await action(service, {
@@ -615,8 +615,8 @@ test('票 81 e2e：0 硬币时按钮写「去种地」，下单被拒绝且硬�
   const board = boardView.boardView(broke.body.trading, { now: clock.value })
   assert.equal(board.order.canSubmit, false)
   assert.equal(board.order.submitLabel, '去种地')
-  assert.match(board.order.hint, /先去种地/)
-  assert.match(board.hints.positions, /去种地/)
+  assert.equal(board.order.hint, '去种地')
+  assert.equal(board.hints.positions, '还没有持仓')
 
   const refused = await action(service, {
     action: 'trading-open-position', side: 'long', margin: 50, leverage: 1, cropId: 'tomato'
