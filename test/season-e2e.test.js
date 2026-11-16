@@ -92,6 +92,18 @@ function state (service) {
   return call(service, '/dsh-zoo/state')
 }
 
+// 房间用自己的真实时钟判断“在线/心跳”，这里只借它造出可用的空闲宠物。
+function seedGuardPets (service, count) {
+  const at = Date.now()
+  for (let index = 0; index < count; index += 1) {
+    const deviceId = 'guard-pet-' + index
+    const nickname = '守卫宠物' + index
+    service.room.observeBeacon({ deviceId, nickname, port: 4100 + index }, at)
+    service.room.admit(deviceId)
+    service.room.observeHeartbeat({ deviceId, nickname }, at)
+  }
+}
+
 async function seedFarm (dir, now, { crops = {}, seeds = {}, coins = 30, dew = 0 } = {}) {
   const store = await createFarmStore(dir, {
     now: () => now,
@@ -258,6 +270,7 @@ test('临时守卫：雇 2 名花 40 硬币，守卫率 100%，胜利奖励照�
   await seedFarm(dir, at, { coins: 100 })
   const service = makeService(t, dir, { farmNow: () => at, farmRandom: () => 0.99 })
   await service.ready
+  seedGuardPets(service, 2)
 
   const bad = await action(service, {
     action: 'farm-omen-resolve', choice: 'guard', guards: 3, expectedStart: omen.day
@@ -276,6 +289,37 @@ test('临时守卫：雇 2 名花 40 硬币，守卫率 100%，胜利奖励照�
   assert.equal(after.coins, 130)
   assert.equal(after.dew, 5)
   assert.equal(after.seeds.rice, 1)
+})
+
+test('临时守卫：没有空闲宠物时只能自己守，不能雇人', async (t) => {
+  const omen = freshOmen(seasonAt(AUTUMN))
+  const at = omen.start + HOUR_MS
+  const dir = await tempDir(t)
+  await seedFarm(dir, at, { coins: 100 })
+  const service = makeService(t, dir, { farmNow: () => at, farmRandom: () => 0.4 })
+  await service.ready
+
+  const before = (await state(service)).body.farm
+  assert.equal(before.season.omen.guardPets, 0)
+  assert.equal(before.season.omen.guardOptions[1].affordable, false)
+  assert.match(before.season.omen.guardOptions[1].reason, /空闲宠物/)
+
+  const denied = await action(service, {
+    action: 'farm-omen-resolve', choice: 'guard', guards: 1, expectedStart: omen.day
+  })
+  assert.equal(denied.body.ok, false)
+  assert.equal(denied.body.error, 'no-guard-pet')
+
+  seedGuardPets(service, 1)
+  const after = (await state(service)).body.farm
+  assert.equal(after.season.omen.guardPets, 1)
+  assert.equal(after.season.omen.guardOptions[1].affordable, true)
+
+  const won = await action(service, {
+    action: 'farm-omen-resolve', choice: 'guard', guards: 1, expectedStart: omen.day
+  })
+  assert.equal(won.body.ok, true)
+  assert.equal(won.body.guardChance, 0.8)
 })
 
 test('season.json 落盘：领奖后 claimed=true，且 farm.json 版本不变', async (t) => {
