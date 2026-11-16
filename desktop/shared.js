@@ -243,6 +243,8 @@
   const BOARD_MAX_LEAGUE_ROWS = 32
   const BOARD_MAX_LEAGUE_POSITIONS = 8
   const BOARD_MAX_LEAGUE_COUNT = BOARD_MAX_LEAGUE_ROWS * BOARD_MAX_LEAGUE_POSITIONS
+  /** 旧版本邻居的可见计数：与 `src/protocol.js` 的 MAX_NEIGHBORS（64）同量级，只做形状夹取。 */
+  const BOARD_MAX_WATCHERS = 64
   const BOARD_MAX_WEEK_PNL = 1000000
   const BOARD_MAX_WEEK_PNL_PCT = 1000
   /**
@@ -1890,6 +1892,12 @@
     const own = source.self !== null && typeof source.self === 'object' && !Array.isArray(source.self)
       ? source.self
       : {}
+    // 旧版本邻居（评审 P1）：有人在线、但一条周报都没发时，窗口要画「旧版本」而不是
+    // 「还没有邻居上线」。这两个数只是展示用的计数，坏了归零。
+    const watchers = source.watchers !== null && typeof source.watchers === 'object' &&
+      !Array.isArray(source.watchers)
+      ? source.watchers
+      : {}
     return {
       rows,
       sentiment: {
@@ -1902,6 +1910,10 @@
         weekPnlPct: own.weekPnlPct === null || own.weekPnlPct === undefined
           ? null
           : normalizeBoardNumber(own.weekPnlPct, -BOARD_MAX_WEEK_PNL_PCT, BOARD_MAX_WEEK_PNL_PCT)
+      },
+      watchers: {
+        online: normalizeBoardInt(watchers.online, 0, BOARD_MAX_WATCHERS) ?? 0,
+        reported: normalizeBoardInt(watchers.reported, 0, BOARD_MAX_WATCHERS) ?? 0
       }
     }
   }

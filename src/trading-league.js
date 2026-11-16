@@ -116,16 +116,61 @@ function sentimentOf (rows) {
 }
 
 /**
+ * 旧版本邻居的可见状态（评审 P1 / SPEC v10「旧邻居」）：
+ *   - `online` = 已放行且此刻有心跳的邻居数（room 的邻居表已经按 TTL 清人）；
+ *   - `reported` = 其中在本机收到的新鲜窗口内发过周报的数量。
+ * `online > 0 && reported === 0` 才是「他们在，但不会发周报」——窗口据此说
+ * 「邻居是旧版本，还没有周报」，而不是误导成「还没有邻居上线」。
+ *
+ * 纯函数：邻居表与 digest 表都由 service 从内存取出来喂进来，这一层不碰 room/网络。
+ */
+export function watcherCounts ({ neighbors = [], digests = [], now = Date.now() } = {}) {
+  const stamp = Number(now)
+  const at = Number.isFinite(stamp) ? stamp : Date.now()
+  const online = new Set()
+  for (const neighbor of Array.isArray(neighbors) ? neighbors : []) {
+    if (neighbor === null || typeof neighbor !== 'object') continue
+    if (neighbor.status !== 'allowed') continue
+    if (!(Number(neighbor.heartbeatAt) > 0)) continue
+    if (typeof neighbor.deviceId !== 'string' || neighbor.deviceId === '') continue
+    online.add(neighbor.deviceId)
+  }
+  let reported = 0
+  for (const digest of Array.isArray(digests) ? digests : []) {
+    if (digest === null || typeof digest !== 'object') continue
+    if (!online.has(digest.deviceId)) continue
+    const seenAt = Number(digest.seenAt)
+    if (!Number.isFinite(seenAt) || at - seenAt > TRADING_DIGEST_FRESH_MS) continue
+    reported += 1
+  }
+  return { online: online.size, reported }
+}
+
+/** 旧版本状态只认两个非负整数；坏输入按 0，窗口不会拿 NaN 去比较。 */
+function watchersOf (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { online: 0, reported: 0 }
+  }
+  const count = (value) => {
+    const num = Number(value)
+    return Number.isInteger(num) && num >= 0 ? num : 0
+  }
+  const online = count(raw.online)
+  return { online, reported: Math.min(online, count(raw.reported)) }
+}
+
+/**
  * 合并成榜：`self` 是本机（`{ deviceId, nickname, weekPnl, weekPnlPct?, weekBase,
  * positions }`），`peers` 是 service 从内存 Map 取出来的邻居周报
- * （`{ deviceId, nickname, weekPnl, weekPnlPct, positions, seenAt }`），`now` 是本机时钟。
+ * （`{ deviceId, nickname, weekPnl, weekPnlPct, positions, seenAt }`），`now` 是本机时钟，
+ * `watchers` 是 service 用 `watcherCounts()` 算好的旧版本可见状态。
  *
- * 返回 `{ rows, sentiment, self }`：`rows` 已排序（含 `me: true` 的本机行），
+ * 返回 `{ rows, sentiment, self, watchers }`：`rows` 已排序（含 `me: true` 的本机行），
  * `sentiment` 是上面那三格计数，`self` 是窗口抬头用的本机分数
  * （和本机发出去的那条 digest 同源，免得榜上和自报对不上）。
  * 唯一不发 `trading-digest` 的邻居不会出现——旧版本静默降级（SPEC「旧邻居」）。
  */
-export function buildLeague ({ self = null, peers = [], now = Date.now() } = {}) {
+export function buildLeague ({ self = null, peers = [], now = Date.now(), watchers = null } = {}) {
   const stamp = Number(now)
   const at = Number.isFinite(stamp) ? stamp : Date.now()
   const rows = []
@@ -144,6 +189,7 @@ export function buildLeague ({ self = null, peers = [], now = Date.now() } = {})
     sentiment: sentimentOf(rows),
     self: own === null
       ? { weekPnl: 0, weekPnlPct: null }
-      : { weekPnl: own.weekPnl, weekPnlPct: own.weekPnlPct }
+      : { weekPnl: own.weekPnl, weekPnlPct: own.weekPnlPct },
+    watchers: watchersOf(watchers)
   }
 }
