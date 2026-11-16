@@ -195,6 +195,25 @@
       .close:hover {
         background: #e7e1d8;
       }
+      /* 票 79：头部的「盘口」入口（15 分钟合约小窗），和置顶/关闭同一排。 */
+      .board-entry {
+        appearance: none;
+        flex: none;
+        height: 24px;
+        padding: 0 10px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+        font: inherit;
+        font-size: 12px;
+        font-weight: 600;
+        line-height: 24px;
+        cursor: pointer;
+      }
+      .board-entry:hover {
+        background: #f8e7cb;
+      }
       .pin {
         appearance: none;
         width: 24px;
@@ -2280,6 +2299,7 @@
           <span class="pill dew" title="露水">
             <span class="emoji" aria-hidden="true">💧</span><b id="dew-value">0</b>
           </span>
+          <button class="board-entry" id="board" type="button" aria-label="打开盘口" title="打开盘口（15 分钟合约）">盘口</button>
           <button class="pin" id="pin" type="button" aria-label="置顶窗口" aria-pressed="false" title="置顶窗口">📌</button>
           <button class="close" id="close" type="button" aria-label="关闭农场">×</button>
         </div>

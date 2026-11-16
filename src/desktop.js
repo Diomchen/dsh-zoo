@@ -131,6 +131,8 @@ export function createDesktop (options = {}) {
   let lastStatus = null
   /** 农场小窗的真实开关状态（ticket 46）：helper 在小窗开关时主动报，不靠宿主猜。 */
   let farmWindowOpen = false
+  /** 盘口小窗的真实开关状态（票 79）：同一套语义，×/Esc 关窗也会报上来。 */
+  let boardWindowOpen = false
   let lastError = null
   let helperErrors = 0
   let restartTimer = null
@@ -449,6 +451,8 @@ export function createDesktop (options = {}) {
       settleReply(event)
     } else if (event.type === 'farm-window-state') {
       farmWindowOpen = event.open === true
+    } else if (event.type === 'board-window-state') {
+      boardWindowOpen = event.open === true
     } else if (event.type === 'pong') {
       notePong()
     } else if (event.type === 'error') {
@@ -637,6 +641,21 @@ export function createDesktop (options = {}) {
     })
   }
 
+  /**
+   * 盘口小窗（票 79）：把宿主算好的整份盘口视图交给 helper。
+   * `open:true` 打开/聚焦；`open:false` 只刷新已经开着的那扇；`close:true` 关窗
+   * （和刷新分开：刷新不能把窗口关掉）。窗口拿不到 `/state`，所以价格/硬币/持仓/历史
+   * 必须随这条命令一起走。
+   */
+  function boardWindow (payload = {}) {
+    return sendHostCommand({
+      type: 'board-window',
+      open: payload?.open === true,
+      ...(payload?.close === true ? { close: true } : {}),
+      state: payload?.state ?? null
+    })
+  }
+
   function show () {
     try {
       return send({ type: 'show' })
@@ -755,6 +774,8 @@ export function createDesktop (options = {}) {
       lastStatus,
       // ticket 46：右键「农场」按这个开关（用户用 ×/Esc 关窗也会同步过来）。
       farmOpen: farmWindowOpen,
+      // 票 79：右键「盘口」同理。
+      boardOpen: boardWindowOpen,
       assetRoots: assetRoots.slice(),
       giftsRoot,
       stderr: stderrLines.slice(),
@@ -823,6 +844,7 @@ export function createDesktop (options = {}) {
     giftDiscard,
     bringWindow,
     farmWindow,
+    boardWindow,
     actionResult,
     shot,
     requestStatus,
