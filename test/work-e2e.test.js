@@ -167,7 +167,7 @@ async function hireFrom (a, b, bId, hours = 2) {
 test('挂牌 → 雇佣 → 雇工画面 → 守卫 0.8/0 → 提前结束 → 结算只发生一次', async (t) => {
   const { a, b, dirA, aId, bId } = await connectedPair(t)
   await listOn(b)
-  // 雇佣前记下墙钟：A 的 farm.json 还没有写过时，用时间下界验证「雇佣重置待机」。
+  // 雇佣前记下墙钟：雇佣不能再把在线计时推到点击那一刻。
   const beforeHireAt = Date.now()
   await delay(30)
   await hireFrom(a, b, bId)
@@ -182,9 +182,9 @@ test('挂牌 → 雇佣 → 雇工画面 → 守卫 0.8/0 → 提前结束 → �
   const incoming = b.snapshot().contracts.incoming[0]
   assert.equal(incoming.employerDeviceId, aId)
 
-  // 雇佣也是一次农场动作：待机锚点被推到点击那一刻。
+  // 雇佣也是农场动作，但露水按在线时长累计：动作不重置锚点。
   const afterHire = JSON.parse(await readFile(join(dirA, FARM_FILE), 'utf8'))
-  assert.ok(afterHire.dewAt >= beforeHireAt + 20, '雇佣重置待机计时（dewAt 被推到点击那一刻）')
+  assert.ok(afterHire.dewAt <= beforeHireAt, '雇佣不重置在线计时（dewAt 留在原地）')
 
   // 记录页：双方各一条 hire 日志，带 who / hours / wage。
   await waitFor(() => a.snapshot().farm.log.some((entry) => entry.kind === 'hire') &&

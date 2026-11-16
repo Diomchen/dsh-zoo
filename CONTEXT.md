@@ -20,7 +20,7 @@
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
-农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 待机 / 露水”同义。
+农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
 
 ## Language
 
@@ -226,12 +226,15 @@ _Avoid_: 订单, 协议, order, deal
 宠物在家时对农场的保护；它出门串门或在外打工时失效。
 _Avoid_: 防守, 保安, defend, protect
 
-**待机 (Idle)**：
-DSH 开着、主人 10 分钟没做过农场动作的状态；它攒“露水”，给农场加成。
-_Avoid_: 挂机, 闲置, AFK
+**在线 (Online)**：
+DSH 开着就累计“露水”，不再要求“没做农场动作”；种/收/浇/施肥/买卖/雇佣都不打断计时。
+代码里的 `idle` 是历史命名，语义已放宽为“DSH 在线”。
+_Avoid_: 待机, 挂机, AFK
 
 **露水 (Dew)**：
-待机攒出来的资源，用来浇水/施肥；有每日上限。
+在线累计的资源，用来浇水/施肥；每天最多新增 48，余额也封顶 48。
+本地午夜只重置“今天已挣”的额度，保留未花完的余额
+（[ADR-0024](docs/adr/0024-dew-accrues-while-online.md)）。
 _Avoid_: 能量, 体力, energy, water
 
 **离线生长 (Offline Growth)**：

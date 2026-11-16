@@ -179,7 +179,7 @@ test('离线补算：min(now − lastTickAt, 12h)；时钟倒退/缺时间戳按
   assert.equal(offlineElapsed(T0, T0 + 24 * HOUR_MS, 2 * HOUR_MS), 2 * HOUR_MS)
 })
 
-test('露水：10 分钟 +1、零头保留、余额封顶 48、跨本地午夜归零', () => {
+test('露水：10 分钟 +1、零头保留、余额封顶 48、跨本地午夜保留余额只重置已挣', () => {
   const start = { dew: 0, dewAt: T0, dewDay: TODAY }
   const nine = advanceDew(start, T0 + 9 * MINUTE_MS)
   assert.deepEqual(nine, {
@@ -210,7 +210,7 @@ test('露水：10 分钟 +1、零头保留、余额封顶 48、跨本地午夜�
   assert.equal(over.dew, MAX_DEW)
   assert.equal(over.gained, 0)
 
-  // 跨本地午夜：余额归零，锚点从午夜之后重新算。
+  // 跨本地午夜：余额保留，只把「今天已挣」归零，锚点从午夜之后重新算。
   const late = new Date(2026, 4, 6, 23, 50, 0).getTime()
   const lateDay = localDayKey(late)
   const beforeMidnight = advanceDew({ dew: 12, dewAt: late, dewDay: lateDay }, late + 5 * MINUTE_MS)
@@ -219,12 +219,14 @@ test('露水：10 分钟 +1、零头保留、余额封顶 48、跨本地午夜�
     { dew: 12, dewAt: late, dewDay: lateDay },
     late + 20 * MINUTE_MS
   )
-  assert.equal(afterMidnight.dew, 0)
+  assert.equal(afterMidnight.dew, 12)
+  assert.equal(afterMidnight.dewEarned, 0)
   assert.equal(afterMidnight.reset, true)
   assert.equal(afterMidnight.dewAt, late + 20 * MINUTE_MS)
   assert.equal(afterMidnight.dewDay, localDayKey(late + 20 * MINUTE_MS))
   const nextPoint = advanceDew(afterMidnight, late + 30 * MINUTE_MS)
-  assert.equal(nextPoint.dew, 1)
+  assert.equal(nextPoint.dew, 13)
+  assert.equal(nextPoint.dewEarned, 1)
 })
 
 test('露水每日上限按「已挣」算：挣满 48、花光后再等 10 分钟也不再涨；跨日恢复', () => {

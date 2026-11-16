@@ -239,7 +239,7 @@ test('锁着的地块：收/偷/帮都回 bad-plot，不只是种', async (t) =>
   assert.equal((await store.fertilize('p5')).error, 'bad-plot')
 })
 
-test('解锁算一次农场动作：重置待机锚点并落盘', async (t) => {
+test('解锁不重置待机锚点：到点照常攒露水并落盘', async (t) => {
   const dir = await tempDir(t)
   const clock = { value: NOON }
   const store = await makeStore(dir, () => clock.value)
@@ -248,6 +248,8 @@ test('解锁算一次农场动作：重置待机锚点并落盘', async (t) => {
   assert.equal((await store.unlockPlot(4)).ok, true)
   const file = JSON.parse(await readFile(join(dir, FARM_FILE), 'utf8'))
   assert.equal(file.dewAt, clock.value)
+  assert.equal(file.dew, 1, '第 10 分钟照常 +1，没有因为解锁被清零')
+  assert.equal(file.dewEarned, 1)
 })
 
 test('50 块一茬全卖分两笔：相对 4 块的深度只跌约 7–9%', () => {

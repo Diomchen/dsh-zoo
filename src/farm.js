@@ -63,9 +63,9 @@ import { parseJsonText } from './json-text.js'
  *
  * 三条产品规则决定这里的形状：
  *   - **离线也长，但一次最多补 12 小时**；成熟就停，不枯萎、不生病；
- *   - **露水只奖励「DSH 开着但没在玩」**：每 10 分钟 +1，每天最多挣 48
- *     （余额也封顶 48）；关掉 DSH 的时间不算，加载时把计时锚点重置到 now；
- *   - **任何一次成功的农场动作都会重置待机计时**（种/收/浇/施肥）。
+ *   - **露水按 DSH 开启时长累计**：每 10 分钟 +1，每天最多新增 48，余额封顶 48；
+ *     种/收/浇/施肥/买卖/雇佣都不打断计时；关掉 DSH 的时间不算，加载时把锚点放到 now；
+ *   - 本地午夜只重置“今天已挣”的额度，**保留未花完的余额**。
  *
  * 容错与 `src/backpack.js` 同一套路：
  *   - 文件不存在：初始农场（4 空地、30 硬币、2 颗小番茄种子），不告警；
@@ -819,7 +819,7 @@ class FarmStore {
 
   /**
    * 加载时的两件事：补 `min(now − lastTickAt, 12h)` 的生长（离线），
-   * 以及把待机锚点重置到 now（关掉 DSH 的时间不算露水）。
+   * 以及把露水锚点放到 now（关掉 DSH 的时间不算露水）。
    * 返回本次是否真的改动了要落盘的状态。
    */
   #settleLoad (now, { offline }) {
@@ -842,8 +842,8 @@ class FarmStore {
       (this.#state.dewDay !== null && this.#state.dewDay !== day) ||
       (this.#state.dewDayEarned !== null && this.#state.dewDayEarned !== day)
     )
-    // 跨日重置/「余额算进今天已挣」只有一份实现（advanceDew）；把锚点先放到 now，
-    // 关掉 DSH 的时长不算待机，也不会补前一天剩下的零头。
+    // 跨日只重置「今天已挣」，余额原样保留；统一走 advanceDew 一份实现。
+    // 加载时把锚点先放到 now：关掉 DSH 的时长不算露水，也不会补前一天剩下的零头。
     const dew = advanceDew({
       dew: this.#state.dew,
       dewEarned: this.#state.dewEarned,
@@ -856,7 +856,7 @@ class FarmStore {
     this.#state.dewAt = dew.dewAt
     if (dew.dewDay !== null) this.#state.dewDay = dew.dewDay
     if (dew.dewDayEarned !== null) this.#state.dewDayEarned = dew.dewDayEarned
-    // 升级旧文件时不因为「余额补进已挣」白写一次 farm.json；只有跨日重置要立刻落盘。
+    // 跨日重置要立刻落盘；普通加载不白写一次 farm.json。
     if (dayReset) changed = true
     // 访客日限额同样按本地日重置：昨天用掉的次数不能带到今天。
     // 这是派生字段：**不**因为加载就立刻落盘（升级旧文件不该白写一次 farm.json）；
@@ -1000,9 +1000,8 @@ class FarmStore {
   }
 
   /**
-   * 任何一次农场动作都重置待机计时（SPEC v5「待机、露水」）。
-   * 工坊动作里只有种/收/浇/施肥/买卖会走各自的 `#resetIdle`；雇佣由 service 显式调这里，
-   * 语义上「主人在玩」就重置，不是「露水又攒了一滴」。
+   * 在线心跳只推进露水，不再重置计时。
+   * 露水按 DSH 开启时长累计，种/收/浇/施肥/买卖/雇佣都不影响下一次 +1 的时间。
    */
   touch () {
     return this.#enqueue(() => this.#touch())
@@ -1161,15 +1160,6 @@ class FarmStore {
     return this.#now()
   }
 
-  #resetIdle (now) {
-    this.#state.dewAt = now
-    const day = localDayKey(now)
-    if (day !== null) {
-      this.#state.dewDay = day
-      this.#state.dewDayEarned = day
-    }
-  }
-
   #appendLog (entry) {
     this.#state.log.unshift(entry)
     if (this.#state.log.length > MAX_FARM_LOG) this.#state.log.length = MAX_FARM_LOG
@@ -1225,7 +1215,6 @@ class FarmStore {
     }
     this.#state.plots[index] = planted
     this.#appendLog({ at: now, kind: 'plant', crop: cropId, qty: 1 })
-    this.#resetIdle(now)
 
     const persisted = await this.#persist(true)
     return {
@@ -1264,7 +1253,6 @@ class FarmStore {
     addStack(this.#state.crops, cropId, qty)
     this.#state.plots[index] = emptyPlot(plotId)
     this.#appendLog({ at: now, kind: 'harvest', crop: cropId, qty })
-    this.#resetIdle(now)
 
     const persisted = await this.#persist(true)
     return {
@@ -1304,7 +1292,6 @@ class FarmStore {
     if (watered === null) return farmError('bad-plot')
     this.#state.plots[index] = watered
     this.#state.dew -= WATER_COST
-    this.#resetIdle(now)
 
     const persisted = await this.#persist(true)
     return {
@@ -1341,7 +1328,6 @@ class FarmStore {
     if (fertilized === null) return farmError('bad-plot')
     this.#state.plots[index] = fertilized
     this.#state.dew -= FERTILIZE_COST
-    this.#resetIdle(now)
 
     const persisted = await this.#persist(true)
     return {
@@ -1423,7 +1409,6 @@ class FarmStore {
       else this.#state.crops[cropId] = left
       this.#state.coins = Math.min(MAX_COINS, this.#state.coins + total)
     }
-    this.#resetIdle(now)
 
     const farmPersisted = await this.#persist(true)
     let marketPersisted = true
@@ -1455,8 +1440,8 @@ class FarmStore {
   /**
    * 解锁下一块地（ticket 48 / ADR-0017）。
    * 失败：`max-plots`（已到 50）、`stale`（expected 与当前不符）、`no-coin`（不够）、
-   * `reserve`（解锁后不够买一颗最便宜种子）。成功：扣币、`unlocked+1`、写 `unlock` 日志、
-   * 重置待机计时；新地块是空地，不送种子。
+   * `reserve`（解锁后不够买一颗最便宜种子）。成功：扣币、`unlocked+1`、写 `unlock` 日志；
+   * 新地块是空地，不送种子。露水计时不受影响。
    */
   async #unlockPlot (rawExpected) {
     const now = this.#nowMs()
@@ -1486,7 +1471,6 @@ class FarmStore {
     this.#state.coins -= cost
     this.#state.unlocked = current + 1
     this.#appendLog({ at: now, kind: 'unlock', qty: 1, plot: this.#state.unlocked, cost })
-    this.#resetIdle(now)
 
     const persisted = await this.#persist(true)
     return {
@@ -1670,7 +1654,6 @@ class FarmStore {
     this.#state.dew -= THAW_COST.dew
     this.#state.coins -= THAW_COST.coins
     this.#appendLog({ at: now, kind: 'thaw', qty: 1 })
-    this.#resetIdle(now)
 
     const persisted = await this.#persist(true)
     return {
@@ -1740,9 +1723,8 @@ class FarmStore {
   async #touch () {
     const now = this.#nowMs()
     this.#advance(now)
-    this.#resetIdle(now)
     const persisted = await this.#persist(true)
-    return { ok: true, action: 'touch', dewAt: now, persisted }
+    return { ok: true, action: 'touch', dewAt: this.#state.dewAt, persisted }
   }
 
   async #noteHire (raw) {

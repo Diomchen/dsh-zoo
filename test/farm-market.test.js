@@ -191,18 +191,18 @@ test('每分钟最多 10 笔：第 11 笔明确 market-busy，前 10 笔都已�
   assert.equal((await farm.buySeed('tomato', 1)).ok, true, '过了 1 分钟窗口恢复')
 })
 
-test('买卖会重置待机计时（和种/收/浇/施肥同一条规则）', async (t) => {
+test('买卖不重置待机计时（和种/收/浇/施肥同一条规则）', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock()
   const { farm } = await makeStores(dir, clock, { dew: 0, dewEarned: 0, dewAt: NOON })
   clock.advance(10 * 60 * 1000)
-  // 交易入口先 advance，10 分钟攒的 1 点露水不会因为买卖丢掉；同时把待机锚点推到 now。
+  // 交易入口先 advance，10 分钟攒的 1 点露水不会因为买卖丢掉。
   const first = await farm.buySeed('tomato', 1)
   assert.equal(first.dew, 1)
   clock.advance(5 * 60 * 1000)
   const second = await farm.buySeed('tomato', 1)
-  assert.equal(second.dew, 1, '买卖刚重置过待机，5 分钟还不够再攒 1 点')
-  clock.advance(10 * 60 * 1000)
+  assert.equal(second.dew, 1, '5 分钟还不够再攒 1 点')
+  clock.advance(5 * 60 * 1000)
   const third = await farm.buySeed('tomato', 1)
-  assert.equal(third.dew, 2, '又攒满 10 分钟，再得 1 点')
+  assert.equal(third.dew, 2, '买卖没有把锚点推后，第 20 分钟照常再得 1 点')
 })
