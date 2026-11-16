@@ -890,6 +890,49 @@
     return { element, countdown, progress: fill }
   }
 
+  /**
+   * 24 小时成交价曲线。交易所只保留最近 50 笔，所以这里不是“每个 tick 都采样”的
+   * K 线，而是“最近成交价 + 此刻卖价”的折线；没有成交就画一条空的虚线，
+   * 让玩家知道这里确实有曲线，只是还没有行情。
+   */
+  function marketSpark (history, cropId, { now = Date.now(), currentPrice = null, windowMs = 24 * 60 * 60 * 1000 } = {}) {
+    const stamp = Number(now)
+    const span = Number.isFinite(windowMs) && windowMs > 0 ? windowMs : 24 * 60 * 60 * 1000
+    const cutoff = Number.isFinite(stamp) ? stamp - span : 0
+    const points = (Array.isArray(history) ? history : [])
+      .filter((entry) => entry !== null && typeof entry === 'object' && entry.crop === cropId)
+      .map((entry) => ({ at: Number(entry.at), price: Number(entry.price) }))
+      .filter((entry) => Number.isFinite(entry.at) && entry.at >= cutoff && Number.isFinite(entry.price) && entry.price >= 0)
+      .sort((left, right) => left.at - right.at)
+      .map((entry) => ({ at: entry.at, price: entry.price }))
+    const hasTrades = points.length > 0
+    const price = Number(currentPrice)
+    if (Number.isFinite(price) && price >= 0) points.push({ at: Number.isFinite(stamp) ? stamp : Date.now(), price })
+    if (points.length === 0) return { points: [], path: '', trend: 'flat', empty: true, min: 0, max: 0 }
+    if (points.length === 1) points.unshift({ at: points[0].at - span, price: points[0].price })
+    const min = Math.min(...points.map((entry) => entry.price))
+    const max = Math.max(...points.map((entry) => entry.price))
+    const range = max - min
+    const coords = points.map((entry, index) => ({
+      x: points.length <= 1 ? 0 : (index / (points.length - 1)) * 100,
+      y: 21 - (range <= 0 ? 0.5 : (entry.price - min) / range) * 18
+    }))
+    const trend = points[points.length - 1].price > points[0].price
+      ? 'up'
+      : points[points.length - 1].price < points[0].price ? 'down' : 'flat'
+    const path = coords.map((point) => point.x.toFixed(2) + ',' + point.y.toFixed(2)).join(' ')
+    return {
+      points,
+      path,
+      area: '0,24 ' + path + ' 100,24',
+      last: coords[coords.length - 1],
+      trend,
+      empty: !hasTrades,
+      min,
+      max
+    }
+  }
+
   return {
     CROP_META,
     CROP_IDS,
@@ -916,6 +959,7 @@
     seasonCalendar,
     eventCard,
     omenCard,
+    marketSpark,
     tradeView,
     listingIsStale,
     plotCards,

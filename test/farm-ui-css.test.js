@@ -160,3 +160,18 @@ test('clear button has danger color and two-click confirmation', () => {
   assert.match(renderer, /clearArmed/)
   assert.match(renderer, /dataset\.armed/)
 })
+
+test('market sparkline is rendered as an inline SVG with trend colors', () => {
+  const rule = bodyOf('.market-spark')
+  assert.match(rule, /height:\s*28px/)
+  const line = bodyOf('.market-spark polyline')
+  assert.match(line, /stroke-width:\s*2\.2/)
+  assert.match(css, /\.market-spark\.up polyline/)
+  assert.match(css, /\.market-spark\.down polyline/)
+  assert.match(css, /\.market-spark\.empty polyline/)
+  assert.match(css, /\.market-spark-area/)
+  assert.match(css, /\.market-spark-end/)
+  assert.match(renderer, /marketSpark/)
+  assert.match(renderer, /createElementNS\('http:\/\/www\.w3\.org\/2000\/svg'/)
+  assert.match(renderer, /market-spark-note/)
+})
