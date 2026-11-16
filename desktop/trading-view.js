@@ -1,7 +1,7 @@
 /**
- * 盘口小窗的纯视图模型（票 79 / 票 81）。
+ * 盘口小窗的纯视图模型（票 79 / 票 81 / 票 82）。
  *
- * 这层只做「宿主推来的盘口 view → 标题/K 线几何/下单区/持仓卡/历史/空态」的纯计算，
+ * 这层只做「宿主推来的盘口 view → 标题/K 线几何/下单区/持仓卡/历史/真人周榜/空态」的纯计算，
  * 不碰 window、document、IPC，也不改任何数据。渲染页把它当普通 script 加载
  * （`window.dshZooBoardView`），Node 测试用 `require` 同一份文件；DOM 由
  * `desktop/board.js` 建。
@@ -717,8 +717,69 @@
         ? '还没有持仓。硬币不够开仓时，先去种地。'
         : '还没有持仓。选好方向和保证金，一键开一手。',
       history: '还没有结算记录。收盘或手动平仓后会出现在这里。',
-      // 票 82 才有人榜数据：这里先占住位置，并说清为什么是空的。
+      // 票 82：榜上只有自己时用这一句（空态也要说清「现在能做什么」）。
       neighbors: '还没有邻居上线。等邻居打开 DSH 就会出现在这里；行情照走，一个人也能做单。'
+    }
+  }
+
+  /**
+   * 真人周榜 + LAN 情绪（票 82）。
+   *
+   * 排序、新鲜度、计数全部由宿主算好（`src/trading-league.js` 是纯函数的那一层），
+   * 这里只把数字画成文案：本周盈亏 `+12` / `-8`、收益率 `+3.50%` 或 `—`、
+   * 持仓摘要 `多 2 · 空 1`，一条仓位都没有就是「观望」。
+   * 收益率是**比率**（0.035 = +3.5%，与 SPEC 的 `weekPnl / weekBase` 同口径），
+   * 所以显示时乘 100；邻居没报就是 null → 「—」，不拿 0% 冒充。
+   */
+  function leagueView (payload) {
+    const safe = payload !== null && typeof payload === 'object' ? payload : null
+    const league = safe !== null && safe.league !== null && typeof safe.league === 'object'
+      ? safe.league
+      : {}
+    const rows = []
+    for (const entry of Array.isArray(league.rows) ? league.rows : []) {
+      if (entry === null || typeof entry !== 'object') continue
+      const weekPnl = toNumber(entry.weekPnl)
+      if (weekPnl === null) continue
+      const pct = toNumber(entry.weekPnlPct)
+      let long = 0
+      let short = 0
+      for (const position of Array.isArray(entry.positions) ? entry.positions : []) {
+        if (position === null || typeof position !== 'object') continue
+        if (position.side === 'long') long += 1
+        else if (position.side === 'short') short += 1
+      }
+      const nickname = typeof entry.nickname === 'string' && entry.nickname.trim() !== ''
+        ? entry.nickname.trim()
+        : '邻居'
+      rows.push({
+        nickname,
+        me: entry.me === true,
+        pnlText: formatSigned(weekPnl, 0),
+        pnlTone: toneOf(weekPnl),
+        pctText: pct === null ? '—' : formatSigned(pct * 100, 2) + '%',
+        pctTone: pct === null ? 'flat' : toneOf(pct * 100, 2),
+        positionsText: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short
+      })
+    }
+    const counts = league.sentiment !== null && typeof league.sentiment === 'object'
+      ? league.sentiment
+      : {}
+    const long = Math.max(0, Math.round(toNumber(counts.long) ?? 0))
+    const short = Math.max(0, Math.round(toNumber(counts.short) ?? 0))
+    return {
+      rows,
+      // 只有自己一行：窗口要在榜下面补一句「还没有邻居上线…行情照走」。
+      hasPeers: rows.some((row) => !row.me),
+      countText: rows.length + ' 人',
+      sentiment: {
+        long,
+        short,
+        // 全场一条仓位都没有 = 观望（SPEC：「没有仓位写观望」），不画「多 0 · 空 0」。
+        text: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
+        tone: long === 0 && short === 0 ? 'flat' : long >= short ? 'long' : 'short'
+      },
+      empty: emptyHints(safe).neighbors
     }
   }
 
@@ -745,6 +806,7 @@
       order,
       positions: positionCards(safe),
       history: historyRows(safe, now),
+      league: leagueView(safe),
       hints: emptyHints(safe)
     }
   }
@@ -771,6 +833,7 @@
     orderView,
     positionCards,
     historyRows,
+    leagueView,
     emptyHints,
     cropsView,
     boardView

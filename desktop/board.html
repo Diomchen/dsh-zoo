@@ -3,10 +3,11 @@
   <head>
     <meta charset="utf-8" />
     <!--
-      盘口小窗（票 79 / 票 81）：三作物 K 线、下单、持仓/止损、最近结算、本周盈亏。
+      盘口小窗（票 79 / 票 81 / 票 82）：三作物 K 线、下单、持仓/止损、最近结算、本周盈亏、
+      真人周榜与 LAN 情绪。
 
       和农场窗同一条安全模型：file:// 页面，不联网、不加载远程资源、读不到宿主
-      /state。行情、硬币、持仓、历史、周盈亏、风向全部由宿主随 `board-window` 命令推过来，
+      /state。行情、硬币、持仓、历史、周盈亏、风向、真人周榜全部由宿主随 `board-window` 命令推过来，
       这里只画、只把「申请」交回主进程。窗口能收键盘（focusable），但**不按失焦关窗**：
       macOS 中文输入法候选窗会抢焦点（农场窗踩过这个坑）。
 
@@ -653,12 +654,71 @@
       .empty[hidden] {
         display: none;
       }
-      /* ------------------------------ 邻居（票 82 填） ------------------------------ */
+      /* ------------------------------ 真人周榜（票 82） ------------------------------ */
       .neighbor-card {
         grid-area: neighbor;
         display: flex;
         flex-direction: column;
         min-height: 0;
+      }
+      .neighbor-card .scroll {
+        flex: 1;
+        min-height: 0;
+      }
+      .sentiment {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 8px;
+        margin-bottom: 4px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid var(--line);
+        font-size: 10px;
+        color: var(--muted);
+      }
+      .sentiment-value {
+        font-size: 12px;
+        font-weight: 700;
+        color: var(--ink-soft);
+        font-variant-numeric: tabular-nums;
+      }
+      .sentiment-value[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .sentiment-value[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      /* 本机那一行一直高亮：榜上第一眼要找的是自己的名次，不是邻居。 */
+      .league-row.me {
+        margin: 0 -6px;
+        padding: 4px 6px;
+        border-radius: 8px;
+        background: var(--emerald-soft);
+      }
+      .league-row.me + .league-row {
+        border-top: none;
+      }
+      .league-score {
+        flex: none;
+        text-align: right;
+        white-space: nowrap;
+      }
+      /* 榜行比持仓卡密：分数用 12px，够看清又不把一屏挤成两行。 */
+      .league-row .pnl {
+        font-size: 12px;
+        min-width: 40px;
+      }
+      .league-pct {
+        margin-left: 6px;
+        font-size: 10px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .league-pct[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .league-pct[data-tone='down'] {
+        color: var(--rose-ink);
       }
       /* ------------------------------ 其他 ------------------------------ */
       .foot {
@@ -792,9 +852,14 @@
 
         <section class="card neighbor-card" aria-labelledby="neighbor-title">
           <div class="card-head">
-            <h2 id="neighbor-title">邻居</h2>
-            <span>真人周榜</span>
+            <h2 id="neighbor-title">真人周榜</h2>
+            <span id="league-count">1 人</span>
           </div>
+          <div class="sentiment">
+            <span>LAN 情绪</span>
+            <b class="sentiment-value" id="sentiment" data-tone="flat">观望</b>
+          </div>
+          <div class="scroll" id="league"></div>
           <p class="empty" id="neighbor-empty">还没有邻居上线。</p>
         </section>
       </div>
