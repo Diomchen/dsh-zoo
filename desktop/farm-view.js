@@ -630,6 +630,14 @@
             ? {}
             : { reason: dew < THAW_COST.dew ? '露水不够（需要 ' + THAW_COST.dew + '）' : '硬币不够（需要 ' + THAW_COST.coins + '）' })
         }))
+        // 票 77：冻住也能直接铲掉，省下解冻费，但作物同样没了。
+        card.actions.push(action({
+          action: 'clear',
+          plotId: card.plotId,
+          label: '铲除',
+          className: 'clear',
+          disabled: busy
+        }))
       } else if (card.openPlant) {
         card.detailText = withered ? '换季枯了，点一下重种' : '点一下选种子'
       } else if (mature) {
@@ -669,6 +677,14 @@
           reason: plot?.fertilized === true
             ? '已经施过肥了'
             : '露水不够（需要 ' + FERTILIZE_COST + '）'
+        }))
+        // 票 77：生长中也可以提前铲掉，方便换季前止损。
+        card.actions.push(action({
+          action: 'clear',
+          plotId: card.plotId,
+          label: '铲除',
+          className: 'clear',
+          disabled: busy
         }))
       }
       return card

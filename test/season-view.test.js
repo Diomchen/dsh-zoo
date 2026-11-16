@@ -142,9 +142,11 @@ test('plotCards：冻住的地显示解冻按钮，不能点开重种；资源�
   assert.equal(card.cropName, '白萝卜（冻住）')
   assert.equal(card.openPlant, false)
   assert.equal(card.detailText, '生火解冻：2 露水 + 5 硬币')
-  assert.equal(card.actions.length, 1)
+  assert.equal(card.actions.length, 2)
   assert.equal(card.actions[0].action, 'thaw')
   assert.equal(card.actions[0].disabled, false)
+  assert.equal(card.actions[1].action, 'clear')
+  assert.equal(card.actions[1].disabled, false)
 
   const [poor] = view.plotCards({
     dew: 0,
