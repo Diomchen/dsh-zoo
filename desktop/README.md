@@ -350,6 +350,8 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | 改名 | 收起全部 | 不收起 | 同上 |
 
 - 显式关闭（Esc / × / 宿主 `close:true` / 主窗 `hide` / 退出）不变，仍然只关对应窗口或全部。
+- 点宠物本体也算“点外面”：主窗是 `focusable:false`，点它不一定让插件窗收到 blur，
+  所以 `dsh-zoo:input` 的可信左键按下会直接走同一条判定收起（输入法合成/锁期间仍跳过）。
 - 输入法保护：每个 preload 在 `compositionstart` / `compositionend` 时向主进程发
   `dsh-zoo:composing`；主进程按 `webContents.id` 记在 `Map` 里，合成期间整组跳过收起。
   这是旧约定「打中文时别关」唯一保留的部分，不是「永不关」。
