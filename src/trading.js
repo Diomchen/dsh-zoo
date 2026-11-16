@@ -984,6 +984,10 @@ class TradingStore {
    * 第 2 步失败时仓位保持 `settling`：本次运行不会再动它，重启后只补后半段。
    */
   async #settle (position, { exit, reason, at }) {
+    // 没有农场就没有钱包可退：与 open/close/placeOrder 同一条守卫。启动补算
+    // （`#settleDue`）可能在 farm 注入之前就看到一笔该结的仓位；少了这一句，
+    // `credit > 0` 时会在 `this.#farm.addCoins` 上抛 TypeError（评审 P2 的 latent 路径）。
+    if (this.#farm === null) return tradingError('starting')
     const outcome = settlementOf({
       side: position.side,
       margin: position.margin,
