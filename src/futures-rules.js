@@ -110,7 +110,8 @@ export function roundCoin (value) {
   return rounded === 0 ? 0 : rounded
 }
 
-function startOfWeek (at) {
+/** 这一周的周一 00:00（本地时区）。合约上市时间与「本周盈亏」的起算点都用它。 */
+export function startOfWeek (at) {
   const date = new Date(at)
   const day = date.getDay() // 0 = 周日
   const offset = (day + 6) % 7 // 周一 = 0

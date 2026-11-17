@@ -65,6 +65,7 @@ import {
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
 import { createFuturesStore, initialFuturesView } from './futures.js'
+import { FUTURES_LEVERAGES, LOT_SIZE, MM_SPREAD, SLOT_MS, TAKER_FEE_RATE } from './futures-rules.js'
 import { buildLeague, watcherCounts } from './trading-league.js'
 import {
   BOARD_TIMEFRAMES,
@@ -741,6 +742,8 @@ export function createService (ctx, options = {}) {
   let farmWindowOpened = false
   /** 宿主记住的盘口窗开关（票 79）：helper 报的真实状态优先，和农场窗同款。 */
   let tradingWindowOpened = false
+  /** 宿主记住的期货窗开关（票 93）：同上。 */
+  let futuresWindowOpened = false
   /**
    * 盘口窗正在看哪一种作物（票 90）。`null` = 还没人切过，按目录第一个算。
    *
@@ -1200,31 +1203,49 @@ export function createService (ctx, options = {}) {
     // 张数、费用、托管余额全由账本算——手改存档里的价格不会变成成交价。
     if (action === 'futures-deposit') {
       if (futures === null) return { ok: false, error: 'starting' }
-      return futures.deposit(body?.coins)
+      const result = await futures.deposit(body?.coins)
+      if (result?.ok === true) refreshFuturesWindow()
+      return result
     }
     if (action === 'futures-withdraw') {
       if (futures === null) return { ok: false, error: 'starting' }
-      return futures.withdraw(body?.coins)
+      const result = await futures.withdraw(body?.coins)
+      if (result?.ok === true) refreshFuturesWindow()
+      return result
     }
     if (action === 'futures-open') {
       if (futures === null) return { ok: false, error: 'starting' }
-      return futures.open({
+      const result = await futures.open({
         crop: body?.cropId,
         side: body?.side,
         margin: body?.margin,
         leverage: body?.leverage,
         at: futuresClock()
       })
+      if (result?.ok === true) refreshFuturesWindow()
+      return result
     }
     if (action === 'futures-close') {
       if (futures === null) return { ok: false, error: 'starting' }
-      return futures.close({ id: body?.positionId, at: futuresClock() })
+      const result = await futures.close({ id: body?.positionId, at: futuresClock() })
+      if (result?.ok === true) refreshFuturesWindow()
+      return result
     }
     // 结算本来是 tick 自己做的；这条动作只给脚本和验收用（幂等，多跑一次不多入账）。
     if (action === 'futures-settle') {
       if (futures === null) return { ok: false, error: 'starting' }
-      return futures.settleDue(futuresClock())
+      const result = await futures.settleDue(futuresClock())
+      if (result?.ok === true) refreshFuturesWindow()
+      return result
     }
+    // 窗口的倒计时归零时请宿主「结这一根 + 重推一拍」（票 93）。幂等：没仓位就没账可记。
+    if (action === 'futures-refresh') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      await futures.settleDue(futuresClock())
+      const state = futuresWindowView()
+      return { ok: true, action: 'futures-refresh', state }
+    }
+    if (action === 'futures-window') return handleFuturesOpen()
 
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') return recallPet()
@@ -1465,8 +1486,8 @@ export function createService (ctx, options = {}) {
       contracts: contractsView(),
       // 盘口（票 79）：和盘口窗同一份形状（价格/硬币/持仓/历史/本周 + 按钮白名单）。
       trading: tradingWindowView(),
-      // 期货（票 92）：托管余额/持仓/报价/费用累计。和盘口是两本账，互不影响。
-      futures: futuresView()
+      // 期货（票 92/93）：托管余额/持仓/报价/费用累计 + 作物目录与白名单（窗口直接用这份）。
+      futures: futuresWindowView()
     }
   }
 
@@ -2401,6 +2422,35 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 期货窗（票 93）的整份视图：账本快照 + 作物目录（含现货指数）+ 白名单 + 本根收盘时刻。
+   * 窗口不读 `/state`、也不 import 规则层——费用率、张大小、杠杆档全在这里下发。
+   */
+  function futuresWindowView () {
+    const now = futuresClock()
+    const view = futures === null ? initialFuturesView() : futures.snapshot({ at: now })
+    const crops = boardCrops().map((id) => ({
+      id,
+      label: CROPS[id]?.name ?? id,
+      index: futuresIndexOf(id),
+      contract: view.quotes[id]?.contract?.id ?? null
+    }))
+    return {
+      ...view,
+      ready: futures !== null,
+      crops,
+      limits: {
+        leverages: FUTURES_LEVERAGES.slice(),
+        lotSize: LOT_SIZE,
+        takerFeeRate: TAKER_FEE_RATE,
+        spreadRate: MM_SPREAD
+      },
+      now,
+      // 本根的收盘时刻：窗口拿它走倒计时，到点再请宿主结这一根（futures-refresh）。
+      slotEnd: (Math.floor(now / SLOT_MS) + 1) * SLOT_MS
+    }
+  }
+
+  /**
    * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
    * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
    * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
@@ -2566,6 +2616,66 @@ export function createService (ctx, options = {}) {
   function refreshTradingWindow () {
     if (tradingWindowOpenNow() !== true) return
     pushTradingWindow()
+  }
+
+  /**
+   * 菜单「期货」/农场窗按钮（票 93）：开着就关，否则打开/聚焦。
+   * 「开着」以 helper 报上来的真实窗口状态为准（`desktop.status().futuresOpen`）。
+   */
+  function handleFuturesOpen () {
+    if (desktop === null || typeof desktop.futuresWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
+    }
+    if (futuresWindowOpenNow()) return closeFuturesWindow('futures-open')
+    const opened = desktop.futuresWindow({ open: true, state: futuresWindowView() })
+    if (opened !== true) return boardSendFailed('futures-open')
+    futuresWindowOpened = true
+    return { ok: true, action: 'futures-open', window: 'opened', notice: '期货已打开。' }
+  }
+
+  /** 期货窗此刻是否真的开着（helper 优先；测试替身/老 helper 退回宿主记录）。 */
+  function futuresWindowOpenNow () {
+    if (desktop !== null && typeof desktop.status === 'function') {
+      const status = desktop.status()
+      if (status !== null && typeof status === 'object' && typeof status.futuresOpen === 'boolean') {
+        return status.futuresOpen
+      }
+    }
+    return futuresWindowOpened === true
+  }
+
+  /** 关窗的唯一出口：右键「期货」再点一次和自己关窗共用；`close:true` 与刷新分开。 */
+  function closeFuturesWindow (action = 'futures-close') {
+    if (desktop === null || typeof desktop.futuresWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: tradingErrorText('desktop-off') }
+    }
+    let sent = false
+    try {
+      sent = desktop.futuresWindow({ open: false, close: true }) === true
+    } catch {
+      sent = false
+    }
+    futuresWindowOpened = false
+    if (sent !== true) return boardSendFailed(action)
+    return { ok: true, action, window: 'closed', notice: '期货已经关了。' }
+  }
+
+  /** 刷新已经开着的期货窗（`open:false` 不会新开窗）。 */
+  function pushFuturesWindow () {
+    if (desktop === null || typeof desktop.futuresWindow !== 'function') return false
+    try {
+      const sent = desktop.futuresWindow({ open: false, state: futuresWindowView() }) === true
+      if (sent !== true) noteBoardSendFailure('futures-refresh')
+      return sent
+    } catch {
+      return false
+    }
+  }
+
+  /** 充值/提现/开仓/平仓/盯市之后刷新期货窗。没开窗就不发——关窗不影响结算。 */
+  function refreshFuturesWindow () {
+    if (futuresWindowOpenNow() !== true) return
+    pushFuturesWindow()
   }
 
   /**
@@ -5356,6 +5466,9 @@ export function createService (ctx, options = {}) {
           } else if (event?.type === 'board-window-state') {
             // 票 79：盘口窗真的开了/关了（含用户点 ×/Esc）。右键「盘口」靠它决定开还是关。
             tradingWindowOpened = event.open === true
+          } else if (event?.type === 'futures-window-state') {
+            // 票 93：期货窗同理——关了之后右键「期货」要能重新打开。
+            futuresWindowOpened = event.open === true
           } else if (event?.type === 'action') {
             // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
             // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。
@@ -6405,11 +6518,15 @@ export function createService (ctx, options = {}) {
     if (futuresTimer !== null || disposed) return
     futuresTimer = setInterval(() => {
       if (futures === null) return
+      let settled = null
       try {
-        futures.settleDue(futuresClock())
+        settled = futures.settleDue(futuresClock())
       } catch (error) {
         warnOnce('futures-tick', '期货结算失败：' + message(error))
+        return
       }
+      // 盯市改了余额/持仓价：窗口开着就推新的一拍（票 93）。
+      if (Array.isArray(settled?.settled) && settled.settled.length > 0) refreshFuturesWindow()
     }, futuresTickMs)
     futuresTimer.unref?.()
   }
@@ -7395,6 +7512,8 @@ export function createService (ctx, options = {}) {
     tradingWindow: () => tradingWindowView(),
     /** 票 92 的测试/诊断缝：期货账本的整份只读视图（与 `/state` 的 `futures` 同源）。 */
     futures: () => futuresView(),
+    /** 票 93 的测试/诊断缝：期货窗当前会收到的整份视图（含作物目录、白名单、倒计时）。 */
+    futuresWindow: () => futuresWindowView(),
     farmGuard: () => farmGuard(),
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),

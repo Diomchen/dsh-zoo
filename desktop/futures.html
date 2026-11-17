@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>期货</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dshzoo:">
+<style>
+  :root {
+    --paper: #f7f3e8;
+    --card: #fffdf6;
+    --ink: #2b2b2b;
+    --muted: #7a7466;
+    --line: #2b2b2b;
+    --soft: #ded6c4;
+    --up: #b3352b;
+    --down: #2f6b45;
+    --danger: #c0392b;
+    --radius: 6px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    width: 760px; height: 700px; overflow: hidden;
+    background: var(--paper); color: var(--ink);
+    font: 13px/1.45 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #app {
+    display: grid; height: 100%;
+    grid-template-rows: 52px minmax(0, 1fr) auto 152px;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 0 14px;
+    border-bottom: 2px solid var(--line); background: var(--card);
+  }
+  header .brand { font-weight: 700; letter-spacing: .06em; }
+  header .week { color: var(--muted); }
+  header .count { margin-left: auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+  header .count b { color: var(--ink); font-size: 15px; }
+  .stats { display: flex; gap: 12px; font-variant-numeric: tabular-nums; }
+  .stats span { color: var(--muted); }
+  .stats b { color: var(--ink); font-weight: 600; }
+  .up { color: var(--up); }
+  .down { color: var(--down); }
+  section { min-height: 0; overflow: hidden; }
+  .quotes { overflow: auto; border-bottom: 2px solid var(--line); }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 8px; text-align: right; white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--paper); color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--soft); }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:hover { background: #efe9d8; }
+  tbody tr.closed td { color: var(--muted); }
+  tbody tr.danger { background: #f7ded9; }
+  .order { border-bottom: 2px solid var(--line); background: var(--card); padding: 8px 14px; }
+  .order .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .order .row + .row { margin-top: 6px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
+  .seg button {
+    border: 0; background: transparent; color: var(--ink); padding: 4px 10px; cursor: pointer; font: inherit;
+  }
+  .seg button + button { border-left: 1px solid var(--soft); }
+  .seg button.on { background: var(--ink); color: var(--paper); }
+  select, input[type=number] {
+    font: inherit; color: var(--ink); background: var(--card);
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 4px 6px;
+  }
+  input[type=number] { width: 84px; text-align: right; }
+  .preview { display: flex; gap: 14px; font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); }
+  .preview b { color: var(--ink); font-weight: 600; }
+  .preview .bad { color: var(--danger); }
+  #submit {
+    margin-left: auto; padding: 5px 16px; border-radius: var(--radius); cursor: pointer; font: inherit;
+    border: 1px solid var(--line); background: var(--ink); color: var(--paper);
+  }
+  #submit:disabled { opacity: .35; cursor: not-allowed; }
+  #withdraw {
+    padding: 5px 12px; border-radius: var(--radius); cursor: pointer; font: inherit;
+    border: 1px solid var(--line); background: transparent; color: var(--ink);
+  }
+  .bottom { display: grid; grid-template-columns: minmax(0, 1fr) 300px; border-top: 0; }
+  .bottom > section + section { border-left: 2px solid var(--line); }
+  .bottom h2 { margin: 0; padding: 5px 10px; font-size: 12px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--soft); }
+  .scroll { overflow: auto; max-height: 126px; }
+  .empty { padding: 14px; color: var(--muted); }
+  .close-btn {
+    border: 1px solid var(--line); background: transparent; color: var(--ink); border-radius: 4px;
+    padding: 1px 6px; cursor: pointer; font: inherit; font-size: 12px;
+  }
+  .banner {
+    position: absolute; inset: 52px 0 auto 0; padding: 8px 14px; background: #fdf1c8;
+    border-bottom: 1px solid var(--line); font-size: 12px;
+  }
+  #toast {
+    position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+    background: var(--ink); color: var(--paper); padding: 5px 12px; border-radius: var(--radius);
+    font-size: 12px; opacity: 0; transition: opacity .15s; pointer-events: none; max-width: 560px;
+  }
+  #toast.show { opacity: .95; }
+  .mono { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="brand">期货</span>
+    <span class="week" id="week">—</span>
+    <div class="stats">
+      <span>可用 <b id="balance">—</b></span>
+      <span>占用 <b id="marginUsed">—</b></span>
+      <span>权益 <b id="equity">—</b></span>
+      <span>本周 <b id="weekPnl">—</b></span>
+    </div>
+    <span class="count">本根 <b id="countdown">—</b></span>
+  </header>
+
+  <section class="quotes">
+    <table>
+      <thead>
+        <tr><th>作物 · 合约</th><th>买一</th><th>卖一</th><th>价差</th><th>偏离指数</th><th>点差</th></tr>
+      </thead>
+      <tbody id="quotes"></tbody>
+    </table>
+    <div class="empty" id="quotesEmpty" hidden>周末休市，下周一 00:00 开新一周的合约。</div>
+  </section>
+
+  <section class="order">
+    <div class="row">
+      <div class="seg" id="side">
+        <button type="button" data-side="long" class="on">做多</button>
+        <button type="button" data-side="short">做空</button>
+      </div>
+      <select id="crop" aria-label="作物"></select>
+      <div class="seg" id="leverage"></div>
+      <label>保证金 <input id="margin" type="number" min="1" step="1" value="50"></label>
+      <button type="button" id="withdraw">提现</button>
+      <button type="button" id="submit">下单</button>
+    </div>
+    <div class="row preview">
+      <span>一手 <b id="pLots">—</b> 张</span>
+      <span>名义 <b id="pNotional">—</b></span>
+      <span>保证金 <b id="pMargin">—</b></span>
+      <span>手续费 <b id="pFee">—</b></span>
+      <span>强平价 <b id="pLiquidation">—</b></span>
+      <span class="bad" id="pReason"></span>
+    </div>
+  </section>
+
+  <div class="bottom">
+    <section>
+      <h2>持仓</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>合约</th><th>方向</th><th>张</th><th>入场</th><th>保证金</th><th>强平</th><th>浮盈亏</th><th></th></tr></thead>
+          <tbody id="positions"></tbody>
+        </table>
+        <div class="empty" id="positionsEmpty">没有持仓。上面选个作物，下单。</div>
+      </div>
+    </section>
+    <section>
+      <h2>最近成交</h2>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>时间</th><th>合约</th><th>方向</th><th>价格</th><th>张</th><th>费</th></tr></thead>
+          <tbody id="trades"></tbody>
+        </table>
+        <div class="empty" id="tradesEmpty">还没有成交。</div>
+      </div>
+    </section>
+  </div>
+</div>
+<div id="toast"></div>
+<script src="futures-view.js"></script>
+<script src="futures.js"></script>
+</body>
+</html>

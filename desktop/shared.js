@@ -89,7 +89,7 @@
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
   // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'home', 'reload', 'scan-skins']
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'futures', 'home', 'reload', 'scan-skins']
   /**
    * 右键工具项 → 宿主动作申请（评审 P2）：渲染端以前用一条 `id === 'reload' || …` 的
    * 手写链，多一个工具就要改两处。现在只有这一张表，`runMenuTool` 直接查它。
@@ -101,6 +101,7 @@
     bring: 'bring',
     farm: 'farm-open',
     trading: 'trading-open',
+    futures: 'futures-window',
     reload: 'reload',
     'scan-skins': 'scan-skins'
   })
@@ -359,13 +360,38 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     // 票 52/53：右键邻居看田、从看田窗派它去偷（都只带 deviceId）。
     'farm-look', 'farm-raid',
     // 票 79：右键「盘口」只发一个空动作，开/关与整份视图都在宿主。
-    ...BOARD_OPEN_ACTIONS
+    ...BOARD_OPEN_ACTIONS,
+    // 票 93：右键「期货」同理——空动作，宿主开窗并推整份视图。
+    'futures-window'
   ]
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
   const SKIN_ID_RE = /^[A-Za-z0-9_-]{1,32}$/
   /** helper → 宿主能报的全部动作：控件 + 菜单 + 盘口小窗的提交（三条不同的 IPC 入口）。 */
-  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS)
+  /**
+   * 期货小窗的提交白名单（票 93）：和盘口同一套纪律——窗口只报意图，
+   * 价格、张数、成交价、余额全由宿主算。`futures-refresh` 是倒计时归零时
+   * 请宿主结这一根并重推一拍，不带字段。
+   */
+  const FUTURES_SUBMIT_ACTIONS = [
+    'futures-deposit',
+    'futures-withdraw',
+    'futures-open',
+    'futures-close',
+    'futures-refresh'
+  ]
+  /**
+   * 期货杠杆白名单（票 93）：1×/3×/10×/20×，与 `src/futures-rules.js` 的
+   * `FUTURES_LEVERAGES` 同值；`test/futures-window.test.js` 有 drift 断言。
+   */
+  const FUTURES_LEVERAGES = [1, 3, 10, 20]
+  /** 保证金形状上限：与宿主的 `MAX_MARGIN` 同值（整数币，1..1,000,000）。 */
+  const FUTURES_MAX_MARGIN = 1000000
+  /** `/state` 与窗口最多画多少手/多少笔：与账本的视图上限同值。 */
+  const FUTURES_MAX_POSITIONS = 20
+  const FUTURES_MAX_TRADES = 20
+
+  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS, FUTURES_SUBMIT_ACTIONS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
   const MAX_ACTION_TEXT = 64
   /**
@@ -2305,6 +2331,124 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { action, side, margin, leverage, cropId }
   }
 
+  /**
+   * 期货小窗（票 93）的视图：宿主算好整份推过来，窗口只画。
+   * 这一层只守形状与体量（数组截断、数字归一），不算任何钱。
+   */
+  function normalizeFuturesView (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const num = (value, fallback = null) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
+    const text = (value) => (typeof value === 'string' ? value.slice(0, 64) : null)
+
+    const quotes = {}
+    if (raw.quotes !== null && typeof raw.quotes === 'object' && !Array.isArray(raw.quotes)) {
+      for (const [cropId, quote] of Object.entries(raw.quotes)) {
+        if (Object.keys(quotes).length >= BOARD_MAX_LIMITS) break
+        if (quote === null || typeof quote !== 'object' || Array.isArray(quote)) continue
+        const contract = quote.contract !== null && typeof quote.contract === 'object'
+          ? { id: text(quote.contract.id) ?? '', openAt: num(quote.contract.openAt, 0), expireAt: num(quote.contract.expireAt, 0) }
+          : null
+        quotes[cropId] = { contract, fair: num(quote.fair), bid: num(quote.bid), ask: num(quote.ask) }
+      }
+    }
+
+    const positions = Array.isArray(raw.positions)
+      ? raw.positions.slice(0, FUTURES_MAX_POSITIONS).filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item)).map((item) => ({
+        id: text(item.id),
+        crop: text(item.crop),
+        contract: text(item.contract) ?? '—',
+        side: item.side === 'short' ? 'short' : 'long',
+        lots: num(item.lots, 0),
+        entry: num(item.entry, 0),
+        margin: num(item.margin, 0),
+        leverage: num(item.leverage, 1),
+        unrealized: num(item.unrealized, 0)
+      }))
+      : []
+
+    const trades = Array.isArray(raw.trades)
+      ? raw.trades.slice(0, FUTURES_MAX_TRADES).filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item)).map((item) => ({
+        at: num(item.at, 0),
+        crop: text(item.crop),
+        contract: text(item.contract) ?? '—',
+        side: item.side === 'short' ? 'short' : 'long',
+        lots: num(item.lots, 0),
+        price: num(item.price, 0),
+        fee: num(item.fee, 0),
+        kind: item.kind === 'close' ? 'close' : 'open'
+      }))
+      : []
+
+    const crops = Array.isArray(raw.crops)
+      ? raw.crops.slice(0, BOARD_MAX_LIMITS).filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item)).map((item) => ({
+        id: text(item.id) ?? '',
+        label: text(item.label) ?? text(item.id) ?? '',
+        index: num(item.index)
+      }))
+      : []
+
+    const limitsRaw = raw.limits !== null && typeof raw.limits === 'object' ? raw.limits : {}
+    const leverages = Array.isArray(limitsRaw.leverages)
+      ? limitsRaw.leverages.filter((item) => FUTURES_LEVERAGES.includes(item)).slice(0, FUTURES_LEVERAGES.length)
+      : FUTURES_LEVERAGES.slice()
+
+    return {
+      ready: raw.ready === true,
+      epoch: text(raw.epoch) ?? '',
+      balance: num(raw.balance, 0),
+      marginUsed: num(raw.marginUsed, 0),
+      equity: num(raw.equity, 0),
+      closed: num(raw.closed, 0),
+      positionCount: num(raw.positionCount, positions.length),
+      positions,
+      trades,
+      week: raw.week !== null && typeof raw.week === 'object'
+        ? { start: num(raw.week.start, 0), pnl: num(raw.week.pnl, 0) }
+        : { start: 0, pnl: 0 },
+      quotes,
+      crops,
+      limits: {
+        leverages: leverages.length > 0 ? leverages : FUTURES_LEVERAGES.slice(),
+        lotSize: num(limitsRaw.lotSize, 100),
+        takerFeeRate: num(limitsRaw.takerFeeRate, 0.001),
+        spreadRate: num(limitsRaw.spreadRate, 0.002)
+      },
+      now: num(raw.now, 0),
+      slotEnd: num(raw.slotEnd, 0)
+    }
+  }
+
+  /** `futures-window` 命令：与盘口同形——`open:true` 打开/聚焦，`open:false` 刷新，`close:true` 关窗。 */
+  function normalizeFuturesWindow (raw) {
+    return {
+      open: raw.open === true,
+      ...(raw.close === true ? { close: true } : {}),
+      state: normalizeFuturesView(raw.state)
+    }
+  }
+
+  /** 期货小窗提交（`dsh-zoo:futures-submit`）的白名单：坏形状整条拒绝。 */
+  function normalizeFuturesAction (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+    if (!FUTURES_SUBMIT_ACTIONS.includes(action)) return null
+    if (action === 'futures-refresh') return { action }
+    if (action === 'futures-deposit' || action === 'futures-withdraw') {
+      const coins = strictBoardInt(raw.coins, 1, MAX_FARM_COINS)
+      return coins === null ? null : { action, coins }
+    }
+    if (action === 'futures-close') {
+      const positionId = normalizeUuid(raw.positionId)
+      return positionId === null ? null : { action, positionId }
+    }
+    const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+    const margin = strictBoardInt(raw.margin, 1, FUTURES_MAX_MARGIN)
+    const leverage = FUTURES_LEVERAGES.includes(raw.leverage) ? raw.leverage : null
+    const cropId = normalizeBoardCropId(raw.cropId)
+    if (side === null || margin === null || leverage === null || cropId === null) return null
+    return { action, side, margin, leverage, cropId }
+  }
+
   /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
   /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
@@ -2377,6 +2521,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (action === 'farm-refresh' || action === 'farm-own') return { action }
     // 票 79：农场窗的「盘口」按钮只是开窗申请，不带字段。
     if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
+    // 票 93：右键「期货」与农场窗的「期货」按钮同样是开窗申请。
+    if (action === 'futures-window') return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
     if (action === 'farm-unlock') {
       if (raw.expectedUnlocked === undefined || raw.expectedUnlocked === null) return { action }
@@ -3597,6 +3743,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
        */
       case 'board-window':
         return { ok: true, command: { type, id, ...normalizeBoardWindow(raw) } }
+      /**
+       * 期货小窗（票 93）：与盘口同形——`open:true` 打开/聚焦，`open:false` 只刷新，
+       * `close:true` 才是关窗。
+       */
+      case 'futures-window':
+        return { ok: true, command: { type, id, ...normalizeFuturesWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
@@ -3607,7 +3759,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
             ? 'farm'
             : raw.window === 'board'
               ? 'board'
-              : null
+              : raw.window === 'futures'
+                ? 'futures'
+                : null
         return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
@@ -3789,6 +3943,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       boardOpen: raw.boardOpen === true,
       boardVisible: raw.boardVisible === true,
       boardFocused: raw.boardFocused === true,
+      // 票 93：期货小窗同一套三个数。
+      futuresOpen: raw.futuresOpen === true,
+      futuresVisible: raw.futuresVisible === true,
+      futuresFocused: raw.futuresFocused === true,
       alwaysOnTop: raw.alwaysOnTop === true,
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
@@ -3949,6 +4107,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       case 'board-window-state':
         // 票 79：盘口小窗同一套语义——×/Esc 关窗后，右键「盘口」必须能重新打开。
         return { ok: true, event: { type, id, open: raw.open === true } }
+      case 'futures-window-state':
+        // 票 93：期货小窗同理——关窗后右键「期货」必须能重新打开。
+        return { ok: true, event: { type, id, open: raw.open === true } }
       case 'action': {
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
         if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
@@ -3986,6 +4147,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         if (BOARD_SUBMIT_ACTIONS.includes(action)) {
           const normalized = normalizeBoardAction(raw)
           if (normalized === null) return { ok: false, error: 'bad-board-action' }
+          return { ok: true, event: { type, id, ...normalized } }
+        }
+        // 期货小窗（票 93）：同一份白名单校验，落到农场窄口会把 side/margin/leverage 削掉。
+        if (FUTURES_SUBMIT_ACTIONS.includes(action)) {
+          const normalized = normalizeFuturesAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-futures-action' }
           return { ok: true, event: { type, id, ...normalized } }
         }
         // 雇佣（ticket 44）：四个动作的字段与窗口提交共用同一条白名单。
@@ -4557,6 +4724,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     normalizeBoardWindow,
     normalizeBoardView,
     normalizeBoardAction,
+    normalizeFuturesAction,
+    normalizeFuturesWindow,
+    normalizeFuturesView,
+    FUTURES_SUBMIT_ACTIONS,
+    FUTURES_LEVERAGES,
     normalizeSeason,
     applyCropCatalog,
     normalizeFarmAction,

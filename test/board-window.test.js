@@ -1635,8 +1635,9 @@ test('评审 P1：shot 命令支持盘口窗（关着回 not-ready，不误拍�
   // 且命令分支把它和 bring/farm 放在同一组（关窗走统一的 not-ready）。
   const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
   assert.match(main, /command\.window === 'board'/)
-  assert.match(main, /target === 'board' \? boardWin/)
-  assert.match(main, /command\.window === 'bring' \|\| command\.window === 'farm' \|\| command\.window === 'board'/)
+  // 票 93 起 target 链上多了期货那一档，盘口仍然是 `board` → boardWin。
+  assert.match(main, /command\.window === 'board' \? boardWin : futuresWin/)
+  assert.match(main, /command\.window === 'board' \|\| command\.window === 'futures'/)
 })
 
 test('票 85：盘口窗可拖动，位置记在 userData/board-window.json（静态窄口）', async () => {

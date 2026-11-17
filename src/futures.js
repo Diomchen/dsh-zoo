@@ -13,6 +13,11 @@
  *         "lots": 2, "entry": 5.05, "margin": 101, "leverage": 10,
  *         "openedAt": 1763308800000, "slot": 1959232, "settleSlot": 1959233 }
  *     ],
+ *     "trades": [                              // 成交记录，最新在前，硬截 50 条（票 93）
+ *       { "at": 1763308800000, "crop": "tomato", "contract": "tomato-2026W47",
+ *         "side": "long", "lots": 2, "price": 5.05, "fee": 1.01, "kind": "open" }
+ *     ],
+ *     "week": { "start": 1763251200000, "pnl": 12.5 },  // 本周已实现盈亏（票 93 顶部展示）
  *     "closed": 0,                             // 平掉/交割的累计笔数（只用于展示）
  *     "tradedAt": 0                            // 最后一笔动钱的时刻
  *   }
@@ -59,6 +64,7 @@ import {
   pnlOf,
   quotesOf,
   roundCoin,
+  startOfWeek,
   takerFeeOf
 } from './futures-rules.js'
 
@@ -66,6 +72,9 @@ export const FUTURES_FILE = 'futures.json'
 export const FUTURES_VERSION = 1
 /** `/state` 最多带 20 个仓位；账本本身不设上限（一周最多几十手）。 */
 export const FUTURES_VIEW_POSITIONS = 20
+/** 盘上最多留 50 条成交；`/state` 与窗口只带最近 20 条（票 93 的「成交记录」）。 */
+export const FUTURES_TRADE_LIMIT = 50
+export const FUTURES_VIEW_TRADES = 20
 
 const MAX_ID_LENGTH = 64
 const MAX_QUANTITY = 1_000_000
@@ -103,6 +112,8 @@ export function initialFuturesState () {
     marginUsed: 0,
     fees: { insurance: 0, burned: 0 },
     positions: [],
+    trades: [],
+    week: { start: 0, pnl: 0 },
     closed: 0,
     tradedAt: 0
   }
@@ -122,6 +133,8 @@ export function initialFuturesView () {
     closed: 0,
     positionCount: 0,
     positions: [],
+    trades: [],
+    week: { start: 0, pnl: 0 },
     quotes: {}
   }
 }
@@ -143,6 +156,22 @@ function normalizePosition (raw) {
   if (lots === null || entry === null || entry <= 0 || margin === null || leverage === null) return null
   if (openedAt === null || openedAt <= 0 || slot === null || settleSlot === null) return null
   return { id, crop, contract: contract.id, side, lots, entry, margin, leverage, openedAt, slot, settleSlot }
+}
+
+/** 一条成交记录：坏记录整条丢掉，不修补（它只是展示用的流水）。 */
+function normalizeTrade (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const at = finiteNumber(raw.at)
+  const crop = isCropId(raw.crop) ? raw.crop : null
+  const contract = contractWindowOf(raw.contract)
+  const side = isFuturesSide(raw.side) ? raw.side : null
+  const lots = positiveInt(raw.lots, MAX_QUANTITY)
+  const price = finiteNumber(raw.price)
+  const fee = nonNegativeCoin(raw.fee)
+  const kind = raw.kind === 'close' ? 'close' : raw.kind === 'open' ? 'open' : null
+  if (at === null || at <= 0 || crop === null || contract === null || side === null) return null
+  if (lots === null || price === null || price <= 0 || fee === null || kind === null) return null
+  return { at, crop, contract: contract.id, side, lots, price, fee, kind }
 }
 
 /**
@@ -184,6 +213,31 @@ export function normalizeFuturesFile (value) {
   if (tradedAt === null || tradedAt < 0) repaired += 1
   else state.tradedAt = tradedAt
 
+  // 成交流水只是展示：坏记录逐条丢，不影响账。
+  if (Array.isArray(value.trades)) {
+    for (const raw of value.trades) {
+      const trade = normalizeTrade(raw)
+      if (trade === null) {
+        repaired += 1
+        continue
+      }
+      if (state.trades.length >= FUTURES_TRADE_LIMIT) break
+      state.trades.push(trade)
+    }
+  } else if (value.trades !== undefined) {
+    repaired += 1
+  }
+
+  // 本周盈亏（票 93）：`start` 是那一周的周一 00:00，`pnl` 可正可负。
+  if (value.week !== null && typeof value.week === 'object' && !Array.isArray(value.week)) {
+    const start = finiteNumber(value.week.start)
+    const pnl = finiteNumber(value.week.pnl)
+    if (start === null || start < 0 || pnl === null) repaired += 1
+    else state.week = { start, pnl: roundCoin(pnl) }
+  } else if (value.week !== undefined) {
+    repaired += 1
+  }
+
   if (value.positions !== undefined) {
     if (!Array.isArray(value.positions)) {
       repaired += 1
@@ -220,6 +274,8 @@ function toFileState (state) {
     marginUsed: roundCoin(state.marginUsed),
     fees: { insurance: roundCoin(state.fees.insurance), burned: roundCoin(state.fees.burned) },
     positions: state.positions.map((position) => ({ ...position })),
+    trades: state.trades.map((trade) => ({ ...trade })),
+    week: { start: state.week.start, pnl: roundCoin(state.week.pnl) },
     closed: state.closed,
     tradedAt: state.tradedAt
   }
@@ -317,7 +373,7 @@ class FuturesStore {
   }
 
   /** 只读快照：调用方随便改返回值，改不到账本。 */
-  snapshot ({ at = this.#nowMs(), positionLimit = FUTURES_VIEW_POSITIONS } = {}) {
+  snapshot ({ at = this.#nowMs(), positionLimit = FUTURES_VIEW_POSITIONS, tradeLimit = FUTURES_VIEW_TRADES } = {}) {
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const quotes = {}
     for (const cropId of CROP_IDS) {
@@ -338,7 +394,10 @@ class FuturesStore {
       closed: this.#state.closed,
       positionCount: this.#state.positions.length,
       positions,
-      quotes
+      trades: this.#state.trades.slice(0, Math.max(0, Number(tradeLimit) || 0)).map((trade) => ({ ...trade })),
+      week: { start: this.#weekStartOf(stamp), pnl: this.#weekPnl(stamp) },
+      quotes,
+      now: stamp
     }
   }
 
@@ -431,6 +490,7 @@ class FuturesStore {
     this.#state.positions.push(position)
     this.#state.tradedAt = stamp
     this.#chargeFee(fee)
+    this.#recordTrade({ at: stamp, crop, contract: quote.contract.id, side, lots, price, fee, kind: 'open' })
     const persisted = await this.#persist()
     return {
       ok: true,
@@ -463,6 +523,18 @@ class FuturesStore {
     this.#state.balance = roundCoin(this.#state.balance + credit)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
+    this.#bookPnl(pnl, stamp)
+    // 平仓是反向的一笔成交：方向反过来记，手续费只有开仓那一下收（交割费由票 96 加）。
+    this.#recordTrade({
+      at: stamp,
+      crop: position.crop,
+      contract: position.contract,
+      side: position.side === 'long' ? 'short' : 'long',
+      lots: position.lots,
+      price: exit,
+      fee: 0,
+      kind: 'close'
+    })
     const persisted = await this.#persist()
     return {
       ok: true,
@@ -505,6 +577,8 @@ class FuturesStore {
         this.#state.positions.splice(i, 1)
         this.#state.marginUsed = this.#recomputeMarginUsed()
         this.#state.closed += 1
+        // 本周盈亏记「整块保证金」（钱在开仓时就已经划走了，这里记的是它的去向）。
+        this.#bookPnl(roundCoin(-position.margin), priceAt)
         settled.push({
           position: { ...position },
           price,
@@ -519,6 +593,7 @@ class FuturesStore {
       position.entry = price
       position.settleSlot = this.#slotOf(priceAt) + 1
       this.#state.tradedAt = priceAt
+      this.#bookPnl(pnl, priceAt)
       settled.push({
         position: { ...position },
         price,
@@ -545,6 +620,29 @@ class FuturesStore {
     let sum = 0
     for (const position of this.#state.positions) sum = roundCoin(sum + position.margin)
     return sum
+  }
+
+  #weekStartOf (at) {
+    const start = startOfWeek(at)
+    return Number.isFinite(start) ? start : 0
+  }
+
+  /** 本周已实现盈亏：跨周之后旧数字不算数（读的时候不写账，等下一笔成交再滚）。 */
+  #weekPnl (at) {
+    if (this.#state.week.start !== this.#weekStartOf(at)) return 0
+    return roundCoin(this.#state.week.pnl)
+  }
+
+  #bookPnl (pnl, at) {
+    const start = this.#weekStartOf(at)
+    if (this.#state.week.start !== start) this.#state.week = { start, pnl: 0 }
+    this.#state.week.pnl = roundCoin(this.#state.week.pnl + pnl)
+  }
+
+  /** 成交流水：最新在前，硬截 50 条（盘上不留无限增长的账）。 */
+  #recordTrade (trade) {
+    this.#state.trades.unshift(trade)
+    if (this.#state.trades.length > FUTURES_TRADE_LIMIT) this.#state.trades.length = FUTURES_TRADE_LIMIT
   }
 
   #chargeFee (fee) {
