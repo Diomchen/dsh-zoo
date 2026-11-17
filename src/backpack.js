@@ -70,6 +70,9 @@ export function giftNameFromPath (filePath) {
  */
 export function normalizePacketNote (value) {
   if (value === undefined || value === null) return ''
+  // 祝福语是选填的：sanitizeNote 把空串判成 null（字条需要非空），
+  // 但红包允许不写，所以空白要先归一成「没写」，否则整只红包会被拒。
+  if (typeof value === 'string' && value.trim() === '') return ''
   const text = sanitizeNote(value)
   if (text === null) return null
   return [...text].length > PACKET_LIMITS.maxNoteChars ? null : text
@@ -222,6 +225,35 @@ function copyItem (item) {
     return copy
   }
   return { id: item.id, kind: 'text', text: item.text, at: item.at, state: item.state }
+}
+
+/**
+ * 落盘用的形状：**按 kind 分开写**，不能拿 text 分支兜底。
+ *
+ * 红包没有 `text` 字段，早先这里只分了 file / 其它，结果红包被写成
+ * `{kind:'text', text:undefined}`：内容整包丢掉，重启后 normalizeBackpackItem
+ * 又因为缺 text 把它判成坏件——东西已经扣了钱，却从背包里蒸发。
+ */
+function serializeItem (item) {
+  const trail = { at: item.at, state: item.state, ...(item.state === 'out' ? { visitId: item.visitId } : {}) }
+  if (item.kind === 'file') {
+    return { id: item.id, kind: 'file', path: item.path, name: item.name, ...trail }
+  }
+  if (item.kind === 'packet') {
+    const out = {
+      id: item.id,
+      kind: 'packet',
+      packet: {
+        coins: item.packet.coins,
+        crops: { ...item.packet.crops },
+        seeds: { ...item.packet.seeds }
+      },
+      ...trail
+    }
+    if (item.note !== undefined) out.note = item.note
+    return out
+  }
+  return { id: item.id, kind: 'text', text: item.text, ...trail }
 }
 
 function errorName (error) {
@@ -559,9 +591,7 @@ class BackpackStore {
       await mkdir(this.#dir, { recursive: true, mode: 0o700 })
       const body = JSON.stringify({
         version: BACKPACK_VERSION,
-        items: this.#items.map((item) => item.kind === 'file'
-          ? { id: item.id, kind: 'file', path: item.path, name: item.name, at: item.at, state: item.state, ...(item.state === 'out' ? { visitId: item.visitId } : {}) }
-          : { id: item.id, kind: 'text', text: item.text, at: item.at, state: item.state, ...(item.state === 'out' ? { visitId: item.visitId } : {}) })
+        items: this.#items.map(serializeItem)
       }, null, 2) + '\n'
       await writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 })
       // 同目录 rename 是原子的：不会留下半个背包文件，也不会读到写了一半的 JSON。

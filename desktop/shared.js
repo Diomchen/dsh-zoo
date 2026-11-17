@@ -129,6 +129,7 @@
    * 过期 = 渲染端卡死/失联 → 没有命中区、没有租约，整窗回到穿透（fail-closed）。
    */
   const RENDERER_RECT_MAX_AGE_MS = 900
+const OVERLAY_RECT_MAX_AGE_MS = 3000
   /** 场景刚更新、渲染端还没上报矩形时的兜底：只用出生矩形，最多这么久。 */
   const SCENE_RECT_FALLBACK_MS = 800
   /** 拖拽/弹层输入租约：渲染端每 BUSY_HEARTBEAT_MS 续一次，主进程超过 BUSY_LEASE_MS 没收到就释放。 */
@@ -766,6 +767,9 @@
   /** 红包的祝福语：和字条共用清洗，但上限只有 60 个字。 */
   function normalizePacketNote (value) {
     if (value === undefined || value === null) return ''
+    // 祝福语是选填的：字条那边空文本算非法，红包这边空白要当「没写」。
+    // 否则用户不写祝福语时 normalizeNoteText 返回 null，整只红包被判成坏礼物。
+    if (typeof value === 'string' && value.trim() === '') return ''
     const text = normalizeNoteText(value, MAX_PACKET_NOTE)
     return text === null ? null : text
   }
@@ -4484,6 +4488,7 @@
     POINTER_POLL_MS,
     MAIN_FALLBACK_DWELL_MS,
     RENDERER_RECT_MAX_AGE_MS,
+    OVERLAY_RECT_MAX_AGE_MS,
     SCENE_RECT_FALLBACK_MS,
     BUSY_HEARTBEAT_MS,
     BUSY_LEASE_MS,

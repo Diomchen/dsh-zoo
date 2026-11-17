@@ -107,6 +107,22 @@ contextBridge.exposeInMainWorld('dshZooDesktop', {
     ipcRenderer.on('dsh-zoo:action-result', listener)
     return () => ipcRenderer.removeListener('dsh-zoo:action-result', listener)
   },
+  /**
+   * 探针（票 92）：主进程发现矩形长时间没更新时敲一下，渲染端立刻全量重报一次。
+   * 长时间运行后 rAF 被系统降频/停掉时，只靠逐帧上报会彻底失联，窗口再也点不动。
+   */
+  onProbe (handler) {
+    if (typeof handler !== 'function') return () => {}
+    const listener = () => {
+      try {
+        handler()
+      } catch {
+        // 探针失败不抛给主进程：下一次心跳还会再敲
+      }
+    }
+    ipcRenderer.on('dsh-zoo:probe', listener)
+    return () => ipcRenderer.removeListener('dsh-zoo:probe', listener)
+  },
   onScene (handler) {
     if (typeof handler !== 'function') return () => {}
     const listener = (_event, scene) => {
