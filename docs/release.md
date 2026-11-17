@@ -11,6 +11,21 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.7.1 版本记录
+
+GitHub Release 正文就是 [`releases/1.7.1.md`](releases/1.7.1.md)。
+
+修「农场窗点了开不出来、得重启插件」：helper 换代（崩溃/被重启/重载）时宿主没清
+`farmWindowOpen`，新 helper 手里没有窗却也不会主动上报「关着」，于是宿主一直以为窗开着，
+每次点「农场」都走关窗分支。现在宿主在拉起/退出/报错/ready 四个点清零窗口状态，
+`status().farmOpen` 以 helper ready 为前提；helper 侧窗口被藏起来时会先 `show()`，
+「开着」也改成按 `isVisible()` 判断并随 `show`/`hide` 回报。存档与协议不变。
+
+## 1.7.0 版本记录
+
+GitHub Release 正文见 [`releases/1.7.0.md`](releases/1.7.0.md)：盘口上线（15 分钟一根的
+合约、K 线与下单横条、持仓与结算、黑白模式），农场窗顶部新增「盘口」入口。
+
 ## 1.6.8 版本记录
 
 GitHub Release 正文就是 [`releases/1.6.8.md`](releases/1.6.8.md)。
