@@ -11,6 +11,15 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.7.2 版本记录
+
+GitHub Release 正文就是 [`releases/1.7.2.md`](releases/1.7.2.md)。
+
+修三件「跑久了 / 换版本就坏」的事：入口点击在长时间运行后失效（补「丢 down」兜底 click、
+弹层矩形 3s 过期 + 500ms 心跳、矩形看门狗、hit 事件按目标变化重发）；红包寄不出去与重启丢件
+（`bring` 回执补 `item`、背包按 `kind` 落盘、空白祝福语视为没写）；红包发给老版本会静默蒸发
+（`CAPS` 新增 `packet`，对方没声明就把红包留在背包、只去串门）。协议没有新增包类型。
+
 ## 1.7.1 版本记录
 
 GitHub Release 正文就是 [`releases/1.7.1.md`](releases/1.7.1.md)。
