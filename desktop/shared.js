@@ -3166,10 +3166,13 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       const width = Number(candidate.width)
       const bottom = Number(candidate.bottom)
       if (![x, width, bottom].every(Number.isFinite) || width <= 0) continue
+      const top = Number(candidate.top)
       bands.push({
         x: clampNumber(x, -MAX_COORD, MAX_COORD),
         width: clampNumber(width, 0.001, MAX_ITEM_SIZE),
-        bottom: clampNumber(bottom, -MAX_COORD, MAX_COORD)
+        bottom: clampNumber(bottom, -MAX_COORD, MAX_COORD),
+        // 票 95：带的上边界（这块屏的顶边）。扔上去撞到屏幕顶就弹回来，不会飞进没有显示器的空区。
+        top: Number.isFinite(top) ? clampNumber(top, -MAX_COORD, MAX_COORD) : null
       })
     }
     return bands
@@ -3181,7 +3184,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
    */
   function walkBands (floors) {
     const entries = normalizeFloors(floors)
-      .map((floor) => ({ left: floor.x, right: floor.x + floor.width, bottom: floor.y + floor.height }))
+      .map((floor) => ({ left: floor.x, right: floor.x + floor.width, top: floor.y, bottom: floor.y + floor.height }))
       .sort((left, right) => (left.bottom - right.bottom) || (left.left - right.left))
     const bands = []
     for (const entry of entries) {
@@ -3193,10 +3196,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         break
       }
       if (band === null) {
-        bands.push({ left: entry.left, right: entry.right, bottom: entry.bottom })
+        bands.push({ left: entry.left, right: entry.right, top: entry.top, bottom: entry.bottom })
       } else {
         band.left = Math.min(band.left, entry.left)
         band.right = Math.max(band.right, entry.right)
+        band.top = Math.min(band.top, entry.top)
       }
     }
     // 合并可能让两条带变得相邻/重叠（≤8 条，直接收敛）。
@@ -3209,13 +3213,14 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
           if (bands[index].left > bands[other].right + 1 || bands[other].left > bands[index].right + 1) continue
           bands[index].left = Math.min(bands[index].left, bands[other].left)
           bands[index].right = Math.max(bands[index].right, bands[other].right)
+          bands[index].top = Math.min(bands[index].top, bands[other].top)
           bands.splice(other, 1)
           merged = true
           break
         }
       }
     }
-    return bands.map((band) => ({ x: band.left, width: band.right - band.left, bottom: band.bottom }))
+    return bands.map((band) => ({ x: band.left, width: band.right - band.left, top: band.top, bottom: band.bottom }))
   }
 
   /**
@@ -3269,7 +3274,15 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       x = Math.max(band.x, band.x + band.width - next.width)
       if (vx > 0) vx = -vx * PHYSICS.WALL_BOUNCE
     }
-    return snapBodyToFloor({ ...next, x, vx }, area, band.bottom)
+    // 票 95：撞到这块屏的顶边就弹回来。整张桌面的上边界在混合 DPI 下可能落在小屏上方
+    // 没有显示器的区域，只按窗口顶夹会让宠物飞到看不见的地方。
+    let y = next.y
+    let vy = next.vy
+    if (isFiniteNumber(band.top) && y < band.top) {
+      y = band.top
+      if (vy < 0) vy = -vy * PHYSICS.WALL_BOUNCE
+    }
+    return snapBodyToFloor({ ...next, x, vx, y, vy }, area, band.bottom)
   }
 
   /** 出生/松手/热插拔：把身体整体挪进一条地面带（x、y 都夹），保证它在可见的屏上。 */
@@ -3278,7 +3291,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     const current = createBody(body, area)
     if (band === null || typeof band !== 'object') return current
     const x = clampNumber(current.x, band.x, Math.max(band.x, band.x + band.width - current.width))
-    return snapBodyToFloor({ ...current, x }, area, band.bottom)
+    // 票 95：高度也夹到这块屏的顶边，扔到屏幕上方空区的宠物落回来时不会悬在那里。
+    const y = isFiniteNumber(band.top) ? Math.max(current.y, band.top) : current.y
+    return snapBodyToFloor({ ...current, x, y }, area, band.bottom)
   }
 
   /**
@@ -3833,6 +3848,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
             pid: Number.isInteger(raw.pid) && raw.pid > 0 ? raw.pid : null,
             workArea,
             displays,
+            // 票 94：混合 DPI 时 helper 已经把「每块屏在窗口 CSS 坐标里的矩形」算好；
+            // 宿主优先用这份，缺了才按 DIP 现算。
+            floors: normalizeFloors(raw.floors),
+            homeArea: normalizeRect(raw.homeArea),
             debug: raw.debug === true,
             shotMode: raw.shotMode === true
           }
@@ -4152,6 +4171,51 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     const area = normalizeRect(bounds)
     if (point === null || area === null) return null
     return { x: point.x - area.x, y: point.y - area.y }
+  }
+
+  /**
+   * 把「每块屏的真实物理工作区」换算成窗口 CSS 坐标里的矩形（票 94）。
+   *
+   * 为什么不能直接用显示器的 DIP 矩形：窗口铺满虚拟桌面时只按**一块**屏的缩放渲染，
+   * 而各显示器在 DIP 空间里的位置是按各自缩放折出来的。两块屏缩放不同（125% + 150%）
+   * 时，`显示器.workArea - 窗口.bounds` 推出来的矩形和渲染端真实的 CSS 区域差一截：
+   * 小屏那块会整体偏到屏幕左上方，宠物走到那块「地」上就出了显示器，抓不回来。
+   *
+   * 这里换成物理坐标做减法：窗口自己的物理矩形（`screen.dipToScreenRect(win, bounds)`）
+   * 和各屏的真实物理工作区（helper 用一次性的小窗口探出来）都在同一个物理空间里，
+   * 除以窗口缩放就是 CSS 坐标。物理矩形缺失时返回空，调用方回退旧算法。
+   *
+   * @param {object} options
+   * @param {{x:number,y:number,width:number,height:number}|null} options.windowPhysical
+   * @param {number} options.windowScale 物理像素 / CSS 像素（= 物理宽 / bounds 宽）
+   * @param {Array<{physicalWorkArea?:object, primary?:boolean}>} options.displays
+   * @param {{x:number,y:number,width:number,height:number}|null} options.area 窗口 CSS 矩形
+   * @returns {{floors:{x:number,y:number,width:number,height:number}[], homeArea:{x:number,y:number,width:number,height:number}|null}}
+   */
+  function floorsFromPhysical (options = {}) {
+    const window = normalizeRect(options.windowPhysical)
+    const scale = Number(options.windowScale)
+    if (window === null || !Number.isFinite(scale) || scale <= 0) return { floors: [], homeArea: null }
+    const surface = normalizeRect(options.area)
+    const floors = []
+    let homeArea = null
+    for (const display of Array.isArray(options.displays) ? options.displays : []) {
+      if (display === null || typeof display !== 'object') continue
+      const physical = normalizeRect(display.physicalWorkArea)
+      if (physical === null) continue
+      const local = normalizeRect({
+        x: (physical.x - window.x) / scale,
+        y: (physical.y - window.y) / scale,
+        width: physical.width / scale,
+        height: physical.height / scale
+      })
+      if (local === null) continue
+      const clipped = surface === null ? local : clipRectToArea(local, surface)
+      if (clipped === null) continue
+      floors.push(clipped)
+      if (display.primary === true && homeArea === null) homeArea = clipped
+    }
+    return { floors, homeArea }
   }
 
   function toScreenPoint (localPoint, bounds) {
@@ -4668,6 +4732,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     normalizeInputReport,
     clipRectToArea,
     desktopArea,
+    floorsFromPhysical,
     normalizeFloors,
     normalizeBands,
     walkBands,

@@ -3421,7 +3421,7 @@
       snapshot: () => ({
         at: round(performance.now()),
         area: { width: area.width, height: area.height },
-        bands: bands.map((band) => ({ x: band.x, width: band.width, bottom: band.bottom })),
+        bands: bands.map((band) => ({ x: band.x, width: band.width, top: band.top, bottom: band.bottom })),
         busy,
         dragging: drag === null ? null : drag.id,
         dragTarget: drag === null ? null : { x: round(drag.target.x), y: round(drag.target.y) },
