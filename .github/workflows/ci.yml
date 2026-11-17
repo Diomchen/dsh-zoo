@@ -139,8 +139,11 @@ jobs:
           version="$(node -p "require('./package.json').version")"
           # tag 可以重推（Release job 支持覆盖），npm 上已有的版本不能再发一次。
           # 判据用「打印出来的版本号正好等于本地版本」，不看退出码：`npm view`
-          # 在版本不存在时会给非零，但空输出却返回 0 的情况也出现过，那会让
-          # 这里误判成「已发布」而静默跳过（v1.9.0 就这么被跳过一次）。
+          # 在版本不存在时会给非零，但空输出 + 0 的情况并不保证不会出现，
+          # 那种情况下「靠退出码判断」会把没发的包当成已发而静默跳过。
+          # 另外 registry 有索引滞后：v1.9.0 是 11:22 发的，11:26 才查得到
+          # （当时被误判成「被跳过」，其实是传播延迟），所以判据只用来跳过，
+          # 不承担「确认发布成功」的职责——发布成功看这一步自己的退出码。
           published="$(npm view "dsh-zoo@${version}" version --registry=https://registry.npmjs.org 2>/dev/null || true)"
           echo "::notice::registry 上的 dsh-zoo@${version} = '${published:-<不存在>}'"
           if [ "$published" = "$version" ]; then
