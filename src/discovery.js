@@ -17,7 +17,8 @@ import {
  *
  * 收到一个合法 beacon 时：
  *   1. 按 deviceId 记住来源地址/服务端口（每次报文都刷新）；
- *   2. 把**白名单后的**报文交给 onPeer（service 再喂给 room）；
+ *   2. 把**白名单后的**报文交给 onPeer（service 再喂给 room），并带上这一包的
+ *      UDP 源 `{ address, port }`（票 94 的期货反冒充要用）；
  *   3. 对来源地址单播一条 beacon-ack（每来源限速，避免回执风暴）。
  *
  * 地址只留在这一层，通过 addressOf(deviceId) 单独取；**绝不进快照**。
@@ -275,11 +276,13 @@ export function createDiscovery ({
     const packet = parsed.packet
     if (identity?.deviceId !== undefined && packet.deviceId === identity.deviceId) return
 
-    // 先记地址：即便 onPeer 把包丢掉（例如邻居表满），后续单播仍然找得到它。
+      // 先记地址：即便 onPeer 把包丢掉（例如邻居表满），后续单播仍然找得到它。
     rememberEndpoint(packet, source, sourcePort)
 
     try {
-      onPeer?.(packet)
+      // 票 94：把这一包的 UDP 源（地址 + 端口）一并交出去——期货房主要靠它把
+      // deviceId 钉在第一次见到的源上，否则「知道 deviceId 就能花别人账户」。
+      onPeer?.(packet, { address: source, port: sourcePort })
     } catch {
       // 回调坏掉不能把 socket 弄崩；下一包还会继续走这里
       warnOnce('on-peer', '邻居报文处理失败，已丢弃')

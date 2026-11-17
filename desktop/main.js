@@ -214,6 +214,22 @@ let boardSeq = 0
 /** 盘口窗拖动后延迟落盘的计时器（ADR-0029：`moved` 连续来，不必每帧写盘）。 */
 let boardPositionTimer = null
 /**
+ * 期货小窗（票 93）。和盘口窗同一类独立窗口：同一套失焦收起、位置记忆、动作等待语义；
+ * 不同的是这里展示的是「周合约 + 房主清算」的期货账本，数据仍全部由宿主算好再下发。
+ */
+let futuresWin = null
+/** 宿主交下来的整份期货视图（报价/持仓/成交/余额/倒计时），打开或刷新时原样转发。 */
+let futuresState = null
+/** 正在等宿主答复的那次期货动作（action id）与它的计时器。 */
+let futuresPending = null
+let futuresTimer = null
+/** 最近一次报给宿主的期货窗开关；只在真的变了时发。 */
+let lastFuturesWindowOpen = null
+/** 期货申请的流水号，只用于给 action id 起个不重复的名字。 */
+let futuresSeq = 0
+/** 期货窗拖动后延迟落盘的计时器。 */
+let futuresPositionTimer = null
+/**
  * 四扇插件窗里正在输入法合成的 webContents id（ADR-0029 / 票 85）。
  * 候选窗抢焦点会触发 blur；只有 compositionstart..compositionend 之间不收起窗口。
  */
@@ -543,6 +559,7 @@ function focusAppForDialog () {
 function pluginWindows () {
   const candidates = [
     { name: 'board', window: boardWin },
+    { name: 'futures', window: futuresWin },
     { name: 'farm', window: farmWin },
     { name: 'gift', window: giftWin },
     { name: 'rename', window: renameWin }
@@ -628,6 +645,7 @@ function closeAllPluginWindows (reason) {
   closeGiftWindow(reason)
   closeFarmWindow(reason)
   closeBoardWindow(reason)
+  closeFuturesWindow(reason)
 }
 
 /** 失焦后只排一次计时器；新的失焦会顶掉旧的，焦点回来就取消。 */
@@ -1608,6 +1626,36 @@ function isBoardSender (event) {
   return boardWin !== null && !boardWin.isDestroyed() && event.sender === boardWin.webContents
 }
 
+// ---------------------------------------------------------------------------
+// 期货小窗的 IPC（票 93）：只认这扇窗自己的 webContents
+// ---------------------------------------------------------------------------
+
+ipcMain.on('dsh-zoo:futures-ready', (event) => {
+  if (!isFuturesSender(event)) return
+  sendFuturesState()
+})
+
+ipcMain.on('dsh-zoo:futures-close', (event) => {
+  if (!isFuturesSender(event)) return
+  closeFuturesWindow('close')
+})
+
+ipcMain.on('dsh-zoo:futures-submit', (event, payload) => {
+  if (!isFuturesSender(event)) return
+  // 同一时间只等一条结果：连点两次时，第二条静默落空——窗口的 pending 也会挡住它。
+  if (futuresPending !== null) return
+  const action = shared.normalizeFuturesAction(payload)
+  if (action === null) {
+    sendFuturesResult({ ok: false, code: 'bad-futures-action' })
+    return
+  }
+  startFuturesPending(action.action, action)
+})
+
+function isFuturesSender (event) {
+  return futuresWin !== null && !futuresWin.isDestroyed() && event.sender === futuresWin.webContents
+}
+
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
@@ -1667,6 +1715,15 @@ const BOARD_HEIGHT = 700
 const BOARD_TIMEOUT_MS = 10000
 /** 拖动结束后 250ms 落盘（ADR-0029）：`moved` 会连续来，不必每帧写盘。 */
 const BOARD_POSITION_SAVE_MS = 250
+
+/**
+ * 期货小窗（票 93）：与盘口同尺寸、同动作等待时长，位置单独存一份。
+ * 760×700 是报价表 + 下单条 + 持仓/成交两列能同时放下、又不会占掉半块屏的最小尺寸。
+ */
+const FUTURES_WIDTH = 760
+const FUTURES_HEIGHT = 700
+const FUTURES_TIMEOUT_MS = 10000
+const FUTURES_POSITION_SAVE_MS = 250
 /**
  * 农场窗默认不置顶；用户可在窗口右上角自己切换，选择记在 userData 下，
  * 下次开窗沿用。桌面宠物本体的置顶是另一扇窗，不受这里影响。
@@ -2461,8 +2518,198 @@ function startBoardPending (action, event) {
   }
 }
 
-function pruneRendererRects () {
-  if (rendererRects.length === 0) return
+/**
+ * 期货窗位置（票 93）：与盘口同一条 `pickBounds`，但存在自己的 `futures-window.json`。
+ * 坏文件或离屏回落到居中；保存点还在某块屏里时夹进那块屏。
+ */
+function futuresBounds () {
+  const area = workArea ?? screen.getPrimaryDisplay().workArea
+  let displays = []
+  try {
+    displays = screen.getAllDisplays().map((display) => display.workArea)
+  } catch {
+    displays = []
+  }
+  return windowBounds.pickBounds({
+    saved: windowBounds.readPosition(futuresPositionFile()),
+    areas: displays,
+    area,
+    width: FUTURES_WIDTH,
+    height: FUTURES_HEIGHT
+  })
+}
+
+function futuresPositionFile () {
+  return path.join(app.getPath('userData'), windowBounds.FUTURES_POSITION_FILE)
+}
+
+function clearFuturesPositionTimer () {
+  if (futuresPositionTimer === null) return
+  clearTimeout(futuresPositionTimer)
+  futuresPositionTimer = null
+}
+
+function saveFuturesPosition (source) {
+  if (source === null || source.isDestroyed()) return
+  let bounds
+  try {
+    bounds = source.getBounds()
+  } catch {
+    return
+  }
+  windowBounds.writePosition(futuresPositionFile(), { x: bounds.x, y: bounds.y })
+}
+
+function scheduleFuturesPositionSave (source) {
+  clearFuturesPositionTimer()
+  futuresPositionTimer = setTimeout(() => {
+    futuresPositionTimer = null
+    saveFuturesPosition(source)
+  }, FUTURES_POSITION_SAVE_MS)
+  futuresPositionTimer.unref?.()
+}
+
+function openFuturesWindow () {
+  if (futuresWin !== null && !futuresWin.isDestroyed()) {
+    futuresWin.focus()
+    // 已经开着：把最新视图推一遍（可能刚在农场窗里开过仓）。
+    sendFuturesState()
+    return true
+  }
+  if (win === null || win.isDestroyed()) return false
+  const created = new BrowserWindow({
+    ...futuresBounds(),
+    width: FUTURES_WIDTH,
+    height: FUTURES_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    alwaysOnTop: false,
+    skipTaskbar: true,
+    hasShadow: true,
+    focusable: true,
+    acceptFirstMouse: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'futures-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      // 倒计时每秒走一格；后台节流会让窗口看起来“卡住”。
+      backgroundThrottling: false,
+      devTools: debugEnabled,
+      spellcheck: false
+    }
+  })
+  futuresWin = created
+  futuresPending = null
+  clearFuturesTimer()
+  notifyFuturesWindowState()
+  created.webContents.once('did-finish-load', sendFuturesState)
+  created.webContents.on('context-menu', (event) => event.preventDefault())
+  created.on('moved', () => scheduleFuturesPositionSave(created))
+  // 和其余插件窗同一条失焦收起规则（ADR-0029），输入法合成期间例外。
+  adoptPluginWindow(created)
+  created.on('closed', () => {
+    if (futuresWin === created) futuresWin = null
+    futuresPending = null
+    clearFuturesTimer()
+    clearFuturesPositionTimer()
+    notifyFuturesWindowState()
+  })
+  created.once('ready-to-show', () => {
+    if (futuresWin !== created || created.isDestroyed()) return
+    created.show()
+    focusAppForDialog()
+    created.focus()
+  })
+  created.loadFile(path.join(__dirname, 'futures.html')).catch(() => closeFuturesWindow('load-failed'))
+  return true
+}
+
+function closeFuturesWindow (reason) {
+  futuresPending = null
+  clearFuturesTimer()
+  clearFuturesPositionTimer()
+  const target = futuresWin
+  futuresWin = null
+  if (target !== null && !target.isDestroyed()) {
+    // 拖完立刻关窗时 250ms 的落盘还没到：先补一次，下次开窗不会回到旧位置。
+    saveFuturesPosition(target)
+    try {
+      target.destroy()
+    } catch {
+      // 已经没了
+    }
+  }
+  notifyFuturesWindowState()
+}
+
+/**
+ * 把期货窗的真实开关报给宿主：×/Esc/宿主 `close:true`/hide/退出都汇到这一条。
+ * 只报变化；宿主据此把右键「期货」做成开/关切换。
+ */
+function notifyFuturesWindowState () {
+  const open = futuresWin !== null && !futuresWin.isDestroyed()
+  if (open === lastFuturesWindowOpen) return
+  lastFuturesWindowOpen = open
+  writeEvent({ type: 'futures-window-state', open })
+}
+
+function clearFuturesTimer () {
+  if (futuresTimer === null) return
+  clearTimeout(futuresTimer)
+  futuresTimer = null
+}
+
+/** 整份期货视图（报价/持仓/成交/余额/倒计时 + 白名单）。 */
+function sendFuturesState () {
+  if (futuresWin === null || futuresWin.isDestroyed()) return
+  try {
+    futuresWin.webContents.send('dsh-zoo:futures-state', futuresState)
+  } catch {
+    // 页面还没挂上：ready 会再来一次
+  }
+}
+
+function sendFuturesResult (result) {
+  if (futuresWin === null || futuresWin.isDestroyed()) return
+  try {
+    futuresWin.webContents.send('dsh-zoo:futures-result', result)
+  } catch {
+    // 窗口刚被关掉：结果没人接就算了
+  }
+}
+
+/**
+ * 把一次充值/提现/开仓/平仓/刷新交给宿主，并等 action-result。
+ * 成功**不关窗**（渲染端 toast 一下继续做）。
+ */
+function startFuturesPending (action, event) {
+  futuresSeq += 1
+  const id = 'futures-' + String(futuresSeq) + '-' + Date.now().toString(36)
+  futuresPending = { id, action }
+  clearFuturesTimer()
+  futuresTimer = setTimeout(() => {
+    if (futuresPending === null || futuresPending.id !== id) return
+    futuresPending = null
+    sendFuturesResult({ ok: false, code: 'timeout' })
+  }, FUTURES_TIMEOUT_MS)
+  futuresTimer.unref?.()
+  const written = writeEvent({ ...event, type: 'action', id })
+  if (!written) {
+    clearFuturesTimer()
+    futuresPending = null
+    sendFuturesResult({ ok: false, code: 'host-unavailable' })
+  }
+}
+
+function pruneRendererRects () {  if (rendererRects.length === 0) return
   const ids = new Set(scene.items.map((item) => item.id))
   const kept = rendererRects.filter((rect) => rect.id === null || ids.has(rect.id))
   if (kept.length !== rendererRects.length) rendererRects = kept
@@ -2632,6 +2879,23 @@ function applyCommand (command) {
         })
         return
       }
+      // 期货小窗（票 93）：同一套按 id 认领；成功后也留在窗里，顺便把新视图推回去。
+      if (futuresPending !== null && command.id === futuresPending.id) {
+        futuresPending = null
+        clearFuturesTimer()
+        sendFuturesResult({
+          ok: command.ok === true,
+          notice: command.notice,
+          code: command.error,
+          action: command.action ?? null,
+          state: command.state ?? null
+        })
+        if (command.state != null) {
+          futuresState = command.state
+          sendFuturesState()
+        }
+        return
+      }
       sendActionResult({
         id: command.id,
         ok: command.ok === true,
@@ -2650,6 +2914,7 @@ function applyCommand (command) {
       closeGiftWindow('hide')
       closeFarmWindow('hide')
       closeBoardWindow('hide')
+      closeFuturesWindow('hide')
       if (win !== null && !win.isDestroyed()) win.hide()
       return
     case 'bring-window': {
@@ -2712,6 +2977,23 @@ function applyCommand (command) {
         }
       } else if (boardWin !== null && !boardWin.isDestroyed()) {
         sendBoardState()
+      }
+      return
+    }
+    case 'futures-window': {
+      // 宿主交下来的整份期货视图（票 93）：不落盘、不拼路径。
+      // `open:true` 打开/聚焦；`open:false` 刷新已开着的窗；`close:true` 才是关窗。
+      if (command.close === true) {
+        closeFuturesWindow('host')
+        return
+      }
+      futuresState = command.state ?? null
+      if (command.open === true) {
+        if (!openFuturesWindow()) {
+          writeEvent({ type: 'error', id: command.id, code: 'futures-window-failed', message: 'cannot open futures window' })
+        }
+      } else if (futuresWin !== null && !futuresWin.isDestroyed()) {
+        sendFuturesState()
       }
       return
     }
@@ -2783,11 +3065,14 @@ function applyCommand (command) {
       return
     }
     case 'shot':
-      // 冒烟可以点名抓「带派」/农场/盘口小窗；主窗没就绪不影响那扇窗的截图。
-      if (command.window === 'bring' || command.window === 'farm' || command.window === 'board') {
+      // 冒烟可以点名抓「带派」/农场/盘口/期货小窗；主窗没就绪不影响那扇窗的截图。
+      if (command.window === 'bring' || command.window === 'farm' ||
+        command.window === 'board' || command.window === 'futures') {
         const target = command.window === 'bring'
           ? giftWin
-          : command.window === 'farm' ? farmWin : boardWin
+          : command.window === 'farm'
+            ? farmWin
+            : command.window === 'board' ? boardWin : futuresWin
         if (target === null || target.isDestroyed()) {
           writeEvent({
             type: 'error',
@@ -3321,6 +3606,10 @@ function statusEvent (id) {
     boardOpen: boardWin !== null && !boardWin.isDestroyed(),
     boardVisible: boardWin !== null && !boardWin.isDestroyed() && boardWin.isVisible(),
     boardFocused: boardWin !== null && !boardWin.isDestroyed() && boardWin.isFocused(),
+    /** 期货小窗（票 93）：同样分开报「开着 / 看得见 / 拿到焦点」。 */
+    futuresOpen: futuresWin !== null && !futuresWin.isDestroyed(),
+    futuresVisible: futuresWin !== null && !futuresWin.isDestroyed() && futuresWin.isVisible(),
+    futuresFocused: futuresWin !== null && !futuresWin.isDestroyed() && futuresWin.isFocused(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
     alwaysOnTop: winFlag((candidate) => candidate.isAlwaysOnTop()),
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
@@ -3423,7 +3712,11 @@ async function captureTo (filePath, id, target = 'main') {
   // `board` 与农场窗同一条路（评审 P1）：盘口开着才能抓，关着由命令分支回 not-ready。
   const window = target === 'bring'
     ? giftWin
-    : target === 'farm' ? farmWin : target === 'board' ? boardWin : win
+    : target === 'farm'
+      ? farmWin
+      : target === 'board'
+        ? boardWin
+        : target === 'futures' ? futuresWin : win
   const image = await capturePage(window)
   if (image === null) {
     writeEvent({ type: 'error', id, code: 'shot-failed', message: 'capturePage failed' })
@@ -3604,6 +3897,7 @@ function shutdown (code) {
   closeGiftWindow('shutdown')
   closeFarmWindow('shutdown')
   closeBoardWindow('shutdown')
+  closeFuturesWindow('shutdown')
   unhookWindowMessages()
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()

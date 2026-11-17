@@ -133,6 +133,8 @@ export function createDesktop (options = {}) {
   let farmWindowOpen = false
   /** 盘口小窗的真实开关状态（票 79）：同一套语义，×/Esc 关窗也会报上来。 */
   let boardWindowOpen = false
+  /** 期货小窗的真实开关状态（票 93）：同上。 */
+  let futuresWindowOpen = false
 
   /**
    * 换了一代 helper（拉起/退出/ready）就把两个"窗开着"的标志清零。
@@ -146,6 +148,7 @@ export function createDesktop (options = {}) {
   function resetWindowState () {
     farmWindowOpen = false
     boardWindowOpen = false
+    futuresWindowOpen = false
   }
 
   let lastError = null
@@ -499,6 +502,8 @@ export function createDesktop (options = {}) {
       farmWindowOpen = event.open === true
     } else if (event.type === 'board-window-state') {
       boardWindowOpen = event.open === true
+    } else if (event.type === 'futures-window-state') {
+      futuresWindowOpen = event.open === true
     } else if (event.type === 'pong') {
       notePong()
     } else if (event.type === 'error') {
@@ -722,6 +727,19 @@ export function createDesktop (options = {}) {
     })
   }
 
+  /**
+   * 期货小窗（票 93）：与 `boardWindow` 同形——`open:true` 打开/聚焦，`open:false` 只刷新，
+   * `close:true` 关窗。整份视图随命令走，窗口拿不到 `/state`。
+   */
+  function futuresWindow (payload = {}) {
+    return sendHostCommand({
+      type: 'futures-window',
+      open: payload?.open === true,
+      ...(payload?.close === true ? { close: true } : {}),
+      state: payload?.state ?? null
+    })
+  }
+
   function show () {
     try {
       return send({ type: 'show' })
@@ -853,6 +871,8 @@ export function createDesktop (options = {}) {
       farmOpen: ready === true && farmWindowOpen === true,
       // 票 79：右键「盘口」同理。
       boardOpen: ready === true && boardWindowOpen === true,
+      // 票 93：期货小窗同理。
+      futuresOpen: ready === true && futuresWindowOpen === true,
       assetRoots: assetRoots.slice(),
       giftsRoot,
       stderr: stderrLines.slice(),
@@ -922,6 +942,7 @@ export function createDesktop (options = {}) {
     bringWindow,
     farmWindow,
     boardWindow,
+    futuresWindow,
     actionResult,
     lastCommandFailure: lastCommandFailureOf,
     shot,

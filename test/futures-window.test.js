@@ -1,0 +1,681 @@
+/**
+ * 票 93：期货小窗（不开 Electron）。
+ *
+ * 覆盖：
+ *   1. 纯视图模型：金额/百分比/倒计时排版，下单预览与 `src/futures-rules.js` 同源
+ *      （张数、保证金、手续费、强平价不 drift），持仓的危险行，四种状态文案；
+ *   2. `desktop/shared.js` 的白名单：期货五个动作只收白名单字段，坏杠杆/非整数保证金
+ *      整条拒；`futures-window` 命令与 `futures-window-state` 事件；
+ *   3. 宿主侧：`futures-window` 开窗下发整份视图；再点一次关窗；用户 × 之后能重开；
+ *      没有桌面层是 `desktop-off`；`futures-refresh` 回一拍新视图；这条命令 < 64 KiB。
+ */
+import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+
+import shared from '../desktop/shared.js'
+import { FARM_FILE } from '../src/farm.js'
+import { createService } from '../src/service.js'
+import {
+  FUTURES_LEVERAGES,
+  LOT_SIZE,
+  MM_SPREAD,
+  SLOT_MS,
+  TAKER_FEE_RATE,
+  lotsFor,
+  marginOf,
+  notionalOf,
+  takerFeeOf
+} from '../src/futures-rules.js'
+
+const require = createRequire(import.meta.url)
+// 渲染页与 Node 测试共用同一份纯视图模型（desktop/ 是 CommonJS）。
+const view = require('../desktop/futures-view.js')
+
+// 2026-11-17 是周二：周合约在 24/7 交易窗内，报价一定存在。
+const TUESDAY = new Date(2026, 10, 17, 10, 0, 0, 0).getTime()
+
+/** 一份最小可用的窗口视图：番茄有报价，其余从略。 */
+function sampleView (overrides = {}) {
+  const price = 5
+  return {
+    ready: true,
+    epoch: 'epoch-1',
+    balance: 300,
+    marginUsed: 25,
+    equity: 305,
+    closed: 2,
+    positionCount: 1,
+    positions: [],
+    trades: [],
+    week: { start: TUESDAY - 9 * 60 * 60 * 1000, pnl: 5 },
+    quotes: {
+      tomato: {
+        contract: { id: 'tomato-2026W47', crop: 'tomato', openAt: TUESDAY, expireAt: TUESDAY + 4 * 86400000 },
+        fair: price,
+        bid: price * (1 - MM_SPREAD),
+        ask: price * (1 + MM_SPREAD)
+      }
+    },
+    crops: [{ id: 'tomato', label: '番茄', index: price, contract: 'tomato-2026W47' }],
+    limits: { leverages: FUTURES_LEVERAGES.slice(), lotSize: LOT_SIZE, takerFeeRate: TAKER_FEE_RATE, spreadRate: MM_SPREAD },
+    now: TUESDAY,
+    slotEnd: TUESDAY + SLOT_MS / 2,
+    ...overrides
+  }
+}
+
+test('视图模型：金额、百分比与倒计时按窗口口径排版', () => {
+  assert.equal(view.formatPrice(12.345), '12.35')
+  assert.equal(view.formatPrice(null), '—')
+  assert.equal(view.formatCoin(-3.5), '−3.50')
+  assert.equal(view.formatCoin(0), '0.00')
+  assert.equal(view.formatPct(0.0123), '+1.23%')
+  assert.equal(view.formatPct(-0.0123), '−1.23%')
+  assert.equal(view.formatPct(null), '—')
+
+  const end = TUESDAY + 90 * 1000
+  const early = view.countdown(end, TUESDAY)
+  assert.equal(early.text, '01:30')
+  assert.equal(early.atEnd, false)
+  const late = view.countdown(end, end)
+  assert.equal(late.text, '00:00')
+  assert.equal(late.atEnd, true)
+  assert.equal(view.slotEndOf({ slotEnd: end }), end)
+  assert.equal(view.slotEndOf({ now: TUESDAY }), Math.floor(TUESDAY / SLOT_MS) * SLOT_MS + SLOT_MS)
+})
+
+test('下单预览与 src/futures-rules.js 同源：张数/保证金/手续费/强平价不 drift', () => {
+  const sample = sampleView()
+  const ask = sample.quotes.tomato.ask
+  for (const side of ['long', 'short']) {
+    for (const leverage of FUTURES_LEVERAGES) {
+      for (const margin of [50, 250, 1000]) {
+        const preview = view.orderPreview(sample, { side, margin, leverage, cropId: 'tomato' })
+        assert.equal(preview.ok, true, side + ' ' + leverage + '× ' + margin)
+        const price = side === 'long' ? ask : sample.quotes.tomato.bid
+        const notional = notionalOf({ lots: 0, price })
+        void notional
+        // 张数：名义 = 保证金 × 杠杆，向下取整，至少一张。
+        const lots = Math.max(1, Math.floor((margin * leverage) / (price * LOT_SIZE)))
+        assert.equal(preview.lots, lots)
+        assert.equal(lotsFor({ notional: margin * leverage, price }), lots)
+        // 保证金与手续费都按「实际张数 × 100 × 价格」重算，并到分。
+        assert.equal(preview.margin, Math.round(marginOf({ lots, price, leverage }) * 100) / 100)
+        assert.equal(preview.fee, Math.round(takerFeeOf(lots * LOT_SIZE * price) * 100) / 100)
+        // 强平价就是「反向走 1/杠杆」。
+        const move = 1 / leverage
+        const liquidation = Math.round((side === 'long' ? price * (1 - move) : price * (1 + move)) * 100) / 100
+        assert.equal(preview.liquidation, liquidation)
+        assert.equal(preview.cost, Math.round((preview.margin + preview.fee) * 100) / 100)
+      }
+    }
+  }
+  // 缺一项就禁用，并给人话。
+  assert.equal(view.orderPreview(sample, { side: null, margin: 50, leverage: 20, cropId: 'tomato' }).reason, '选方向')
+  assert.equal(view.orderPreview(sample, { side: 'long', margin: 0, leverage: 20, cropId: 'tomato' }).reason, '保证金要是整数币')
+  assert.equal(view.orderPreview(sample, { side: 'long', margin: 50, leverage: 5, cropId: 'tomato' }).reason, '选杠杆')
+  assert.equal(view.orderPreview(sample, { side: 'long', margin: 50, leverage: 20, cropId: null }).reason, '选作物')
+  assert.equal(view.orderPreview(sample, { side: 'long', margin: 50, leverage: 20, cropId: 'pea' }).reason, '这张合约现在不能交易')
+})
+
+test('持仓表：浮亏吃到八成保证金就把整行标红', () => {
+  const base = { id: 'p1', crop: 'tomato', contract: 'tomato-2026W47', side: 'long', lots: 1, entry: 5, margin: 25, leverage: 20 }
+  const calm = view.positionRows(sampleView({ positions: [{ ...base, unrealized: -5 }] }))[0]
+  assert.equal(calm.danger, false)
+  assert.equal(calm.liquidation, view.formatPrice(5 * (1 - 1 / 20)))
+  assert.equal(calm.unrealized, '−5.00')
+
+  const red = view.positionRows(sampleView({ positions: [{ ...base, unrealized: -20.5 }] }))[0]
+  assert.equal(red.danger, true)
+  // 空头的强平价在入场价上方。
+  const short = view.positionRows(sampleView({ positions: [{ ...base, side: 'short', unrealized: 1 }] }))[0]
+  assert.equal(short.liquidation, view.formatPrice(5 * (1 + 1 / 20)))
+  assert.equal(short.side, '空')
+})
+
+test('状态四态：没就绪、没充钱、周末收盘、正常', () => {
+  assert.equal(view.statusOf(sampleView({ ready: false })).kind, 'starting')
+  // 票 94：对端没升级时文案要说清楚，不能装作「还没就绪」。
+  const oldPeer = sampleView({ peer: { ready: false, text: '对端未升级，期货不可用。' } })
+  assert.equal(view.statusOf(oldPeer).text, '对端未升级，期货不可用。')
+  assert.equal(view.statusOf(sampleView({ balance: 0, marginUsed: 0, equity: 0, positions: [], trades: [], quotes: {} })).kind, 'no-funds')
+  assert.equal(view.statusOf(sampleView({ quotes: {} })).kind, 'closed')
+  assert.equal(view.statusOf(sampleView()).kind, 'ok')
+
+  const built = view.build(sampleView(), { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }, TUESDAY)
+  assert.equal(built.countdown.atEnd, false)
+  assert.equal(built.canSubmit, true)
+  assert.equal(built.header.balance, '300.00')
+  assert.equal(built.quotes.length, 1)
+  assert.equal(built.quotes[0].tone, 'flat')
+  assert.match(built.title, /期货/)
+  assert.match(built.title, /2026W47/)
+})
+
+test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢', () => {
+  const order = {
+    id: 'order-1',
+    deviceId: 'device-1',
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'long',
+    price: 5.0123,
+    lots: 3,
+    lotsLeft: 2,
+    leverage: 20,
+    marginFrozen: 12.5,
+    at: TUESDAY,
+    secret: '不该过桥'
+  }
+  const good = shared.normalizeFuturesView(sampleView({
+    orders: [order],
+    session: { kind: 'weekend', text: '周末休市，下周一见。' },
+    delivery: { contract: 'tomato-2026W47', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: TUESDAY },
+    insurance: 12.5,
+    shortfall: 3,
+    liquidationCount: 2
+  }))
+  assert.deepEqual(good.orders, [{
+    id: 'order-1',
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'long',
+    price: 5.0123,
+    lots: 3,
+    lotsLeft: 2,
+    leverage: 20,
+    marginFrozen: 12.5,
+    at: TUESDAY
+  }])
+  assert.deepEqual(good.session, { kind: 'weekend', text: '周末休市，下周一见。' })
+  assert.deepEqual(good.delivery, {
+    contract: 'tomato-2026W47',
+    closes: [5.02, 5.01, 5.005, 5.015],
+    price: 5.0125,
+    at: TUESDAY
+  })
+  assert.equal(good.insurance, 12.5)
+  assert.equal(good.shortfall, 3)
+  assert.equal(good.liquidationCount, 2)
+
+  // 坏挂单：缺 id / 方向不明 / 价格非正 / 张数非整数 / 剩余超过张数 / 冻结为负，整条丢。
+  const bad = shared.normalizeFuturesView(sampleView({
+    orders: [
+      { ...order, id: '' },
+      { ...order, side: 'up' },
+      { ...order, price: 0 },
+      { ...order, lots: 1.5 },
+      { ...order, lotsLeft: 4 },
+      { ...order, marginFrozen: -1 }
+    ]
+  }))
+  assert.deepEqual(bad.orders, [])
+
+  // 最多 8 条，多出来的截掉。
+  const many = shared.normalizeFuturesView(sampleView({
+    orders: Array.from({ length: 10 }, (_, index) => ({ ...order, id: 'order-' + index }))
+  }))
+  assert.equal(many.orders.length, 8)
+  assert.equal(many.orders.at(-1).id, 'order-7')
+
+  // 交易阶段的 kind 只认三个值，text 截断到 60 字。
+  assert.equal(shared.normalizeFuturesView(sampleView({ session: { kind: 'holiday', text: '放假' } })).session, null)
+  assert.equal(shared.normalizeFuturesView(sampleView({ session: { kind: 'weekend', text: 7 } })).session.text, '')
+  assert.equal(shared.normalizeFuturesView(sampleView({ session: { kind: 'expired', text: '周'.repeat(80) } })).session.text.length, 60)
+
+  // 交割窗口：closes 只留数字、最多四根；价格非正或合约为空整块丢。
+  const trimmed = shared.normalizeFuturesView(sampleView({
+    delivery: { contract: 'tomato-2026W47', closes: [5.02, 'x', 5.01, 5.015, 5.02, 9], price: 5.0125, at: TUESDAY }
+  }))
+  assert.deepEqual(trimmed.delivery.closes, [5.02, 5.01, 5.015, 5.02])
+  assert.equal(shared.normalizeFuturesView(sampleView({ delivery: { contract: '', closes: [5.02], price: 5 } })).delivery, null)
+  assert.equal(shared.normalizeFuturesView(sampleView({ delivery: { contract: 'x', closes: [5.02], price: 0 } })).delivery, null)
+
+  // 保险基金 / 欠账 / 强平次数：负数与坏值都兜底 0。
+  const zeroed = shared.normalizeFuturesView(sampleView({ insurance: -5, shortfall: 'x', liquidationCount: NaN }))
+  assert.equal(zeroed.insurance, 0)
+  assert.equal(zeroed.shortfall, 0)
+  assert.equal(zeroed.liquidationCount, 0)
+  assert.equal(shared.normalizeFuturesView({}).insurance, 0)
+
+  // 成交类型放行交割/转现货/强平，未知类型仍回落 open。
+  const kinds = shared.normalizeFuturesView(sampleView({
+    trades: ['open', 'close', 'delivery', 'convert', 'liquidation', 'mystery'].map((kind, index) => ({
+      at: TUESDAY,
+      contract: 'tomato-2026W47',
+      side: 'long',
+      lots: 1,
+      price: 5,
+      fee: 0.01,
+      kind,
+      index
+    }))
+  }))
+  assert.deepEqual(kinds.trades.map((trade) => trade.kind), ['open', 'close', 'delivery', 'convert', 'liquidation', 'open'])
+})
+
+test('挂单表：作物名/方向/价格/剩余/冻结按窗口口径排版', () => {
+  const rows = view.orderRows(sampleView({
+    orders: [
+      { id: 'o1', crop: 'tomato', contract: 'tomato-2026W47', side: 'long', price: 5, lots: 5, lotsLeft: 2, leverage: 20, marginFrozen: 12.345, at: TUESDAY },
+      { id: 'o2', crop: 'pea', contract: 'pea-2026W47', side: 'short', price: 3.333, lots: 1, lotsLeft: 0, leverage: 10, marginFrozen: 0, at: TUESDAY }
+    ]
+  }))
+  assert.equal(rows.length, 2)
+  assert.deepEqual(rows[0], {
+    id: 'o1',
+    label: '番茄',
+    side: '多',
+    sideText: '做多',
+    price: '5.00',
+    lots: '5',
+    lotsLeft: '2',
+    marginFrozen: '12.35',
+    at: '10:00'
+  })
+  // 目录里没有的作物退回 crop id；空头说「做空」。
+  assert.equal(rows[1].label, 'pea')
+  assert.equal(rows[1].side, '空')
+  assert.equal(rows[1].sideText, '做空')
+  assert.equal(rows[1].price, '3.33')
+  assert.equal(rows[1].marginFrozen, '0.00')
+  // 缺价或张数不是正数的条目画不出来，跳过。
+  assert.deepEqual(view.orderRows(sampleView({ orders: [{ id: 'o3', side: 'long', lots: 1 }] })), [])
+  assert.deepEqual(view.orderRows(sampleView({ orders: [{ id: 'o4', side: 'long', price: 5, lots: 0 }] })), [])
+})
+
+test('交割提示：四根收盘价带时刻，顺序与交割价可复核', () => {
+  const fridayClose = new Date(2026, 10, 20, 20, 0, 0, 0).getTime()
+  const line = view.deliveryLine(sampleView({
+    delivery: { contract: 'tomato-2026W47', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: fridayClose }
+  }))
+  assert.equal(line, '交割价 5.0125（19:15 5.0200 / 19:30 5.0100 / 19:45 5.0050 / 20:00 5.0150）')
+
+  // 顺序照账本，不排序。
+  const ordered = view.deliveryLine(sampleView({
+    delivery: { contract: 'x', closes: [5.03, 5.01, 5.04, 5.02], price: 5.025, at: fridayClose }
+  }))
+  assert.equal(ordered, '交割价 5.0250（19:15 5.0300 / 19:30 5.0100 / 19:45 5.0400 / 20:00 5.0200）')
+
+  // 四根不齐、价格非正、没有交割窗口都不硬画。
+  assert.equal(view.deliveryLine(sampleView({ delivery: { contract: 'x', closes: [5.02, 5.01, 5.005], price: 5 } })), null)
+  assert.equal(view.deliveryLine(sampleView({ delivery: { contract: 'x', closes: [5.02, 5.01, 5.005, 5.015], price: 0 } })), null)
+  assert.equal(view.deliveryLine(sampleView()), null)
+})
+
+test('交易阶段：交易中不提示，周末/到期贴宿主文案；收盘状态兜底', () => {
+  assert.equal(view.sessionLine(sampleView({ session: { kind: 'trading', text: '交易中' } })), null)
+  assert.equal(view.sessionLine(sampleView({ session: { kind: 'weekend', text: '周末休市，下周一 00:00 开新一周。' } })), '周末休市，下周一 00:00 开新一周。')
+  assert.equal(view.sessionLine(sampleView()), null)
+  assert.equal(view.sessionLine(sampleView({ session: { kind: 'expired', text: '' } })), null)
+
+  const expired = view.statusOf(sampleView({ session: { kind: 'expired', text: '本周合约已到期，等交割结算。' } }))
+  assert.equal(expired.kind, 'closed')
+  assert.equal(expired.text, '本周合约已到期，等交割结算。')
+  const weekend = view.statusOf(sampleView({ session: { kind: 'weekend', text: '周末休市。' } }))
+  assert.equal(weekend.kind, 'closed')
+  assert.equal(weekend.text, '周末休市。')
+  // 收盘优先于「没充钱」：账本说收盘就别再劝人充值。
+  assert.equal(view.statusOf(sampleView({ balance: 0, marginUsed: 0, equity: 0, session: { kind: 'weekend', text: '周末休市。' } })).kind, 'closed')
+
+  const built = view.build(sampleView({
+    orders: [{ id: 'o1', crop: 'tomato', side: 'long', price: 5, lots: 2, lotsLeft: 1, leverage: 20, marginFrozen: 5, at: TUESDAY }],
+    session: { kind: 'expired', text: '本周合约已到期。' },
+    delivery: { contract: 'tomato-2026W47', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: TUESDAY }
+  }), { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }, TUESDAY)
+  assert.equal(built.orderCount, 1)
+  assert.equal(built.orders.length, 1)
+  assert.equal(built.sessionLine, '本周合约已到期。')
+  assert.match(built.deliveryLine, /^交割价 5\.0125（/)
+  assert.equal(built.header.insurance, '0.00')
+  assert.equal(built.header.shortfall, '0.00')
+})
+
+test('shared：期货动作只收白名单字段，坏杠杆/非整数保证金整条拒', () => {
+  const good = shared.normalizeFuturesAction({ action: 'futures-open', side: 'long', margin: 50, leverage: 20, cropId: 'tomato', price: 999 })
+  assert.deepEqual(good, { action: 'futures-open', side: 'long', margin: 50, leverage: 20, cropId: 'tomato' })
+
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-open', side: 'long', margin: 50, leverage: 5, cropId: 'tomato' }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-open', side: 'long', margin: 50.5, leverage: 20, cropId: 'tomato' }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-open', side: 'up', margin: 50, leverage: 20, cropId: 'tomato' }), null)
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-deposit', coins: 100 }), { action: 'futures-deposit', coins: 100 })
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-withdraw', coins: 40 }), { action: 'futures-withdraw', coins: 40 })
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-close', positionId: '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60' }), {
+    action: 'futures-close',
+    positionId: '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60'
+  })
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-refresh' }), { action: 'futures-refresh' })
+
+  // helper 事件：五个期货动作走 futures 分支，窗口命令走窄口。
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'a1', action: 'futures-open', side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }).event.action, 'futures-open')
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'a2', action: 'futures-open', side: 'long', margin: 50, leverage: 5, cropId: 'tomato' }).error, 'bad-futures-action')
+  assert.equal(shared.normalizeHelperEvent({ type: 'action', id: 'a3', action: 'futures-window' }).event.action, 'futures-window')
+  assert.deepEqual(shared.normalizeHelperEvent({ type: 'futures-window-state', id: 'w1', open: true }).event, {
+    type: 'futures-window-state',
+    id: 'w1',
+    open: true
+  })
+})
+
+test('shared：票 98 的挂单/撤单/转现货/切档动作各有白名单', () => {
+  assert.deepEqual(
+    shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 4.567, lots: 2, leverage: 10 }),
+    { action: 'futures-place', side: 'long', lots: 2, leverage: 10, cropId: 'tomato', price: 4.57 }
+  )
+  // 价格按分记：0、负数、NaN 整条拒；杠杆只认 1/3/10/20。
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 0, lots: 1, leverage: 10 }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 5, lots: 1, leverage: 5 }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 5, lots: 0, leverage: 10 }), null)
+
+  const id = '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60'
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-cancel', orderId: id }), { action: 'futures-cancel', orderId: id })
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-convert', positionId: id, lots: 3 }), { action: 'futures-convert', positionId: id, lots: 3 })
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert', positionId: id, lots: 0 }), null)
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-mode', mode: 'live' }), { action: 'futures-mode', mode: 'live' })
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-mode', mode: 'turbo' }), null)
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-rollback' }), { action: 'futures-rollback' })
+})
+
+test('视图模型：影子模式先报「只记账」，不落成周末休市；限额与待提取各一行', () => {
+  const view = sampleView({
+    mode: 'shadow',
+    session: { kind: 'shadow', text: '影子模式：只记账，不动农场硬币。' },
+    quotes: {},
+    dayNotional: 0,
+    dayCap: 0,
+    positionCap: 20000,
+    pending: 30
+  })
+})
+
+test('视图模型：影子模式先报「只记账」，不落成周末休市；限额与待提取各一行', () => {
+  const built = view.build(
+    sampleView({
+      mode: 'shadow',
+      session: { kind: 'shadow', text: '影子模式：只记账，不动农场硬币。' },
+      quotes: {},
+      dayNotional: 0,
+      dayCap: 0,
+      positionCap: 20000,
+      pending: 30
+    }),
+    { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' },
+    TUESDAY
+  )
+  assert.equal(built.status.kind, 'shadow')
+  assert.match(built.status.text, /只记账/)
+  assert.equal(built.mode.kind, 'shadow')
+  assert.equal(built.mode.label, '影子')
+  assert.match(built.capsLine, /日额|今日/)
+  assert.match(built.pendingLine, /30/)
+  // 影子模式下不给下单：日额上限是 0，按钮该灰着。
+  assert.equal(built.canSubmit, false)
+
+  // 关掉时一律报关闭，即使有报价——没有托管账户，画报价会让人以为能买。
+  const off = view.build(sampleView({ mode: 'off' }), { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }, TUESDAY)
+  assert.equal(off.status.kind, 'off')
+  assert.equal(off.canTrade, false)
+})
+
+test('shared：futures-window 命令带整份视图，缺字段有默认', () => {
+  const command = shared.normalizeHostCommand({ type: 'futures-window', id: 'c1', open: true, state: sampleView() })
+  assert.equal(command.ok, true)
+  assert.equal(command.command.type, 'futures-window')
+  assert.equal(command.command.open, true)
+  assert.equal(command.command.state.ready, true)
+  assert.deepEqual(command.command.state.limits.leverages, FUTURES_LEVERAGES)
+
+  const bare = shared.normalizeHostCommand({ type: 'futures-window', id: 'c2' })
+  assert.equal(bare.ok, true)
+  assert.equal(bare.command.open, false)
+  // 刷新命令必须带状态；不带就是 null，窗口那边按「还没收到一拍」处理。
+  assert.equal(bare.command.state, null)
+  const empty = shared.normalizeFuturesView({})
+  assert.equal(empty.ready, false)
+  assert.equal(empty.positionCount, 0)
+  assert.deepEqual(empty.limits.leverages, FUTURES_LEVERAGES)
+})
+
+function delay (ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor (predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await delay(15)
+  }
+  throw new Error('waitFor timeout')
+}
+
+function fakeCtx () {
+  const routes = []
+  const warnings = []
+  return {
+    warnings,
+    ctx: {
+      webServer: {
+        register (options) {
+          routes.push(options)
+          return () => {}
+        }
+      },
+      logger: { info () {}, warn (line) { warnings.push(line) } }
+    },
+    routes
+  }
+}
+
+async function tempDir (t) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-futures-window-'))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
+  return dir
+}
+
+function makeService (t, options = {}) {
+  const { ctx, routes, warnings } = fakeCtx()
+  const service = createService(ctx, {
+    network: false,
+    petBridge: false,
+    skinServer: false,
+    ...options
+  })
+  service.routes = routes
+  service.warnings = warnings
+  t.after(() => service.dispose())
+  return service
+}
+
+async function call (service, path, { method = 'GET', body } = {}) {
+  const route = service.routes.find((candidate) => candidate.path === path)
+  assert.ok(route, '应该注册 ' + path)
+  const res = {
+    statusCode: 0,
+    headers: {},
+    setHeader (key, value) { this.headers[key] = value },
+    end (payload) { this.payload = payload }
+  }
+  const req = {
+    method,
+    _listeners: {},
+    on (event, fn) {
+      this._listeners[event] = fn
+      return this
+    },
+    destroy () {}
+  }
+  const pending = route.handler(req, res)
+  if (body !== undefined) {
+    queueMicrotask(() => req._listeners.data?.(Buffer.from(JSON.stringify(body))))
+    queueMicrotask(() => req._listeners.end?.())
+  }
+  await pending
+  return { status: res.statusCode, body: res.payload ? JSON.parse(res.payload) : null }
+}
+
+function callAction (service, body) {
+  return call(service, '/dsh-zoo/action', { method: 'POST', body })
+}
+
+/** 只记录窗口命令的桌面替身；不 spawn Electron。 */
+function desktopDouble () {
+  const calls = { scenes: [], futures: [], results: [] }
+  let onEvent = null
+  let futuresOpen = false
+  return {
+    calls,
+    factory (factoryOptions) {
+      onEvent = factoryOptions.onEvent
+      return {
+        start () { return { ok: true, pid: 4242 } },
+        update (scene) { calls.scenes.push(scene); return true },
+        resync (scene) { calls.scenes.push(scene); return true },
+        status () { return { farmOpen: false, boardOpen: false } },
+        farmWindow () { return true },
+        boardWindow () { return true },
+        futuresWindow (payload) {
+          calls.futures.push(payload)
+          if (payload.close === true) futuresOpen = false
+          else if (payload.open === true) futuresOpen = true
+          return true
+        },
+        lastCommandFailure () { return null },
+        actionResult (id, result) { calls.results.push({ id, result }) },
+        dispose () {}
+      }
+    },
+    ready (workArea = { x: 0, y: 30, width: 1000, height: 700 }) {
+      onEvent?.({ type: 'ready', pid: 4242, workArea, displays: [{ id: 1, bounds: workArea, workArea, scaleFactor: 1, primary: true }] })
+    },
+    emit (event) { onEvent?.(event) },
+    /** 用户点 × / Esc：helper 关窗并回报真实状态。 */
+    userCloseFutures () {
+      futuresOpen = false
+      onEvent?.({ type: 'futures-window-state', open: false })
+    },
+    isFuturesOpen () { return futuresOpen }
+  }
+}
+
+test('futures-window：开窗下发整份视图；再点一次关闭；× 之后能重开', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 500 }), 'utf8')
+  const clock = { value: TUESDAY }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value,
+    marketNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+
+  const opened = await callAction(service, { action: 'futures-window' })
+  assert.equal(opened.status, 200)
+  assert.equal(opened.body.ok, true)
+  assert.equal(opened.body.window, 'opened')
+  assert.equal(desktop.calls.futures.length, 1)
+  const command = desktop.calls.futures[0]
+  assert.equal(command.open, true)
+  assert.equal('close' in command, false)
+  const state = command.state
+  assert.equal(state.ready, true)
+  assert.deepEqual(state.limits, {
+    leverages: FUTURES_LEVERAGES.slice(),
+    lotSize: LOT_SIZE,
+    takerFeeRate: TAKER_FEE_RATE,
+    spreadRate: MM_SPREAD
+  })
+  assert.equal(state.crops.length >= 10, true)
+  assert.equal(state.slotEnd, Math.floor(TUESDAY / SLOT_MS) * SLOT_MS + SLOT_MS)
+  assert.equal(state.now, TUESDAY)
+  // 一份视图能直接交给纯视图模型画出来。
+  const painted = view.build(state, { side: 'long', margin: 50, leverage: 20, cropId: state.crops[0].id }, TUESDAY)
+  // 票 98：新装的实例默认影子档，窗口先报「只记账」——房主切到真钱之后才轮到余额。
+  assert.equal(painted.status.kind, 'shadow')
+  assert.equal(painted.quotes.length >= 10, true)
+  const live = view.build({ ...state, mode: 'live', session: null }, { side: 'long', margin: 50, leverage: 20, cropId: state.crops[0].id }, TUESDAY)
+  assert.equal(live.status.kind, 'no-funds')
+
+  // 再点一次「期货」= 关窗。
+  const toggled = await callAction(service, { action: 'futures-window' })
+  assert.equal(toggled.body.ok, true)
+  assert.equal(toggled.body.window, 'closed')
+  const closeCommand = desktop.calls.futures.at(-1)
+  assert.equal(closeCommand.open, false)
+  assert.equal(closeCommand.close, true)
+  assert.equal(desktop.isFuturesOpen(), false)
+
+  // 用户点 ×（helper 回报 open:false）之后，再点「期货」必须重新打开。
+  desktop.userCloseFutures()
+  const reopened = await callAction(service, { action: 'futures-window' })
+  assert.equal(reopened.body.window, 'opened')
+  assert.equal(desktop.calls.futures.at(-1).open, true)
+})
+
+test('futures-window：没有桌面层是 desktop-off，说人话', async (t) => {
+  const dir = await tempDir(t)
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktop: false
+  })
+  await service.ready
+  const offline = await callAction(service, { action: 'futures-window' })
+  assert.equal(offline.status, 409)
+  assert.equal(offline.body.error, 'desktop-off')
+  assert.ok(offline.body.notice.length > 0)
+})
+
+test('futures-refresh：回一拍新视图，不重复下单也不关窗', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 500 }), 'utf8')
+  const clock = { value: TUESDAY }
+  const desktop = desktopDouble()
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value,
+    marketNow: () => clock.value
+  })
+  await service.ready
+  desktop.ready()
+  await waitFor(() => desktop.calls.scenes.length > 0)
+  await callAction(service, { action: 'futures-window' })
+
+  const before = desktop.calls.futures.length
+  clock.value += 60 * 1000
+  const refreshed = await callAction(service, { action: 'futures-refresh' })
+  assert.equal(refreshed.status, 200)
+  assert.equal(refreshed.body.ok, true)
+  assert.equal(refreshed.body.state.ready, true)
+  assert.equal(refreshed.body.state.now, TUESDAY + 60 * 1000)
+  // 刷新不等于开/关窗。
+  assert.equal(desktop.calls.futures.length, before)
+})
+
+test('futures-window 这一包 < 64 KiB（helper 单行不是瓶颈）', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 500 }), 'utf8')
+  const clock = { value: TUESDAY }
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    farmNow: () => clock.value,
+    marketNow: () => clock.value
+  })
+  await service.ready
+  const state = service.futuresWindow()
+  const line = shared.encodeMessage({ type: 'futures-window', open: true, state: shared.normalizeFuturesView(state) })
+  assert.notEqual(line, null)
+  assert.ok(Buffer.byteLength(line, 'utf8') < 64 * 1024)
+})

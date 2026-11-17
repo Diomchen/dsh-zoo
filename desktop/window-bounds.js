@@ -19,6 +19,8 @@ const path = require('node:path')
 
 /** 和农场窗的 `farm-window.json` 放在同一个 userData 目录下。 */
 const BOARD_POSITION_FILE = 'board-window.json'
+/** 期货小窗（票 93）自己一份：两扇窗可以拖到不同位置。 */
+const FUTURES_POSITION_FILE = 'futures-window.json'
 /** 窗口边缘留 8px：和改名/农场/盘口原来的居中夹取同一个数。 */
 const DEFAULT_EDGE_MARGIN = 8
 
@@ -170,6 +172,7 @@ function writePosition (file, point, fileSystem = fs) {
 
 module.exports = {
   BOARD_POSITION_FILE,
+  FUTURES_POSITION_FILE,
   DEFAULT_EDGE_MARGIN,
   normalizePoint,
   isInsideArea,

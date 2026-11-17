@@ -15,7 +15,15 @@ import {
   PEER_LOST_MS,
   PROTOCOL_VERSION,
   VISIT_MAX_MS,
+  FUTURES_MAX_ORDERS,
+  FUTURES_MAX_POSITIONS,
+  FUTURES_ORDER_KINDS,
   createRateLimiter,
+  encodeFuturesCancel,
+  encodeFuturesHello,
+  encodeFuturesOrder,
+  encodeFuturesSettle,
+  encodeFuturesSync,
   encodeHeartbeat,
   encodeMarketDigest,
   encodePacket,
@@ -214,6 +222,25 @@ function workKeys (type) {
   }[type]
 }
 
+function futuresPayload (type, deviceId) {
+  const base = { v: PROTOCOL_VERSION, type, deviceId, at: 1700000000000 }
+  if (type === 'futures-hello') return base
+  if (type === 'futures-order') return { ...base, kind: 'deposit', coins: 5 }
+  if (type === 'futures-cancel') return { ...base, orderId: randomUUID() }
+  if (type === 'futures-sync') return { ...base, epoch: 'e1', lastSeq: 3 }
+  return { ...base, epoch: 'e1', seq: 3, balance: 10, marginUsed: 0, delta: 0, positions: [], orders: [], trades: [], insurance: 0, shortfall: 0 }
+}
+
+function futuresKeys (type) {
+  return {
+    'futures-hello': ['v', 'type', 'deviceId', 'at'],
+    'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
+    'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'pending'],
+    'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq']
+  }[type]
+}
+
 test('任何报文都不含坐标字段（包括串门报文）', () => {
   const deviceId = randomUUID()
   const visitId = randomUUID()
@@ -357,6 +384,8 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type.startsWith('futures-')) {
+      raw = { ...futuresPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('work-')) {
       raw = { ...workPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('visit-')) {
@@ -409,6 +438,8 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
   ? ['v', 'type', 'deviceId', 'giftId', 'contents', 'note']
   : type === 'packet-returned'
     ? ['v', 'type', 'deviceId', 'giftId']
+  : type.startsWith('futures-')
+    ? futuresKeys(type)
   : type.startsWith('work-')
                           ? workKeys(type)
                       : type.startsWith('visit-')
@@ -720,7 +751,13 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'work-end',
     'work-end-ack',
     'work-settle',
-    'work-settle-ack'
+    'work-settle-ack',
+    // 票 94：双机开户与净额结算（hello/order/cancel/settle/sync 各自独立，不进 VISIT_TYPES）
+    'futures-hello',
+    'futures-order',
+    'futures-cancel',
+    'futures-settle',
+    'futures-sync'
   ])
 })
 
@@ -889,4 +926,484 @@ test('非法本地字段在编码阶段就失败，不会发出半截包', () =>
   // 心跳不需要昵称/端口；非法的本机动画名不抛，降级为 null。
   assert.doesNotThrow(() => encodeHeartbeat({ deviceId: randomUUID() }))
   assert.equal(JSON.parse(encodeHeartbeat({ deviceId: randomUUID(), anim: 42 }).toString('utf8')).anim, null)
+})
+
+// ── 票 94：期货五包（hello / order / cancel / settle / sync） ────────────────
+// 这一层只验 wire：白名单字段、每项坏字段整包丢、单包 ≤ 4 KiB。
+// 「谁记账、谁信谁」在 futures-net.test.js 的两台服务里验。
+
+const FUTURES_AT = 1700000000123
+
+function validFuturesPosition (overrides = {}) {
+  return {
+    id: randomUUID(),
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'long',
+    lots: 3,
+    entry: 5.12,
+    margin: 15.36,
+    leverage: 10,
+    ...overrides
+  }
+}
+
+function validFuturesSettle (overrides = {}) {
+  return {
+    deviceId: randomUUID(),
+    at: FUTURES_AT,
+    epoch: 'a3f1c2d4-0000-4000-8000-000000000000',
+    seq: 7,
+    balance: 120.5,
+    marginUsed: 15.36,
+    delta: 0,
+    positions: [validFuturesPosition()],
+    ...overrides
+  }
+}
+
+/** 票 95：settle 里的一条挂单（`lots` 原始张数、`lotsLeft` 剩余张数）。 */
+function validFuturesOrder (overrides = {}) {
+  return {
+    id: randomUUID(),
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'long',
+    price: 5.12,
+    lots: 3,
+    lotsLeft: 2,
+    leverage: 10,
+    marginFrozen: 6.4,
+    at: FUTURES_AT,
+    ...overrides
+  }
+}
+
+test('票 94：futures-hello 往返只带 v/type/deviceId/at，多余字段解析时丢掉', () => {
+  const deviceId = randomUUID()
+  const data = encodeFuturesHello({ deviceId: deviceId.toUpperCase(), at: FUTURES_AT })
+  const raw = JSON.parse(data.toString('utf8'))
+  assert.deepEqual(Object.keys(raw), ['v', 'type', 'deviceId', 'at'])
+  assert.equal(raw.deviceId, deviceId)
+
+  const parsed = parsePacket(data)
+  assert.deepEqual(parsed, {
+    ok: true,
+    packet: { v: PROTOCOL_VERSION, type: 'futures-hello', deviceId, at: FUTURES_AT }
+  })
+  // 冒充/夹带：解析只重建白名单字段，nickname/epoch 这类一律不进 packet。
+  const dirty = parsePacket(encodeJson({ ...raw, nickname: '路过的小猫', epoch: 'fake', seq: 99 }))
+  assert.equal(dirty.ok, true)
+  assert.deepEqual(Object.keys(dirty.packet), ['v', 'type', 'deviceId', 'at'])
+})
+
+test('票 95/96：futures-order 五种 kind 各自往返，缺字段/坏字段直接拒', () => {
+  const deviceId = randomUUID()
+  assert.deepEqual([...FUTURES_ORDER_KINDS], ['open', 'close', 'deposit', 'place', 'convert'])
+
+  const open = encodeFuturesOrder({
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'open',
+    crop: 'tomato',
+    side: 'short',
+    margin: 20,
+    leverage: 10
+  })
+  assert.deepEqual(JSON.parse(open.toString('utf8')), {
+    v: PROTOCOL_VERSION,
+    type: 'futures-order',
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'open',
+    crop: 'tomato',
+    side: 'short',
+    margin: 20,
+    leverage: 10
+  })
+
+  const positionId = randomUUID()
+  assert.deepEqual(parsePacket(encodeFuturesOrder({ deviceId, at: FUTURES_AT, kind: 'close', positionId })).packet, {
+    v: PROTOCOL_VERSION,
+    type: 'futures-order',
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'close',
+    positionId
+  })
+
+  assert.deepEqual(parsePacket(encodeFuturesOrder({ deviceId, at: FUTURES_AT, kind: 'deposit', coins: 250 })).packet, {
+    v: PROTOCOL_VERSION,
+    type: 'futures-order',
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'deposit',
+    coins: 250
+  })
+
+  // 票 95：place 只带限价、方向、张数、杠杆；保证金与成交价不随包走。
+  const placed = encodeFuturesOrder({
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'place',
+    crop: 'tomato',
+    side: 'long',
+    price: 5.12,
+    lots: 3,
+    leverage: 10
+  })
+  assert.deepEqual(JSON.parse(placed.toString('utf8')), {
+    v: PROTOCOL_VERSION,
+    type: 'futures-order',
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'place',
+    crop: 'tomato',
+    side: 'long',
+    price: 5.12,
+    lots: 3,
+    leverage: 10
+  })
+  assert.deepEqual(parsePacket(placed).packet, {
+    v: PROTOCOL_VERSION,
+    type: 'futures-order',
+    deviceId,
+    at: FUTURES_AT,
+    kind: 'place',
+    crop: 'tomato',
+    side: 'long',
+    price: 5.12,
+    lots: 3,
+    leverage: 10
+  })
+
+  // 票 96：convert 只带仓位 id 与张数；价格/手续费全由房主算。
+  const convertId = randomUUID()
+  assert.deepEqual(
+    parsePacket(encodeFuturesOrder({ deviceId, at: FUTURES_AT, kind: 'convert', positionId: convertId.toUpperCase(), lots: 2 })).packet,
+    { v: PROTOCOL_VERSION, type: 'futures-order', deviceId, at: FUTURES_AT, kind: 'convert', positionId: convertId, lots: 2 }
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'convert', positionId: convertId, lots: 0 }),
+    /invalid futures lots/
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'convert', positionId: 'nope', lots: 1 }),
+    /invalid futures positionId/
+  )
+  const convertBase = { v: PROTOCOL_VERSION, type: 'futures-order', deviceId, at: FUTURES_AT }
+  assert.equal(
+    parsePacket(encodeJson({ ...convertBase, kind: 'convert', positionId: convertId, lots: 1.5 })).reason,
+    'lots'
+  )
+  assert.equal(
+    parsePacket(encodeJson({ ...convertBase, kind: 'convert', positionId: 'nope', lots: 1 })).reason,
+    'position-id'
+  )
+
+  // 编码端：本地字段坏 = 抛，不发半截包。
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'open', crop: 'tomato', side: 'long', margin: 0, leverage: 10 }),
+    /invalid futures margin/
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'open', crop: 'nope', side: 'long', margin: 10, leverage: 10 }),
+    /invalid futures crop/
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'open', crop: 'tomato', side: 'both', margin: 10, leverage: 10 }),
+    /invalid futures side/
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'open', crop: 'tomato', side: 'long', margin: 10, leverage: 7 }),
+    /invalid futures leverage/
+  )
+  assert.throws(() => encodeFuturesOrder({ deviceId, kind: 'close' }), /invalid positionId/)
+  assert.throws(() => encodeFuturesOrder({ deviceId, kind: 'deposit', coins: 0 }), /invalid futures coins/)
+  assert.throws(() => encodeFuturesOrder({ deviceId, kind: 'open', margin: 10 }), /invalid futures crop/)
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'place', crop: 'tomato', side: 'long', price: 0, lots: 3, leverage: 10 }),
+    /invalid futures place/
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'place', crop: 'tomato', side: 'long', price: 5.12, lots: 0, leverage: 10 }),
+    /invalid futures place/
+  )
+  assert.throws(
+    () => encodeFuturesOrder({ deviceId, kind: 'place', crop: 'tomato', side: 'long', price: 5.12, lots: 3, leverage: 7 }),
+    /invalid futures place/
+  )
+
+  // 解析端：同样坏的内容返回 {ok:false}，连 reason 都指到具体字段。
+  const base = { v: PROTOCOL_VERSION, type: 'futures-order', deviceId, at: FUTURES_AT }
+  assert.equal(parsePacket(encodeJson({ ...base, kind: 'open', crop: 'tomato', side: 'long', margin: -1, leverage: 10 })).ok, false)
+  assert.equal(parsePacket(encodeJson({ ...base, kind: 'steal' })).reason, 'kind')
+  assert.equal(parsePacket(encodeJson({ ...base, kind: 'open', crop: 'tomato', side: 'long', margin: 10 })).reason, 'leverage')
+  assert.equal(parsePacket(encodeJson({ ...base, kind: 'deposit', coins: 0 })).reason, 'coins')
+  assert.equal(parsePacket(encodeJson({ ...base, kind: 'deposit', coins: 1_000_000_001 })).reason, 'coins')
+  assert.equal(parsePacket(encodeJson({ ...base, kind: 'close', positionId: 'nope' })).reason, 'position-id')
+  assert.equal(
+    parsePacket(encodeJson({ ...base, kind: 'place', crop: 'tomato', side: 'long', price: 5.12, lots: 3, leverage: 7 })).reason,
+    'place'
+  )
+  assert.equal(
+    parsePacket(encodeJson({ ...base, kind: 'place', crop: 'tomato', side: 'long', price: 5.12, lots: 3 })).reason,
+    'place'
+  )
+})
+
+test('票 95：futures-cancel 认 orderId（也留 positionId 给票 96），两者都没有整包拒', () => {
+  const deviceId = randomUUID()
+  const orderId = randomUUID()
+  assert.deepEqual(
+    parsePacket(encodeFuturesCancel({ deviceId, at: FUTURES_AT, orderId: orderId.toUpperCase() })).packet,
+    { v: PROTOCOL_VERSION, type: 'futures-cancel', deviceId, at: FUTURES_AT, orderId }
+  )
+
+  // 票 96 会按仓位撤：positionId 继续可选，两个一起给就都带上。
+  const positionId = randomUUID()
+  assert.deepEqual(
+    parsePacket(encodeFuturesCancel({ deviceId, at: FUTURES_AT, positionId })).packet,
+    { v: PROTOCOL_VERSION, type: 'futures-cancel', deviceId, at: FUTURES_AT, positionId }
+  )
+  assert.deepEqual(
+    parsePacket(encodeFuturesCancel({ deviceId, at: FUTURES_AT, orderId, positionId })).packet,
+    { v: PROTOCOL_VERSION, type: 'futures-cancel', deviceId, at: FUTURES_AT, orderId, positionId }
+  )
+
+  assert.throws(() => encodeFuturesCancel({ deviceId }), /invalid futures cancel target/)
+  assert.throws(() => encodeFuturesCancel({ deviceId, orderId: 'nope' }), /invalid futures cancel target/)
+  const base = { v: PROTOCOL_VERSION, type: 'futures-cancel', deviceId, at: FUTURES_AT }
+  assert.equal(parsePacket(encodeJson(base)).reason, 'cancel-target')
+  assert.equal(parsePacket(encodeJson({ ...base, orderId: 'nope' })).reason, 'cancel-target')
+})
+
+test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂单 / 坏字段都整包拒', () => {
+  const body = validFuturesSettle({ orders: [validFuturesOrder()] })
+  const parsed = parsePacket(encodeFuturesSettle(body))
+  assert.equal(parsed.ok, true)
+  assert.deepEqual(parsed.packet, {
+    v: PROTOCOL_VERSION,
+    type: 'futures-settle',
+    deviceId: body.deviceId,
+    at: body.at,
+    epoch: body.epoch,
+    seq: body.seq,
+    balance: body.balance,
+    marginUsed: body.marginUsed,
+    delta: 0,
+    positions: body.positions,
+    orders: body.orders,
+    trades: [],
+    // 票 97：基金/欠账始终在线，缺省 0。
+    insurance: 0,
+    shortfall: 0,
+    // 票 98：模式缺省 shadow、待提取缺省 0。
+    mode: 'shadow',
+    pending: 0
+  })
+
+  // 票 95：`orders` 是可选的（票 94 的调用方不带），不带就是空盘口，字段始终在线。
+  const bare = parsePacket(encodeFuturesSettle(validFuturesSettle()))
+  assert.equal(bare.ok, true)
+  assert.deepEqual(bare.packet.orders, [])
+  // 票 96：`trades` 同样可选，字段始终在线。
+  assert.deepEqual(bare.packet.trades, [])
+  // 票 97：基金与欠账同样可选，缺省 0，字段始终在线。
+  assert.deepEqual([bare.packet.insurance, bare.packet.shortfall], [0, 0])
+  // 票 98：模式与待提取同样可选；缺省 shadow / 0。
+  assert.deepEqual([bare.packet.mode, bare.packet.pending], ['shadow', 0])
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ mode: 'turbo' })), /invalid futures mode/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ pending: -1 })), /invalid futures pending/)
+  assert.equal(parsePacket(encodeFuturesSettle(validFuturesSettle({ mode: 'live', pending: 12.5 }))).packet.pending,
+    12.5
+  )
+
+  // 金额到分、张数与杠杆夹取由编码端统一做：不是整数分就拒，不四舍五入蒙过去。
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ balance: -1 })), /invalid futures balance/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ seq: -1 })), /invalid futures seq/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ epoch: '' })), /invalid futures epoch/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ epoch: 'e'.repeat(65) })), /invalid futures epoch/)
+
+  // 持仓上限 8：8 个能发，9 个连编码都不行。
+  assert.equal(FUTURES_MAX_POSITIONS, 8)
+  const eight = Array.from({ length: 8 }, () => validFuturesPosition())
+  const packed = encodeFuturesSettle(validFuturesSettle({ positions: eight }))
+  assert.ok(packed.length <= MAX_PACKET_BYTES)
+  assert.equal(parsePacket(packed).packet.positions.length, 8)
+  assert.throws(
+    () => encodeFuturesSettle(validFuturesSettle({ positions: [...eight, validFuturesPosition()] })),
+    /invalid futures positions/
+  )
+
+  // 挂单上限 8：与持仓同一条口径（一条账目里最多 8 笔）。
+  assert.equal(FUTURES_MAX_ORDERS, 8)
+  const eightOrders = Array.from({ length: 8 }, () => validFuturesOrder())
+  const packedOrders = encodeFuturesSettle(validFuturesSettle({ orders: eightOrders }))
+  assert.ok(packedOrders.length <= MAX_PACKET_BYTES)
+  assert.equal(parsePacket(packedOrders).packet.orders.length, 8)
+  assert.throws(
+    () => encodeFuturesSettle(validFuturesSettle({ orders: [...eightOrders, validFuturesOrder()] })),
+    /invalid futures orders/
+  )
+
+  const base = { v: PROTOCOL_VERSION, type: 'futures-settle', deviceId: body.deviceId, at: FUTURES_AT, epoch: 'e1', seq: 1, balance: 10, marginUsed: 0 }
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], mode: 'turbo' })).reason, 'mode')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], pending: -1 })).reason, 'pending')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [...eight, validFuturesPosition()] })).reason, 'positions')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [validFuturesPosition({ contract: 'tomato-47' })] })).reason, 'positions')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [validFuturesPosition({ side: 'both' })] })).reason, 'positions')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [validFuturesPosition({ lots: 0 })] })).reason, 'positions')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [] , balance: -10 })).reason, 'balance')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], epoch: '' })).reason, 'epoch')
+  // 空持仓是合法的：零账户（还没开过仓）也要能发出去。
+  assert.deepEqual(parsePacket(encodeJson({ ...base, delta: 0, positions: [] })).packet.positions, [])
+
+  // 挂单同理：坏一条整包丢（`lotsLeft` 超过 `lots`、时间坏、`marginFrozen` 为负都算坏）。
+  const badOrders = (orders) => parsePacket(encodeJson({ ...base, delta: 0, positions: [], orders })).reason
+  assert.equal(badOrders([validFuturesOrder({ lotsLeft: 9 })]), 'orders')
+  assert.equal(badOrders([validFuturesOrder({ at: 0 })]), 'orders')
+  assert.equal(badOrders([validFuturesOrder({ marginFrozen: -1 })]), 'orders')
+  assert.equal(badOrders([validFuturesOrder({ price: 0 })]), 'orders')
+  assert.equal(badOrders([validFuturesOrder({ contract: 'tomato-47' })]), 'orders')
+  assert.equal(badOrders('nope'), 'orders')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], orders: [] })).ok, true)
+
+  // 票 96：交割流水往返；delivery 必须带 deliveryFee，坏一条整包丢。
+  const delivery = {
+    at: FUTURES_AT,
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'short',
+    lots: 2,
+    price: 5.12,
+    fee: 1.02,
+    kind: 'delivery',
+    deliveryFee: 1.02
+  }
+  const settled = parsePacket(encodeFuturesSettle(validFuturesSettle({ trades: [delivery] })))
+  assert.equal(settled.ok, true)
+  assert.deepEqual(settled.packet.trades, [delivery])
+  assert.throws(
+    () => encodeFuturesSettle(validFuturesSettle({ trades: [{ ...delivery, deliveryFee: undefined }] })),
+    /invalid futures trades/
+  )
+  assert.throws(
+    () => encodeFuturesSettle(validFuturesSettle({ trades: [{ ...delivery, kind: 'steal' }] })),
+    /invalid futures trades/
+  )
+  assert.equal(
+    parsePacket(encodeJson({ ...base, delta: 0, positions: [], trades: [{ ...delivery, fee: -1 }] })).reason,
+    'trades'
+  )
+
+  // 票 97：强平流水与交割同形（额外字段只有 delivery 要），kind 白名单认 liquidation。
+  const liquidation = {
+    at: FUTURES_AT,
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'short',
+    lots: 1,
+    price: 4.87,
+    fee: 0.49,
+    kind: 'liquidation'
+  }
+  const blown = parsePacket(encodeFuturesSettle(validFuturesSettle({ trades: [liquidation] })))
+  assert.equal(blown.ok, true)
+  assert.deepEqual(blown.packet.trades, [liquidation])
+
+  // 票 98：灰度切换流水只带 note，lots/price/fee 固定 0，允许没有 crop/contract/side。
+  const mode = { at: FUTURES_AT, kind: 'mode', note: 'shadow', lots: 0, price: 0, fee: 0 }
+  const switched = parsePacket(encodeFuturesSettle(validFuturesSettle({ trades: [mode] })))
+  assert.equal(switched.ok, true)
+  assert.deepEqual(switched.packet.trades, [mode])
+  assert.equal(
+    parsePacket(encodeJson({ ...base, delta: 0, positions: [], trades: [{ ...mode, note: 'turbo' }] })).reason,
+    'trades'
+  )
+
+  // 票 97：基金余额与欠账往返；负数/非整数分连编码都过不去，解码侧落 'insurance' / 'shortfall'。
+  const funded = parsePacket(encodeFuturesSettle(validFuturesSettle({ insurance: 3.2, shortfall: 0.8 })))
+  assert.deepEqual([funded.packet.insurance, funded.packet.shortfall], [3.2, 0.8])
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ insurance: -0.01 })), /invalid futures insurance/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ shortfall: -1 })), /invalid futures shortfall/)
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], insurance: -1 })).reason, 'insurance')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], shortfall: 'x' })).reason, 'shortfall')
+})
+
+test('票 94：futures-sync 带 (epoch,lastSeq)；坏 lastSeq 拒', () => {
+  const deviceId = randomUUID()
+  assert.deepEqual(parsePacket(encodeFuturesSync({ deviceId, at: FUTURES_AT, epoch: 'e1', lastSeq: 4 })).packet, {
+    v: PROTOCOL_VERSION,
+    type: 'futures-sync',
+    deviceId,
+    at: FUTURES_AT,
+    epoch: 'e1',
+    lastSeq: 4
+  })
+  assert.throws(() => encodeFuturesSync({ deviceId, epoch: 'e1', lastSeq: -1 }), /invalid futures last seq/)
+  assert.throws(() => encodeFuturesSync({ deviceId, epoch: '', lastSeq: 1 }), /invalid futures epoch/)
+  const base = { v: PROTOCOL_VERSION, type: 'futures-sync', deviceId, at: FUTURES_AT, epoch: 'e1' }
+  assert.equal(parsePacket(encodeJson({ ...base, lastSeq: 1.5 })).reason, 'last-seq')
+  assert.equal(parsePacket(encodeJson({ ...base, lastSeq: 2 ** 31 })).reason, 'last-seq')
+})
+
+test('票 94：一条装满 8 个持仓的 settle 也在 4 KiB 之内', () => {
+  // 最坏情况：64 字符 epoch + 8 个字段都取上限的持仓 + 大余额。
+  const positions = Array.from({ length: FUTURES_MAX_POSITIONS }, () => validFuturesPosition({
+    id: randomUUID(),
+    crop: 'pumpkin',
+    contract: 'pumpkin-9999W99',
+    lots: 1_000_000,
+    entry: 999_999.99,
+    margin: 999_999.99,
+    leverage: 20
+  }))
+  const data = encodeFuturesSettle(validFuturesSettle({
+    epoch: 'e'.repeat(64),
+    seq: 2 ** 31 - 1,
+    balance: 999_999_999.99,
+    marginUsed: 999_999_999.99,
+    delta: -999_999_999.99,
+    positions
+  }))
+  assert.ok(data.length <= MAX_PACKET_BYTES, 'settle 单包 ' + data.length + ' 字节，超过 4 KiB')
+  assert.equal(parsePacket(data).packet.positions.length, FUTURES_MAX_POSITIONS)
+})
+
+test('票 95：8 个持仓 + 8 条挂单同时装满也仍在 4 KiB 之内', () => {
+  // 最坏情况：64 字符 epoch + 8 个字段都取上限的持仓 + 8 条字段取上限的挂单 + 大余额。
+  const positions = Array.from({ length: FUTURES_MAX_POSITIONS }, () => validFuturesPosition({
+    crop: 'pumpkin',
+    contract: 'pumpkin-9999W99',
+    lots: 1_000_000,
+    entry: 999_999.99,
+    margin: 999_999.99,
+    leverage: 20
+  }))
+  const orders = Array.from({ length: FUTURES_MAX_ORDERS }, () => validFuturesOrder({
+    crop: 'pumpkin',
+    contract: 'pumpkin-9999W99',
+    lots: 1_000_000,
+    lotsLeft: 1_000_000,
+    price: 999_999.99,
+    marginFrozen: 999_999.99,
+    leverage: 20
+  }))
+  const data = encodeFuturesSettle(validFuturesSettle({
+    epoch: 'e'.repeat(64),
+    seq: 2 ** 31 - 1,
+    balance: 999_999_999.99,
+    marginUsed: 999_999_999.99,
+    delta: -999_999_999.99,
+    positions,
+    orders
+  }))
+  assert.ok(data.length <= MAX_PACKET_BYTES, 'settle 单包 ' + data.length + ' 字节，超过 4 KiB')
+  const parsed = parsePacket(data)
+  assert.equal(parsed.packet.positions.length, FUTURES_MAX_POSITIONS)
+  assert.equal(parsed.packet.orders.length, FUTURES_MAX_ORDERS)
+  // 线上只带剩余张数：`lots` 是原始张数，`lotsLeft` 才是还能成交的部分。
+  assert.equal(parsed.packet.orders[0].lots, 1_000_000)
+  assert.equal(parsed.packet.orders[0].lotsLeft, 1_000_000)
 })

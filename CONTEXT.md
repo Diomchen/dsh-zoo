@@ -23,10 +23,16 @@
 规格见 [SPEC v10](.scratch/dsh-zoo/SPEC-v10.md)；票 79–83 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
+「期货 / 周合约 / 房主清算」的决策见 [ADR-0032](docs/adr/0032-futures-host-as-clearinghouse.md)，
+规格见 [SPEC v11](.scratch/dsh-zoo/SPEC-v11.md)；票 92–99 在
+[`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。盘口与期货是两层：盘口对着机器，期货对着人。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
 农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
 
 盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
+
+期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 周合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 影子模式”同义。注意 `contract` 在期货线指**周合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
 ## Language
 
@@ -338,6 +344,7 @@ _Avoid_: 交易所, 市场, exchange, market, 订单簿
 **合约 (Contract)**：
 以作物为标的、15 分钟一根、现金结算的仓位；不做交割、不做组合/指数。
 合约价与现货 `market.json` 的 bid/price 是两张互不写入的图。
+盘口的「合约」不是期货：期货是另一层带到期日、带对手盘的周合约（见下节）。
 _Avoid_: 期货, 现货, futures, spot
 
 **一根 (Bar)**：
@@ -397,3 +404,98 @@ _Avoid_: 排行榜, 天梯, 赛季榜, ranking, ladder
 本机 + 邻居当前持仓的多空计数（多 N · 空 M）；一条仓位都没有时写「观望」。
 它只数大家报上来的方向，不做加权，也不影响行情。
 _Avoid_: 市场情绪, 多空比, 指数, market mood
+
+## 期货（周合约 · 房主清算）
+
+**期货 (Futures)**：
+一层独立于盘口的 LAN 多人市场：有到期日、有对手盘、有费用与价差，钱在交易所托管账户里跑。
+盘口对着机器（价格是算出来的），期货对着人（价格来自指数 + 撮合）。
+它和盘口共用作物与硬币，但两个账本互不写入。
+_Avoid_: 盘口, 合约交易, 现货交易, derivatives
+
+**清算所 (Clearing House)**：
+房主机器扮演的唯一权威账本：价格、撮合、余额、强平都由它算，其他玩家只发意图、只收结算。
+没有服务器集群，也没有共识——房主掉线市场就冻结。
+_Avoid_: 服务器, 交易所, 节点, node, exchange
+
+**周合约 (Weekly Contract)**：
+每作物一张、周一到期的合约：周一 00:00 上市、周五 20:00 到期，24/7 交易。
+到期就结束，不做永续、不跨周。代号形如 `corn-2026W47`。
+_Avoid_: 永续, perpetual, 主力合约, 期权
+
+**张 (Lot)**：
+合约的最小单位：1 张 = 100 个作物。仓位、挂单、成交都用张计数，不用「个」。
+_Avoid_: 手, 份, 单位, unit, share
+
+**公允价 (Fair Price)**：
+做市商报价的中心：`现货指数 × exp(OU 偏离)`。偏离是均值回归噪声（σ 0.4%、半衰期 30 分钟），
+每 15 秒更新一次；它决定买卖报价，不直接决定成交价。
+_Avoid_: 理论价, 参考价, 标记价, mark price, oracle
+
+**现货指数 (Spot Index)**：
+期货的锚：有邻居时用 LAN 加权行情指数，单机用本地现货价。指数变了，公允价跟着变。
+_Avoid_: 大盘, 基准, benchmark
+
+**报价 (Quote)**：
+做市商挂在公允价两侧的买一/卖一（各让 0.2%），随时可吃；吃单付 taker 费。
+玩家挂的限价单进另一个队列，每 15 秒撮合一次（有新单进来会立刻再撮一次，不等下一拍）。
+_Avoid_: 盘口, 深度, order book, 挂单簿
+
+**托管账户 (Escrow Account)**：
+交易所里的余额，和农场硬币隔开：充值进来才能交易，提现原路退回农场。
+`balance` 是可用，`marginUsed` 是冻结的保证金，两者之和才是账户总额。
+_Avoid_: 钱包, 资金池, wallet, vault
+
+**保证金占用 (Margin Used)**：
+开仓时从 `balance` 划走、锁在这笔仓位里的钱。平仓或强平后释放回 `balance`。
+和盘口的「保证金」是同一个概念，但这里不直接扣农场硬币。
+_Avoid_: 冻结资金, 占用额度, reserved margin
+
+**强平 (Liquidation)**（期货口径）：
+保证金亏到 1/杠杆 时系统平掉，和盘口同一条线，但这里**真的会发生**：
+期货有价差、费用和指数偏离，20× 的 5% 线不再是打不到的摆设。
+_Avoid_: 爆仓, 清算, margin call
+
+**交割价 (Settlement Price)**：
+到期时用来结清所有仓位的价格：19:15 / 19:30 / 19:45 / 20:00 四根公允价收盘的算术平均。
+用均价是为了不给尾盘插针留空间。
+_Avoid_: 结算价（盘口口径）, 收盘价, expiry price
+
+**交割 (Delivery)**：
+到期把持仓按交割价结清：默认现金（差额进/出 `balance`），玩家也可以主动「转现货」拿作物。
+_Avoid_: 行权, 到期, exercise, expiry
+
+**转现货 (Convert to Spot)**：
+把期货仓位换成实物：按公允价成交现货 + 平掉等量合约，两步原子完成。
+它是玩家主动行为，不是到期默认路径。
+_Avoid_: 提货, 交割, 换仓, roll
+
+**盯市 (Mark to Market)**：
+每 15 秒把仓位按当时的公允价重估一次：浮盈亏记进 `balance`、仓位的 `entry` 改成新价，
+仓位本身不动。它是「净额结算」在单机上的落地方式——不需要逐笔转账，也不会让持仓过期。
+_Avoid_: 结算（到期口径）, revalue, settle
+
+**净额结算 (Netting)**：
+每根把所有账户的盈亏、费用轧成一次净额记到账上，不逐笔转账；每 15 秒盯市，
+根末再由房主广播一条 `futures-settle`。报文带 `(epoch, seq)`，重复或乱序直接丢掉。
+_Avoid_: 逐笔结算, 清算, clearing, settlement batch
+
+**保险基金 (Insurance Fund)**：
+强平缺口与系统兜底的钱：费用里 10% 进这里，90% 销毁。
+基金空了就记账（`shortfall`）不追债——亏损仍然以保证金为限，余额永不为负。
+_Avoid_: 风险准备金, 公益金, reserve fund
+
+**影子模式 (Shadow Mode)**：
+灰度第一阶段：撮合、结算、强平全跑，但钱只在托管账里动，不写 `farm.json`。
+日额上限这时是 0，只用来观察和对账（记账流水 vs 农场硬币的差额必须为 0）。
+_Avoid_: 模拟盘, 测试模式, dry run, sandbox
+
+**日额 (Daily Cap)**：
+单个账户一天能开的仓与挂单的名义总额（默认 5,000 币，本地 00:00 归零）；
+影子模式下为 0。和它并列的是同时持仓名义上限（20,000 币）。
+_Avoid_: 限额, 额度, quota
+
+**待提取 (Pending Withdrawal)**：
+农场硬币撞到 1,000,000 上限时，托管账里没能退出去的那部分：留在 `balance` 里等下次提，
+不会静默丢钱。
+_Avoid_: 冻结, 失败余额, stuck funds
