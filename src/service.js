@@ -64,6 +64,7 @@ import {
   stealSucceeds
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
+import { createFuturesStore, initialFuturesView } from './futures.js'
 import { buildLeague, watcherCounts } from './trading-league.js'
 import {
   BOARD_TIMEFRAMES,
@@ -343,6 +344,13 @@ export function createService (ctx, options = {}) {
     const stamp = Number(value)
     return Number.isFinite(stamp) ? stamp : Date.now()
   }
+  // 期货（票 92）沿用同一个测试时钟：结算按 15 分钟整根走，时钟注入决定「现在是第几根」。
+  const futuresNow = typeof options.futuresNow === 'function' ? options.futuresNow : farmNow
+  const futuresClock = () => {
+    const value = futuresNow === undefined ? Date.now() : futuresNow()
+    const stamp = Number(value)
+    return Number.isFinite(stamp) ? stamp : Date.now()
+  }
   // 盘口周报（票 82）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值
   // （与行情 gossip 同款），测试注入更小的值把「等 30 秒」变成几十毫秒。
   const tradingDigestMs = positiveOption(options.tradingDigestMs, TRADING_DIGEST_INTERVAL_MS, 10)
@@ -365,6 +373,8 @@ export function createService (ctx, options = {}) {
   let contracts = null
   // 盘口账本（票 79）：钱包是农场硬币，所以只在农场起来之后才建；读不出来 = 空盘口。
   let trading = null
+  // 期货账本（票 92）：托管账户同样建在农场之上；读不出来 = 空市场（不影响农场/盘口）。
+  let futures = null
   let contractsReadyAt = 0
   /** 在飞雇佣：requestId → { deviceId, data, attempts, deadline, resolve, timer, done }。 */
   const workRequests = new Map()
@@ -1181,6 +1191,36 @@ export function createService (ctx, options = {}) {
       return result
     }
 
+    // 期货（票 92）：窗口只发「充多少 / 开哪边 / 多大保证金 / 几倍杠杆」；撮合价、
+    // 张数、费用、托管余额全由账本算——手改存档里的价格不会变成成交价。
+    if (action === 'futures-deposit') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      return futures.deposit(body?.coins)
+    }
+    if (action === 'futures-withdraw') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      return futures.withdraw(body?.coins)
+    }
+    if (action === 'futures-open') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      return futures.open({
+        crop: body?.cropId,
+        side: body?.side,
+        margin: body?.margin,
+        leverage: body?.leverage,
+        at: futuresClock()
+      })
+    }
+    if (action === 'futures-close') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      return futures.close({ id: body?.positionId, at: futuresClock() })
+    }
+    // 结算本来是 tick 自己做的；这条动作只给脚本和验收用（幂等，多跑一次不多入账）。
+    if (action === 'futures-settle') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      return futures.settleDue(futuresClock())
+    }
+
     // 本地召回：已抵达会写 out 记录并让接收方立刻清场；还在请求中则只是取消。
     if (action === 'recall') return recallPet()
 
@@ -1419,7 +1459,9 @@ export function createService (ctx, options = {}) {
       // 雇佣合同（ticket 44）：store 没起来也给完整空形状，绝不 undefined。
       contracts: contractsView(),
       // 盘口（票 79）：和盘口窗同一份形状（价格/硬币/持仓/历史/本周 + 按钮白名单）。
-      trading: tradingWindowView()
+      trading: tradingWindowView(),
+      // 期货（票 92）：托管余额/持仓/报价/费用累计。和盘口是两本账，互不影响。
+      futures: futuresView()
     }
   }
 
@@ -2349,6 +2391,21 @@ export function createService (ctx, options = {}) {
    * 窗口根本打不开（还误报成桌面层没在运行）。其余作物切过去时走 `trading-charts`
    * 按需拉；`limits.crops` 仍然是完整目录，作物条/下单白名单不受影响。
    */
+  /**
+   * 期货（票 92）：`/state` 里的一份只读视图。store 没起来时给空形状，窗口与脚本
+   * 按同一套字段读，不用到处判 undefined。
+   */
+  function futuresView () {
+    return futures === null ? initialFuturesView() : futures.snapshot({ at: futuresClock() })
+  }
+
+  /** 期货指数的来源：交易所的本机价。票 94 换成局域网加权价时只改这一处。 */
+  function futuresIndexOf (cropId) {
+    if (market === null) return null
+    const prices = market.snapshot({ historyLimit: 0 }).prices
+    return prices?.[cropId]?.price ?? null
+  }
+
   function tradingWindowView () {
     const now = tradingClock()
     const view = trading === null
@@ -4643,6 +4700,23 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 期货（票 92）：托管账户同样建在农场硬币之上，指数取交易所的本机价（票 94 再换成
+      // 局域网加权价）。坏文件只降级成空市场，农场与盘口照常；`futuresNow` 只给测试注入。
+      if (farm !== null) {
+        try {
+          futures = await createFuturesStore(dir, {
+            log,
+            farm,
+            indexOf: futuresIndexOf,
+            ...(typeof options.futuresNow === 'function' ? { now: options.futuresNow } : {})
+          })
+        } catch (error) {
+          futures = null
+          warn(ctx, '期货初始化失败，本次按空市场运行：' + message(error))
+        }
+      }
+      if (disposed) return
+
       // 季节/节日/来客（票 65/67）：只写 season.json；坏文件降级成「没有节日」，
       // 但季节本身仍由纯规则按本地日期算，农场照常运行。
       try {
@@ -6298,6 +6372,8 @@ export function createService (ctx, options = {}) {
         ticks.push(['红包', expirePackets(Date.now())])
         // 盘口（票 79）搭同一班车：60 秒一拍正好是 1 个 tick；收盘/换周后把新盘面推给窗口。
         if (trading !== null) ticks.push(['盘口', trading.tick().then(() => refreshTradingWindow())])
+        // 期货（票 92）搭同一班车：每拍结算「开仓那一根已经走完」的仓位，幂等。
+        if (futures !== null) ticks.push(['期货', futures.settleDue(futuresClock())])
       } catch (error) {
         warnOnce('farm-tick', '农场 tick 失败：' + message(error))
         return
@@ -7292,6 +7368,8 @@ export function createService (ctx, options = {}) {
     contractWindow: () => contractWindowView(),
     /** 票 79 的测试/诊断缝：盘口窗当前会收到的整份视图。 */
     tradingWindow: () => tradingWindowView(),
+    /** 票 92 的测试/诊断缝：期货账本的整份只读视图（与 `/state` 的 `futures` 同源）。 */
+    futures: () => futuresView(),
     farmGuard: () => farmGuard(),
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),
