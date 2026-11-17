@@ -369,9 +369,10 @@ CI 里已经写死 `--registry=https://registry.npmjs.org`。
 
 #### 兜底：本地手动发
 
-CI 挂了又急着发版时，在 `package.json` 版本对应的那个 tag 上手动发：
+CI 挂了又急着发版时，先 checkout 到对应 tag（`package.json` 的版本要和 tag 一致），再手动发：
 
 ```sh
+git checkout v1.0.0
 npm publish --registry=https://registry.npmjs.org --access public
 ```
 
