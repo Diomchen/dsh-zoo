@@ -3387,6 +3387,9 @@ function statusEvent (id) {
 
 function sendReady () {
   readySent = true
+  // 票 94：混合 DPI 下把「每块屏在窗口 CSS 坐标里的矩形」一起报给宿主；算不出来就不带，
+  // 宿主按老算法（DIP 差值）兜底。
+  const measuredFloors = measureFloorsInCss()
   writeEvent({
     type: 'ready',
     pid: process.pid,
@@ -3395,6 +3398,7 @@ function sendReady () {
     // 两者必须是同一个矩形，否则宠物会被宿主放在窗口外（屏幕上看起来就是“不见了”）。
     workArea: surfaceBounds() ?? surfaceArea(),
     displays: displayList(),
+    ...(measuredFloors === null ? {} : { floors: measuredFloors.floors, homeArea: measuredFloors.homeArea }),
     debug: debugEnabled,
     shotMode: isShotMode
   })
@@ -3436,6 +3440,90 @@ function surfaceBounds () {
   } catch {
     return null
   }
+}
+
+/**
+ * 一块屏的**真实物理**工作区（票 94）。
+ *
+ * `screen.dipToScreenRect(win, rect)` 只按**窗口自己**的缩放换算：跨屏窗口里，缩放和窗口不同的
+ * 那块屏会被算到别处去（实测主屏 125% + 副屏 150% 时，主屏的工作区被算到屏幕左上方的空白里，
+ * 宠物走到那条「地板」上就出了显示器、抓不回来）。在那块屏上临时开一扇 8×8 的隐藏窗，让系统按
+ * **那块屏**的 DPI 落位，再问它的物理矩形，拿到的才是真值。
+ */
+function displayPhysicalWorkArea (display) {
+  let probe = null
+  try {
+    probe = new BrowserWindow({
+      x: display.workArea.x,
+      y: display.workArea.y,
+      width: 8,
+      height: 8,
+      show: false,
+      frame: false,
+      skipTaskbar: true,
+      focusable: false,
+      enableLargerThanScreen: true
+    })
+    return screen.dipToScreenRect(probe, display.workArea)
+  } catch {
+    return null
+  } finally {
+    try {
+      probe?.destroy()
+    } catch {
+      // 探针窗销毁失败不影响主窗
+    }
+  }
+}
+
+/**
+ * 每块屏在窗口 CSS 坐标里的工作区 + 主屏出生区（票 94）。
+ *
+ * 场景下发给渲染端的 floors / homeArea 必须是**窗口 CSS 坐标**：渲染端画在哪，命中矩形就在哪。
+ * 缩放一致时物理换算和 DIP 差值等价；缩放不一致时必须按物理矩形换算，否则小屏那块地板会整体
+ * 偏到屏幕左上方。任何一步拿不到物理几何就返回 null，宿主回退旧算法。
+ * @returns {{floors:object[], homeArea:object|null}|null}
+ */
+function measureFloorsInCss () {
+  if (win === null || win.isDestroyed()) return null
+  if (typeof screen.dipToScreenRect !== 'function') return null
+  const bounds = surfaceBounds()
+  if (bounds === null || !(bounds.width > 0)) return null
+  let windowPhysical = null
+  try {
+    windowPhysical = screen.dipToScreenRect(win, bounds)
+  } catch {
+    return null
+  }
+  const windowScale = windowPhysical.width / bounds.width
+  if (!(windowScale > 0)) return null
+  let primary = null
+  try {
+    primary = screen.getPrimaryDisplay()
+  } catch {
+    primary = null
+  }
+  const displays = []
+  for (const display of screen.getAllDisplays()) {
+    const sameScale = Math.abs(display.scaleFactor - windowScale) < 0.01
+    const physicalWorkArea = sameScale
+      ? screen.dipToScreenRect(win, display.workArea)
+      : displayPhysicalWorkArea(display)
+    if (physicalWorkArea === null) continue
+    displays.push({
+      id: display.id,
+      primary: primary !== null && display.id === primary.id,
+      physicalWorkArea
+    })
+  }
+  const measured = shared.floorsFromPhysical({
+    windowPhysical,
+    windowScale,
+    displays,
+    area: { x: 0, y: 0, width: bounds.width, height: bounds.height }
+  })
+  if (measured.floors.length === 0) return null
+  return measured
 }
 
 function writeEvent (event) {

@@ -505,14 +505,14 @@ test('多屏地面带：同高相邻合并、异高分开；宠物不会走进�
     { x: 2560, y: 0, width: 1920, height: 1080 }
   ]
   assert.deepEqual(shared.walkBands(floors), [
-    { x: 2560, width: 1920, bottom: 1080 },
-    { x: 0, width: 2560, bottom: 1440 }
+    { x: 2560, width: 1920, top: 0, bottom: 1080 },
+    { x: 0, width: 2560, top: 0, bottom: 1440 }
   ], '底边不同 = 两条独立的带（按 bottom 从小到大）')
 
   assert.deepEqual(shared.walkBands([
     { x: 0, y: 0, width: 1440, height: 875 },
     { x: 1440, y: 0, width: 1440, height: 875 }
-  ]), [{ x: 0, width: 2880, bottom: 875 }], '同高相邻的两块屏是一条带，可以来回走')
+  ]), [{ x: 0, width: 2880, top: 0, bottom: 875 }], '同高相邻的两块屏是一条带，可以来回走')
 
   assert.deepEqual(shared.walkBands([
     { x: 0, y: 0, width: 1440, height: 875 },
@@ -522,7 +522,7 @@ test('多屏地面带：同高相邻合并、异高分开；宠物不会走进�
   assert.equal(shared.normalizeFloors([{ x: 1 }, null, 'x']).length, 0, '坏矩形直接丢')
 
   const shortBand = shared.bandAt(shared.walkBands(floors), { x: 2700, y: 1300 })
-  assert.deepEqual(shortBand, { x: 2560, width: 1920, bottom: 1080 }, '黑区里按水平范围回到脚下的矮屏')
+  assert.deepEqual(shortBand, { x: 2560, width: 1920, top: 0, bottom: 1080 }, '黑区里按水平范围回到脚下的矮屏')
 
   // 松手：x、y 都夹回矮屏，不能留在黑区里。
   const dropped = shared.confineBodyToBand(
@@ -551,6 +551,36 @@ test('多屏地面带：同高相邻合并、异高分开；宠物不会走进�
   for (let index = 0; index < 300; index += 1) one = shared.stepOnBand(one, single, 1 / 60, singleBand)
   assert.equal(one.y + one.height, 875 - 8)
   assert.ok(one.x + one.width <= 1440)
+})
+
+test('多屏带：扔到屏幕上方空区的宠物会被顶边弹回来（票 95）', () => {
+  // 混合 DPI 现场：主屏在窗口 CSS 坐标里只占下半截（顶边 641、底边 1395），
+  // 上半截左边是没有显示器的空区。只按窗口顶夹的话，往上扔会飞进空区抓不回来。
+  const union = { x: 0, y: 0, width: 4096, height: 1395 }
+  const floors = [
+    { x: 256, y: 641, width: 1280, height: 754 },
+    { x: 1536, y: 0, width: 2560, height: 1392 }
+  ]
+  const bands = shared.walkBands(floors)
+  const band = shared.bandAt(bands, { x: 700, y: 1395 })
+  assert.deepEqual(band, { x: 256, width: 1280, top: 641, bottom: 1395 })
+
+  let body = shared.createBody({ x: 700, y: 1000, width: 120, height: 160, vx: 0, vy: -2500 }, union)
+  for (let index = 0; index < 240; index += 1) {
+    body = shared.stepOnBand(body, union, 1 / 60, shared.bandAt(bands, {
+      x: body.x + body.width / 2,
+      y: body.y + body.height / 2
+    }))
+    assert.ok(body.y >= 641 - 0.01, '不能跑到屏幕顶边上方：y=' + body.y)
+  }
+
+  // 松手/出生：直接丢在上方空区也会被拉回这块屏的顶边以内。
+  const dropped = shared.confineBodyToBand({ x: 700, y: 100, width: 120, height: 160 }, union, band)
+  assert.ok(dropped.y >= 641, 'confine 也要夹住顶边：y=' + dropped.y)
+
+  // 没有 top 的旧场景（老宿主）行为不变：仍然只按窗口顶。
+  const legacy = shared.walkBands([{ x: 0, y: 0, width: 1000, height: 800 }])
+  assert.equal(legacy[0].top, 0)
 })
 
 test('穿透裁定：光标不在命中区永远是穿透；渲染端确认要新鲜；没确认时按停留兜底', () => {
