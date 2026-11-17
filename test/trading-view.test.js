@@ -42,7 +42,7 @@ const TF_SPAN = { '1h': HOUR_MS, '1d': 24 * HOUR_MS, '1w': 7 * 24 * HOUR_MS }
 
 const LIMITS = {
   margins: [50, 100, 250],
-  leverages: [1, 5, 20],
+  leverages: [1, 5],
   crops: [
     { id: 'tomato', name: '小番茄' },
     { id: 'carrot', name: '胡萝卜' },
@@ -304,8 +304,9 @@ test('票 81：下单区有三档杠杆（来自 payload）、预览句与作物
   assert.equal(order.submitLabel, '开一手')
   assert.equal(order.preview, '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
   // SPEC v10 US7：下单前就能看到强平价；做空的强平线在现价上方。
-  assert.equal(order.liquidationPrice, 5.06 * 1.2)
-  assert.equal(order.liquidationText, '强平价 6.07 · 涨到就平')
+  // 票 101：强平线预留 5% 维持保证金 → 5.06 × (1 + 0.95/5)。
+  assert.equal(order.liquidationPrice, 5.06 * 1.19)
+  assert.equal(order.liquidationText, '强平价 6.02 · 涨到就平')
   assert.deepEqual(order.sides.map((choice) => choice.label), ['做多', '做空'])
   // 票 83：三档预设 + 一颗「全下」（金额 = 此刻可用硬币 120）。
   assert.deepEqual(order.margins.map((choice) => choice.margin), [50, 100, 250, 120])
@@ -313,7 +314,7 @@ test('票 81：下单区有三档杠杆（来自 payload）、预览句与作物
   assert.equal(order.margins[1].active, true)
   assert.equal(order.margins[3].allIn, true)
   assert.equal(order.margins[3].disabled, false)
-  assert.deepEqual(order.leverages.map((choice) => choice.leverage), [1, 5, 20])
+  assert.deepEqual(order.leverages.map((choice) => choice.leverage), [1, 5])
   assert.equal(order.leverages[1].active, true)
   // 白名单之外的方向/保证金/杠杆回到默认值。
   assert.equal(view.orderView(payload(), { side: 'up', margin: 7, leverage: 3 }).side, 'long')
@@ -350,7 +351,8 @@ test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式�
     current: { slot: SLOT, open: 100, high: 100, low: 100, price: 100, tick: 0, remainingMs: 1 }
   })
   for (const side of ['long', 'short']) {
-    for (const leverage of [5, 20]) {
+    // 票 101：白名单只剩 1×/5×，20× 不再作为可下单杠杆参与对拍。
+    for (const leverage of [5]) {
       const order = view.orderView(at, { side, leverage, margin: 50 })
       assert.equal(
         order.liquidationPrice,
@@ -362,6 +364,8 @@ test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式�
         (side === 'long' ? '跌到就平' : '涨到就平'))
     }
   }
+  // 白名单之外的杠杆（老窗口传 20×）回落到 1×，于是没有强平线。
+  assert.equal(view.orderView(at, { leverage: 20, margin: 50 }).leverage, 1)
   // 1× 没有强平线：数字是 null，文案是「强平价 —」（SPEC v10 US7）。
   const oneX = view.orderView(at, { leverage: 1, margin: 50 })
   assert.equal(oneX.liquidationPrice, null)
@@ -994,7 +998,7 @@ test('票 91：下单横条两排、4/3 档、没有滚动容器；11px 只留�
   assert.match(html, /class="order-row order-row-secondary"/)
   assert.doesNotMatch(html, /\.field-row \{/)
   assert.match(html, /\.order-row \.chip-row\.margins \{[\s\S]*?repeat\(4, 42px\)/)
-  assert.match(html, /\.order-row \.chip-row\.leverages \{[\s\S]*?repeat\(3, 42px\)/)
+  assert.match(html, /\.order-row \.chip-row\.leverages \{[\s\S]*?repeat\(2, 42px\)/)
   // 同一组内相邻点击目标 ≥8px；组与组之间 ≥10px。
   assert.match(html, /\.order-row \.chip-row \{[\s\S]*?gap: 8px/)
   assert.match(html, /\.order-row \{[\s\S]*?gap: 10px/)
@@ -1169,7 +1173,7 @@ test('票 79：空态与坏输入都不抛——没有盘口数据时也能画�
     assert.equal(board.league.hasPeers, false)
     assert.equal(board.hints.neighbors, '等邻居上线')
   }
-  // 老 payload 没有 limits.leverages：杠杆退回 1×（票 80 之后宿主会下发 [1,5,20]）。
+  // 老 payload 没有 limits.leverages：杠杆退回 1×（票 101 之后宿主只下发 [1,5]）。
   const legacy = view.orderView({ coins: { available: 120 } })
   assert.deepEqual(legacy.leverages.map((choice) => choice.leverage), [1])
   assert.equal(legacy.leverage, 1)
@@ -1276,7 +1280,7 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
     'timeframe:15m',
     'side:long', 'side:short',
     'margin:50', 'margin:100', 'margin:250', 'margin:all-in',
-    'leverage:1', 'leverage:5', 'leverage:20',
+    'leverage:1', 'leverage:5',
     'limit-toggle', 'limit-input', 'limit-place', 'submit',
     'cancel:' + ORDER_ID,
     'stop:p1', 'close:p1'
@@ -1949,8 +1953,8 @@ test('票 91：下单横条第二行的预览句只留「涨 1% / 跌 1%」；�
   const order = view.orderView(payload({ coins: { available: 500 } }), { margin: 100, leverage: 5 })
   assert.equal(order.preview, '5× · 100 保证金：涨 1% = +5；跌 1% = −5；强平 −100')
   assert.equal(order.previewShort, '涨 1% +5 · 跌 1% −5')
-  // 做多 + 5×：5.06 × (1 − 1/5) = 4.048 → 4.05，且方向文案是「跌到就平」。
-  assert.equal(order.liquidationText, '强平价 4.05 · 跌到就平')
+  // 做多 + 5×：5.06 × (1 − 0.95/5) = 4.0986 → 4.10，且方向文案是「跌到就平」。
+  assert.equal(order.liquidationText, '强平价 4.10 · 跌到就平')
   // 1× 没有强平：横条第二行显示「强平价 —」（与旧字段同一口径）。
   const oneX = view.orderView(payload({ coins: { available: 500 } }), { margin: 100, leverage: 1 })
   assert.equal(oneX.previewShort, '涨 1% +1 · 跌 1% −1')

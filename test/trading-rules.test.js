@@ -15,6 +15,7 @@ import {
   BOARD_BAR_COUNT,
   BOARD_SIDES,
   BOARD_TIMEFRAMES,
+  LEGACY_MAX_LEVERAGE,
   MAX_LEVERAGE,
   MAX_MARGIN,
   MAX_PATH_SCAN_MS,
@@ -107,9 +108,9 @@ test('票 79：同一作物 + slot + tick 在任何机器上是同一个价（�
   // 中间插入别的计算不影响结果（没有隐藏的可变状态）。
   boardPrice({ crop: 'corn', slot: SLOT + 999, tick: 3 })
   assert.equal(boardPrice({ crop: 'tomato', slot: SLOT, tick: 0 }), first)
-  // 散列本身是固定的：种子/盐一改就会在这里报警（票 86 把盐升到 v2，老图作废）。
-  assert.equal(PRICE_SALT, 'board-v2')
-  assert.equal(hash32('board-v2:tomato:fast:0'), 1142833372)
+  // 散列本身是固定的：种子/盐一改就会在这里报警（票 102 把模型换成 v4 随机游走，老图作废）。
+  assert.equal(PRICE_SALT, 'board-v4')
+  assert.equal(hash32('board-v4:tomato'), 3948279544)
 })
 
 test('票 79：收盘价 = 下一根的开盘价，bar 之间连续', () => {
@@ -152,7 +153,7 @@ test('票 79：作物不同、slot 不同就是不同的图；参数坏掉返回
   assert.equal(boardPrice({ crop: 'tomato', slot: SLOT, tick: 99 }), slotClosePrice('tomato', SLOT))
 })
 
-test('票 79：此刻的价格只由时间决定（开盘 = 边界那一刻的现价）', () => {
+test('票 79：此刻的价格只由时间决定（1 分钟内恒定，跨分钟才走一步）', () => {
   const slot = SLOT
   assert.equal(markPrice({ crop: 'tomato', now: slot * SLOT_MS }), boardPrice({ crop: 'tomato', slot, tick: 0 }))
   assert.equal(
@@ -160,10 +161,15 @@ test('票 79：此刻的价格只由时间决定（开盘 = 边界那一刻的�
     boardPrice({ crop: 'tomato', slot, tick: 7.5 })
   )
   assert.equal(markPrice({ crop: 'tomato', now: 'nope' }), null)
-  // 相邻两毫秒的价格只差一点点：路径是连续的，回放不会看到阶跃。
-  const before = markPrice({ crop: 'tomato', now: slot * SLOT_MS - 1 })
-  const after = markPrice({ crop: 'tomato', now: slot * SLOT_MS + 1 })
-  assert.ok(Math.abs(after - before) < CROPS.tomato.base * 0.001)
+  // v4 是分钟级随机游走：同一分钟之内价格恒定（不插值——插值等于把下一分钟的方向提前印出来），
+  // 跨过整分钟才走一步，而不是毫秒连续。
+  const start = slot * SLOT_MS + 3 * TICK_MS
+  const within = markPrice({ crop: 'tomato', now: start })
+  assert.equal(markPrice({ crop: 'tomato', now: start + TICK_MS - 1 }), within)
+  const next = markPrice({ crop: 'tomato', now: start + TICK_MS })
+  assert.notEqual(next, within)
+  // 一步的幅度有上限：均匀增量 ±√3σ ≈ ±0.9%，远小于底价的 2%。
+  assert.ok(Math.abs(next - within) <= CROPS.tomato.base * 0.02, '一分钟的步子太大：' + (next - within))
 })
 
 test('票 79：盈亏 = 保证金 × 杠杆 × 价格变化；做空反过来', () => {
@@ -182,22 +188,22 @@ test('票 79：结算按整数硬币四舍五入；亏损封顶保证金，硬�
   // +3.6 → +4，退回 104。
   assert.deepEqual(
     settlementOf({ side: 'long', margin: 100, leverage: 1, entry: 5, mark: 5.18 }),
-    { pnl: 4, credit: 104 }
+    { pnl: 4, fee: 0, credit: 104 }
   )
   // −3.6 → −4。
   assert.deepEqual(
     settlementOf({ side: 'long', margin: 100, leverage: 1, entry: 5, mark: 4.82 }),
-    { pnl: -4, credit: 96 }
+    { pnl: -4, fee: 0, credit: 96 }
   )
   // 价格归零也只亏掉保证金：pnl = −margin，退回 0（调用方跳过 addCoins）。
   assert.deepEqual(
     settlementOf({ side: 'long', margin: 50, leverage: 1, entry: 5, mark: 0 }),
-    { pnl: -50, credit: 0 }
+    { pnl: -50, fee: 0, credit: 0 }
   )
   // 做空方向反过来，封顶同样只看 margin。
   assert.deepEqual(
     settlementOf({ side: 'short', margin: 100, leverage: 1, entry: 5, mark: 50 }),
-    { pnl: -100, credit: 0 }
+    { pnl: -100, fee: 0, credit: 0 }
   )
   assert.equal(settlementOf({ side: 'long', margin: 0, leverage: 1, entry: 5, mark: 6 }), null)
 })
@@ -219,7 +225,7 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物
   assert.deepEqual(boardCrops(), CROP_IDS)
   // 票 83：三档预设 + 窗口的「全下」；保证金规则本身接受任意整数（见下一条）。
   assert.deepEqual(TRADING_MARGINS, [50, 100, 250])
-  assert.deepEqual(TRADING_LEVERAGES, [1, 5, 20])
+  assert.deepEqual(TRADING_LEVERAGES, [1, 5])
   assert.deepEqual(BOARD_SIDES, ['long', 'short'])
   // 结算原因固定四种：手动 / 收盘 / 强平 / 止损（历史行就按这个写）。
   assert.deepEqual(TRADING_CLOSE_REASONS, ['close', 'settle', 'liquidate', 'stop'])
@@ -244,7 +250,8 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物
   assert.equal(isMarginAmount('50'), false)
   assert.equal(isTradingLeverage(1), true)
   assert.equal(isTradingLeverage(5), true)
-  assert.equal(isTradingLeverage(20), true)
+  // 票 101：20× 从下单白名单拿掉了，老仓位仍要能读回来（见下一条）。
+  assert.equal(isTradingLeverage(20), false)
   assert.equal(isTradingLeverage(2), false)
   assert.equal(isTradingLeverage('5'), false)
   assert.equal(isStopLossLevel(0), true)
@@ -254,7 +261,8 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物
   assert.equal(isStopLossLevel('0.5'), false)
   // 读盘只按形状（5×/20× 写进文件后仍要能读回来）。
   assert.equal(isStoredLeverage(20), true)
-  assert.equal(isStoredLeverage(MAX_LEVERAGE + 1), false)
+  assert.equal(isStoredLeverage(LEGACY_MAX_LEVERAGE), true)
+  assert.equal(isStoredLeverage(LEGACY_MAX_LEVERAGE + 1), false)
   assert.equal(isStoredLeverage(0), false)
 })
 
@@ -319,12 +327,14 @@ test('票 88：运行时新增作物立刻上盘口；坏底价/缺底价被忽�
   assert.equal(targetBandOf({ crop: 'no-base' }), null)
 })
 
-test('票 80：强平价 = 1/杠杆；做多往下、做空往上；1× 没有强平线', () => {
+test('票 101：强平价 = 维持保证金 5%（0.95/杠杆）；做多往下、做空往上；1× 没有强平线', () => {
   // 用二进制里能整除的价格（8）断言精确值，不留浮点尾巴。
-  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 5 }), 8 * 0.8)
-  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 5 }), 8 * 1.2)
-  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 20 }), 8 * 0.95)
-  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 20 }), 8 * 1.05)
+  // 5× 的强平线从「亏光」的 −20% 收到 −19%（权益只剩 5%）；8 × 0.81 = 6.48。
+  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 5 }), 8 * 0.81)
+  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 5 }), 8 * 1.19)
+  // 老仓位的 20× 仍按同一条公式算：8 × 0.9525。
+  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 20 }), 8 * 0.9525)
+  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 20 }), 8 * 1.0475)
   // 1× 要跌到 0 才亏光，而价格有底价：没有强平线，窗口画「—」。
   assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 1 }), null)
   assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 1 }), null)
@@ -332,12 +342,15 @@ test('票 80：强平价 = 1/杠杆；做多往下、做空往上；1× 没有�
   assert.equal(liquidationPriceOf({ side: 'up', entry: 8, leverage: 5 }), null)
   assert.equal(liquidationPriceOf({ side: 'long', entry: 0, leverage: 5 }), null)
   assert.equal(liquidationPriceOf({ side: 'long', entry: 'x', leverage: 5 }), null)
-  // 强平价正好是「保证金亏光」的那一点：pnl = −margin（证明两条公式同源）。
+  // 强平价正好是「权益只剩保证金的 5%」那一点：pnl = −0.95 × margin（两条公式同源）。
   for (const leverage of [5, 20]) {
     for (const side of ['long', 'short']) {
       const line = liquidationPriceOf({ side, entry: 8, leverage })
       const pnl = pnlOf({ side, margin: 50, leverage, entry: 8, mark: line })
-      assert.ok(Math.abs(pnl + 50) < 1e-9, side + ' ' + leverage + '× 在强平价正好亏光保证金（' + pnl + '）')
+      assert.ok(
+        Math.abs(pnl + 0.95 * 50) < 1e-9,
+        side + ' ' + leverage + '× 在强平价只剩 5% 权益（' + pnl + '）'
+      )
     }
   }
 })
@@ -506,7 +519,8 @@ function beyondCap (seed) {
       floor = Math.min(floor, extremesOf(slot).low.price)
     }
     // 强平线放在窗口最低价再低 0.1%：窗口里一秒都不该触发。
-    const entry = (floor / 0.95) * 0.999
+    // 票 101：20× 的强平线是 0.9525 × entry（维持保证金 5%），不是老口径的 0.95。
+    const entry = (floor / (1 - 0.95 / 20)) * 0.999
     const capEnd = start + MAX_PATH_SCAN_SLOTS
     for (let slot = capEnd; slot < capEnd + 480; slot += 1) {
       if (extremesOf(slot).low.price < floor * 0.998) {
@@ -849,20 +863,21 @@ function readabilityOf (chart) {
  *         但那是「影线满幅」下的假实体：单根振幅本身就接近整张图）。
  * 三个作物 × 三个时刻一起断言，谁把长波幅度调小了都会在这里露出来。
  */
-test('票 86：多尺度慢波——1 日/1 周都读得出趋势，周线实体不是针', () => {
+test('票 86（v4 修订）：随机游走的尺度性质——窗口越长振幅越大，实体不是针', () => {
+  // 票 102 把价格换成随机游走之后，「读得出趋势」不再成立（鞅没有趋势，这正是要的）：
+  // 这里改成钉住鞅的形状——振幅仍随窗口变长按 √N 放大，K 线不是一条被压平的直线。
   for (const crop of boardCrops()) {
     for (const now of READABILITY_NOWS) {
       const day = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1d' }))
       const dayTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 日'
-      assert.ok(day.run >= 4, dayTag + '趋势段只有 ' + day.run + ' 根')
+      // 实测 2.2–11.9×（√96 ≈ 9.8 的量级），低于 2 说明被压平了。
       assert.ok(day.rangeRatio >= 2, dayTag + '总振幅只有单根的 ' + day.rangeRatio.toFixed(2) + ' 倍')
+      assert.ok(day.bodyRatio >= 0.25, dayTag + '实体占比只有 ' + day.bodyRatio.toFixed(3))
 
       const week = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1w' }))
       const weekTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 周'
-      assert.ok(week.run >= 3, weekTag + '趋势段只有 ' + week.run + ' 根')
-      assert.ok(week.rangeRatio >= 1.8, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
-      // 实体占比：影线不是「接近满幅」，收盘价确实落在这一周的实际移动上。
-      assert.ok(week.bodyRatio >= 0.35, weekTag + '实体占比只有 ' + week.bodyRatio.toFixed(3))
+      // 实测 1.71–2.38（√7 ≈ 2.6 的量级）；下限放到 1.5，只拦「整周不动」。
+      assert.ok(week.rangeRatio >= 1.5, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
     }
   }
 })
@@ -874,19 +889,20 @@ test('票 86：多尺度慢波——1 日/1 周都读得出趋势，周线实体
  *   × 每根 3 个 tick 扫下来，价格仍在 [0.58, 1.71] × 底价 之内（实测 0.59–1.704），
  *   没有一根是被夹出来的。
  */
-test('票 86：15 分钟仍有日内波动，价格离夹子有余量', () => {
+test('票 86（v4 修订）：15 分钟仍有日内波动，一年也基本不贴夹子', () => {
   for (const crop of boardCrops()) {
     const base = CROPS[crop].base
     const chart = barsFor({ crop, now: TF_NOW })
     const highs = chart.bars.map((bar) => bar.high).concat(chart.current.high)
     const lows = chart.bars.map((bar) => bar.low).concat(chart.current.low)
     const range = Math.max(...highs) - Math.min(...lows)
+    // 实测 9.7–22%（σ_bar ≈ 2%，24 根按 √N 放大）。
     assert.ok(
-      range >= base * 0.1,
+      range >= base * 0.07,
       crop + ' 6 小时振幅只有底价的 ' + ((range / base) * 100).toFixed(1) + '%'
     )
   }
-  // 逐 slot 扫一年：快噪声的格点就在整数 slot 上，取开盘/半根/收盘三针已经够密。
+  // 逐 slot 扫一年：价格是随机的，但 OU 回归的稳态 σ ≈ 0.12，夹子（±5σ）外基本摸不到。
   for (const crop of boardCrops()) {
     const base = CROPS[crop].base
     const firstSlot = slotIndexAt(TF_NOW)
@@ -899,9 +915,9 @@ test('票 86：15 分钟仍有日内波动，价格离夹子有余量', () => {
         if (ratio > highest) highest = ratio
       }
     }
-    assert.ok(lowest >= 0.58, crop + ' 价格贴到夹取下沿：' + lowest.toFixed(3))
-    // 十种作物里 pea 最高 1.7034（2026 年扫一年）；仍离 1.75 的夹子有余量。
-    assert.ok(highest <= 1.71, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
+    // 严格不等：真被夹住会正好等于夹子，这里既证明「没贴上去」，也证明夹子没参与定价。
+    assert.ok(lowest > PRICE_FLOOR_RATIO, crop + ' 价格贴到夹取下沿：' + lowest.toFixed(3))
+    assert.ok(highest < PRICE_CEIL_RATIO, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
   }
 })
 
@@ -925,13 +941,16 @@ test('票 86：采样细化只改显示——结算/路径/止损仍只认 15 �
   const lastWeek = week.bars.at(-1)
   assert.equal(lastWeek.close, boardPrice({ crop: 'tomato', slot: slotIndexAt(lastWeek.end), tick: 0 }))
   // 结算 = 保证金 × 杠杆 × (现价/入场 − 1)，只在最后取整；亏损封顶保证金。
+  // 价格是随机的，所以期望值按当天收盘现算（票 102 之前这里是写死的 121/221）。
+  const longPnl = Math.round(pnlOf({ side: 'long', margin: 100, leverage: 5, entry: 5, mark: close }))
   assert.deepEqual(
     settlementOf({ side: 'long', margin: 100, leverage: 5, entry: 5, mark: close }),
-    { pnl: 121, credit: 221 }
+    { pnl: longPnl, fee: 0, credit: 100 + longPnl }
   )
+  // 亏损封顶：做空遇到 10 倍价，只亏掉保证金。
   assert.deepEqual(
-    settlementOf({ side: 'short', margin: 100, leverage: 5, entry: 5, mark: close }),
-    { pnl: -100, credit: 0 }
+    settlementOf({ side: 'short', margin: 100, leverage: 5, entry: 5, mark: 50 }),
+    { pnl: -100, fee: 0, credit: 0 }
   )
 
   // 路径扫描的参考实现：从下一个整数分钟走到终点，端点也算（和 pathScan 同一条网格）。
@@ -952,10 +971,18 @@ test('票 86：采样细化只改显示——结算/路径/止损仍只认 15 �
   const from = spikeSlot * SLOT_MS
   const to = (spikeSlot + 1) * SLOT_MS
   const liquidation = liquidationPriceOf({ side: 'long', entry, leverage: 20 })
-  assert.deepEqual(
-    pathScan({ crop: 'tomato', side: 'long', margin: 50, leverage: 20, entry, from, to }),
-    referenceScan(from, to, (mark) => isLiquidated({ side: 'long', mark, liquidation }), 'liquidate')
+  const liquidated = pathScan({ crop: 'tomato', side: 'long', margin: 50, leverage: 20, entry, from, to })
+  const referenceLiquidation = referenceScan(
+    from,
+    to,
+    (mark) => isLiquidated({ side: 'long', mark, liquidation }),
+    'liquidate'
   )
+  // 触发时刻与逐分钟重扫一致；但成交价按**强平线**算，不用那一分钟的插针价
+  // （票 102：否则 20× 一格跳空能穿透好几个点，5% 维持保证金就名存实亡）。
+  assert.equal(liquidated.at, referenceLiquidation.at)
+  assert.equal(liquidated.reason, 'liquidate')
+  assert.equal(liquidated.exit, liquidation)
   // 止损：5× 的 −25% 保证金 = 价格 −5%，同一根里先撞到它（强平线在 −20%，这一根摸不到）。
   assert.deepEqual(
     pathScan({ crop: 'tomato', side: 'long', margin: 50, leverage: 5, entry, stopLoss: 0.25, from, to }),
@@ -968,15 +995,17 @@ test('票 86：采样细化只改显示——结算/路径/止损仍只认 15 �
   )
 })
 
-test('票 81：风向是确定性的 55–68% 弱信号，同一根内不变', () => {
-  const now = SLOT_EDGE + 3 * TICK_MS
+test('票 81（v4 修订）：风向是最近三根动量的 55–68% 弱信号，同一根内不变', () => {
+  // 票 102：风向改成「最近三根已实现动量」，必须挑一根已经有历史的 slot。
+  const base = SLOT_EDGE + 500 * SLOT_MS
+  const now = base + 3 * TICK_MS
   const hint = hintOf({ crop: 'tomato', now })
   assert.deepEqual(hintOf({ crop: 'tomato', now }), hint)
   assert.ok(hint.confidence >= 0.55 && hint.confidence <= 0.68, '置信度落在 55–68%：' + hint.confidence)
   assert.ok(['up', 'down', 'flat'].includes(hint.direction))
-  // 同一根内（开根/中间/差 1 毫秒收盘）风向不闪：斜率取的是本根起点。
+  // 同一根内（开根/中间/差 1 毫秒收盘）风向不闪：三根历史都在本根之前。
   for (const offset of [0, 7 * TICK_MS, SLOT_MS - 1]) {
-    assert.deepEqual(hintOf({ crop: 'tomato', now: SLOT_EDGE + offset }), hint)
+    assert.deepEqual(hintOf({ crop: 'tomato', now: base + offset }), hint)
   }
   // 一整天扫过去：方向有涨有跌，置信度是 0.01 一格的离散值，都夹在区间里。
   const directions = new Set()
@@ -1017,39 +1046,37 @@ test('票 83：到价目标价带 = 0.55–1.75× 底价，带外/坏数字一�
 
 test('票 83：到价成交扫描——做多跌到目标、做空涨到目标，成交价永远是目标价', () => {
   const start = SLOT_EDGE
-  // 这一根的 tick 1–15 是一路下跌的（见 slot 1959232 的确定性路径）。
-  const longTarget = markPrice({ crop: 'tomato', now: start + 14 * TICK_MS })
-  const longFill = limitFillScan({
-    crop: 'tomato',
-    side: 'long',
-    target: longTarget,
-    from: start,
-    to: start + SLOT_MS
-  })
-  assert.deepEqual(longFill, { at: start + 14 * TICK_MS, slot: SLOT })
-  // 目标价刚好等于第 14 分钟的价：第 14 分钟成交，不是收盘，也不是更早。
-  assert.ok(markPrice({ crop: 'tomato', now: start + 13 * TICK_MS }) > longTarget)
+  // 票 102 起价格是随机的，不能再写死「这一根一路下跌」：先把这一根的 16 个分钟价读出来，
+  // 再按「第一个满足条件的那一分钟」算期望值。
+  const prices = []
+  for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+    prices.push(markPrice({ crop: 'tomato', now: start + tick * TICK_MS }))
+  }
+  const firstIndex = (hit) => prices.findIndex(hit)
 
-  const shortTarget = markPrice({ crop: 'tomato', now: start + TICK_MS })
-  const shortFill = limitFillScan({
-    crop: 'tomato',
-    side: 'short',
-    target: shortTarget,
-    from: start,
-    to: start + SLOT_MS
-  })
-  assert.deepEqual(shortFill, { at: start + TICK_MS, slot: SLOT })
+  // 做多：价格跌到这一根的最低点就成交，成交价永远是目标价本身。
+  const longTarget = Math.min(...prices)
+  const longIndex = firstIndex((price) => price <= longTarget)
+  assert.deepEqual(
+    limitFillScan({ crop: 'tomato', side: 'long', target: longTarget, from: start, to: start + SLOT_MS }),
+    { at: start + longIndex * TICK_MS, slot: SLOT }
+  )
 
-  // 终点在收盘那一刻：收盘价也参与扫描（图上摸到就算）。
+  // 做空：涨到这一根的最高点成交。
+  const shortTarget = Math.max(...prices)
+  const shortIndex = firstIndex((price) => price >= shortTarget)
+  assert.deepEqual(
+    limitFillScan({ crop: 'tomato', side: 'short', target: shortTarget, from: start, to: start + SLOT_MS }),
+    { at: start + shortIndex * TICK_MS, slot: SLOT }
+  )
+
+  // 终点在收盘那一刻：收盘价也参与扫描，且「先摸到就按摸到的那一分钟成交」。
   const closeTarget = slotClosePrice('tomato', SLOT)
-  const atClose = limitFillScan({
-    crop: 'tomato',
-    side: 'long',
-    target: closeTarget,
-    from: start,
-    to: start + SLOT_MS
-  })
-  assert.equal(atClose.at, start + SLOT_MS)
+  const closeIndex = firstIndex((price) => price <= closeTarget)
+  assert.deepEqual(
+    limitFillScan({ crop: 'tomato', side: 'long', target: closeTarget, from: start, to: start + SLOT_MS }),
+    { at: start + (closeIndex === -1 ? SLOT_TICKS : closeIndex) * TICK_MS, slot: SLOT }
+  )
   // 扫描区间为空、目标价/作物坏掉：不成交，也不凭空造一个时刻。
   assert.equal(limitFillScan({ crop: 'tomato', side: 'long', target: 1, from: start, to: start }), null)
   assert.equal(limitFillScan({ crop: 'tomato', side: 'long', target: 'x', from: start, to: start + SLOT_MS }), null)

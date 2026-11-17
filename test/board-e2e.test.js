@@ -27,6 +27,7 @@ import {
   markPrice,
   settlementOf,
   slotClosePrice,
+  tradingFeeOf,
   slotIndexAt,
   weekStartOf
 } from '../src/trading-rules.js'
@@ -263,8 +264,8 @@ test('票 79 e2e：硬币不够（含 0 硬币）拒绝开仓，硬币不为负'
  * 票 86 把价格盐升到 board-v2 后行情全变，这一根按新行情现找（20× 需要单根 5% 的
  * 波动，不是每根都有），不再写死「下一根 / tick 12」。
  */
-function breachBar (fromSlot) {
-  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+function breachBar (fromSlot, ratio = 0.95) {
+  for (let slot = fromSlot; slot < fromSlot + 20000; slot += 1) {
     const prices = []
     for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
       prices.push(boardPrice({ crop: 'tomato', slot, tick }))
@@ -272,7 +273,7 @@ function breachBar (fromSlot) {
     const entry = prices[5]
     let breachTick = -1
     for (let tick = 6; tick <= 14; tick += 1) {
-      if (prices[tick] <= entry * 0.95) {
+      if (prices[tick] <= entry * ratio) {
         breachTick = tick
         break
       }
@@ -290,53 +291,89 @@ const AFTER_80 = (BAR_80.slot + 1) * SLOT_MS + 1000
 const TICK_80 = BAR_80.breachTick
 const EXIT_80 = boardPrice({ crop: 'tomato', slot: BAR_80.slot, tick: TICK_80 })
 
-test('票 80 e2e：20× 开仓 → 跳过时钟 → 强平；只亏保证金，杠杆白名单是 [1,5,20]', async (t) => {
+// 票 101：下单杠杆收到 1×/5×，但盘上还有别人昨天开的 20×。它们的强平线是
+// (1 − 5%) / 20 = 0.9525，比原来的 −100% 保证金线早一点点，所以单独挑一根行情。
+const BAR_LEGACY = breachBar(Math.floor(SLOT_EDGE / SLOT_MS) + 1, 1 - 0.95 / 20)
+const OPEN_LEGACY = BAR_LEGACY.slot * SLOT_MS + 5 * TICK_MS
+const AFTER_LEGACY = (BAR_LEGACY.slot + 1) * SLOT_MS + 1000
+const TICK_LEGACY = BAR_LEGACY.breachTick
+const EXIT_LEGACY = boardPrice({ crop: 'tomato', slot: BAR_LEGACY.slot, tick: TICK_LEGACY })
+
+test('票 80 e2e：杠杆白名单是 [1,5]；盘上老 20× 仓位照旧强平，只亏保证金', async (t) => {
   const dir = await tempDir(t)
-  await seedFarm(dir, 500)
-  const clock = { value: OPEN_80 }
+  // 保证金在开仓那一刻就扣过了，所以农场先记 450。
+  await seedFarm(dir, 450)
+  const entry = markPrice({ crop: 'tomato', now: OPEN_LEGACY })
+  await writeFile(join(dir, TRADING_FILE), JSON.stringify({
+    version: 1,
+    week: { start: weekStartOf(OPEN_LEGACY), pnl: 0, base: 450 },
+    positions: [{
+      id: 'legacy-20',
+      crop: 'tomato',
+      side: 'long',
+      margin: 50,
+      leverage: 20,
+      entry,
+      openedAt: OPEN_LEGACY,
+      stopLoss: 0
+    }],
+    orders: [],
+    history: []
+  }), 'utf8')
+  const clock = { value: OPEN_LEGACY }
   const service = makeService(t, dir, { farmNow: () => clock.value })
   await service.ready
 
-  // 1) 白名单：宿主下发 1×/5×/20× 与四档止损，窗口不自己复制一份。
+  // 1) 白名单：宿主只下发 1×/5× 与四档止损，窗口不自己复制一份。
   const before = await state(service)
-  assert.deepEqual(before.body.trading.limits.leverages, [1, 5, 20])
-  assert.equal(before.body.farm.coins, 500)
+  assert.deepEqual(before.body.trading.limits.leverages, [1, 5])
+  assert.equal(before.body.farm.coins, 450)
+  // 老仓位读得回来，杠杆保持 20，强平价按 5% 维持保证金算。
+  const legacy = before.body.trading.positions[0]
+  assert.equal(legacy.leverage, 20)
+  assert.equal(legacy.liquidation, liquidationPriceOf({
+    side: 'long',
+    entry: legacy.entry,
+    leverage: 20
+  }))
 
-  // 2) 20× 开仓：硬币当场扣，持仓卡带强平价（= entry × (1 − 1/20)）与默认关的止损。
-  const opened = await action(service, {
+  // 2) 现在想再开 20×：拒单，硬币一分不动。
+  const rejected = await action(service, {
     action: 'trading-open-position',
     side: 'long',
     margin: 50,
     leverage: 20,
     cropId: 'tomato'
   })
-  assert.equal(opened.status, 200)
-  assert.equal(opened.body.ok, true)
-  const afterOpen = await state(service)
-  assert.equal(afterOpen.body.farm.coins, 450)
-  const position = afterOpen.body.trading.positions[0]
-  assert.equal(position.leverage, 20)
-  assert.equal(position.stopLoss, 0)
-  assert.equal(position.liquidation, liquidationPriceOf({
-    side: 'long',
-    entry: position.entry,
-    leverage: 20
-  }))
+  assert.equal(rejected.body.ok, false)
+  assert.equal(rejected.body.error, 'bad-leverage')
+  assert.equal((await state(service)).body.farm.coins, 450)
 
-  // 3) 时钟跳过这一根：强平线在 TICK_80 那一分钟就被跌穿，收盘价还在更下面。
-  clock.value = AFTER_80
+  // 3) 时钟跳过这一根：老仓在 TICK_LEGACY 撞上 0.9525 的强平线。
+  clock.value = AFTER_LEGACY
   const refreshed = await action(service, { action: 'trading-refresh' })
   assert.equal(refreshed.status, 200)
   const settled = await state(service)
   assert.equal(settled.body.trading.positions.length, 0)
   assert.equal(settled.body.trading.history.length, 1)
   const row = settled.body.trading.history[0]
+  // 票 102：强平按**强平线**成交（不是撞线那一分钟的插针价），否则 20× 的跳空会穿透好几个点。
+  const liquidation = liquidationPriceOf({ side: 'long', entry, leverage: 20 })
+  const expected = settlementOf({
+    side: 'long',
+    margin: 50,
+    leverage: 20,
+    entry,
+    mark: liquidation,
+    fee: tradingFeeOf({ margin: 50, leverage: 20 }) * 2
+  })
   assert.equal(row.reason, 'liquidate')
-  assert.equal(row.exit, EXIT_80, '平在撞线那一刻，不是收盘价')
-  assert.equal(row.pnl, -50, '亏损封顶保证金')
-  assert.equal(settled.body.farm.coins, 450, '硬币 = 开仓后 − 0：没有一分钱退回来')
+  assert.equal(row.exit, liquidation, '按强平线成交，不是插针价')
+  assert.equal(row.pnl, expected.pnl)
+  assert.equal(row.fee, expected.fee)
+  assert.equal(settled.body.farm.coins, 450, '回款被亏损和手续费吃干净，一分钱不退回')
   assert.equal(settled.body.trading.coins.locked, 0)
-  assert.equal(settled.body.trading.week.pnl, -50)
+  assert.equal(settled.body.trading.week.pnl, expected.pnl - expected.fee, '本周盈亏按净额记')
 
   // 4) 重启：钱和记录都不变（不重复结算、不重复退款）。
   service.dispose()
@@ -392,13 +429,16 @@ test('票 80 e2e：一键止损 → /state 反映档位 → 到线平，原因�
   const settled = await state(service)
   assert.equal(settled.body.trading.positions.length, 0)
   const row = settled.body.trading.history[0]
-  const expected = settlementOf({ side: 'long', margin: 50, leverage: 5, entry, mark: EXIT_80 })
+  // 票 101：开平各 0.2%，结算时一次扣清（保证金只扣一次，手续费合计 0.4% 名义）。
+  const fee = tradingFeeOf({ margin: 50, leverage: 5 }) * 2
+  const expected = settlementOf({ side: 'long', margin: 50, leverage: 5, entry, mark: EXIT_80, fee })
   assert.equal(row.reason, 'stop')
   assert.equal(row.exit, EXIT_80)
   assert.equal(row.pnl, expected.pnl)
+  assert.equal(row.fee, fee)
   assert.equal(settled.body.farm.coins, 450 + expected.credit)
-  assert.equal(settled.body.trading.week.pnl, expected.pnl)
-  // 硬币口径：可用 = 农场硬币；锁定清零；没有手续费。
+  assert.equal(settled.body.trading.week.pnl, expected.pnl - fee)
+  // 硬币口径：可用 = 农场硬币；锁定清零。
   assert.equal(settled.body.trading.coins.available, settled.body.farm.coins)
   assert.equal(settled.body.trading.coins.locked, 0)
   assert.equal(settled.body.trading.coins.total, settled.body.farm.coins)
@@ -589,13 +629,13 @@ test('票 82 e2e：/state 带真人周榜；只有自己时「观望」，开仓
   assert.equal(empty.league.hasPeers, false)
   assert.equal(empty.league.empty, '等邻居上线')
 
-  // 开一手 20× 空南瓜：榜里自己那行出现持仓，情绪变「多 0 · 空 1」。
+  // 开一手 5× 空南瓜（票 101 之后的白名单上限）：榜里自己那行出现持仓，情绪变「多 0 · 空 1」。
   const opened = await action(service, {
-    action: 'trading-open-position', side: 'short', margin: 100, leverage: 20, cropId: 'pumpkin'
+    action: 'trading-open-position', side: 'short', margin: 100, leverage: 5, cropId: 'pumpkin'
   })
   assert.equal(opened.body.ok, true, JSON.stringify(opened.body))
   const after = (await state(service)).body.trading
-  assert.deepEqual(after.league.rows[0].positions, [{ crop: 'pumpkin', side: 'short', leverage: 20 }])
+  assert.deepEqual(after.league.rows[0].positions, [{ crop: 'pumpkin', side: 'short', leverage: 5 }])
   // 行里只有三个公开字段：保证金/入场价不出本机。
   assert.deepEqual(Object.keys(after.league.rows[0].positions[0]), ['crop', 'side', 'leverage'])
   assert.deepEqual(after.league.sentiment, { long: 0, short: 1, flat: 0 })
@@ -636,12 +676,27 @@ test('票 81 e2e：0 硬币时按钮写「去种地」，下单被拒绝且硬�
 test('票 83 e2e：挂单锁币 → 到价成交（entry = 目标价）→ 撤单退回；/state 与存档对得上', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir, 500)
-  const clock = { value: SLOT_EDGE }
+  // 价格是随机的（票 102）：现场找一根「开盘价高于后面某个低点」的行情，
+  // 目标价 = 那一根的最低点，成交时刻 = 第一次摸到它的那一分钟。
+  let bar = null
+  for (let attempt = 0; attempt < 200 && bar === null; attempt += 1) {
+    const slot = Math.floor(SLOT_EDGE / SLOT_MS) + attempt
+    const start = slot * SLOT_MS
+    const prices = []
+    for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+      prices.push(markPrice({ crop: 'tomato', now: start + tick * TICK_MS }))
+    }
+    const low = Math.min(...prices.slice(1))
+    const dipTick = prices.findIndex((price, index) => index > 0 && price <= low)
+    if (dipTick > 0 && prices[0] > low) bar = { start, low, dipTick }
+  }
+  assert.ok(bar, '找不到「开盘价高于后面某个低点」的行情')
+  const clock = { value: bar.start }
   const service = makeService(t, dir, { farmNow: () => clock.value })
   await service.ready
 
-  // 开盘挂一张做多：目标价取第 14 分钟的价（这一根一路跌，第 14 分钟第一次越价）。
-  const target = markPrice({ crop: 'tomato', now: SLOT_EDGE + 14 * TICK_MS })
+  // 开盘挂一张做多：目标价 = 这一根的最低点，第一次越价就在 dipTick。
+  const target = bar.low
   const placed = await action(service, {
     action: 'trading-place-order',
     side: 'long',
@@ -663,7 +718,7 @@ test('票 83 e2e：挂单锁币 → 到价成交（entry = 目标价）→ 撤�
   assert.equal(file.orders[0].id, orderId)
 
   // 时钟推到成交那一分钟：trading-refresh 让宿主撮合；成交价是目标价。
-  clock.value = SLOT_EDGE + 14 * TICK_MS
+  clock.value = bar.start + bar.dipTick * TICK_MS
   assert.equal((await action(service, { action: 'trading-refresh' })).body.ok, true)
   const afterFill = await state(service)
   assert.deepEqual(afterFill.body.trading.orders, [])
@@ -672,7 +727,7 @@ test('票 83 e2e：挂单锁币 → 到价成交（entry = 目标价）→ 撤�
   assert.equal(position.entry, target)
   assert.equal(position.margin, 100)
   assert.equal(position.leverage, 5)
-  assert.equal(position.openedAt, SLOT_EDGE + 14 * TICK_MS)
+  assert.equal(position.openedAt, bar.start + bar.dipTick * TICK_MS)
   assert.equal(afterFill.body.farm.coins, 400, '成交时不再动钱')
   assert.equal((await readTrading(dir)).positions.length, 1)
 

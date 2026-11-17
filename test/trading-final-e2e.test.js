@@ -5,6 +5,10 @@
  *   开窗 → 5× 开仓 → 设止损 → 到价挂单（锁保证金）→ 推时钟到价成交（entry = 目标价）
  *   → 收盘结算 → 硬币/历史/本周盈亏/存档对账 → 榜上只有自己（没有 NPC）。
  * 另外两条降级：坏 trading.json / 0 硬币；离线补算；旧/未知报文在协议边界静默丢掉。
+ *
+ * 行情是 board-v4 的分钟级随机游走（同一分钟内价格恒定）：主流程用的那一根
+ * （tick 2 开仓、tick `FILL_TICK` 第一次到价、收盘前不撞止损/强平线）由 `e2eBar()`
+ * 现场扫出来，不写死 tick / 价格。
  */
 import assert from 'node:assert/strict'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
@@ -23,9 +27,11 @@ import {
   SLOT_TICKS,
   TICK_MS,
   boardPrice,
+  liquidationPriceOf,
   markPrice,
   settlementOf,
   slotClosePrice,
+  tradingFeeOf,
   weekStartOf
 } from '../src/trading-rules.js'
 
@@ -33,11 +39,50 @@ const require = createRequire(import.meta.url)
 // 窗口的纯视图：确认 0 硬币时按钮真的写「去种地」。
 const boardView = require('../desktop/trading-view.js')
 
-const SLOT_EDGE = 1763308800000
-const SLOT = SLOT_EDGE / SLOT_MS
-/** 这一根 tick 1→15 一路下跌（价格由行情算，board-v2 下 3.47 → 3.32）；tick 2 开仓、tick 10 到价。 */
+const BASE_SLOT = 1763308800000 / SLOT_MS
+
+/** 一根里 0..15 分钟的价格（tick 15 就是收盘价）。 */
+function pricesOf (slot) {
+  const prices = []
+  for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+    prices.push(boardPrice({ crop: 'tomato', slot, tick }))
+  }
+  return prices
+}
+
+/**
+ * 主流程用的那一根：tick 2 开仓（entry = 那一分钟的价），挂单目标取 tick 4..13 里
+ * 第一次跌到的最低价（`FILL_TICK` ≥ 4）——从 tick 3 起第一次越价就在那一分钟。
+ * 两个额外约束保证收盘前不先撞线：−50% 止损（5× 下 = −10% 价格）不触发，
+ * 5× 的强平线（−19%）也不碰。价格是随机的，所以现场扫，不写死。
+ */
+function e2eBar (fromSlot) {
+  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+    const prices = pricesOf(slot)
+    const entry = prices[2]
+    let fillTick = 4
+    let target = prices[4]
+    for (let tick = 5; tick <= 13; tick += 1) {
+      if (prices[tick] < target) {
+        target = prices[tick]
+        fillTick = tick
+      }
+    }
+    // 必须是**第一次**越价：成交那一分钟之前没有更低的价。
+    if (prices.slice(3, fillTick).some((price) => price <= target)) continue
+    const afterOpen = Math.min(...prices.slice(3))
+    if (afterOpen <= entry * 0.9) continue
+    if (afterOpen <= liquidationPriceOf({ side: 'long', entry, leverage: 5 })) continue
+    if (Math.min(...prices.slice(fillTick)) <= liquidationPriceOf({ side: 'long', entry: target, leverage: 5 })) continue
+    return { slot, fillTick }
+  }
+  throw new Error('找不到「tick 2 开仓、tick 4..13 第一次到价、收盘前不撞线」的行情（行情规则改了？）')
+}
+const { slot: SLOT, fillTick: FILL_TICK } = e2eBar(BASE_SLOT)
+/** 这一根的价格是随机的：tick 2 开仓、tick `FILL_TICK` 到价、收盘结算。 */
+const SLOT_EDGE = SLOT * SLOT_MS
 const OPEN_AT = SLOT_EDGE + 2 * TICK_MS
-const FILL_AT = SLOT_EDGE + 10 * TICK_MS
+const FILL_AT = SLOT_EDGE + FILL_TICK * TICK_MS
 const CLOSE_AT = SLOT_EDGE + SLOT_MS
 
 function delay (ms) {
@@ -207,7 +252,7 @@ test('票 83 最终 e2e：开窗 → 5× 开仓 → 设止损 → 到价成交 �
   assert.equal(stop.body.position.stopLoss, 0.5)
   assert.equal((await state(service)).body.farm.coins, 400)
 
-  // 3) 到价挂单：目标价取第 10 分钟的价（这一根一路跌，第一次越价就在那里）。
+  // 3) 到价挂单：目标价取 tick 4..13 里第一次越价的低点（现场扫出来的那一分钟）。
   const target = markPrice({ crop: 'tomato', now: FILL_AT })
   const placed = await action(service, {
     action: 'trading-place-order', side: 'long', margin: 100, leverage: 5, cropId: 'tomato', target
@@ -241,15 +286,21 @@ test('票 83 最终 e2e：开窗 → 5× 开仓 → 设止损 → 到价成交 �
   assert.equal(settled.body.trading.history.length, 2)
   assert.deepEqual(settled.body.trading.history.map((row) => row.reason), ['settle', 'settle'])
   const exit = slotClosePrice('tomato', SLOT)
-  const expectedStop = settlementOf({ side: 'long', margin: 100, leverage: 5, entry, mark: exit })
-  const expectedFill = settlementOf({ side: 'long', margin: 100, leverage: 5, entry: target, mark: exit })
+  // 手续费在结算时一次扣清：一手 100×5 的单边 = round(100 × 5 × 0.002) = 1，开平两侧共 2。
+  const fee = tradingFeeOf({ margin: 100, leverage: 5 }) * 2
+  const expectedStop = settlementOf({ side: 'long', margin: 100, leverage: 5, entry, mark: exit, fee })
+  const expectedFill = settlementOf({ side: 'long', margin: 100, leverage: 5, entry: target, mark: exit, fee })
   const pnl = expectedStop.pnl + expectedFill.pnl
-  assert.equal(settled.body.farm.coins, 300 + expectedStop.credit + expectedFill.credit)
-  assert.equal(settled.body.trading.week.pnl, pnl)
-  assert.equal(settled.body.trading.week.total, pnl)
+  const net = (expectedStop.pnl - expectedStop.fee) + (expectedFill.pnl - expectedFill.fee)
+  const credited = expectedStop.credit + expectedFill.credit
+  assert.deepEqual(settled.body.trading.history.map((row) => row.fee), [fee, fee])
+  assert.equal(settled.body.farm.coins, 300 + credited, '两手回款 = 保证金 + 盈亏 − 手续费')
+  assert.equal(settled.body.trading.week.pnl, net, '本周盈亏是净额（已扣手续费）')
+  assert.equal(settled.body.trading.week.total, net)
   assert.equal(settled.body.trading.coins.locked, 0)
-  // 没有手续费：硬币 = 本金 500 + 两笔盈亏，一分不多一分不少。
-  assert.equal(settled.body.trading.coins.total, 500 + pnl)
+  // 硬币 = 本金 500 + 两笔盈亏 − 两笔手续费，一分不多一分不少。
+  assert.equal(settled.body.trading.coins.total, 500 + pnl - fee * 2)
+  assert.equal(settled.body.trading.coins.total, 300 + credited)
   assert.equal(settled.body.trading.coins.available, settled.body.farm.coins)
 
   // 6) 榜上只有自己（没有 NPC）；结算后没有持仓 → 观望。
@@ -263,6 +314,7 @@ test('票 83 最终 e2e：开窗 → 5× 开仓 → 设止损 → 到价成交 �
   assert.deepEqual(file.orders, [])
   assert.deepEqual(file.positions, [])
   assert.equal(file.history.length, 2)
+  assert.equal(file.history[0].fee, fee)
   assert.equal('coins' in file, false)
 
   // 8) 关窗后再开：历史还在，窗口拿到的是同一份结算结果。
@@ -270,7 +322,7 @@ test('票 83 最终 e2e：开窗 → 5× 开仓 → 设止损 → 到价成交 �
   assert.equal((await action(service, { action: 'trading-open' })).body.window, 'opened')
   const reopened = desktop.calls.board.at(-1)
   assert.equal(reopened.state.history.length, 2)
-  assert.equal(reopened.state.week.pnl, pnl)
+  assert.equal(reopened.state.week.pnl, net)
 })
 
 test('票 83 降级：坏 trading.json = 空盘口 + 一次告警；0 硬币 = 开仓/挂单都拒，硬币不动', async (t) => {
@@ -327,7 +379,7 @@ test('票 83 降级：离线跨过收盘会补结算；未知/旧报文在协议
   })
   assert.equal(opened.body.ok, true)
   // 挂一张这一根绝不会成交的目标价（做多、目标价在这根所有 tick 之下），离线期间应该到期退回。
-  // 目标价由行情现算：写死 5 在 board-v2 的行情里会被当场越价成交（这一根在 3.3 附近）。
+  // 目标价由行情现算（写死价格会被随机行情当场越价成交）。
   let noFillTarget = Infinity
   for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
     noFillTarget = Math.min(noFillTarget, boardPrice({ crop: 'tomato', slot: SLOT, tick }))
@@ -349,15 +401,18 @@ test('票 83 降级：离线跨过收盘会补结算；未知/旧报文在协议
   assert.deepEqual(caughtUp.body.trading.orders, [])
   assert.equal(caughtUp.body.trading.history.length, 1)
   assert.equal(caughtUp.body.trading.history[0].reason, 'settle')
+  // 100×1 的单边手续费 round(0.2) = 0，但口径照旧现算，不写死「没有手续费」。
+  const fee = tradingFeeOf({ margin: 100, leverage: 1 }) * 2
   const expected = settlementOf({
     side: 'long',
     margin: 100,
     leverage: 1,
     entry: opened.body.position.entry,
-    mark: slotClosePrice('tomato', SLOT)
+    mark: slotClosePrice('tomato', SLOT),
+    fee
   })
   assert.equal(caughtUp.body.farm.coins, 400 + expected.credit, '挂单的 50 退回 + 仓位的 100+盈亏')
-  assert.equal(caughtUp.body.trading.week.pnl, expected.pnl)
+  assert.equal(caughtUp.body.trading.week.pnl, expected.pnl - expected.fee, '本周盈亏是净额')
   // 再重启一次：不重复结算、不重复退款。
   restarted.dispose()
   const again = makeService(t, dir, { farmNow: () => clock.value })

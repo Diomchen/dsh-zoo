@@ -29,6 +29,7 @@ import {
   pnlOf,
   settlementOf,
   slotClosePrice,
+  tradingFeeOf,
   slotIndexAt,
   weekStartOf
 } from '../src/trading-rules.js'
@@ -45,7 +46,7 @@ const MONDAY = weekStartOf(SLOT_EDGE)
  * 20× 需要单根 5% 的波动，不是每一根都有，所以从 SLOT 往后扫，而不是再写一个魔数。
  */
 function breachBar (fromSlot) {
-  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+  for (let slot = fromSlot; slot < fromSlot + 20000; slot += 1) {
     const prices = []
     for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
       prices.push(boardPrice({ crop: 'tomato', slot, tick }))
@@ -66,6 +67,20 @@ function breachBar (fromSlot) {
   throw new Error('找不到「tick 5 开仓、之后跌穿 −5%、收盘更低」的行情（行情规则改了？）')
 }
 const { slot: SLOT_80, breachTick: TICK_80 } = breachBar(SLOT + 1)
+/**
+ * 20× 老仓位的第一个撞线 tick。票 101 把强平线从 1/杠杆 改成 (1-5%)/杠杆，
+ * 做多的线因此从 0.95 抬到 0.9525——撞线会比「亏光保证金」早一两个 tick，
+ * 所以不能再把 TICK_80 当成常数用。
+ */
+function firstBreach (slot, { entry, side = 'long', leverage = 20, fromTick = 6 }) {
+  const line = liquidationPriceOf({ side, entry, leverage })
+  for (let tick = fromTick; tick <= SLOT_TICKS; tick += 1) {
+    const price = boardPrice({ crop: 'tomato', slot, tick })
+    if (side === 'long' ? price <= line : price >= line) return { tick, price }
+  }
+  throw new Error('这一根没有撞线：用例的行情点要重挑')
+}
+
 const OPEN_80 = SLOT_80 * SLOT_MS + 5 * TICK_MS
 
 /**
@@ -162,6 +177,38 @@ async function readTrading (dir) {
 
 async function writeTrading (dir, value) {
   await writeFile(join(dir, TRADING_FILE), JSON.stringify(value), 'utf8')
+}
+
+/**
+ * 票 101：5× 之后 20× 已经不在下单白名单里，强平路径只能靠「读盘」复现。
+ * 直接把一条 `leverage: 20` 的仓位写进 `trading.json`（保证金视为开仓时已扣），
+ * 再正常 `createTradingStore` 读回来——和线上老仓位的处境一致。
+ */
+async function seedLegacy20 (dir, { clock, farm, margin = 50, side = 'long' }) {
+  const now = clock.now()
+  const slot = Math.floor(now / SLOT_MS)
+  const tick = Math.round((now - slot * SLOT_MS) / TICK_MS)
+  const entry = boardPrice({ crop: 'tomato', slot, tick })
+  const spent = await farm.spendCoins(margin)
+  assert.equal(spent.ok, true, '老仓位的保证金要在开仓时就扣掉')
+  await writeTrading(dir, {
+    version: TRADING_VERSION,
+    week: { start: weekStartOf(now), pnl: 0, base: farm.wallet.coins },
+    positions: [{
+      id: 'legacy-20',
+      crop: 'tomato',
+      side,
+      margin,
+      leverage: 20,
+      entry,
+      openedAt: now,
+      slot,
+      stopLoss: 0
+    }],
+    orders: [],
+    history: []
+  })
+  return openStore(dir, { clock, farm })
 }
 
 test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与可用分得清', async (t) => {
@@ -583,33 +630,38 @@ test('票 80：5×/20× 开仓落盘；持仓带强平价与止损档，1× 没�
   const twenty = await store.openPosition({ crop: 'tomato', side: 'short', margin: 100, leverage: 20 })
   assert.equal(one.ok, true, JSON.stringify(one))
   assert.equal(five.ok, true, JSON.stringify(five))
-  assert.equal(twenty.ok, true, JSON.stringify(twenty))
-  assert.equal(farm.wallet.coins, 800, '三手各扣各的保证金')
+  assert.equal(twenty.error, 'bad-leverage', '20× 已经不在下单白名单里')
+  assert.equal(farm.wallet.coins, 900, '两手各扣各的保证金')
 
   const now = SLOT_EDGE + 3 * TICK_MS
   const view = store.view({ now })
-  const [first, second, third] = view.positions
+  const [first, second] = view.positions
   // 1× 没有强平线：窗口画「—」。
   assert.equal(first.liquidation, null)
   assert.equal(first.stopLoss, 0, '止损默认关')
-  // 5×/20× 的强平价 = entry × (1 ∓ 1/杠杆)，和纯规则同源。
+  // 5× 的强平价 = entry × (1 ∓ 0.95/杠杆)，和纯规则同源。
   assert.equal(second.leverage, 5)
   assert.equal(second.liquidation, liquidationPriceOf({ side: 'long', entry: second.entry, leverage: 5 }))
-  assert.equal(third.leverage, 20)
-  assert.equal(third.liquidation, liquidationPriceOf({ side: 'short', entry: third.entry, leverage: 20 }))
-  assert.ok(third.liquidation > third.entry, '做空的强平线在入场价上方')
 
   // 磁盘上：杠杆、止损落盘；强平价是派生字段，不落盘（改 entry 后它会立刻变假）。
   const file = await readTrading(dir)
-  assert.deepEqual(file.positions.map((position) => position.leverage), [1, 5, 20])
-  assert.deepEqual(file.positions.map((position) => position.stopLoss), [0, 0, 0])
+  assert.deepEqual(file.positions.map((position) => position.leverage), [1, 5])
+  assert.deepEqual(file.positions.map((position) => position.stopLoss), [0, 0])
   assert.equal('liquidation' in file.positions[0], false)
 
   // 重启：杠杆与强平价都读得回来（5×/20× 不会因为读盘被降级）。
   const restarted = await openStore(dir, { clock, farm })
   const again = restarted.view({ now })
-  assert.deepEqual(again.positions.map((position) => position.leverage), [1, 5, 20])
+  assert.deepEqual(again.positions.map((position) => position.leverage), [1, 5])
   assert.equal(again.positions[1].liquidation, second.liquidation)
+
+  // 老 20× 仓位：读得回来，强平价照旧按 0.95/20 算（票 101 的兼容承诺）。
+  const legacyDir = await tempDir(t)
+  const legacyFarm = fakeFarm(500)
+  const legacyStore = await seedLegacy20(legacyDir, { clock, farm: legacyFarm })
+  const legacy = legacyStore.view({ now }).positions[0]
+  assert.equal(legacy.leverage, 20, '老 20× 仓位不会被读盘降级')
+  assert.equal(legacy.liquidation, liquidationPriceOf({ side: 'long', entry: legacy.entry, leverage: 20 }))
 })
 
 test('票 80：一键止损——档位循环落盘；坏档位拒绝；坏值读回修补，缺省不算修补', async (t) => {
@@ -679,9 +731,9 @@ test('票 80：20× 强平——时钟跳过也按路径平，只亏保证金，
   const dir = await tempDir(t)
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
-  const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
-  assert.equal(opened.ok, true, JSON.stringify(opened))
+  const store = await seedLegacy20(dir, { clock, farm })
+  const opened = { position: store.view().positions[0] }
+  assert.equal(opened.position.leverage, 20, '老仓位按 20× 读回来')
   assert.equal(farm.wallet.coins, 450, '开仓当场扣掉保证金')
   const entry = opened.position.entry
   const liquidation = opened.position.liquidation
@@ -694,16 +746,17 @@ test('票 80：20× 强平——时钟跳过也按路径平，只亏保证金，
   assert.equal(view.positions.length, 0)
   assert.equal(view.history.length, 1)
   const row = view.history[0]
-  const exit = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 })
-  const expected = settlementOf({ side: 'long', margin: 50, leverage: 20, entry, mark: exit })
+  const breach = firstBreach(SLOT_80, { entry })
+  const expected = settlementOf({ side: 'long', margin: 50, leverage: 20, entry, mark: liquidation })
   assert.equal(row.reason, 'liquidate', '结算原因写「强平」')
-  assert.equal(row.exit, exit, '平在第一次撞线那一刻的价')
-  assert.equal(row.at, SLOT_80 * SLOT_MS + TICK_80 * TICK_MS)
+  assert.equal(row.exit, liquidation, '平在强平线上，不是那一分钟的插针价')
+  assert.equal(row.at, SLOT_80 * SLOT_MS + breach.tick * TICK_MS)
   assert.ok(row.exit > slotClosePrice('tomato', SLOT_80), '不是按收盘价敷衍过去的')
   assert.equal(row.pnl, expected.pnl)
-  assert.equal(row.pnl, -50, '亏损封顶保证金')
+  assert.equal(row.pnl, -47, '强平在 5% 维持线上：亏掉 95% 保证金，不到 100%')
   assert.equal(farm.wallet.coins, 450, 'credit 0：只亏掉已经扣掉的 50')
-  assert.equal(view.week.pnl, -50)
+  // 本周盈亏按净额记：−48 的亏损 + 4 的手续费。
+  assert.equal(view.week.pnl, -51)
   assert.equal(farm.calls.some(([kind, qty]) => kind === 'add' && qty === 0), false, 'credit 0 不调 addCoins')
   assert.equal(tradingReasonText(row.reason), '强平')
 
@@ -721,15 +774,14 @@ test('票 80：硬币本来就是 0 时强平也不为负（亏损上限是保�
   const dir = await tempDir(t)
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(50)
-  const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
+  const store = await seedLegacy20(dir, { clock, farm })
   assert.equal(farm.wallet.coins, 0, '全部硬币押进去了')
 
   clock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await store.tick()
   const row = store.view().history[0]
   assert.equal(row.reason, 'liquidate')
-  assert.equal(row.pnl, -50)
+  assert.equal(row.pnl, -47)
   assert.equal(farm.wallet.coins, 0, '硬币不会变成负数')
   assert.equal(farm.calls.some(([kind]) => kind === 'add'), false, '没有一分钱要退')
 })
@@ -749,7 +801,14 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   assert.equal(await store.tick(), true)
   const row = store.view().history[0]
   const exit = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 })
-  const expected = settlementOf({ side: 'long', margin: 50, leverage: 5, entry, mark: exit })
+  const expected = settlementOf({
+    side: 'long',
+    margin: 50,
+    leverage: 5,
+    entry,
+    mark: exit,
+    fee: tradingFeeOf({ margin: 50, leverage: 5 }) * 2
+  })
   assert.equal(row.reason, 'stop')
   assert.equal(row.exit, exit)
   assert.equal(row.pnl, expected.pnl)
@@ -778,27 +837,28 @@ test('票 80：止损到线按那一刻的 mark 平，原因 止损；默认关�
   // 20× 的强平线（−5% 价格）这一根里会到；同一刻先算玩家设的止损，原因写「止损」。
   const last = await tempDir(t)
   const lastClock = makeClock(OPEN_80)
-  const lastStore = await openStore(last, { clock: lastClock, farm: fakeFarm(500) })
-  const taken = await lastStore.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
+  const lastStore = await seedLegacy20(last, { clock: lastClock, farm: fakeFarm(500) })
+  const taken = { position: lastStore.view().positions[0] }
   const doomed = await lastStore.setStopLoss(taken.position.id, 1)
   assert.equal(doomed.ok, true)
   assert.equal(doomed.position.stopLoss, 1)
   lastClock.set((SLOT_80 + 1) * SLOT_MS + 1000)
   await lastStore.tick()
   const lastRow = lastStore.view().history[0]
-  assert.equal(lastRow.reason, 'stop')
-  assert.equal(lastRow.pnl, -50, '到 −100% 保证金时正好亏光')
-  // 和「不设档位」那手是同一个价、同一笔钱：档位没到就由强平接手（上面已经断言过）。
-  assert.equal(lastRow.exit, boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 }))
+  // 票 101 之后强平线抬到 0.9525，而 −100% 档在 0.95：强平永远先到，
+  // 「亏光才平」的档位在 20× 上已经轮不到，原因写「强平」。
+  assert.equal(lastRow.reason, 'liquidate')
+  assert.equal(lastRow.pnl, -47, '强平先到：亏掉 95% 保证金')
+  assert.equal(lastRow.exit, liquidationPriceOf({ side: 'long', entry: taken.position.entry, leverage: 20 }))
 })
 
 test('票 80（评审 P0）：设止损不跳过之前的强平路径，新止损不按旧 mark 平', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
-  const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
-  assert.equal(opened.ok, true, JSON.stringify(opened))
+  const store = await seedLegacy20(dir, { clock, farm })
+  const opened = { position: store.view().positions[0] }
+  assert.equal(opened.position.leverage, 20, '老仓位按 20× 读回来')
   const entry = opened.position.entry
   assert.ok(liquidationPriceOf({ side: 'long', entry, leverage: 20 }) < entry * 0.96)
 
@@ -809,11 +869,11 @@ test('票 80（评审 P0）：设止损不跳过之前的强平路径，新止�
 
   assert.equal(await store.tick(), true)
   const row = store.view().history[0]
-  const firstBreach = boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 })
+  const breach = firstBreach(SLOT_80, { entry })
   assert.equal(row.reason, 'liquidate', '下一拍仍要补出设止损之前越过的强平')
-  assert.equal(row.at, SLOT_80 * SLOT_MS + TICK_80 * TICK_MS, '平在最早撞线的那一分钟')
-  assert.equal(row.exit, firstBreach, '不是按设止损那一刻的 mark 平')
-  assert.equal(row.pnl, -50)
+  assert.equal(row.at, SLOT_80 * SLOT_MS + breach.tick * TICK_MS, '平在最早撞线的那一分钟')
+  assert.equal(row.exit, liquidationPriceOf({ side: 'long', entry, leverage: 20 }), '不是按设止损那一刻的 mark 平')
+  assert.equal(row.pnl, -47)
   // 强平已经发生：止损档位不再有任何作用，钱只亏保证金。
   assert.equal(farm.wallet.coins, 450)
 })
@@ -824,9 +884,9 @@ test('票 80（评审 P0）：设止损之前跌破档位的那一段不补平�
   const dir = await tempDir(t)
   const clock = makeClock(slot * SLOT_MS + 5 * TICK_MS)
   const farm = fakeFarm(500)
-  const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
-  assert.equal(opened.ok, true, JSON.stringify(opened))
+  const store = await seedLegacy20(dir, { clock, farm })
+  const opened = { position: store.view().positions[0] }
+  assert.equal(opened.position.leverage, 20, '老仓位按 20× 读回来')
   const entry = opened.position.entry
   const stopPrice = entry * (1 - 0.25 / 20)
   // 插针那一分钟确实在档位之下：如果设止损时把整段路径重扫一遍，它就会被补平。
@@ -849,17 +909,18 @@ test('票 80（评审 P0）：快进跨多根仍按最早撞线那一刻平，�
   const dir = await tempDir(t)
   const clock = makeClock(OPEN_80)
   const farm = fakeFarm(500)
-  const store = await openStore(dir, { clock, farm })
-  const opened = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 20 })
-  assert.equal(opened.ok, true, JSON.stringify(opened))
+  const store = await seedLegacy20(dir, { clock, farm })
+  const opened = { position: store.view().positions[0] }
+  assert.equal(opened.position.leverage, 20, '老仓位按 20× 读回来')
   clock.set(OPEN_80 + 6 * SLOT_MS)
   assert.equal(await store.tick(), true)
   const liquidated = store.view().history[0]
+  const breach = firstBreach(SLOT_80, { entry: opened.position.entry })
   assert.equal(liquidated.reason, 'liquidate')
-  assert.equal(liquidated.at, SLOT_80 * SLOT_MS + TICK_80 * TICK_MS)
-  assert.equal(liquidated.exit, boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 }))
+  assert.equal(liquidated.at, SLOT_80 * SLOT_MS + breach.tick * TICK_MS)
+  assert.equal(liquidated.exit, liquidationPriceOf({ side: 'long', entry: opened.position.entry, leverage: 20 }))
   assert.ok(liquidated.exit > slotClosePrice('tomato', SLOT_80), '最早撞线价不是收盘价')
-  assert.equal(liquidated.pnl, -50)
+  assert.equal(liquidated.pnl, -47)
 
   // 止损：5× 做多 + −25% 档，同样跳 6 根；最早触发那一刻（同一个 TICK_80）优先于收盘。
   const stopDir = await tempDir(t)
@@ -909,7 +970,7 @@ test('票 80：关掉止损后不再触发；离线几个小时回来只补一�
   assert.equal(view.history[0].reason, 'stop')
   assert.equal(view.history[0].exit, boardPrice({ crop: 'tomato', slot: SLOT_80, tick: TICK_80 }))
   const coins = offlineFarm.wallet.coins
-  assert.equal(coins, 250 + view.history[0].pnl + 50)
+  assert.equal(coins, 250 + view.history[0].pnl + 50 - view.history[0].fee)
 
   // 再启动一次 + 再 tick：历史还是那一条，硬币不再变。
   const again = await openStore(offline, { clock: offlineClock, farm: offlineFarm })

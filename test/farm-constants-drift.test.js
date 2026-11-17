@@ -33,7 +33,13 @@ import {
   HIRE_WAGE_MAX,
   HIRE_WAGE_MIN
 } from '../src/protocol.js'
-import { BOARD_TIMEFRAMES, MAX_LEVERAGE, MAX_MARGIN, TRADING_STOP_LEVELS } from '../src/trading-rules.js'
+import {
+  BOARD_TIMEFRAMES,
+  LEGACY_MAX_LEVERAGE,
+  MAX_LEVERAGE,
+  MAX_MARGIN,
+  TRADING_STOP_LEVELS
+} from '../src/trading-rules.js'
 import shared from '../desktop/shared.js'
 
 const FARM_JS = new URL('../desktop/farm.js', import.meta.url)
@@ -150,7 +156,10 @@ test('票 84：helper 的周期白名单与宿主的周期清单同源', () => {
 
 test('票 81/评审 P2：helper 与窗口的盘口杠杆/止损档与宿主同源', () => {
   // 杠杆上限与止损四档各写一份（helper/渲染页不是 ESM），靠这两条断言防漂移。
-  assert.equal(shared.BOARD_MAX_LEVERAGE, MAX_LEVERAGE)
+  // 票 101：能下单的杠杆收到 1×/5×，但窗口仍要画得出别人手里的老 20× 仓位，
+  // 所以 helper 的上限对齐「读得回来的形状」LEGACY_MAX_LEVERAGE，而不是下单白名单。
+  assert.equal(shared.BOARD_MAX_LEVERAGE, LEGACY_MAX_LEVERAGE)
+  assert.equal(MAX_LEVERAGE, 5)
   assert.deepEqual(shared.BOARD_STOP_LEVELS, TRADING_STOP_LEVELS)
   // 窗口的循环按钮吃的是同一组档位；下一步永远在这四个值里转。
   assert.deepEqual(boardView.stopLevels(), TRADING_STOP_LEVELS)

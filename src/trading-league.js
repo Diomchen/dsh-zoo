@@ -45,6 +45,7 @@ function selfRow (raw) {
   const positions = normalizeTradingPositions(raw.positions)
   if (positions === null) return null
   const base = Number(raw.weekBase)
+  // 收益率优先信本机算的；没带就按本金回算（旧周报没有 weekBase 时为 null，排到榜尾）。
   const fallbackPct = Number.isFinite(base) && base > 0 ? weekPnl / base : null
   return {
     deviceId: raw.deviceId,
@@ -54,6 +55,12 @@ function selfRow (raw) {
     positions,
     me: true
   }
+}
+
+/** 邻居周报没带收益率时，按它自己的本周本金回算；连本金都没有就是 null。 */
+function peerFallbackPct (raw, weekPnl) {
+  const base = Number(raw.weekBase)
+  return Number.isFinite(base) && base > 0 ? weekPnl / base : null
 }
 
 /**
@@ -76,17 +83,23 @@ function peerRow (raw, now) {
     deviceId: raw.deviceId,
     nickname: nicknameOf(raw.nickname, PEER_NAME),
     weekPnl,
-    weekPnlPct: finiteOrNull(raw.weekPnlPct),
+    weekPnlPct: finiteOrNull(raw.weekPnlPct) ?? peerFallbackPct(raw, weekPnl),
     positions,
     me: false
   }
 }
 
 /**
- * 排序：本周盈亏降序；并列时先昵称再 deviceId。
- * 不用 `localeCompare`——它随系统语言变，同一份数据在不同机器上会排出不同顺序。
+ * 排序：本周**收益率**降序（票 102）——金币绝对值只说明本金大，不说明会玩。
+ * 没有收益率的行（旧邻居的周报不带这个键）一律排到最后，再按金币降序；
+ * 并列时先昵称再 deviceId。不用 `localeCompare`——它随系统语言变，
+ * 同一份数据在不同机器上会排出不同顺序。
  */
 function compareRows (a, b) {
+  const left = Number.isFinite(a.weekPnlPct) ? a.weekPnlPct : null
+  const right = Number.isFinite(b.weekPnlPct) ? b.weekPnlPct : null
+  if ((left === null) !== (right === null)) return left === null ? 1 : -1
+  if (left !== null && left !== right) return right - left
   if (a.weekPnl !== b.weekPnl) return b.weekPnl - a.weekPnl
   if (a.nickname !== b.nickname) return a.nickname < b.nickname ? -1 : 1
   if (a.deviceId === b.deviceId) return 0

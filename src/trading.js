@@ -78,6 +78,7 @@ import {
   settlementOf,
   slotClosePrice,
   slotIndexAt,
+  tradingFeeOf,
   weekStartOf
 } from './trading-rules.js'
 
@@ -205,13 +206,14 @@ function normalizeSettling (value) {
   const exit = positiveNumber(value.exit)
   const pnl = strictInt(value.pnl, -MAX_COINS, MAX_COINS)
   const credit = strictInt(value.credit, 0, MAX_COINS)
+  const fee = value.fee === undefined ? 0 : strictInt(value.fee, 0, MAX_COINS)
   const reason = typeof value.reason === 'string' && TRADING_CLOSE_REASONS.includes(value.reason)
     ? value.reason
     : null
-  if (at === null || exit === null || pnl === null || credit === null || reason === null) {
+  if (at === null || exit === null || pnl === null || credit === null || fee === null || reason === null) {
     return { settling: null, repaired: 1 }
   }
-  return { settling: { at, exit, pnl, credit, reason }, repaired: 0 }
+  return { settling: { at, exit, pnl, fee, credit, reason }, repaired: 0 }
 }
 
 /**
@@ -290,6 +292,8 @@ function normalizeHistoryEntry (value) {
   if (entry === null || exit === null) return null
   const pnl = strictInt(value.pnl, -MAX_COINS, MAX_COINS)
   if (pnl === null) return null
+  const fee = value.fee === undefined ? 0 : strictInt(value.fee, 0, MAX_COINS)
+  if (fee === null) return null
   if (typeof value.reason !== 'string' || !TRADING_CLOSE_REASONS.includes(value.reason)) return null
   const at = timestamp(value.at)
   if (at === null) return null
@@ -302,6 +306,7 @@ function normalizeHistoryEntry (value) {
     entry,
     exit,
     pnl,
+    fee,
     reason: value.reason,
     at
   }
@@ -365,6 +370,9 @@ function normalizeOrder (value) {
   const placedAt = timestamp(value.placedAt)
   if (placedAt === null) return null
   const refunding = normalizeRefunding(value.refunding)
+  // 票 101：老单没有 `fee`，撤单时按 0 处理（那时也没收过费）。
+  const fee = value.fee === undefined ? 0 : strictInt(value.fee, 0, MAX_COINS)
+  if (fee === null) return null
   return {
     order: {
       id,
@@ -373,6 +381,7 @@ function normalizeOrder (value) {
       target,
       margin,
       leverage: value.leverage,
+      fee,
       placedAt,
       slot: slotIndexAt(placedAt),
       ...(refunding.refunding === null ? {} : { refunding: refunding.refunding })
@@ -655,7 +664,7 @@ class TradingStore {
     if (spent?.ok !== true) {
       return tradingError(spent?.error === 'no-coin' ? 'no-coin' : 'action-failed')
     }
-    // 成交价 = 扣钱那一刻的现价；算不出来（作物底价坏了）就把保证金退回去。
+    // 成交价 = 扣钱那一刻的现价；算不出来（作物底价坏了）就把保证金和手续费退回去。
     const entry = markPrice({ crop, now })
     if (entry === null) {
       await farm.addCoins(raw.margin)
@@ -923,6 +932,8 @@ class TradingStore {
       target: order.target,
       margin: order.margin,
       leverage: order.leverage,
+      // 下单时预付的那一侧手续费（票 101）：窗口按这个数显示「这单已经花了多少」。
+      fee: order.fee ?? 0,
       placedAt: order.placedAt,
       slot: order.slot,
       remainingMs: Math.max(0, (order.slot + 1) * SLOT_MS - now)
@@ -989,15 +1000,27 @@ class TradingStore {
     // （`#settleDue`）可能在 farm 注入之前就看到一笔该结的仓位；少了这一句，
     // `credit > 0` 时会在 `this.#farm.addCoins` 上抛 TypeError（评审 P2 的 latent 路径）。
     if (this.#farm === null) return tradingError('starting')
+    // 票 101：开平两侧各 0.2%，但在结算时一次扣清——开仓只扣保证金，
+    // 免得「差 1 个硬币付手续费」把一笔单挡在门外；平仓时从回款里扣，
+    // 亏光时 credit 自然落到 0，不会出现负余额。
+    const closeFee = tradingFeeOf({ margin: position.margin, leverage: position.leverage }) * 2
     const outcome = settlementOf({
       side: position.side,
       margin: position.margin,
       leverage: position.leverage,
       entry: position.entry,
-      mark: exit
+      mark: exit,
+      fee: closeFee
     })
     if (outcome === null) return tradingError('action-failed')
-    const settling = { at, exit, pnl: outcome.pnl, credit: outcome.credit, reason }
+    const settling = {
+      at,
+      exit,
+      pnl: outcome.pnl,
+      fee: outcome.fee,
+      credit: outcome.credit,
+      reason
+    }
     position.settling = settling
     const intent = await this.#persist(true)
     if (intent !== true) {
@@ -1018,6 +1041,7 @@ class TradingStore {
       action: 'trading-close-position',
       history,
       pnl: outcome.pnl,
+      fee: outcome.fee,
       credit: outcome.credit,
       coins: this.#coinBase(),
       persisted
@@ -1038,14 +1062,18 @@ class TradingStore {
       entry: position.entry,
       exit: settling.exit,
       pnl: settling.pnl,
+      // 平仓那一侧的手续费（票 101）：记进流水，历史里能看见「赚了但还是亏在费上」。
+      fee: settling.fee ?? 0,
       reason: settling.reason,
       at: settling.at
     }
     this.#state.history.unshift(history)
     if (this.#state.history.length > MAX_TRADING_HISTORY) this.#state.history.length = MAX_TRADING_HISTORY
+    // 本周盈亏按「净额」累计：手续费是实打实烧掉的硬币，不算进盈利榜。
+    const net = settling.pnl - (settling.fee ?? 0)
     this.#state.week.pnl = Math.min(
       MAX_COINS,
-      Math.max(-MAX_COINS, this.#state.week.pnl + settling.pnl)
+      Math.max(-MAX_COINS, this.#state.week.pnl + net)
     )
     return history
   }
@@ -1083,6 +1111,7 @@ class TradingStore {
       margin: position.margin,
       leverage: position.leverage,
       entry: position.entry,
+
       openedAt: position.openedAt,
       slot: position.slot,
       // 强平价是派生字段（票 80）：1× 没有强平 → null，窗口画「—」。

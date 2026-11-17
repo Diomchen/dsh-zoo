@@ -671,6 +671,12 @@ function renderOrder (board) {
     button.textContent = choice.label
     leverageRowEl.append(button)
   }
+  // 票 101：手续费写在杠杆旁边——下单当场就要看见，不能等结算才知道。
+  const feeNote = document.createElement('span')
+  feeNote.className = 'chip-note'
+  feeNote.textContent = order.feeText
+  feeNote.title = '开仓和平仓各收名义价值（保证金 × 杠杆）的 0.2%，结算时一次扣清。'
+  leverageRowEl.append(feeNote)
   // 票 91：横条第二行只放「涨 1% +0.5 · 跌 1% −0.5 · 强平价 —」这一句；
   // 完整预览句（带杠杆/保证金）仍在 `order.preview` 里，给旧调用方和测试。
   previewEl.textContent = order.previewShort
@@ -845,7 +851,8 @@ function renderLeague (board) {
     main.className = 'row-main'
     const title = document.createElement('div')
     title.className = 'row-title'
-    title.textContent = row.me ? row.nickname + '（我）' : row.nickname
+    // 票 102：名次写在昵称前——榜是按收益率排的，名次比金币绝对值更该被看见。
+    title.textContent = row.rank + '. ' + (row.me ? row.nickname + '（我）' : row.nickname)
     const meta = document.createElement('div')
     meta.className = 'row-meta'
     meta.textContent = row.positionsText
@@ -872,15 +879,16 @@ function renderLeague (board) {
 
     const score = document.createElement('div')
     score.className = 'league-score'
-    const pnl = document.createElement('b')
-    pnl.className = 'pnl'
-    pnl.dataset.tone = row.pnlTone
-    pnl.textContent = board.display.mono ? row.pnlMonoText : row.pnlText
-    const pct = document.createElement('span')
+    // 票 102：主数字是**收益率**（排序键），金币退成副标题——本金大小不再等于名次。
+    const pct = document.createElement('b')
     pct.className = 'league-pct'
     pct.dataset.tone = row.pctTone
     pct.textContent = board.display.mono ? row.pctMonoText : row.pctText
-    score.append(pnl, pct)
+    const pnl = document.createElement('span')
+    pnl.className = 'league-pnl'
+    pnl.dataset.tone = row.pnlTone
+    pnl.textContent = board.display.mono ? row.pnlMonoText : row.pnlText
+    score.append(pct, pnl)
 
     line.append(main, score)
     leagueEl.append(line)

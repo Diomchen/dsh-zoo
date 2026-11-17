@@ -1614,11 +1614,13 @@
     // 强平价（SPEC v10 US7）：用 payload 的现价当入场价，下单前就告诉玩家会从哪里被平。
     // 1× 没有强平线（价格有底价，跌不到 0），显示「—」。这是纯展示：公式与宿主
     // `liquidationPriceOf()` 相同，`test/trading-view.test.js` 的 drift 断言盯着两边。
+    // 票 101：预留 5% 维持保证金，强平线从 (1 - 1/杠杆) 抬到 (1 - 0.95/杠杆)。
+    const liquidationRatio = 0.95 / chosenLeverage
     const liquidationPrice = price === null || chosenLeverage <= 1
       ? null
       : chosenSide === 'long'
-        ? price * (1 - 1 / chosenLeverage)
-        : price * (1 + 1 / chosenLeverage)
+        ? price * (1 - liquidationRatio)
+        : price * (1 + liquidationRatio)
     const liquidationText = liquidationPrice === null
       ? '强平价 —'
       : '强平价 ' + formatPrice(liquidationPrice) + ' · ' +
@@ -1675,6 +1677,8 @@
       liquidationPrice,
       liquidationText,
       // 0 硬币时按钮本身就是「去种地」——盘口不给救济，这是唯一的下一步。
+      // 票 101：手续费必须让下单的人看见——「开平各 0.2%」，不是藏进结算里。
+      feeText: '开平各 ' + formatTrim(limits.feeRate * 100) + '%',
       submitLabel: coins.available <= 0 ? '去种地' : '开一手',
       limit: {
         enabled: limitOpen,
@@ -1865,6 +1869,8 @@
       const pctText = pct === null ? '—' : formatSigned(pct * 100, 2) + '%'
       const pctTone = pct === null ? 'flat' : toneOf(pct * 100, 2)
       rows.push({
+        // 票 102：榜按收益率排，名次由宿主给的顺序决定（这里不重排，只编号）。
+        rank: rows.length + 1,
         nickname,
         me: entry.me === true,
         pnlText,

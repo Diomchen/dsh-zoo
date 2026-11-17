@@ -30,6 +30,7 @@ import {
   TICK_MS,
   PRICE_CEIL_RATIO,
   PRICE_FLOOR_RATIO,
+  TAKER_FEE_RATE,
   TRADING_LEVERAGES,
   TRADING_STOP_LEVELS,
   boardCrops,
@@ -263,6 +264,8 @@ test('trading-open：窗口拿完整盘口视图；场景没有 trading 控件�
     margins: [50, 100, 250],
     // 杠杆与作物白名单都与纯规则同源：票 80 把杠杆换成 [1,5,20] 时这里不用改。
     leverages: TRADING_LEVERAGES.slice(),
+    // 票 101：手续费率同样随包下发（窗口把「开平各 0.2%」写在下单区）。
+    feeRate: TAKER_FEE_RATE,
     crops: boardCrops().map((id) => ({ id, name: boardView.cropNameOf(state, id) })),
     // 票 84：周期清单同样只有 `src/trading-rules.js` 一份来源。
     timeframes: BOARD_TIMEFRAMES.map(({ id, label }) => ({ id, label })),
@@ -1676,7 +1679,10 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.match(html, /class="order-row order-row-primary"/)
   assert.match(html, /class="order-row order-row-secondary"/)
   assert.match(html, /repeat\(4, 42px\)/)
-  assert.match(html, /repeat\(3, 42px\)/)
+  // 票 101：杠杆白名单收到 1×/5×，横条里就两列（方向也是两列）。
+  assert.match(html, /\.chip-row\.side \{[\s\S]*?repeat\(2, 42px\)/)
+  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(2, 42px\)/)
+  assert.doesNotMatch(html, /repeat\(3, 42px\)/)
   const orderBar = /\.order-bar \{([\s\S]*?)\}/.exec(html)
   assert.ok(orderBar, '应有 .order-bar 规则')
   assert.match(orderBar[1], /overflow: visible/)

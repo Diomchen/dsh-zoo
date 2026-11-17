@@ -29,7 +29,9 @@ import { CROPS, CROP_IDS, MAX_GUARD, isCropId, MINUTE_MS } from './farm-rules.js
 import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 // 票 82：盘口周报只认盘口的作物/方向/杠杆白名单——白名单的真相在 `src/trading-rules.js`
 // （盘口窗口的按钮也由它下发），协议层不另抄一份。
-import { isBoardCrop, isBoardSide, isTradingLeverage } from './trading-rules.js'
+// 票 101：盘上遗留的 20× 仓位仍要能被读回来（周报/排行榜要显示它们），
+// 所以协议层用 `isStoredLeverage`（1..20），下单白名单仍然是 1×/5×。
+import { isBoardCrop, isBoardSide, isStoredLeverage } from './trading-rules.js'
 // 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
 // 票 95：指令种类（含 `place`）同样只认规则层那一份，协议层 re-export。
 import {
@@ -754,7 +756,9 @@ export function normalizeTradingPositions (value) {
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
     if (!isBoardCrop(entry.crop)) return null
     if (!isBoardSide(entry.side)) return null
-    if (!isTradingLeverage(entry.leverage)) return null
+    // 票 101：白名单收成 1×/5×，但榜上要能显示别人手里的老 20× 仓位——
+    // 这里校验的是「读得回来的杠杆形状」，不是「现在能不能下单」。
+    if (!isStoredLeverage(entry.leverage)) return null
     positions.push({ crop: entry.crop, side: entry.side, leverage: entry.leverage })
   }
   return positions

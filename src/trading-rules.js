@@ -37,8 +37,12 @@ export const MAX_PATH_SCAN_MS = MAX_PATH_SCAN_SLOTS * SLOT_MS
  * 行情版本盐：调价格手感（幅度/波形）时一起改它，老图当场作废，
  * 而不是邻居算一份新、我算一份旧。它只进散列种子，不落盘。
  * v1 → v2（票 86）：慢波从两条换成多尺度，旧图作废；确定性不变，所有机器仍是同一张图。
+ * v2 → v3（票 102）：正弦慢波换成多尺度**值噪声**；v3 → v4：值噪声的每个八度都是桥，
+ * 单根内几乎不动、任何尺度都带均值回复（反着做有 +0.23%/根 的可预测收益），
+ * 于是 v4 换成**分钟级随机游走**——所有可观察尺度上都是鞅，任何策略的期望只剩 −手续费。
+ * 旧图作废；确定性不变，所有机器仍是同一张图。
  */
-export const PRICE_SALT = 'board-v2'
+export const PRICE_SALT = 'board-v4'
 /** 价格锚在作物底价，夹在 [0.55, 1.75] 倍（SPEC v10「行情」）。 */
 export const PRICE_FLOOR_RATIO = 0.55
 export const PRICE_CEIL_RATIO = 1.75
@@ -50,10 +54,37 @@ export const PRICE_CEIL_RATIO = 1.75
  * 「全下」也不在这张表里：金额 = 可用硬币，窗口多画一颗按钮，`isMarginAmount` 放行任意整数。
  */
 export const TRADING_MARGINS = Object.freeze([50, 100, 250])
-/** 1× / 5× / 20×（SPEC v10「交易与结算」）；1× 没有强平。 */
-export const TRADING_LEVERAGES = Object.freeze([1, 5, 20])
-/** 读盘时杠杆的形状上限：就是白名单里最大的那一档，别在 store 里另写一个 20。 */
-export const MAX_LEVERAGE = 20
+/**
+ * 1× / 5×（SPEC v10「交易与结算」；票 101 把 20× 拿掉了）。
+ *
+ * 20× 的问题是单根内 ±1.9% 的抖动就能翻倍或爆仓，而底价被夹在 [0.55, 1.75] 倍，
+ * 一天的高杠杆收益能把整片农场比下去。白名单只留 1× 和 5×：想赌可以，但杠上开花的
+ * 速度不再压过种地。
+ */
+export const TRADING_LEVERAGES = Object.freeze([1, 5])
+/** 下单白名单里的最高档：就是上面那张表的最大值。 */
+export const MAX_LEVERAGE = 5
+/**
+ * 读盘时杠杆的形状上限（票 101）：**只给老仓位用**。
+ *
+ * 20× 已经不能新开，但盘上还有 20× 的仓位要能读回来、能结算、能强平。所以
+ * 「形状」放到 20，「下单白名单」留在 `TRADING_LEVERAGES`——两者别再共用一个常量。
+ */
+export const LEGACY_MAX_LEVERAGE = 20
+/**
+ * 手续费（票 101）：按**名义价值**（保证金 × 杠杆）双边各收 0.2%。
+ *
+ * 只收单边的话，玩家可以零成本反复开平刷赔率；双边收等于每一轮先亏掉
+ * `2 × 0.2% × 杠杆` 的保证金（5× 是 2%），把「每根都赌」的期望压回地面。
+ */
+export const TAKER_FEE_RATE = 0.002
+/**
+ * 维持保证金率（票 101）：权益只剩 5% 的保证金就强平。
+ *
+ * 老口径是「亏光才平」（1/leverage 的逆行距离），5× 要 20% 的逆行才触发；
+ * 加这条之后 5× 的强平线变成 19%，与真实交易所的「维持保证金」对齐。
+ */
+export const MAINTENANCE_MARGIN_RATIO = 0.05
 /**
  * 单笔保证金上限 = 农场硬币上限（`src/farm.js` 的 `MAX_COINS`）。
  *
@@ -73,42 +104,40 @@ export const TRADING_STOP_LEVELS = Object.freeze([0, 0.25, 0.5, 1])
 export const TRADING_CLOSE_REASONS = Object.freeze(['close', 'settle', 'liquidate', 'stop'])
 
 /**
- * 多尺度慢趋势（票 86 / ADR-0030）：六条正弦叠在**同一条**对数价格上。
+ * 盘口价格过程 v4（票 102）：**分钟级随机游走**。
  *
- * 每条波**单独给对数振幅**，不再用「权重和 = 1 × 一个总幅度」：它们服务的图表周期不一样，
- * 用同一个幅度均分，等于把长波饿死（旧模型只有两条 2–3 小时波，日/周线就是纯噪声）。
- * 幅度按「谁的周期长谁说话」排：短波只负责盘面的呼吸，日/周线的趋势必须由长波扛。
+ * 为什么既不是正弦、也不是多八度值噪声：
+ *   - 正弦是时间的光滑函数，一根之内的斜率是确定的 → `hintOf` 直接读出「下一根往哪走」，
+ *     跟随做单实测胜率 96%、每手期望 +7% 保证金，盘口变成印钞机（票 102 的原始 bug）。
+ *   - 值噪声把格点值改成散列，但每个八度都是**桥**（格点之间插值）：单根内几乎没有波动，
+ *     且任何尺度上都带均值回复——实测 σ_bar 2.07% 时反着做仍有约 +0.23%/根 的可预测收益。
  *
- *   9 / 11.4 slot（2.25 / 2.85 小时）→ 15 分钟图的风向：6 小时里两三个来回；
- *   33 slot（8.25 小时）             → 1 时图的波段；故意比 8 小时多半根，日线/周线的形态
- *                                      才不逐根复读（正好整除一天/一周会让高低点永远落在同一点）；
- *   688 slot（7.17 天）              → 1 日图的主趋势（一周一次涨跌），1 周图的形状；
- *                                      同样故意不完全等于 672（日历周）；
- *   2816 slot（29.3 天，约 4 周）    → 1 日/1 周图的波段：24 根日线正好走完一个来回；
- *   8064 slot（84 天）               → 1 周图的宏观底/顶：票 86/ADR-0030 写「约 16 周（≈8064 slot）」，
- *                                      按 slot 数算其实是 84 天（12 周）；照 ticket 给的 slot 数实现，
- *                                      量级不变——24 根周线里只走半圈，「这半年在涨还是在跌」看它。
+ * 随机游走是唯一在**所有可观察尺度**上都是鞅的过程：第 m 分钟的增量与历史独立，
+ * 所以「下一分钟 / 下一根」的期望漂移都是 0，任何策略的期望只剩 −手续费。
+ *   · 每个 1 分钟 tick 一个增量（±均匀分布，σ = WALK_MINUTE_SIGMA）；
+ *   · 单根（15 分钟）σ = 0.0052 × √15 ≈ 2.0%，盘面动得起来、又能被 0.4% 名义费覆盖；
+ *   · 价格在 1 分钟之内**是常数**（不插值）：插值等于把下一分钟的走向提前印在图上。
  *
- * 六条振幅之和 = 0.52（对数口径）；只有六条同相时才会叠满，实测最坏（含快噪声）约 ±0.53，
- * 价格落在 0.59–1.69 × 底价——仍在 [0.55, 1.75] 的夹子之内，不去撞夹子，夹子只兜底（票 86 验收）。
- * 相位仍由 `phaseOf(crop, index)` 按作物 + 序号散列，确定性不变：同一台机器、同一刻一张图。
+ * 确定性：增量只由（PRICE_SALT、作物、绝对分钟序号）决定，所有机器、任何时刻同一张图；
+ * 累计值按 64 分钟一个检查点缓存（每作物约 130KB/年），单次查询是 O(64) 次整数散列。
  */
-const SLOW_WAVES = Object.freeze([
-  // 2–3 小时：15 分钟图的「风」。票 86 保留这两条周期，只把幅度从 ±19% 收到 ±7%。
-  Object.freeze({ slots: 9, amplitude: 0.04 }),
-  Object.freeze({ slots: 11.4, amplitude: 0.028 }),
-  // 8 小时：1 时图一段能看出涨跌；1 日图里走三个来回，只进影线，几乎不进日线收盘。
-  Object.freeze({ slots: 33, amplitude: 0.032 }),
-  // 1 周：1 日图的主趋势——连着三四根日线同向，靠的就是这一条。
-  Object.freeze({ slots: 688, amplitude: 0.12 }),
-  // 4 周：1 日/1 周图的波段，也是周线实体的主要来源（周线收盘 = 4 周波走了 1/4 圈）。
-  Object.freeze({ slots: 2816, amplitude: 0.21 }),
-  // 12 周：1 周图的宏观底/顶，24 根周线里只走半圈，负责「这半年在涨还是在跌」。
-  Object.freeze({ slots: 8064, amplitude: 0.09 })
-])
-/** 快噪声：每个 slot 一个散列值、tick 之间平滑插值，幅度约 ±2.2%。 */
-const FAST_AMPLITUDE = 0.022
-const TWO_PI = Math.PI * 2
+const WALK_EPOCH_MINUTE = Math.floor(Date.UTC(2025, 0, 1) / 60_000)
+const WALK_MINUTE_SIGMA = 0.0052
+/**
+ * 每分钟的回归系数（OU 过程）：`level ← (1 - WALK_PULL) × level + 增量`。
+ *
+ * 纯随机游走没有锚，几百天下来必然漂到 [0.55, 1.75] 的夹子上——夹子会变成「可预测的顶/底」，
+ * 反过来制造套利（实测贴夹子的采样占 7–17%，还出现过整段价格纹丝不动）。
+ * 这里给一个弱回归把稳态压进夹子内部：半衰期 ≈ ln2 / 0.0009 ≈ 770 分钟（约 13 小时），
+ * 稳态 σ = 0.0052 / √(2 × 0.0009) ≈ 0.12（对数），价格大致在 0.79–1.27 倍底价之间呼吸；
+ * 0.55 的下夹是 5σ 以外，实测一年贴夹率 < 0.1%。
+ * 回归本身带来的可预测漂移：1σ 偏离时每根回拉 ≈ 0.0009 × 0.12 × 15 ≈ 0.16%，
+ * 小于 0.4% 的名义费（5× 时相当于保证金的 2%），照着做仍然亏。
+ */
+const WALK_PULL = 0.0009
+const WALK_CHECKPOINT = 64
+const WALK_CACHE = new Map()
+const WALK_SEEDS = new Map()
 
 /**
  * K 线显示最近 24 根 + 当前形成中的一根（SPEC v10「行情」）。
@@ -147,14 +176,14 @@ const TIMEFRAME_SAMPLE_MS = Object.freeze({
  * 所以封顶 68%，UI 必须写「不是保证」（SPEC v10「行情」）。
  * 取本根起点而不是「此刻」，是为了让一根之内风向不闪。
  */
-const HINT_FLAT_SLOPE = 0.002
+const HINT_FLAT_MOMENTUM = 0.004
 const HINT_MIN_CONFIDENCE = 0.55
 const HINT_MAX_CONFIDENCE = 0.68
 /**
- * 多尺度慢波叠起来，单根斜率最大约 0.051（六条同相时）；到 0.04 就算顶格——
- * 再陡的坡度多半是短波凑出来的，不该让玩家觉得「这一根特别有把握」。
+ * 三根累计涨跌到 6% 就算「最近走得很猛」，置信度顶格 68%——再高的置信度会让玩家
+ * 误以为这是预测（票 102 之后它只是描述过去，不是概率）。
  */
-const HINT_FULL_SLOPE = 0.04
+const HINT_FULL_MOMENTUM = 0.06
 
 function finiteNumber (value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -178,13 +207,22 @@ export function hash32 (text) {
   return hash >>> 0
 }
 
-/** 散列到 [0, 1)：只用来当噪声格点值与相位，绝不参与钱的取整。 */
+/**
+ * 散列到 [0, 1)：只用来当噪声格点值与相位，绝不参与钱的取整。
+ *
+ * 必须再过一道雪崩（票 102 的第二个坑）：FNV-1a 对「只差最后一位」的字符串
+ * 输出恰好相差常量 0x01000193——格点 ":1" 和 ":2" 的值于是只差 0.4%，
+ * 插值出来的曲线像一条被周期性折断的直线，单根内几乎没有波动，
+ * 而且这种结构本身可预测。xor-shift + 乘法混合把这点相关性彻底打散。
+ */
 function unitHash (text) {
-  return hash32(text) / 4294967296
-}
-
-function phaseOf (crop, index) {
-  return unitHash(PRICE_SALT + ':' + crop + ':phase:' + index) * TWO_PI
+  let hash = hash32(text)
+  hash ^= hash >>> 16
+  hash = Math.imul(hash, 0x85ebca6b)
+  hash ^= hash >>> 13
+  hash = Math.imul(hash, 0xc2b2ae35)
+  hash ^= hash >>> 16
+  return (hash >>> 0) / 4294967296
 }
 
 function clampNumber (value, min, max) {
@@ -217,35 +255,82 @@ export function boardCrops () {
 }
 
 /**
- * 慢趋势分量（对数口径）：`x = slot + tick / 15`，按「根」为单位连续变化。
- * 多尺度波各自带振幅直接相加（见 `SLOW_WAVES` 的注释：短波是呼吸、长波是趋势）。
- * 相位由作物决定，所以三个作物将来是三条不同的曲线，但同一条在所有机器上一样。
+
+ * 32 位雪崩混合：整数输入 → [0, 1)。整数散列比字符串散列快一个量级，
+ * 随机游走要逐分钟推进，这一步不能省。
  */
-function slowLevel (crop, x) {
-  let sum = 0
-  for (let index = 0; index < SLOW_WAVES.length; index += 1) {
-    const wave = SLOW_WAVES[index]
-    sum += wave.amplitude * Math.sin((TWO_PI * x) / wave.slots + phaseOf(crop, index))
+function mix32 (value) {
+  let x = value | 0
+  x ^= x >>> 16
+  x = Math.imul(x, 0x7feb352d)
+  x ^= x >>> 15
+  x = Math.imul(x, 0x846ca68b)
+  x ^= x >>> 16
+  return (x >>> 0) / 4294967296
+}
+
+/** 作物的游走种子：只跟盐与作物名有关——改盐等于换一张图。 */
+function walkSeed (crop) {
+  let seed = WALK_SEEDS.get(crop)
+  if (seed === undefined) {
+    seed = hash32(PRICE_SALT + ':' + crop) | 0
+    WALK_SEEDS.set(crop, seed)
   }
-  return sum
+  return seed
+}
+
+/** 第 `minute` 分钟的对数增量：均值 0、标准差 WALK_MINUTE_SIGMA（均匀分布）。 */
+function walkStep (crop, minute) {
+  const unit = mix32(Math.imul(walkSeed(crop) ^ minute, 0x9e3779b1))
+  return (unit * 2 - 1) * Math.sqrt(3) * WALK_MINUTE_SIGMA
 }
 
 /**
- * 快噪声分量：格点在**半根**（slot 的 1/2，即 tick 7.5）上，tick 之间用 smoothstep 插值。
- *
- * 为什么不是整根一格：整根一格时一根里的 1 分钟路径是**单调**的（smoothstep 从 a 到 b
- * 不回弯），现实里不存在的「插针→收回」「同一根里先破止损再站回去」这些场景就一个都没有了
- * （票 86 实测：20k 根里 0 根能先跌破 1.25% 再收回）。半根一格之后 1 分钟图会拐一次弯，
- * 而整根边界仍然是格点（`tick = 0` / `tick = 15` 都落在格点上）——
- * 一根的收盘价天然等于下一根的开盘价，不需要额外对齐。
+ * 检查点序列：`values[k]` = 第 `k * WALK_CHECKPOINT` 分钟（相对纪元）的累计值。
+ * 按需向前推进，进程内共享；同一作物只会走一遍。
  */
-function fastLevel (crop, x) {
-  const cell = Math.floor(x * 2)
-  const frac = x * 2 - cell
-  const smooth = frac * frac * (3 - 2 * frac)
-  const a = unitHash(PRICE_SALT + ':' + crop + ':fast:' + cell) * 2 - 1
-  const b = unitHash(PRICE_SALT + ':' + crop + ':fast:' + (cell + 1)) * 2 - 1
-  return (a * (1 - smooth) + b * smooth) * FAST_AMPLITUDE
+function ensureWalk (crop, check) {
+  let series = WALK_CACHE.get(crop)
+  if (series === undefined) {
+    series = { values: new Float64Array(256), length: 1 }
+    series.values[0] = 0
+    WALK_CACHE.set(crop, series)
+  }
+  if (check < series.length) return series
+  if (check >= series.values.length) {
+    let size = series.values.length
+    while (size <= check) size *= 2
+    const grown = new Float64Array(size)
+    grown.set(series.values.subarray(0, series.length))
+    series.values = grown
+  }
+  for (let k = series.length; k <= check; k += 1) {
+    let value = series.values[k - 1]
+    const start = (k - 1) * WALK_CHECKPOINT
+    for (let i = 0; i < WALK_CHECKPOINT; i += 1) {
+      value = value * (1 - WALK_PULL) + walkStep(crop, start + i)
+    }
+    series.values[k] = value
+  }
+  series.length = check + 1
+  return series
+}
+
+/** 第 `minute` 分钟（相对纪元）的对数价格偏移。 */
+function walkLevel (crop, minute) {
+  const index = Math.max(0, Math.floor(minute))
+  const check = Math.floor(index / WALK_CHECKPOINT)
+  const series = ensureWalk(crop, check)
+  let value = series.values[check]
+  for (let i = check * WALK_CHECKPOINT; i < index; i += 1) {
+    value = value * (1 - WALK_PULL) + walkStep(crop, i)
+  }
+  return value
+}
+
+/** 对数价格偏移：`x` 以「根」为单位，1 根 = 15 分钟 = 15 个 tick。 */
+function noiseLevel (crop, x) {
+  return walkLevel(crop, Math.floor(x * SLOT_TICKS) - WALK_EPOCH_MINUTE)
 }
 
 /**
@@ -264,7 +349,7 @@ export function boardPrice ({ crop, slot, tick = 0 } = {}) {
   const slotIndex = Math.floor(slotNumber)
   const ticks = clampNumber(tickNumber, 0, SLOT_TICKS)
   const x = slotIndex + ticks / SLOT_TICKS
-  const raw = base * Math.exp(slowLevel(crop, x) + fastLevel(crop, x))
+  const raw = base * Math.exp(noiseLevel(crop, x))
   return clampNumber(raw, base * PRICE_FLOOR_RATIO, base * PRICE_CEIL_RATIO)
 }
 
@@ -532,22 +617,29 @@ export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_
 }
 
 /**
- * 风向提示（票 81）：慢趋势在本根的斜率 → 方向 + 置信度。
+ * 风向提示（票 81，票 102 改口径）：最近三根的**已实现动量** → 方向 + 置信度。
  *
- * 只读 `slowLevel()`，不碰快噪声：这正是 SPEC 说的「快噪声会把弱信号打反，
- * UI 必须写不是保证」——所以这里给的永远是一个 55–68% 的弱信号，不是预测。
- * 同一根内返回值恒定（取本根起点），窗口每秒重画也不会闪。
+ * 旧版读的是 `slowLevel(slot+1) - slowLevel(slot)`，也就是**下一根**的确定性斜率——
+ * 那不是在提示，而是在把答案印在屏幕上（票 102 实测跟随提示胜率 96%）。
+ * 现在价格是随机游走，过去三根的涨跌对下一根没有预测力；这里仍给方向与置信度，
+ * 是因为「追涨杀跌」本身就是玩法，但文案必须写清：**这只是最近的走势，不预示下一根**。
+ * 同一根内返回值恒定（只取已收盘的根），窗口每秒重画也不会闪。
  */
 export function hintOf ({ crop, now } = {}) {
   if (baseOf(crop) === null) return null
   const slot = slotIndexAt(now)
   if (slot === null) return null
-  const slope = slowLevel(crop, slot + 1) - slowLevel(crop, slot)
-  const strength = Math.min(1, Math.abs(slope) / HINT_FULL_SLOPE)
+  // 前 3 根还没有「最近三根」可比：给 flat（不是 null——时钟是好的，只是历史不够）。
+  if (slot < 3) return { direction: 'flat', confidence: 0.5 }
+  const latest = slotClosePrice(crop, slot - 1)
+  const earlier = slotClosePrice(crop, slot - 4)
+  if (latest === null || earlier === null || earlier <= 0) return { direction: 'flat', confidence: 0.5 }
+  const momentum = latest / earlier - 1
+  const strength = Math.min(1, Math.abs(momentum) / HINT_FULL_MOMENTUM)
   const confidence = Math.round(
     (HINT_MIN_CONFIDENCE + (HINT_MAX_CONFIDENCE - HINT_MIN_CONFIDENCE) * strength) * 100
   ) / 100
-  const direction = Math.abs(slope) < HINT_FLAT_SLOPE ? 'flat' : slope > 0 ? 'up' : 'down'
+  const direction = Math.abs(momentum) < HINT_FLAT_MOMENTUM ? 'flat' : momentum > 0 ? 'up' : 'down'
   return { direction, confidence }
 }
 
@@ -577,9 +669,23 @@ export function isTradingLeverage (value) {
   return Number.isInteger(value) && TRADING_LEVERAGES.includes(value)
 }
 
-/** 读盘用：只判断形状合法（1..MAX_LEVERAGE），下单白名单另说。 */
+/** 读盘用：只判断形状合法（1..LEGACY_MAX_LEVERAGE），下单白名单另说（票 101）。 */
 export function isStoredLeverage (value) {
-  return Number.isInteger(value) && value >= 1 && value <= MAX_LEVERAGE
+  return Number.isInteger(value) && value >= 1 && value <= LEGACY_MAX_LEVERAGE
+}
+
+/**
+ * 单边手续费（票 101）= 名义价值 × `TAKER_FEE_RATE`。
+ *
+ * 名义价值是「保证金 × 杠杆」：5× 的 100 硬币仓位，名义 500，单边 1 硬币。
+ * 参数不成立返回 0——手续费不该因为一个坏参数变成 NaN 或负数。
+ */
+export function tradingFeeOf ({ margin, leverage = 1 } = {}) {
+  const marginValue = finiteNumber(margin)
+  const leverageValue = finiteNumber(leverage)
+  if (marginValue === null || marginValue <= 0) return 0
+  if (leverageValue === null || leverageValue <= 0) return 0
+  return Math.round(marginValue * leverageValue * TAKER_FEE_RATE)
 }
 
 /**
@@ -622,21 +728,34 @@ export function pnlOf ({ side, margin, leverage = 1, entry, mark } = {}) {
 }
 
 /**
- * 结算结果：`pnl` 是取整后的盈亏（整数硬币，亏损封顶保证金），`credit` 是要退回的
- * `margin + pnl`。SPEC 的「亏损上限是 margin、不会欠钱」落在这里——硬币不会变负。
+ * 结算结果：`pnl` 是取整后的盈亏（整数硬币，亏损封顶保证金），`fee` 是平仓那一侧
+ * 的手续费（票 101），`credit` 是要退回的 `margin + pnl − fee`。
+ *
+ * SPEC 的「亏损上限是 margin、不会欠钱」落在这里——硬币不会变负：手续费从回款里扣，
+ * 回款已经是 0 的时候不会再让玩家倒贴（`Math.max(0, …)`）。
+ * `fee` 缺省 0，老调用方（不带票 101 口径）行为不变。
  */
-export function settlementOf ({ side, margin, leverage = 1, entry, mark } = {}) {
+export function settlementOf ({ side, margin, leverage = 1, entry, mark, fee = 0 } = {}) {
   const raw = pnlOf({ side, margin, leverage, entry, mark })
   const marginValue = finiteNumber(margin)
+  const feeValue = finiteNumber(fee)
   if (raw === null || marginValue === null || marginValue <= 0) return null
-  const pnl = Math.round(Math.max(-marginValue, raw))
-  return { pnl, credit: Math.max(0, Math.round(marginValue) + pnl) }
+  const charge = feeValue === null ? 0 : Math.max(0, Math.round(feeValue))
+  // `|| 0` 把 `Math.round(-0.2)` 的 `-0` 收成 `0`：存档与断言里不该出现负零。
+  const pnl = Math.round(Math.max(-marginValue, raw)) || 0
+  return {
+    pnl,
+    fee: charge,
+    credit: Math.max(0, Math.round(marginValue) + pnl - charge)
+  }
 }
 
 /**
- * 强平价（票 80）：做多 `entry × (1 − 1/leverage)`，做空 `entry × (1 + 1/leverage)`。
- * 1× 没有强平（价格要跌到 0 才亏光，而价格有底价），返回 null，窗口画「—」。
- * 参数不成立也返回 null——调用方按「没有强平线」处理，不会凭空造一条线出来。
+ * 强平价（票 101）：维持保证金 5%。
+ *
+ * 做多 `entry × (1 − 0.95/leverage)`，做空 `entry × (1 + 0.95/leverage)`——权益只剩
+ * 保证金的 5% 就强平，5× 对应 19% 的逆行（老口径是 1/leverage，要 20%）。
+ * 1× 仍然没有强平（价格有 0.55 倍底价，跌不到 95%），返回 null，窗口画「—」。
  */
 export function liquidationPriceOf ({ side, entry, leverage = 1 } = {}) {
   if (!isBoardSide(side)) return null
@@ -644,7 +763,7 @@ export function liquidationPriceOf ({ side, entry, leverage = 1 } = {}) {
   const leverageValue = finiteNumber(leverage)
   if (entryPrice === null || entryPrice <= 0) return null
   if (leverageValue === null || leverageValue <= 1) return null
-  const ratio = 1 / leverageValue
+  const ratio = (1 - MAINTENANCE_MARGIN_RATIO) / leverageValue
   return side === 'long' ? entryPrice * (1 - ratio) : entryPrice * (1 + ratio)
 }
 
@@ -719,9 +838,14 @@ export function pathScan ({
   const checkAt = (at) => {
     const exit = markPrice({ crop, now: at })
     if (exit === null) return null
-    // 先看玩家自己设的止损：`−100%` 那一档与强平线是同一个价（都是亏光保证金），
-    // 档位既然存在就按「止损」记，钱一分不差（亏损封顶）。没设档位时强平兜底。
-    // 止损的生效时刻之前不参与判定——设止损不翻旧账，强平则照常从路径起点检查。
+    // 强平先判：它是交易所的规则，撞到线上就是强平，玩家的止损不可能「抢在强平前面」
+    // 成交（票 102 之后 20× 老仓与 −100% 档正好同价，谁先判谁写原因）。平仓价用
+    // **强平线本身**，不是那一分钟的插针价：20× 一格的跳空能直接穿透 4 个点，
+    // 按插针价结会让「维持保证金 5%」变成「一夜亏光 100%」，和规则说的不是一回事。
+    if (isLiquidated({ side, mark: exit, liquidation })) {
+      return { at, exit: liquidation, reason: 'liquidate' }
+    }
+    // 再看玩家自己设的止损；生效时刻之前不参与判定（设止损不翻旧账）。
     const hit = at >= stopStart && isStopLossHit({
       side,
       margin: marginValue,
@@ -731,7 +855,6 @@ export function pathScan ({
       stopLoss
     })
     if (hit) return { at, exit, reason: 'stop' }
-    if (isLiquidated({ side, mark: exit, liquidation })) return { at, exit, reason: 'liquidate' }
     return null
   }
   const horizon = Math.min(end, start + MAX_PATH_SCAN_MS)

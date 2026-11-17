@@ -41,19 +41,20 @@ function position (crop, side, leverage = 1) {
   return { crop, side, leverage }
 }
 
-test('票 82：按本周盈亏降序（含负数）；并列先昵称再 deviceId', () => {
-  const win = peer({ weekPnl: 40, nickname: '阿赢' })
-  const lose = peer({ weekPnl: -8, nickname: '阿亏' })
-  const tieA = peer({ weekPnl: 10, nickname: 'B', deviceId: '00000000-0000-4000-8000-0000000000bb' })
-  const tieB = peer({ weekPnl: 10, nickname: 'A', deviceId: '00000000-0000-4000-8000-0000000000aa' })
+test('票 82（票 102 修订）：按本周收益率降序；没报收益率的排最后；并列先昵称再 deviceId', () => {
+  const win = peer({ weekPnl: 40, weekPnlPct: 0.4, nickname: '阿赢' })
+  const lose = peer({ weekPnl: -8, weekPnlPct: -0.08, nickname: '阿亏' })
+  const tieA = peer({ weekPnl: 10, weekPnlPct: 0.2, nickname: 'B', deviceId: '00000000-0000-4000-8000-0000000000bb' })
+  const tieB = peer({ weekPnl: 10, weekPnlPct: 0.2, nickname: 'A', deviceId: '00000000-0000-4000-8000-0000000000aa' })
+  // 金币最多的那个人反而排最后：他赚了 90，但周报里没有收益率（旧版本邻居）。
+  const noPct = peer({ weekPnl: 90, weekPnlPct: undefined, nickname: '没报' })
   const league = buildLeague({
-    self: self({ weekPnl: 10, nickname: 'Z' }),
-    peers: [lose, win, tieA, tieB],
+    self: self({ weekPnl: 25, weekBase: 500, weekPnlPct: 0.05, nickname: 'Z' }),
+    peers: [noPct, lose, win, tieA, tieB],
     now: NOW
   })
-  assert.deepEqual(league.rows.map((row) => row.weekPnl), [40, 10, 10, 10, -8])
-  // 同为 10 时：昵称升序（A < B < Z），同昵称才看 deviceId。
-  assert.deepEqual(league.rows.map((row) => row.nickname), ['阿赢', 'A', 'B', 'Z', '阿亏'])
+  // .4 > .2（A 在 B 前）> .05（本机）> −.08 > null
+  assert.deepEqual(league.rows.map((row) => row.nickname), ['阿赢', 'A', 'B', 'Z', '阿亏', '没报'])
   assert.equal(league.rows[3].me, true)
   // 行形状是窗口直接画的：六个键，多一个都不给。
   assert.deepEqual(Object.keys(league.rows[0]),
@@ -71,8 +72,9 @@ test('票 82：收益率——本机从 base 算，邻居报什么算什么，�
   assert.equal(league.self.weekPnlPct, 0.05, '本机收益率 = 25 / 500')
   assert.equal(league.rows.find((row) => row.nickname === '不报收益率').weekPnlPct, null)
   assert.equal(league.rows.find((row) => row.nickname === '报了').weekPnlPct, 0.5)
-  // 收益率只展示，不改排序：20 > 5 > 25? 不，25 最大。
-  assert.deepEqual(league.rows.map((row) => row.weekPnl), [25, 20, 5])
+  // 票 102：收益率就是排序键。报了 50% > 本机 5% > 没报（排最后），
+  // 所以金币最多的 25 排第二——这正是要的：本金大小不再等于排名。
+  assert.deepEqual(league.rows.map((row) => row.nickname), ['报了', '我', '不报收益率'])
 
   // 调用方给了「未取整口径」的收益率时优先用它（service 从 total / base 算），
   // 显式 0 也是有效值（本周刚好打平），不会被当成「没给」。

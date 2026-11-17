@@ -83,6 +83,8 @@ import {
   BOARD_TIMEFRAMES,
   PRICE_CEIL_RATIO,
   PRICE_FLOOR_RATIO,
+  // 票 101：盘口自己的费率（futures-rules 里另有一份期货费率，同名不同用途，这里给盘口那份起别名）。
+  TAKER_FEE_RATE as BOARD_TAKER_FEE_RATE,
   TRADING_LEVERAGES,
   TRADING_MARGINS,
   boardCrops,
@@ -2720,6 +2722,8 @@ export function createService (ctx, options = {}) {
       limits: {
         margins: TRADING_MARGINS.slice(),
         leverages: TRADING_LEVERAGES.slice(),
+        // 票 101：开平各 0.2%（结算时一次扣清）。数字随包下发，窗口只负责显示。
+        feeRate: BOARD_TAKER_FEE_RATE,
         crops: crops.map((id) => ({ id, name: CROPS[id]?.name ?? id })),
         // 票 84：周期清单只从 `src/trading-rules.js` 下发，窗口不硬编码
         // 「15分/1时/1日/1周」——加周期只改规则层一处。

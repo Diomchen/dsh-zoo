@@ -1109,7 +1109,7 @@
         /* 同一组内相邻 chip 至少 8px（票 89 的点击目标规则）；组与组之间是 10px。 */
         gap: 8px;
       }
-      /* 档位数固定（4 档保证金 / 3 档杠杆），整宽横条里给每颗 chip 一个固定的舒适宽度，
+      /* 档位数固定（4 档保证金 / 2 档杠杆：票 101 把杠杆收到 1×/5×），整宽横条里给每颗 chip 一个固定的舒适宽度，
          比 minmax(0,1fr) 更好读——不再需要迁就 300px 的窄列。 */
       .order-row .chip-row.side {
         grid-template-columns: repeat(2, 42px);
@@ -1118,7 +1118,7 @@
         grid-template-columns: repeat(4, 42px);
       }
       .order-row .chip-row.leverages {
-        grid-template-columns: repeat(3, 42px);
+        grid-template-columns: repeat(2, 42px);
       }
       .order-sep {
         flex: none;
@@ -1415,6 +1415,15 @@
       .sentiment b[data-tone='short'] {
         color: var(--rose-ink);
       }
+      /* 票 101：杠杆 chip 后面那颗静态说明（手续费），和 chip 同高、不占鼠标焦点。 */
+      .chip-note {
+        align-self: center;
+        margin-left: 2px;
+        font-size: 12px;
+        color: var(--muted);
+        white-space: nowrap;
+        font-variant-numeric: tabular-nums;
+      }
       .league-row {
         align-items: flex-start;
         padding: 1px 0;
@@ -1437,20 +1446,33 @@
         text-align: right;
         white-space: nowrap;
       }
-      .league-row .pnl {
-        font-size: 14px;
-        min-width: 34px;
-      }
+      /* 票 102：收益率是排序键，当主数字；金币只做副标题。 */
       .league-pct {
         display: block;
-        font-size: 12px;
-        color: var(--muted);
+        font-size: 14px;
+        min-width: 44px;
+        font-weight: 700;
         font-variant-numeric: tabular-nums;
       }
       .league-pct[data-tone='up'] {
         color: var(--emerald-deep);
       }
       .league-pct[data-tone='down'] {
+        color: var(--rose-ink);
+      }
+      .league-pct[data-tone='flat'] {
+        color: var(--muted);
+      }
+      .league-pnl {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .league-pnl[data-tone='up'] {
+        color: var(--emerald-deep);
+      }
+      .league-pnl[data-tone='down'] {
         color: var(--rose-ink);
       }
       .league-chips {

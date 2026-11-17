@@ -2,7 +2,9 @@
  * 票 83：到价开仓（本地限价单）的账本行为。
  *
  * 临时目录 + 假时钟 + 假农场（只记 coins / spendCoins / addCoins），不联网、不 sleep。
- * 用例挑的是确定性行情里**已知会越价**的那几根（见 FILL_SLOT / DROP_SLOT 的注释）；
+ * 行情是 board-v4 的**分钟级随机游走**（同一分钟内价格恒定）：需要某种形状的行情时
+ * （第一次越价、跌破止损线、收盘前从不越价），全部从 `SLOT_EDGE` 往后现场扫出来
+ * （见 `fillBar` / `dropBar` / `noFillBar`），不再写死 slot / tick / 价格。
  * 成交价、退款次数、硬币余额全按外部行为断言，不测私有函数。
  */
 import assert from 'node:assert/strict'
@@ -22,56 +24,111 @@ import {
   SLOT_TICKS,
   TICK_MS,
   boardPrice,
+  liquidationPriceOf,
   markPrice,
+  settlementOf,
   slotClosePrice,
   slotIndexAt,
+  tradingFeeOf,
   weekStartOf
 } from '../src/trading-rules.js'
 
 /** 正好落在 slot 边界上的一刻。 */
 const SLOT_EDGE = 1763308800000
 const SLOT = SLOT_EDGE / SLOT_MS
-const MONDAY = weekStartOf(SLOT_EDGE)
-/**
- * 成交用的那一根：tick 1→15 一路下跌（价格是算出来的，见 `priceAt`），
- * 做多 target 取第 14 分钟的价 → 第 14 分钟第一次越价；做空 target 取第 1 分钟的最高价。
- */
-const FILL_SLOT = SLOT
-const LONG_FILL_TICK = 14
-const SHORT_FILL_TICK = 1
+
+/** 一根里 0..15 分钟的价格（tick 15 就是收盘价）。 */
+function pricesOf (slot) {
+  const prices = []
+  for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
+    prices.push(boardPrice({ crop: 'tomato', slot, tick }))
+  }
+  return prices
+}
 
 /**
- * 插针用的那一根：tick 1 开仓，之后**第一次**跌穿 −5.5% 在 `DROP_TICK`——20× 的强平线
- * 是 −5%，5× + −25% 止损（−5% 价格）也在同一分钟触发，而且下一根的 tick 1 比这一根
- * 所有 tick 都低：拿它当目标价，正好测「没越价就到期退款」。
- * 票 86 把价格盐升到 board-v2 后行情全变，这一根按新行情现找，不再写死 slot / 5.181。
+ * 成交用的那一根：tick 1 之后**第一次**越价落在 tick 2..14 的最低点（`LONG_FILL_TICK`）。
+ * 做多 target 取这个低点 → 目标价在那一分钟第一次被摸到；做空 target 取第 1 分钟的价，
+ * 第 1 分钟第一次越价。价格是随机的（board-v4 随机游走），所以现场扫，不写死。
+ */
+function fillBar (fromSlot) {
+  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+    const prices = pricesOf(slot)
+    let tick = 2
+    let low = prices[2]
+    for (let t = 3; t <= 14; t += 1) {
+      if (prices[t] < low) {
+        low = prices[t]
+        tick = t
+      }
+    }
+    // 必须是**第一次**越价：成交那一分钟之前没有更低的价。
+    if (prices.slice(1, tick).some((price) => price <= low)) continue
+    return { slot, tick, target: low }
+  }
+  throw new Error('找不到「tick 1 之后第一次越价落在 tick 2..14」的行情（行情规则改了？）')
+}
+const { slot: FILL_SLOT, tick: LONG_FILL_TICK } = fillBar(SLOT)
+const SHORT_FILL_TICK = 1
+const MONDAY = weekStartOf(SLOT_EDGE)
+
+/**
+ * 强平/止损用的那一根：tick 1 开仓，之后**第一次**跌破 −5% 的那一分钟（`DROP_TICK`）
+ * 要深到 −5.5%——5× 的 −25% 止损档在 −5% 价格处触发，多跌一点才不会擦线落在 −12。
+ * 20× 老仓的强平线（−4.75%）也在这根里：同一根能测「强平先于止损」和「按强平线成交」。
+ * 行情是随机的，这一根（含强平撞线的那一分钟）也是现场扫出来的。
  */
 function dropBar (fromSlot) {
-  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
-    const prices = []
-    for (let tick = 0; tick <= SLOT_TICKS; tick += 1) {
-      prices.push(boardPrice({ crop: 'tomato', slot, tick }))
-    }
+  for (let slot = fromSlot; slot < fromSlot + 20000; slot += 1) {
+    const prices = pricesOf(slot)
     const entry = prices[1]
     let dropTick = -1
     for (let tick = 3; tick <= SLOT_TICKS; tick += 1) {
-      // −5.5%：5× 的 −25% 档要亏到 −13 以下（用例断言 pnl <= -13），比强平线多留一点。
-      if (prices[tick] <= entry * 0.945) {
+      if (prices[tick] <= entry * 0.95) {
         dropTick = tick
         break
       }
     }
     if (dropTick < 0) continue
-    // 强平线（−5%）的第一次触发必须就是 dropTick：之前的分钟不能有更深的价。
-    if (prices.slice(2, dropTick).some((price) => price <= entry * 0.95)) continue
+    if (prices[dropTick] > entry * 0.945) continue
+    // 20× 的强平线：第一次撞线的那一分钟（强平按线成交，at 用这一分钟）。
+    const line = liquidationPriceOf({ side: 'long', entry, leverage: 20 })
+    let liqTick = -1
+    for (let tick = 2; tick <= SLOT_TICKS; tick += 1) {
+      if (prices[tick] <= line) {
+        liqTick = tick
+        break
+      }
+    }
+    if (liqTick < 0) continue
+    return { slot, entry, dropTick, liqTick, line }
+  }
+  throw new Error('找不到「tick 1 开仓后第一次跌破 −5% 且深到 −5.5%」的行情（行情规则改了？）')
+}
+const {
+  slot: DROP_SLOT,
+  entry: DROP_ENTRY,
+  dropTick: DROP_TICK,
+  liqTick: DROP_LIQ_TICK,
+  line: DROP_LIQ_LINE
+} = dropBar(SLOT + 2)
+
+/**
+ * 「这一根从没越价」用的那一根：目标价压在这一根所有分钟价之下（`low`），
+ * 而下一根的 tick 1 已经低于它——「此刻现价已越过目标价」但挂单只活一根，
+ * 到期只退款、不成交。和 `dropBar` 分开扫：同一根同时满足两边太苛刻。
+ */
+function noFillBar (fromSlot) {
+  for (let slot = fromSlot; slot < fromSlot + 4000; slot += 1) {
+    const prices = pricesOf(slot)
     const low = Math.min(...prices.slice(1))
     const nextFirst = boardPrice({ crop: 'tomato', slot: slot + 1, tick: 1 })
     if (nextFirst >= low) continue
-    return { slot, dropTick, noFillTarget: nextFirst }
+    return { slot, target: nextFirst }
   }
-  throw new Error('找不到「tick 1 开仓、之后跌穿 −5%、下一根更低」的行情（行情规则改了？）')
+  throw new Error('找不到「下一根更低、这一根从不越价」的行情（行情规则改了？）')
 }
-const { slot: DROP_SLOT, dropTick: DROP_TICK, noFillTarget: NOFILL_TARGET } = dropBar(SLOT + 2)
+const { slot: NOFILL_SLOT, target: NOFILL_TARGET } = noFillBar(SLOT + 2)
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-trading-orders-'))
@@ -149,7 +206,7 @@ function tickLowOf (slot) {
 
 test('票 83：挂单当场锁保证金一次；视图/存档有单；重启不重复扣钱', async (t) => {
   const dir = await tempDir(t)
-  const clock = makeClock(SLOT_EDGE + 2 * TICK_MS)
+  const clock = makeClock(FILL_SLOT * SLOT_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
   const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
@@ -177,7 +234,7 @@ test('票 83：挂单当场锁保证金一次；视图/存档有单；重启不�
   assert.equal(order.leverage, 5)
   assert.equal(order.placedAt, clock.now())
   assert.equal(order.slot, slotIndexAt(clock.now()))
-  assert.equal(order.remainingMs, SLOT_EDGE + SLOT_MS - clock.now())
+  assert.equal(order.remainingMs, FILL_SLOT * SLOT_MS + SLOT_MS - clock.now())
   // 挂单的保证金也在「含锁定」里：展示层加回，farm.json 只有可用硬币。
   assert.equal(view.locked, 50)
   assert.equal(view.unrealized, 0)
@@ -200,7 +257,7 @@ test('票 83：挂单当场锁保证金一次；视图/存档有单；重启不�
 
 test('票 83：坏挂单/硬币不够都不扣钱；同一价位连挂两张各扣各的', async (t) => {
   const dir = await tempDir(t)
-  const clock = makeClock(SLOT_EDGE + TICK_MS)
+  const clock = makeClock(FILL_SLOT * SLOT_MS + TICK_MS)
   const farm = fakeFarm(120)
   const store = await openStore(dir, { clock, farm })
   const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
@@ -237,10 +294,10 @@ test('票 83：坏挂单/硬币不够都不扣钱；同一价位连挂两张各�
 })
 
 test('票 83：做多跌到目标价、做空涨到目标价——成交价是目标价，时刻是第一处越价', async (t) => {
-  // 做多：目标价取第 14 分钟的价，第 14 分钟第一次越价。
+  // 做多：目标价取 tick 2..14 里第一次越价的那个低点，成交就在那一分钟。
   const longDir = await tempDir(t)
   // 挂单就在这一根开盘那一刻：成交必须发生在挂单之后，不能拿「挂单前的价」倒推。
-  const longClock = makeClock(SLOT_EDGE)
+  const longClock = makeClock(FILL_SLOT * SLOT_MS)
   const longFarm = fakeFarm(500)
   const longStore = await openStore(longDir, { clock: longClock, farm: longFarm })
   const longTarget = priceAt(FILL_SLOT, LONG_FILL_TICK)
@@ -263,9 +320,9 @@ test('票 83：做多跌到目标价、做空涨到目标价——成交价是�
   assert.equal(longFarm.wallet.coins, 450, '成交不再动钱（保证金早就锁了）')
   assert.equal(longFarm.calls.filter(([kind]) => kind === 'add').length, 0)
 
-  // 做空：目标价取第 1 分钟的最高价，第 1 分钟第一次越价。
+  // 做空：目标价取第 1 分钟的价，第 1 分钟第一次越价。
   const shortDir = await tempDir(t)
-  const shortClock = makeClock(SLOT_EDGE)
+  const shortClock = makeClock(FILL_SLOT * SLOT_MS)
   const shortFarm = fakeFarm(500)
   const shortStore = await openStore(shortDir, { clock: shortClock, farm: shortFarm })
   const shortTarget = priceAt(FILL_SLOT, SHORT_FILL_TICK)
@@ -283,12 +340,12 @@ test('票 83：做多跌到目标价、做空涨到目标价——成交价是�
 
 test('票 83：这一根从没越价就不成交（哪怕此刻的现价已经越过目标），到期只退一次', async (t) => {
   const dir = await tempDir(t)
-  const placedAt = DROP_SLOT * SLOT_MS
+  const placedAt = NOFILL_SLOT * SLOT_MS
   const clock = makeClock(placedAt)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
   // 这一根从 tick 1 到收盘都不低于 NOFILL_TARGET；目标价只在下一根才被摸到。
-  const later = (DROP_SLOT + 1) * SLOT_MS + TICK_MS
+  const later = (NOFILL_SLOT + 1) * SLOT_MS + TICK_MS
   assert.ok(markPrice({ crop: 'tomato', now: later }) <= NOFILL_TARGET, '此刻现价已经越过目标价')
   assert.equal((await store.placeOrder({
     crop: 'tomato', side: 'long', target: NOFILL_TARGET, margin: 50, leverage: 5
@@ -312,7 +369,7 @@ test('票 83：这一根从没越价就不成交（哪怕此刻的现价已经�
 
 test('票 83：refunding 意图（写完退款就崩）在启动时只补删单，绝不重复加钱', async (t) => {
   const dir = await tempDir(t)
-  const clock = makeClock(SLOT_EDGE + 2 * TICK_MS)
+  const clock = makeClock(FILL_SLOT * SLOT_MS + 2 * TICK_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
   const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
@@ -343,12 +400,12 @@ test('票 83：refunding 意图（写完退款就崩）在启动时只补删单�
 
 test('票 83：手动撤单退一次；再撤是 no-order；撤单不进历史', async (t) => {
   const dir = await tempDir(t)
-  const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)
+  const clock = makeClock(FILL_SLOT * SLOT_MS + 3 * TICK_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
   const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
   const placed = await store.placeOrder({
-    crop: 'tomato', side: 'short', target, margin: 100, leverage: 20
+    crop: 'tomato', side: 'short', target, margin: 100, leverage: 5
   })
   assert.equal(farm.wallet.coins, 400)
 
@@ -378,13 +435,13 @@ test('票 83：坏挂单行只丢自己并计修补；缺省 orders 不算修补
     id: 'o-good',
     crop: 'tomato',
     side: 'long',
-    // 目标价压在这一根所有 tick 之下（由行情现算）：写死 5.5 会被当场越价成交，
+    // 目标价压在这一根所有 tick 之下（由行情现算）：写死价格会被当场越价成交，
     // 那就不是「好单读得回来」而是「好单已经成交」了。
-    target: tickLowOf(SLOT) * 0.999,
+    target: tickLowOf(FILL_SLOT) * 0.999,
     margin: 50,
     leverage: 5,
-    placedAt: SLOT_EDGE,
-    slot: SLOT
+    placedAt: FILL_SLOT * SLOT_MS,
+    slot: FILL_SLOT
   }
   const normalized = normalizeTradingFile({
     version: 1,
@@ -428,7 +485,7 @@ test('票 83：坏挂单行只丢自己并计修补；缺省 orders 不算修补
 
   // 带一张好单的存档：启动只告警一次，单还在。
   const dir = await tempDir(t)
-  const clock = makeClock(SLOT_EDGE + TICK_MS)
+  const clock = makeClock(FILL_SLOT * SLOT_MS + TICK_MS)
   const farm = fakeFarm(500)
   await writeTrading(dir, {
     version: TRADING_VERSION,
@@ -444,30 +501,58 @@ test('票 83：坏挂单行只丢自己并计修补；缺省 orders 不算修补
   assert.match(logger.warnings[0], /修补/)
 })
 
-test('票 83：到价成交的仓位照样走得完强平——20× 插针只亏保证金', async (t) => {
+test('票 83：到价成交的仓位照样走得完强平——20× 老仓插针只亏保证金', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(DROP_SLOT * SLOT_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const target = priceAt(DROP_SLOT, 1)
+  const target = DROP_ENTRY
+  assert.equal(target, priceAt(DROP_SLOT, 1), '目标价就是 tick 1 的价')
   assert.equal((await store.placeOrder({
-    crop: 'tomato', side: 'long', target, margin: 50, leverage: 20
+    crop: 'tomato', side: 'long', target, margin: 50, leverage: 5
   })).ok, true)
   assert.equal(farm.wallet.coins, 450)
 
-  clock.set((DROP_SLOT + 1) * SLOT_MS)
+  // 成交：第 1 分钟第一次越价，仓位 entry = 目标价。
+  clock.set(DROP_SLOT * SLOT_MS + TICK_MS)
   await store.tick()
-  const view = store.view({ now: clock.now() })
+  const filled = store.view({ now: clock.now() })
+  assert.equal(filled.positions.length, 1)
+  assert.equal(filled.positions[0].entry, target)
+
+  // 新单最高 5×，一根要跌 19% 才强平（v4 一根最多约 6%）——强平路径只有老仓能走到：
+  // 把落盘的杠杆改成 20（读盘允许 1..20 的老仓位），重启后同一根继续走。
+  const file = await readTrading(dir)
+  assert.equal(file.positions[0].leverage, 5)
+  file.positions[0].leverage = 20
+  await writeTrading(dir, file)
+  const restarted = await openStore(dir, { clock, farm })
+  assert.equal(restarted.view({ now: clock.now() }).positions[0].leverage, 20)
+
+  clock.set((DROP_SLOT + 1) * SLOT_MS)
+  await restarted.tick()
+  const view = restarted.view({ now: clock.now() })
   assert.equal(view.positions.length, 0)
   assert.equal(view.orders.length, 0)
   assert.equal(view.history.length, 1)
+
+  const fee = tradingFeeOf({ margin: 50, leverage: 20 }) * 2
+  const outcome = settlementOf({
+    side: 'long', margin: 50, leverage: 20, entry: target, mark: DROP_LIQ_LINE, fee
+  })
   const history = view.history[0]
   assert.equal(history.reason, 'liquidate')
   assert.equal(history.entry, target, '成交价仍是目标价')
-  assert.equal(history.exit, priceAt(DROP_SLOT, DROP_TICK), '强平用的是路径上那一分钟')
-  assert.equal(history.pnl, -50, '亏损封顶保证金')
+  // 强平按**强平线本身**成交，不是撞线那一分钟的插针价。
+  assert.equal(history.exit, liquidationPriceOf({ side: 'long', entry: target, leverage: 20 }))
+  assert.equal(history.exit, DROP_LIQ_LINE)
+  assert.equal(history.at, DROP_SLOT * SLOT_MS + DROP_LIQ_TICK * TICK_MS, '第一处撞线的那一分钟')
+  assert.equal(history.pnl, outcome.pnl)
+  assert.equal(history.fee, fee, '手续费在结算时一次扣清（开平两侧）')
+  assert.equal(history.pnl >= -50, true, '亏损封顶保证金')
+  assert.equal(history.pnl <= -40, true, '强平线只剩 5% 维持保证金，几乎亏光')
   assert.equal(farm.wallet.coins, 450, '保证金全亏，没有钱退回')
-  assert.equal(view.week.pnl, -50)
+  assert.equal(view.week.pnl, outcome.pnl - outcome.fee, '本周盈亏是净额（pnl − fee）')
   assert.equal(farm.calls.some(([kind, qty]) => kind === 'add' && qty === 0), false, '不调 addCoins(0)')
 })
 
@@ -476,7 +561,7 @@ test('票 83：到价成交后还能设止损，按路径上撞线那一分钟�
   const clock = makeClock(DROP_SLOT * SLOT_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
-  const target = priceAt(DROP_SLOT, 1)
+  const target = DROP_ENTRY
   assert.equal((await store.placeOrder({
     crop: 'tomato', side: 'long', target, margin: 50, leverage: 5
   })).ok, true)
@@ -493,10 +578,20 @@ test('票 83：到价成交后还能设止损，按路径上撞线那一分钟�
   const view = store.view({ now: clock.now() })
   assert.equal(view.positions.length, 0)
   assert.equal(view.history.length, 1)
-  assert.equal(view.history[0].reason, 'stop')
-  assert.equal(view.history[0].exit, priceAt(DROP_SLOT, DROP_TICK))
-  assert.equal(view.history[0].pnl <= -13, true, '−25% 保证金档（5× 下约 −14）')
-  assert.equal(farm.wallet.coins, 450 + view.history[0].pnl + 50)
+  const exit = priceAt(DROP_SLOT, DROP_TICK)
+  const fee = tradingFeeOf({ margin: 50, leverage: 5 }) * 2
+  const outcome = settlementOf({
+    side: 'long', margin: 50, leverage: 5, entry: target, mark: exit, fee
+  })
+  const history = view.history[0]
+  assert.equal(history.reason, 'stop')
+  // 止损按**触发那一分钟的价**成交（不是强平线）。
+  assert.equal(history.exit, exit)
+  assert.equal(history.at, DROP_SLOT * SLOT_MS + DROP_TICK * TICK_MS)
+  assert.equal(history.pnl, outcome.pnl)
+  assert.equal(history.fee, fee)
+  assert.equal(history.pnl <= -13, true, '−25% 保证金档（5× 下约 −14）')
+  assert.equal(farm.wallet.coins, 450 + outcome.credit, '回款 = 保证金 + 盈亏 − 手续费')
 })
 
 test('票 83：到价成交后收盘照常结算（用这一根的收盘价）', async (t) => {
@@ -516,12 +611,14 @@ test('票 83：到价成交后收盘照常结算（用这一根的收盘价）',
   assert.equal(view.history[0].reason, 'settle')
   assert.equal(view.history[0].exit, slotClosePrice('tomato', FILL_SLOT))
   assert.equal(view.history[0].openedAt, undefined, '历史行不复制开盘时刻（契约只有 at）')
-  assert.equal(view.week.pnl + 0, view.history[0].pnl + 0)
+  const fee = tradingFeeOf({ margin: 50, leverage: 1 }) * 2
+  // 本周盈亏是净额：pnl − fee（这一档手续费取整为 0，但口径不写死）。
+  assert.equal(view.week.pnl, view.history[0].pnl - fee)
 })
 
 test('票 83：保证金接受任意整数（全下/自定义金额），不只 50/100/250', async (t) => {
   const dir = await tempDir(t)
-  const clock = makeClock(SLOT_EDGE + TICK_MS)
+  const clock = makeClock(FILL_SLOT * SLOT_MS + TICK_MS)
   const farm = fakeFarm(500)
   const store = await openStore(dir, { clock, farm })
   const target = priceAt(FILL_SLOT, LONG_FILL_TICK)
