@@ -39,7 +39,7 @@ if (selected.length === 0) process.exit(0)
 
 const args = [
   '--test',
-  '--test-concurrency=4',
+  '--test-concurrency=2', // 2 核 CI 上 4 路并发会把真实定时器挤到超时（改用例不如先别抢 CPU）
   '--test-force-exit',
   ...selected.map((name) => join(TEST_DIR, name))
 ]

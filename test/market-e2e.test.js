@@ -224,7 +224,7 @@ test('HTTP：农场 tick 也推进交易所均值回归（每 10 分钟向 base 
   assert.equal((await state(service)).body.market.prices.tomato.price, 10)
 
   clock.value += 10 * MINUTE_MS
-  const deadline = Date.now() + 1000
+  const deadline = Date.now() + 5000 // CI 上 4 路并发抢 2 核，1 秒太紧
   while (service.snapshot().market.prices.tomato.price === 10 && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 10))
   }
@@ -233,7 +233,7 @@ test('HTTP：农场 tick 也推进交易所均值回归（每 10 分钟向 base 
 
   // tick 的写盘是异步的：等到文件也变成回归后的价格，而不是读到上一版。
   let file = null
-  const fileDeadline = Date.now() + 1000
+  const fileDeadline = Date.now() + 5000 // 同上：写盘是异步的，别和 CPU 抢
   while (Date.now() < fileDeadline) {
     file = JSON.parse(await readFile(join(dir, MARKET_FILE), 'utf8'))
     if (Math.abs(file.prices.tomato.price - 9.85) < 1e-9) break

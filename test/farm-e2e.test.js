@@ -384,7 +384,7 @@ test('HTTP：60 秒 tick 的接线（测试用 15ms 节拍）会推进生长与�
   assert.equal((await action(service, { action: 'plant', plotId: 'p1', cropId: 'tomato' })).body.ok, true)
 
   clock.value += 10 * MINUTE_MS
-  const deadline = Date.now() + 1000
+  const deadline = Date.now() + 5000 // CI 上 4 路并发抢 2 核，1 秒太紧
   while (service.snapshot().farm.dew < 1 && Date.now() < deadline) await delay(10)
 
   const farm = service.snapshot().farm
