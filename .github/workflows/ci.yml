@@ -138,7 +138,12 @@ jobs:
           fi
           version="$(node -p "require('./package.json').version")"
           # tag 可以重推（Release job 支持覆盖），npm 上已有的版本不能再发一次。
-          if npm view "dsh-zoo@${version}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
+          # 判据用「打印出来的版本号正好等于本地版本」，不看退出码：`npm view`
+          # 在版本不存在时会给非零，但空输出却返回 0 的情况也出现过，那会让
+          # 这里误判成「已发布」而静默跳过（v1.9.0 就这么被跳过一次）。
+          published="$(npm view "dsh-zoo@${version}" version --registry=https://registry.npmjs.org 2>/dev/null || true)"
+          echo "::notice::registry 上的 dsh-zoo@${version} = '${published:-<不存在>}'"
+          if [ "$published" = "$version" ]; then
             echo "dsh-zoo@${version} 已经在 npm 上了，跳过"
             exit 0
           fi
@@ -149,3 +154,4 @@ jobs:
           esac
           npm whoami
           npm publish --access public --registry=https://registry.npmjs.org --tag "$dist_tag"
+          echo "::notice::已发布 dsh-zoo@${version}（dist-tag ${dist_tag}）"
