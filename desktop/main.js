@@ -248,6 +248,8 @@ let lastTrustedInputAt = 0
  * 主进程收到一次就重放一次「穿透 → 可交互」，不重启 helper 也能把卡住的输入态解开。
  */
 let lostDowns = 0
+// 上一次已上报的命中身份：可交互态 + 命中目标，用来去重
+let lastHitKey = ''
 let lastLostDownAt = 0
 let lastHealAt = 0
 /**
@@ -354,6 +356,7 @@ app.whenReady().then(() => {
     startHostLink()
   }
   startPointerWatchdog()
+  startRectProbe()
 }).catch((error) => {
   reportError('create-window-failed', error)
   shutdown(1)
@@ -1087,6 +1090,8 @@ function applyDecision (reason) {
   if (shared.shouldReassert({ ignoring: ignoreState.ignoring, now: Date.now(), lastAt: lastReassertAt })) {
     reassertInteractive()
   }
+  // 命中目标变了（例如从放行卡挪到宠物）也要让调用方看见，不能只在翻转时发
+  emitHit(decision.reason || reason)
 }
 
 /**
@@ -1105,12 +1110,54 @@ function liveRects (now) {
   } else {
     pets = []
   }
-  const overlays = overlayRectsAt > 0 && now - overlayRectsAt <= shared.RENDERER_RECT_MAX_AGE_MS
+  const overlays = overlayRectsAt > 0 && now - overlayRectsAt <= shared.OVERLAY_RECT_MAX_AGE_MS
     ? overlayRects
     : []
   if (overlays.length === 0) return pets
   if (pets.length === 0) return overlays
   return overlays.concat(pets)
+}
+
+// 矩形看门狗（票 92）：长时间运行后渲染端的 rAF 会被系统降频甚至停掉，宠物/弹层矩形
+// 不再上报；主进程按过期把整窗当「窗外」，窗口翻回穿透，怎么点都没反应，只能重启插件。
+// 这里定时空敲一次探针让渲染端全量重报；连续几次都叫不醒就重载渲染端（不动宿主）。
+const RECT_PROBE_INTERVAL_MS = 3000
+const RECT_PROBE_STALE_MS = 4000
+const RECT_PROBE_MAX_STRIKES = 3
+const RENDERER_RELOAD_COOLDOWN_MS = 60 * 1000
+let rectProbeTimer = null
+let rectProbeStrikes = 0
+let lastRendererReloadAt = 0
+
+function probeRendererRects (now) {
+  if (win === null || win.isDestroyed() || rendererReady !== true) return
+  const stale = rendererRectsAt === 0 || now - rendererRectsAt > RECT_PROBE_STALE_MS
+  if (!stale) {
+    rectProbeStrikes = 0
+    return
+  }
+  rectProbeStrikes += 1
+  try {
+    win.webContents.send('dsh-zoo:probe')
+  } catch (error) {
+    reportError('rect-probe-failed', error)
+  }
+  if (rectProbeStrikes < RECT_PROBE_MAX_STRIKES) return
+  if (now - lastRendererReloadAt < RENDERER_RELOAD_COOLDOWN_MS) return
+  lastRendererReloadAt = now
+  rectProbeStrikes = 0
+  reportError('renderer-reload', new Error('rects stale'))
+  try {
+    win.webContents.reload()
+  } catch {
+    // 重载失败：等下一轮冷却结束再试
+  }
+}
+
+function startRectProbe () {
+  if (rectProbeTimer !== null) return
+  rectProbeTimer = setInterval(() => probeRendererRects(Date.now()), RECT_PROBE_INTERVAL_MS)
+  rectProbeTimer.unref?.()
 }
 
 function startPointerWatchdog () {
@@ -1158,6 +1205,10 @@ function emitHit (reason) {
   const rects = liveRects(Date.now())
   const rect = local === null ? null : shared.hitTestRects(rects, local)
   const bounds = win !== null && !win.isDestroyed() ? win.getBounds() : null
+  const hitKey = (ignoreState.ignoring === false ? '1' : '0') + '|' + (rect !== null && typeof rect.id === 'string' ? rect.id : '')
+  // 状态没变、目标也没变：这条 hit 没有新信息，别刷屏
+  if (hitKey === lastHitKey) return
+  lastHitKey = hitKey
   writeEvent({
     type: 'hit',
     // 这个字段的语义是「光标现在在不在命中矩形里」，不是渲染端上次说了什么。
@@ -3580,6 +3631,11 @@ function stopTimers () {
   if (pointerTimer !== null) {
     clearInterval(pointerTimer)
     pointerTimer = null
+  }
+
+  if (rectProbeTimer !== null) {
+    clearInterval(rectProbeTimer)
+    rectProbeTimer = null
   }
   if (hostPollTimer !== null) {
     clearInterval(hostPollTimer)
