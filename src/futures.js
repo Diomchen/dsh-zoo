@@ -17,20 +17,30 @@
  *       { "at": 1763308800000, "crop": "tomato", "contract": "tomato-2026W47",
  *         "side": "long", "lots": 2, "price": 5.05, "fee": 1.01, "kind": "open" }
  *     ],
+ *     "orders": [                              // 票 95：自己挂的限价单（未成交部分还冻结着保证金）
+ *       { "id": "…", "deviceId": "local", "crop": "tomato", "contract": "tomato-2026W47",
+ *         "side": "long", "price": 5.05, "lots": 2, "lotsLeft": 2, "leverage": 10,
+ *         "marginFrozen": 10.1, "at": 1763308800000 }
+ *     ],
  *     "week": { "start": 1763251200000, "pnl": 12.5 },  // 本周已实现盈亏（票 93 顶部展示）
  *     "closed": 0,                             // 平掉/交割的累计笔数（只用于展示）
  *     "tradedAt": 0,                           // 最后一笔动钱的时刻
  *     "seq": 7,                                // 票 94：账本流水号，每次「peer 必须看见」的变动 +1
  *     "remotes": {                             // 票 94：房主替别人托管的账户（key = deviceId）
- *       "…uuid…": { "balance": 100, "marginUsed": 40, "positions": [ … ],
+ *       "…uuid…": { "balance": 100, "marginUsed": 40, "positions": [ … ], "orders": [ … ],
  *                   "lastSeq": 7, "updatedAt": 1763308800000 }
  *     }
  *   }
  *
  * 票 94 的分工：**房主是清算所**。别人的账户记在 `remotes` 里，价格、成交、余额全由
- * 本机算（peer 只能发「充值/开仓/平仓」三个指令，发不了价格）；`seq` 是这条账的单调流水号，
- * peer 按 `(epoch, seq)` 判重、拒收倒退的包。`epoch` 每次启动换新，所以房主重启后
- * peer 的旧 `lastSeq` 一律作废、直接采纳新账本。
+ * 本机算（peer 只能发「充值/开仓/平仓/挂单/撤单」这些指令，发不了价格）；`seq` 是这条账的
+ * 单调流水号，peer 按 `(epoch, seq)` 判重、拒收倒退的包。`epoch` 每次启动换新，所以房主
+ * 重启后 peer 的旧 `lastSeq` 一律作废、直接采纳新账本。
+ *
+ * 票 95 的挂单：下单即把 `marginFrozen` 从 `balance` 划进 `marginUsed`（钱没离开托管账户，
+ * 只是从「可用」变成「冻结」）；成交时这笔冻结按成交张数比例转成仓位的 `margin`，手续费
+ * 另从 `balance` 扣。撤单只退**剩余未成交**那部分。所以任何时刻都有
+ * `marginUsed = Σ 仓位保证金 + Σ 挂单冻结保证金`，`balance + marginUsed` 才是总权益。
  *
  * peer 侧的副本（`replica`）**不落盘**：它只是房主账本的缓存，重启后 30 秒内就会重新同步，
  * 写盘只会多一份可能过期的副本。
@@ -62,7 +72,7 @@ import { CROP_IDS, CROPS, isCropId } from './farm-rules.js'
 import { MAX_COINS } from './farm.js'
 import { parseJsonText } from './json-text.js'
 // 票 94：远端账户的键就是协议里的 deviceId，形状校验只认那一份真相（protocol 不 import 本文件）。
-import { isDeviceId, FUTURES_MAX_POSITIONS } from './protocol.js'
+import { isDeviceId, FUTURES_MAX_POSITIONS, FUTURES_MAX_ORDERS } from './protocol.js'
 import {
   SLOT_MS,
   contractOf,
@@ -75,10 +85,13 @@ import {
   isMarginAmount,
   lotsFor,
   marginOf,
+  matchOrders,
+  MAX_MARGIN,
   notionalOf,
   pnlOf,
   quotesOf,
   roundCoin,
+  sortBook,
   startOfWeek,
   takerFeeOf
 } from './futures-rules.js'
@@ -93,6 +106,8 @@ export const FUTURES_VIEW_TRADES = 20
 
 const MAX_ID_LENGTH = 64
 const MAX_QUANTITY = 1_000_000
+/** 本地挂单的 deviceId 占位：真正的设备号只出现在 `remotes` 的键上。 */
+export const LOCAL_ORDER_DEVICE = 'local'
 
 function finiteNumber (value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -128,6 +143,7 @@ export function initialFuturesState () {
     fees: { insurance: 0, burned: 0 },
     positions: [],
     trades: [],
+    orders: [],
     week: { start: 0, pnl: 0 },
     closed: 0,
     tradedAt: 0,
@@ -140,7 +156,7 @@ export function initialFuturesState () {
 
 /** 一个远端账户的空壳（房主第一次见到某个 deviceId 时用）。 */
 function initialRemoteAccount (seq = 0, at = 0) {
-  return { balance: 0, marginUsed: 0, positions: [], lastSeq: seq, updatedAt: at }
+  return { balance: 0, marginUsed: 0, positions: [], orders: [], lastSeq: seq, updatedAt: at }
 }
 
 /**
@@ -158,6 +174,8 @@ export function initialFuturesView () {
     positionCount: 0,
     positions: [],
     trades: [],
+    orders: [],
+    orderCount: 0,
     week: { start: 0, pnl: 0 },
     quotes: {}
   }
@@ -199,6 +217,44 @@ function normalizeTrade (raw) {
 }
 
 /**
+ * 一条挂单（票 95）。`marginFrozen` 只记**剩余未成交**部分的冻结保证金：
+ * 每笔成交按比例扣掉一份，撤单把剩下的退回去，所以它永远等于「还压着的钱」。
+ */
+function normalizeOrder (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const id = typeof raw.id === 'string' && raw.id !== '' && raw.id.length <= MAX_ID_LENGTH ? raw.id : null
+  const deviceId = typeof raw.deviceId === 'string' && raw.deviceId !== '' && raw.deviceId.length <= MAX_ID_LENGTH
+    ? raw.deviceId
+    : null
+  const crop = isCropId(raw.crop) ? raw.crop : null
+  const contract = contractWindowOf(raw.contract)
+  const side = isFuturesSide(raw.side) ? raw.side : null
+  const price = finiteNumber(raw.price)
+  const lots = positiveInt(raw.lots, MAX_QUANTITY)
+  const lotsLeft = positiveInt(raw.lotsLeft, MAX_QUANTITY)
+  const leverage = isFuturesLeverage(raw.leverage) ? raw.leverage : null
+  const marginFrozen = nonNegativeCoin(raw.marginFrozen)
+  const at = finiteNumber(raw.at)
+  if (id === null || deviceId === null || crop === null || contract === null || side === null) return null
+  if (price === null || price <= 0 || lots === null || lotsLeft === null || lotsLeft > lots) return null
+  if (leverage === null || marginFrozen === null || marginFrozen <= 0) return null
+  if (at === null || at <= 0) return null
+  return {
+    id,
+    deviceId,
+    crop,
+    contract: contract.id,
+    side,
+    price: roundCoin(price),
+    lots,
+    lotsLeft,
+    leverage,
+    marginFrozen,
+    at
+  }
+}
+
+/**
  * 一个远端账户（票 94）：房主替 peer 记的账。位置形状与本地仓位一致（也要能逐根盯市）。
  * 坏账户整条丢掉——留着半份账户比没有更危险（少一条持仓，看起来就像已经平掉了）。
  */
@@ -222,8 +278,21 @@ function normalizeRemoteAccount (raw) {
       positions.push(position)
     }
   }
-  // 保证金一律以仓位为准（与本地账本同一取舍）：删仓位之后不会留下凭空冻结的钱。
-  return { balance, marginUsed: roundCoin(positions.reduce((sum, position) => sum + position.margin, 0)), positions, lastSeq, updatedAt }
+  const orders = []
+  if (raw.orders !== undefined) {
+    if (!Array.isArray(raw.orders)) return null
+    const seen = new Set()
+    for (const entry of raw.orders) {
+      const order = normalizeOrder(entry)
+      if (order === null || seen.has(order.id)) return null
+      seen.add(order.id)
+      orders.push(order)
+    }
+  }
+  // 保证金一律以「仓位 + 挂单冻结」为准（与本地账本同一取舍）：删仓位/撤单之后不会留下凭空冻结的钱。
+  const margin = positions.reduce((sum, position) => sum + position.margin, 0) +
+    orders.reduce((sum, order) => sum + order.marginFrozen, 0)
+  return { balance, marginUsed: roundCoin(margin), positions, orders, lastSeq, updatedAt }
 }
 
 /**
@@ -243,6 +312,36 @@ function normalizeReplicaPosition (raw) {
   if (id === null || crop === null || contract === null || side === null) return null
   if (lots === null || entry === null || entry <= 0 || margin === null || leverage === null) return null
   return { id, crop, contract: contract.id, side, lots, entry, margin, leverage }
+}
+
+/** 副本（peer 侧）里的一条挂单：线上形状，`lotsLeft` 是剩余未成交张数。 */
+function normalizeReplicaOrder (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const id = typeof raw.id === 'string' && raw.id !== '' && raw.id.length <= MAX_ID_LENGTH ? raw.id : null
+  const crop = isCropId(raw.crop) ? raw.crop : null
+  const contract = contractWindowOf(raw.contract)
+  const side = isFuturesSide(raw.side) ? raw.side : null
+  const price = finiteNumber(raw.price)
+  const lotsLeft = positiveInt(raw.lotsLeft, MAX_QUANTITY)
+  const leverage = isFuturesLeverage(raw.leverage) ? raw.leverage : null
+  const marginFrozen = nonNegativeCoin(raw.marginFrozen)
+  const at = finiteNumber(raw.at)
+  if (id === null || crop === null || contract === null || side === null) return null
+  if (price === null || price <= 0 || lotsLeft === null || leverage === null) return null
+  if (marginFrozen === null || marginFrozen < 0) return null
+  if (at === null || at <= 0) return null
+  return {
+    id,
+    crop,
+    contract: contract.id,
+    side,
+    price: roundCoin(price),
+    lots: lotsLeft,
+    lotsLeft,
+    leverage,
+    marginFrozen,
+    at
+  }
 }
 
 /**
@@ -276,7 +375,10 @@ export function normalizeFuturesFile (value) {
     repaired += 1
   }
 
-  const closed = value.closed === undefined ? 0 : positiveInt(value.closed, MAX_QUANTITY)
+  // `closed` 从 0 起步，0 是合法值（`positiveInt` 会把 0 判成坏值，所以这里单独判）。
+  const closed = value.closed === undefined
+    ? 0
+    : Number.isInteger(value.closed) && value.closed >= 0 ? value.closed : null
   if (closed === null) repaired += 1
   else state.closed = closed
 
@@ -329,7 +431,10 @@ export function normalizeFuturesFile (value) {
           repaired += 1
           continue
         }
-        state.remotes[deviceId.toLowerCase()] = account
+        const key = deviceId.toLowerCase()
+        // 挂单的归属以账户键为准：文件里手改的 deviceId 不认。
+        for (const order of account.orders) order.deviceId = key
+        state.remotes[key] = account
       }
     }
   }
@@ -351,9 +456,30 @@ export function normalizeFuturesFile (value) {
     }
   }
 
-  // 保证金是「从余额划走的钱」：仓位丢了、保证金还在，账会凭空多钱或少钱。
-  // 托盘里的仓位总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
-  const expectedMargin = roundCoin(state.positions.reduce((sum, position) => sum + position.margin, 0))
+  // 票 95：挂单。老文件没有这个键（空数组，不算修补）；坏记录整条丢。
+  if (value.orders !== undefined) {
+    if (!Array.isArray(value.orders)) {
+      repaired += 1
+    } else {
+      const seen = new Set()
+      for (const raw of value.orders) {
+        const order = normalizeOrder(raw)
+        if (order === null || seen.has(order.id)) {
+          repaired += 1
+          continue
+        }
+        seen.add(order.id)
+        state.orders.push({ ...order, deviceId: LOCAL_ORDER_DEVICE })
+      }
+    }
+  }
+
+  // 保证金是「从余额划走的钱」：仓位/挂单丢了、保证金还在，账会凭空多钱或少钱。
+  // 仓位 + 挂单冻结的总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
+  const expectedMargin = roundCoin(
+    state.positions.reduce((sum, position) => sum + position.margin, 0) +
+    state.orders.reduce((sum, order) => sum + order.marginFrozen, 0)
+  )
   if (expectedMargin !== state.marginUsed) {
     state.marginUsed = expectedMargin
     repaired += 1
@@ -371,6 +497,8 @@ function toFileState (state) {
     fees: { insurance: roundCoin(state.fees.insurance), burned: roundCoin(state.fees.burned) },
     positions: state.positions.map((position) => ({ ...position })),
     trades: state.trades.map((trade) => ({ ...trade })),
+    // 票 95：挂单（`marginFrozen` 只覆盖剩余未成交部分）。
+    orders: state.orders.map((order) => ({ ...order })),
     week: { start: state.week.start, pnl: roundCoin(state.week.pnl) },
     closed: state.closed,
     tradedAt: state.tradedAt,
@@ -387,6 +515,7 @@ function remoteFileState (remotes) {
       balance: roundCoin(account.balance),
       marginUsed: roundCoin(account.marginUsed),
       positions: account.positions.map((position) => ({ ...position })),
+      orders: account.orders.map((order) => ({ ...order })),
       lastSeq: account.lastSeq,
       updatedAt: account.updatedAt
     }
@@ -512,6 +641,9 @@ class FuturesStore {
       positionCount: this.#state.positions.length,
       positions,
       trades: this.#state.trades.slice(0, Math.max(0, Number(tradeLimit) || 0)).map((trade) => ({ ...trade })),
+      // 票 95：自己的挂单（窗口画「我的挂单」，撮合后 lotsLeft 会变）。
+      orders: this.#state.orders.map((order) => ({ ...order })),
+      orderCount: this.#state.orders.length,
       week: { start: this.#weekStartOf(stamp), pnl: this.#weekPnl(stamp) },
       quotes,
       now: stamp
@@ -640,7 +772,7 @@ class FuturesStore {
       settleSlot: slot + 1
     }
     account.positions.push(position)
-    account.marginUsed = this.#marginSum(account.positions)
+    account.marginUsed = this.#recomputeFor(account)
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
     // 手续费从 peer 的余额里出，落在本机的保险/销毁桶里（钱确实动了，费账就得跟着动）。
@@ -677,7 +809,7 @@ class FuturesStore {
     const exit = fillPriceOf(quote, position.side === 'long' ? 'short' : 'long')
     const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit, side: position.side })
     account.positions.splice(index, 1)
-    account.marginUsed = this.#marginSum(account.positions)
+    account.marginUsed = this.#recomputeFor(account)
     const credit = Math.max(0, roundCoin(position.margin + pnl))
     account.balance = roundCoin(account.balance + credit)
     account.updatedAt = stamp
@@ -707,7 +839,7 @@ class FuturesStore {
     const key = this.#remoteKey(deviceId)
     const account = key === null ? undefined : this.#state.remotes[key]
     if (account === undefined) {
-      return { balance: 0, marginUsed: 0, equity: 0, positions: [], seq: 0, epoch: this.#state.epoch }
+      return { balance: 0, marginUsed: 0, equity: 0, positions: [], orders: [], seq: 0, epoch: this.#state.epoch }
     }
     return this.#accountView(account, stamp, positionLimit)
   }
@@ -719,7 +851,7 @@ class FuturesStore {
    * 说明房主换了账本（重启/换人），旧的 lastSeq 一笔作废、直接采纳新账。
    * 不写盘：这是房主账本的缓存（见文件头）。
    */
-  applySettle ({ epoch, seq, balance, marginUsed, positions, at = this.#nowMs() } = {}) {
+  applySettle ({ epoch, seq, balance, marginUsed, positions, orders, at = this.#nowMs() } = {}) {
     // 先验形状再看新旧：坏包必须被「拒」，不能被当成「旧的」悄悄咽下去。
     if (typeof epoch !== 'string' || epoch === '' || epoch.length > MAX_ID_LENGTH) {
       return { ok: false, error: 'bad-epoch' }
@@ -739,6 +871,13 @@ class FuturesStore {
       const position = normalizeReplicaPosition(entry)
       if (position !== null) accountPositions.push(position)
     }
+    // 票 95：自己的挂单。老房主不发 `orders` 时按空数组处理（不算坏包）。
+    if (orders !== undefined && !Array.isArray(orders)) return { ok: false, error: 'bad-orders' }
+    const accountOrders = []
+    for (const entry of Array.isArray(orders) ? orders.slice(0, FUTURES_MAX_ORDERS) : []) {
+      const order = normalizeReplicaOrder(entry)
+      if (order !== null) accountOrders.push(order)
+    }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     this.#state.replica = {
       epoch,
@@ -746,6 +885,7 @@ class FuturesStore {
       balance: safeBalance,
       marginUsed: safeMarginUsed,
       positions: accountPositions,
+      orders: accountOrders,
       updatedAt: stamp
     }
     return { ok: true, applied: true }
@@ -760,7 +900,8 @@ class FuturesStore {
       lastSeq: replica.lastSeq,
       balance: roundCoin(replica.balance),
       marginUsed: roundCoin(replica.marginUsed),
-      positions: replica.positions.map((position) => ({ ...position }))
+      positions: replica.positions.map((position) => ({ ...position })),
+      orders: replica.orders.map((order) => ({ ...order }))
     }
   }
 
@@ -813,6 +954,342 @@ class FuturesStore {
       persisted
     }
   }
+
+  /**
+   * 挂限价单（票 95）：下单即把保证金从余额划进「冻结」，成交/撤单时才动。
+   * `deviceId` 给了就走房主的 `hostPlace`（peer 的单记在 `remotes` 上）。
+   */
+  async place ({ crop, side, price, lots, leverage, at = this.#nowMs(), deviceId = null } = {}) {
+    if (isDeviceId(deviceId)) return this.hostPlace(deviceId, { crop, side, price, lots, leverage, at })
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const prepared = this.#prepareOrder({ crop, side, price, lots, leverage, stamp })
+    if (prepared.ok !== true) return prepared
+    const placed = this.#placeInto(this.#state, prepared)
+    if (placed.ok !== true) return placed
+    this.#state.tradedAt = stamp
+    const persisted = await this.#persist()
+    return { ok: true, action: 'futures-place', order: { ...placed.order }, ...this.#view(), persisted }
+  }
+
+  /** 房主：替 peer 挂单——规则与 `place()` 同一套，账记在 `remotes[deviceId]` 上。 */
+  async hostPlace (deviceId, { crop, side, price, lots, leverage, at = this.#nowMs() } = {}) {
+    const key = this.#remoteKey(deviceId)
+    if (key === null) return { ok: false, error: 'bad-device' }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const prepared = this.#prepareOrder({ crop, side, price, lots, leverage, stamp })
+    if (prepared.ok !== true) return prepared
+    prepared.order.deviceId = key
+    const account = this.#remoteAccount(deviceId, stamp)
+    if (account === null) return { ok: false, error: 'bad-device' }
+    const placed = this.#placeInto(account, prepared)
+    if (placed.ok !== true) return placed
+    account.updatedAt = stamp
+    const seq = this.#bumpAccount(account)
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-place',
+      order: { ...placed.order },
+      account: this.#accountView(account, stamp),
+      seq,
+      persisted
+    }
+  }
+
+  /**
+   * 撤单（票 95）：只退**剩余未成交**那部分冻结保证金；已经成交的部分早就变成仓位了。
+   * 别人的单回 `not-yours`（不泄漏「这单存在」以外的信息），不存在回 `no-order`。
+   */
+  async cancel ({ orderId, at = this.#nowMs(), deviceId = null } = {}) {
+    if (isDeviceId(deviceId)) return this.hostCancel(deviceId, { orderId, at })
+    const id = typeof orderId === 'string' && orderId !== '' && orderId.length <= MAX_ID_LENGTH ? orderId : null
+    if (id === null) return { ok: false, error: 'bad-order' }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const index = this.#state.orders.findIndex((order) => order.id === id)
+    if (index < 0) return { ok: false, error: this.#orderOwnerOf(id) === null ? 'no-order' : 'not-yours' }
+    const order = this.#state.orders[index]
+    this.#state.orders.splice(index, 1)
+    this.#state.balance = roundCoin(this.#state.balance + order.marginFrozen)
+    this.#state.marginUsed = this.#recomputeMarginUsed()
+    this.#state.tradedAt = stamp
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-cancel',
+      order: { ...order },
+      released: order.marginFrozen,
+      ...this.#view(),
+      persisted
+    }
+  }
+
+  /** 房主：替 peer 撤单。 */
+  async hostCancel (deviceId, { orderId, at = this.#nowMs() } = {}) {
+    const key = this.#remoteKey(deviceId)
+    if (key === null) return { ok: false, error: 'bad-device' }
+    const id = typeof orderId === 'string' && orderId !== '' && orderId.length <= MAX_ID_LENGTH ? orderId : null
+    if (id === null) return { ok: false, error: 'bad-order' }
+    const account = this.#state.remotes[key]
+    if (account === undefined) return { ok: false, error: 'no-order' }
+    const index = account.orders.findIndex((order) => order.id === id)
+    if (index < 0) return { ok: false, error: this.#orderOwnerOf(id) === null ? 'no-order' : 'not-yours' }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const order = account.orders[index]
+    account.orders.splice(index, 1)
+    account.balance = roundCoin(account.balance + order.marginFrozen)
+    account.marginUsed = this.#recomputeFor(account)
+    account.updatedAt = stamp
+    const seq = this.#bumpAccount(account)
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-cancel',
+      order: { ...order },
+      released: order.marginFrozen,
+      account: this.#accountView(account, stamp),
+      seq,
+      persisted
+    }
+  }
+
+  /**
+   * 撮合入口（票 95）：每个 tick 对每个合约跑一次。
+   *
+   * 顺序固定、与机器无关：
+   *   1. 先把这一拍的盯市补上（成交必须落在已经结算过的账上）；
+   *   2. 玩家挂单两两撮合（`matchOrders`：价格优先、同价时间优先，成交价取 maker 价）；
+   *   3. 做市商扫单：买单价 ≥ ask、卖单价 ≤ bid 时整张被 MM 吃掉（同样按挂单价成交）。
+   *
+   * 幂等：成交当场扣 `lotsLeft`、扣 `marginFrozen`，所以同一时刻重复调用不会重复成交。
+   * 每笔成交给双方各开一个仓位（`margin` = 该笔成交对应的那部分冻结保证金，
+   * `entry` = 成交价），按成交名义向双方各收 0.1%，并记一条 `kind:'open'` 的成交流水。
+   */
+  async matchDue (at = this.#nowMs()) {
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    await this.settleDue(stamp)
+    let fills = 0
+    const touched = new Map()
+    const contracts = new Set()
+    for (const order of this.#state.orders) contracts.add(order.contract)
+    for (const account of Object.values(this.#state.remotes)) {
+      for (const order of account.orders) contracts.add(order.contract)
+    }
+    for (const contract of [...contracts].sort()) {
+      if (contractWindowOf(contract) === null) continue
+      const pools = this.#orderPools(contract)
+      if (pools.orders.length === 0) continue
+      const due = matchOrders({ orders: pools.orders, contract, at: stamp })
+      for (const fill of due) {
+        const parties = this.#applyFill(pools, fill, stamp)
+        if (parties === null) continue
+        fills += 1
+        for (const party of parties) if (party.deviceId !== undefined) touched.set(party.deviceId, party.account)
+      }
+      // 做市商扫单：这一拍剩下的单里，价格已经穿过对手价的整张吃掉。
+      fills += this.#sweepMarketMaker(pools, stamp, touched)
+    }
+    if (fills === 0) return { ok: true, action: 'futures-match', fills, ...this.#view() }
+    // 成交完的单从盘口摘掉：`lotsLeft: 0` 的单留在账本里会让 settle 的 `orders` 变成坏字段。
+    this.#pruneOrders()
+
+    const accounts = []
+    for (const [deviceId, account] of touched) {
+      account.updatedAt = stamp
+      const seq = this.#bumpAccount(account)
+      accounts.push({ deviceId, seq, account: this.#accountView(account, stamp) })
+    }
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-match',
+      fills,
+      accounts,
+      ...this.#view(),
+      persisted
+    }
+  }
+
+  /** 校验一张挂单的静态字段；余额、自成交、条数上限由 `#placeInto` 按账户判断。 */
+  #prepareOrder ({ crop, side, price, lots, leverage, stamp }) {
+    if (!isCropId(crop)) return { ok: false, error: 'bad-crop' }
+    if (!isFuturesSide(side)) return { ok: false, error: 'bad-side' }
+    const limit = finiteNumber(price)
+    if (limit === null || limit <= 0) return { ok: false, error: 'bad-price' }
+    const count = positiveInt(lots, MAX_QUANTITY)
+    if (count === null) return { ok: false, error: 'bad-lots' }
+    if (!isFuturesLeverage(leverage)) return { ok: false, error: 'bad-leverage' }
+    const contract = contractOf(crop, stamp)
+    if (contract === null) return { ok: false, error: 'market-closed' }
+    if (stamp >= contract.expireAt) return { ok: false, error: 'contract-expired' }
+    const limitPrice = roundCoin(limit)
+    const marginFrozen = marginOf({ lots: count, price: limitPrice, leverage })
+    if (!(marginFrozen > 0) || marginFrozen > MAX_MARGIN) return { ok: false, error: 'bad-margin' }
+    return {
+      ok: true,
+      order: {
+        id: randomUUID(),
+        deviceId: LOCAL_ORDER_DEVICE,
+        crop,
+        contract: contract.id,
+        side,
+        price: limitPrice,
+        lots: count,
+        lotsLeft: count,
+        leverage,
+        marginFrozen,
+        at: stamp
+      }
+    }
+  }
+
+  /** 把一张已经校验过的单挂进某个账户：查条数上限、自成交、余额，然后冻结保证金。 */
+  #placeInto (account, prepared) {
+    const order = prepared.order
+    if (account.orders.length >= FUTURES_MAX_ORDERS) return { ok: false, error: 'order-limit' }
+    if (this.#crossesOwn(account.orders, order)) return { ok: false, error: 'self-trade' }
+    const cost = roundCoin(order.marginFrozen + takerFeeOf(notionalOf({ lots: order.lots, price: order.price })))
+    if (account.balance < cost) return { ok: false, error: 'no-balance' }
+    account.orders.push(order)
+    account.balance = roundCoin(account.balance - order.marginFrozen)
+    account.marginUsed = this.#recomputeFor(account)
+    return { ok: true, order }
+  }
+
+  /** 新单会不会立刻和同一个账户已有的对手单交叉（自成交防护）。 */
+  #crossesOwn (orders, order) {
+    for (const other of orders) {
+      if (other.side === order.side) continue
+      if (other.lotsLeft <= 0) continue
+      if (order.side === 'long' && order.price >= other.price) return true
+      if (order.side === 'short' && order.price <= other.price) return true
+    }
+    return false
+  }
+
+  /** 这一条单属于哪个账户（`local` / 远端 deviceId），找不到返回 null。 */
+  #orderOwnerOf (id) {
+    if (this.#state.orders.some((order) => order.id === id)) return LOCAL_ORDER_DEVICE
+    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
+      if (account.orders.some((order) => order.id === id)) return deviceId
+    }
+    return null
+  }
+
+  /** 把一个合约上所有账户的挂单摊平成一盘，`owners` 记住每条单属于谁。 */
+  #orderPools (contract) {
+    const local = { account: this.#state, local: true }
+    const pools = { local, accounts: [], orders: [], owners: new Map() }
+    for (const order of this.#state.orders) {
+      if (order.contract !== contract) continue
+      pools.orders.push(order)
+      pools.owners.set(order.id, local)
+    }
+    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
+      const pool = { account, local: false, deviceId }
+      pools.accounts.push(pool)
+      for (const order of account.orders) {
+        if (order.contract !== contract) continue
+        pools.orders.push(order)
+        pools.owners.set(order.id, pool)
+      }
+    }
+    return pools
+  }
+
+  /** 成交完的单从盘口摘掉：`lotsLeft: 0` 留在账本里会让 settle 的 `orders` 变成坏字段。 */
+  #pruneOrders () {
+    this.#state.orders = this.#state.orders.filter((order) => order.lotsLeft > 0)
+    for (const account of Object.values(this.#state.remotes)) {
+      account.orders = account.orders.filter((order) => order.lotsLeft > 0)
+    }
+  }
+
+  /** 从挂单的冻结保证金里按成交张数比例扣一份，返回这一份（最后一张全给，避免留 1 分残渣）。 */  #takeFrozen (order, lots) {
+    const count = Math.min(lots, order.lotsLeft)
+    const part = count >= order.lotsLeft ? order.marginFrozen : roundCoin(order.marginFrozen * count / order.lotsLeft)
+    order.marginFrozen = roundCoin(order.marginFrozen - part)
+    order.lotsLeft = count >= order.lotsLeft ? 0 : order.lotsLeft - count
+    return part
+  }
+
+  /** 成交后给某一方开仓：保证金来自冻结，手续费从余额扣，仓位带这一拍的结算游标。 */
+  #openFromOrder (pool, order, lots, price, margin, stamp) {
+    const account = pool.account
+    const fee = takerFeeOf(notionalOf({ lots, price }))
+    account.balance = roundCoin(account.balance - fee)
+    const slot = this.#slotOf(stamp)
+    account.positions.push({
+      id: randomUUID(),
+      crop: order.crop,
+      contract: order.contract,
+      side: order.side,
+      lots,
+      entry: price,
+      margin,
+      leverage: order.leverage,
+      openedAt: stamp,
+      slot,
+      settleSlot: slot + 1
+    })
+    account.marginUsed = this.#recomputeFor(account)
+    if (pool.local) {
+      this.#state.tradedAt = stamp
+      this.#recordTrade({
+        at: stamp,
+        crop: order.crop,
+        contract: order.contract,
+        side: order.side,
+        lots,
+        price,
+        fee,
+        kind: 'open',
+        orderId: order.id
+      })
+    }
+    this.#chargeFee(fee)
+  }
+
+  /** 落一笔玩家对玩家的成交；返回吃到的两方（用于给远端账户 +1 流水号）。 */
+  #applyFill (pools, fill, stamp) {
+    const maker = pools.owners.get(fill.makerId)
+    const taker = pools.owners.get(fill.takerId)
+    if (maker === undefined || taker === undefined) return null
+    const makerOrder = maker.account.orders.find((order) => order.id === fill.makerId)
+    const takerOrder = taker.account.orders.find((order) => order.id === fill.takerId)
+    if (makerOrder === undefined || takerOrder === undefined) return null
+    const lots = Math.min(fill.lots, makerOrder.lotsLeft, takerOrder.lotsLeft)
+    if (!(lots > 0)) return null
+    const price = Number(fill.price)
+    const makerMargin = this.#takeFrozen(makerOrder, lots)
+    const takerMargin = this.#takeFrozen(takerOrder, lots)
+    this.#openFromOrder(maker, makerOrder, lots, price, makerMargin, stamp)
+    this.#openFromOrder(taker, takerOrder, lots, price, takerMargin, stamp)
+    return [maker, taker]
+  }
+
+  /** 做市商扫单：买单价 ≥ ask / 卖单价 ≤ bid 的整张吃掉，成交价仍是挂单价。 */
+  #sweepMarketMaker (pools, stamp, touched) {
+    const window = contractWindowOf(pools.orders[0]?.contract)
+    if (window === null) return 0
+    const quote = this.quoteOf(window.crop, stamp)
+    if (quote === null) return 0
+    let fills = 0
+    for (const order of sortBook(pools.orders)) {
+      if (order.lotsLeft <= 0) continue
+      const touch = order.side === 'long' ? quote.ask : quote.bid
+      const crossed = order.side === 'long' ? Number(order.price) >= touch : Number(order.price) <= touch
+      if (!crossed) continue
+      const pool = pools.owners.get(order.id)
+      if (pool === undefined) continue
+      const lots = order.lotsLeft
+      const margin = this.#takeFrozen(order, lots)
+      this.#openFromOrder(pool, order, lots, Number(order.price), margin, stamp)
+      if (pool.deviceId !== undefined) touched.set(pool.deviceId, pool.account)
+      fills += 1
+    }
+    return fills
+  }
+
 
   /** 主动平仓：按当前对手价成交，保证金 + 盈亏记回余额。合约过期后只能等交割（票 96）。 */
   async close ({ id, at = this.#nowMs() }) {
@@ -962,7 +1439,7 @@ class FuturesStore {
         at: outcome.at
       })
     }
-    if (settled.length > 0) account.marginUsed = this.#marginSum(account.positions)
+    if (settled.length > 0) account.marginUsed = this.#recomputeFor(account)
     return settled
   }
 
@@ -1021,6 +1498,8 @@ class FuturesStore {
       marginUsed: roundCoin(account.marginUsed),
       equity: roundCoin(account.balance + account.marginUsed),
       positions,
+      // 票 95：这个账户自己的挂单（房主据此拼 settle）。
+      orders: account.orders.map((order) => ({ ...order })),
       seq: account.lastSeq,
       epoch: this.#state.epoch
     }
@@ -1033,14 +1512,25 @@ class FuturesStore {
     return account.lastSeq
   }
 
-  /** 保证金占用一律以仓位为准：删仓位之后不会留下凭空冻结的钱。 */
+  /** 保证金占用一律以「仓位 + 挂单冻结」为准：删仓位/撤单之后不会留下凭空冻结的钱。 */
   #recomputeMarginUsed () {
-    return this.#marginSum(this.#state.positions)
+    return roundCoin(this.#marginSum(this.#state.positions) + this.#frozenSum(this.#state.orders))
+  }
+
+  /** 任意账户（本地 state 或远端 account）的保证金总额。 */
+  #recomputeFor (account) {
+    return roundCoin(this.#marginSum(account.positions) + this.#frozenSum(account.orders))
   }
 
   #marginSum (positions) {
     let sum = 0
     for (const position of positions) sum = roundCoin(sum + position.margin)
+    return sum
+  }
+
+  #frozenSum (orders) {
+    let sum = 0
+    for (const order of orders) sum = roundCoin(sum + order.marginFrozen)
     return sum
   }
 

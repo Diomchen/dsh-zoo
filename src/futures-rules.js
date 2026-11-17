@@ -43,6 +43,11 @@ export const FEE_INSURANCE_SHARE = 0.1
 export const FEE_BURN_SHARE = 0.9
 /** 杠杆白名单：期货有价差与偏离，不用盘口那套 1/5/20。 */
 export const FUTURES_LEVERAGES = Object.freeze([1, 3, 10, 20])
+/**
+ * 期货指令的种类（票 95）：开仓/平仓/充值/挂限价单。
+ * 协议层直接引用这一份，避免「规则层认 place、线上却不认」的漂移（测试有断言）。
+ */
+export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit', 'place'])
 export const MAX_MARGIN = 1_000_000
 /** 合约编号里的作物部分只认小写字母数字与下划线，防手改文件塞进路径分隔符。 */
 const CONTRACT_ID_RE = /^([a-z][a-z0-9_]*)-(\d{4})W(\d{2})$/
@@ -262,4 +267,112 @@ export function feeSplitOf (fee) {
   const total = roundCoin(fee)
   const insurance = roundCoin(total * FEE_INSURANCE_SHARE)
   return { total, insurance, burned: roundCoin(total - insurance) }
+}
+
+// ── 挂单簿（票 95） ──────────────────────────────────────────────────────────
+// 撮合必须「可复现」：同一组挂单在房主和任何一台复核机器上都要算出同一个成交序列。
+// 所以这里不碰时钟、不碰随机数，排序键全部来自挂单自身（价格、at、id）。
+
+function orderIdOf (order) {
+  return typeof order?.id === 'string' ? order.id : ''
+}
+
+function orderTimeOf (order) {
+  const at = Number(order?.at)
+  return Number.isFinite(at) ? at : 0
+}
+
+/** 时间优先的比较器：`at` 早的在前，同一毫秒按 `id` 字典序（不用 localeCompare，避免机器相关）。 */
+function timeThenId (left, right) {
+  const delta = orderTimeOf(left) - orderTimeOf(right)
+  if (delta !== 0) return delta
+  const a = orderIdOf(left)
+  const b = orderIdOf(right)
+  if (a === b) return 0
+  return a < b ? -1 : 1
+}
+
+/**
+ * 挂单的规范顺序：买盘在前（价高优先），卖盘在后（价低优先）；同价 `at` 早优先，
+ * 再按 `id` 字典序。返回新数组，不改入参。
+ *
+ * `lotsLeft <= 0`（已经成交完）的单不进盘口；方向、价格、剩余张数不是正数的坏记录
+ * 也一并丢掉——盘口只认能成交的单，坏数据不该影响排序结果。
+ */
+export function sortBook (orders) {
+  const bids = []
+  const asks = []
+  const list = Array.isArray(orders) ? orders : []
+  for (const order of list) {
+    if (order === null || typeof order !== 'object') continue
+    if (!isFuturesSide(order.side)) continue
+    const price = Number(order.price)
+    const lotsLeft = Number(order.lotsLeft)
+    if (!Number.isFinite(price) || price <= 0) continue
+    if (!Number.isFinite(lotsLeft) || lotsLeft <= 0) continue
+    if (order.side === 'long') bids.push(order)
+    else asks.push(order)
+  }
+  bids.sort((left, right) => (Number(right.price) - Number(left.price)) || timeThenId(left, right))
+  asks.sort((left, right) => (Number(left.price) - Number(right.price)) || timeThenId(left, right))
+  return [...bids, ...asks]
+}
+
+/**
+ * 两两撮合（票 95）：返回**确定性**的成交序列 `[{ makerId, takerId, lots, price }]`。
+ *
+ * - 只撮合同一个 `contract` 的单（`contract` 为空则不分合约，测试/单合约场景用）。
+ * - 买一 ≥ 卖一才成交；成交价取 **maker（先挂的那一单）的挂单价**，不是对手价。
+ * - 部分成交：maker 剩多少吃多少，`lotsLeft` 不够就按较小的那边算。
+ * - `at` 给了就只撮合「这个时刻之前已经挂出」的单（`order.at <= at`），防止把
+ *   下一拍才生效的单提前吃掉。
+ *
+ * 这里只算「谁和谁、多少张、什么价」，冻结保证金、仓位、手续费都在账本层落。
+ */
+export function matchOrders ({ orders, contract = null, at = null } = {}) {
+  const stamp = Number(at)
+  const cutoff = Number.isFinite(stamp) && stamp > 0 ? stamp : null
+  const book = sortBook(
+    (Array.isArray(orders) ? orders : [])
+      .filter((order) => order !== null && typeof order === 'object')
+      .filter((order) => contract === null || contract === undefined || order.contract === contract)
+      .filter((order) => cutoff === null || orderTimeOf(order) <= cutoff)
+  )
+  const bids = book.filter((order) => order.side === 'long')
+  const asks = book.filter((order) => order.side === 'short')
+  const left = new Map()
+  for (const order of book) left.set(order.id, Number(order.lotsLeft))
+
+  const fills = []
+  let bi = 0
+  let ai = 0
+  while (bi < bids.length && ai < asks.length) {
+    const bid = bids[bi]
+    const ask = asks[ai]
+    const bidLeft = left.get(bid.id) ?? 0
+    const askLeft = left.get(ask.id) ?? 0
+    if (bidLeft <= 0) {
+      bi += 1
+      continue
+    }
+    if (askLeft <= 0) {
+      ai += 1
+      continue
+    }
+    // 买价低于卖价：后面只会更差（两边都按价格优先排过），到此为止。
+    if (Number(bid.price) < Number(ask.price)) break
+    const lots = Math.min(bidLeft, askLeft)
+    const maker = timeThenId(bid, ask) <= 0 ? bid : ask
+    fills.push({
+      makerId: maker.id,
+      takerId: maker === bid ? ask.id : bid.id,
+      lots,
+      price: Number(maker.price)
+    })
+    left.set(bid.id, bidLeft - lots)
+    left.set(ask.id, askLeft - lots)
+    if (left.get(bid.id) === 0) bi += 1
+    if (left.get(ask.id) === 0) ai += 1
+  }
+  return fills
 }

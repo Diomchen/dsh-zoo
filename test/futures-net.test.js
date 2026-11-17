@@ -22,7 +22,7 @@ import dgram from 'node:dgram'
 
 import { FARM_FILE } from '../src/farm.js'
 import { createFuturesStore } from '../src/futures.js'
-import { SLOT_MS } from '../src/futures-rules.js'
+import { SLOT_MS, notionalOf, roundCoin, takerFeeOf } from '../src/futures-rules.js'
 import { createService } from '../src/service.js'
 
 function delay (ms) {
@@ -377,6 +377,79 @@ test('票 94：换源冒充同一个 deviceId 的指令不落账', async (t) => 
   assert.equal(b.futuresAccountOf(strangerId).balance, 0)
   assert.equal(b.futuresAccountOf(strangerId).seq, 0)
   assert.equal(b.futuresAccountOf(aId).balance, before.balance)
+})
+
+test('票 95：peer 挂单、房主吃单——一根后两头权益变化之和只等于两笔手续费', async (t) => {
+  // 共用同一个冻住的时钟：报价不动，挂单价与手续费都能提前算死。
+  const clock = { at: Date.UTC(2026, 10, 17, 12, 0, 0) }
+  const { a, b, aId } = await connectedPair(t, {
+    a: { futuresNow: () => clock.at },
+    b: { futuresNow: () => clock.at }
+  })
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  // 两边各充 300：A 走 peer 通道（农场 → 本机托管 → 房主账本），B 是房主本机充值。
+  assert.equal((await callAction(a, { action: 'futures-deposit', coins: 300 })).body.pending, true)
+  await waitFor(() => a.futuresWindow().balance === 300)
+  assert.equal((await callAction(b, { action: 'futures-deposit', coins: 300 })).body.ok, true)
+  assert.equal(b.futures().balance, 300)
+
+  // 卖单挂在 ask 上：高于 bid 不会立刻被做市商扫掉，只会等人来吃。
+  const ask = b.futuresWindow().quotes.tomato.ask
+  const price = roundCoin(ask)
+  const placed = await callAction(a, {
+    action: 'futures-place',
+    cropId: 'tomato',
+    side: 'short',
+    price,
+    lots: 1,
+    leverage: 10
+  })
+  assert.equal(placed.body.ok, true)
+  assert.equal(placed.body.pending, true)
+  assert.equal(placed.body.notice, '已发给房主，等一拍回执。')
+  await waitFor(() => a.futuresWindow().orders.length === 1)
+  // 房主账本上记的是 A 的挂单，且冻结保证金真的从 A 的余额里划走了。
+  const hostBook = b.futuresAccountOf(aId)
+  assert.equal(hostBook.orders.length, 1)
+  assert.equal(hostBook.orders[0].side, 'short')
+  assert.equal(hostBook.orders[0].price, price)
+  assert.equal(hostBook.marginUsed, hostBook.orders[0].marginFrozen)
+  assert.ok(hostBook.balance < 300)
+
+  // B 下反向买单（价格相同 → 立刻与 A 的卖单交叉，先于做市商扫单）。
+  const taken = await callAction(b, {
+    action: 'futures-place',
+    cropId: 'tomato',
+    side: 'long',
+    price,
+    lots: 1,
+    leverage: 10
+  })
+  assert.equal(taken.body.ok, true)
+
+  await waitFor(() => a.futuresWindow().positionCount === 1 && b.futuresWindow().positionCount === 1)
+  // A 的挂单从两边窗口都消失：peer 副本与房主账本都不该再留着它。
+  await waitFor(() => a.futuresWindow().orders.length === 0)
+  assert.deepEqual(a.futuresWindow().orders, [])
+  assert.deepEqual(b.futuresAccountOf(aId).orders, [])
+
+  const peerWindow = a.futuresWindow()
+  const hostWindow = b.futuresWindow()
+  assert.equal(peerWindow.positions[0].side, 'short')
+  assert.equal(peerWindow.positions[0].entry, price)
+  assert.equal(peerWindow.positions[0].lots, 1)
+  assert.equal(hostWindow.positions[0].side, 'long')
+  assert.equal(hostWindow.positions[0].entry, price)
+  assert.equal(hostWindow.positions[0].lots, 1)
+
+  // 两边余额与占用逐分一致（账只有一本，peer 只是副本）。
+  assert.equal(peerWindow.balance, b.futuresAccountOf(aId).balance)
+  assert.equal(peerWindow.marginUsed, b.futuresAccountOf(aId).marginUsed)
+
+  // 零和：保证金只是从「可用」划进「占用」，两头合起来只少了各自那腿手续费。
+  const fee = takerFeeOf(notionalOf({ lots: 1, price }))
+  assert.equal(roundCoin((peerWindow.equity - 300) + (hostWindow.equity - 300)), roundCoin(-2 * fee))
 })
 
 test('票 94：老邻居（没有 futures 能力位）不影响本机，窗口直说对端未升级', async (t) => {

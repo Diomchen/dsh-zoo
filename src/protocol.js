@@ -31,7 +31,10 @@ import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 // （盘口窗口的按钮也由它下发），协议层不另抄一份。
 import { isBoardCrop, isBoardSide, isTradingLeverage } from './trading-rules.js'
 // 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
-import { isFuturesLeverage, isFuturesSide, isMarginAmount } from './futures-rules.js'
+// 票 95：指令种类（含 `place`）同样只认规则层那一份，协议层 re-export。
+import { FUTURES_ORDER_KINDS, isFuturesLeverage, isFuturesSide, isMarginAmount } from './futures-rules.js'
+
+export { FUTURES_ORDER_KINDS }
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -98,16 +101,16 @@ export const MAX_WEEK_PNL_PCT = 1000
  * 期货（票 94）：一台机器当房主清算，其余机器只发指令。
  *
  * 线上只有五个类型：`hello`（我想跟你做期货）、`order`（充值/开仓/平仓）、
- * `cancel`（票 96 的占位，收到就丢）、`settle`（房主 → peer 的账户快照）、
+ * `cancel`（票 95 起有语义：撤自己的挂单）、`settle`（房主 → peer 的账户快照）、
  * `sync`（peer 每 30 秒要一次对账）。
  *
- * 关键：**peer 发过来的只有「做什么」**——没有价格、没有成交价、没有余额。
+ * 关键：**peer 发过来的只有「做什么」**——没有成交价、没有余额。
  * 价格、成交、余额全部由房主算（SPEC v11「任何 LAN 玩家都能开户，不需要审批」），
- * 所以伪造一包也改不了别人的账，最多改自己的。
+ * 所以伪造一包也改不了别人的账，最多改自己的。挂单只带限价与张数，撮合仍由房主按盘口做。
  */
-export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit'])
-/** 一份 settle 最多带 8 条持仓：与盘口周报同一量级，整包稳在 4 KiB 内。 */
+/** 一份 settle 最多带 8 条持仓、8 条挂单：与盘口周报同一量级，整包稳在 4 KiB 内。 */
 export const FUTURES_MAX_POSITIONS = 8
+export const FUTURES_MAX_ORDERS = 8
 /** 合约编号（与 `src/futures-rules.js` 的 `contractOf` 同形）：`tomato-2026W47`。 */
 export const FUTURES_CONTRACT_RE = /^[a-z][a-z0-9_]*-\d{4}W\d{2}$/
 /** 余额/保证金是「币」，上线到分（`roundCent`）；这里只给一个宽到不可能撞上的上界。 */
@@ -825,6 +828,63 @@ function normalizeFuturesPositions (value) {
   return positions
 }
 
+/** `place` 指令的载荷（票 95）：只带限价与张数，成交价与保证金全由房主算。 */
+function normalizeFuturesPlace (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!isCropId(value.crop)) return null
+  if (!isFuturesSide(value.side)) return null
+  const price = normalizeFuturesPositiveCoin(value.price)
+  if (price === null) return null
+  if (!Number.isInteger(value.lots) || value.lots < 1 || value.lots > MAX_FUTURES_LOTS) return null
+  if (!isFuturesLeverage(value.leverage)) return null
+  return { crop: value.crop, side: value.side, price, lots: value.lots, leverage: value.leverage }
+}
+
+/**
+ * settle 里的一条挂单（票 95）：`lots` 是原始张数、`lotsLeft` 是还没成交的部分，
+ * `marginFrozen` 是剩余部分压着的保证金。坏一条同样整包丢。
+ */
+function normalizeFuturesOrder (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!isVisitId(value.id)) return null
+  if (!isCropId(value.crop)) return null
+  if (typeof value.contract !== 'string' || !FUTURES_CONTRACT_RE.test(value.contract)) return null
+  if (!isFuturesSide(value.side)) return null
+  const price = normalizeFuturesPositiveCoin(value.price)
+  if (price === null) return null
+  if (!Number.isInteger(value.lots) || value.lots < 1 || value.lots > MAX_FUTURES_LOTS) return null
+  if (!Number.isInteger(value.lotsLeft) || value.lotsLeft < 1 || value.lotsLeft > value.lots) return null
+  if (!isFuturesLeverage(value.leverage)) return null
+  const marginFrozen = normalizeFuturesCoin(value.marginFrozen)
+  if (marginFrozen === null) return null
+  const at = normalizeDigestAt(value.at)
+  if (at === null) return null
+  return {
+    id: value.id.toLowerCase(),
+    crop: value.crop,
+    contract: value.contract,
+    side: value.side,
+    price,
+    lots: value.lots,
+    lotsLeft: value.lotsLeft,
+    leverage: value.leverage,
+    marginFrozen,
+    at
+  }
+}
+
+function normalizeFuturesOrders (value) {
+  if (!Array.isArray(value)) return null
+  if (value.length > FUTURES_MAX_ORDERS) return null
+  const orders = []
+  for (const entry of value) {
+    const order = normalizeFuturesOrder(entry)
+    if (order === null) return null
+    orders.push(order)
+  }
+  return orders
+}
+
 /** 五包共用的 `at`：缺省取本地时钟；坏时间整包丢（与 digest 同一套判定）。 */
 function futuresStamp (at, now) {
   const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
@@ -930,6 +990,11 @@ function buildPacket ({
   leverage,
   coins,
   positionId,
+  // 票 95：挂单（place 的限价/张数、settle 的 orders[]、cancel 的 orderId）
+  price,
+  lots,
+  orders,
+  orderId,
   epoch,
   seq,
   balance,
@@ -1223,7 +1288,7 @@ function buildPacket ({
     // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，at 会在这里消失。
     packet = { ...base, at: futuresStamp(at, now) }
   } else if (type === 'futures-order') {
-    // 只带「做什么」。价格、成交价、余额一律不上线：房主算，peer 信不信由它。
+    // 只带「做什么」。成交价、保证金、余额一律不上线：房主算，peer 信不信由它。
     const stamp = futuresStamp(at, now)
     if (!isFuturesOrderKind(kind)) throw new Error('protocol: invalid futures kind')
     if (kind === 'open') {
@@ -1235,6 +1300,11 @@ function buildPacket ({
     } else if (kind === 'close') {
       if (!isVisitId(positionId)) throw new Error('protocol: invalid positionId')
       packet = { ...base, at: stamp, kind, positionId: positionId.toLowerCase() }
+    } else if (kind === 'place') {
+      // 票 95：限价单只带限价与张数，冻多少保证金由房主按同一套 marginOf 算。
+      const safePlace = normalizeFuturesPlace({ crop, side, price, lots, leverage })
+      if (safePlace === null) throw new Error('protocol: invalid futures place')
+      packet = { ...base, at: stamp, kind, ...safePlace }
     } else {
       // 充值只带金币数量：钱从房主那边的农场账户走，peer 不自己扣。
       if (!Number.isInteger(coins) || coins < 1 || coins > MAX_FUTURES_COIN) {
@@ -1243,12 +1313,21 @@ function buildPacket ({
       packet = { ...base, at: stamp, kind, coins }
     }
   } else if (type === 'futures-cancel') {
-    // 票 96 才有语义（撤单/撤单回执）；现在只保证形状能被解析，收到就丢。
-    if (!isVisitId(positionId)) throw new Error('protocol: invalid positionId')
-    packet = { ...base, at: futuresStamp(at, now), positionId: positionId.toLowerCase() }
+    // 票 95：按挂单撤（`orderId`）；`positionId` 留给票 96 的「按仓位撤单」，两者至少一个。
+    const safeOrderId = isVisitId(orderId) ? orderId.toLowerCase() : null
+    const safePositionId = isVisitId(positionId) ? positionId.toLowerCase() : null
+    if (safeOrderId === null && safePositionId === null) {
+      throw new Error('protocol: invalid futures cancel target')
+    }
+    packet = {
+      ...base,
+      at: futuresStamp(at, now),
+      ...(safeOrderId === null ? {} : { orderId: safeOrderId }),
+      ...(safePositionId === null ? {} : { positionId: safePositionId })
+    }
   } else if (type === 'futures-settle') {
     // 房主 → peer 的账户快照。`delta` 只说明这一拍余额动了多少，
-    // peer **不拿它入账**（账以 balance/marginUsed/positions 为准），所以重复包不会被记两次。
+    // peer **不拿它入账**（账以 balance/marginUsed/positions/orders 为准），所以重复包不会被记两次。
     const stamp = futuresStamp(at, now)
     if (!isFuturesEpoch(epoch)) throw new Error('protocol: invalid futures epoch')
     if (!isFuturesSeq(seq)) throw new Error('protocol: invalid futures seq')
@@ -1260,6 +1339,9 @@ function buildPacket ({
     if (safeDelta === null) throw new Error('protocol: invalid futures delta')
     const safePositions = normalizeFuturesPositions(positions)
     if (safePositions === null) throw new Error('protocol: invalid futures positions')
+    // 票 95：挂单是可选字段（老调用方不带 = 空盘口），带了就必须整份合法。
+    const safeOrders = orders === undefined ? [] : normalizeFuturesOrders(orders)
+    if (safeOrders === null) throw new Error('protocol: invalid futures orders')
     packet = {
       ...base,
       at: stamp,
@@ -1268,7 +1350,8 @@ function buildPacket ({
       balance: safeBalance,
       marginUsed: safeMarginUsed,
       delta: safeDelta,
-      positions: safePositions
+      positions: safePositions,
+      orders: safeOrders
     }
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
@@ -1432,7 +1515,7 @@ export function encodeFuturesHello ({ deviceId, at, now } = {}) {
   return encodePacket({ type: 'futures-hello', deviceId, at, now })
 }
 
-export function encodeFuturesOrder ({ deviceId, at, kind, crop, side, margin, leverage, coins, positionId, now } = {}) {
+export function encodeFuturesOrder ({ deviceId, at, kind, crop, side, margin, leverage, price, lots, coins, positionId, now } = {}) {
   return encodePacket({
     type: 'futures-order',
     deviceId,
@@ -1442,17 +1525,19 @@ export function encodeFuturesOrder ({ deviceId, at, kind, crop, side, margin, le
     side,
     margin,
     leverage,
+    price,
+    lots,
     coins,
     positionId,
     now
   })
 }
 
-export function encodeFuturesCancel ({ deviceId, at, positionId, now } = {}) {
-  return encodePacket({ type: 'futures-cancel', deviceId, at, positionId, now })
+export function encodeFuturesCancel ({ deviceId, at, orderId, positionId, now } = {}) {
+  return encodePacket({ type: 'futures-cancel', deviceId, at, orderId, positionId, now })
 }
 
-export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, now } = {}) {
+export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, orders, now } = {}) {
   return encodePacket({
     type: 'futures-settle',
     deviceId,
@@ -1463,6 +1548,7 @@ export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, margin
     marginUsed,
     delta,
     positions,
+    orders,
     now
   })
 }
@@ -2042,15 +2128,23 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       if (!isVisitId(raw.positionId)) return fail('position-id')
       return { ok: true, packet: { ...base, positionId: raw.positionId.toLowerCase() } }
     }
+    if (raw.kind === 'place') {
+      // 票 95：只收限价与张数；多余的字段一律不读（重建对象）。
+      const place = normalizeFuturesPlace(raw)
+      if (place === null) return fail('place')
+      return { ok: true, packet: { ...base, ...place } }
+    }
     if (!Number.isInteger(raw.coins) || raw.coins < 1 || raw.coins > MAX_FUTURES_COIN) return fail('coins')
     return { ok: true, packet: { ...base, coins: raw.coins } }
   }
 
-  // 撤单（票 96）：形状照收，语义还没有。收到的一方按协议只当作「知道你要撤」。
+  // 撤单（票 95）：`orderId` 撤挂单，`positionId` 留给票 96 的按仓位撤单，至少给一个。
   if (raw.type === 'futures-cancel') {
     const at = normalizeDigestAt(raw.at)
     if (at === null) return fail('at')
-    if (!isVisitId(raw.positionId)) return fail('position-id')
+    const orderId = isVisitId(raw.orderId) ? raw.orderId.toLowerCase() : null
+    const positionId = isVisitId(raw.positionId) ? raw.positionId.toLowerCase() : null
+    if (orderId === null && positionId === null) return fail('cancel-target')
     return {
       ok: true,
       packet: {
@@ -2058,7 +2152,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         type: raw.type,
         deviceId: raw.deviceId.toLowerCase(),
         at,
-        positionId: raw.positionId.toLowerCase()
+        ...(orderId === null ? {} : { orderId }),
+        ...(positionId === null ? {} : { positionId })
       }
     }
   }
@@ -2077,6 +2172,9 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     if (delta === null) return fail('delta')
     const positions = normalizeFuturesPositions(raw.positions)
     if (positions === null) return fail('positions')
+    // 票 95：挂单可选（老 peer 不发 = 空盘口）；给了就必须整份合法。
+    const orders = raw.orders === undefined ? [] : normalizeFuturesOrders(raw.orders)
+    if (orders === null) return fail('orders')
     return {
       ok: true,
       packet: {
@@ -2089,7 +2187,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         balance,
         marginUsed,
         delta,
-        positions
+        positions,
+        orders
       }
     }
   }

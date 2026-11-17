@@ -79,13 +79,18 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 { "v": 1, "type": "futures-hello", "deviceId": "<uuid>", "at": 1700000000000 }
 { "v": 1, "type": "futures-order", "deviceId": "<uuid>", "at": 1700000000000,
   "kind": "open", "crop": "tomato", "side": "long", "margin": 50, "leverage": 10 }
+{ "v": 1, "type": "futures-order", "deviceId": "<uuid>", "at": 1700000000000,
+  "kind": "place", "crop": "tomato", "side": "short", "price": 5.12, "lots": 2, "leverage": 10 }
 { "v": 1, "type": "futures-cancel", "deviceId": "<uuid>", "at": 1700000000000,
-  "positionId": "<uuid>" }
+  "orderId": "<uuid>" }
 { "v": 1, "type": "futures-settle", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "seq": 7, "balance": 431.5, "marginUsed": 50.34, "delta": -2.39,
   "positions": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-2026W47",
                   "side": "long", "lots": 1, "entry": 5.03, "margin": 50.34,
-                  "leverage": 10 }] }
+                  "leverage": 10 }],
+  "orders": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-2026W47",
+               "side": "short", "price": 5.12, "lots": 2, "lotsLeft": 1,
+               "leverage": 10, "marginFrozen": 5.12, "at": 1700000000000 }] }
 { "v": 1, "type": "futures-sync", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "lastSeq": 7 }
 ```
@@ -128,14 +133,17 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `weekPnlPct` | `trading-digest` | 可选收益率**比率**（`0.035` = +3.5%）；范围 `[-1000, 1000]`；缺省表示本机没有可用的周起点硬币 |
 | `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20；没有仓位就是空数组 |
 | `at`（期货） | `futures-hello`、`futures-order`、`futures-cancel`、`futures-settle`、`futures-sync` | 发起方时钟的正整数毫秒；只有 `futures-settle` 拿它当账目的时间戳，「这份账旧不旧」只看 `(epoch, seq)` |
-| `kind` | `futures-order` | `open` / `close` / `deposit`；别的值整包丢 |
+| `kind` | `futures-order` | `open` / `close` / `deposit` / `place`；别的值整包丢 |
 | `crop` / `side` / `margin` / `leverage`（期货） | `futures-order`（`kind:'open'`） | 作物必须在作物表里；`side` 是 `long`/`short`；`margin` 是 1–1,000,000 的整数金币；`leverage` 是 1/3/10/20 |
-| `positionId` | `futures-order`（`kind:'close'`）、`futures-cancel` | 持仓 UUID；平仓只能平自己账户里的那一手 |
+| `crop` / `side` / `price` / `lots` / `leverage`（挂单） | `futures-order`（`kind:'place'`） | 作物必须在作物表里；`side` 是 `long`/`short`；`price` 是到分的正数；`lots` 是 1..1,000,000 的整数；`leverage` 是 1/3/10/20。保证金由房主按同一套 `marginOf` 现算，**不上线** |
+| `positionId` | `futures-order`（`kind:'close'`）、`futures-cancel`（可选） | 持仓 UUID；平仓只能平自己账户里的那一手；撤单里的 `positionId` 留给票 96 的按仓位撤单 |
+| `orderId` | `futures-cancel` | 挂单 UUID；与 `positionId` 至少给一个，都不给整包丢 |
 | `coins` | `futures-order`（`kind:'deposit'`） | 1..1,000,000 的整数：peer 先从自己农场扣掉这么多，再划进房主账本 |
 | `epoch` | `futures-settle`、`futures-sync` | 房主账本代次，非空字符串、≤64 字符；epoch 一变说明房主换了账本（重启/换人），旧 `seq` 一笔作废 |
 | `seq` | `futures-settle` | 该账户的流水号，整数 0..2^31-1，只增；接收方按 `(epoch, seq)` 幂等，`seq` 倒退的包丢弃 |
 | `balance` / `marginUsed` / `delta` | `futures-settle` | 到分的金币数（≥0；`delta` 可负）；`delta` 只用于显示「这一拍变了多少」，peer 不拿它记账——`balance` 才是真值 |
 | `positions`（期货） | `futures-settle` | 最多 `8` 条 `{ id, crop, contract, side, lots, entry, margin, leverage }`；`contract` 形如 `tomato-2026W47`（`/^[a-z][a-z0-9_]*-\d{4}W\d{2}$/`），`lots` 1..1,000,000，`entry`/`margin` 是到分的正数 |
+| `orders`（挂单） | `futures-settle` | 可选，缺省 = 空盘口；最多 `8` 条 `{ id, crop, contract, side, price, lots, lotsLeft, leverage, marginFrozen, at }`。`lots` 是原始张数、`lotsLeft` 是剩余张数（1..`lots`），`price` 是到分的正数，`marginFrozen` 是剩余部分压着的保证金；坏一条整包丢 |
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
@@ -888,18 +896,18 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    结束原因见字段表；结算原因只允许 `completed` / `recall` / `employer-end` / `offline` /
    `expired`。`contractId` / `requestId` 都是 UUID 形状。
 
-### 跨机期货账户（5 种 `futures-*`，票 94）
+### 跨机期货账户（5 种 `futures-*`，票 94 / 95）
 
 期货的**账本只有一本**：房主算价、算保证金、算强平，peer 只发窄指令、只显示房主给它的账。
-`futures.json` 里的 `remotes` 就是这些托管账户（`{ balance, marginUsed, positions, lastSeq }`），
+`futures.json` 里的 `remotes` 就是这些托管账户（`{ balance, marginUsed, positions, orders, lastSeq }`），
 本机自己的账户仍是顶层那套字段，两者互不影响（ADR-0032）。
 
 | 类型 | 方向 | 字段 | 幂等键 |
 | --- | --- | --- | --- |
 | `futures-hello` | peer → 房主 | `at` | 无（每 peer 30 秒最多 1 条） |
-| `futures-order` | peer → 房主 | `kind` +（`crop`/`side`/`margin`/`leverage` 或 `positionId` 或 `coins`） | 无（房主逐条记账，重复包靠源地址门控挡） |
-| `futures-cancel` | peer → 房主 | `positionId` | 无（票 96 才有语义；当前解析后丢弃） |
-| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` | `(epoch, seq)` |
+| `futures-order` | peer → 房主 | `kind` +（`crop`/`side`/`margin`/`leverage` 或 `positionId` 或 `coins` 或 `crop`/`side`/`price`/`lots`/`leverage`） | 无（房主逐条记账，重复包靠源地址门控挡） |
+| `futures-cancel` | peer → 房主 | `orderId`（票 96 起也认 `positionId`，至少一个） | 无（撤单本身幂等：单子没了就回 `no-order`） |
+| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` / `orders` | `(epoch, seq)` |
 | `futures-sync` | peer → 房主 | `epoch` / `lastSeq` | 无（每 30 秒最多 1 条，房主收到就回一份 settle） |
 
 1. **房主选举**：`[本机 deviceId, ...带 futures 能力位的已放行邻居]` 排序取最小，两端算出
@@ -910,18 +918,27 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 3. **指令**：`deposit` 的钱是 peer 自己农场出的——先按单机口径充进本机托管（农场扣款），
    再 `transferOut` 划给房主账本，所以两边账守恒、不会凭空生币；指令发不出去就原路退回农场。
    房主只记账，不碰自己的农场。`open`/`close` 走与单机完全相同的
-   `quoteOf`/`fillPriceOf`/`marginOf`/`takerFeeOf`。房主拒绝时
-   （`no-balance` / `market-closed` / `position-limit` …）只记一条日志，不广播、不回包。
-4. **结算**：每根（15 分钟）房主按同一套规则盯市每个远端账户——`pnl` 进该账户余额、
-   保证金不足就强平——然后 `seq += 1`，给每个报到过的 peer 各发一条它自己的 `futures-settle`。
-5. **对账**：peer 存一份 `(epoch, seq)` 副本，重发的同一条只算一次、`seq` 倒退的包丢掉；
+   `quoteOf`/`fillPriceOf`/`marginOf`/`takerFeeOf`。`place` 只带限价与张数：
+   房主按同一个 `marginOf({ lots, price, leverage })` 冻结保证金，余额不够回 `no-balance`；
+   新单若恰好与自己已有的对手单交叉，回 `self-trade`（票 95 的自成交防护）。
+   房主拒绝时（`no-balance` / `market-closed` / `position-limit` / `self-trade` / `order-limit` …）
+   只记一条日志，不广播、不回包。
+4. **撮合（票 95）**：房主每根把本地账户和所有远端账户的挂单放在一张盘口里撮合——
+   买价高优先、卖价低优先，同价按挂单时间、再按 id 字典序；成交价取 maker 的挂单价，
+   支持部分成交。做市商也会扫单：买单价 ≥ `ask`、卖单价 ≤ `bid` 时整张按挂单价成交。
+   每笔成交给双方各开一个仓位，`margin` 取该笔对应比例的冻结保证金、`entry` 取成交价，
+   双方各收 0.1% 名义费用（9 成销毁、1 成进保险）。撤单只退**剩余未成交**部分的冻结保证金。
+5. **结算**：每根（15 分钟）房主按同一套规则盯市每个远端账户——`pnl` 进该账户余额、
+   保证金不足就强平——然后 `seq += 1`，给每个报到过的 peer 各发一条它自己的 `futures-settle`
+   （只带它自己的持仓与挂单，别人的账不上线）。
+6. **对账**：peer 存一份 `(epoch, seq)` 副本，重发的同一条只算一次、`seq` 倒退的包丢掉；
    epoch 变了（房主重启/换人）就整份采纳新账。丢包不靠重传：peer 每 30 秒 `futures-sync`，
-   房主回一份当前账户。本实现直接回整份快照、不维护增量日志——8 条持仓的整份也只有约 1.5 KiB。
-6. **旧邻居**：只有广告了 `futures` 能力位的已放行邻居才会收到这五种包。对方没这一位时
+   房主回一份当前账户。本实现直接回整份快照、不维护增量日志——8 条持仓 + 8 条挂单的整份也在 4 KiB 内。
+7. **旧邻居**：只有广告了 `futures` 能力位的已放行邻居才会收到这五种包。对方没这一位时
    两边都不发，本机窗口写「对端未升级，期货不可用」；农场、盘口、串门照常。
-7. **窗口动作**：peer 点 `futures-deposit` / `futures-open` / `futures-close` 只发指令，
-   回 `{ ok: true, pending: true }`，等房主下一拍 settle 才改显示；`futures-withdraw` 仍是
-   房主本机动作（只有房主能提自己账上的钱）。
+8. **窗口动作**：peer 点 `futures-deposit` / `futures-open` / `futures-close` / `futures-place` /
+   `futures-cancel` 只发指令，回 `{ ok: true, pending: true }`，等房主下一拍 settle 才改显示；
+   `futures-withdraw` 仍是房主本机动作（只有房主能提自己账上的钱）。
 
 ### 限额与边界
 
@@ -942,15 +959,15 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
 | 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
 | 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
-| 期货账户 | 单账户持仓 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符 |
-| 期货广播 | `futures-settle` 每账户每根 1 条；`futures-sync` 1 条/30 秒；整包 ≤4 KiB（8 条持仓约 1.5 KiB） |
+| 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符 |
+| 期货广播 | `futures-settle` 每账户每根 1 条；`futures-sync` 1 条/30 秒；整包 ≤4 KiB（8 条持仓 + 8 条挂单仍在内） |
 | 期货价格 | 指数锚现货价（已被行情夹在 `[base×0.5, base×2]`）；做市价差 0.2%；吃单费 0.1%（9 成销毁、1 成进保险） |
 
 ### 4 KiB、白名单与旧邻居
 
 - **4 KiB**：所有 UDP 报文都是单个 JSON，超过 4 KiB 在解析前丢弃；不回复、不报错。
   `market-digest`、`trading-digest`、8 种 `work-*` 和 5 种 `futures-*` 都很小（价格 3 个数、
-  合同 6 个字段、榜上最多 8 条持仓、一份期货账户最多 8 条持仓 ≈1.5 KiB），正常触不到上限。
+  合同 6 个字段、榜上最多 8 条持仓、一份期货账户最多 8 条持仓 + 8 条挂单 ≈3 KiB），正常触不到上限。
   农场快照走 HTTP，不受 UDP 4 KiB 限制，但访客客户端仍只收 ≤64 KiB。
 - **字段白名单**：每种类型只重建自己的字段；未知字段、未知作物、未知枚举、越界数字
   一律丢弃或整包拒绝。所有 id 只从校验过的字段拼，不拼路径。

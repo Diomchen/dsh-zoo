@@ -152,6 +152,7 @@ import {
   encodeTradingDigest,
   encodeFuturesHello,
   encodeFuturesOrder,
+  encodeFuturesCancel,
   encodeFuturesSettle,
   encodeFuturesSync,
   normalizeSkinId,
@@ -1284,6 +1285,42 @@ export function createService (ctx, options = {}) {
         return futuresOrderPending('futures-close', { kind: 'close', positionId: body?.positionId })
       }
       const result = await futures.close({ id: body?.positionId, at: futuresClock() })
+      if (result?.ok === true) refreshFuturesWindow()
+      return result
+    }
+    // 票 95：挂限价单。peer 只发「限价、方向、张数、杠杆」，冻结多少保证金由房主算。
+    if (action === 'futures-place') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      if (!isFuturesHost()) {
+        return futuresOrderPending('futures-place', {
+          kind: 'place',
+          crop: body?.cropId,
+          side: body?.side,
+          price: body?.price,
+          lots: body?.lots,
+          leverage: body?.leverage
+        })
+      }
+      const result = await futures.place({
+        crop: body?.cropId,
+        side: body?.side,
+        price: body?.price,
+        lots: body?.lots,
+        leverage: body?.leverage,
+        at: futuresClock()
+      })
+      if (result?.ok === true) {
+        // 挂上就撮一次：贴着对手价的单不用等下一拍 tick。
+        await futures.matchDue(futuresClock())
+        refreshFuturesWindow()
+      }
+      return result
+    }
+    // 票 95：撤自己的挂单（只退剩余未成交那部分冻结保证金）。
+    if (action === 'futures-cancel') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      if (!isFuturesHost()) return futuresCancelPending(body?.orderId)
+      const result = await futures.cancel({ orderId: body?.orderId, at: futuresClock() })
       if (result?.ok === true) refreshFuturesWindow()
       return result
     }
@@ -5123,7 +5160,8 @@ export function createService (ctx, options = {}) {
             } else if (packet.type === 'futures-settle') {
               handleFuturesSettle(packet)
             } else if (packet.type === 'futures-cancel') {
-              // TODO(票 96)：撤单还没有语义。协议层已经校验过字段，这里只丢。
+              // 票 95：撤单。房主按 remotes[peer].orders 撤；peer 收到（正常不会）就当没这回事。
+              void handleFuturesCancel(packet, from)
             } else {
               room.observeBeacon(packet)
               // 票 59：beacon 里带着邻居的作物目录指纹，不一致就问一次。
@@ -6420,6 +6458,19 @@ export function createService (ctx, options = {}) {
       margin: position.margin,
       leverage: position.leverage
     }))
+    // 票 95：peer 只收到**自己的**挂单；`lots` 保留原始张数，窗口画进度条用。
+    const orders = (account.orders ?? []).map((order) => ({
+      id: order.id,
+      crop: order.crop,
+      contract: order.contract,
+      side: order.side,
+      price: order.price,
+      lots: order.lots,
+      lotsLeft: order.lotsLeft,
+      leverage: order.leverage,
+      marginFrozen: order.marginFrozen,
+      at: order.at
+    }))
     return encodeFuturesSettle({
       deviceId: room.snapshot().self.deviceId,
       at,
@@ -6428,7 +6479,8 @@ export function createService (ctx, options = {}) {
       balance: account.balance,
       marginUsed: account.marginUsed,
       delta,
-      positions
+      positions,
+      orders
     })
   }
 
@@ -6477,6 +6529,7 @@ export function createService (ctx, options = {}) {
       return roundCoin(-(margin + fee))
     }
     if (packet.kind === 'close') return roundCoin(Number(result?.credit) || 0)
+    if (packet.kind === 'place') return roundCoin(-(Number(result?.order?.marginFrozen) || 0))
     return 0
   }
 
@@ -6489,8 +6542,8 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 票 94：对端的充值/开仓/平仓。房主是唯一记账人——价格、张数、费用、余额全现算，
-   * 对端只能提「充多少 / 开哪边 / 多少保证金 / 几倍杠杆」。
+   * 票 94：对端的充值/开仓/平仓。票 95 加了挂单（`place`）。房主是唯一记账人——
+   * 价格、张数、费用、余额全现算，对端只能提「做什么」。
    * 拒单不广播：对端手里的账目仍是上一拍的真账，下一拍 sync 也不会算出别的数。
    */
   async function handleFuturesOrder (packet, from) {
@@ -6512,6 +6565,17 @@ export function createService (ctx, options = {}) {
         })
       } else if (packet.kind === 'close') {
         result = await futures.hostClose(packet.deviceId, { id: packet.positionId, at })
+      } else if (packet.kind === 'place') {
+        result = await futures.hostPlace(packet.deviceId, {
+          crop: packet.crop,
+          side: packet.side,
+          price: packet.price,
+          lots: packet.lots,
+          leverage: packet.leverage,
+          at
+        })
+        // 票 95：挂上就撮一次，贴着对手价的单立刻成交（peer 的下一拍 settle 会带回仓位）。
+        if (result?.ok === true) await futures.matchDue(at)
       } else {
         return
       }
@@ -6524,6 +6588,29 @@ export function createService (ctx, options = {}) {
       return
     }
     sendFuturesSettle(packet.deviceId, { delta: futuresOrderDelta(packet, result) })
+  }
+
+  /**
+   * 票 95：对端撤单。房主按 `remotes[peer].orders` 撤，只退剩余未成交部分的冻结保证金；
+   * 撤完推一份新账目（撤销本身也动了余额）。
+   */
+  async function handleFuturesCancel (packet, from) {
+    if (disposed || futures === null || !isFuturesHost()) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    if (!futuresBindPeer(packet.deviceId, from)) return
+    if (typeof packet.orderId !== 'string') return
+    let result = null
+    try {
+      result = await futures.hostCancel(packet.deviceId, { orderId: packet.orderId, at: futuresClock() })
+    } catch (error) {
+      warnOnce('futures-cancel', '撤单没法落账：' + message(error))
+      return
+    }
+    if (result?.ok !== true) {
+      warnOnce('futures-cancel-' + String(result?.error), '撤单被拒：' + String(result?.error))
+      return
+    }
+    sendFuturesSettle(packet.deviceId, { delta: roundCoin(Number(result.released) || 0) })
   }
 
   /** 票 94：对端每 30 秒对一次账。房主直接回整份账户——gap 再大也不会算错。 */
@@ -6551,6 +6638,7 @@ export function createService (ctx, options = {}) {
         balance: packet.balance,
         marginUsed: packet.marginUsed,
         positions: packet.positions,
+        orders: packet.orders,
         at: futuresClock()
       })
     } catch (error) {
@@ -6639,6 +6727,8 @@ export function createService (ctx, options = {}) {
     const view = futures === null ? initialFuturesView() : futures.snapshot({ at: now })
     const replica = futures === null ? null : futures.replicaOf()
     const positions = futuresReplicaPositions(replica, now)
+    // 票 95：自己的挂单也只从房主的副本里取（本地账本在 peer 侧不记挂单）。
+    const orders = replica === null ? [] : replica.orders.map((order) => ({ ...order }))
     const balance = replica === null ? 0 : replica.balance
     const marginUsed = replica === null ? 0 : replica.marginUsed
     const upgraded = futuresPeerIds().length > 0
@@ -6659,6 +6749,8 @@ export function createService (ctx, options = {}) {
       equity: roundCoin(balance + marginUsed),
       positions,
       positionCount: positions.length,
+      orders,
+      orderCount: orders.length,
       // 周报/成交明细是房主的账，协议里没有这两样：对端窗口留空形状，不假装有。
       trades: [],
       week: { start: 0, pnl: 0 },
@@ -6695,6 +6787,35 @@ export function createService (ctx, options = {}) {
       return { ok: false, error: 'no-host' }
     }
     return { ok: true, action, pending: true, notice: '已发给房主，等一拍回执。' }
+  }
+
+  /**
+   * 票 95：peer 撤单——只发 `orderId`，房主按自己的账撤，退多少由房主算。
+   * 没有 orderId 直接拒（协议层也会拒，这里先给一句人话）。
+   */
+  function futuresCancelPending (orderId) {
+    if (typeof orderId !== 'string' || orderId.trim() === '') return { ok: false, error: 'bad-order' }
+    if (disposed || discovery === null) return { ok: false, error: 'network-off' }
+    const hostId = futuresHostId()
+    if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
+    let data
+    try {
+      data = encodeFuturesCancel({
+        deviceId: room.snapshot().self.deviceId,
+        at: futuresClock(),
+        orderId
+      })
+    } catch (error) {
+      warnOnce('futures-cancel-encode', '撤单发不出去：' + message(error))
+      return { ok: false, error: 'bad-order' }
+    }
+    try {
+      if (discovery.sendTo(hostId, data) !== true) return { ok: false, error: 'no-host' }
+    } catch (error) {
+      warnOnce('futures-cancel-send', '撤单发不出去：' + message(error))
+      return { ok: false, error: 'no-host' }
+    }
+    return { ok: true, action: 'futures-cancel', pending: true, notice: '已发给房主，等一拍回执。' }
   }
 
   /**
@@ -6999,6 +7120,20 @@ export function createService (ctx, options = {}) {
         broadcastFuturesSettle(settled.remotes.map((entry) => entry.deviceId))
         refreshFuturesWindow()
       }
+      // 票 95：结算之后撮合这一拍（价格优先、同价时间优先；MM 扫单也在里面）。
+      // 必须在 settle 之后：成交开的是新仓位，下一拍才轮到它盯市，不会「刚成交就被结算」。
+      void Promise.resolve()
+        .then(() => futures.matchDue(futuresClock()))
+        .then((matched) => {
+          if (matched?.ok !== true || !(matched.fills > 0)) return
+          const targets = Array.isArray(matched.accounts) && matched.accounts.length > 0
+            ? matched.accounts.map((entry) => entry.deviceId)
+            : null
+          // 有人成交：把新仓位/新余额推回给相关对端（没有就全体重推一遍，账永远是整份的）。
+          broadcastFuturesSettle(targets)
+          refreshFuturesWindow()
+        })
+        .catch((error) => warnOnce('futures-match', '期货撮合失败：' + message(error)))
       // 票 94：同一班车顺手做「报到」和「对账」。两条都按 30 秒节流，15 秒一拍正好两拍一次。
       announceFutures()
       syncFutures()
