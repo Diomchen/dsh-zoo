@@ -249,7 +249,8 @@ git push origin v1.0.0
 1. 先跑 `npm run check`（语法检查 + 全部测试）；
 2. 检查 tag 与 `package.json` 版本是否一致；
 3. `npm pack` 生成 `dsh-zoo-1.0.0.tgz`，并复制一份**不带版本号**的 `dsh-zoo.tgz`；
-4. 创建 GitHub Release，两个文件都作为附件。
+4. 创建 GitHub Release，两个文件都作为附件；
+5. 往 npm 发 `dsh-zoo@1.0.0`（npm 上已经有这个版本就跳过，不会让重推 tag 变红）。
 
 稳定的下载地址是：
 
@@ -337,17 +338,48 @@ gh pr create --repo awesome-dsh-plugin/awesome-dsh-plugin \
 - 截图：在仓库根放 `screenshots.json`，列 1–8 张仓库内图片的相对路径；市场和网站会自动展示。
   不写也没关系。
 
-### 可选：发布到 npm
+### 发布到 npm（CI 自动）
 
 npm 不是上架 dsh-market 的必要条件；发布后市场会多显示下载量，并会优先使用 npm 预构建包。
-如果要发 npm：
+这一步现在由 CI 做：推 tag 后 `Publish npm` job 在 `Test` 通过时跑
+`npm publish --access public`，用的是仓库 secret `NPM_TOKEN`。
+
+版本号已经在 npm 上时 job 直接跳过 —— 重推同一个 tag 不会让流水线变红，
+但也意味着**漏发的版本没法靠重推 tag 补上**，只能改 `version` 发新 tag 或本地手动发。
+
+#### 密钥 = 本机 npm 的那条 token
+
+`NPM_TOKEN` 就是 `~/.npmrc` 里 `//registry.npmjs.org/:_authToken=` 后面那串，换 token 时重设：
+
+```sh
+token="$(sed -n 's|^//registry\.npmjs\.org/:_authToken=\(.*\)$|\1|p' ~/.npmrc)"
+printf '%s' "$token" | gh secret set NPM_TOKEN --repo Diomchen/dsh-zoo
+gh secret list --repo Diomchen/dsh-zoo   # 只能看到更新时间，值读不回来
+```
+
+token 用 granular 的，权限 `Read and write (publish and stage)`，勾上
+`Bypass two-factor authentication`；选成 `stage only` 只能把版本送进暂存区。
+往 npm 发必须走 `registry.npmjs.org`（本机默认 registry 是 npmmirror，发镜像会被拒），
+CI 里已经写死 `--registry=https://registry.npmjs.org`。
+
+#### 前置条件
 
 1. `package.json` 不能有 `"private": true`（本项目已移除）；
-2. `repository` 要指回 `https://github.com/Diomchen/dsh-zoo`；
-3. `npm publish --registry=https://registry.npmjs.org --access public`
-   （本机默认 registry 是 npmmirror，往镜像发布会被拒）；
-4. 用 granular token 时，权限要选 `Read and write (publish and stage)`，并勾上
-   `Bypass two-factor authentication`；选成 `stage only` 只能把版本送进暂存区。
+2. `repository` 要指回 `https://github.com/Diomchen/dsh-zoo`（provenance/来源链接靠它）。
+
+#### 兜底：本地手动发
+
+CI 挂了又急着发版时，在 `package.json` 版本对应的那个 tag 上手动发：
+
+```sh
+npm publish --registry=https://registry.npmjs.org --access public
+```
+
+#### 以后想换掉长期 token
+
+npm 正在收紧「绕过 2FA 的 token」用于发包，长期方案是 Trusted Publishing（OIDC）：
+在 npm 包设置里把发布来源指到 `Diomchen/dsh-zoo` 的 `.github/workflows/ci.yml`，
+再给 job 加 `id-token: write`、去掉 `NODE_AUTH_TOKEN`。现在 token 方案还能用，先不折腾。
 
 npm 包和精选列表是自动关联的，不需要在 YAML 里写 `npm:` 字段。
 
