@@ -8664,6 +8664,9 @@ function actionDeviceId (value) {
  * 拿不到主屏标记（老 helper / 单屏没带 displays）时返回 null，petScene 退回旧行为。
  */
 function primaryHomeArea (event) {
+  // 票 94：混合 DPI 时 helper 已经把主屏在窗口 CSS 坐标里的矩形算好了，直接用。
+  const measured = shared.normalizeRect(event?.homeArea)
+  if (measured !== null) return measured
   const workArea = event?.workArea
   if (workArea === null || typeof workArea !== 'object') return null
   const displays = Array.isArray(event.displays) ? event.displays : []
@@ -8688,6 +8691,15 @@ function primaryHomeArea (event) {
  * 场景里空数组 = 老宿主/单屏，物理退回整张桌面。
  */
 function displayFloors (event) {
+  // 票 94：helper 报的是按物理几何换算过的窗口 CSS 矩形，优先用；缺了才按 DIP 差值现算。
+  if (Array.isArray(event?.floors) && event.floors.length > 0) {
+    const measured = []
+    for (const raw of event.floors) {
+      const rect = shared.normalizeRect(raw)
+      if (rect !== null) measured.push(rect)
+    }
+    if (measured.length > 0) return measured
+  }
   const workArea = event?.workArea
   if (workArea === null || typeof workArea !== 'object') return []
   const surface = localSurface(workArea)

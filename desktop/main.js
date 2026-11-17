@@ -290,7 +290,7 @@ let mediaWaitTimer = null
 /** 当前窗口是否穿透（Electron 没有 isIgnoreMouseEvents 读取 API，只能自己镜像）。 */
 const ignoreState = { ignoring: null }
 /** 渲染端上报的悬停状态；lastAt 是主进程决定「要不要相信渲染端」的唯一依据。 */
-const hover = { inside: false, lastAt: 0, frozen: false }
+const hover = { inside: false, lastAt: 0, point: null, pointAt: 0, frozen: false }
 /** 渲染端逐帧上报的命中矩形（窗口局部 DIP）与时间戳；过期即视为没有命中区。 */
 let rendererRects = []
 let rendererRectsAt = 0
@@ -1033,6 +1033,8 @@ function healLostDown () {
 function forceIgnore (reason) {
   hover.inside = false
   hover.lastAt = 0
+  hover.point = null
+  hover.pointAt = 0
   busy.active = false
   busy.at = 0
   busy.since = 0
@@ -1081,8 +1083,8 @@ function applyDecision (reason) {
     setIgnore(true, 'hidden')
     return
   }
-  const local = localCursor()
   const now = Date.now()
+  const { point: local, mixedDpi } = hitPointFor(now)
   revokeStaleBusy(now)
   const rects = liveRects(now)
   const inside = local !== null && shared.hitTestRects(rects, local) !== null
@@ -1100,7 +1102,8 @@ function applyDecision (reason) {
     busyAt: busy.at,
     busySince: busy.since,
     // 调试里 freeze 表示「渲染端已经死了」：这时连兜底也必须停，验证 fail-closed。
-    allowMainFallback: hover.frozen !== true,
+    // 混合缩放时 OS 坐标不可信，同样不许 main-fallback 拿它开窗（票 96）。
+    allowMainFallback: hover.frozen !== true && mixedDpi !== true,
     now
   })
   setIgnore(!decision.interactive, decision.reason || reason)
@@ -1217,10 +1220,80 @@ function safeCursorPoint () {
   }
 }
 
+/**
+ * 各屏缩放是否不一致（票 93）。
+ *
+ * 窗口按**一块**屏的 deviceScaleFactor 渲染，`screen.getCursorScreenPoint()` 却按**光标所在那块屏**
+ * 的缩放折算；两块屏缩放不同时，这两套坐标在跨屏窗口里对不上。`getAllDisplays()` 每次都要同步问
+ * 一次系统，而判定每秒跑十次，所以缓存 5 秒；显示器增删/缩放变化本来就会重建窗口，缓存不会长期过期。
+ */
+let mixedDpiCache = { at: 0, value: false }
+function mixedDpiDisplays (now) {
+  if (now - mixedDpiCache.at < 5000) return mixedDpiCache.value
+  let value = false
+  try {
+    const factors = new Set(screen.getAllDisplays().map((display) => display.scaleFactor))
+    value = factors.size > 1
+  } catch {
+    value = false
+  }
+  mixedDpiCache = { at: now, value }
+  return value
+}
+
+/** 最近一次命中判定采信的坐标来源；写进 status，混合 DPI 现场能直接看出走了哪一路。 */
+let lastPointSource = null
+
+/**
+ * 命中判定用的窗口本地坐标。
+ *
+ * 混合 DPI 下以渲染端上报的 CSS 指针为准（它和命中矩形同一套坐标系），其余情况仍用 OS 光标——
+ * 单屏/同缩放时这等于原来的行为，主进程的独立复核一点都不放松。调试用的固定光标优先于一切，
+ * 免得测试被 DPI 分支带偏。
+ *
+ * 返回 `{ point, source }`：source 是这一拍采信的来源（`renderer` / `os` / null），
+ * 调用方还要按 `mixedDpiDisplays()` 决定这份坐标能不能作数（票 96）。
+ */
+function currentLocalPoint (now) {
+  const picked = shared.chooseLocalPoint({
+    osPoint: localCursor(),
+    rendererPoint: hover.point,
+    rendererAt: hover.pointAt,
+    now,
+    preferRenderer: pointerOverride === null && mixedDpiDisplays(now),
+    area: localArea()
+  })
+  lastPointSource = picked.source
+  return picked
+}
+
+/**
+ * 这一拍命中判定实际能用的本地坐标（票 93 / 票 96）。
+ *
+ * 混合缩放下 OS 光标的本地坐标本身是错位的：窗口按一块屏渲染，光标却按另一块屏折算。
+ * 所以只认渲染端上报的 CSS 指针；拿不到（过期/未上报/坏形状）就返回 `point: null`，
+ * 让调用方 fail-closed 回穿透 —— 不能再拿错位坐标去开 `main-fallback`，否则光标明明不在
+ * 宠物上，窗口也会在 300ms 后接管鼠标。
+ *
+ * 调试用的固定光标（`pointerOverride`）是明确的「假装光标在这里」，不参与这条收紧。
+ */
+function hitPointFor (now) {
+  const picked = currentLocalPoint(now)
+  const mixedDpi = pointerOverride === null && mixedDpiDisplays(now)
+  return {
+    point: mixedDpi && picked.source !== 'renderer' ? null : picked.point,
+    source: picked.source,
+    mixedDpi
+  }
+}
+
 function emitHit (reason) {
-  const local = localCursor()
+  const now = Date.now()
+  // 和 applyDecision 用同一份「能作数的坐标」：混合缩放拿不到渲染端指针时，
+  // 这条 hit 的 inside 也必须是 false（票 96），诊断口不能自说自话。
+  const { point: local } = hitPointFor(now)
   const screenPoint = pointerOverride ?? safeCursorPoint()
-  const rects = liveRects(Date.now())
+  const rects = liveRects(now)
   const rect = local === null ? null : shared.hitTestRects(rects, local)
   const bounds = win !== null && !win.isDestroyed() ? win.getBounds() : null
   const hitKey = (ignoreState.ignoring === false ? '1' : '0') + '|' + (rect !== null && typeof rect.id === 'string' ? rect.id : '')
@@ -1435,12 +1508,17 @@ ipcMain.on('dsh-zoo:hover', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   if (hover.frozen) return
   const inside = payload !== null && typeof payload === 'object' && payload.inside === true
+  // 票 93：渲染端把自己那份 CSS 坐标一起报上来。混合 DPI 的跨屏窗口里，OS 光标换算出的本地坐标
+  // 和渲染端真实的 CSS 坐标差一截，只有这一份能和命中矩形对上。
+  const point = inside ? shared.normalizePoint(payload.point) : null
   hover.inside = inside
   hover.lastAt = inside ? Date.now() : 0
+  hover.point = point
+  hover.pointAt = point === null ? 0 : Date.now()
   // 渲染端重新看见光标停在命中区 = 它活着且能接指针：允许重新申请输入租约。
   // 但硬上限触发的 blocked 只认 busy:false，悬停不能把它复活。
   if (inside && busy.blocked !== true) busy.allow = true
-  // 立即翻转（不用等 100ms 轮询）；主进程仍会用自己的光标位置复核。
+  // 立即翻转（不用等 100ms 轮询）；主进程仍会按自己的坐标复核——单屏/同缩放时就是 OS 光标。
   applyDecision(inside ? 'renderer-hover' : 'renderer-leave')
 })
 
@@ -3615,12 +3693,19 @@ function statusEvent (id) {
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
     bounds,
     pointer: pointerOverride ?? safeCursorPoint(),
+    // 票 93：这一拍命中判定用的是谁的坐标（renderer = 渲染端 CSS 指针，os = OS 光标），
+    // 以及渲染端上报的原值；混合 DPI 现场先看这两项再怀疑别的。
+    pointerSource: lastPointSource,
+    hoverPoint: hover.point === null ? null : { ...hover.point },
     debug: debugEnabled
   }
 }
 
 function sendReady () {
   readySent = true
+  // 票 94：混合 DPI 下把「每块屏在窗口 CSS 坐标里的矩形」一起报给宿主；算不出来就不带，
+  // 宿主按老算法（DIP 差值）兜底。
+  const measuredFloors = measureFloorsInCss()
   writeEvent({
     type: 'ready',
     pid: process.pid,
@@ -3629,6 +3714,7 @@ function sendReady () {
     // 两者必须是同一个矩形，否则宠物会被宿主放在窗口外（屏幕上看起来就是“不见了”）。
     workArea: surfaceBounds() ?? surfaceArea(),
     displays: displayList(),
+    ...(measuredFloors === null ? {} : { floors: measuredFloors.floors, homeArea: measuredFloors.homeArea }),
     debug: debugEnabled,
     shotMode: isShotMode
   })
@@ -3670,6 +3756,90 @@ function surfaceBounds () {
   } catch {
     return null
   }
+}
+
+/**
+ * 一块屏的**真实物理**工作区（票 94）。
+ *
+ * `screen.dipToScreenRect(win, rect)` 只按**窗口自己**的缩放换算：跨屏窗口里，缩放和窗口不同的
+ * 那块屏会被算到别处去（实测主屏 125% + 副屏 150% 时，主屏的工作区被算到屏幕左上方的空白里，
+ * 宠物走到那条「地板」上就出了显示器、抓不回来）。在那块屏上临时开一扇 8×8 的隐藏窗，让系统按
+ * **那块屏**的 DPI 落位，再问它的物理矩形，拿到的才是真值。
+ */
+function displayPhysicalWorkArea (display) {
+  let probe = null
+  try {
+    probe = new BrowserWindow({
+      x: display.workArea.x,
+      y: display.workArea.y,
+      width: 8,
+      height: 8,
+      show: false,
+      frame: false,
+      skipTaskbar: true,
+      focusable: false,
+      enableLargerThanScreen: true
+    })
+    return screen.dipToScreenRect(probe, display.workArea)
+  } catch {
+    return null
+  } finally {
+    try {
+      probe?.destroy()
+    } catch {
+      // 探针窗销毁失败不影响主窗
+    }
+  }
+}
+
+/**
+ * 每块屏在窗口 CSS 坐标里的工作区 + 主屏出生区（票 94）。
+ *
+ * 场景下发给渲染端的 floors / homeArea 必须是**窗口 CSS 坐标**：渲染端画在哪，命中矩形就在哪。
+ * 缩放一致时物理换算和 DIP 差值等价；缩放不一致时必须按物理矩形换算，否则小屏那块地板会整体
+ * 偏到屏幕左上方。任何一步拿不到物理几何就返回 null，宿主回退旧算法。
+ * @returns {{floors:object[], homeArea:object|null}|null}
+ */
+function measureFloorsInCss () {
+  if (win === null || win.isDestroyed()) return null
+  if (typeof screen.dipToScreenRect !== 'function') return null
+  const bounds = surfaceBounds()
+  if (bounds === null || !(bounds.width > 0)) return null
+  let windowPhysical = null
+  try {
+    windowPhysical = screen.dipToScreenRect(win, bounds)
+  } catch {
+    return null
+  }
+  const windowScale = windowPhysical.width / bounds.width
+  if (!(windowScale > 0)) return null
+  let primary = null
+  try {
+    primary = screen.getPrimaryDisplay()
+  } catch {
+    primary = null
+  }
+  const displays = []
+  for (const display of screen.getAllDisplays()) {
+    const sameScale = Math.abs(display.scaleFactor - windowScale) < 0.01
+    const physicalWorkArea = sameScale
+      ? screen.dipToScreenRect(win, display.workArea)
+      : displayPhysicalWorkArea(display)
+    if (physicalWorkArea === null) continue
+    displays.push({
+      id: display.id,
+      primary: primary !== null && display.id === primary.id,
+      physicalWorkArea
+    })
+  }
+  const measured = shared.floorsFromPhysical({
+    windowPhysical,
+    windowScale,
+    displays,
+    area: { x: 0, y: 0, width: bounds.width, height: bounds.height }
+  })
+  if (measured.floors.length === 0) return null
+  return measured
 }
 
 function writeEvent (event) {
@@ -3755,6 +3925,10 @@ async function shotSidecar (image) {
     scene,
     renderer: await rendererDebug(),
     pointer: pointerOverride ?? safeCursorPoint(),
+    // 票 93：这一拍命中判定用的是谁的坐标（renderer = 渲染端 CSS 指针，os = OS 光标），
+    // 以及渲染端上报的原值；混合 DPI 现场先看这两项再怀疑别的。
+    pointerSource: lastPointSource,
+    hoverPoint: hover.point === null ? null : { ...hover.point },
     ignoring: ignoreState.ignoring !== false,
     busy: busyFresh(Date.now()),
     overlayRects: overlayRects.length,

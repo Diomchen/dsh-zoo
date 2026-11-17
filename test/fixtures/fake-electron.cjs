@@ -17,7 +17,8 @@
  *
  * 渲染端替身：收到 `dsh-zoo:scene` 后按场景矩形（窗口局部 DIP）上报 `dsh-zoo:rects`，
  * 并在光标压在矩形上时上报 `dsh-zoo:hover`——与 desktop/renderer.js 的最小行为一致，
- * 足以让主进程的点击穿透裁定走真实代码路径。
+ * 足以让主进程的点击穿透裁定走真实代码路径。布局里给了 `rendererCursor`（窗口局部 CSS 坐标）时，
+ * 替身按它判命中，用来复现「混合 DPI 下渲染端和 OS 光标坐标不一致」（票 93）。
  */
 
 'use strict'
@@ -278,16 +279,33 @@ function reportRects (contents, includeHover) {
   if (includeHover === true) reportHover(contents)
 }
 
+/**
+ * 替身渲染端眼里的本地指针（窗口局部 CSS 坐标）。
+ *
+ * 默认就是「OS 光标 − 窗口 bounds」——单屏/同缩放下渲染端和主进程本来就是同一套坐标。
+ * 布局里给了 `rendererCursor` 时用它：混合 DPI 的真实现场里，渲染端按窗口自己的缩放渲染，
+ * 和 OS 光标按光标所在屏折算出的小区标会差一截；回归用例靠这个字段把「两边不一致」摆出来。
+ */
+function rendererLocalPoint (contents) {
+  const raw = layout !== null ? layout.rendererCursor : null
+  if (raw !== null && typeof raw === 'object' &&
+    Number.isFinite(Number(raw.x)) && Number.isFinite(Number(raw.y))) {
+    return { x: Number(raw.x), y: Number(raw.y) }
+  }
+  const point = cursorPoint()
+  const bounds = contents.win.bounds
+  return { x: point.x - bounds.x, y: point.y - bounds.y }
+}
+
 /** 光标在场景矩形里 = 渲染端看到指针压在宠物上（真渲染端由 pointermove 驱动）。 */
 function reportHover (contents) {
   if (contents.win.destroyed) return
-  const point = cursorPoint()
-  const bounds = contents.win.bounds
-  const local = { x: point.x - bounds.x, y: point.y - bounds.y }
+  const local = rendererLocalPoint(contents)
   const inside = sceneRects().some((rect) =>
     local.x >= rect.x && local.x < rect.x + rect.width &&
     local.y >= rect.y && local.y < rect.y + rect.height)
-  ipcMain.emit('dsh-zoo:hover', { sender: contents }, { inside })
+  // 票 93：真渲染端会把 CSS 指针一起报上来，主进程在混合 DPI 下只认这一份。
+  ipcMain.emit('dsh-zoo:hover', { sender: contents }, { inside, point: inside ? local : null })
 }
 
 const heartbeat = setInterval(() => {

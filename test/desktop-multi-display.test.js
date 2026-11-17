@@ -30,12 +30,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 const WORK_AREA_Y = 25
 const SCREEN = { width: 1440, height: 900 }
 
-function display (id, x) {
+function display (id, x, scaleFactor = 2) {
   return {
     id,
     bounds: { x, y: 0, width: SCREEN.width, height: SCREEN.height },
     workArea: { x, y: WORK_AREA_Y, width: SCREEN.width, height: SCREEN.height - WORK_AREA_Y },
-    scaleFactor: 2
+    scaleFactor
   }
 }
 
@@ -230,6 +230,59 @@ test('多屏：第二块屏在主屏左侧时，负坐标同样要能命中', as
   assert.deepEqual(status.bounds, unionOf(layout), '负坐标布局也要覆盖两块屏')
   assert.equal(status.hoverInside, true, '左屏上的宠物必须能被命中（窗口局部坐标 = 屏幕坐标 − 窗口左上角）')
   assert.equal(status.ignoring, false, '左屏上的宠物必须可交互')
+})
+
+test('混合缩放：OS 光标换算偏了，也要按渲染端的 CSS 指针命中（票 93）', async (t) => {
+  // 主屏 125%、副屏 150%：窗口只按一块屏的缩放渲染，OS 光标却按光标所在那块屏折算，
+  // 两边算出的窗口本地坐标会差一截（现场实测差 ~(155, 28)）。这里让 OS 光标落在宠物矩形外、
+  // 渲染端按真实 CSS 坐标报「在宠物身上」——命中判定必须采信渲染端那一份，否则现场就是：
+  // 宠物看得见、悬停也会亮，左键却永远穿透到下层窗口。
+  const pet = { id: 'self', kind: 'pet', role: 'self', x: 740, y: 600, width: 160, height: 200, label: '我', color: '#3b74d8' }
+  const layout = {
+    revision: 1,
+    primaryId: 1,
+    cursor: { x: 640, y: 640 }, // OS 光标：换算出的本地坐标 (640,615) 在宠物外面
+    rendererCursor: { x: 800, y: 700 }, // 渲染端 CSS 指针：压在宠物身上
+    displays: [display(1, 0, 1.25), display(2, SCREEN.width, 1.5)]
+  }
+  const helper = await startHelper(t, layout)
+
+  helper.send({
+    type: 'update',
+    scene: { version: 3, reset: true, items: [pet], controls: {}, menu: {} }
+  })
+  await sleep(300)
+
+  const status = await helper.status()
+  assert.equal(status.hoverInside, true, '渲染端应当看见光标压在宠物身上')
+  assert.equal(status.pointerSource, 'renderer', '混合缩放时命中判定必须采信渲染端上报的 CSS 指针')
+  assert.equal(status.ignoring, false, '这块屏上必须接管鼠标；为 true = 只能看不能点')
+})
+
+test('混合缩放：渲染端说不在宠物上时，OS 错位坐标不能把窗口变成可交互（票 96）', async (t) => {
+  // 反方向的毛病：渲染端的 CSS 指针离宠物很远（inside=false），但 OS 光标按光标所在屏折算出的
+  // 本地坐标恰好落进宠物矩形。修复前 main-fallback 会在 300ms 后用这份错位坐标把窗口变成可交互，
+  // 光标旁边的点击就被 helper 吞掉。
+  const pet = { id: 'self', kind: 'pet', role: 'self', x: 740, y: 600, width: 160, height: 200, label: '我', color: '#3b74d8' }
+  const layout = {
+    revision: 1,
+    primaryId: 1,
+    cursor: { x: 800, y: 700 }, // OS 本地坐标 (800,675) 落在宠物身上
+    rendererCursor: { x: 100, y: 100 }, // 渲染端真实指针离宠物很远
+    displays: [display(1, 0, 1.25), display(2, SCREEN.width, 1.5)]
+  }
+  const helper = await startHelper(t, layout)
+
+  helper.send({
+    type: 'update',
+    scene: { version: 3, reset: true, items: [pet], controls: {}, menu: {} }
+  })
+  await sleep(600) // 超过 MAIN_FALLBACK_DWELL_MS（300ms）
+
+  const status = await helper.status()
+  assert.equal(status.hoverInside, false, '渲染端应如实告诉主进程：光标不在宠物上')
+  assert.equal(status.pointerSource, 'os', '拿不到渲染端指针时确实退回了 OS')
+  assert.equal(status.ignoring, true, '混合缩放时 OS 坐标不可信，拿不到渲染端指针就必须回穿透')
 })
 
 test('多屏：拔掉第二块屏后窗口收回到剩下的屏幕，宠物仍可用', async (t) => {

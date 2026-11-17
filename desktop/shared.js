@@ -109,6 +109,11 @@
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
   const HOVER_CONFIRM_MAX_AGE_MS = 1200
+  /**
+   * 渲染端上报的本地指针（CSS 坐标）的保鲜期：心跳 350ms 一拍，留四拍余量。
+   * 混合 DPI 下主进程按这份坐标裁定命中（票 93），过期就退回 OS 光标。
+   */
+  const HOVER_POINT_MAX_AGE_MS = 1500
   /** 主进程按真实光标位置兜底轮询的间隔。 */
   const POINTER_POLL_MS = 100
   /**
@@ -3413,10 +3418,13 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       const width = Number(candidate.width)
       const bottom = Number(candidate.bottom)
       if (![x, width, bottom].every(Number.isFinite) || width <= 0) continue
+      const top = Number(candidate.top)
       bands.push({
         x: clampNumber(x, -MAX_COORD, MAX_COORD),
         width: clampNumber(width, 0.001, MAX_ITEM_SIZE),
-        bottom: clampNumber(bottom, -MAX_COORD, MAX_COORD)
+        bottom: clampNumber(bottom, -MAX_COORD, MAX_COORD),
+        // 票 95：带的上边界（这块屏的顶边）。扔上去撞到屏幕顶就弹回来，不会飞进没有显示器的空区。
+        top: Number.isFinite(top) ? clampNumber(top, -MAX_COORD, MAX_COORD) : null
       })
     }
     return bands
@@ -3428,7 +3436,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
    */
   function walkBands (floors) {
     const entries = normalizeFloors(floors)
-      .map((floor) => ({ left: floor.x, right: floor.x + floor.width, bottom: floor.y + floor.height }))
+      .map((floor) => ({ left: floor.x, right: floor.x + floor.width, top: floor.y, bottom: floor.y + floor.height }))
       .sort((left, right) => (left.bottom - right.bottom) || (left.left - right.left))
     const bands = []
     for (const entry of entries) {
@@ -3440,10 +3448,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         break
       }
       if (band === null) {
-        bands.push({ left: entry.left, right: entry.right, bottom: entry.bottom })
+        bands.push({ left: entry.left, right: entry.right, top: entry.top, bottom: entry.bottom })
       } else {
         band.left = Math.min(band.left, entry.left)
         band.right = Math.max(band.right, entry.right)
+        band.top = Math.min(band.top, entry.top)
       }
     }
     // 合并可能让两条带变得相邻/重叠（≤8 条，直接收敛）。
@@ -3456,13 +3465,14 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
           if (bands[index].left > bands[other].right + 1 || bands[other].left > bands[index].right + 1) continue
           bands[index].left = Math.min(bands[index].left, bands[other].left)
           bands[index].right = Math.max(bands[index].right, bands[other].right)
+          bands[index].top = Math.min(bands[index].top, bands[other].top)
           bands.splice(other, 1)
           merged = true
           break
         }
       }
     }
-    return bands.map((band) => ({ x: band.left, width: band.right - band.left, bottom: band.bottom }))
+    return bands.map((band) => ({ x: band.left, width: band.right - band.left, top: band.top, bottom: band.bottom }))
   }
 
   /**
@@ -3516,7 +3526,15 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       x = Math.max(band.x, band.x + band.width - next.width)
       if (vx > 0) vx = -vx * PHYSICS.WALL_BOUNCE
     }
-    return snapBodyToFloor({ ...next, x, vx }, area, band.bottom)
+    // 票 95：撞到这块屏的顶边就弹回来。整张桌面的上边界在混合 DPI 下可能落在小屏上方
+    // 没有显示器的区域，只按窗口顶夹会让宠物飞到看不见的地方。
+    let y = next.y
+    let vy = next.vy
+    if (isFiniteNumber(band.top) && y < band.top) {
+      y = band.top
+      if (vy < 0) vy = -vy * PHYSICS.WALL_BOUNCE
+    }
+    return snapBodyToFloor({ ...next, x, vx, y, vy }, area, band.bottom)
   }
 
   /** 出生/松手/热插拔：把身体整体挪进一条地面带（x、y 都夹），保证它在可见的屏上。 */
@@ -3525,7 +3543,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     const current = createBody(body, area)
     if (band === null || typeof band !== 'object') return current
     const x = clampNumber(current.x, band.x, Math.max(band.x, band.x + band.width - current.width))
-    return snapBodyToFloor({ ...current, x }, area, band.bottom)
+    // 票 95：高度也夹到这块屏的顶边，扔到屏幕上方空区的宠物落回来时不会悬在那里。
+    const y = isFiniteNumber(band.top) ? Math.max(current.y, band.top) : current.y
+    return snapBodyToFloor({ ...current, x, y }, area, band.bottom)
   }
 
   /**
@@ -4057,6 +4077,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
       pointer,
+      // 票 93：这次命中判定用的是谁的坐标（渲染端 CSS 指针 / OS 光标），以及渲染端那一路的原值。
+      // 混合 DPI 现场只靠 `pointer` 一个数是看不出「差在哪一侧」的。
+      pointerSource: raw.pointerSource === 'renderer' || raw.pointerSource === 'os' ? raw.pointerSource : null,
+      hoverPoint: normalizePoint(raw.hoverPoint),
       debug: raw.debug === true
     }
   }
@@ -4088,6 +4112,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
             pid: Number.isInteger(raw.pid) && raw.pid > 0 ? raw.pid : null,
             workArea,
             displays,
+            // 票 94：混合 DPI 时 helper 已经把「每块屏在窗口 CSS 坐标里的矩形」算好；
+            // 宿主优先用这份，缺了才按 DIP 现算。
+            floors: normalizeFloors(raw.floors),
+            homeArea: normalizeRect(raw.homeArea),
             debug: raw.debug === true,
             shotMode: raw.shotMode === true
           }
@@ -4418,11 +4446,107 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { x: point.x - area.x, y: point.y - area.y }
   }
 
+  /**
+   * 把「每块屏的真实物理工作区」换算成窗口 CSS 坐标里的矩形（票 94）。
+   *
+   * 为什么不能直接用显示器的 DIP 矩形：窗口铺满虚拟桌面时只按**一块**屏的缩放渲染，
+   * 而各显示器在 DIP 空间里的位置是按各自缩放折出来的。两块屏缩放不同（125% + 150%）
+   * 时，`显示器.workArea - 窗口.bounds` 推出来的矩形和渲染端真实的 CSS 区域差一截：
+   * 小屏那块会整体偏到屏幕左上方，宠物走到那块「地」上就出了显示器，抓不回来。
+   *
+   * 这里换成物理坐标做减法：窗口自己的物理矩形（`screen.dipToScreenRect(win, bounds)`）
+   * 和各屏的真实物理工作区（helper 用一次性的小窗口探出来）都在同一个物理空间里，
+   * 除以窗口缩放就是 CSS 坐标。物理矩形缺失时返回空，调用方回退旧算法。
+   *
+   * @param {object} options
+   * @param {{x:number,y:number,width:number,height:number}|null} options.windowPhysical
+   * @param {number} options.windowScale 物理像素 / CSS 像素（= 物理宽 / bounds 宽）
+   * @param {Array<{physicalWorkArea?:object, primary?:boolean}>} options.displays
+   * @param {{x:number,y:number,width:number,height:number}|null} options.area 窗口 CSS 矩形
+   * @returns {{floors:{x:number,y:number,width:number,height:number}[], homeArea:{x:number,y:number,width:number,height:number}|null}}
+   */
+  function floorsFromPhysical (options = {}) {
+    const window = normalizeRect(options.windowPhysical)
+    const scale = Number(options.windowScale)
+    if (window === null || !Number.isFinite(scale) || scale <= 0) return { floors: [], homeArea: null }
+    const surface = normalizeRect(options.area)
+    const floors = []
+    let homeArea = null
+    for (const display of Array.isArray(options.displays) ? options.displays : []) {
+      if (display === null || typeof display !== 'object') continue
+      const physical = normalizeRect(display.physicalWorkArea)
+      if (physical === null) continue
+      const local = normalizeRect({
+        x: (physical.x - window.x) / scale,
+        y: (physical.y - window.y) / scale,
+        width: physical.width / scale,
+        height: physical.height / scale
+      })
+      if (local === null) continue
+      const clipped = surface === null ? local : clipRectToArea(local, surface)
+      if (clipped === null) continue
+      floors.push(clipped)
+      if (display.primary === true && homeArea === null) homeArea = clipped
+    }
+    return { floors, homeArea }
+  }
+
   function toScreenPoint (localPoint, bounds) {
     const point = normalizePoint(localPoint)
     const area = normalizeRect(bounds)
     if (point === null || area === null) return null
     return { x: point.x + area.x, y: point.y + area.y }
+  }
+
+  /**
+   * 命中判定用哪个「窗口本地坐标」（票 93）。
+   *
+   * 窗口铺满整张虚拟桌面时，`screen.getCursorScreenPoint()` 给的是**光标所在那块屏**的缩放折算后的
+   * 屏幕坐标，而窗口自己只按**一块**屏的缩放渲染。两块屏缩放不同（例如 125% + 150%）时，
+   * 「光标屏幕坐标 − 窗口 bounds」推出的本地坐标和渲染端真实的 CSS 坐标会差一截：渲染端知道
+   * 光标就在宠物身上，主进程却判定「在外面」，窗口永远停在穿透，点哪儿都掉到下层窗口。
+   *
+   * 所以缩放不一致时以渲染端上报的指针为准（pointermove 的 CSS 坐标，和命中矩形同一套坐标系）；
+   * 缩放一致时保持原行为，主进程仍按 OS 光标独立复核，渲染端卡死时照样 fail-closed。
+   * 渲染端指针过期、越界、形状不对一律不用，退回 OS 光标。
+   *
+   * @param {object} [options]
+   * @param {{x:number,y:number}|null} [options.osPoint] OS 光标换算出的窗口本地坐标
+   * @param {{x:number,y:number}|null} [options.rendererPoint] 渲染端上报的本地指针（CSS 坐标）
+   * @param {number} [options.rendererAt] 渲染端上报时刻（毫秒时间戳）
+   * @param {number} [options.now] 当前时刻，测试可注入
+   * @param {number} [options.maxAgeMs] 渲染端指针的保鲜期
+   * @param {boolean} [options.preferRenderer] 是否优先采信渲染端指针（混合 DPI 时为真）
+   * @param {{x:number,y:number,width:number,height:number}|null} [options.area] 窗口本地矩形，越界即弃
+   * @returns {{point:{x:number,y:number}|null, source:'renderer'|'os'|null}}
+   */
+  function chooseLocalPoint (options = {}) {
+    const now = isFiniteNumber(options.now) ? options.now : Date.now()
+    const maxAge = isFiniteNumber(options.maxAgeMs) && options.maxAgeMs >= 0
+      ? options.maxAgeMs
+      : HOVER_POINT_MAX_AGE_MS
+    const os = normalizePoint(options.osPoint)
+    const renderer = freshLocalPoint(options.rendererPoint, options.rendererAt, now, maxAge, options.area)
+    if (options.preferRenderer === true && renderer !== null) return { point: renderer, source: 'renderer' }
+    if (os !== null) return { point: os, source: 'os' }
+    if (renderer !== null) return { point: renderer, source: 'renderer' }
+    return { point: null, source: null }
+  }
+
+  /** 渲染端上报的本地指针：要新鲜、要落在窗口里；任一条不满足就当没有。 */
+  function freshLocalPoint (raw, at, now, maxAgeMs, area) {
+    const point = normalizePoint(raw)
+    if (point === null) return null
+    const stamp = Number(at)
+    if (!Number.isFinite(stamp) || stamp <= 0) return null
+    const age = now - stamp
+    if (!(age >= 0) || age > maxAgeMs) return null
+    const rect = normalizeRect(area)
+    if (rect !== null) {
+      if (point.x < rect.x || point.y < rect.y) return null
+      if (point.x > rect.x + rect.width || point.y > rect.y + rect.height) return null
+    }
+    return point
   }
 
   // -------------------------------------------------------------------------
@@ -4758,6 +4882,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     MAX_DISPLAYS,
     HOVER_HEARTBEAT_MS,
     HOVER_CONFIRM_MAX_AGE_MS,
+    HOVER_POINT_MAX_AGE_MS,
     POINTER_POLL_MS,
     MAIN_FALLBACK_DWELL_MS,
     RENDERER_RECT_MAX_AGE_MS,
@@ -4885,6 +5010,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     normalizeInputReport,
     clipRectToArea,
     desktopArea,
+    floorsFromPhysical,
     normalizeFloors,
     normalizeBands,
     walkBands,
@@ -4910,6 +5036,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     unionRect,
     toLocalPoint,
     toScreenPoint,
+    chooseLocalPoint,
     shouldReadStdinDirectly,
     shouldBeInteractive,
     shouldReassert,

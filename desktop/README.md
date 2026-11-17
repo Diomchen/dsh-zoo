@@ -146,7 +146,7 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
 | `renderer-state` | `id?`, `state` | 仅 `debug-renderer` 的回复 |
 | `error` | `code`, `message` | 非致命错误 |
 | `pong` | `id?` | 对 `ping` |
-| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `trustedInputs` / `lostDowns` / `reasserts` / `windowMessages` / `bounds` / `pointer` / `renameOpen` / `bringOpen` / `farmOpen` / `farmVisible` / `farmFocused` 等 |
+| `status` | `id?` 等扁平字段 | 含 `ignoring` / `sceneItems` / `busy` / `busyHeldMs` / `busyBlocked` / `busyCapMs` / `rendererRects` / `overlayRects` / `hoverInside` / `pointerSource` / `hoverPoint` / `trustedInputs` / `lostDowns` / `reasserts` / `windowMessages` / `bounds` / `pointer` / `renameOpen` / `bringOpen` / `farmOpen` / `farmVisible` / `farmFocused` 等 |
 
 `ready` 里的 `workArea` 是**整张虚拟桌面**：所有显示器工作区的并集（DIP），也就是窗口实际
 覆盖的那块矩形；`displays` 里带每块屏的 `bounds` / `workArea` / `scaleFactor` / `primary`。
@@ -267,8 +267,14 @@ ticket 11 又加了：悬停 → 弹层、按钮点击真的把 `action` 写给�
    没有命中区）。场景刚更新、渲染端还没上报时，用出生矩形兜底最多 800ms。
    渲染端上报的矩形是不可信输入：单边超过 `MAX_HIT_RECT_SIZE`（1024）直接拒绝、越界的
    裁到工作区里（裁完为空就丢掉）、数量上限 `MAX_HIT_RECTS`（256）。
-4. 光标位置仍由主进程用自己的 `screen.getCursorScreenPoint()` 独立复核；渲染端只能申请，
-   不能单方面把窗口变成可交互。
+4. 光标位置由主进程复核：单屏/同缩放时用自己的 `screen.getCursorScreenPoint()`；多屏缩放不一致
+   （各屏 `scaleFactor` 不同）时，OS 坐标按光标所在屏折算、和渲染端 CSS 坐标不是一套，
+   改采信渲染端随 `dsh-zoo:hover` 上报的 CSS 指针（`shared.chooseLocalPoint`，票 93）。
+   渲染端仍只能申请：主进程自己再对这份坐标做命中判定，超过 `HOVER_POINT_MAX_AGE_MS`
+   （1500ms）没更新、越界、形状不对一律当没有，失败方向仍然是穿透。
+   `status.pointerSource` 记录这一拍用的是 `renderer` 还是 `os`。
+   混合缩放时拿不到渲染端指针就**一律回穿透**，也不再走 `main-fallback`（票 96）：
+   宁可不接鼠标，也不拿错位的 OS 坐标把光标旁边的区域变成可交互。
 5. **只有拖拽**会让渲染端通过 `dsh-zoo:busy` 持有**输入租约**：宠物是弹簧跟随，快速拖动
    时光标会跑到宠物矩形外，位置判定已经失效，窗口也必须保持可交互，否则
    `pointermove`/`pointerup` 全断（ticket 07 的坑）。为此拖拽期间额外上报一条以光标为
