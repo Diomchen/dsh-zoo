@@ -21,7 +21,7 @@ import {
   normalizePacketContents,
   parsePacket
 } from '../src/protocol.js'
-import { createBackpackStore } from '../src/backpack.js'
+import { createBackpackStore, normalizePacketNote } from '../src/backpack.js'
 import { createGiftStore, PACKET_TTL_MS } from '../src/gifts.js'
 import { createFarmStore } from '../src/farm.js'
 import { resetCropCatalog } from '../src/farm-rules.js'
@@ -121,6 +121,50 @@ test('红包能装进背包：准备成礼物时内容一字不差', async () =>
     const removed = await backpack.remove(added.item.id)
     assert.equal(removed.ok, true)
     assert.deepEqual(removed.item.packet, { coins: 6, crops: {}, seeds: { rice: 2 } })
+  })
+})
+
+test('祝福语是选填的：空串或空白都当没写，不能把红包判成坏礼物', async () => {
+  assert.equal(normalizePacketNote(''), '')
+  assert.equal(normalizePacketNote('   '), '')
+  assert.equal(normalizePacketNote(undefined), '')
+  assert.equal(normalizePacketNote('喵'.repeat(61)), null)
+
+  await withDir(async (dir) => {
+    const backpack = await createBackpackStore(dir)
+    const added = await backpack.add({ kind: 'packet', packet: { coins: 8 }, note: '' })
+    assert.equal(added.ok, true)
+    assert.equal(added.item.kind, 'packet')
+    // 空祝福语不进 item：既省一次落盘字段，也不会在卡片上多出一行空行。
+    assert.equal(added.item.note ?? '', '')
+  })
+})
+
+test('红包落盘按 packet 写：重启后内容还在，不会退化成空字条', async () => {
+  // 现场回归：落盘只分了 file / 其它，红包被写成 {kind:'text', text:undefined}。
+  // 结果内容全丢，重启后 normalizeBackpackItem 又因缺 text 丢掉整件——
+  // 硬币已经扣了，背包里却什么都没有。
+  await withDir(async (dir) => {
+    const backpack = await createBackpackStore(dir)
+    const added = await backpack.add({
+      kind: 'packet',
+      packet: { coins: 40, crops: { tomato: 2 }, seeds: { rice: 1 } },
+      note: '新年好'
+    })
+    assert.equal(added.ok, true)
+
+    const onDisk = JSON.parse(await readFile(path.join(dir, 'backpack.json'), 'utf8'))
+    assert.equal(onDisk.items.length, 1)
+    assert.equal(onDisk.items[0].kind, 'packet')
+    assert.deepEqual(onDisk.items[0].packet, { coins: 40, crops: { tomato: 2 }, seeds: { rice: 1 } })
+    assert.equal(onDisk.items[0].note, '新年好')
+
+    const reloaded = await createBackpackStore(dir)
+    const [item] = reloaded.items()
+    assert.equal(item.kind, 'packet')
+    assert.deepEqual(item.packet, { coins: 40, crops: { tomato: 2 }, seeds: { rice: 1 } })
+    assert.equal(item.note, '新年好')
+    assert.equal(item.state, 'idle')
   })
 })
 

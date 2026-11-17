@@ -37,6 +37,24 @@ test('helper 收红包：内容按上限夹，一件都没有就整件丢掉', (
   assert.equal(shared.normalizeBringGift({ kind: 'packet', packet: { crops: { 'Tomato!': 1 } } }), null)
 })
 
+test('祝福语可以不写：空白不能把整只红包判成坏礼物', () => {
+  // 现场回归：窗口没写祝福语时会把 '' 传下来，字条那条清洗把空串判成非法，
+  // 结果整只红包被拒，界面只显示「这件东西没有准备好」。
+  const empty = shared.normalizeBringGift({
+    kind: 'packet',
+    packet: { coins: 200, crops: {}, seeds: {} },
+    note: ''
+  })
+  assert.deepEqual(empty, { kind: 'packet', packet: { coins: 200, crops: {}, seeds: {} } })
+  assert.equal('note' in empty, false)
+  assert.deepEqual(
+    shared.normalizeBringGift({ kind: 'packet', packet: { coins: 5 }, note: '   ' }),
+    { kind: 'packet', packet: { coins: 5, crops: {}, seeds: {} } }
+  )
+  // 真写了还是照旧：超长截断，非法控制字符整件丢。
+  assert.equal(shared.normalizeBringGift({ kind: 'packet', packet: { coins: 1 }, note: '\u0000' }), null)
+})
+
 test('红包面板：宿主给多少就画多少，但不信它给的上下限', () => {
   const setup = shared.normalizeBringWindow({
     items: [],

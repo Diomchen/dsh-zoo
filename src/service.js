@@ -4381,6 +4381,10 @@ export function createService (ctx, options = {}) {
     return {
       ok: true,
       action: 'bring',
+      // handleBringAction 统一读 added.item.id 回 giftId：这里少带 item，
+      // 东西其实已经进背包、钱也扣了，但调用方会 TypeError，
+      // 窗口最后只看到一句「这次操作没有完成」。
+      item: added.item,
       giftId: added.item.id,
       count: added.count,
       notice: '红包装进背包了：' + packetSummary(packet) + '。'
