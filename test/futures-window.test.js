@@ -54,13 +54,13 @@ function sampleView (overrides = {}) {
     week: { start: TUESDAY - 9 * 60 * 60 * 1000, pnl: 5 },
     quotes: {
       tomato: {
-        contract: { id: 'tomato-2026W47', crop: 'tomato', openAt: TUESDAY, expireAt: TUESDAY + 4 * 86400000 },
+        contract: { id: 'tomato-20261117', crop: 'tomato', openAt: TUESDAY, expireAt: TUESDAY + 4 * 86400000 },
         fair: price,
         bid: price * (1 - MM_SPREAD),
         ask: price * (1 + MM_SPREAD)
       }
     },
-    crops: [{ id: 'tomato', label: '番茄', index: price, contract: 'tomato-2026W47' }],
+    crops: [{ id: 'tomato', label: '番茄', index: price, contract: 'tomato-20261117' }],
     limits: { leverages: FUTURES_LEVERAGES.slice(), lotSize: LOT_SIZE, takerFeeRate: TAKER_FEE_RATE, spreadRate: MM_SPREAD },
     now: TUESDAY,
     slotEnd: TUESDAY + SLOT_MS / 2,
@@ -123,7 +123,7 @@ test('下单预览与 src/futures-rules.js 同源：张数/保证金/手续费/�
 })
 
 test('持仓表：浮亏吃到八成保证金就把整行标红', () => {
-  const base = { id: 'p1', crop: 'tomato', contract: 'tomato-2026W47', side: 'long', lots: 1, entry: 5, margin: 25, leverage: 20 }
+  const base = { id: 'p1', crop: 'tomato', contract: 'tomato-20261117', side: 'long', lots: 1, entry: 5, margin: 25, leverage: 20 }
   const calm = view.positionRows(sampleView({ positions: [{ ...base, unrealized: -5 }] }))[0]
   assert.equal(calm.danger, false)
   assert.equal(calm.liquidation, view.formatPrice(5 * (1 - 1 / 20)))
@@ -153,7 +153,7 @@ test('状态四态：没就绪、没充钱、周末收盘、正常', () => {
   assert.equal(built.quotes.length, 1)
   assert.equal(built.quotes[0].tone, 'flat')
   assert.match(built.title, /期货/)
-  assert.match(built.title, /2026W47/)
+  assert.match(built.title, /20261117/)
 })
 
 test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢', () => {
@@ -161,7 +161,7 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
     id: 'order-1',
     deviceId: 'device-1',
     crop: 'tomato',
-    contract: 'tomato-2026W47',
+    contract: 'tomato-20261117',
     side: 'long',
     price: 5.0123,
     lots: 3,
@@ -174,7 +174,7 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
   const good = shared.normalizeFuturesView(sampleView({
     orders: [order],
     session: { kind: 'weekend', text: '周末休市，下周一见。' },
-    delivery: { contract: 'tomato-2026W47', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: TUESDAY },
+    delivery: { contract: 'tomato-20261117', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: TUESDAY },
     insurance: 12.5,
     shortfall: 3,
     liquidationCount: 2
@@ -182,7 +182,7 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
   assert.deepEqual(good.orders, [{
     id: 'order-1',
     crop: 'tomato',
-    contract: 'tomato-2026W47',
+    contract: 'tomato-20261117',
     side: 'long',
     price: 5.0123,
     lots: 3,
@@ -193,7 +193,7 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
   }])
   assert.deepEqual(good.session, { kind: 'weekend', text: '周末休市，下周一见。' })
   assert.deepEqual(good.delivery, {
-    contract: 'tomato-2026W47',
+    contract: 'tomato-20261117',
     closes: [5.02, 5.01, 5.005, 5.015],
     price: 5.0125,
     at: TUESDAY
@@ -229,7 +229,7 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
 
   // 交割窗口：closes 只留数字、最多四根；价格非正或合约为空整块丢。
   const trimmed = shared.normalizeFuturesView(sampleView({
-    delivery: { contract: 'tomato-2026W47', closes: [5.02, 'x', 5.01, 5.015, 5.02, 9], price: 5.0125, at: TUESDAY }
+    delivery: { contract: 'tomato-20261117', closes: [5.02, 'x', 5.01, 5.015, 5.02, 9], price: 5.0125, at: TUESDAY }
   }))
   assert.deepEqual(trimmed.delivery.closes, [5.02, 5.01, 5.015, 5.02])
   assert.equal(shared.normalizeFuturesView(sampleView({ delivery: { contract: '', closes: [5.02], price: 5 } })).delivery, null)
@@ -246,7 +246,7 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
   const kinds = shared.normalizeFuturesView(sampleView({
     trades: ['open', 'close', 'delivery', 'convert', 'liquidation', 'mystery'].map((kind, index) => ({
       at: TUESDAY,
-      contract: 'tomato-2026W47',
+      contract: 'tomato-20261117',
       side: 'long',
       lots: 1,
       price: 5,
@@ -261,8 +261,8 @@ test('shared：视图放行挂单/交易阶段/交割窗口，坏条目整条丢
 test('挂单表：作物名/方向/价格/剩余/冻结按窗口口径排版', () => {
   const rows = view.orderRows(sampleView({
     orders: [
-      { id: 'o1', crop: 'tomato', contract: 'tomato-2026W47', side: 'long', price: 5, lots: 5, lotsLeft: 2, leverage: 20, marginFrozen: 12.345, at: TUESDAY },
-      { id: 'o2', crop: 'pea', contract: 'pea-2026W47', side: 'short', price: 3.333, lots: 1, lotsLeft: 0, leverage: 10, marginFrozen: 0, at: TUESDAY }
+      { id: 'o1', crop: 'tomato', contract: 'tomato-20261117', side: 'long', price: 5, lots: 5, lotsLeft: 2, leverage: 20, marginFrozen: 12.345, at: TUESDAY },
+      { id: 'o2', crop: 'pea', contract: 'pea-20261117', side: 'short', price: 3.333, lots: 1, lotsLeft: 0, leverage: 10, marginFrozen: 0, at: TUESDAY }
     ]
   }))
   assert.equal(rows.length, 2)
@@ -291,7 +291,7 @@ test('挂单表：作物名/方向/价格/剩余/冻结按窗口口径排版', (
 test('交割提示：四根收盘价带时刻，顺序与交割价可复核', () => {
   const fridayClose = new Date(2026, 10, 20, 20, 0, 0, 0).getTime()
   const line = view.deliveryLine(sampleView({
-    delivery: { contract: 'tomato-2026W47', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: fridayClose }
+    delivery: { contract: 'tomato-20261117', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: fridayClose }
   }))
   assert.equal(line, '交割价 5.0125（19:15 5.0200 / 19:30 5.0100 / 19:45 5.0050 / 20:00 5.0150）')
 
@@ -325,7 +325,7 @@ test('交易阶段：交易中不提示，周末/到期贴宿主文案；收盘�
   const built = view.build(sampleView({
     orders: [{ id: 'o1', crop: 'tomato', side: 'long', price: 5, lots: 2, lotsLeft: 1, leverage: 20, marginFrozen: 5, at: TUESDAY }],
     session: { kind: 'expired', text: '本周合约已到期。' },
-    delivery: { contract: 'tomato-2026W47', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: TUESDAY }
+    delivery: { contract: 'tomato-20261117', closes: [5.02, 5.01, 5.005, 5.015], price: 5.0125, at: TUESDAY }
   }), { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }, TUESDAY)
   assert.equal(built.orderCount, 1)
   assert.equal(built.orders.length, 1)

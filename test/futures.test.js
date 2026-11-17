@@ -39,43 +39,55 @@ import {
 /** 2026-11-16 是周一。所有窗口测试都挂在这一天，避免「今天恰好是周日」的偶发。 */
 const MONDAY = new Date(2026, 10, 16, 0, 0, 0, 0).getTime()
 
-test('合约：周一 00:00 上市，周五 20:00 到期，周末没有合约', () => {
+test('合约：工作日 00:00 上市，当天 20:00 交割，周末没有合约', () => {
   const monday = contractOf('tomato', MONDAY)
-  assert.equal(monday.id, 'tomato-2026W47')
+  assert.equal(monday.id, 'tomato-20261116')
   assert.equal(monday.openAt, MONDAY)
-  assert.equal(monday.expireAt, MONDAY + 4 * DAY_MS + 20 * HOUR_MS)
+  assert.equal(monday.expireAt, MONDAY + 20 * HOUR_MS)
 
-  // 周四 23:59 仍在这张合约里
-  assert.equal(contractOf('tomato', MONDAY + 3 * DAY_MS + 23 * HOUR_MS + 59 * 60 * 1000).id, monday.id)
-  // 周五 20:00 整到期
+  // 当天 19:59 仍在这张合约里
+  assert.equal(contractOf('tomato', MONDAY + 19 * HOUR_MS + 59 * 60 * 1000).id, monday.id)
+  // 20:00 整交割
   assert.equal(contractOf('tomato', monday.expireAt), null)
+  // 当晚到第二天 00:00 之间没有合约
+  assert.equal(contractOf('tomato', MONDAY + 23 * HOUR_MS), null)
   // 周六、周日均休市
   assert.equal(contractOf('tomato', MONDAY + 5 * DAY_MS + 9 * HOUR_MS), null)
   assert.equal(contractOf('tomato', MONDAY + 6 * DAY_MS + 9 * HOUR_MS), null)
-  // 下周一开盘是下一张
-  const next = contractOf('tomato', MONDAY + 7 * DAY_MS)
-  assert.equal(next.id, 'tomato-2026W48')
+  // 第二天（周二）00:00 是下一张
+  const next = contractOf('tomato', MONDAY + DAY_MS)
+  assert.equal(next.id, 'tomato-20261117')
+  assert.equal(next.expireAt, MONDAY + DAY_MS + 20 * HOUR_MS)
 })
 
 test('合约：编号能反解回窗口，坏编号返回 null', () => {
-  const window = contractWindowOf('tomato-2026W47')
+  const window = contractWindowOf('tomato-20261116')
   assert.equal(window.crop, 'tomato')
   assert.equal(window.openAt, MONDAY)
-  assert.equal(window.expireAt, MONDAY + 4 * DAY_MS + 20 * HOUR_MS)
+  assert.equal(window.expireAt, MONDAY + 20 * HOUR_MS)
+  // 旧存档里的周合约还要能反解（交割旧仓位用）
+  const legacy = contractWindowOf('tomato-2026W47')
+  assert.equal(legacy.openAt, MONDAY)
+  assert.equal(legacy.expireAt, MONDAY + 4 * DAY_MS + 20 * HOUR_MS)
 
+  assert.equal(contractWindowOf('tomato-20260231'), null, '不存在的日期')
+  assert.equal(contractWindowOf('tomato-20261121'), null, '周六没有合约')
   assert.equal(contractWindowOf('tomato-2026W54'), null)
   assert.equal(contractWindowOf('tomato'), null)
   assert.equal(contractWindowOf('../etc/passwd'), null)
   assert.equal(contractWindowOf(null), null)
 })
 
-test('合约：跨年那一周用 ISO 周号，两台机器算出同一张', () => {
-  // 2026-12-31 是周四，属于 2026 的最后一周
+test('合约：同一天两台机器算出同一张，跨日零点换代号', () => {
   const thursday = new Date(2026, 11, 31, 12, 0, 0, 0).getTime()
   const a = contractOf('rice', thursday)
   const b = contractOf('rice', thursday + 60 * 1000)
   assert.equal(a.id, b.id)
-  assert.ok(a.id.startsWith('rice-'))
+  assert.equal(a.id, 'rice-20261231')
+  // 跨年那天 23:59 与 00:00 是两个不同状态：前者已交割（null），后者是 1 月 1 日那张。
+  assert.equal(contractOf('rice', thursday + 11 * HOUR_MS + 59 * 60 * 1000), null)
+  const newYear = contractOf('rice', new Date(2027, 0, 1, 0, 0, 0, 0).getTime())
+  assert.equal(newYear.id, 'rice-20270101')
 })
 
 test('偏离：同样的输入永远同一个数，clamp 在合理范围', () => {

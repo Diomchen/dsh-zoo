@@ -85,13 +85,13 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "orderId": "<uuid>" }
 { "v": 1, "type": "futures-settle", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "seq": 7, "balance": 431.5, "marginUsed": 50.34, "delta": -2.39,
-  "positions": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-2026W47",
+  "positions": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-20261117",
                   "side": "long", "lots": 1, "entry": 5.03, "margin": 50.34,
                   "leverage": 10 }],
-  "orders": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-2026W47",
+  "orders": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-20261117",
                "side": "short", "price": 5.12, "lots": 2, "lotsLeft": 1,
                "leverage": 10, "marginFrozen": 5.12, "at": 1700000000000 }],
-  "trades": [{ "at": 1700000000000, "crop": "tomato", "contract": "tomato-2026W47",
+  "trades": [{ "at": 1700000000000, "crop": "tomato", "contract": "tomato-20261117",
                "side": "short", "lots": 1, "price": 4.87, "fee": 0.49,
                "kind": "liquidation" }],
   "insurance": 3.2, "shortfall": 0.8, "mode": "shadow", "pending": 0 }
@@ -146,7 +146,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `epoch` | `futures-settle`、`futures-sync` | 房主账本代次，非空字符串、≤64 字符；epoch 一变说明房主换了账本（重启/换人），旧 `seq` 一笔作废 |
 | `seq` | `futures-settle` | 该账户的流水号，整数 0..2^31-1，只增；接收方按 `(epoch, seq)` 幂等，`seq` 倒退的包丢弃 |
 | `balance` / `marginUsed` / `delta` | `futures-settle` | 到分的金币数（≥0；`delta` 可负）；`delta` 只用于显示「这一拍变了多少」，peer 不拿它记账——`balance` 才是真值 |
-| `positions`（期货） | `futures-settle` | 最多 `8` 条 `{ id, crop, contract, side, lots, entry, margin, leverage }`；`contract` 形如 `tomato-2026W47`（`/^[a-z][a-z0-9_]*-\d{4}W\d{2}$/`），`lots` 1..1,000,000，`entry`/`margin` 是到分的正数 |
+| `positions`（期货） | `futures-settle` | 最多 `8` 条 `{ id, crop, contract, side, lots, entry, margin, leverage }`；`contract` 形如 `tomato-20261117`（`/^[a-z][a-z0-9_]*-(?:\d{4}W\d{2}|\d{8})$/`，旧的周合约编号仍被接受），`lots` 1..1,000,000，`entry`/`margin` 是到分的正数 |
 | `orders`（挂单） | `futures-settle` | 可选，缺省 = 空盘口；最多 `8` 条 `{ id, crop, contract, side, price, lots, lotsLeft, leverage, marginFrozen, at }`。`lots` 是原始张数、`lotsLeft` 是剩余张数（1..`lots`），`price` 是到分的正数，`marginFrozen` 是剩余部分压着的保证金；坏一条整包丢 |
 | `trades`（成交） | `futures-settle` | 可选，缺省 = 空；最多 `8` 条 `{ at, crop, contract, side, lots, price, fee, kind }`。`kind` 只认 `open` / `close` / `delivery` / `convert` / `liquidation` / `mode`；`delivery` 额外带 `deliveryFee`（到分、≥0）。`mode` 是灰度切换的审计流水，只带 `{ at, kind:'mode', note:'off'\|'shadow'\|'live', lots:0, price:0, fee:0 }`，没有 `crop`/`contract`/`side`。`side` 记的是**成交那一腿**（多单平仓记 `short`）；`liquidation` 的 `price` 就是强平触发价、`fee` 是实际收到的费用。坏一条整包丢 |
 | `insurance` / `shortfall` | `futures-settle` | 可选，缺省 `0`；保险基金余额与累计欠账，到分的金币数（≥0）。它们是**房主账本的全局数**，peer 只显示不参与计算（票 97） |

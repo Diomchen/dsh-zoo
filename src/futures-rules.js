@@ -6,8 +6,9 @@
  * 不碰 `Math.random()`（与 `src/trading-rules.js` 的 `PRICE_SALT` 同一套路）。
  *
  * 三件事定形状：
- *   - **一周一张合约**：周一 00:00 上市、周五 20:00 到期（`contractOf`）；周末没有
- *     可交易的合约，开仓直接拒绝——到期换月是票 96 的事，这里只负责说「现在没有」。
+ *   - **一天一张合约**：每个交易日（周一到周五）00:00 上市、当天 20:00 交割
+ *     （`contractOf`）；20:00 之后与周末没有可交易的合约，开仓直接拒绝——到期交割
+ *     是票 96 的事，这里只负责说「现在没有」。
  *   - **公允价锚现货指数**：`fair = index × exp(ou)`，ou 是均值回归偏离（σ 0.4%/15 秒、
  *     半衰期 30 分钟）。指数由调用方给（单机就是本机交易所价），规则层不认识交易所。
  *   - **做市商两侧各让 0.2%**：`bid = fair × 0.998`、`ask = fair × 1.002`，永远有对手方。
@@ -62,6 +63,10 @@ export const POSITION_NOTIONAL_CAP = 20000
 export const MAX_MARGIN = 1_000_000
 /** 合约编号里的作物部分只认小写字母数字与下划线，防手改文件塞进路径分隔符。 */
 const CONTRACT_ID_RE = /^([a-z][a-z0-9_]*)-(\d{4})W(\d{2})$/
+/** 日合约编号：`tomato-20261117`。旧的周合约编号继续认（存档里的仓位要能交割）。 */
+const DAY_CONTRACT_ID_RE = /^([a-z][a-z0-9_]*)-(\d{8})$/
+/** 交割时刻：交易日当天 20:00（本地时区）。 */
+export const CONTRACT_CLOSE_HOUR = 20
 const SIDES = Object.freeze(['long', 'short'])
 export const FUTURES_SIDES = SIDES
 
@@ -154,30 +159,74 @@ function pad2 (value) {
   return String(value).padStart(2, '0')
 }
 
+/** 当天 00:00（本地时区）。 */
+export function startOfDay (at) {
+  const date = new Date(Number(at))
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), 0, 0, 0, 0).getTime()
+}
+
+/** 交易日：周一到周五。周末没有合约，开仓一律 market-closed。 */
+export function isTradingDay (at) {
+  const day = new Date(startOfDay(at)).getDay()
+  return day >= 1 && day <= 5
+}
+
+/** 编号里的日期段：`20261117`。 */
+export function dayCodeOf (at) {
+  const date = new Date(startOfDay(at))
+  return String(date.getFullYear()) + pad2(date.getMonth() + 1) + pad2(date.getDate())
+}
+
+/** 当天交割时刻（20:00）。用 Date 构造而不是加毫秒，夏令时切换日也不会漂一小时。 */
+function closeOfDay (dayStart) {
+  const date = new Date(dayStart)
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate(), CONTRACT_CLOSE_HOUR, 0, 0, 0).getTime()
+}
+
 /**
- * 某一刻属于哪张合约：周一 00:00 上市、周五 20:00 到期。
- * 周五 20:00 之后到周日 24:00 之间没有可交易的合约 → `null`（周末休市）。
+ * 某一天的那张合约（收盘后仍然返回，用来交割与展示）。周末返回 `null`。
+ * 窗口是 [00:00, 20:00)：20:00 之后只能靠它把「今天这张」取回来。
  */
-export function contractOf (crop, at) {
+export function dayWindowOf (crop, at) {
   if (typeof crop !== 'string' || crop === '') return null
   const stamp = Number(at)
   if (!Number.isFinite(stamp)) return null
-  const monday = startOfWeek(stamp)
-  const expireAt = monday + 4 * DAY_MS + 20 * HOUR_MS
-  if (stamp >= expireAt) return null
-  const { year, week } = isoWeekOf(monday)
-  return {
-    crop,
-    id: crop + '-' + year + 'W' + pad2(week),
-    openAt: monday,
-    expireAt,
-    week
-  }
+  const openAt = startOfDay(stamp)
+  if (!isTradingDay(openAt)) return null
+  const day = dayCodeOf(openAt)
+  return { crop, id: crop + '-' + day, openAt, expireAt: closeOfDay(openAt), day }
 }
 
-/** 合约编号 → 窗口；编号不合法返回 null（坏存档按空市场处理时要用）。 */
+/**
+ * 某一刻可以交易的合约：交易日 00:00 上市、当天 20:00 交割。
+ * 20:00 之后到第二天 00:00、以及整个周末都没有可交易的合约 → `null`。
+ */
+export function contractOf (crop, at) {
+  const window = dayWindowOf(crop, at)
+  if (window === null) return null
+  return Number(at) >= window.expireAt ? null : window
+}
+
+/**
+ * 合约编号 → 窗口；编号不合法返回 `null`（坏存档按空市场处理时要用）。
+ * 同时认两种：日合约 `tomato-20261117` 与旧的周合约 `tomato-20261117`——旧仓位还要交割。
+ */
 export function contractWindowOf (id) {
-  const match = CONTRACT_ID_RE.exec(String(id ?? ''))
+  const text = String(id ?? '')
+  const dayMatch = DAY_CONTRACT_ID_RE.exec(text)
+  if (dayMatch !== null) {
+    const [, crop, dayText] = dayMatch
+    const year = Number(dayText.slice(0, 4))
+    const month = Number(dayText.slice(4, 6))
+    const date = Number(dayText.slice(6, 8))
+    const openAt = new Date(year, month - 1, date, 0, 0, 0, 0).getTime()
+    // 日期段必须是真实存在的日子：20260231 会被 Date 进位到 3 月，这里回读核对。
+    const open = new Date(openAt)
+    if (open.getFullYear() !== year || open.getMonth() !== month - 1 || open.getDate() !== date) return null
+    if (!isTradingDay(openAt)) return null
+    return { crop, id: crop + '-' + dayText, openAt, expireAt: closeOfDay(openAt), day: dayText }
+  }
+  const match = CONTRACT_ID_RE.exec(text)
   if (match === null) return null
   const [, crop, yearText, weekText] = match
   const year = Number(yearText)

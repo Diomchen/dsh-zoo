@@ -26,16 +26,18 @@ import {
 } from '../src/futures-rules.js'
 
 const CROP = 'tomato'
-const CONTRACT = 'tomato-2026W47'
+const CONTRACT = 'tomato-20261116'
 
 function local (year, month, day, hour, minute = 0, second = 0) {
   return new Date(year, month - 1, day, hour, minute, second, 0).getTime()
 }
 
+// 2026-11-16 是周一：日合约 00:00 上市、当天 20:00 交割。
 const MONDAY = local(2026, 11, 16, 0, 0, 0)
-const FRIDAY_LATE = local(2026, 11, 20, 19, 59, 59)
-const FRIDAY_EXPIRE = local(2026, 11, 20, 20, 0, 0)
+const LATE = local(2026, 11, 16, 19, 59, 59)
+const EXPIRE = local(2026, 11, 16, 20, 0, 0)
 const SATURDAY = local(2026, 11, 21, 10, 0, 0)
+const SUNDAY = local(2026, 11, 22, 10, 0, 0)
 
 async function tempDir (t) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-futures-expiry-'))
@@ -89,11 +91,17 @@ async function makeStore (t, { coins = 1000, at = MONDAY, indexPrice = 10 } = {}
   return { dir, farm, store, setNow: (ms) => { now = ms }, now: () => now }
 }
 
-test('周一 00:00 上新合约；周五 19:59:59 仍可开仓，20:00 整休市，周六是 weekend', async (t) => {
+test('工作日 00:00 上新合约；当天 19:59:59 仍可开仓，20:00 整休市，周末是 weekend', async (t) => {
   const { store } = await makeStore(t)
-  assert.equal(contractOf(CROP, MONDAY).id, CONTRACT)
-  assert.equal(contractOf(CROP, FRIDAY_LATE).id, CONTRACT)
-  assert.equal(contractOf(CROP, FRIDAY_EXPIRE), null)
+  assert.equal(contractOf(CROP, MONDAY).id, CONTRACT, '周一的合约代号带日期')
+  assert.equal(contractOf(CROP, LATE).id, CONTRACT)
+  assert.equal(contractOf(CROP, EXPIRE), null, '20:00 整这张就没了')
+  assert.equal(contractOf(CROP, EXPIRE + 3 * 60 * 60 * 1000), null, '当晚不换新合约')
+  assert.equal(contractOf(CROP, SATURDAY), null, '周六没有合约')
+  assert.equal(contractOf(CROP, SUNDAY), null, '周日没有合约')
+  // 第二天（周二）00:00 是另一张：代号换日期、窗口是新的 20 小时。
+  const tuesday = contractOf(CROP, local(2026, 11, 17, 0, 0, 0))
+  assert.equal(tuesday.id, 'tomato-20261117')
 
   await store.deposit(1000)
   const opened = await store.open({
@@ -101,7 +109,7 @@ test('周一 00:00 上新合约；周五 19:59:59 仍可开仓，20:00 整休市
     side: 'long',
     margin: 100,
     leverage: 10,
-    at: FRIDAY_LATE
+    at: LATE
   })
   assert.equal(opened.ok, true, '19:59:59 必须还能开仓')
 
@@ -110,27 +118,28 @@ test('周一 00:00 上新合约；周五 19:59:59 仍可开仓，20:00 整休市
     side: 'long',
     margin: 100,
     leverage: 10,
-    at: FRIDAY_EXPIRE
+    at: EXPIRE
   })
   assert.equal(closed.ok, false)
   assert.equal(closed.error, 'market-closed')
-  assert.match(closed.notice, /合约已到期/)
+  assert.match(closed.notice, /今日合约已交割/)
 
-  const friday = store.snapshot({ at: FRIDAY_EXPIRE, crop: CROP })
-  assert.equal(friday.session.kind, 'expired')
-  assert.match(friday.session.text, /下周一 00:00 开新合约/)
-  assert.equal(friday.delivery.contract, CONTRACT)
-  assert.equal(friday.delivery.closes.length, 4)
-  assert.equal(friday.delivery.price, deliveryPriceOf({
+  const closedToday = store.snapshot({ at: EXPIRE, crop: CROP })
+  assert.equal(closedToday.session.kind, 'expired')
+  assert.match(closedToday.session.text, /明天 00:00 开新合约/)
+  assert.equal(closedToday.delivery.contract, CONTRACT)
+  assert.equal(closedToday.delivery.closes.length, 4)
+  assert.equal(closedToday.delivery.price, deliveryPriceOf({
     crop: CROP,
     contractId: CONTRACT,
     indexOf: () => 10,
-    at: FRIDAY_EXPIRE
+    at: EXPIRE
   }))
 
   const saturday = store.snapshot({ at: SATURDAY, crop: CROP })
   assert.equal(saturday.session.kind, 'weekend')
-  assert.equal(saturday.delivery, null, '周六窗口不再展示上一周的交付价')
+  assert.match(saturday.session.text, /周一 00:00 开新合约/)
+  assert.equal(saturday.delivery, null, '周末窗口不再展示上一张的交付价')
 })
 
 test('交割价 = 19:00–20:00 四根收盘价的算术平均，且窗口四根可复核', async (t) => {
@@ -139,39 +148,39 @@ test('交割价 = 19:00–20:00 四根收盘价的算术平均，且窗口四根
     crop: CROP,
     contractId: CONTRACT,
     indexOf: () => 10,
-    at: FRIDAY_EXPIRE
+    at: EXPIRE
   })
   assert.equal(closes.length, 4)
   for (const close of closes) assert.ok(close > 0)
   const price = roundCoin(closes.reduce((sum, close) => sum + close, 0) / closes.length)
-  assert.equal(deliveryPriceOf({ crop: CROP, contractId: CONTRACT, indexOf: () => 10, at: FRIDAY_EXPIRE }), price)
+  assert.equal(deliveryPriceOf({ crop: CROP, contractId: CONTRACT, indexOf: () => 10, at: EXPIRE }), price)
 
-  const view = store.snapshot({ at: FRIDAY_EXPIRE, crop: CROP })
+  const view = store.snapshot({ at: EXPIRE, crop: CROP })
   assert.deepEqual(view.delivery.closes, closes)
   assert.equal(view.delivery.price, price)
-  assert.equal(view.delivery.at, FRIDAY_EXPIRE)
+  assert.equal(view.delivery.at, EXPIRE)
 })
 
 test('到期现金交割：仓位清零、余额 = 期初 − 开仓费 + 盈亏 − 交割费，marginUsed 归零', async (t) => {
   // 19:00 开仓：此时合约还在，交割价取 19:15–20:00 四根，与开仓价不同，正好验盈亏。
-  const openAt = local(2026, 11, 20, 19, 0, 0)
+  const openAt = local(2026, 11, 16, 19, 0, 0)
   const { store } = await makeStore(t)
   await store.deposit(1000)
   const opened = await store.open({ crop: CROP, side: 'long', margin: 200, leverage: 10, at: openAt })
   assert.equal(opened.ok, true)
   const position = opened.position
-  const price = deliveryPriceOf({ crop: CROP, contractId: CONTRACT, indexOf: () => 10, at: FRIDAY_EXPIRE })
+  const price = deliveryPriceOf({ crop: CROP, contractId: CONTRACT, indexOf: () => 10, at: EXPIRE })
   const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit: price, side: 'long' })
   const deliveryFee = roundCoin(notionalOf({ lots: position.lots, price }) * DELIVERY_FEE_RATE)
 
-  const result = await store.expireDue(FRIDAY_EXPIRE)
+  const result = await store.expireDue(EXPIRE)
   assert.equal(result.ok, true)
   assert.equal(result.action, 'futures-expire')
   assert.equal(result.deliveries.length, 1)
   assert.equal(result.deliveries[0].contract, CONTRACT)
   assert.equal(result.deliveries[0].price, price)
 
-  const view = store.snapshot({ at: FRIDAY_EXPIRE, crop: CROP })
+  const view = store.snapshot({ at: EXPIRE, crop: CROP })
   assert.equal(view.positions.length, 0)
   assert.equal(view.positionCount, 0)
   assert.equal(view.marginUsed, 0)
@@ -192,29 +201,29 @@ test('到期先撤单：挂单消失、冻结保证金退回；重复 expireDue 
     price: 1,
     lots: 2,
     leverage: 10,
-    at: local(2026, 11, 20, 18, 0, 0)
+    at: local(2026, 11, 16, 18, 0, 0)
   })
   assert.equal(placed.ok, true)
   const frozen = placed.order.marginFrozen
-  const before = store.snapshot({ at: local(2026, 11, 20, 18, 0, 0) })
+  const before = store.snapshot({ at: local(2026, 11, 16, 18, 0, 0) })
   assert.equal(before.orders.length, 1)
 
-  const first = await store.expireDue(FRIDAY_EXPIRE)
+  const first = await store.expireDue(EXPIRE)
   assert.equal(first.deliveries.length, 1)
   assert.equal(first.deliveries[0].cancelled, 1)
-  const after = store.snapshot({ at: FRIDAY_EXPIRE, crop: CROP })
+  const after = store.snapshot({ at: EXPIRE, crop: CROP })
   assert.deepEqual(after.orders, [])
   assert.equal(after.balance, roundCoin(before.balance + frozen))
   assert.equal(after.marginUsed, 0)
 
   const balance = after.balance
-  const second = await store.expireDue(FRIDAY_EXPIRE + 15_000)
+  const second = await store.expireDue(EXPIRE + 15_000)
   assert.deepEqual(second.deliveries, [])
-  assert.equal(store.snapshot({ at: FRIDAY_EXPIRE + 15_000 }).balance, balance)
+  assert.equal(store.snapshot({ at: EXPIRE + 15_000 }).balance, balance)
 })
 
 test('转现货：整张与部分（lots:1 分两次）都入作物库存，守恒只差手续费', async (t) => {
-  const at = local(2026, 11, 20, 19, 0, 0)
+  const at = local(2026, 11, 16, 19, 0, 0)
   const { store, farm } = await makeStore(t, { coins: 10_000 })
   await store.deposit(10_000)
   // 按 ask 反推「正好两张」的保证金，后面才能用 lots:1 分两次平完。
@@ -260,7 +269,7 @@ test('转现货：整张与部分（lots:1 分两次）都入作物库存，守�
 })
 
 test('转现货拒绝：无仓位、坏张数、到期后、余额不足都有明确错误码', async (t) => {
-  const at = local(2026, 11, 20, 19, 0, 0)
+  const at = local(2026, 11, 16, 19, 0, 0)
   const { store } = await makeStore(t)
   await store.deposit(300)
   const opened = await store.open({ crop: CROP, side: 'long', margin: 200, leverage: 20, at })
@@ -279,7 +288,7 @@ test('转现货拒绝：无仓位、坏张数、到期后、余额不足都有�
   const expired = await store.convertToSpot({
     positionId: opened.position.id,
     lots: 1,
-    at: FRIDAY_EXPIRE
+    at: EXPIRE
   })
   assert.equal(expired.error, 'contract-expired')
 })

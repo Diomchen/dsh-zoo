@@ -30,8 +30,8 @@ import {
 } from '../src/futures-rules.js'
 import { createFuturesRateLimiter } from '../src/service.js'
 
-// 2026-11-17 是周二，本周合约正在交易。
-const NOW = Date.UTC(2026, 10, 17, 12, 0, 0)
+// 2026-11-17 是周二；取本地 12:00（UTC 12:00 在东八区已过 20:00 交割，日合约会休市）。
+const NOW = new Date(2026, 10, 17, 12, 0, 0, 0).getTime()
 const CROP = 'tomato'
 const PEER = '11111111-1111-4111-8111-111111111111'
 

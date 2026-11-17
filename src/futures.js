@@ -9,16 +9,16 @@
  *     "marginUsed": 100,                       // 冻结的保证金（币，到分）
  *     "fees": { "insurance": 0.12, "burned": 1.08 },
  *     "positions": [
- *       { "id": "…", "crop": "tomato", "contract": "tomato-2026W47", "side": "long",
+ *       { "id": "…", "crop": "tomato", "contract": "tomato-20261117", "side": "long",
  *         "lots": 2, "entry": 5.05, "margin": 101, "leverage": 10,
  *         "openedAt": 1763308800000, "slot": 1959232, "settleSlot": 1959233 }
  *     ],
  *     "trades": [                              // 成交记录，最新在前，硬截 50 条（票 93）
- *       { "at": 1763308800000, "crop": "tomato", "contract": "tomato-2026W47",
+ *       { "at": 1763308800000, "crop": "tomato", "contract": "tomato-20261117",
  *         "side": "long", "lots": 2, "price": 5.05, "fee": 1.01, "kind": "open" }
  *     ],
  *     "orders": [                              // 票 95：自己挂的限价单（未成交部分还冻结着保证金）
- *       { "id": "…", "deviceId": "local", "crop": "tomato", "contract": "tomato-2026W47",
+ *       { "id": "…", "deviceId": "local", "crop": "tomato", "contract": "tomato-20261117",
  *         "side": "long", "price": 5.05, "lots": 2, "lotsLeft": 2, "leverage": 10,
  *         "marginFrozen": 10.1, "at": 1763308800000 }
  *     ],
@@ -95,6 +95,7 @@ import {
   SLOT_MS,
   contractOf,
   contractWindowOf,
+  dayWindowOf,
   deliveryClosesOf,
   deliveryPriceOf,
   fairPriceOf,
@@ -120,7 +121,7 @@ import {
 
 export const FUTURES_FILE = 'futures.json'
 export const FUTURES_VERSION = 1
-/** `/state` 最多带 20 个仓位；账本本身不设上限（一周最多几十手）。 */
+/** `/state` 最多带 20 个仓位；账本本身不设上限（一天最多几十手）。 */
 export const FUTURES_VIEW_POSITIONS = 20
 /** 盘上最多留 50 条成交；`/state` 与窗口只带最近 20 条（票 93 的「成交记录」）。 */
 export const FUTURES_TRADE_LIMIT = 50
@@ -1153,17 +1154,13 @@ class FuturesStore {
   }
 
   /**
-   * 票 96：到期日（周五）的交割窗口。19:15/19:30/19:45/20:00 四根收盘价从
-   * `deliveryClosesOf` 来，交割价与窗口复核共用同一组到分数值。
-   * 20:00 之后 `contractOf` 已返回 null，这里用「到期前一毫秒」把本周合约取回来。
+   * 票 96：交割窗口。19:15/19:30/19:45/20:00 四根收盘价从 `deliveryClosesOf` 来，
+   * 交割价与窗口复核共用同一组到分数值。
+   * 日合约的每个交易日都是到期日，所以工作日全天都返回今天这张；20:00 之后
+   * `contractOf` 已返回 null，用 `dayWindowOf` 把「今天这张」取回来。
    */
   #deliveryOf (crop, stamp) {
-    if (new Date(stamp).getDay() !== 5) return null
-    let window = contractOf(crop, stamp)
-    if (window === null) {
-      const monday = startOfWeek(stamp)
-      window = contractOf(crop, monday + 4 * DAY_MS + 20 * HOUR_MS - 1)
-    }
+    const window = dayWindowOf(crop, stamp)
     if (window === null) return null
     const closes = deliveryClosesOf({
       crop,
@@ -1182,9 +1179,9 @@ class FuturesStore {
     }
   }
 
-  /** 票 96：交易中 / 已到期 / 周末三态；文案由账本层统一给，窗口不自己拼。 */
+  /** 票 96：交易中 / 今日已收盘 / 周末三态；文案由账本层统一给，窗口不自己拼。 */
   #sessionOf (crop, stamp) {
-    // 票 98：模式优先于合约状态——off 时连「这周有没有合约」都不该显示。
+    // 票 98：模式优先于合约状态——off 时连「今天有没有合约」都不该显示。
     if (this.#state.disabled || this.modeOf() === 'off') {
       return { kind: 'off', text: '期货未开放' }
     }
@@ -1193,13 +1190,12 @@ class FuturesStore {
     }
     const contract = contractOf(crop, stamp)
     if (contract !== null) {
-      return { kind: 'trading', text: contract.id + ' 交易中，周五 20:00 到期。' }
+      return { kind: 'trading', text: contract.id + ' 交易中，今天 20:00 交割。' }
     }
-    const day = new Date(stamp).getDay()
-    if (day === 5) {
-      return { kind: 'expired', text: '合约已到期，本周合约已交割，下周一 00:00 开新合约。' }
+    if (dayWindowOf(crop, stamp) !== null) {
+      return { kind: 'expired', text: '今日合约已交割，明天 00:00 开新合约。' }
     }
-    return { kind: 'weekend', text: '周末休市，本周合约已交割，下周一 00:00 开新合约。' }
+    return { kind: 'weekend', text: '周末休市，周一 00:00 开新合约。' }
   }
 
   #unrealizedOf (position, at) {
@@ -1362,7 +1358,7 @@ class FuturesStore {
       return this.#closedError(crop, stamp) ?? { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
     }
     if (this.#state.delivered[quote.contract.id] !== undefined) {
-      return { ok: false, error: 'contract-expired', notice: '合约已到期，周五 20:00 后停止交易。' }
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
     const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
@@ -1932,14 +1928,13 @@ class FuturesStore {
     }
   }
 
-  /** 票 96：周五 20:00 与周末都按 `market-closed` 拒绝，只有文案区分；已有仓位走 `contract-expired`。 */
+  /** 票 96：20:00 之后与周末都按 `market-closed` 拒绝，只有文案区分；已有仓位走 `contract-expired`。 */
   #closedError (crop, stamp) {
     if (contractOf(crop, stamp) !== null) return null
-    const monday = startOfWeek(stamp)
-    if (stamp < monday + 5 * DAY_MS) {
-      return { ok: false, error: 'market-closed', notice: '合约已到期，周五 20:00 后停止交易。' }
+    if (dayWindowOf(crop, stamp) !== null) {
+      return { ok: false, error: 'market-closed', notice: '今日合约已交割，20:00 后停止交易，明天 00:00 开新合约。' }
     }
-    return { ok: false, error: 'market-closed', notice: '周末休市，下周一 00:00 开新合约。' }
+    return { ok: false, error: 'market-closed', notice: '周末休市，周一 00:00 开新合约。' }
   }
 
   /** 吃单开仓：做多吃卖一、做空吃买一；保证金与手续费当场从余额划走。 */
@@ -1956,7 +1951,7 @@ class FuturesStore {
       return this.#closedError(crop, stamp) ?? { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
     }
     if (this.#state.delivered[quote.contract.id] !== undefined) {
-      return { ok: false, error: 'contract-expired', notice: '合约已到期，周五 20:00 后停止交易。' }
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
     const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
@@ -2188,7 +2183,7 @@ class FuturesStore {
     }
     // 票 96：已交割的合约即使时钟被拨回也不许再挂单。
     if (this.#state.delivered[contract.id] !== undefined) {
-      return { ok: false, error: 'contract-expired', notice: '合约已到期，周五 20:00 后停止交易。' }
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
     const limitPrice = roundCoin(limit)
     const marginFrozen = marginOf({ lots: count, price: limitPrice, leverage })
@@ -2423,7 +2418,7 @@ class FuturesStore {
    * 逐根盯市 + 逐拍强平（票 97）。
    *
    * 盯市 = 把浮盈浮亏记进 `balance`，入场价改成收盘价，仓位继续持有、保证金不动——
-   * 这样周合约才拿得住一整周。
+   * 这样一根接一根地拿，不会被「这只是浮盈」卡住。
    *
    * 强平不再看「这一根的收盘价」，而是**按路径扫**：对每个仓位（本地 + 所有远端）从上次
    * 盯市时刻一直采样到 `now`（15 秒一格，正好是价格的生成分辨率），第一个让
@@ -2696,7 +2691,7 @@ class FuturesStore {
     if (!(settleAt <= stamp)) return null
     const window = contractWindowOf(position.contract)
     if (window === null) return null
-    // 到期那一根没有「下一根」了：按到期前一毫秒的价结算，否则周五最后一根的仓位
+    // 到期那一根没有「下一根」了：按到期前一毫秒的价结算，否则当天最后一根的仓位
     // 会因为 contractOf() 在到期后返回 null 而永远结不掉。
     const priceAt = Math.min(settleAt, window.expireAt - 1)
     const price = this.#fairAt(position.crop, position.contract, priceAt)
@@ -2705,7 +2700,7 @@ class FuturesStore {
     return { price, pnl, liquidated: roundCoin(position.margin + pnl) <= 0, at: priceAt }
   }
 
-  /** 某个合约在某一刻的公允价：用仓位自己的合约，不被「本周合约」顶替。 */
+  /** 某个合约在某一刻的公允价：用仓位自己的合约，不被「今天这张」顶替。 */
   #fairAt (crop, contractId, at) {
     const indexPrice = this.#indexOf(crop)
     const price = fairPriceOf({ indexPrice, crop, contractId, at })

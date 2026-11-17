@@ -74,7 +74,7 @@ function row (overrides = {}) {
     id: 'o1',
     deviceId: 'local',
     crop: 'tomato',
-    contract: 'tomato-2026W47',
+    contract: 'tomato-20261117',
     side: 'long',
     price: 5,
     lots: 1,
@@ -135,7 +135,7 @@ test('matchOrders：固定一组订单得到可复现的成交序列（价格优
     row({ id: 'ask-a', side: 'short', price: 5.0, lots: 3, lotsLeft: 3, at: 2000 }),
     row({ id: 'ask-b', side: 'short', price: 5.2, lots: 1, lotsLeft: 1, at: 500 })
   ]
-  const due = matchOrders({ orders: book, contract: 'tomato-2026W47', at: AT })
+  const due = matchOrders({ orders: book, contract: 'tomato-20261117', at: AT })
   assert.deepEqual(due, [
     // 5.10 的买单先吃 5.00 的卖单；两张同为 5.00，问价方（ask-a, t=2000）比 bid-a（t=3000）早，所以它是 maker。
     { makerId: 'ask-a', takerId: 'bid-a', lots: 2, price: 5 },
@@ -143,7 +143,7 @@ test('matchOrders：固定一组订单得到可复现的成交序列（价格优
     { makerId: 'bid-b', takerId: 'ask-a', lots: 1, price: 5 }
   ])
   // 同一份输入重复算：序列一模一样（每台机器算出的必须是同一盘）。
-  assert.deepEqual(matchOrders({ orders: book, contract: 'tomato-2026W47', at: AT }), due)
+  assert.deepEqual(matchOrders({ orders: book, contract: 'tomato-20261117', at: AT }), due)
   // ask-b 卖 5.20 比所有买价都高，不成交。
   assert.equal(due.some((fill) => fill.makerId === 'ask-b' || fill.takerId === 'ask-b'), false)
 })
@@ -174,7 +174,7 @@ test('matchOrders：支持部分成交，maker 剩多少吃多少；未到时间
     row({ id: 'ask-early', side: 'short', price: 5.0, lots: 2, lotsLeft: 2, at: 900 }),
     row({ id: 'ask-late', side: 'short', price: 5.0, lots: 2, lotsLeft: 2, at: 5000 })
   ]
-  const due = matchOrders({ orders: book, contract: 'tomato-2026W47', at: 2000 })
+  const due = matchOrders({ orders: book, contract: 'tomato-20261117', at: 2000 })
   // 只算 2000 之前挂出来的单；买单 5 张，第一笔吃满 2 张。
   assert.deepEqual(due, [{ makerId: 'ask-early', takerId: 'bid', lots: 2, price: 5 }])
 })

@@ -23,7 +23,8 @@
 规格见 [SPEC v10](.scratch/dsh-zoo/SPEC-v10.md)；票 79–83 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
-「期货 / 周合约 / 房主清算」的决策见 [ADR-0032](docs/adr/0032-futures-host-as-clearinghouse.md)，
+「期货 / 日合约 / 房主清算」的决策见 [ADR-0032](docs/adr/0032-futures-host-as-clearinghouse.md)
+与 [ADR-0034](docs/adr/0034-futures-daily-contracts.md)，
 规格见 [SPEC v11](.scratch/dsh-zoo/SPEC-v11.md)；票 92–99 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。盘口与期货是两层：盘口对着机器，期货对着人。
 
@@ -32,7 +33,7 @@
 
 盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
 
-期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 周合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 影子模式”同义。注意 `contract` 在期货线指**周合约**，在农场线指**雇工合同**，靠上下文与模块区分。
+期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 影子模式”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
 ## Language
 
@@ -344,7 +345,7 @@ _Avoid_: 交易所, 市场, exchange, market, 订单簿
 **合约 (Contract)**：
 以作物为标的、15 分钟一根、现金结算的仓位；不做交割、不做组合/指数。
 合约价与现货 `market.json` 的 bid/price 是两张互不写入的图。
-盘口的「合约」不是期货：期货是另一层带到期日、带对手盘的周合约（见下节）。
+盘口的「合约」不是期货：期货是另一层带到期日、带对手盘的日合约（见下节）。
 _Avoid_: 期货, 现货, futures, spot
 
 **一根 (Bar)**：
@@ -405,7 +406,7 @@ _Avoid_: 排行榜, 天梯, 赛季榜, ranking, ladder
 它只数大家报上来的方向，不做加权，也不影响行情。
 _Avoid_: 市场情绪, 多空比, 指数, market mood
 
-## 期货（周合约 · 房主清算）
+## 期货（日合约 · 房主清算）
 
 **期货 (Futures)**：
 一层独立于盘口的 LAN 多人市场：有到期日、有对手盘、有费用与价差，钱在交易所托管账户里跑。
@@ -418,10 +419,11 @@ _Avoid_: 盘口, 合约交易, 现货交易, derivatives
 没有服务器集群，也没有共识——房主掉线市场就冻结。
 _Avoid_: 服务器, 交易所, 节点, node, exchange
 
-**周合约 (Weekly Contract)**：
-每作物一张、周一到期的合约：周一 00:00 上市、周五 20:00 到期，24/7 交易。
-到期就结束，不做永续、不跨周。代号形如 `corn-2026W47`。
-_Avoid_: 永续, perpetual, 主力合约, 期权
+**日合约 (Daily Contract)**：
+每个交易日一张：当天 00:00 上市、20:00 交割；20:00 到第二天 00:00 与周末休市。
+到期就结束，不做永续、不能持仓过夜、不跨日。代号形如 `corn-20261117`（旧存档里还有
+周合约 `corn-2026W47`，只为交割旧仓位保留解析）。
+_Avoid_: 永续, perpetual, 主力合约, 期权, 周合约
 
 **张 (Lot)**：
 合约的最小单位：1 张 = 100 个作物。仓位、挂单、成交都用张计数，不用「个」。

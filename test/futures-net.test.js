@@ -267,7 +267,7 @@ test('票 94：房主替 peer 充值 + 开仓，peer 窗口的余额/持仓与�
 test('票 94：过一根之后两边盯市的余额仍然逐分一致（假时钟跳到下一根）', async (t) => {
   // 两台共用同一个可拨的时钟：开盘在第 N 根，然后把时钟拨到第 N+1 根整点，
   // 房主的期货 tick 就会盯市并把新的余额发回来（不然要真等 15 分钟）。
-  const clock = { at: Date.UTC(2026, 10, 17, 12, 0, 0) }
+  const clock = { at: new Date(2026, 10, 17, 12, 0, 0, 0).getTime() }
   const { a, b, aId } = await connectedPair(t, {
     a: { futuresNow: () => clock.at },
     b: { futuresNow: () => clock.at }
@@ -289,7 +289,8 @@ test('票 94：过一根之后两边盯市的余额仍然逐分一致（假时�
   const beforeSeq = b.futuresAccountOf(aId).seq
   const beforeEntry = a.futuresWindow().positions[0].entry
 
-  clock.at += SLOT_MS
+  // 拨一小时（四根）：公允价按分取整，只拨一根有可能正好还在同一分上。
+  clock.at += 4 * SLOT_MS
 
   // seq 变了 = 房主真的盯市并发了一拍新的 settle（不是窗口自己算的）。
   await waitFor(() => b.futuresAccountOf(aId).seq > beforeSeq)
@@ -341,8 +342,8 @@ test('票 96：peer 转现货把作物入本机仓库，房主平合约并按公
   assert.ok(trades[0].fee > 0)
 })
 
-test('票 96：周五 20:00 房主到期交割，peer 的余额与持仓同步清零并收到交割流水', async (t) => {
-  const clock = { at: new Date(2026, 10, 20, 19, 0, 0).getTime() }
+test('票 96：20:00 房主到期交割，peer 的余额与持仓同步清零并收到交割流水', async (t) => {
+  const clock = { at: new Date(2026, 10, 17, 19, 0, 0).getTime() }
   const { a, b, aId } = await connectedPair(t, {
     a: { futuresNow: () => clock.at },
     b: { futuresNow: () => clock.at }
@@ -363,7 +364,7 @@ test('票 96：周五 20:00 房主到期交割，peer 的余额与持仓同步�
   await waitFor(() => a.futuresWindow().positionCount === 1, DELIVERY_WAIT_MS)
 
   // 拨到到期整点：房主 tick 会先盯市、再走 expireDue 的交割。
-  clock.at = new Date(2026, 10, 20, 20, 0, 0).getTime()
+  clock.at = new Date(2026, 10, 17, 20, 0, 0).getTime()
   await waitFor(
     () => b.futuresAccountOf(aId).positions.length === 0 && a.futuresWindow().positionCount === 0,
     DELIVERY_WAIT_MS
@@ -375,10 +376,10 @@ test('票 96：周五 20:00 房主到期交割，peer 的余额与持仓同步�
   assert.equal(hostAccount.marginUsed, 0)
   assert.equal(peerWindow.balance, hostAccount.balance)
   assert.equal(peerWindow.session.kind, 'expired')
-  assert.match(peerWindow.delivery.contract, /-2026W47$/)
+  assert.match(peerWindow.delivery.contract, /-20261117$/)
   const delivery = peerWindow.trades.filter((entry) => entry.kind === 'delivery')
   assert.equal(delivery.length, 1)
-  assert.equal(delivery[0].contract, 'tomato-2026W47')
+  assert.equal(delivery[0].contract, 'tomato-20261117')
   assert.equal(delivery[0].lots, 1)
   assert.equal(typeof delivery[0].deliveryFee, 'number')
   assert.equal(hostAccount.trades.filter((entry) => entry.kind === 'delivery').length, 1)
@@ -392,7 +393,7 @@ test('票 94：同一条 settle 只算一次，倒退的 seq 丢掉，新 epoch 
   const positions = [{
     id: '11111111-1111-4111-8111-111111111111',
     crop: 'tomato',
-    contract: 'tomato-2026W47',
+    contract: 'tomato-20261117',
     side: 'long',
     lots: 2,
     entry: 5,
@@ -478,7 +479,7 @@ test('票 94：换源冒充同一个 deviceId 的指令不落账', async (t) => 
 
 test('票 95：peer 挂单、房主吃单——一根后两头权益变化之和只等于两笔手续费', async (t) => {
   // 共用同一个冻住的时钟：报价不动，挂单价与手续费都能提前算死。
-  const clock = { at: Date.UTC(2026, 10, 17, 12, 0, 0) }
+  const clock = { at: new Date(2026, 10, 17, 12, 0, 0, 0).getTime() }
   const { a, b, aId } = await connectedPair(t, {
     a: { futuresNow: () => clock.at },
     b: { futuresNow: () => clock.at }

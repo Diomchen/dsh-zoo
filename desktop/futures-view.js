@@ -414,7 +414,7 @@
     // 票 96：账本说已到期/周末时，哪怕余额为空也先报「收盘」，文案用宿主给的那句。
     const session = view.session
     if (session !== null && typeof session === 'object' && (session.kind === 'expired' || session.kind === 'weekend')) {
-      const text = typeof session.text === 'string' && session.text !== '' ? session.text : '本周期已收盘。'
+      const text = typeof session.text === 'string' && session.text !== '' ? session.text : '今天已收盘。'
       return { kind: 'closed', text, action: null }
     }
     // 票 98：影子模式没有报价也要说清楚是「只记账」，不能落成「周末休市」。
@@ -430,7 +430,7 @@
     }
     const quotes = view.quotes ?? {}
     if (Object.keys(quotes).length === 0) {
-      return { kind: 'closed', text: '周末休市：下周一 00:00 开新一周的合约。', action: null }
+      return { kind: 'closed', text: '周末休市：周一 00:00 开今天这张合约。', action: null }
     }
     return { kind: 'ok', text: '', action: null }
   }
@@ -467,7 +467,7 @@
     return '待提取 ' + formatCoin(pending) + '：农场硬币到上限了，下次提现会先补这一笔。'
   }
 
-  /** 窗口标题：本周合约的周号 + 倒计时（宿主没给就只写「期货」）。 */
+  /** 窗口标题：今天这张合约的日期 + 倒计时（宿主没给就只写「期货」）。 */
   function title (view) {
     const week = weekOf(view)
     const end = slotEndOf(view)
@@ -476,13 +476,13 @@
     return week === null ? '期货' + left : '期货 · ' + week + left
   }
 
-  /** 本周合约的周号（取第一个有报价的合约，`crop-2026W47` → `2026W47`）。 */
+  /** 合约的日期/周号（取第一个有报价的合约，`crop-20261117` → `20261117`，旧的 `crop-2026W47` → `2026W47`）。 */
   function weekOf (view) {
     const quotes = view?.quotes ?? {}
     for (const key of Object.keys(quotes)) {
       const id = quotes[key]?.contract?.id
       if (typeof id === 'string') {
-        const match = /-(\d{4}W\d{2})$/.exec(id)
+        const match = /-(\d{8}|\d{4}W\d{2})$/.exec(id)
         if (match !== null) return match[1]
       }
     }

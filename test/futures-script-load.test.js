@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url'
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
 
-const CONTRACT = 'tomato-2026W47'
+const CONTRACT = 'tomato-20261117'
 // `render()` 用的是真实 `Date.now()`（窗口不信任宿主时钟之外的偏移），
 // 所以样例 view 的 `now` 也取当下，免得倒计时落进「本根已结束 → 自动请宿主结算」。
 const NOW = Date.now()
@@ -86,11 +86,11 @@ function loadWindowScript (file, { bridge, view }) {
 function sampleView () {
   const crops = [
     { id: 'tomato', label: '番茄', index: 5, contract: CONTRACT },
-    { id: 'carrot', label: '胡萝卜', index: 12, contract: 'carrot-2026W47' }
+    { id: 'carrot', label: '胡萝卜', index: 12, contract: 'carrot-20261117' }
   ]
   const quotes = {
     tomato: { fair: 5.21, bid: 5.2, ask: 5.22, contract: { id: CONTRACT } },
-    carrot: { fair: 12.4, bid: 12.38, ask: 12.42, contract: { id: 'carrot-2026W47' } }
+    carrot: { fair: 12.4, bid: 12.38, ask: 12.42, contract: { id: 'carrot-20261117' } }
   }
   return {
     ready: true,
@@ -112,7 +112,7 @@ function sampleView () {
       { id: 'p1', crop: 'tomato', contract: CONTRACT, side: 'long', lots: 20, entry: 5.12, margin: 240, leverage: 10, unrealized: 18.4 }
     ],
     orders: [
-      { id: 'o1', crop: 'carrot', contract: 'carrot-2026W47', side: 'long', price: 12.1, lots: 8, lotsLeft: 8, marginFrozen: 96, at: NOW - 60000 }
+      { id: 'o1', crop: 'carrot', contract: 'carrot-20261117', side: 'long', price: 12.1, lots: 8, lotsLeft: 8, marginFrozen: 96, at: NOW - 60000 }
     ],
     trades: [
       { at: NOW - 120000, crop: 'tomato', contract: CONTRACT, side: 'long', lots: 20, price: 5.12, fee: 0.1, kind: 'open' }

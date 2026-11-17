@@ -120,8 +120,8 @@ export const MAX_WEEK_PNL_PCT = 1000
 /** 一份 settle 最多带 8 条持仓、8 条挂单：与盘口周报同一量级，整包稳在 4 KiB 内。 */
 export const FUTURES_MAX_POSITIONS = 8
 export const FUTURES_MAX_ORDERS = 8
-/** 合约编号（与 `src/futures-rules.js` 的 `contractOf` 同形）：`tomato-2026W47`。 */
-export const FUTURES_CONTRACT_RE = /^[a-z][a-z0-9_]*-\d{4}W\d{2}$/
+/** 合约编号（与 `src/futures-rules.js` 的 `contractOf` 同形）：`tomato-20261117`（旧存档还有 `tomato-2026W47`）。 */
+export const FUTURES_CONTRACT_RE = /^[a-z][a-z0-9_]*-(?:\d{4}W\d{2}|\d{8})$/
 /** 余额/保证金是「币」，上线到分（`roundCent`）；这里只给一个宽到不可能撞上的上界。 */
 export const MAX_FUTURES_COIN = 1_000_000_000
 /** 账户流水号 0..2^31-1：一根合约 15 分钟结算一次，这个量级够跑几十年。 */
