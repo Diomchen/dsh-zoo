@@ -139,6 +139,9 @@ test('持仓表：浮亏吃到八成保证金就把整行标红', () => {
 
 test('状态四态：没就绪、没充钱、周末收盘、正常', () => {
   assert.equal(view.statusOf(sampleView({ ready: false })).kind, 'starting')
+  // 票 94：对端没升级时文案要说清楚，不能装作「还没就绪」。
+  const oldPeer = sampleView({ peer: { ready: false, text: '对端未升级，期货不可用。' } })
+  assert.equal(view.statusOf(oldPeer).text, '对端未升级，期货不可用。')
   assert.equal(view.statusOf(sampleView({ balance: 0, marginUsed: 0, equity: 0, positions: [], trades: [], quotes: {} })).kind, 'no-funds')
   assert.equal(view.statusOf(sampleView({ quotes: {} })).kind, 'closed')
   assert.equal(view.statusOf(sampleView()).kind, 'ok')

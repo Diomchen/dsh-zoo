@@ -75,12 +75,25 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "requestId": "<uuid>", "servedMs": 7200000, "earned": 20, "reason": "recall" }
 { "v": 1, "type": "work-settle-ack", "deviceId": "<uuid>", "contractId": "<uuid>",
   "requestId": "<uuid>", "ok": true, "earned": 20 }
+
+{ "v": 1, "type": "futures-hello", "deviceId": "<uuid>", "at": 1700000000000 }
+{ "v": 1, "type": "futures-order", "deviceId": "<uuid>", "at": 1700000000000,
+  "kind": "open", "crop": "tomato", "side": "long", "margin": 50, "leverage": 10 }
+{ "v": 1, "type": "futures-cancel", "deviceId": "<uuid>", "at": 1700000000000,
+  "positionId": "<uuid>" }
+{ "v": 1, "type": "futures-settle", "deviceId": "<uuid>", "at": 1700000000000,
+  "epoch": "<uuid>", "seq": 7, "balance": 431.5, "marginUsed": 50.34, "delta": -2.39,
+  "positions": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-2026W47",
+                  "side": "long", "lots": 1, "entry": 5.03, "margin": 50.34,
+                  "leverage": 10 }] }
+{ "v": 1, "type": "futures-sync", "deviceId": "<uuid>", "at": 1700000000000,
+  "epoch": "<uuid>", "lastSeq": 7 }
 ```
 
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -114,9 +127,19 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `weekPnl` | `trading-digest` | 本机本周交易盈亏（金币，含未实现，四舍五入到整数）；范围 `[-1,000,000, 1,000,000]` |
 | `weekPnlPct` | `trading-digest` | 可选收益率**比率**（`0.035` = +3.5%）；范围 `[-1000, 1000]`；缺省表示本机没有可用的周起点硬币 |
 | `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20；没有仓位就是空数组 |
+| `at`（期货） | `futures-hello`、`futures-order`、`futures-cancel`、`futures-settle`、`futures-sync` | 发起方时钟的正整数毫秒；只有 `futures-settle` 拿它当账目的时间戳，「这份账旧不旧」只看 `(epoch, seq)` |
+| `kind` | `futures-order` | `open` / `close` / `deposit`；别的值整包丢 |
+| `crop` / `side` / `margin` / `leverage`（期货） | `futures-order`（`kind:'open'`） | 作物必须在作物表里；`side` 是 `long`/`short`；`margin` 是 1–1,000,000 的整数金币；`leverage` 是 1/3/10/20 |
+| `positionId` | `futures-order`（`kind:'close'`）、`futures-cancel` | 持仓 UUID；平仓只能平自己账户里的那一手 |
+| `coins` | `futures-order`（`kind:'deposit'`） | 1..1,000,000 的整数：peer 先从自己农场扣掉这么多，再划进房主账本 |
+| `epoch` | `futures-settle`、`futures-sync` | 房主账本代次，非空字符串、≤64 字符；epoch 一变说明房主换了账本（重启/换人），旧 `seq` 一笔作废 |
+| `seq` | `futures-settle` | 该账户的流水号，整数 0..2^31-1，只增；接收方按 `(epoch, seq)` 幂等，`seq` 倒退的包丢弃 |
+| `balance` / `marginUsed` / `delta` | `futures-settle` | 到分的金币数（≥0；`delta` 可负）；`delta` 只用于显示「这一拍变了多少」，peer 不拿它记账——`balance` 才是真值 |
+| `positions`（期货） | `futures-settle` | 最多 `8` 条 `{ id, crop, contract, side, lots, entry, margin, leverage }`；`contract` 形如 `tomato-2026W47`（`/^[a-z][a-z0-9_]*-\d{4}W\d{2}$/`），`lots` 1..1,000,000，`entry`/`margin` 是到分的正数 |
+| `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
-`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*`）旧端不认识时整包
+`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 5 种 `futures-*`）旧端不认识时整包
 静默丢弃，既不回复也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
@@ -792,7 +815,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 
 ```json
 { "v": 1, "type": "beacon", "deviceId": "<uuid>", "nickname": "小黄", "port": 45871,
-  "caps": ["raid", "look", "crops"],
+  "caps": ["raid", "look", "crops", "futures"],
   "crops": { "v": 1, "hash": "0123456789abcdef", "count": 7 } }
 ```
 
@@ -865,6 +888,41 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    结束原因见字段表；结算原因只允许 `completed` / `recall` / `employer-end` / `offline` /
    `expired`。`contractId` / `requestId` 都是 UUID 形状。
 
+### 跨机期货账户（5 种 `futures-*`，票 94）
+
+期货的**账本只有一本**：房主算价、算保证金、算强平，peer 只发窄指令、只显示房主给它的账。
+`futures.json` 里的 `remotes` 就是这些托管账户（`{ balance, marginUsed, positions, lastSeq }`），
+本机自己的账户仍是顶层那套字段，两者互不影响（ADR-0032）。
+
+| 类型 | 方向 | 字段 | 幂等键 |
+| --- | --- | --- | --- |
+| `futures-hello` | peer → 房主 | `at` | 无（每 peer 30 秒最多 1 条） |
+| `futures-order` | peer → 房主 | `kind` +（`crop`/`side`/`margin`/`leverage` 或 `positionId` 或 `coins`） | 无（房主逐条记账，重复包靠源地址门控挡） |
+| `futures-cancel` | peer → 房主 | `positionId` | 无（票 96 才有语义；当前解析后丢弃） |
+| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` | `(epoch, seq)` |
+| `futures-sync` | peer → 房主 | `epoch` / `lastSeq` | 无（每 30 秒最多 1 条，房主收到就回一份 settle） |
+
+1. **房主选举**：`[本机 deviceId, ...带 futures 能力位的已放行邻居]` 排序取最小，两端算出
+   同一个答案，不需要额外的协商报文；没有 `futures` 邻居时就没有房主。房主不发 hello、不 sync，只应答。
+2. **报到与反冒充**：peer 第一次 `futures-hello` 时，房主把 `deviceId` 绑到这一包的 UDP
+   **源地址 + 源端口**；之后同一个 `deviceId` 从别的源发来的包整包丢（不回复、不落账）。
+   绑定 10 分钟不用就过期；`futures-order` 先到也算报到（首包即绑定）。
+3. **指令**：`deposit` 的钱是 peer 自己农场出的——先按单机口径充进本机托管（农场扣款），
+   再 `transferOut` 划给房主账本，所以两边账守恒、不会凭空生币；指令发不出去就原路退回农场。
+   房主只记账，不碰自己的农场。`open`/`close` 走与单机完全相同的
+   `quoteOf`/`fillPriceOf`/`marginOf`/`takerFeeOf`。房主拒绝时
+   （`no-balance` / `market-closed` / `position-limit` …）只记一条日志，不广播、不回包。
+4. **结算**：每根（15 分钟）房主按同一套规则盯市每个远端账户——`pnl` 进该账户余额、
+   保证金不足就强平——然后 `seq += 1`，给每个报到过的 peer 各发一条它自己的 `futures-settle`。
+5. **对账**：peer 存一份 `(epoch, seq)` 副本，重发的同一条只算一次、`seq` 倒退的包丢掉；
+   epoch 变了（房主重启/换人）就整份采纳新账。丢包不靠重传：peer 每 30 秒 `futures-sync`，
+   房主回一份当前账户。本实现直接回整份快照、不维护增量日志——8 条持仓的整份也只有约 1.5 KiB。
+6. **旧邻居**：只有广告了 `futures` 能力位的已放行邻居才会收到这五种包。对方没这一位时
+   两边都不发，本机窗口写「对端未升级，期货不可用」；农场、盘口、串门照常。
+7. **窗口动作**：peer 点 `futures-deposit` / `futures-open` / `futures-close` 只发指令，
+   回 `{ ok: true, pending: true }`，等房主下一拍 settle 才改显示；`futures-withdraw` 仍是
+   房主本机动作（只有房主能提自己账上的钱）。
+
 ### 限额与边界
 
 | 项 | 值 |
@@ -884,19 +942,23 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
 | 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
 | 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
+| 期货账户 | 单账户持仓 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符 |
+| 期货广播 | `futures-settle` 每账户每根 1 条；`futures-sync` 1 条/30 秒；整包 ≤4 KiB（8 条持仓约 1.5 KiB） |
+| 期货价格 | 指数锚现货价（已被行情夹在 `[base×0.5, base×2]`）；做市价差 0.2%；吃单费 0.1%（9 成销毁、1 成进保险） |
 
 ### 4 KiB、白名单与旧邻居
 
 - **4 KiB**：所有 UDP 报文都是单个 JSON，超过 4 KiB 在解析前丢弃；不回复、不报错。
-  `market-digest`、`trading-digest` 和 8 种 `work-*` 都很小（价格 3 个数、合同 6 个字段、
-  榜上最多 8 条持仓），正常触不到上限。
+  `market-digest`、`trading-digest`、8 种 `work-*` 和 5 种 `futures-*` 都很小（价格 3 个数、
+  合同 6 个字段、榜上最多 8 条持仓、一份期货账户最多 8 条持仓 ≈1.5 KiB），正常触不到上限。
   农场快照走 HTTP，不受 UDP 4 KiB 限制，但访客客户端仍只收 ≤64 KiB。
 - **字段白名单**：每种类型只重建自己的字段；未知字段、未知作物、未知枚举、越界数字
   一律丢弃或整包拒绝。所有 id 只从校验过的字段拼，不拼路径。
 - **旧邻居**：旧版本只认识自己的报文类型，`market-digest` / `trading-digest` /
-  `farm-action(-result)` / `work-*` 会被当成未知类型静默丢掉，不报错、不崩。新端收到旧端：
+  `farm-action(-result)` / `work-*` / `futures-*` 会被当成未知类型静默丢掉，不报错、不崩。新端收到旧端：
   缺 `action`/`skin*`/`gift` 都按本文的兼容口径降级；没有农场报文时，本地农场照常运行，
-  只是不能跨机偷/帮/雇；没有盘口报文时，盘口照常运行，只是榜上只有自己。
+  只是不能跨机偷/帮/雇；没有盘口报文时，盘口照常运行，只是榜上只有自己；没有 `futures`
+  能力位时两边都不发期货包，本机窗口写「对端未升级，期货不可用」，本地账本照常。
 - **降级**：旧邻居 → 串门/礼物/记录照常，没有农场入口；对方没开局域网端口 → 串门照常、
   快照取不到、偷/帮/雇不可用；对方离线 → 不能偷/帮/雇，行情过期，合同按最后心跳结束；
   没有桌面层 → HTTP 动作与 `state` 可用，没有农场窗，也没有雇工宠物。
@@ -957,6 +1019,12 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
   四字段分支。合同只能由本机 action（`hire` / `hire-listing` / `recall-worker` /
   `end-contract`）或已放行邻居的合法报文创建/推进；`work-*` ack 按
   `${deviceId}:${requestId}` 回放最近 200 条 / 10 分钟。
+- 5 种 `futures-*` 同样不落进 `VISIT_TYPES`：`kind` 是固定枚举，`epoch` ≤64 字符，
+  `seq` 0..2^31-1，金额到分且 ≥0，`positions` ≤8 条且每条的 `id`/`contract` 形状都校验，
+  坏条目/坏形状整包丢。**房主额外认源地址**：`futures-hello`/`-order`/`-sync` 只接受
+  绑定过的 UDP 源地址 + 源端口，换了源的同 `deviceId` 包静默丢弃（不回复、不落账，
+  绑定 10 分钟过期）；非放行邻居的包连账户都不会建。peer 侧只认房主发来的 settle，
+  `(epoch, seq)` 幂等 + `seq` 倒退丢弃，重放不会让账目多一分钱。
 - `farm.json` / `market.json` / `contracts.json` 只由本机 store 写，写入串行 + tmp/rename、
   每份有界（日志 50、历史 200、合同每侧 20）；远端报文不能直接写文件或指定路径。
   访客动作的落账同样只经 `farm.store`，并受日限额/每地每轮/`requestId` 幂等约束。

@@ -259,6 +259,26 @@ test('提现：超过农场上限时按 1,000,000 分批，并只扣实收的部
   assert.equal(reloaded.snapshot().balance, 500_000, '没加进去的 200,000 留在托管账户里')
 })
 
+test('票 94：托管余额划出去交给房主账本，农场一分不动', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(500)
+  const store = await createFuturesStore(dir, { farm, now: () => MONDAY })
+  await store.deposit(100)
+  assert.equal(store.snapshot().balance, 100)
+  assert.equal(farm.state.coins, 400)
+
+  const moved = await store.transferOut(40)
+  assert.equal(moved.ok, true)
+  assert.equal(moved.coins, 40)
+  assert.equal(store.snapshot().balance, 60, '划出去的只是托管余额')
+  assert.equal(farm.state.coins, 400, '不是提现，农场不该涨回来')
+
+  // 划不出比账上更多的钱；坏金额也不动账。
+  assert.equal((await store.transferOut(1000)).error, 'no-balance')
+  assert.equal((await store.transferOut(0)).error, 'bad-amount')
+  assert.equal(store.snapshot().balance, 60)
+})
+
 test('坏文件：按空账本运行、只告警一次、不写回盘上的坏内容', async (t) => {
   const dir = await tempDir(t)
   const farm = fakeFarm(0)

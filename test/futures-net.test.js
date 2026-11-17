@@ -1,0 +1,404 @@
+/**
+ * 票 94：两台真 service 走回环 UDP 的「双机开户与净额结算」链路。
+ *
+ * 只覆盖端到端才能验的部分（协议形状在 `test/protocol.test.js`，账本规则在
+ * `test/futures-store.test.js`）：
+ *   1. peer 报到（hello）后房主回一份 settle，窗口拿到 epoch/seq 并认出自己是 peer；
+ *   2. 房主替 peer 记账：充值 + 开仓之后，peer 窗口上的余额/持仓与房主账本一致；
+ *   3. `(epoch, seq)` 幂等：同一条重发只算一次，倒退的 seq 丢掉，新 epoch 直接采纳；
+ *   4. 换了 UDP 源（端口不同）冒充同一个 deviceId 的包不落账；
+ *   5. 没放行的 deviceId 的包也不落账。
+ *
+ * 用 `network:true, port:0` + 127.0.0.1（与 `test/trading-e2e.test.js` 同款）：
+ * 内核挑端口避开并发测试的端口竞态，不碰真实局域网。角色用 `futuresHost` 钉死，
+ * 免得两个随机 deviceId 让「谁当房主」的选举结果在两次跑之间翻面。
+ */
+import assert from 'node:assert/strict'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+import dgram from 'node:dgram'
+
+import { FARM_FILE } from '../src/farm.js'
+import { createFuturesStore } from '../src/futures.js'
+import { SLOT_MS } from '../src/futures-rules.js'
+import { createService } from '../src/service.js'
+
+function delay (ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function waitFor (predicate, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await predicate()) return
+    await delay(15)
+  }
+  throw new Error('waitFor timeout')
+}
+
+function fakeCtx () {
+  const routes = []
+  return {
+    ctx: {
+      webServer: {
+        register (options) {
+          routes.push(options)
+          return () => {}
+        }
+      },
+      logger: { info () {}, warn () {} }
+    },
+    routes
+  }
+}
+
+async function tempDir (t) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-futures-net-'))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
+  return dir
+}
+
+async function seedFarm (dir, coins = 500) {
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins }), 'utf8')
+}
+
+function makeService (t, options = {}) {
+  const { ctx, routes } = fakeCtx()
+  const service = createService(ctx, {
+    petBridge: false,
+    skinServer: false,
+    desktop: false,
+    ...options
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  return service
+}
+
+async function callAction (service, body) {
+  const route = service.routes.find((candidate) => candidate.path === '/dsh-zoo/action')
+  assert.ok(route, '应该注册 /dsh-zoo/action')
+  const res = {
+    statusCode: 0,
+    setHeader () {},
+    end (payload) { this.payload = payload }
+  }
+  const req = {
+    method: 'POST',
+    _listeners: {},
+    on (event, fn) {
+      this._listeners[event] = fn
+      return this
+    },
+    destroy () {}
+  }
+  const pending = route.handler(req, res)
+  queueMicrotask(() => req._listeners.data?.(Buffer.from(JSON.stringify(body))))
+  queueMicrotask(() => req._listeners.end?.())
+  await pending
+  return { status: res.statusCode, body: res.payload ? JSON.parse(res.payload) : null }
+}
+
+function optionsFor (dir, port, targetPort, overrides = {}) {
+  return {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: true,
+    port,
+    targetPort,
+    bindAddress: '127.0.0.1',
+    broadcastAddress: '127.0.0.1',
+    beaconIntervalMs: 5000,
+    heartbeatIntervalMs: 5000,
+    tickIntervalMs: 20,
+    marketDigestMs: 1000,
+    // 票 94：结算/报到/对账都调快，别让「等 15/30 秒」变成测试的等待时间。
+    futuresTickMs: 20,
+    futuresHelloMs: 40,
+    futuresSyncMs: 40,
+    ...overrides
+  }
+}
+
+/**
+ * B 先起（`port:0`），A 再起并主动向 B 的端口广播；双方放行对方并等一次心跳。
+ * B 是房主（`futuresHost:true`），A 是 peer（`futuresHost:false`）。
+ */
+async function connectedPair (t, overrides = {}) {
+  const dirA = await tempDir(t)
+  const dirB = await tempDir(t)
+  await seedFarm(dirA)
+  await seedFarm(dirB)
+  const b = makeService(t, optionsFor(dirB, 0, 0, { futuresHost: true, ...overrides.b }))
+  await b.ready
+  const bPort = b.localPort()
+  assert.ok(bPort > 0)
+  const a = makeService(t, optionsFor(dirA, 0, bPort, { futuresHost: false, ...overrides.a }))
+  await a.ready
+  await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
+  const aId = a.snapshot().self.deviceId
+  const bId = b.snapshot().self.deviceId
+  assert.equal(a.room.admit(bId).ok, true)
+  assert.equal(b.room.admit(aId).ok, true)
+  a.sendHeartbeats()
+  b.sendHeartbeats()
+  await waitFor(() => (a.snapshot().neighbors[0]?.heartbeatAt ?? 0) > 0 &&
+    (b.snapshot().neighbors[0]?.heartbeatAt ?? 0) > 0)
+  return { a, b, dirA, dirB, aId, bId, bPort }
+}
+
+/** 给某台服务的 UDP 端口直接投一包（模拟「别人拿别人的 deviceId 发指令」）。 */
+async function sendRaw (port, packet) {
+  const socket = dgram.createSocket('udp4')
+  try {
+    await new Promise((resolve, reject) => {
+      socket.send(Buffer.from(JSON.stringify(packet), 'utf8'), port, '127.0.0.1', (error) => {
+        if (error) reject(error)
+        else resolve()
+      })
+    })
+  } finally {
+    socket.close()
+  }
+}
+
+test('票 94：peer 报到后房主回一份 settle，窗口认出 role=peer 与房主 id', async (t) => {
+  const { a, b, aId, bId } = await connectedPair(t)
+
+  // hello 由 service 自己按节拍发（不是测试手喂），走到这里必然已经握手过。
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+  const window = a.futuresWindow()
+  assert.equal(window.role, 'peer')
+  assert.equal(window.hostId, bId)
+  assert.equal(window.ready, true)
+  assert.equal(window.peer.text, '已连上房主，账目每 30 秒对一次')
+  assert.equal(typeof window.epoch, 'string')
+  assert.ok(window.epoch.length > 0, 'settle 必须带非空 epoch')
+  assert.equal(window.balance, 0)
+  assert.equal(window.positionCount, 0)
+  // 窗口的「壳」照旧由本机下发：没有 crops/limits/slotEnd，peer 窗连按钮都画不出来。
+  assert.ok(Array.isArray(window.crops) && window.crops.length > 0)
+  assert.ok(Array.isArray(window.limits.leverages) && window.limits.leverages.length > 0)
+  assert.equal(typeof window.limits.lotSize, 'number')
+  assert.equal(typeof window.limits.takerFeeRate, 'number')
+  assert.ok(window.slotEnd > window.now)
+  assert.equal(a.futuresHost(), bId)
+
+  // 房主那边：账户是零账，但 epoch 跟自己账本一致；自己不会变成 peer。
+  const account = b.futuresAccountOf(aId)
+  assert.equal(account.seq, 0)
+  assert.equal(account.epoch, window.epoch)
+  assert.equal(b.futuresWindow().role, undefined)
+  assert.equal(b.futuresHost(), bId)
+})
+
+test('票 94：房主替 peer 充值 + 开仓，peer 窗口的余额/持仓与房主账本一致', async (t) => {
+  const { a, b, aId } = await connectedPair(t)
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  // peer 点「充值」：钱先从自己农场划出，再只把指令发给房主，回执是 pending。
+  const deposit = await callAction(a, { action: 'futures-deposit', coins: 100 })
+  assert.equal(deposit.status, 200)
+  assert.equal(deposit.body.ok, true)
+  assert.equal(deposit.body.pending, true)
+  assert.equal(deposit.body.notice, '已发给房主，等一拍回执。')
+
+  await waitFor(() => a.futuresWindow().balance === 100)
+  assert.equal(b.futuresAccountOf(aId).balance, 100)
+  // 房主自己的农场硬币不动：peer 的余额只是「你在我这里的可用额度」。
+  assert.equal(b.snapshot().farm.coins, 500)
+  // peer 那边真的花了 100 个币：农场少 100，本机托管归零，房主账本多 100（不凭空生币）。
+  assert.equal(a.snapshot().farm.coins, 400)
+  assert.equal(a.futures().balance, 0)
+  assert.equal(a.snapshot().farm.coins + a.futures().balance + b.snapshot().farm.coins +
+    b.futuresAccountOf(aId).balance, 1000)
+
+  const opened = await callAction(a, {
+    action: 'futures-open',
+    cropId: 'tomato',
+    side: 'long',
+    margin: 20,
+    leverage: 10
+  })
+  assert.equal(opened.body.ok, true)
+  assert.equal(opened.body.pending, true)
+
+  await waitFor(() => a.futuresWindow().positionCount === 1)
+  const peerWindow = a.futuresWindow()
+  const hostAccount = b.futuresAccountOf(aId)
+  assert.equal(peerWindow.positions[0].crop, 'tomato')
+  assert.equal(peerWindow.positions[0].side, 'long')
+  assert.equal(peerWindow.positions[0].leverage, 10)
+  assert.ok(peerWindow.positions[0].lots > 0)
+  // 余额与保证金是房主算的：两边必须逐分一致（不是「差不多」）。
+  assert.equal(peerWindow.balance, hostAccount.balance)
+  assert.equal(peerWindow.marginUsed, hostAccount.marginUsed)
+  assert.equal(peerWindow.equity, hostAccount.equity)
+  assert.ok(peerWindow.balance < 100, '开仓要扣保证金和手续费')
+  assert.equal(typeof peerWindow.positions[0].unrealized, 'number')
+
+  // 平仓：同样是发给房主，回执 pending，账目回来后才变。
+  const closed = await callAction(a, { action: 'futures-close', positionId: peerWindow.positions[0].id })
+  assert.equal(closed.body.pending, true)
+  await waitFor(() => a.futuresWindow().positionCount === 0)
+  assert.equal(a.futuresWindow().balance, b.futuresAccountOf(aId).balance)
+})
+
+test('票 94：过一根之后两边盯市的余额仍然逐分一致（假时钟跳到下一根）', async (t) => {
+  // 两台共用同一个可拨的时钟：开盘在第 N 根，然后把时钟拨到第 N+1 根整点，
+  // 房主的期货 tick 就会盯市并把新的余额发回来（不然要真等 15 分钟）。
+  const clock = { at: Date.UTC(2026, 10, 17, 12, 0, 0) }
+  const { a, b, aId } = await connectedPair(t, {
+    a: { futuresNow: () => clock.at },
+    b: { futuresNow: () => clock.at }
+  })
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  const deposit = await callAction(a, { action: 'futures-deposit', coins: 200 })
+  assert.equal(deposit.body.pending, true)
+  await waitFor(() => a.futuresWindow().balance === 200)
+  const opened = await callAction(a, {
+    action: 'futures-open',
+    cropId: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 10
+  })
+  assert.equal(opened.body.pending, true)
+  await waitFor(() => a.futuresWindow().positionCount === 1)
+  const beforeSeq = b.futuresAccountOf(aId).seq
+  const beforeEntry = a.futuresWindow().positions[0].entry
+
+  clock.at += SLOT_MS
+
+  // seq 变了 = 房主真的盯市并发了一拍新的 settle（不是窗口自己算的）。
+  await waitFor(() => b.futuresAccountOf(aId).seq > beforeSeq)
+  await waitFor(() => a.futuresWindow().balance === b.futuresAccountOf(aId).balance)
+  const peerWindow = a.futuresWindow()
+  const hostAccount = b.futuresAccountOf(aId)
+  assert.equal(peerWindow.balance, hostAccount.balance)
+  assert.equal(peerWindow.marginUsed, hostAccount.marginUsed)
+  assert.equal(peerWindow.equity, hostAccount.equity)
+  assert.equal(peerWindow.positionCount, hostAccount.positions.length)
+  // 盯市会把 entry 挪到这一根的价（同一份账，两边同一个数）。
+  assert.equal(peerWindow.positions[0].entry, hostAccount.positions[0].entry)
+  assert.notEqual(peerWindow.positions[0].entry, beforeEntry)
+})
+
+test('票 94：同一条 settle 只算一次，倒退的 seq 丢掉，新 epoch 直接采纳', async (t) => {
+  const dir = await tempDir(t)
+  const farm = { spendCoins: async (qty) => ({ ok: true, qty }), addCoins: async (qty) => ({ ok: true, qty }) }
+  const store = await createFuturesStore(dir, { farm, now: () => 1700000000000 })
+
+  const positions = [{
+    id: '11111111-1111-4111-8111-111111111111',
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'long',
+    lots: 2,
+    entry: 5,
+    margin: 10,
+    leverage: 10
+  }]
+  const first = store.applySettle({ epoch: 'e1', seq: 5, balance: 100, marginUsed: 10, positions })
+  assert.deepEqual(first, { ok: true, applied: true })
+  // 重发同一条：不算第二次（否则平白多一笔钱）。
+  assert.deepEqual(store.applySettle({ epoch: 'e1', seq: 5, balance: 100, marginUsed: 10, positions }), {
+    ok: true,
+    applied: false,
+    reason: 'stale'
+  })
+  // 乱序到达的旧包：同样丢。
+  assert.deepEqual(store.applySettle({ epoch: 'e1', seq: 4, balance: 999, marginUsed: 0, positions: [] }), {
+    ok: true,
+    applied: false,
+    reason: 'stale'
+  })
+  assert.equal(store.replicaOf().balance, 100)
+  assert.equal(store.replicaOf().lastSeq, 5)
+
+  // 新 epoch = 房主换了账本（重启/换人）：seq 归零也照收。
+  assert.deepEqual(store.applySettle({ epoch: 'e2', seq: 1, balance: 7, marginUsed: 0, positions: [] }), {
+    ok: true,
+    applied: true
+  })
+  assert.equal(store.replicaOf().epoch, 'e2')
+  assert.equal(store.replicaOf().lastSeq, 1)
+  assert.equal(store.replicaOf().balance, 7)
+  assert.equal(store.replicaOf().positions.length, 0)
+
+  // 坏包一个字节都不落：epoch/seq/positions 任一不合格就整包拒。
+  assert.equal(store.applySettle({ epoch: '', seq: 2, balance: 1, marginUsed: 0, positions: [] }).ok, false)
+  assert.equal(store.applySettle({ epoch: 'e2', seq: -1, balance: 1, marginUsed: 0, positions: [] }).ok, false)
+  assert.equal(store.applySettle({ epoch: 'e3', seq: 2, balance: 1, marginUsed: 0, positions: 'x' }).ok, false)
+  assert.equal(store.replicaOf().epoch, 'e2')
+  // 重启后副本不落盘：下次启动靠 30 秒 sync 重新要一份。
+  const reloaded = await createFuturesStore(dir, { farm })
+  assert.equal(reloaded.replicaOf(), null)
+})
+
+test('票 94：换源冒充同一个 deviceId 的指令不落账', async (t) => {
+  const { a, b, aId, bPort } = await connectedPair(t)
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+  const deposit = await callAction(a, { action: 'futures-deposit', coins: 100 })
+  assert.equal(deposit.body.pending, true)
+  await waitFor(() => b.futuresAccountOf(aId).balance === 100)
+  const before = b.futuresAccountOf(aId)
+
+  // 同一个 deviceId，但从另一个 UDP 端口发来：房主把它当冒充，整包丢。
+  await sendRaw(bPort, {
+    v: 1,
+    type: 'futures-order',
+    deviceId: aId,
+    at: Date.now(),
+    kind: 'deposit',
+    coins: 900
+  })
+  await delay(300)
+  const after = b.futuresAccountOf(aId)
+  assert.equal(after.balance, before.balance)
+  assert.equal(after.seq, before.seq)
+  // peer 那边的副本也一分没多。
+  assert.equal(a.futuresWindow().balance, 100)
+
+  // 没放行的 deviceId 更不行：房主连账户都不给它建。
+  const strangerId = '22222222-2222-4222-8222-222222222222'
+  await sendRaw(bPort, {
+    v: 1,
+    type: 'futures-order',
+    deviceId: strangerId,
+    at: Date.now(),
+    kind: 'deposit',
+    coins: 50
+  })
+  await delay(300)
+  assert.equal(b.futuresAccountOf(strangerId).balance, 0)
+  assert.equal(b.futuresAccountOf(strangerId).seq, 0)
+  assert.equal(b.futuresAccountOf(aId).balance, before.balance)
+})
+
+test('票 94：老邻居（没有 futures 能力位）不影响本机，窗口直说对端未升级', async (t) => {
+  // 两台都是老版本：谁都没有 futures 能力位，也就选不出房主。
+  const oldCaps = ['raid', 'look', 'crops']
+  const { a, b } = await connectedPair(t, {
+    a: { caps: oldCaps, futuresHost: false },
+    b: { caps: oldCaps, futuresHost: false }
+  })
+  await delay(300)
+  assert.deepEqual(a.snapshot().neighbors[0].caps ?? [], oldCaps)
+  for (const service of [a, b]) {
+    const window = service.futuresWindow()
+    assert.equal(window.role, 'peer')
+    assert.equal(window.hostId, null)
+    assert.equal(window.peer.ready, false)
+    assert.equal(window.peer.text, '对端未升级，期货不可用')
+    assert.equal(service.futuresHost(), null)
+  }
+  // 农场与本机账本都没被这条链路动过：老邻居照常种地。
+  assert.equal(a.snapshot().farm.coins, 500)
+  assert.equal(b.snapshot().farm.coins, 500)
+  assert.equal(a.futures().balance, 0)
+  assert.equal(b.futures().balance, 0)
+})

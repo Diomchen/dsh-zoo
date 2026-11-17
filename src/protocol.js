@@ -30,6 +30,8 @@ import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 // 票 82：盘口周报只认盘口的作物/方向/杠杆白名单——白名单的真相在 `src/trading-rules.js`
 // （盘口窗口的按钮也由它下发），协议层不另抄一份。
 import { isBoardCrop, isBoardSide, isTradingLeverage } from './trading-rules.js'
+// 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
+import { isFuturesLeverage, isFuturesSide, isMarginAmount } from './futures-rules.js'
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -93,6 +95,28 @@ export const MAX_WEEK_PNL = 1_000_000
  */
 export const MAX_WEEK_PNL_PCT = 1000
 /**
+ * 期货（票 94）：一台机器当房主清算，其余机器只发指令。
+ *
+ * 线上只有五个类型：`hello`（我想跟你做期货）、`order`（充值/开仓/平仓）、
+ * `cancel`（票 96 的占位，收到就丢）、`settle`（房主 → peer 的账户快照）、
+ * `sync`（peer 每 30 秒要一次对账）。
+ *
+ * 关键：**peer 发过来的只有「做什么」**——没有价格、没有成交价、没有余额。
+ * 价格、成交、余额全部由房主算（SPEC v11「任何 LAN 玩家都能开户，不需要审批」），
+ * 所以伪造一包也改不了别人的账，最多改自己的。
+ */
+export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit'])
+/** 一份 settle 最多带 8 条持仓：与盘口周报同一量级，整包稳在 4 KiB 内。 */
+export const FUTURES_MAX_POSITIONS = 8
+/** 合约编号（与 `src/futures-rules.js` 的 `contractOf` 同形）：`tomato-2026W47`。 */
+export const FUTURES_CONTRACT_RE = /^[a-z][a-z0-9_]*-\d{4}W\d{2}$/
+/** 余额/保证金是「币」，上线到分（`roundCent`）；这里只给一个宽到不可能撞上的上界。 */
+export const MAX_FUTURES_COIN = 1_000_000_000
+/** 账户流水号 0..2^31-1：一根合约 15 分钟结算一次，这个量级够跑几十年。 */
+export const MAX_FUTURES_SEQ = 2 ** 31 - 1
+/** 一条持仓的张数上限：与 `src/futures.js` 的 `MAX_QUANTITY` 同量级（100 张一手 × 一万手）。 */
+export const MAX_FUTURES_LOTS = 1_000_000
+/**
  * 雇工挂牌的真实可用性（ticket 44）：`ready` / `off` / `visiting` / `working`。
  * 枚举与 `src/contracts-rules.js` 同源；`null` 只为兼容旧版本保留。
  */
@@ -142,10 +166,12 @@ export const PLOT_ID_RE = /^p(?:[1-9]|[1-4][0-9]|50)$/
 
 /**
  * 能力声明（ticket 51 / ADR-0018）：老版本不发也不认，缺省 = 只支持串门。
- * `raid` = 能收「来偷」的串门请求（免放行）；`look` = 有 `/dsh-zoo-farm/open` 只读视图。
+ * `raid` = 能收「来偷」的串门请求（免放行）；`look` = 有 `/dsh-zoo-farm/open` 只读视图；
+ * `crops` = 会发运行时作物目录；`futures` = 认识期货五包（票 94，没有 = 老版本，不能一起交易）；
+ * `packet` = 认识红包回执里的 `item`（另一个会话的分支加的能力位，这里补回，别丢）。
  */
-export const CAPS = Object.freeze(['raid', 'look', 'crops'])
-export const MAX_CAPS = 4
+export const CAPS = Object.freeze(['raid', 'look', 'crops', 'futures', 'packet'])
+export const MAX_CAPS = 5
 /** 一趟行程的硬上限（ticket 51）：到点自己回家，不写串门记录。 */
 export const RAID_MAX_MS = 60 * 1000
 export const RAID_PURPOSE = 'steal'
@@ -316,7 +342,14 @@ export const PACKET_TYPES = Object.freeze([
   'work-end',
   'work-end-ack',
   'work-settle',
-  'work-settle-ack'
+  'work-settle-ack',
+  // 票 94：期货（双机开户与净额结算）。老版本按「未知类型」整包丢掉——既不会崩，
+  // 也不会被拉进一场它算不了的账；本机靠 beacon 的 `futures` 能力位认出这些邻居。
+  'futures-hello',
+  'futures-order',
+  'futures-cancel',
+  'futures-settle',
+  'futures-sync'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -340,6 +373,7 @@ const HIRE_REASON_SET = new Set(HIRE_REASONS)
 const WORK_ERROR_SET = new Set(WORK_ERRORS)
 const WORK_END_REASON_SET = new Set(WORK_END_REASONS)
 const WORK_SETTLE_REASON_SET = new Set(WORK_SETTLE_REASONS)
+const FUTURES_ORDER_KIND_SET = new Set(FUTURES_ORDER_KINDS)
 
 const TYPE_SET = new Set(PACKET_TYPES)
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
@@ -704,6 +738,100 @@ export function normalizeTradingPositions (value) {
   return positions
 }
 
+/**
+ * 币值（余额/保证金/盈亏）：一律四舍五入到分再上线。
+ *
+ * 农场硬币是整数，期货的保证金/手续费/盈亏却是「币」的浮点数（账本那边落账前
+ * 都过 `roundCoin`）。线上再取一次整分，是为了让「同一笔账」在两台机器上
+ * JSON 比出来完全相等——否则 100.00000000000001 这种尾巴会让两边永远对不上。
+ */
+function roundCent (value) {
+  return Math.round(value * 100) / 100
+}
+
+/** 币值：有限数、非负、到分；坏值返回 null（整包丢，不猜）。 */
+function normalizeFuturesCoin (value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  if (value < 0 || value > MAX_FUTURES_COIN) return null
+  return roundCent(value)
+}
+
+/** 价格/保证金的正数版本：0 不算（持仓的 entry/margin 不可能是 0）。 */
+function normalizeFuturesPositiveCoin (value) {
+  const coin = normalizeFuturesCoin(value)
+  return coin === null || coin <= 0 ? null : coin
+}
+
+/** 变动额：可正可负（充值 +、强平 −），同样到分。 */
+function normalizeFuturesDelta (value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  if (value < -MAX_FUTURES_COIN || value > MAX_FUTURES_COIN) return null
+  return roundCent(value)
+}
+
+/** 账户 epoch：房主每次启动换一个新 UUID；线上只要求非空、不超长。 */
+export function isFuturesEpoch (value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_LABEL
+}
+
+/** 账户流水号：0..2^31-1 的整数（比 SafeInteger 窄，坏包更容易被抓出来）。 */
+export function isFuturesSeq (value) {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_FUTURES_SEQ
+}
+
+export function isFuturesOrderKind (value) {
+  return typeof value === 'string' && FUTURES_ORDER_KIND_SET.has(value)
+}
+
+/**
+ * settle 里的一条持仓。与盘口周报的持仓（只有 crop/side/leverage）不同，
+ * 这里必须带 id/entry/margin/lots：peer 要按 id 平仓，也要自己算浮盈给你看。
+ *
+ * 任何一条坏就整包丢——半份账户比没有更危险（少一条持仓，看起来就像已经平掉了）。
+ */
+function normalizeFuturesPosition (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  if (!isVisitId(value.id)) return null
+  if (!isCropId(value.crop)) return null
+  if (typeof value.contract !== 'string' || !FUTURES_CONTRACT_RE.test(value.contract)) return null
+  if (!isFuturesSide(value.side)) return null
+  if (!Number.isInteger(value.lots) || value.lots < 1 || value.lots > MAX_FUTURES_LOTS) return null
+  const entry = normalizeFuturesPositiveCoin(value.entry)
+  if (entry === null) return null
+  const margin = normalizeFuturesPositiveCoin(value.margin)
+  if (margin === null) return null
+  if (!isFuturesLeverage(value.leverage)) return null
+  return {
+    id: value.id.toLowerCase(),
+    crop: value.crop,
+    contract: value.contract,
+    side: value.side,
+    lots: value.lots,
+    entry,
+    margin,
+    leverage: value.leverage
+  }
+}
+
+function normalizeFuturesPositions (value) {
+  if (!Array.isArray(value)) return null
+  if (value.length > FUTURES_MAX_POSITIONS) return null
+  const positions = []
+  for (const entry of value) {
+    const position = normalizeFuturesPosition(entry)
+    if (position === null) return null
+    positions.push(position)
+  }
+  return positions
+}
+
+/** 五包共用的 `at`：缺省取本地时钟；坏时间整包丢（与 digest 同一套判定）。 */
+function futuresStamp (at, now) {
+  const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
+  if (stamp === null) throw new Error('protocol: invalid futures at')
+  return stamp
+}
+
 /** 环境变量覆盖监听端口；非法值静默回落到默认端口，避免坏配置把插件拖死。 */
 export function resolvePort (env = process.env) {
   const raw = env?.DSH_ZOO_PORT
@@ -722,6 +850,11 @@ export function resolvePort (env = process.env) {
  *   gift-received           → { v, type, deviceId, visitId, giftId }
  *   market-digest           → { v, type, deviceId, at, prices, hire }
  *   trading-digest          → { v, type, deviceId, at, weekPnl[, weekPnlPct], positions }
+ *   futures-*               → hello { v, type, deviceId, at }；
+ *                             order { v, type, deviceId, at, kind, … }（按 kind 只带自己那几个字段）；
+ *                             cancel { v, type, deviceId, at, positionId }；
+ *                             settle { v, type, deviceId, at, epoch, seq, balance, marginUsed, delta, positions }；
+ *                             sync { v, type, deviceId, at, epoch, lastSeq }
  * 绝不带上坐标：这个函数没有接收坐标的参数，也不需要（ADR-0003）。
  *
  * deviceId / visitId / port / deny reason 是本地代码传进来的，非法即抛
@@ -790,6 +923,19 @@ function buildPacket ({
   guard,
   servedMs,
   earned,
+  // 票 94：期货五包的全部线上字段（side/margin/leverage/coins/positionId/epoch/seq/balance/marginUsed/delta/lastSeq）
+  kind,
+  side,
+  margin,
+  leverage,
+  coins,
+  positionId,
+  epoch,
+  seq,
+  balance,
+  marginUsed,
+  delta,
+  lastSeq,
   caps,
   purpose,
   plots,
@@ -1073,6 +1219,63 @@ function buildPacket ({
     const safeEntries = normalizeCatalogEntries(entries)
     if (safeEntries === null) throw new Error('protocol: invalid catalog entries')
     packet = { ...base, catalogHash: safeCatalogHash, chunk, total, entries: safeEntries }
+  } else if (type === 'futures-hello') {
+    // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，at 会在这里消失。
+    packet = { ...base, at: futuresStamp(at, now) }
+  } else if (type === 'futures-order') {
+    // 只带「做什么」。价格、成交价、余额一律不上线：房主算，peer 信不信由它。
+    const stamp = futuresStamp(at, now)
+    if (!isFuturesOrderKind(kind)) throw new Error('protocol: invalid futures kind')
+    if (kind === 'open') {
+      if (!isCropId(crop)) throw new Error('protocol: invalid futures crop')
+      if (!isFuturesSide(side)) throw new Error('protocol: invalid futures side')
+      if (!isMarginAmount(margin)) throw new Error('protocol: invalid futures margin')
+      if (!isFuturesLeverage(leverage)) throw new Error('protocol: invalid futures leverage')
+      packet = { ...base, at: stamp, kind, crop, side, margin, leverage }
+    } else if (kind === 'close') {
+      if (!isVisitId(positionId)) throw new Error('protocol: invalid positionId')
+      packet = { ...base, at: stamp, kind, positionId: positionId.toLowerCase() }
+    } else {
+      // 充值只带金币数量：钱从房主那边的农场账户走，peer 不自己扣。
+      if (!Number.isInteger(coins) || coins < 1 || coins > MAX_FUTURES_COIN) {
+        throw new Error('protocol: invalid futures coins')
+      }
+      packet = { ...base, at: stamp, kind, coins }
+    }
+  } else if (type === 'futures-cancel') {
+    // 票 96 才有语义（撤单/撤单回执）；现在只保证形状能被解析，收到就丢。
+    if (!isVisitId(positionId)) throw new Error('protocol: invalid positionId')
+    packet = { ...base, at: futuresStamp(at, now), positionId: positionId.toLowerCase() }
+  } else if (type === 'futures-settle') {
+    // 房主 → peer 的账户快照。`delta` 只说明这一拍余额动了多少，
+    // peer **不拿它入账**（账以 balance/marginUsed/positions 为准），所以重复包不会被记两次。
+    const stamp = futuresStamp(at, now)
+    if (!isFuturesEpoch(epoch)) throw new Error('protocol: invalid futures epoch')
+    if (!isFuturesSeq(seq)) throw new Error('protocol: invalid futures seq')
+    const safeBalance = normalizeFuturesCoin(balance)
+    if (safeBalance === null) throw new Error('protocol: invalid futures balance')
+    const safeMarginUsed = normalizeFuturesCoin(marginUsed)
+    if (safeMarginUsed === null) throw new Error('protocol: invalid futures margin used')
+    const safeDelta = normalizeFuturesDelta(delta)
+    if (safeDelta === null) throw new Error('protocol: invalid futures delta')
+    const safePositions = normalizeFuturesPositions(positions)
+    if (safePositions === null) throw new Error('protocol: invalid futures positions')
+    packet = {
+      ...base,
+      at: stamp,
+      epoch,
+      seq,
+      balance: safeBalance,
+      marginUsed: safeMarginUsed,
+      delta: safeDelta,
+      positions: safePositions
+    }
+  } else if (type === 'futures-sync') {
+    // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
+    const stamp = futuresStamp(at, now)
+    if (!isFuturesEpoch(epoch)) throw new Error('protocol: invalid futures epoch')
+    if (!isFuturesSeq(lastSeq)) throw new Error('protocol: invalid futures last seq')
+    packet = { ...base, at: stamp, epoch, lastSeq }
   } else if (VISIT_TYPES.has(type)) {
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
     packet = { ...base, visitId: visitId.toLowerCase() }
@@ -1219,6 +1422,53 @@ export function encodeMarketDigest ({ deviceId, at, prices, hire, now } = {}) {
  */
 export function encodeTradingDigest ({ deviceId, at, weekPnl, weekPnlPct, positions, now } = {}) {
   return encodePacket({ type: 'trading-digest', deviceId, at, weekPnl, weekPnlPct, positions, now })
+}
+
+/**
+ * 期货五包（票 94）的窄入口：全部只带账户字段——没有昵称、端口、坐标、自由文本。
+ * 编码失败抛异常（本机程序错误）；解析失败返回 `{ok:false, reason}`（网络输入）。
+ */
+export function encodeFuturesHello ({ deviceId, at, now } = {}) {
+  return encodePacket({ type: 'futures-hello', deviceId, at, now })
+}
+
+export function encodeFuturesOrder ({ deviceId, at, kind, crop, side, margin, leverage, coins, positionId, now } = {}) {
+  return encodePacket({
+    type: 'futures-order',
+    deviceId,
+    at,
+    kind,
+    crop,
+    side,
+    margin,
+    leverage,
+    coins,
+    positionId,
+    now
+  })
+}
+
+export function encodeFuturesCancel ({ deviceId, at, positionId, now } = {}) {
+  return encodePacket({ type: 'futures-cancel', deviceId, at, positionId, now })
+}
+
+export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, now } = {}) {
+  return encodePacket({
+    type: 'futures-settle',
+    deviceId,
+    at,
+    epoch,
+    seq,
+    balance,
+    marginUsed,
+    delta,
+    positions,
+    now
+  })
+}
+
+export function encodeFuturesSync ({ deviceId, at, epoch, lastSeq, now } = {}) {
+  return encodePacket({ type: 'futures-sync', deviceId, at, epoch, lastSeq, now })
 }
 
 /**
@@ -1761,6 +2011,104 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         requestId: raw.requestId.toLowerCase(),
         ok: false,
         error: raw.error
+      }
+    }
+  }
+
+  // 期货五包（票 94）：**不**落进 VISIT_TYPES（那里只重建四个字段，账户字段会消失）。
+  // 任何一项坏都整包丢；昵称、端口、坐标等即使出现也不读（下面重建对象）。
+  if (raw.type === 'futures-hello') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    return {
+      ok: true,
+      packet: { v: PROTOCOL_VERSION, type: raw.type, deviceId: raw.deviceId.toLowerCase(), at }
+    }
+  }
+
+  if (raw.type === 'futures-order') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!isFuturesOrderKind(raw.kind)) return fail('kind')
+    const base = { v: PROTOCOL_VERSION, type: raw.type, deviceId: raw.deviceId.toLowerCase(), at, kind: raw.kind }
+    if (raw.kind === 'open') {
+      if (!isCropId(raw.crop)) return fail('crop')
+      if (!isFuturesSide(raw.side)) return fail('side')
+      if (!isMarginAmount(raw.margin)) return fail('margin')
+      if (!isFuturesLeverage(raw.leverage)) return fail('leverage')
+      return { ok: true, packet: { ...base, crop: raw.crop, side: raw.side, margin: raw.margin, leverage: raw.leverage } }
+    }
+    if (raw.kind === 'close') {
+      if (!isVisitId(raw.positionId)) return fail('position-id')
+      return { ok: true, packet: { ...base, positionId: raw.positionId.toLowerCase() } }
+    }
+    if (!Number.isInteger(raw.coins) || raw.coins < 1 || raw.coins > MAX_FUTURES_COIN) return fail('coins')
+    return { ok: true, packet: { ...base, coins: raw.coins } }
+  }
+
+  // 撤单（票 96）：形状照收，语义还没有。收到的一方按协议只当作「知道你要撤」。
+  if (raw.type === 'futures-cancel') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!isVisitId(raw.positionId)) return fail('position-id')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        positionId: raw.positionId.toLowerCase()
+      }
+    }
+  }
+
+  // 账户快照：peer 只读，不入账两次（幂等键是 (epoch, seq)，见 service 的 applySettle）。
+  if (raw.type === 'futures-settle') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!isFuturesEpoch(raw.epoch)) return fail('epoch')
+    if (!isFuturesSeq(raw.seq)) return fail('seq')
+    const balance = normalizeFuturesCoin(raw.balance)
+    if (balance === null) return fail('balance')
+    const marginUsed = normalizeFuturesCoin(raw.marginUsed)
+    if (marginUsed === null) return fail('margin-used')
+    const delta = normalizeFuturesDelta(raw.delta)
+    if (delta === null) return fail('delta')
+    const positions = normalizeFuturesPositions(raw.positions)
+    if (positions === null) return fail('positions')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        epoch: raw.epoch,
+        seq: raw.seq,
+        balance,
+        marginUsed,
+        delta,
+        positions
+      }
+    }
+  }
+
+  // 对账请求：peer 报「我手上有哪个 epoch 的第几号账」，房主回一条 settle。
+  if (raw.type === 'futures-sync') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!isFuturesEpoch(raw.epoch)) return fail('epoch')
+    if (!isFuturesSeq(raw.lastSeq)) return fail('last-seq')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        epoch: raw.epoch,
+        lastSeq: raw.lastSeq
       }
     }
   }

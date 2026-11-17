@@ -30,8 +30,10 @@ function entry (overrides = {}) {
 }
 
 test('能力位：新增 crops，且只认已知能力', () => {
-  assert.deepEqual([...CAPS], ['raid', 'look', 'crops'])
+  assert.deepEqual([...CAPS], ['raid', 'look', 'crops', 'futures', 'packet'])
   assert.deepEqual(normalizeCaps(['crops', 'nope', 'crops']), ['crops'])
+  // 票 94：新能力位进了白名单，老邻居的 caps 里没有它就是「没升级」。
+  assert.deepEqual(normalizeCaps(['futures', 'crops']), ['futures', 'crops'])
 })
 
 test('报文类型表：两条目录报文都在白名单里', () => {

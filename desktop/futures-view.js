@@ -313,7 +313,15 @@
       return { kind: 'starting', text: '期货市场还没就绪，稍等一拍。', action: null }
     }
     if (view.ready === false) {
+      // 对端没升级时房主的账户发不过来，界面得说清楚是谁的问题。
+      if (view.peer !== undefined && view.peer !== null && view.peer.ready === false) {
+        return { kind: 'starting', text: view.peer.text ?? '对端未升级，期货不可用。', action: null }
+      }
       return { kind: 'starting', text: '期货市场还没就绪，稍等一拍。', action: null }
+    }
+    // 自己是 peer 时窗口照常可看，但要有「等房主」的底注，不能显示成空账户。
+    if (view.peer !== undefined && view.peer !== null && view.peer.ready === false) {
+      return { kind: 'starting', text: view.peer.text ?? '对端未升级，期货不可用。', action: null }
     }
     const balance = round2(view.balance) ?? 0
     const marginUsed = round2(view.marginUsed) ?? 0
