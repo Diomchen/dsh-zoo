@@ -108,6 +108,11 @@
   /** 渲染端「我还在命中区里」的心跳间隔；主进程允许的最大陈旧时间。 */
   const HOVER_HEARTBEAT_MS = 350
   const HOVER_CONFIRM_MAX_AGE_MS = 1200
+  /**
+   * 渲染端上报的本地指针（CSS 坐标）的保鲜期：心跳 350ms 一拍，留四拍余量。
+   * 混合 DPI 下主进程按这份坐标裁定命中（票 93），过期就退回 OS 光标。
+   */
+  const HOVER_POINT_MAX_AGE_MS = 1500
   /** 主进程按真实光标位置兜底轮询的间隔。 */
   const POINTER_POLL_MS = 100
   /**
@@ -3793,6 +3798,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       allWorkspaces: raw.allWorkspaces === true,
       bounds,
       pointer,
+      // 票 93：这次命中判定用的是谁的坐标（渲染端 CSS 指针 / OS 光标），以及渲染端那一路的原值。
+      // 混合 DPI 现场只靠 `pointer` 一个数是看不出「差在哪一侧」的。
+      pointerSource: raw.pointerSource === 'renderer' || raw.pointerSource === 'os' ? raw.pointerSource : null,
+      hoverPoint: normalizePoint(raw.hoverPoint),
       debug: raw.debug === true
     }
   }
@@ -4152,6 +4161,57 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { x: point.x + area.x, y: point.y + area.y }
   }
 
+  /**
+   * 命中判定用哪个「窗口本地坐标」（票 93）。
+   *
+   * 窗口铺满整张虚拟桌面时，`screen.getCursorScreenPoint()` 给的是**光标所在那块屏**的缩放折算后的
+   * 屏幕坐标，而窗口自己只按**一块**屏的缩放渲染。两块屏缩放不同（例如 125% + 150%）时，
+   * 「光标屏幕坐标 − 窗口 bounds」推出的本地坐标和渲染端真实的 CSS 坐标会差一截：渲染端知道
+   * 光标就在宠物身上，主进程却判定「在外面」，窗口永远停在穿透，点哪儿都掉到下层窗口。
+   *
+   * 所以缩放不一致时以渲染端上报的指针为准（pointermove 的 CSS 坐标，和命中矩形同一套坐标系）；
+   * 缩放一致时保持原行为，主进程仍按 OS 光标独立复核，渲染端卡死时照样 fail-closed。
+   * 渲染端指针过期、越界、形状不对一律不用，退回 OS 光标。
+   *
+   * @param {object} [options]
+   * @param {{x:number,y:number}|null} [options.osPoint] OS 光标换算出的窗口本地坐标
+   * @param {{x:number,y:number}|null} [options.rendererPoint] 渲染端上报的本地指针（CSS 坐标）
+   * @param {number} [options.rendererAt] 渲染端上报时刻（毫秒时间戳）
+   * @param {number} [options.now] 当前时刻，测试可注入
+   * @param {number} [options.maxAgeMs] 渲染端指针的保鲜期
+   * @param {boolean} [options.preferRenderer] 是否优先采信渲染端指针（混合 DPI 时为真）
+   * @param {{x:number,y:number,width:number,height:number}|null} [options.area] 窗口本地矩形，越界即弃
+   * @returns {{point:{x:number,y:number}|null, source:'renderer'|'os'|null}}
+   */
+  function chooseLocalPoint (options = {}) {
+    const now = isFiniteNumber(options.now) ? options.now : Date.now()
+    const maxAge = isFiniteNumber(options.maxAgeMs) && options.maxAgeMs >= 0
+      ? options.maxAgeMs
+      : HOVER_POINT_MAX_AGE_MS
+    const os = normalizePoint(options.osPoint)
+    const renderer = freshLocalPoint(options.rendererPoint, options.rendererAt, now, maxAge, options.area)
+    if (options.preferRenderer === true && renderer !== null) return { point: renderer, source: 'renderer' }
+    if (os !== null) return { point: os, source: 'os' }
+    if (renderer !== null) return { point: renderer, source: 'renderer' }
+    return { point: null, source: null }
+  }
+
+  /** 渲染端上报的本地指针：要新鲜、要落在窗口里；任一条不满足就当没有。 */
+  function freshLocalPoint (raw, at, now, maxAgeMs, area) {
+    const point = normalizePoint(raw)
+    if (point === null) return null
+    const stamp = Number(at)
+    if (!Number.isFinite(stamp) || stamp <= 0) return null
+    const age = now - stamp
+    if (!(age >= 0) || age > maxAgeMs) return null
+    const rect = normalizeRect(area)
+    if (rect !== null) {
+      if (point.x < rect.x || point.y < rect.y) return null
+      if (point.x > rect.x + rect.width || point.y > rect.y + rect.height) return null
+    }
+    return point
+  }
+
   // -------------------------------------------------------------------------
   // 宠物物理（纯函数）
   // -------------------------------------------------------------------------
@@ -4485,6 +4545,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     MAX_DISPLAYS,
     HOVER_HEARTBEAT_MS,
     HOVER_CONFIRM_MAX_AGE_MS,
+    HOVER_POINT_MAX_AGE_MS,
     POINTER_POLL_MS,
     MAIN_FALLBACK_DWELL_MS,
     RENDERER_RECT_MAX_AGE_MS,
@@ -4632,6 +4693,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     unionRect,
     toLocalPoint,
     toScreenPoint,
+    chooseLocalPoint,
     shouldReadStdinDirectly,
     shouldBeInteractive,
     shouldReassert,

@@ -151,10 +151,14 @@
     })
   }
 
-  function reportHover (inside) {
+  /**
+   * 悬停申请 + 心跳。票 93：把渲染端自己的 CSS 指针一起带上——混合 DPI 的跨屏窗口里，
+   * `screen.getCursorScreenPoint()` 换算出的本地坐标和这份坐标对不上，主进程只认这一份。
+   */
+  function reportHover (inside, point) {
     if (!api || typeof api.reportHover !== 'function') return
     try {
-      api.reportHover(inside === true)
+      api.reportHover(inside === true, point === undefined ? null : point)
     } catch {
       // 主进程没了/管道断了：窗口本来就会随进程消失
     }
@@ -237,7 +241,7 @@
     stopHoverHeartbeat()
     if (!hoverInside) return
     hoverInside = false
-    reportHover(false)
+    reportHover(false, pointer)
   }
 
   /**
@@ -423,13 +427,13 @@
     if (inside) {
       if (hoverTimer === null) {
         hoverTimer = setInterval(() => {
-          if (hoverInside && drag === null) reportHover(true)
+          if (hoverInside && drag === null) reportHover(true, pointer)
         }, shared.HOVER_HEARTBEAT_MS)
       }
     } else {
       stopHoverHeartbeat()
     }
-    reportHover(inside)
+    reportHover(inside, pointer)
   }
 
   // -------------------------------------------------------------------------
@@ -3213,7 +3217,7 @@
     api.onProbe(() => {
       reportRects(true)
       reportOverlayRects(true)
-      reportHover(hoverInside)
+      reportHover(hoverInside, pointer)
     })
   }
   if (api && typeof api.onScene === 'function') api.onScene(applyScene)
