@@ -27,7 +27,7 @@
   }
   #app {
     display: grid; height: 100%;
-    grid-template-rows: 52px auto minmax(0, 1fr) auto 172px;
+    grid-template-rows: 52px auto minmax(0, 1fr) auto 220px;
     grid-template-columns: minmax(0, 1fr);
   }
   .modebar {
@@ -106,15 +106,22 @@
     padding: 5px 12px; border-radius: var(--radius); cursor: pointer; font: inherit;
     border: 1px solid var(--line); background: transparent; color: var(--ink);
   }
-  .bottom { display: grid; grid-template-columns: minmax(0, 1fr) 216px 250px; border-top: 0; }
-  .bottom > section + section { border-left: 2px solid var(--line); }
+  /* 底部两行：持仓通栏一行，挂单与成交各占半行——760 宽挤三栏时挂单表必然横向溢出。 */
+  .bottom {
+    display: grid; border-top: 0;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .bottom > section:first-child { grid-column: 1 / -1; border-bottom: 2px solid var(--line); }
+  .bottom > section:nth-child(3) { border-left: 2px solid var(--line); }
   .bottom h2 { margin: 0; padding: 5px 10px; font-size: 12px; color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--soft); }
-  .bottom th, .bottom td { padding: 3px 5px; font-size: 11px; }
+  .bottom th, .bottom td { padding: 3px 4px; font-size: 11px; }
+  .bottom td:first-child { max-width: 72px; overflow: hidden; text-overflow: ellipsis; }
   .scroll { overflow: auto; max-height: 144px; }
   .empty { padding: 14px; color: var(--muted); }
   .close-btn {
     border: 1px solid var(--line); background: transparent; color: var(--ink); border-radius: 4px;
-    padding: 1px 6px; cursor: pointer; font: inherit; font-size: 12px;
+    padding: 1px 5px; cursor: pointer; font: inherit; font-size: 11px;
   }
   .close-btn + .close-btn { margin-left: 4px; }
   .limit { margin-top: 6px; font-variant-numeric: tabular-nums; }
@@ -229,7 +236,7 @@
       <h2 id="ordersTitle">我的挂单</h2>
       <div class="scroll">
         <table>
-          <thead><tr><th>合约</th><th>方向</th><th>价格</th><th>张数</th><th>剩余</th><th>冻结</th></tr></thead>
+          <thead><tr><th>合约</th><th>方向</th><th>价格</th><th>张数</th><th>剩余</th><th></th></tr></thead>
           <tbody id="orders"></tbody>
         </table>
         <div class="empty" id="ordersEmpty">暂无挂单</div>

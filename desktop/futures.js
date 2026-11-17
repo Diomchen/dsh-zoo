@@ -9,9 +9,10 @@
  *   - 不 import 规则层：杠杆/作物/费率都从 `view.limits` 与 `view.crops` 读；
  *   - 提交只表达意图：side/margin/leverage/cropId/positionId，价格与张数不过桥。
  */
-'use strict'
 
 (function () {
+  'use strict'
+
   const api = window.dshZooFuturesView
   const bridge = window.dshZooFutures
   const el = (id) => document.getElementById(id)
@@ -104,10 +105,11 @@
     for (const row of rows) {
       const tr = document.createElement('tr')
       if (row.danger) tr.className = 'danger'
-      const cells = [row.contract, row.side, row.lots, row.entry, row.margin, row.liquidation, row.unrealized]
+      const cells = [row.label, row.side, row.lots, row.entry, row.margin, row.liquidation, row.unrealized]
       cells.forEach((text, index) => {
         const td = document.createElement('td')
         td.textContent = text
+        if (index === 0) td.title = row.contract
         if (index === 6) td.className = row.tone
         tr.appendChild(td)
       })
@@ -137,10 +139,11 @@
     body.textContent = ''
     for (const row of rows) {
       const tr = document.createElement('tr')
-      const cells = [row.time, row.contract, row.kind + row.side, row.price, row.lots, row.fee]
-      for (const text of cells) {
+      const cells = [row.time, row.label, row.kind + row.side, row.price, row.lots, row.fee]
+      for (const [index, text] of cells.entries()) {
         const td = document.createElement('td')
         td.textContent = text
+        if (index === 1) td.title = row.contract
         tr.appendChild(td)
       }
       body.appendChild(tr)
@@ -153,10 +156,12 @@
     body.textContent = ''
     for (const row of rows) {
       const tr = document.createElement('tr')
-      const cells = [row.label, row.sideText, row.price, row.lots, row.lotsLeft, row.marginFrozen]
-      for (const text of cells) {
+      // 178px 只放得下五列 + 撤：合约名、方向、限价、张数、剩余；冻结保证金挂到标题上。
+      const cells = [row.label, row.side, row.price, row.lots, row.lotsLeft]
+      for (const [index, text] of cells.entries()) {
         const td = document.createElement('td')
         td.textContent = text
+        if (index === 0) td.title = row.label + ' · 冻结保证金 ' + row.marginFrozen
         tr.appendChild(td)
       }
       const action = document.createElement('td')

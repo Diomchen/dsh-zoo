@@ -285,6 +285,8 @@
       const used = margin !== null && margin > 0 && unrealized !== null ? -unrealized / margin : 0
       rows.push({
         id: typeof position?.id === 'string' ? position.id : null,
+        // 底部三栏只有 760 宽，画合约代号会被裁掉；代号留在 `title` 里，单元格画作物名。
+        label: cropNameOf(view, position?.crop) ?? (typeof position?.contract === 'string' ? position.contract : '—'),
         contract: typeof position?.contract === 'string' ? position.contract : '—',
         side: position?.side === 'short' ? '空' : '多',
         sideKey: position?.side === 'short' ? 'short' : 'long',
@@ -349,6 +351,7 @@
     return trades.slice(0, 20).map((trade) => {
       return {
         time: formatClock(trade?.at),
+        label: cropNameOf(view, trade?.crop) ?? (typeof trade?.contract === 'string' ? trade.contract : '—'),
         contract: typeof trade?.contract === 'string' ? trade.contract : '—',
         side: trade?.side === 'short' ? '空' : '多',
         sideKey: trade?.side === 'short' ? 'short' : 'long',

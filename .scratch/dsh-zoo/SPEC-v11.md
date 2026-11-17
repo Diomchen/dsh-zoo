@@ -7,7 +7,7 @@
 > 量化依据：盘口当前每 50 币 20× 跟提示 ≈ 28,671 币/天，而本机农场累计才 28,569 币
 > （见工作区 `zoo-board-1.7.0-review.md` 第九节）。期货要修的就是这个"印钞"缺口。
 
-**Status:** draft
+**Status:** implemented（2026-11-17，票 92–99，见文末「实现」）
 
 **Tickets:** 92–99
 
@@ -171,3 +171,32 @@
 - **与盘口的关系**：盘口是"街机"，期货是"市场"。盘口不改，玩家想稳赚去盘口，想对赌来期货。两者共用同一批作物与硬币，但账本完全隔离。
 - **为什么不是零和**：做市商的价差和费用会把钱从系统里抽走（90% 销毁），长期看所有玩家合计是负和的——这正是它比盘口诚实的地方。
 - **已知不服帖**：现有 UDP 没有时钟同步，所以结算只能以房主时钟为准；peer 的 `at` 仅用于展示，不参与任何计算。
+
+## 实现（2026-11-17，票 92–99）
+
+- **纯规则** `src/futures-rules.js`：合约（周一 00:00 上市 / 周五 20:00 到期）、15 秒一步的均值回归
+  公允价（`OU_SIGMA = 0.004`、`OU_HALF_LIFE_MS = 30min`）、做市报价（`MM_SPREAD = 0.002`）、
+  一手 `LOT_SIZE = 100`、taker / 交割费 `0.1%`（`FEE_INSURANCE_SHARE = 0.1`、其余销毁）、
+  四档交割收盘（19:15/19:30/19:45/20:00 算术平均）、杠杆 1/3/10/20、灰度档位与
+  `DAILY_NOTIONAL_CAP = 5000` / `POSITION_NOTIONAL_CAP = 20000` 白名单。
+- **账本** `src/futures.js`：`futures.json` v1（托管账户、仓位、挂单、成交流水、保险基金与
+  `shortfall`、`mode`/`dayStart`/`dayNotional`/`pending`/`disabled`、对账锚点
+  `farmAnchor`/`farmIn`/`farmOut`）；每 15 秒盯市 + 每根净额结算，逐 15 秒扫描强平，
+  强平/交割亏空由保险基金兜底、余额永不为负；`setMode` / `reconcile` / `rollback`。
+- **撮合与协议** `src/futures.js` + `src/protocol.js`：价格优先的玩家挂单，成交价取 maker；
+  `futures-hello` / `futures-announce` / `futures-settle` / `futures-sync` / `futures-trade`
+  五包 + 字段白名单、`(epoch, seq)` 幂等、`mode`/`pending` 白名单、4 KiB 上限。
+- **宿主接线** `src/service.js`：动作分发（open/close/place/cancel/convert/deposit/withdraw/
+  settle/mode/rollback/reconcile）、`/state.futures`、窗口推送、同源 20 包 / 10 秒限速、
+  中文错误文案；入口 `handleFuturesOpen`。
+- **窗口** `desktop/futures-view.js`（纯视图）+ `desktop/futures.{html,js,preload.js}` +
+  `desktop/shared.js` 白名单归一化；顶部余额条、三档灰度条、报价表、下单/限价、底部
+  持仓 + 挂单 + 成交；760×700，位置存 `futures-window.json`。
+- **测试**：`test/futures.test.js`、`test/futures-book.test.js`、`test/futures-store.test.js`、
+  `test/futures-expiry.test.js`、`test/futures-net.test.js`、`test/futures-liquidation.test.js`、
+  `test/futures-mode.test.js`、`test/futures-window.test.js`、`test/futures-script-load.test.js`、
+  `test/futures-service.test.js`、`test/protocol.test.js` 的期货报文段
+  （回环 UDP 双机，照 `trading-e2e.test.js`）；假时钟 + 本地 HTTP，不开 socket、不 sleep。
+- **偏离规格的地方**（都在票 98 证据段记着）：回滚时远端账户余额退进房主农场、记 peer `pending`；
+  切 `off` 后不再发 settle，peer 会保留旧档位直到下次握手；peer 看不到自己的日额。
+- **发版**：`docs/releases/1.8.0.md`，四张 760×700 截图在 `docs/images/futures-window-*.png`。
