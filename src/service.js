@@ -6506,6 +6506,8 @@ export function createService (ctx, options = {}) {
       kind: trade.kind,
       ...(trade.kind === 'delivery' ? { deliveryFee: trade.deliveryFee } : {})
     }))
+    // 票 97：保险基金与欠账是房主账本的全局数，peer 只显示——随每条 settle 广播。
+    const fund = futures.fundOf()
     const body = {
       deviceId: room.snapshot().self.deviceId,
       at,
@@ -6515,7 +6517,9 @@ export function createService (ctx, options = {}) {
       marginUsed: account.marginUsed,
       delta,
       positions,
-      orders
+      orders,
+      insurance: fund.insurance,
+      shortfall: fund.shortfall
     }
     // 票 96：整包硬上限 4 KiB。满仓 + 满挂单时 8 条流水可能塞不下，逐条减到能发为止。
     for (let keep = trades.length; keep >= 0; keep -= 1) {
@@ -6803,6 +6807,13 @@ export function createService (ctx, options = {}) {
       balance,
       marginUsed,
       equity: roundCoin(balance + marginUsed),
+      // 票 97：基金/欠账是房主账本的全局数（随 settle 带过来）；强平笔数只能从副本流水里数
+      // （房主一条 settle 只带两个数），所以它是「最近 8 条流水里看得见的强平笔数」。
+      insurance: replica === null ? view.insurance : replica.insurance,
+      shortfall: replica === null ? view.shortfall : replica.shortfall,
+      liquidationCount: replica === null
+        ? 0
+        : (replica.trades ?? []).filter((trade) => trade.kind === 'liquidation').length,
       positions,
       positionCount: positions.length,
       orders,

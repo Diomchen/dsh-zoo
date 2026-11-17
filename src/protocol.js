@@ -911,7 +911,9 @@ function normalizeFuturesTrade (value) {
         ? 'delivery'
         : value.kind === 'convert'
           ? 'convert'
-          : null
+          : value.kind === 'liquidation'
+            ? 'liquidation'
+            : null
   if (kind === null) return null
   const trade = {
     at,
@@ -1060,6 +1062,9 @@ function buildPacket ({
   balance,
   marginUsed,
   delta,
+  // 票 97：settle 里附带的保险基金余额与累计欠账（整数分），peer 只显示
+  insurance,
+  shortfall,
   lastSeq,
   caps,
   purpose,
@@ -1412,6 +1417,11 @@ function buildPacket ({
     // 票 96：成交流水（交割/转现货）也是可选字段；不带就是空，带了必须整份合法。
     const safeTrades = trades === undefined ? [] : normalizeFuturesTrades(trades)
     if (safeTrades === null) throw new Error('protocol: invalid futures trades')
+    // 票 97：保险基金余额与累计欠账（整数分、非负）。老房主不发时按 0，不算坏包。
+    const safeInsurance = insurance === undefined ? 0 : normalizeFuturesCoin(insurance)
+    if (safeInsurance === null) throw new Error('protocol: invalid futures insurance')
+    const safeShortfall = shortfall === undefined ? 0 : normalizeFuturesCoin(shortfall)
+    if (safeShortfall === null) throw new Error('protocol: invalid futures shortfall')
     packet = {
       ...base,
       at: stamp,
@@ -1422,7 +1432,9 @@ function buildPacket ({
       delta: safeDelta,
       positions: safePositions,
       orders: safeOrders,
-      trades: safeTrades
+      trades: safeTrades,
+      insurance: safeInsurance,
+      shortfall: safeShortfall
     }
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
@@ -1608,7 +1620,7 @@ export function encodeFuturesCancel ({ deviceId, at, orderId, positionId, now } 
   return encodePacket({ type: 'futures-cancel', deviceId, at, orderId, positionId, now })
 }
 
-export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, orders, trades, now } = {}) {
+export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, orders, trades, insurance = 0, shortfall = 0, now } = {}) {
   return encodePacket({
     type: 'futures-settle',
     deviceId,
@@ -1621,6 +1633,8 @@ export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, margin
     positions,
     orders,
     trades,
+    insurance,
+    shortfall,
     now
   })
 }
@@ -2256,6 +2270,11 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     // 票 96：成交流水可选（老 peer 不发 = 空）；给了就必须整份合法。
     const trades = raw.trades === undefined ? [] : normalizeFuturesTrades(raw.trades)
     if (trades === null) return fail('trades')
+    // 票 97：保险基金与欠账可选（老房主不发 = 0）；给了就必须是非负整数分。
+    const insurance = raw.insurance === undefined ? 0 : normalizeFuturesCoin(raw.insurance)
+    if (insurance === null) return fail('insurance')
+    const shortfall = raw.shortfall === undefined ? 0 : normalizeFuturesCoin(raw.shortfall)
+    if (shortfall === null) return fail('shortfall')
     return {
       ok: true,
       packet: {
@@ -2270,7 +2289,9 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         delta,
         positions,
         orders,
-        trades
+        trades,
+        insurance,
+        shortfall
       }
     }
   }

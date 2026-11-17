@@ -90,7 +90,11 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
                   "leverage": 10 }],
   "orders": [{ "id": "<uuid>", "crop": "tomato", "contract": "tomato-2026W47",
                "side": "short", "price": 5.12, "lots": 2, "lotsLeft": 1,
-               "leverage": 10, "marginFrozen": 5.12, "at": 1700000000000 }] }
+               "leverage": 10, "marginFrozen": 5.12, "at": 1700000000000 }],
+  "trades": [{ "at": 1700000000000, "crop": "tomato", "contract": "tomato-2026W47",
+               "side": "short", "lots": 1, "price": 4.87, "fee": 0.49,
+               "kind": "liquidation" }],
+  "insurance": 3.2, "shortfall": 0.8 }
 { "v": 1, "type": "futures-sync", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "lastSeq": 7 }
 ```
@@ -144,6 +148,8 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `balance` / `marginUsed` / `delta` | `futures-settle` | 到分的金币数（≥0；`delta` 可负）；`delta` 只用于显示「这一拍变了多少」，peer 不拿它记账——`balance` 才是真值 |
 | `positions`（期货） | `futures-settle` | 最多 `8` 条 `{ id, crop, contract, side, lots, entry, margin, leverage }`；`contract` 形如 `tomato-2026W47`（`/^[a-z][a-z0-9_]*-\d{4}W\d{2}$/`），`lots` 1..1,000,000，`entry`/`margin` 是到分的正数 |
 | `orders`（挂单） | `futures-settle` | 可选，缺省 = 空盘口；最多 `8` 条 `{ id, crop, contract, side, price, lots, lotsLeft, leverage, marginFrozen, at }`。`lots` 是原始张数、`lotsLeft` 是剩余张数（1..`lots`），`price` 是到分的正数，`marginFrozen` 是剩余部分压着的保证金；坏一条整包丢 |
+| `trades`（成交） | `futures-settle` | 可选，缺省 = 空；最多 `8` 条 `{ at, crop, contract, side, lots, price, fee, kind }`。`kind` 只认 `open` / `close` / `delivery` / `convert` / `liquidation`；`delivery` 额外带 `deliveryFee`（到分、≥0）。`side` 记的是**成交那一腿**（多单平仓记 `short`）；`liquidation` 的 `price` 就是强平触发价、`fee` 是实际收到的费用。坏一条整包丢 |
+| `insurance` / `shortfall` | `futures-settle` | 可选，缺省 `0`；保险基金余额与累计欠账，到分的金币数（≥0）。它们是**房主账本的全局数**，peer 只显示不参与计算（票 97） |
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
@@ -907,7 +913,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | `futures-hello` | peer → 房主 | `at` | 无（每 peer 30 秒最多 1 条） |
 | `futures-order` | peer → 房主 | `kind` +（`crop`/`side`/`margin`/`leverage` 或 `positionId` 或 `coins` 或 `crop`/`side`/`price`/`lots`/`leverage`） | 无（房主逐条记账，重复包靠源地址门控挡） |
 | `futures-cancel` | peer → 房主 | `orderId`（票 96 起也认 `positionId`，至少一个） | 无（撤单本身幂等：单子没了就回 `no-order`） |
-| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` / `orders` | `(epoch, seq)` |
+| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` / `orders` / `trades` / `insurance` / `shortfall` | `(epoch, seq)` |
 | `futures-sync` | peer → 房主 | `epoch` / `lastSeq` | 无（每 30 秒最多 1 条，房主收到就回一份 settle） |
 
 1. **房主选举**：`[本机 deviceId, ...带 futures 能力位的已放行邻居]` 排序取最小，两端算出
@@ -928,9 +934,15 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    支持部分成交。做市商也会扫单：买单价 ≥ `ask`、卖单价 ≤ `bid` 时整张按挂单价成交。
    每笔成交给双方各开一个仓位，`margin` 取该笔对应比例的冻结保证金、`entry` 取成交价，
    双方各收 0.1% 名义费用（9 成销毁、1 成进保险）。撤单只退**剩余未成交**部分的冻结保证金。
-5. **结算**：每根（15 分钟）房主按同一套规则盯市每个远端账户——`pnl` 进该账户余额、
-   保证金不足就强平——然后 `seq += 1`，给每个报到过的 peer 各发一条它自己的 `futures-settle`
-   （只带它自己的持仓与挂单，别人的账不上线）。
+5. **结算**：房主每 15 秒算一拍，每根（15 分钟）把浮盈亏记进每个远端账户的余额（盯市）。
+   **强平**按路径判：从上次检查时刻到 `now`，按 15 秒一格采样该仓位自己合约的公允价，
+   第一个让「盈亏 ≤ -保证金」的采样点就是触发点（插针也扫得到）；同一拍按触发时刻、
+   建仓时间、id 排序执行。强平按触发点公允价成交、收一腿 taker 费，
+   `credit = max(0, 保证金 + 盈亏 - 费用)` 回余额，`marginUsed` 清零。
+   每笔实收费用按 10% 注入**保险基金**（`insurance` 余额，同时累进 `fees.insurance`）；
+   强平亏空（以及交割费收不上来的部分）先由基金垫，垫不上的累计成**欠账**（`shortfall`，
+   不向玩家追缴，余额永不为负）。每动一个账户就 `seq += 1`，给每个报到过的 peer 各发一条
+   它自己的 `futures-settle`（只带它自己的持仓与挂单，别人的账不上线；基金/欠账两个全局数随包带上）。
 6. **对账**：peer 存一份 `(epoch, seq)` 副本，重发的同一条只算一次、`seq` 倒退的包丢掉；
    epoch 变了（房主重启/换人）就整份采纳新账。丢包不靠重传：peer 每 30 秒 `futures-sync`，
    房主回一份当前账户。本实现直接回整份快照、不维护增量日志——8 条持仓 + 8 条挂单的整份也在 4 KiB 内。
@@ -959,9 +971,10 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
 | 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
 | 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
-| 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符 |
+| 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符；`insurance`/`shortfall` ≥0 |
 | 期货广播 | `futures-settle` 每账户每根 1 条；`futures-sync` 1 条/30 秒；整包 ≤4 KiB（8 条持仓 + 8 条挂单仍在内） |
 | 期货价格 | 指数锚现货价（已被行情夹在 `[base×0.5, base×2]`）；做市价差 0.2%；吃单费 0.1%（9 成销毁、1 成进保险） |
+| 期货强平 | 强平线 = 1/杠杆（1× 没有强平线，亏穿保证金才平）；15 秒路径扫描；基金先垫、欠账记账 |
 
 ### 4 KiB、白名单与旧邻居
 

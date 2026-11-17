@@ -228,7 +228,7 @@ function futuresPayload (type, deviceId) {
   if (type === 'futures-order') return { ...base, kind: 'deposit', coins: 5 }
   if (type === 'futures-cancel') return { ...base, orderId: randomUUID() }
   if (type === 'futures-sync') return { ...base, epoch: 'e1', lastSeq: 3 }
-  return { ...base, epoch: 'e1', seq: 3, balance: 10, marginUsed: 0, delta: 0, positions: [], orders: [], trades: [] }
+  return { ...base, epoch: 'e1', seq: 3, balance: 10, marginUsed: 0, delta: 0, positions: [], orders: [], trades: [], insurance: 0, shortfall: 0 }
 }
 
 function futuresKeys (type) {
@@ -236,7 +236,7 @@ function futuresKeys (type) {
     'futures-hello': ['v', 'type', 'deviceId', 'at'],
     'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
     'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
-    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades'],
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall'],
     'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq']
   }[type]
 }
@@ -1194,7 +1194,10 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     delta: 0,
     positions: body.positions,
     orders: body.orders,
-    trades: []
+    trades: [],
+    // 票 97：基金/欠账始终在线，缺省 0。
+    insurance: 0,
+    shortfall: 0
   })
 
   // 票 95：`orders` 是可选的（票 94 的调用方不带），不带就是空盘口，字段始终在线。
@@ -1203,6 +1206,8 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
   assert.deepEqual(bare.packet.orders, [])
   // 票 96：`trades` 同样可选，字段始终在线。
   assert.deepEqual(bare.packet.trades, [])
+  // 票 97：基金与欠账同样可选，缺省 0，字段始终在线。
+  assert.deepEqual([bare.packet.insurance, bare.packet.shortfall], [0, 0])
 
   // 金额到分、张数与杠杆夹取由编码端统一做：不是整数分就拒，不四舍五入蒙过去。
   assert.throws(() => encodeFuturesSettle(validFuturesSettle({ balance: -1 })), /invalid futures balance/)
@@ -1279,6 +1284,29 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     parsePacket(encodeJson({ ...base, delta: 0, positions: [], trades: [{ ...delivery, fee: -1 }] })).reason,
     'trades'
   )
+
+  // 票 97：强平流水与交割同形（额外字段只有 delivery 要），kind 白名单认 liquidation。
+  const liquidation = {
+    at: FUTURES_AT,
+    crop: 'tomato',
+    contract: 'tomato-2026W47',
+    side: 'short',
+    lots: 1,
+    price: 4.87,
+    fee: 0.49,
+    kind: 'liquidation'
+  }
+  const blown = parsePacket(encodeFuturesSettle(validFuturesSettle({ trades: [liquidation] })))
+  assert.equal(blown.ok, true)
+  assert.deepEqual(blown.packet.trades, [liquidation])
+
+  // 票 97：基金余额与欠账往返；负数/非整数分连编码都过不去，解码侧落 'insurance' / 'shortfall'。
+  const funded = parsePacket(encodeFuturesSettle(validFuturesSettle({ insurance: 3.2, shortfall: 0.8 })))
+  assert.deepEqual([funded.packet.insurance, funded.packet.shortfall], [3.2, 0.8])
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ insurance: -0.01 })), /invalid futures insurance/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ shortfall: -1 })), /invalid futures shortfall/)
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], insurance: -1 })).reason, 'insurance')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], shortfall: 'x' })).reason, 'shortfall')
 })
 
 test('票 94：futures-sync 带 (epoch,lastSeq)；坏 lastSeq 拒', () => {

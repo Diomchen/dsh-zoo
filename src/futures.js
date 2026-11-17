@@ -23,8 +23,11 @@
  *         "marginFrozen": 10.1, "at": 1763308800000 }
  *     ],
  *     "week": { "start": 1763251200000, "pnl": 12.5 },  // 本周已实现盈亏（票 93 顶部展示）
- *     "closed": 0,                             // 平掉/交割的累计笔数（只用于展示）
+ *     "closed": 0,                             // 平掉/交割/强平的累计笔数（只用于展示）
  *     "tradedAt": 0,                           // 最后一笔动钱的时刻
+ *     "insurance": 3.2,                        // 票 97：保险基金**当前余额**（会被亏空花掉）
+ *     "shortfall": 0,                          // 票 97：基金也垫不上的累计欠账（不追缴）
+ *     "liquidationCount": 0,                   // 票 97：累计强平笔数
  *     "seq": 7,                                // 票 94：账本流水号，每次「peer 必须看见」的变动 +1
  *     "remotes": {                             // 票 94：房主替别人托管的账户（key = deviceId）
  *       "…uuid…": { "balance": 100, "marginUsed": 40, "positions": [ … ], "orders": [ … ],
@@ -54,6 +57,14 @@
  *     根号），结算时把浮盈亏记进余额、入场价改成收盘价、仓位继续持有——所以重启、补算、
  *     快进时钟都不会重复入账，也不需要额外的「结算到第几根」游标。
  *   - **手续费拆到分**：`fees.insurance + fees.burned` 永远等于收过的 taker 费之和。
+ *   - **强平按路径扫、亏空先由基金垫**（票 97）：每 15 秒对每个仓位（本地 + 所有远端）从
+ *     上次盯市时刻起，按价格原生分辨率（15 秒）逐点采样该合约的公允价；多头在
+ *     `盈亏 ≤ -保证金` 的第一个采样点强平（空头反之），同一拍按触发时刻、建仓时间、id
+ *     排序执行，所以插针也扫得到、结果可复现。强平按**触发点公允价**成交、收一腿 taker
+ *     费；`保证金 + 盈亏 - 实收费用` 为负的部分叫「亏空」，先由 `insurance` 垫，垫不上
+ *     的累计进 `shortfall`（欠账，不向玩家追缴，余额永不为负）。交割费收不上来走同一条路。
+ *     基金的钱只有一个来源：每笔**实收**费用按 `FEE_INSURANCE_SHARE` 注入 `insurance`
+ *     （同时累进 `fees.insurance`），所以 `insurance ≤ fees.insurance` 永远成立。
  *
  * 容错与 `src/farm.js` / `src/market.js` / `src/trading.js` 同一套路：
  *   - 文件不存在：空账本，不告警；
@@ -94,6 +105,7 @@ import {
   matchOrders,
   MAX_MARGIN,
   notionalOf,
+  OU_STEP_MS,
   pnlOf,
   quotesOf,
   roundCoin,
@@ -157,10 +169,14 @@ export function initialFuturesState () {
     seq: 0,
     remotes: {},
     replica: null,
-    // 票 96：已交割的合约（contractId → 交割时刻），以及保证金亏穿的累计缺口。
-    // 缺口先记账，票 97 的保险基金兜底再决定从哪补。
+    // 票 96：已交割的合约（contractId → 交割时刻）。
     delivered: {},
-    shortfall: 0
+    // 票 97：保险基金**当前余额**（与 `fees.insurance` 的「累计注入」区分开：前者会被
+    // 强平/交割的亏空花掉，后者只增不减，是历史累计）；`shortfall` 是基金也垫不上、
+    // 记在账上的欠账（不向玩家追缴）；`liquidationCount` 是累计强平笔数（展示用）。
+    insurance: 0,
+    shortfall: 0,
+    liquidationCount: 0
   }
 }
 
@@ -180,6 +196,10 @@ export function initialFuturesView () {
     marginUsed: 0,
     equity: 0,
     fees: { insurance: 0, burned: 0 },
+    // 票 97：保险基金余额、累计欠账、累计强平笔数——窗口和 `/state` 都直接读这三个数。
+    insurance: 0,
+    shortfall: 0,
+    liquidationCount: 0,
     closed: 0,
     positionCount: 0,
     positions: [],
@@ -231,7 +251,9 @@ function normalizeTrade (raw) {
         ? 'delivery'
         : raw.kind === 'convert'
           ? 'convert'
-          : null
+          : raw.kind === 'liquidation'
+            ? 'liquidation'
+            : null
   if (at === null || at <= 0 || crop === null || contract === null || side === null) return null
   if (lots === null || price === null || price <= 0 || fee === null || kind === null) return null
   const trade = { at, crop, contract: contract.id, side, lots, price, fee, kind }
@@ -533,6 +555,20 @@ export function normalizeFuturesFile (value) {
   if (shortfall === null) repaired += 1
   else state.shortfall = shortfall
 
+  // 票 97：保险基金余额与累计强平笔数。老文件没有这两个键（票 96 之前根本没有基金），
+  // 按 0 处理且**不算修补**——缺字段是旧版本，不是坏账。
+  const insurance = value.insurance === undefined ? 0 : nonNegativeCoin(value.insurance)
+  if (insurance === null) repaired += 1
+  else state.insurance = insurance
+
+  const liquidationCount = value.liquidationCount === undefined
+    ? 0
+    : Number.isInteger(value.liquidationCount) && value.liquidationCount >= 0
+      ? value.liquidationCount
+      : null
+  if (liquidationCount === null) repaired += 1
+  else state.liquidationCount = liquidationCount
+
   // 保证金是「从余额划走的钱」：仓位/挂单丢了、保证金还在，账会凭空多钱或少钱。
   // 仓位 + 挂单冻结的总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
   const expectedMargin = roundCoin(
@@ -566,7 +602,10 @@ function toFileState (state) {
     remotes: remoteFileState(state.remotes),
     // 票 96：交割标记与累计缺口（缺口是「亏穿保证金的钱」，负余额不允许出现）。
     delivered: { ...state.delivered },
-    shortfall: roundCoin(state.shortfall)
+    shortfall: roundCoin(state.shortfall),
+    // 票 97：保险基金余额与累计强平笔数（基金余额会被亏空花掉，`fees.insurance` 只增不减）。
+    insurance: roundCoin(state.insurance),
+    liquidationCount: state.liquidationCount
   }
 }
 
@@ -701,6 +740,10 @@ class FuturesStore {
       marginUsed: roundCoin(this.#state.marginUsed),
       equity: roundCoin(this.#state.balance + this.#state.marginUsed),
       fees: { ...this.#state.fees },
+      // 票 97：保险基金余额、累计欠账、累计强平笔数（窗口顶部展示）。
+      insurance: roundCoin(this.#state.insurance),
+      shortfall: roundCoin(this.#state.shortfall),
+      liquidationCount: this.#state.liquidationCount,
       closed: this.#state.closed,
       positionCount: this.#state.positions.length,
       positions,
@@ -1144,9 +1187,9 @@ class FuturesStore {
   }
 
   /**
-   * 票 96：一个账户的到期处理——先撤该合约全部挂单（退冻结），再按交割价现金结清全部仓位。
-   * `credit = max(0, margin + pnl)`；亏穿保证金的差额累计进 `state.shortfall`（票 97 兜底）。
-   * 交割费按交割名义收 0.1%，从释放出来的钱里扣；扣完仍不够时也记缺口，余额绝不为负。
+   * 票 96/97：一个账户的到期处理——先撤该合约全部挂单（退冻结），再按交割价现金结清全部仓位。
+   * `credit = max(0, margin + pnl)`；交割费按交割名义收 0.1%，从释放出来的钱里扣，收不上来
+   * 的部分和亏穿的保证金合称「亏空」，走 `#coverHole`：先花保险基金、再记欠账，余额绝不为负。
    */
   #deliverAccount (account, window, price, stamp, local) {
     const kept = []
@@ -1169,18 +1212,18 @@ class FuturesStore {
         continue
       }
       const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit: price, side: position.side })
-      const credit = Math.max(0, roundCoin(position.margin + pnl))
+      const gross = roundCoin(position.margin + pnl)
+      const credit = Math.max(0, gross)
       const deliveryFee = roundCoin(notionalOf({ lots: position.lots, price }) * DELIVERY_FEE_RATE)
-      let net = roundCoin(credit - deliveryFee)
-      let gap = Math.max(0, -roundCoin(position.margin + pnl))
-      if (net < 0) {
-        gap = roundCoin(gap - net)
-        net = 0
-      }
-      this.#state.shortfall = roundCoin(this.#state.shortfall + gap)
+      // 交割费只能从释放出来的钱里收；收不到的部分并进亏空（与强平同一条兜底）。
+      // `net` 只扣**真收到**的那部分，否则同一笔收不上来的费会既扣余额又花基金。
+      const paidFee = Math.min(deliveryFee, credit)
+      const net = roundCoin(credit - paidFee)
+      const gap = roundCoin(Math.max(0, -gross) + Math.max(0, deliveryFee - credit))
+      const covered = this.#coverHole(gap)
       account.balance = roundCoin(account.balance + net)
       this.#state.closed += 1
-      this.#chargeFee(deliveryFee)
+      if (paidFee > 0) this.#chargeFee(paidFee)
       const trade = {
         at: stamp,
         crop: position.crop,
@@ -1188,9 +1231,9 @@ class FuturesStore {
         side: position.side === 'long' ? 'short' : 'long',
         lots: position.lots,
         price,
-        fee: deliveryFee,
+        fee: paidFee,
         kind: 'delivery',
-        deliveryFee
+        deliveryFee: paidFee
       }
       if (local) {
         this.#bookPnl(pnl, stamp)
@@ -1198,7 +1241,16 @@ class FuturesStore {
       } else {
         this.#recordRemoteTrade(account, trade)
       }
-      delivered.push({ position: { ...position }, pnl, credit, deliveryFee, net, gap })
+      delivered.push({
+        position: { ...position },
+        pnl,
+        credit,
+        deliveryFee: paidFee,
+        net,
+        gap,
+        fundPaid: covered.paid,
+        shortfall: covered.owed
+      })
     }
     account.positions = remaining
     account.marginUsed = this.#recomputeFor(account)
@@ -1293,7 +1345,7 @@ class FuturesStore {
    * 说明房主换了账本（重启/换人），旧的 lastSeq 一笔作废、直接采纳新账。
    * 不写盘：这是房主账本的缓存（见文件头）。
    */
-  applySettle ({ epoch, seq, balance, marginUsed, positions, orders, trades, at = this.#nowMs() } = {}) {
+  applySettle ({ epoch, seq, balance, marginUsed, positions, orders, trades, insurance, shortfall, at = this.#nowMs() } = {}) {
     // 先验形状再看新旧：坏包必须被「拒」，不能被当成「旧的」悄悄咽下去。
     if (typeof epoch !== 'string' || epoch === '' || epoch.length > MAX_ID_LENGTH) {
       return { ok: false, error: 'bad-epoch' }
@@ -1328,6 +1380,11 @@ class FuturesStore {
       if (trade !== null) accountTrades.push(trade)
     }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    // 票 97：保险基金与欠账是**房主账本的全局数**（peer 只显示，不参与计算）。
+    // 旧房主不发这两个数时按 0 处理，不把整包判坏。
+    const safeInsurance = insurance === undefined ? 0 : nonNegativeCoin(insurance)
+    const safeShortfall = shortfall === undefined ? 0 : nonNegativeCoin(shortfall)
+    if (safeInsurance === null || safeShortfall === null) return { ok: false, error: 'bad-fund' }
     this.#state.replica = {
       epoch,
       lastSeq: seq,
@@ -1336,6 +1393,8 @@ class FuturesStore {
       positions: accountPositions,
       orders: accountOrders,
       trades: accountTrades,
+      insurance: safeInsurance,
+      shortfall: safeShortfall,
       updatedAt: stamp
     }
     return { ok: true, applied: true }
@@ -1352,7 +1411,10 @@ class FuturesStore {
       marginUsed: roundCoin(replica.marginUsed),
       positions: replica.positions.map((position) => ({ ...position })),
       orders: replica.orders.map((order) => ({ ...order })),
-      trades: (replica.trades ?? []).map((trade) => ({ ...trade }))
+      trades: (replica.trades ?? []).map((trade) => ({ ...trade })),
+      // 票 97：房主广播过来的全局基金/欠账（peer 只读）。
+      insurance: roundCoin(replica.insurance ?? 0),
+      shortfall: roundCoin(replica.shortfall ?? 0)
     }
   }
 
@@ -1809,35 +1871,52 @@ class FuturesStore {
   }
 
   /**
-   * 逐根盯市：结算所有「这一根已经走完」的仓位，按那一根的收盘公允价重估。
+   * 逐根盯市 + 逐拍强平（票 97）。
    *
    * 盯市 = 把浮盈浮亏记进 `balance`，入场价改成收盘价，仓位继续持有、保证金不动——
-   * 这样周合约才拿得住一整周，票 97 的逐 tick 强平也才有对象可强。
-   * 权益归零（亏光保证金）就当场强平：保证金没收，仓位删除。
+   * 这样周合约才拿得住一整周。
+   *
+   * 强平不再看「这一根的收盘价」，而是**按路径扫**：对每个仓位（本地 + 所有远端）从上次
+   * 盯市时刻一直采样到 `now`（15 秒一格，正好是价格的生成分辨率），第一个让
+   * `盈亏 ≤ -保证金` 的采样点就是触发点。收盘价在插针面前是瞎子，路径扫描不是。
+   *
+   * 同一拍里先算完所有触发点，按「触发时刻 → 建仓时间 → id」排序后逐笔强平，再对剩下
+   * 的仓位逐根盯市。排序让结果可复现：文件里仓位的先后、远端账户的遍历顺序都不影响成交。
    * 结算时点由仓位自己的 `settleSlot` 决定，所以重复调用、重启、补算走同一条路径。
    */
   async settleDue (at = this.#nowMs()) {
-    const stamp = Number(at)
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const settled = []
+    // 票 97：先把这一拍所有该强平的仓位找出来、排好队；强平之间互不影响，顺序只为可复现。
+    const remoteHits = new Map()
+    for (const hit of this.#liquidationHits(stamp)) {
+      const entry = this.#liquidate(hit, stamp)
+      if (hit.local) {
+        settled.push(entry)
+        continue
+      }
+      let list = remoteHits.get(hit.deviceId)
+      if (list === undefined) {
+        list = []
+        remoteHits.set(hit.deviceId, list)
+      }
+      list.push(entry)
+    }
+
     for (let i = this.#state.positions.length - 1; i >= 0; i -= 1) {
       const position = this.#state.positions[i]
       const outcome = this.#settlePositionAt(position, stamp)
       if (outcome === null) continue
       if (outcome.liquidated) {
-        // 亏光保证金：保证金没收，仓位删除（票 97 会把这条路径做细）
-        this.#state.positions.splice(i, 1)
-        this.#state.marginUsed = this.#recomputeMarginUsed()
-        this.#state.closed += 1
-        // 本周盈亏记「整块保证金」（钱在开仓时就已经划走了，这里记的是它的去向）。
-        this.#bookPnl(roundCoin(-position.margin), outcome.at)
-        settled.push({
-          position: { ...position },
-          price: outcome.price,
-          pnl: outcome.pnl,
-          credit: 0,
-          liquidated: true,
-          at: outcome.at
-        })
+        // 扫描窗口已经覆盖到这个时刻；走到这里只可能是「结算价恰好压线」的边界情况，
+        // 同样走强平那条路——余额绝不允许被记成负数。
+        settled.push(this.#liquidate({
+          account: this.#state,
+          position,
+          local: true,
+          deviceId: null,
+          hit: outcome
+        }, stamp))
         continue
       }
       this.#state.balance = roundCoin(this.#state.balance + outcome.pnl)
@@ -1859,7 +1938,10 @@ class FuturesStore {
     // 一条 settle 只带一个账户，所以每个动过的账户各自 +1 流水号（peer 按 (epoch,seq) 判重）。
     const remotes = []
     for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
-      const entries = this.#settleRemoteAccount(account, stamp)
+      const entries = [
+        ...(remoteHits.get(deviceId) ?? []),
+        ...this.#settleRemoteAccount(account, stamp)
+      ]
       if (entries.length === 0) continue
       account.updatedAt = stamp
       const seq = this.#bumpAccount(account)
@@ -1879,8 +1961,150 @@ class FuturesStore {
   }
 
   /**
+   * 票 97：这一拍所有被扫到的强平点，已按「触发时刻 → 建仓时间 → id」排好。
+   * 排序用 `<` 比较字符串（不依赖 locale），同一份盘在不同机器上顺序一致。
+   */
+  #liquidationHits (stamp) {
+    const hits = []
+    const consider = (account, position, local, deviceId) => {
+      const hit = this.#scanLiquidation(position, stamp)
+      if (hit !== null) hits.push({ account, position, local, deviceId, hit })
+    }
+    for (const position of this.#state.positions) consider(this.#state, position, true, null)
+    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
+      for (const position of account.positions) consider(account, position, false, deviceId)
+    }
+    hits.sort((a, b) => {
+      if (a.hit.at !== b.hit.at) return a.hit.at - b.hit.at
+      if (a.position.openedAt !== b.position.openedAt) return a.position.openedAt - b.position.openedAt
+      if (a.position.id === b.position.id) return 0
+      return a.position.id < b.position.id ? -1 : 1
+    })
+    return hits
+  }
+
+  /**
+   * 票 97：从上次检查时刻扫到 `now`，返回第一个「保证金被吃穿」的采样点。
+   *
+   * 起点取 `max(openedAt, 上次盯市那根的起点)`：盯市会把 `entry` 改成那一根收盘价，
+   * 所以更早的路径属于上一次检查、不该重复扫。终点不越过到期前一刻（到期后由交割接管）。
+   */
+  #scanLiquidation (position, stamp) {
+    const window = contractWindowOf(position.contract)
+    if (window === null) return null
+    const start = Math.max(position.openedAt, (position.settleSlot - 1) * SLOT_MS)
+    const end = Math.min(stamp, window.expireAt - 1)
+    if (!(end >= start)) return null
+    // 价格的原生分辨率就是 15 秒一格：对齐到网格逐格扫，插针不会落在网格之间。
+    let at = Math.ceil(start / OU_STEP_MS) * OU_STEP_MS
+    let last = null
+    for (; at <= end; at += OU_STEP_MS) {
+      const sample = this.#liquidationSample(position, at)
+      if (sample === null) return null // 没有指数价：本拍跳过，下一拍再试
+      if (sample.trigger) return sample
+      last = at
+    }
+    // `now` 一般不在 15 秒网格上：补采末尾那半格，否则最后不到 15 秒的行情会被漏掉。
+    if (last !== null && last < end) {
+      const sample = this.#liquidationSample(position, end)
+      if (sample !== null && sample.trigger) return sample
+    }
+    return null
+  }
+
+  #liquidationSample (position, at) {
+    const price = this.#fairAt(position.crop, position.contract, at)
+    if (price === null) return null
+    const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit: price, side: position.side })
+    // 强平线 = 1/杠杆：`pnl <= -margin` 与「权益归零」是同一件事（保证金就是开仓时压的钱）。
+    return { at, price, pnl, trigger: roundCoin(position.margin + pnl) <= 0 }
+  }
+
+  /**
+   * 票 97：执行一笔强平。
+   *
+   * 成交价 = 触发点的公允价（不是收盘价、也不是交割价），并收一腿 taker 费。
+   * 能收回来的钱 `credit = max(0, 保证金 + 盈亏 - 费用)` 回余额；收不上来的费用和亏穿的
+   * 保证金合称「亏空」，先由保险基金垫，基金不够就累计欠账，绝不把余额记成负数。
+   */
+  #liquidate ({ account, position, local, deviceId, hit }, stamp) {
+    const fee = takerFeeOf(notionalOf({ lots: position.lots, price: hit.price }))
+    const gross = roundCoin(position.margin + hit.pnl)
+    // 账户里只剩 `max(0, gross)` 这点钱，费用只能从这里收；收不到的部分并进亏空。
+    const paidFee = Math.min(fee, Math.max(0, gross))
+    const credit = Math.max(0, roundCoin(gross - fee))
+    const hole = roundCoin(Math.max(0, -gross) + Math.max(0, fee - Math.max(0, gross)))
+    const covered = this.#coverHole(hole)
+
+    const index = account.positions.findIndex((item) => item.id === position.id)
+    if (index >= 0) account.positions.splice(index, 1)
+    if (local) {
+      this.#state.balance = roundCoin(this.#state.balance + credit)
+      this.#state.marginUsed = this.#recomputeMarginUsed()
+      this.#state.tradedAt = hit.at
+      if (paidFee > 0) this.#chargeFee(paidFee)
+      this.#bookPnl(hit.pnl, hit.at)
+      this.#recordTrade({
+        at: hit.at,
+        crop: position.crop,
+        contract: position.contract,
+        // 成交方向记「平仓那一腿」：多单被卖出、空单被买回。
+        side: position.side === 'long' ? 'short' : 'long',
+        lots: position.lots,
+        price: hit.price,
+        fee: paidFee,
+        kind: 'liquidation'
+      })
+    } else {
+      account.balance = roundCoin(account.balance + credit)
+      account.marginUsed = this.#recomputeFor(account)
+      if (paidFee > 0) this.#chargeFee(paidFee)
+      this.#recordRemoteTrade(account, {
+        at: hit.at,
+        crop: position.crop,
+        contract: position.contract,
+        side: position.side === 'long' ? 'short' : 'long',
+        lots: position.lots,
+        price: hit.price,
+        fee: paidFee,
+        kind: 'liquidation'
+      })
+    }
+    this.#state.closed += 1
+    this.#state.liquidationCount += 1
+    return {
+      position: { ...position },
+      price: hit.price,
+      pnl: hit.pnl,
+      credit,
+      fee: paidFee,
+      hole,
+      fundPaid: covered.paid,
+      shortfall: covered.owed,
+      liquidated: true,
+      at: hit.at,
+      ...(local ? {} : { deviceId })
+    }
+  }
+
+  /**
+   * 票 97：亏空兜底。先花保险基金，基金不够的部分累计成欠账（`shortfall`），
+   * 余额永不为负、也不向玩家追缴。强平与交割费共用这一条。
+   */
+  #coverHole (amount) {
+    const hole = roundCoin(Number(amount))
+    if (!Number.isFinite(hole) || hole <= 0) return { paid: 0, owed: 0 }
+    const fund = roundCoin(this.#state.insurance)
+    const paid = Math.min(fund, hole)
+    this.#state.insurance = roundCoin(fund - paid)
+    const owed = roundCoin(hole - paid)
+    if (owed > 0) this.#state.shortfall = roundCoin(this.#state.shortfall + owed)
+    return { paid, owed }
+  }
+
+  /**
    * 替 peer 的账户逐根盯市：只动余额/入场价/结算游标，不碰本机的周盈亏。
-   * 强平时保证金没收（开仓时已从余额划走），删仓位、重算占用即可。
+   * 强平（含扫描触发）在 `settleDue` 里已经统一做过；这里的 `liquidated` 只是兜底边界。
    */
   #settleRemoteAccount (account, stamp) {
     const settled = []
@@ -1889,15 +2113,13 @@ class FuturesStore {
       const outcome = this.#settlePositionAt(position, stamp)
       if (outcome === null) continue
       if (outcome.liquidated) {
-        account.positions.splice(i, 1)
-        settled.push({
-          position: { ...position },
-          price: outcome.price,
-          pnl: outcome.pnl,
-          credit: 0,
-          liquidated: true,
-          at: outcome.at
-        })
+        settled.push(this.#liquidate({
+          account,
+          position,
+          local: false,
+          deviceId: null,
+          hit: outcome
+        }, stamp))
         continue
       }
       account.balance = roundCoin(account.balance + outcome.pnl)
@@ -2043,6 +2265,18 @@ class FuturesStore {
     const split = feeSplitOf(fee)
     this.#state.fees.insurance = roundCoin(this.#state.fees.insurance + split.insurance)
     this.#state.fees.burned = roundCoin(this.#state.fees.burned + split.burned)
+    // 票 97：同样一笔 10% 进保险基金的**余额**（`fees.insurance` 是累计注入，只增不减；
+    // `insurance` 会被强平/交割的亏空花掉，所以永远有 `insurance <= fees.insurance`）。
+    this.#state.insurance = roundCoin(this.#state.insurance + split.insurance)
+  }
+
+  /** 票 97：保险基金余额、累计欠账、累计强平笔数（房主随 settle 广播前两个数）。 */
+  fundOf () {
+    return {
+      insurance: roundCoin(this.#state.insurance),
+      shortfall: roundCoin(this.#state.shortfall),
+      liquidationCount: this.#state.liquidationCount
+    }
   }
 
   #view () {
