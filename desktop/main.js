@@ -274,7 +274,7 @@ let mediaWaitTimer = null
 /** 当前窗口是否穿透（Electron 没有 isIgnoreMouseEvents 读取 API，只能自己镜像）。 */
 const ignoreState = { ignoring: null }
 /** 渲染端上报的悬停状态；lastAt 是主进程决定「要不要相信渲染端」的唯一依据。 */
-const hover = { inside: false, lastAt: 0, frozen: false }
+const hover = { inside: false, lastAt: 0, point: null, pointAt: 0, frozen: false }
 /** 渲染端逐帧上报的命中矩形（窗口局部 DIP）与时间戳；过期即视为没有命中区。 */
 let rendererRects = []
 let rendererRectsAt = 0
@@ -1015,6 +1015,8 @@ function healLostDown () {
 function forceIgnore (reason) {
   hover.inside = false
   hover.lastAt = 0
+  hover.point = null
+  hover.pointAt = 0
   busy.active = false
   busy.at = 0
   busy.since = 0
@@ -1063,8 +1065,8 @@ function applyDecision (reason) {
     setIgnore(true, 'hidden')
     return
   }
-  const local = localCursor()
   const now = Date.now()
+  const local = currentLocalPoint(now)
   revokeStaleBusy(now)
   const rects = liveRects(now)
   const inside = local !== null && shared.hitTestRects(rects, local) !== null
@@ -1199,8 +1201,52 @@ function safeCursorPoint () {
   }
 }
 
+/**
+ * 各屏缩放是否不一致（票 93）。
+ *
+ * 窗口按**一块**屏的 deviceScaleFactor 渲染，`screen.getCursorScreenPoint()` 却按**光标所在那块屏**
+ * 的缩放折算；两块屏缩放不同时，这两套坐标在跨屏窗口里对不上。`getAllDisplays()` 每次都要同步问
+ * 一次系统，而判定每秒跑十次，所以缓存 5 秒；显示器增删/缩放变化本来就会重建窗口，缓存不会长期过期。
+ */
+let mixedDpiCache = { at: 0, value: false }
+function mixedDpiDisplays (now) {
+  if (now - mixedDpiCache.at < 5000) return mixedDpiCache.value
+  let value = false
+  try {
+    const factors = new Set(screen.getAllDisplays().map((display) => display.scaleFactor))
+    value = factors.size > 1
+  } catch {
+    value = false
+  }
+  mixedDpiCache = { at: now, value }
+  return value
+}
+
+/** 最近一次命中判定采信的坐标来源；写进 status，混合 DPI 现场能直接看出走了哪一路。 */
+let lastPointSource = null
+
+/**
+ * 命中判定用的窗口本地坐标。
+ *
+ * 混合 DPI 下以渲染端上报的 CSS 指针为准（它和命中矩形同一套坐标系），其余情况仍用 OS 光标——
+ * 单屏/同缩放时这等于原来的行为，主进程的独立复核一点都不放松。调试用的固定光标优先于一切，
+ * 免得测试被 DPI 分支带偏。
+ */
+function currentLocalPoint (now) {
+  const picked = shared.chooseLocalPoint({
+    osPoint: localCursor(),
+    rendererPoint: hover.point,
+    rendererAt: hover.pointAt,
+    now,
+    preferRenderer: pointerOverride === null && mixedDpiDisplays(now),
+    area: localArea()
+  })
+  lastPointSource = picked.source
+  return picked.point
+}
+
 function emitHit (reason) {
-  const local = localCursor()
+  const local = currentLocalPoint(Date.now())
   const screenPoint = pointerOverride ?? safeCursorPoint()
   const rects = liveRects(Date.now())
   const rect = local === null ? null : shared.hitTestRects(rects, local)
@@ -1417,12 +1463,17 @@ ipcMain.on('dsh-zoo:hover', (event, payload) => {
   if (win === null || win.isDestroyed() || event.sender !== win.webContents) return
   if (hover.frozen) return
   const inside = payload !== null && typeof payload === 'object' && payload.inside === true
+  // 票 93：渲染端把自己那份 CSS 坐标一起报上来。混合 DPI 的跨屏窗口里，OS 光标换算出的本地坐标
+  // 和渲染端真实的 CSS 坐标差一截，只有这一份能和命中矩形对上。
+  const point = inside ? shared.normalizePoint(payload.point) : null
   hover.inside = inside
   hover.lastAt = inside ? Date.now() : 0
+  hover.point = point
+  hover.pointAt = point === null ? 0 : Date.now()
   // 渲染端重新看见光标停在命中区 = 它活着且能接指针：允许重新申请输入租约。
   // 但硬上限触发的 blocked 只认 busy:false，悬停不能把它复活。
   if (inside && busy.blocked !== true) busy.allow = true
-  // 立即翻转（不用等 100ms 轮询）；主进程仍会用自己的光标位置复核。
+  // 立即翻转（不用等 100ms 轮询）；主进程仍会按自己的坐标复核——单屏/同缩放时就是 OS 光标。
   applyDecision(inside ? 'renderer-hover' : 'renderer-leave')
 })
 
@@ -3326,6 +3377,10 @@ function statusEvent (id) {
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
     bounds,
     pointer: pointerOverride ?? safeCursorPoint(),
+    // 票 93：这一拍命中判定用的是谁的坐标（renderer = 渲染端 CSS 指针，os = OS 光标），
+    // 以及渲染端上报的原值；混合 DPI 现场先看这两项再怀疑别的。
+    pointerSource: lastPointSource,
+    hoverPoint: hover.point === null ? null : { ...hover.point },
     debug: debugEnabled
   }
 }
@@ -3462,6 +3517,10 @@ async function shotSidecar (image) {
     scene,
     renderer: await rendererDebug(),
     pointer: pointerOverride ?? safeCursorPoint(),
+    // 票 93：这一拍命中判定用的是谁的坐标（renderer = 渲染端 CSS 指针，os = OS 光标），
+    // 以及渲染端上报的原值；混合 DPI 现场先看这两项再怀疑别的。
+    pointerSource: lastPointSource,
+    hoverPoint: hover.point === null ? null : { ...hover.point },
     ignoring: ignoreState.ignoring !== false,
     busy: busyFresh(Date.now()),
     overlayRects: overlayRects.length,

@@ -1,7 +1,8 @@
 /**
  * 渲染进程与主进程之间唯一的桥：只读/只写原语，没有任何 Node 能力外泄。
  * - ready()：告诉主进程「监听器已就位，可以推场景了」，消除首帧竞态；
- * - reportHover(inside)：悬停确认 + 心跳（主进程只把它当申请，最终按真实光标裁定）；
+ * - reportHover(inside, point)：悬停确认 + 心跳，带上渲染端自己的 CSS 指针坐标
+ *   （票 93：混合 DPI 的跨屏窗口里，主进程只认这一份，OS 光标换算会偏）；
  * - reportRects(rects)：渲染端本地物理算出的宠物命中矩形（窗口局部 DIP）。主进程只认这一份，
  *   过期就当没有命中区——位置是渲染端拥有的，主进程不猜；
  * - reportOverlayRects(rects)：弹层/放行卡/召回胶囊的命中矩形。它们不参与物理，但必须让主进程
@@ -23,8 +24,8 @@ contextBridge.exposeInMainWorld('dshZooDesktop', {
   ready () {
     ipcRenderer.send('dsh-zoo:renderer-ready')
   },
-  reportHover (inside) {
-    ipcRenderer.send('dsh-zoo:hover', { inside: inside === true })
+  reportHover (inside, point) {
+    ipcRenderer.send('dsh-zoo:hover', { inside: inside === true, point })
   },
   reportRects (rects) {
     ipcRenderer.send('dsh-zoo:rects', Array.isArray(rects) ? rects : [])
