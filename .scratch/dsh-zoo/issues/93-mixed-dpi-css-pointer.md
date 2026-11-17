@@ -21,7 +21,7 @@
 
 - [x] `test/desktop-cursor-point.test.js`：纯函数 10 条（采信顺序、过期、越界、坏形状、status 白名单） ✅ 2026-11-17
 - [x] `test/desktop-multi-display.test.js`：fake-electron 增加 `rendererCursor`，覆盖混合缩放命中回归 ✅ 2026-11-17
-- [x] 合并进 main（`a3cafba`，PR #9），合并后全量 1053 条通过 ✅ 2026-11-17
+- [x] 合并进 main（`a3cafba`，PR #9），合并后本地全量测试通过（1070 条） ✅ 2026-11-17
 - [ ] 实机复核：作者自述 1920×1200@125% + 3840×2160@150% 下 `pointerSource=renderer`、
       `insideForMs=557`、`ignoring=false`、`trustedInputs=6`，点击/拖拽恢复；维护者尚未在同一硬件组合上复跑
 
