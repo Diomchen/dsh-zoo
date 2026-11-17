@@ -142,10 +142,21 @@ export const PLOT_ID_RE = /^p(?:[1-9]|[1-4][0-9]|50)$/
 
 /**
  * 能力声明（ticket 51 / ADR-0018）：老版本不发也不认，缺省 = 只支持串门。
- * `raid` = 能收「来偷」的串门请求（免放行）；`look` = 有 `/dsh-zoo-farm/open` 只读视图。
+ * `raid` = 能收「来偷」的串门请求（免放行）；`look` = 有 `/dsh-zoo-farm/open` 只读视图；
+ * `packet` = 认识 `kind:'packet'` 的礼物（1.6.5 起才有，1.7.2 起才声明）。
  */
-export const CAPS = Object.freeze(['raid', 'look', 'crops'])
+export const CAPS = Object.freeze(['raid', 'look', 'crops', 'packet'])
 export const MAX_CAPS = 4
+/**
+ * 对方能不能收红包（票 79）。
+ *
+ * 1.6.5 之前的版本在 `normalizeGift` 里会把不认识的 `kind:'packet'` **整件丢掉**，
+ * 串门却照常成功——发件方只看到「送出去了」，红包和里面的东西就静默蒸发。
+ * 所以只在对方明确声明 `packet` 时才真的把红包带上路。
+ */
+export function supportsPacket (caps) {
+  return Array.isArray(caps) && caps.includes('packet')
+}
 /** 一趟行程的硬上限（ticket 51）：到点自己回家，不写串门记录。 */
 export const RAID_MAX_MS = 60 * 1000
 export const RAID_PURPOSE = 'steal'

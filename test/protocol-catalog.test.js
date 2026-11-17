@@ -29,8 +29,8 @@ function entry (overrides = {}) {
   return { id: 'kiwi', name: '猕猴桃', growMs: 7200000, seedPrice: 20, yield: 5, base: 12, ...overrides }
 }
 
-test('能力位：新增 crops，且只认已知能力', () => {
-  assert.deepEqual([...CAPS], ['raid', 'look', 'crops'])
+test('能力位：新增 crops 与 packet，且只认已知能力', () => {
+  assert.deepEqual([...CAPS], ['raid', 'look', 'crops', 'packet'])
   assert.deepEqual(normalizeCaps(['crops', 'nope', 'crops']), ['crops'])
 })
 

@@ -166,7 +166,8 @@ import {
   normalizeNickname,
   normalizePacketContents,
   PACKET_LIMITS,
-  resolvePort
+  resolvePort,
+  supportsPacket
 } from './protocol.js'
 import { createRoom } from './room.js'
 import { visitReasonText } from './visit-copy.js'
@@ -6500,12 +6501,18 @@ export function createService (ctx, options = {}) {
     // 背包里被选中的那一件；只有真的发出去才留在 out，发不出去立刻放回 idle。
     let carried = null
     let skipped = null
+    // 红包被扣下来留在背包里（对方版本还不认识红包）：这次空手去，回头说一句。
+    let heldPacket = false
 
     // 按「先放的先带走」从背包取最旧的一件。
     // 文件件的 size/sha256 在这里（发送那一刻）才读；读不出来就空手出门，东西留在背包。
+    // 红包要先问一句「对方认识吗」：老版本会把它整件丢掉，串门却照常成功。
     if (backpack !== null) {
       const picked = backpack.oldestIdle()
-      if (picked !== null) {
+      if (picked !== null && picked.kind === 'packet' && !peerTakesPacket(deviceId)) {
+        heldPacket = true
+        skipped = room.noteGiftMissed('对方版本还不支持红包，这次先帮你留在背包里。')
+      } else if (picked !== null) {
         const prepared = await backpack.prepareGift(picked)
         if (disposed) return { ok: false, error: 'disposed' }
         if (prepared.ok) {
@@ -6591,8 +6598,21 @@ export function createService (ctx, options = {}) {
       nickname: begun.visit.nickname,
       giftDropped: sent.giftDropped,
       ...(carried === null ? {} : { giftId: carried.id }),
+      ...(heldPacket ? { packetHeld: true } : {}),
       ...(notice === null ? {} : { notice: notice.text })
     }
+  }
+
+  /**
+   * 对方是否声明了能收红包（票 79）。
+   *
+   * 只在对方明确发过 `packet` 能力时才把红包带上路：1.6.5 之前的版本会把不认识的
+   * 礼物整件丢掉，串门却照常成功——那是最难查的一种「送出去了但对方没收到」。
+   */
+  function peerTakesPacket (deviceId) {
+    const snap = room.snapshot()
+    const neighbor = (snap.neighbors ?? []).find((entry) => entry.deviceId === deviceId)
+    return supportsPacket(neighbor?.caps)
   }
 
   /**
