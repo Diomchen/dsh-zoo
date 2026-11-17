@@ -1084,7 +1084,7 @@ function applyDecision (reason) {
     busyAt: busy.at,
     busySince: busy.since,
     // 调试里 freeze 表示「渲染端已经死了」：这时连兜底也必须停，验证 fail-closed。
-    // 混合缩放时 OS 坐标不可信，同样不许 main-fallback 拿它开窗（票 94）。
+    // 混合缩放时 OS 坐标不可信，同样不许 main-fallback 拿它开窗（票 96）。
     allowMainFallback: hover.frozen !== true && mixedDpi !== true,
     now
   })
@@ -1234,7 +1234,7 @@ let lastPointSource = null
  * 免得测试被 DPI 分支带偏。
  *
  * 返回 `{ point, source }`：source 是这一拍采信的来源（`renderer` / `os` / null），
- * 调用方还要按 `mixedDpiDisplays()` 决定这份坐标能不能作数（票 94）。
+ * 调用方还要按 `mixedDpiDisplays()` 决定这份坐标能不能作数（票 96）。
  */
 function currentLocalPoint (now) {
   const picked = shared.chooseLocalPoint({
@@ -1250,7 +1250,7 @@ function currentLocalPoint (now) {
 }
 
 /**
- * 这一拍命中判定实际能用的本地坐标（票 93 / 票 94）。
+ * 这一拍命中判定实际能用的本地坐标（票 93 / 票 96）。
  *
  * 混合缩放下 OS 光标的本地坐标本身是错位的：窗口按一块屏渲染，光标却按另一块屏折算。
  * 所以只认渲染端上报的 CSS 指针；拿不到（过期/未上报/坏形状）就返回 `point: null`，
@@ -1272,7 +1272,7 @@ function hitPointFor (now) {
 function emitHit (reason) {
   const now = Date.now()
   // 和 applyDecision 用同一份「能作数的坐标」：混合缩放拿不到渲染端指针时，
-  // 这条 hit 的 inside 也必须是 false（票 94），诊断口不能自说自话。
+  // 这条 hit 的 inside 也必须是 false（票 96），诊断口不能自说自话。
   const { point: local } = hitPointFor(now)
   const screenPoint = pointerOverride ?? safeCursorPoint()
   const rects = liveRects(now)
