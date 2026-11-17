@@ -32,9 +32,16 @@ import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 import { isBoardCrop, isBoardSide, isTradingLeverage } from './trading-rules.js'
 // 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
 // 票 95：指令种类（含 `place`）同样只认规则层那一份，协议层 re-export。
-import { FUTURES_ORDER_KINDS, isFuturesLeverage, isFuturesSide, isMarginAmount } from './futures-rules.js'
+import {
+  FUTURES_DEFAULT_MODE,
+  FUTURES_MODES,
+  FUTURES_ORDER_KINDS,
+  isFuturesLeverage,
+  isFuturesSide,
+  isMarginAmount
+} from './futures-rules.js'
 
-export { FUTURES_ORDER_KINDS }
+export { FUTURES_MODES, FUTURES_ORDER_KINDS }
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -895,6 +902,11 @@ function normalizeFuturesTrade (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
   const at = normalizeDigestAt(value.at)
   if (at === null) return null
+  // 票 98：模式切换流水没有作物/合约/方向，价格与张数都是 0，必须在常规校验之前放行。
+  if (value.kind === 'mode') {
+    if (!FUTURES_MODES.includes(value.note)) return null
+    return { at, kind: 'mode', note: value.note, lots: 0, price: 0, fee: 0 }
+  }
   if (!isCropId(value.crop)) return null
   if (typeof value.contract !== 'string' || !FUTURES_CONTRACT_RE.test(value.contract)) return null
   if (!isFuturesSide(value.side)) return null
@@ -1065,6 +1077,9 @@ function buildPacket ({
   // 票 97：settle 里附带的保险基金余额与累计欠账（整数分），peer 只显示
   insurance,
   shortfall,
+  // 票 98：settle 里附带的灰度模式与待提取余额
+  mode,
+  pending,
   lastSeq,
   caps,
   purpose,
@@ -1422,6 +1437,11 @@ function buildPacket ({
     if (safeInsurance === null) throw new Error('protocol: invalid futures insurance')
     const safeShortfall = shortfall === undefined ? 0 : normalizeFuturesCoin(shortfall)
     if (safeShortfall === null) throw new Error('protocol: invalid futures shortfall')
+    // 票 98：灰度模式（白名单）与待提取余额（非负、可缺省为 0）。
+    const safeMode = mode === undefined ? FUTURES_DEFAULT_MODE : (FUTURES_MODES.includes(mode) ? mode : null)
+    if (safeMode === null) throw new Error('protocol: invalid futures mode')
+    const safePending = pending === undefined ? 0 : normalizeFuturesCoin(pending)
+    if (safePending === null) throw new Error('protocol: invalid futures pending')
     packet = {
       ...base,
       at: stamp,
@@ -1434,7 +1454,9 @@ function buildPacket ({
       orders: safeOrders,
       trades: safeTrades,
       insurance: safeInsurance,
-      shortfall: safeShortfall
+      shortfall: safeShortfall,
+      mode: safeMode,
+      pending: safePending
     }
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
@@ -1620,7 +1642,23 @@ export function encodeFuturesCancel ({ deviceId, at, orderId, positionId, now } 
   return encodePacket({ type: 'futures-cancel', deviceId, at, orderId, positionId, now })
 }
 
-export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, orders, trades, insurance = 0, shortfall = 0, now } = {}) {
+export function encodeFuturesSettle ({
+  deviceId,
+  at,
+  epoch,
+  seq,
+  balance,
+  marginUsed,
+  delta = 0,
+  positions,
+  orders,
+  trades,
+  insurance = 0,
+  shortfall = 0,
+  mode = FUTURES_DEFAULT_MODE,
+  pending = 0,
+  now
+} = {}) {
   return encodePacket({
     type: 'futures-settle',
     deviceId,
@@ -1635,6 +1673,8 @@ export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, margin
     trades,
     insurance,
     shortfall,
+    mode,
+    pending,
     now
   })
 }
@@ -2275,6 +2315,13 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     if (insurance === null) return fail('insurance')
     const shortfall = raw.shortfall === undefined ? 0 : normalizeFuturesCoin(raw.shortfall)
     if (shortfall === null) return fail('shortfall')
+    // 票 98：模式缺省按 shadow（新装实例的缺省）；显式给了就必须在三值白名单里。
+    const mode = raw.mode === undefined
+      ? FUTURES_DEFAULT_MODE
+      : FUTURES_MODES.includes(raw.mode) ? raw.mode : null
+    if (mode === null) return fail('mode')
+    const pending = raw.pending === undefined ? 0 : normalizeFuturesCoin(raw.pending)
+    if (pending === null) return fail('pending')
     return {
       ok: true,
       packet: {
@@ -2291,7 +2338,9 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         orders,
         trades,
         insurance,
-        shortfall
+        shortfall,
+        mode,
+        pending
       }
     }
   }

@@ -63,6 +63,8 @@ async function makeStore (t, { coins = 5000, at = AT } = {}) {
   let now = at
   const sink = logSink()
   const store = await createFuturesStore(dir, { farm, now: () => now, log: sink.log })
+  // 票 98：缺省 shadow；这组用例验的是真钱账本，显式切 live。
+  await store.setMode('live')
   return { dir, farm, store, sink, now: () => now, advance: (ms) => { now += ms } }
 }
 

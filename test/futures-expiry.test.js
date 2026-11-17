@@ -84,6 +84,8 @@ async function makeStore (t, { coins = 1000, at = MONDAY, indexPrice = 10 } = {}
     indexOf: () => indexPrice,
     log: { warn () {} }
   })
+  // 票 98：缺省 shadow 不动农场；这组用例验交割与转现货的真钱口径。
+  await store.setMode('live')
   return { dir, farm, store, setNow: (ms) => { now = ms }, now: () => now }
 }
 

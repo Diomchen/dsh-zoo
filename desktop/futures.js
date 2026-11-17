@@ -112,12 +112,20 @@
         tr.appendChild(td)
       })
       const action = document.createElement('td')
-      const button = document.createElement('button')
-      button.type = 'button'
-      button.className = 'close-btn'
-      button.textContent = '平'
-      button.dataset.positionId = row.id ?? ''
-      action.appendChild(button)
+      const closeButton = document.createElement('button')
+      closeButton.type = 'button'
+      closeButton.className = 'close-btn'
+      closeButton.textContent = '平'
+      closeButton.dataset.positionId = row.id ?? ''
+      action.appendChild(closeButton)
+      const convertButton = document.createElement('button')
+      convertButton.type = 'button'
+      convertButton.className = 'close-btn convert-btn'
+      convertButton.textContent = '转'
+      convertButton.title = '按公允价转成现货'
+      convertButton.dataset.convertId = row.id ?? ''
+      convertButton.dataset.convertLots = String(row.lotsValue ?? '')
+      action.appendChild(convertButton)
       tr.appendChild(action)
       body.appendChild(tr)
     }
@@ -151,9 +159,41 @@
         td.textContent = text
         tr.appendChild(td)
       }
+      const action = document.createElement('td')
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'close-btn'
+      button.textContent = '撤'
+      button.dataset.orderId = row.id ?? ''
+      action.appendChild(button)
+      tr.appendChild(action)
       body.appendChild(tr)
     }
     el('ordersEmpty').hidden = rows.length > 0
+  }
+
+  /** 票 98：三档灰度条。老版本 payload 没有 `mode` 就整行藏掉，窗口不该因此变灰。 */
+  function paintMode (built) {
+    const bar = el('modebar')
+    const mode = built.mode
+    if (!mode || typeof mode.kind !== 'string') {
+      bar.hidden = true
+      return
+    }
+    bar.hidden = false
+    const chip = el('modeChip')
+    chip.textContent = mode.label ?? '—'
+    chip.className = 'chip ' + mode.kind
+    el('modeText').textContent = mode.text ?? ''
+    el('caps').textContent = typeof built.capsLine === 'string' ? built.capsLine : ''
+    const pending = typeof built.pendingLine === 'string' ? built.pendingLine : ''
+    el('pending').textContent = pending
+    el('pending').hidden = pending === ''
+    el('modeSwitch').hidden = built.isHost !== true
+    const select = el('modeSelect')
+    if (document.activeElement !== select) select.value = mode.kind
+    el('applyMode').disabled = built.isHost !== true
+    el('rollback').disabled = built.isHost !== true
   }
 
   function render () {
@@ -195,6 +235,7 @@
     el('pReason').textContent = built.preview.ok ? '' : (built.preview.reason ?? '')
     el('submit').disabled = built.canSubmit !== true || state.busy
     el('submit').textContent = state.draft.side === 'short' ? '做空' : '做多'
+    paintMode(built)
 
     if (built.countdown.atEnd) askRefresh()
   }
@@ -283,10 +324,89 @@
 
   el('positions').addEventListener('click', (event) => {
     const positionId = event.target?.dataset?.positionId
-    if (typeof positionId !== 'string' || positionId === '') return
+    if (typeof positionId === 'string' && positionId !== '') {
+      if (state.busy) return
+      state.busy = true
+      bridge.submit({ action: 'futures-close', positionId })
+      setTimeout(() => { state.busy = false; render() }, 3000)
+      return
+    }
+    const convertId = event.target?.dataset?.convertId
+    if (typeof convertId === 'string' && convertId !== '') {
+      const held = Number(event.target.dataset.convertLots)
+      const raw = window.prompt('转多少张成现货？（这批持仓共 ' + (Number.isFinite(held) ? held : '?') + ' 张）', String(held > 0 ? held : 1))
+      if (raw === null) return
+      const lots = Math.trunc(Number(raw))
+      if (!Number.isFinite(lots) || lots <= 0) {
+        toast('张数要是正整数')
+        return
+      }
+      if (state.busy) return
+      state.busy = true
+      bridge.submit({ action: 'futures-convert', positionId: convertId, lots })
+      setTimeout(() => { state.busy = false; render() }, 3000)
+    }
+  })
+
+  el('orders').addEventListener('click', (event) => {
+    const orderId = event.target?.dataset?.orderId
+    if (typeof orderId !== 'string' || orderId === '') return
     if (state.busy) return
     state.busy = true
-    bridge.submit({ action: 'futures-close', positionId })
+    bridge.submit({ action: 'futures-cancel', orderId })
+    setTimeout(() => { state.busy = false; render() }, 3000)
+  })
+
+  el('place').addEventListener('click', () => {
+    if (state.busy) return
+    const price = Number(el('limitPrice').value)
+    const lots = Math.trunc(Number(el('limitLots').value))
+    const hint = el('placeHint')
+    if (!Number.isFinite(price) || price <= 0) {
+      hint.textContent = '填个价'
+      return
+    }
+    if (!Number.isFinite(lots) || lots <= 0) {
+      hint.textContent = '张数要正整数'
+      return
+    }
+    if (typeof state.draft.cropId !== 'string' || state.draft.cropId === '') {
+      hint.textContent = '先选作物'
+      return
+    }
+    hint.textContent = ''
+    state.busy = true
+    const accepted = bridge.submit({
+      action: 'futures-place',
+      side: state.draft.side,
+      cropId: state.draft.cropId,
+      price,
+      lots,
+      leverage: state.draft.leverage
+    })
+    if (!accepted) {
+      state.busy = false
+      toast('窗口状态不对，重开一下。')
+      return
+    }
+    setTimeout(() => { state.busy = false; render() }, 3000)
+  })
+
+  el('applyMode').addEventListener('click', () => {
+    if (state.busy) return
+    const mode = el('modeSelect').value
+    if (mode !== 'off' && mode !== 'shadow' && mode !== 'live') return
+    if (mode === 'live' && !window.confirm('切到真钱档？切完邻居就能用真硬币下单了。')) return
+    state.busy = true
+    bridge.submit({ action: 'futures-mode', mode })
+    setTimeout(() => { state.busy = false; render() }, 3000)
+  })
+
+  el('rollback').addEventListener('click', () => {
+    if (state.busy) return
+    if (!window.confirm('回滚会把所有人的托管余额退回农场、并关掉期货。继续？')) return
+    state.busy = true
+    bridge.submit({ action: 'futures-rollback' })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 

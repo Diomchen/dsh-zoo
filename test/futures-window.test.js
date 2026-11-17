@@ -361,6 +361,66 @@ test('shared：期货动作只收白名单字段，坏杠杆/非整数保证金�
   })
 })
 
+test('shared：票 98 的挂单/撤单/转现货/切档动作各有白名单', () => {
+  assert.deepEqual(
+    shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 4.567, lots: 2, leverage: 10 }),
+    { action: 'futures-place', side: 'long', lots: 2, leverage: 10, cropId: 'tomato', price: 4.57 }
+  )
+  // 价格按分记：0、负数、NaN 整条拒；杠杆只认 1/3/10/20。
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 0, lots: 1, leverage: 10 }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 5, lots: 1, leverage: 5 }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-place', side: 'long', cropId: 'tomato', price: 5, lots: 0, leverage: 10 }), null)
+
+  const id = '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60'
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-cancel', orderId: id }), { action: 'futures-cancel', orderId: id })
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-convert', positionId: id, lots: 3 }), { action: 'futures-convert', positionId: id, lots: 3 })
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert', positionId: id, lots: 0 }), null)
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-mode', mode: 'live' }), { action: 'futures-mode', mode: 'live' })
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-mode', mode: 'turbo' }), null)
+  assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-rollback' }), { action: 'futures-rollback' })
+})
+
+test('视图模型：影子模式先报「只记账」，不落成周末休市；限额与待提取各一行', () => {
+  const view = sampleView({
+    mode: 'shadow',
+    session: { kind: 'shadow', text: '影子模式：只记账，不动农场硬币。' },
+    quotes: {},
+    dayNotional: 0,
+    dayCap: 0,
+    positionCap: 20000,
+    pending: 30
+  })
+})
+
+test('视图模型：影子模式先报「只记账」，不落成周末休市；限额与待提取各一行', () => {
+  const built = view.build(
+    sampleView({
+      mode: 'shadow',
+      session: { kind: 'shadow', text: '影子模式：只记账，不动农场硬币。' },
+      quotes: {},
+      dayNotional: 0,
+      dayCap: 0,
+      positionCap: 20000,
+      pending: 30
+    }),
+    { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' },
+    TUESDAY
+  )
+  assert.equal(built.status.kind, 'shadow')
+  assert.match(built.status.text, /只记账/)
+  assert.equal(built.mode.kind, 'shadow')
+  assert.equal(built.mode.label, '影子')
+  assert.match(built.capsLine, /日额|今日/)
+  assert.match(built.pendingLine, /30/)
+  // 影子模式下不给下单：日额上限是 0，按钮该灰着。
+  assert.equal(built.canSubmit, false)
+
+  // 关掉时一律报关闭，即使有报价——没有托管账户，画报价会让人以为能买。
+  const off = view.build(sampleView({ mode: 'off' }), { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }, TUESDAY)
+  assert.equal(off.status.kind, 'off')
+  assert.equal(off.canTrade, false)
+})
+
 test('shared：futures-window 命令带整份视图，缺字段有默认', () => {
   const command = shared.normalizeHostCommand({ type: 'futures-window', id: 'c1', open: true, state: sampleView() })
   assert.equal(command.ok, true)
@@ -539,8 +599,11 @@ test('futures-window：开窗下发整份视图；再点一次关闭；× 之后
   assert.equal(state.now, TUESDAY)
   // 一份视图能直接交给纯视图模型画出来。
   const painted = view.build(state, { side: 'long', margin: 50, leverage: 20, cropId: state.crops[0].id }, TUESDAY)
-  assert.equal(painted.status.kind, 'no-funds')
+  // 票 98：新装的实例默认影子档，窗口先报「只记账」——房主切到真钱之后才轮到余额。
+  assert.equal(painted.status.kind, 'shadow')
   assert.equal(painted.quotes.length >= 10, true)
+  const live = view.build({ ...state, mode: 'live', session: null }, { side: 'long', margin: 50, leverage: 20, cropId: state.crops[0].id }, TUESDAY)
+  assert.equal(live.status.kind, 'no-funds')
 
   // 再点一次「期货」= 关窗。
   const toggled = await callAction(service, { action: 'futures-window' })

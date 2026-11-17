@@ -64,6 +64,15 @@ async function seedFarm (dir, coins = 500) {
   await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins }), 'utf8')
 }
 
+/**
+ * 票 98：这组端到端用例验的是真钱净额结算。直接在落盘文件里写 `mode:'live'`，
+ * 不走 `futures-mode` 动作——切模式会推进一次全局 seq、往流水里记一条 mode，
+ * 那两件事会打乱本文件里「新账户 seq=0 / 流水条数」这类既有断言。
+ */
+async function seedLiveFutures (dir) {
+  await writeFile(join(dir, 'futures.json'), JSON.stringify({ version: 1, mode: 'live' }), 'utf8')
+}
+
 function makeService (t, options = {}) {
   const { ctx, routes } = fakeCtx()
   const service = createService(ctx, {
@@ -118,6 +127,9 @@ function optionsFor (dir, port, targetPort, overrides = {}) {
     futuresTickMs: 20,
     futuresHelloMs: 40,
     futuresSyncMs: 40,
+    // 票 98：40ms 一次的 hello/sync 会远超「20 包/10 秒」；这组用例验的是账本同步，
+    // 限速本身另有用例，所以把配额放大，避免控制包把业务包挤掉。
+    futuresRateLimit: 10000,
     ...overrides
   }
 }
@@ -132,6 +144,8 @@ async function connectedPair (t, overrides = {}) {
   const coins = overrides.coins ?? 500
   await seedFarm(dirA, coins)
   await seedFarm(dirB, coins)
+  await seedLiveFutures(dirA)
+  await seedLiveFutures(dirB)
   const b = makeService(t, optionsFor(dirB, 0, 0, { futuresHost: true, ...overrides.b }))
   await b.ready
   const bPort = b.localPort()

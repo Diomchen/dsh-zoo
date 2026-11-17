@@ -86,8 +86,12 @@ import { parseJsonText } from './json-text.js'
 import { isDeviceId, FUTURES_MAX_POSITIONS, FUTURES_MAX_ORDERS } from './protocol.js'
 import {
   DAY_MS,
+  DAILY_NOTIONAL_CAP,
   DELIVERY_FEE_RATE,
+  FUTURES_DEFAULT_MODE,
+  FUTURES_MODES,
   HOUR_MS,
+  POSITION_NOTIONAL_CAP,
   SLOT_MS,
   contractOf,
   contractWindowOf,
@@ -121,6 +125,23 @@ export const FUTURES_VIEW_POSITIONS = 20
 /** 盘上最多留 50 条成交；`/state` 与窗口只带最近 20 条（票 93 的「成交记录」）。 */
 export const FUTURES_TRADE_LIMIT = 50
 export const FUTURES_VIEW_TRADES = 20
+
+// 票 98：灰度模式与敞口限额都由规则层定义，账本层与协议层共用同一份，避免三处各写一套。
+export { DAILY_NOTIONAL_CAP, FUTURES_DEFAULT_MODE, FUTURES_MODES, POSITION_NOTIONAL_CAP }
+
+/**
+ * 拒绝原因的中文文案（票 98）：窗口、`/state`、日志都从这里取，保证同一错误码
+ * 不会在不同地方显示成两句话。
+ */
+export const FUTURES_ERROR_TEXT = Object.freeze({
+  off: '期货未开放。',
+  disabled: '期货已回滚停用，不能再开仓或挂单。',
+  'daily-cap': '今日交易额已到上限。',
+  'notional-cap': '持仓名义已到上限。',
+  'rate-limited': '请求太频繁，已限速。',
+  'not-host': '只有房主能操作。',
+  'bad-mode': '未知的期货模式。'
+})
 
 const MAX_ID_LENGTH = 64
 const MAX_QUANTITY = 1_000_000
@@ -176,13 +197,37 @@ export function initialFuturesState () {
     // 记在账上的欠账（不向玩家追缴）；`liquidationCount` 是累计强平笔数（展示用）。
     insurance: 0,
     shortfall: 0,
-    liquidationCount: 0
+    liquidationCount: 0,
+    // 票 98：灰度模式（off/shadow/live）、按自然日的成交额、待提取余额、回滚停用标记。
+    // `farmAnchor/farmIn/farmOut` 只服务于对账：影子模式没有真实流动，所以差额恒为 0。
+    mode: FUTURES_DEFAULT_MODE,
+    dayStart: 0,
+    dayNotional: 0,
+    pending: 0,
+    disabled: false,
+    farmAnchor: 0,
+    farmIn: 0,
+    farmOut: 0,
+    // 票 98：模式变更的版本号。模式是全局状态，不挂在某个远端账户上；
+    // 推进它并把 peer 的 seq 对齐，切档后的第一份 settle 才不会被当成重复包。
+    modeSeq: 0
   }
 }
 
 /** 一个远端账户的空壳（房主第一次见到某个 deviceId 时用）。 */
 function initialRemoteAccount (seq = 0, at = 0) {
-  return { balance: 0, marginUsed: 0, positions: [], orders: [], trades: [], lastSeq: seq, updatedAt: at }
+  return {
+    balance: 0,
+    marginUsed: 0,
+    positions: [],
+    orders: [],
+    trades: [],
+    lastSeq: seq,
+    updatedAt: at,
+    pending: 0,
+    dayStart: 0,
+    dayNotional: 0
+  }
 }
 
 /**
@@ -208,6 +253,15 @@ export function initialFuturesView () {
     orderCount: 0,
     week: { start: 0, pnl: 0 },
     quotes: {},
+    // 票 98：模式、日额进度与上限、待提取、回滚停用——窗口直接照抄这些字段。
+    mode: FUTURES_DEFAULT_MODE,
+    dayNotional: 0,
+    dayCap: 0,
+    positionCap: POSITION_NOTIONAL_CAP,
+    pending: 0,
+    disabled: false,
+    // 票 98：拒绝原因的中文文案，窗口与 /state 直接取这份表。
+    errorText: FUTURES_ERROR_TEXT,
     // 票 96：到期日窗口与本周所处的交易阶段；还没读盘时先按「交易中」占位。
     delivery: null,
     session: { kind: 'trading', text: '交易中' }
@@ -237,23 +291,32 @@ function normalizePosition (raw) {
 function normalizeTrade (raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
   const at = finiteNumber(raw.at)
+  const kind = raw.kind === 'mode'
+    ? 'mode'
+    : raw.kind === 'close'
+      ? 'close'
+      : raw.kind === 'open'
+        ? 'open'
+        : raw.kind === 'delivery'
+          ? 'delivery'
+          : raw.kind === 'convert'
+            ? 'convert'
+            : raw.kind === 'liquidation'
+              ? 'liquidation'
+              : null
+  // 票 98：模式切换流水是审计记录，没有作物/合约/方向，张数与价格都是 0，
+  // 所以必须在常规成交流水校验之前单独放行。
+  if (kind === 'mode') {
+    const note = FUTURES_MODES.includes(raw.note) ? raw.note : null
+    if (at === null || at <= 0 || note === null) return null
+    return { at, kind, note, lots: 0, price: 0, fee: 0 }
+  }
   const crop = isCropId(raw.crop) ? raw.crop : null
   const contract = contractWindowOf(raw.contract)
   const side = isFuturesSide(raw.side) ? raw.side : null
   const lots = positiveInt(raw.lots, MAX_QUANTITY)
   const price = finiteNumber(raw.price)
   const fee = nonNegativeCoin(raw.fee)
-  const kind = raw.kind === 'close'
-    ? 'close'
-    : raw.kind === 'open'
-      ? 'open'
-      : raw.kind === 'delivery'
-        ? 'delivery'
-        : raw.kind === 'convert'
-          ? 'convert'
-          : raw.kind === 'liquidation'
-            ? 'liquidation'
-            : null
   if (at === null || at <= 0 || crop === null || contract === null || side === null) return null
   if (lots === null || price === null || price <= 0 || fee === null || kind === null) return null
   const trade = { at, crop, contract: contract.id, side, lots, price, fee, kind }
@@ -316,6 +379,12 @@ function normalizeRemoteAccount (raw) {
   const lastSeq = raw.lastSeq === undefined ? 0 : raw.lastSeq
   if (raw.updatedAt !== undefined && !(finiteNumber(raw.updatedAt) >= 0)) return null
   const updatedAt = raw.updatedAt === undefined ? 0 : finiteNumber(raw.updatedAt)
+  const pending = raw.pending === undefined ? 0 : nonNegativeCoin(raw.pending)
+  if (pending === null) return null
+  const dayStart = raw.dayStart === undefined ? 0 : finiteNumber(raw.dayStart)
+  if (!(dayStart >= 0)) return null
+  const dayNotional = raw.dayNotional === undefined ? 0 : nonNegativeCoin(raw.dayNotional)
+  if (dayNotional === null) return null
   const positions = []
   if (raw.positions !== undefined) {
     if (!Array.isArray(raw.positions)) return null
@@ -352,7 +421,7 @@ function normalizeRemoteAccount (raw) {
       trades.push(trade)
     }
   }
-  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt }
+  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional }
 }
 
 /**
@@ -569,6 +638,44 @@ export function normalizeFuturesFile (value) {
   if (liquidationCount === null) repaired += 1
   else state.liquidationCount = liquidationCount
 
+  // 票 98：灰度模式与限额进度。缺字段是旧版本，按缺省值处理且不算修补；
+  // 非法的模式名则必须当坏账修掉（否则窗口会显示一个谁都不认识的状态）。
+  const mode = value.mode === undefined
+    ? FUTURES_DEFAULT_MODE
+    : FUTURES_MODES.includes(value.mode) ? value.mode : null
+  if (mode === null) repaired += 1
+  else state.mode = mode
+
+  const dayStart = value.dayStart === undefined ? 0 : finiteNumber(value.dayStart)
+  if (dayStart === null || dayStart < 0) repaired += 1
+  else state.dayStart = dayStart
+
+  const dayNotional = value.dayNotional === undefined ? 0 : nonNegativeCoin(value.dayNotional)
+  if (dayNotional === null) repaired += 1
+  else state.dayNotional = dayNotional
+
+  const pending = value.pending === undefined ? 0 : nonNegativeCoin(value.pending)
+  if (pending === null) repaired += 1
+  else state.pending = pending
+
+  const disabled = value.disabled === undefined ? false : value.disabled
+  if (typeof disabled !== 'boolean') repaired += 1
+  else state.disabled = disabled
+
+  const farmAnchor = value.farmAnchor === undefined ? 0 : nonNegativeCoin(value.farmAnchor)
+  const farmIn = value.farmIn === undefined ? 0 : nonNegativeCoin(value.farmIn)
+  const farmOut = value.farmOut === undefined ? 0 : nonNegativeCoin(value.farmOut)
+  if (farmAnchor === null || farmIn === null || farmOut === null) repaired += 1
+  else {
+    state.farmAnchor = farmAnchor
+    state.farmIn = farmIn
+    state.farmOut = farmOut
+  }
+
+  const modeSeq = value.modeSeq === undefined ? 0 : value.modeSeq
+  if (!(Number.isInteger(modeSeq) && modeSeq >= 0)) repaired += 1
+  else state.modeSeq = modeSeq
+
   // 保证金是「从余额划走的钱」：仓位/挂单丢了、保证金还在，账会凭空多钱或少钱。
   // 仓位 + 挂单冻结的总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
   const expectedMargin = roundCoin(
@@ -605,7 +712,17 @@ function toFileState (state) {
     shortfall: roundCoin(state.shortfall),
     // 票 97：保险基金余额与累计强平笔数（基金余额会被亏空花掉，`fees.insurance` 只增不减）。
     insurance: roundCoin(state.insurance),
-    liquidationCount: state.liquidationCount
+    liquidationCount: state.liquidationCount,
+    // 票 98：模式、日额进度、待提取、回滚标记与对账锚点。
+    mode: state.mode,
+    dayStart: state.dayStart,
+    dayNotional: roundCoin(state.dayNotional),
+    pending: roundCoin(state.pending),
+    disabled: state.disabled,
+    farmAnchor: roundCoin(state.farmAnchor),
+    farmIn: roundCoin(state.farmIn),
+    farmOut: roundCoin(state.farmOut),
+    modeSeq: state.modeSeq
   }
 }
 
@@ -619,7 +736,10 @@ function remoteFileState (remotes) {
       orders: account.orders.map((order) => ({ ...order })),
       trades: (account.trades ?? []).map((trade) => ({ ...trade })),
       lastSeq: account.lastSeq,
-      updatedAt: account.updatedAt
+      updatedAt: account.updatedAt,
+      pending: roundCoin(account.pending ?? 0),
+      dayStart: account.dayStart ?? 0,
+      dayNotional: roundCoin(account.dayNotional ?? 0)
     }
   }
   return out
@@ -673,6 +793,7 @@ class FuturesStore {
       // 票 94：epoch 必须在启动时就存在——房主拿它给 peer 标记「这是哪一本账」，
       // 空字符串会被 `futures-settle` 直接拒掉。读盘失败也换新：旧账本反正读不出来了。
       this.#state.epoch = randomUUID()
+      this.#state.farmAnchor = this.#farmCoins()
       return
     }
 
@@ -683,6 +804,7 @@ class FuturesStore {
       this.#warnOnce('parse', '期货账本不是合法 JSON，先按空市场运行')
       this.#state = initialFuturesState()
       this.#state.epoch = randomUUID()
+      this.#state.farmAnchor = this.#farmCoins()
       return
     }
 
@@ -693,6 +815,8 @@ class FuturesStore {
     } else if (normalized.repaired > 0) {
       this.#warnOnce('entries', '期货账本有 ' + normalized.repaired + ' 处格式不对，已按默认值修补')
     }
+    // 票 98：旧账本没有对账锚点，第一次读盘时用当前农场硬币补上；之后随账本落盘。
+    if (raw.farmAnchor === undefined) this.#state.farmAnchor = this.#farmCoins()
     // 不落盘：坏文件留在盘上等下一次动钱覆盖，读的时候不自作主张改写用户的账。
     // epoch 每次启动换新（SPEC v11）：它是「这一本账」的身份，票 94 用它判 peer 的状态过期了。
     this.#state.epoch = randomUUID()
@@ -700,6 +824,111 @@ class FuturesStore {
 
   #nowMs () {
     return this.#now()
+  }
+
+  /**
+   * 农场当前的硬币数（票 98 对账用）。真实 farm 有 `snapshot()`；测试里的假农场只有
+   * `state.coins`，两条路都兼容。读不到时按 0 处理，宁可对账报警也不抛。
+   */
+  #farmCoins () {
+    const farm = this.#farm
+    try {
+      if (farm !== null && typeof farm.snapshot === 'function') {
+        const coins = nonNegativeCoin(farm.snapshot()?.coins)
+        if (coins !== null) return coins
+      }
+      if (farm !== null && farm.state !== null && typeof farm.state === 'object') {
+        const coins = nonNegativeCoin(farm.state.coins)
+        if (coins !== null) return coins
+      }
+    } catch {
+      // 农场读失败不影响交易；对账会把差额显出来。
+    }
+    return 0
+  }
+
+  /** 当前生效的模式：peer 跟随房主下发的副本，房主用自己的账本。 */
+  modeOf () {
+    const replica = this.#state.replica
+    if (replica !== null && typeof replica === 'object' && FUTURES_MODES.includes(replica.mode)) {
+      return replica.mode
+    }
+    return this.#state.mode
+  }
+
+  #disabled () {
+    return this.#state.disabled || this.modeOf() === 'off'
+  }
+
+  /** 统一的交易入口闸门：回滚后 `disabled`，房主切 `off` 后一律拒绝。 */
+  #gate () {
+    if (this.#state.disabled) {
+      return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
+    }
+    if (this.modeOf() === 'off') {
+      return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
+    }
+    return null
+  }
+
+  #limitError (code) {
+    return { ok: false, error: code, notice: FUTURES_ERROR_TEXT[code] }
+  }
+
+  /** 本地自然日 00:00（票 98 的日额按本地时区归零）。 */
+  #dayStartOf (stamp) {
+    const date = new Date(stamp)
+    date.setHours(0, 0, 0, 0)
+    return date.getTime()
+  }
+
+  #rollDay (stamp) {
+    this.#rollDayFor(this.#state, stamp)
+  }
+
+  /** 每个账户各自按本地 00:00 归零日额（本地账本就是 `#state`，远端各有一份）。 */
+  #rollDayFor (account, stamp) {
+    const start = this.#dayStartOf(stamp)
+    if (account.dayStart !== start) {
+      account.dayStart = start
+      account.dayNotional = 0
+    }
+  }
+
+  /** 仓位 + 挂单冻结的名义（都按 `保证金 × 杠杆` 还原）。 */
+  #notionalOfAccount (account) {
+    const positions = Array.isArray(account?.positions) ? account.positions : []
+    const orders = Array.isArray(account?.orders) ? account.orders : []
+    return roundCoin(
+      positions.reduce((sum, position) => sum + position.margin * position.leverage, 0) +
+      orders.reduce((sum, order) => sum + order.marginFrozen * order.leverage, 0)
+    )
+  }
+
+  /**
+   * 票 98 的两道敞口闸门：先日额、再同时持仓名义。影子模式的日额上限是 0——
+   * 它只允许观察和撮合已有挂单，任何新开仓/新挂单都按 `daily-cap` 拒绝。
+   * 返回 null 表示放行。
+   */
+  #checkLimits (account, notional, stamp) {
+    const amount = nonNegativeCoin(notional)
+    if (amount === null || amount <= 0) return null
+    const owner = account ?? this.#state
+    this.#rollDayFor(owner, stamp)
+    const cap = this.modeOf() === 'shadow' ? 0 : DAILY_NOTIONAL_CAP
+    if (owner.dayNotional + amount >= cap) {
+      return this.#limitError('daily-cap')
+    }
+    if (this.#notionalOfAccount(account) + amount >= POSITION_NOTIONAL_CAP) {
+      return this.#limitError('notional-cap')
+    }
+    return null
+  }
+
+  #recordNotional (account, notional, stamp) {
+    const owner = account ?? this.#state
+    this.#rollDayFor(owner, stamp)
+    owner.dayNotional = roundCoin(owner.dayNotional + notional)
   }
 
   #slotOf (at) {
@@ -744,6 +973,14 @@ class FuturesStore {
       insurance: roundCoin(this.#state.insurance),
       shortfall: roundCoin(this.#state.shortfall),
       liquidationCount: this.#state.liquidationCount,
+      // 票 98：模式、日额进度/上限、持仓上限、待提取与回滚标记。
+      mode: this.modeOf(),
+      dayNotional: roundCoin(this.#state.dayNotional),
+      dayCap: this.modeOf() === 'shadow' ? 0 : DAILY_NOTIONAL_CAP,
+      positionCap: POSITION_NOTIONAL_CAP,
+      pending: roundCoin(this.#state.pending),
+      disabled: this.#state.disabled,
+      errorText: FUTURES_ERROR_TEXT,
       closed: this.#state.closed,
       positionCount: this.#state.positions.length,
       positions,
@@ -758,6 +995,161 @@ class FuturesStore {
       session: this.#sessionOf(focus, stamp),
       now: stamp
     }
+  }
+
+  /**
+   * 票 98：房主切换灰度模式。切换本身写一条 `kind:'mode'` 的审计流水（价格/张数为 0），
+   * 并重置日额与对账锚点——从切换这一刻起重新按真实流动算差额。
+   */
+  async setMode (rawMode, at = this.#nowMs()) {
+    if (!FUTURES_MODES.includes(rawMode)) {
+      return { ok: false, error: 'bad-mode', notice: FUTURES_ERROR_TEXT['bad-mode'] }
+    }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    this.#state.mode = rawMode
+    // 日额只按自然日归零，不因切模式重置（否则 live→shadow→live 能刷出新的 5,000）。
+    this.#rollDay(stamp)
+    this.#state.farmAnchor = this.#farmCoins()
+    this.#state.farmIn = 0
+    this.#state.farmOut = 0
+    this.#recordTrade({ at: stamp, kind: 'mode', note: rawMode, lots: 0, price: 0, fee: 0 })
+    // 模式是全局账目的一部分：推进模式版本号，并把已有远端账户都对齐到它。
+    // 否则 peer 会把「同一 seq 的新模式」当成重复包丢掉，窗口一直停在旧档位。
+    // 还没建账的 peer 由 `accountOf()` 返回 `modeSeq`，同样能收到这次模式变化。
+    this.#state.modeSeq += 1
+    this.#state.seq = Math.max(this.#state.seq, this.#state.modeSeq)
+    for (const account of Object.values(this.#state.remotes)) {
+      account.updatedAt = stamp
+      account.lastSeq = this.#state.seq
+    }
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-mode',
+      mode: rawMode,
+      disabled: this.#state.disabled,
+      ...this.#view(),
+      persisted
+    }
+  }
+
+  /**
+   * 票 98：影子对账。`diff = 按账面应当的农场硬币 - 真实农场硬币`。
+   *
+   * 影子模式没有任何真实流动（`farmIn/farmOut` 都是 0），所以只要农场没被别的
+   * 模块动过，差额就是 0；切到 live 后的充提都会同时记进这两个计数器，差额仍是 0。
+   */
+  reconcile () {
+    const farmCoins = this.#farmCoins()
+    const custodyTotal = roundCoin(
+      this.#state.balance +
+      Object.values(this.#state.remotes).reduce((sum, account) => sum + account.balance, 0)
+    )
+    let positionsNotional = this.#notionalOfAccount(this.#state)
+    for (const account of Object.values(this.#state.remotes)) {
+      positionsNotional = roundCoin(positionsNotional + this.#notionalOfAccount(account))
+    }
+    const expected = roundCoin(this.#state.farmAnchor + this.#state.farmOut - this.#state.farmIn)
+    return {
+      ok: true,
+      mode: this.modeOf(),
+      farmCoins,
+      custodyTotal,
+      positionsNotional,
+      diff: roundCoin(expected - farmCoins)
+    }
+  }
+
+  /**
+   * 票 98：回滚。顺序是「撤掉所有挂单释放冻结 → 按当前公允价强平本地与远端仓位 →
+   * 托管余额逐笔退回农场（撞上限的留在托管账标 pending）→ 存档 disabled、模式 off」。
+   * 数据不删：仓位/流水都还在，只是不能再开新仓。
+   */
+  async rollback ({ at = this.#nowMs() } = {}) {
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    // 先确认每个仓位都拿得到当前公允价；有一个拿不到就整笔取消，避免“平到一半”。
+    const targets = []
+    for (const position of this.#state.positions) {
+      const price = this.#fairAt(position.crop, position.contract, stamp)
+      if (price === null) return { ok: false, error: 'market-closed', notice: '有仓位拿不到公允价，回滚已取消。' }
+      targets.push({ account: this.#state, position, local: true, deviceId: 'local', price })
+    }
+    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
+      for (const position of account.positions) {
+        const price = this.#fairAt(position.crop, position.contract, stamp)
+        if (price === null) return { ok: false, error: 'market-closed', notice: '有仓位拿不到公允价，回滚已取消。' }
+        targets.push({ account, position, local: false, deviceId, price })
+      }
+    }
+
+    // 撤单：冻结的保证金先回到余额，才能整笔退给农场。
+    for (const order of this.#state.orders) this.#state.balance = roundCoin(this.#state.balance + order.marginFrozen)
+    this.#state.orders = []
+    this.#state.marginUsed = this.#recomputeMarginUsed()
+    for (const account of Object.values(this.#state.remotes)) {
+      for (const order of account.orders) account.balance = roundCoin(account.balance + order.marginFrozen)
+      account.orders = []
+      account.marginUsed = this.#recomputeFor(account)
+    }
+
+    for (const target of targets) {
+      const pnl = pnlOf({
+        lots: target.position.lots,
+        entry: target.position.entry,
+        exit: target.price,
+        side: target.position.side
+      })
+      this.#liquidate({
+        account: target.account,
+        position: target.position,
+        local: target.local,
+        deviceId: target.local ? null : target.deviceId,
+        hit: { at: stamp, price: target.price, pnl, trigger: true }
+      }, stamp)
+    }
+
+    const refunds = []
+    refunds.push(await this.#refundAccount(this.#state, 'local'))
+    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
+      refunds.push(await this.#refundAccount(account, deviceId))
+    }
+
+    this.#state.disabled = true
+    this.#state.mode = 'off'
+    this.#state.dayNotional = 0
+    this.#recordTrade({ at: stamp, kind: 'mode', note: 'off', lots: 0, price: 0, fee: 0 })
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-rollback',
+      refunds,
+      disabled: true,
+      mode: 'off',
+      ...this.#view(),
+      pending: roundCoin(this.#state.pending),
+      persisted
+    }
+  }
+
+  /** 回滚时把一个托管账户的余额退回农场；撞上限的部分留在余额并标 pending。 */
+  async #refundAccount (account, deviceId) {
+    const amount = roundCoin(account.balance)
+    let credited = 0
+    if (amount > 0) {
+      try {
+        const added = await this.#farm.addCoins(amount)
+        if (added !== null && added.ok === true && Number(added.qty) > 0) {
+          credited = roundCoin(Number(added.qty))
+        }
+      } catch {
+        // 农场拒绝时全部留作 pending，不静默丢钱。
+      }
+    }
+    const pending = roundCoin(amount - credited)
+    account.balance = pending
+    account.pending = pending
+    this.#state.farmOut = roundCoin(this.#state.farmOut + credited)
+    return { deviceId, credited, pending }
   }
 
   /**
@@ -792,6 +1184,13 @@ class FuturesStore {
 
   /** 票 96：交易中 / 已到期 / 周末三态；文案由账本层统一给，窗口不自己拼。 */
   #sessionOf (crop, stamp) {
+    // 票 98：模式优先于合约状态——off 时连「这周有没有合约」都不该显示。
+    if (this.#state.disabled || this.modeOf() === 'off') {
+      return { kind: 'off', text: '期货未开放' }
+    }
+    if (this.modeOf() === 'shadow') {
+      return { kind: 'shadow', text: '影子模式：只记账，不动农场硬币' }
+    }
     const contract = contractOf(crop, stamp)
     if (contract !== null) {
       return { kind: 'trading', text: contract.id + ' 交易中，周五 20:00 到期。' }
@@ -810,15 +1209,32 @@ class FuturesStore {
     return pnlOf({ lots: position.lots, entry: position.entry, exit, side: position.side })
   }
 
-  /** 充值：农场扣 coins、托管余额加同样的数。 */
+  /** 充值：live 时农场扣 coins、托管余额加同样的数；shadow 只记托管账。 */
   async deposit (rawCoins) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const coins = positiveInt(rawCoins, MAX_COINS)
     if (coins === null) return { ok: false, error: 'bad-amount' }
+    if (this.modeOf() === 'shadow') {
+      this.#state.balance = roundCoin(this.#state.balance + coins)
+      this.#state.tradedAt = this.#nowMs()
+      const persisted = await this.#persist()
+      return {
+        ok: true,
+        action: 'futures-deposit',
+        coins,
+        shadow: true,
+        mode: 'shadow',
+        ...this.#view(),
+        persisted
+      }
+    }
     const spent = await this.#farm.spendCoins(coins)
     if (spent === null || spent.ok !== true) {
       return { ok: false, error: spent?.error === 'no-coin' ? 'no-coin' : 'farm-refused' }
     }
     this.#state.balance = roundCoin(this.#state.balance + spent.qty)
+    this.#state.farmIn = roundCoin(this.#state.farmIn + spent.qty)
     this.#state.tradedAt = this.#nowMs()
     const persisted = await this.#persist()
     return { ok: true, action: 'futures-deposit', coins: spent.qty, ...this.#view(), persisted }
@@ -829,13 +1245,33 @@ class FuturesStore {
    *
    * 农场 `addCoins` 在上限 1,000,000 处**静默截断**，所以这里按 1,000,000 分批并核对
    * 每一批的实收 `qty`：收多少就扣多少，剩下的留在托管账户里，绝不「账上扣了、农场没进」。
+   * 票 98：撞上限的余额留在 `balance` 并标 `pending`，同时返回中文 `notice`。
+   * 影子模式不碰农场：整笔都算「已提现」，只在托管账上减。
    */
   async withdraw (rawCoins) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     // 提现不受农场单次上限约束：正是「一次提一大笔」才需要分批。
     const coins = positiveInt(rawCoins, Number.MAX_SAFE_INTEGER)
     if (coins === null) return { ok: false, error: 'bad-amount' }
     const available = Math.floor(this.#state.balance)
     if (available < coins) return { ok: false, error: 'no-balance' }
+    if (this.modeOf() === 'shadow') {
+      this.#state.balance = roundCoin(this.#state.balance - coins)
+      this.#state.tradedAt = this.#nowMs()
+      const persisted = await this.#persist()
+      return {
+        ok: true,
+        action: 'futures-withdraw',
+        coins,
+        credited: coins,
+        pending: 0,
+        shadow: true,
+        mode: 'shadow',
+        ...this.#view(),
+        persisted
+      }
+    }
     let remaining = coins
     let credited = 0
     while (remaining > 0) {
@@ -850,10 +1286,28 @@ class FuturesStore {
       remaining -= added.qty
       if (added.qty < batch) break // 农场到上限了，剩下的留在托管账户
     }
+    const uncredited = roundCoin(coins - credited)
     this.#state.balance = roundCoin(this.#state.balance - credited)
+    // 撞上限时，剩下的整笔余额都提不动，统一标成 pending；全额提成功时，
+    // 旧 pending 里被这次提走的部分要相应扣掉。
+    this.#state.pending = uncredited > 0
+      ? this.#state.balance
+      : Math.max(0, roundCoin(this.#state.pending - credited))
+    this.#state.farmOut = roundCoin(this.#state.farmOut + credited)
     this.#state.tradedAt = this.#nowMs()
     const persisted = await this.#persist()
-    return { ok: true, action: 'futures-withdraw', coins: credited, ...this.#view(), persisted }
+    const result = {
+      ok: true,
+      action: 'futures-withdraw',
+      coins: credited,
+      credited,
+      ...this.#view(),
+      persisted
+    }
+    if (uncredited > 0) {
+      result.notice = '农场硬币到上限了，剩 ' + this.#state.pending + ' 留在托管账待提取。'
+    }
+    return result
   }
 
   /**
@@ -876,6 +1330,8 @@ class FuturesStore {
    * 房主只负责记「你在我这里有这么多可用余额」（peer 那边已经在 `transferOut` 里扣过）。
    */
   async hostDeposit (deviceId, rawCoins, at = this.#nowMs()) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const coins = positiveInt(rawCoins, MAX_COINS)
     if (coins === null) return { ok: false, error: 'bad-amount' }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
@@ -890,6 +1346,8 @@ class FuturesStore {
 
   /** 房主：替 peer 开仓（票 94）——校验、定价、收费与 `open()` 是同一套函数，只是账记在 `remotes` 上。 */
   async hostOpen (deviceId, { crop, side, margin, leverage, at = this.#nowMs() } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     if (!isCropId(crop)) return { ok: false, error: 'bad-crop' }
     if (!isFuturesSide(side)) return { ok: false, error: 'bad-side' }
     if (!isMarginAmount(margin)) return { ok: false, error: 'bad-margin' }
@@ -912,7 +1370,19 @@ class FuturesStore {
     const usedMargin = marginOf({ lots, price, leverage })
     const fee = takerFeeOf(notionalOf({ lots, price }))
     const total = roundCoin(usedMargin + fee)
+    // 余额先判：买不起的单本来就该回 no-balance（不该被说成限额）；
+    // 买得起才看日额/持仓两道闸门，被限额拒绝时账上一分不动。
+    // 影子模式例外：日额上限为 0，任何新仓都先按 daily-cap 拒绝，不因余额多少改口。
+    const shadow = this.modeOf() === 'shadow'
+    if (shadow) {
+      const limited = this.#checkLimits(account, notional, stamp)
+      if (limited !== null) return limited
+    }
     if (account.balance < total) return { ok: false, error: 'no-balance' }
+    if (!shadow) {
+      const limited = this.#checkLimits(account, notional, stamp)
+      if (limited !== null) return limited
+    }
 
     account.balance = roundCoin(account.balance - total)
     const slot = this.#slotOf(stamp)
@@ -933,6 +1403,7 @@ class FuturesStore {
     account.marginUsed = this.#recomputeFor(account)
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
+    this.#recordNotional(account, notional, stamp)
     // 手续费从 peer 的余额里出，落在本机的保险/销毁桶里（钱确实动了，费账就得跟着动）。
     this.#chargeFee(fee)
     const persisted = await this.#persist()
@@ -951,6 +1422,8 @@ class FuturesStore {
 
   /** 房主：替 peer 平仓（票 94）。规则与 `close()` 相同；别人的盈亏不进本机的周成绩。 */
   async hostClose (deviceId, { id, at = this.#nowMs() } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const account = this.#state.remotes[key]
@@ -1049,6 +1522,8 @@ class FuturesStore {
    * 所以不是「保证金直接换作物」，余额不够时仍然会 `no-coins`。
    */
   async convertToSpot ({ positionId, lots, at = this.#nowMs() } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const plan = this.#convertPlan(this.#state, positionId, lots, stamp)
     if (plan.ok !== true) return plan
@@ -1135,6 +1610,8 @@ class FuturesStore {
 
   /** 房主：替 peer 转现货。作物不进房主农场——peer 在自己机器上入仓，这里只结钱与合约。 */
   async hostConvert (deviceId, { positionId, lots, at = this.#nowMs() } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const account = this.#state.remotes[key]
@@ -1333,7 +1810,19 @@ class FuturesStore {
     const key = this.#remoteKey(deviceId)
     const account = key === null ? undefined : this.#state.remotes[key]
     if (account === undefined) {
-      return { balance: 0, marginUsed: 0, equity: 0, positions: [], orders: [], trades: [], seq: 0, epoch: this.#state.epoch }
+      return {
+        balance: 0,
+        marginUsed: 0,
+        equity: 0,
+        positions: [],
+        orders: [],
+        trades: [],
+        // 票 98：还没建账的 peer 也要看到房主刚拨过的模式；用模式版本号，
+        // 切档后的第一份 settle 才不会被对端当重复包丢掉。
+        seq: this.#state.modeSeq,
+        epoch: this.#state.epoch,
+        pending: 0
+      }
     }
     return this.#accountView(account, stamp, positionLimit)
   }
@@ -1345,7 +1834,20 @@ class FuturesStore {
    * 说明房主换了账本（重启/换人），旧的 lastSeq 一笔作废、直接采纳新账。
    * 不写盘：这是房主账本的缓存（见文件头）。
    */
-  applySettle ({ epoch, seq, balance, marginUsed, positions, orders, trades, insurance, shortfall, at = this.#nowMs() } = {}) {
+  applySettle ({
+    epoch,
+    seq,
+    balance,
+    marginUsed,
+    positions,
+    orders,
+    trades,
+    insurance,
+    shortfall,
+    mode,
+    pending,
+    at = this.#nowMs()
+  } = {}) {
     // 先验形状再看新旧：坏包必须被「拒」，不能被当成「旧的」悄悄咽下去。
     if (typeof epoch !== 'string' || epoch === '' || epoch.length > MAX_ID_LENGTH) {
       return { ok: false, error: 'bad-epoch' }
@@ -1385,6 +1887,13 @@ class FuturesStore {
     const safeInsurance = insurance === undefined ? 0 : nonNegativeCoin(insurance)
     const safeShortfall = shortfall === undefined ? 0 : nonNegativeCoin(shortfall)
     if (safeInsurance === null || safeShortfall === null) return { ok: false, error: 'bad-fund' }
+    // 票 98：房主把当前模式与待提取余额一起下发；老房主不发时按缺省处理，不判坏包。
+    const safeMode = mode === undefined
+      ? FUTURES_DEFAULT_MODE
+      : FUTURES_MODES.includes(mode) ? mode : null
+    if (safeMode === null) return { ok: false, error: 'bad-mode' }
+    const safePending = pending === undefined ? 0 : nonNegativeCoin(pending)
+    if (safePending === null) return { ok: false, error: 'bad-pending' }
     this.#state.replica = {
       epoch,
       lastSeq: seq,
@@ -1395,6 +1904,8 @@ class FuturesStore {
       trades: accountTrades,
       insurance: safeInsurance,
       shortfall: safeShortfall,
+      mode: safeMode,
+      pending: safePending,
       updatedAt: stamp
     }
     return { ok: true, applied: true }
@@ -1414,7 +1925,10 @@ class FuturesStore {
       trades: (replica.trades ?? []).map((trade) => ({ ...trade })),
       // 票 97：房主广播过来的全局基金/欠账（peer 只读）。
       insurance: roundCoin(replica.insurance ?? 0),
-      shortfall: roundCoin(replica.shortfall ?? 0)
+      shortfall: roundCoin(replica.shortfall ?? 0),
+      // 票 98：模式与待提取余额也跟随房主。
+      mode: FUTURES_MODES.includes(replica.mode) ? replica.mode : FUTURES_DEFAULT_MODE,
+      pending: roundCoin(replica.pending ?? 0)
     }
   }
 
@@ -1430,6 +1944,8 @@ class FuturesStore {
 
   /** 吃单开仓：做多吃卖一、做空吃买一；保证金与手续费当场从余额划走。 */
   async open ({ crop, side, margin, leverage, at = this.#nowMs() }) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     if (!isCropId(crop)) return { ok: false, error: 'bad-crop' }
     if (!isFuturesSide(side)) return { ok: false, error: 'bad-side' }
     if (!isMarginAmount(margin)) return { ok: false, error: 'bad-margin' }
@@ -1448,7 +1964,16 @@ class FuturesStore {
     const usedMargin = marginOf({ lots, price, leverage })
     const fee = takerFeeOf(notionalOf({ lots, price }))
     const total = roundCoin(usedMargin + fee)
+    const shadow = this.modeOf() === 'shadow'
+    if (shadow) {
+      const limited = this.#checkLimits(this.#state, notional, stamp)
+      if (limited !== null) return limited
+    }
     if (this.#state.balance < total) return { ok: false, error: 'no-balance' }
+    if (!shadow) {
+      const limited = this.#checkLimits(this.#state, notional, stamp)
+      if (limited !== null) return limited
+    }
 
     this.#state.balance = roundCoin(this.#state.balance - total)
     this.#state.marginUsed = roundCoin(this.#state.marginUsed + usedMargin)
@@ -1468,6 +1993,7 @@ class FuturesStore {
     }
     this.#state.positions.push(position)
     this.#state.tradedAt = stamp
+    this.#recordNotional(this.#state, notional, stamp)
     this.#chargeFee(fee)
     this.#recordTrade({ at: stamp, crop, contract: quote.contract.id, side, lots, price, fee, kind: 'open' })
     const persisted = await this.#persist()
@@ -1488,6 +2014,8 @@ class FuturesStore {
    * `deviceId` 给了就走房主的 `hostPlace`（peer 的单记在 `remotes` 上）。
    */
   async place ({ crop, side, price, lots, leverage, at = this.#nowMs(), deviceId = null } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     if (isDeviceId(deviceId)) return this.hostPlace(deviceId, { crop, side, price, lots, leverage, at })
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const prepared = this.#prepareOrder({ crop, side, price, lots, leverage, stamp })
@@ -1501,6 +2029,8 @@ class FuturesStore {
 
   /** 房主：替 peer 挂单——规则与 `place()` 同一套，账记在 `remotes[deviceId]` 上。 */
   async hostPlace (deviceId, { crop, side, price, lots, leverage, at = this.#nowMs() } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
@@ -1529,6 +2059,8 @@ class FuturesStore {
    * 别人的单回 `not-yours`（不泄漏「这单存在」以外的信息），不存在回 `no-order`。
    */
   async cancel ({ orderId, at = this.#nowMs(), deviceId = null } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     if (isDeviceId(deviceId)) return this.hostCancel(deviceId, { orderId, at })
     const id = typeof orderId === 'string' && orderId !== '' && orderId.length <= MAX_ID_LENGTH ? orderId : null
     if (id === null) return { ok: false, error: 'bad-order' }
@@ -1553,6 +2085,8 @@ class FuturesStore {
 
   /** 房主：替 peer 撤单。 */
   async hostCancel (deviceId, { orderId, at = this.#nowMs() } = {}) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const id = typeof orderId === 'string' && orderId !== '' && orderId.length <= MAX_ID_LENGTH ? orderId : null
@@ -1682,11 +2216,24 @@ class FuturesStore {
     const order = prepared.order
     if (account.orders.length >= FUTURES_MAX_ORDERS) return { ok: false, error: 'order-limit' }
     if (this.#crossesOwn(account.orders, order)) return { ok: false, error: 'self-trade' }
+    const notional = roundCoin(order.marginFrozen * order.leverage)
+    // 影子模式连余额都不看：一律 daily-cap（票面要求「新的开仓/挂单」全部拒绝）。
+    const shadow = this.modeOf() === 'shadow'
+    if (shadow) {
+      const limited = this.#checkLimits(account, notional, order.at)
+      if (limited !== null) return limited
+    }
     const cost = roundCoin(order.marginFrozen + takerFeeOf(notionalOf({ lots: order.lots, price: order.price })))
     if (account.balance < cost) return { ok: false, error: 'no-balance' }
+    // 票 98：挂单也占日额与同时持仓名义（用冻结保证金还原名义）。
+    if (!shadow) {
+      const limited = this.#checkLimits(account, notional, order.at)
+      if (limited !== null) return limited
+    }
     account.orders.push(order)
     account.balance = roundCoin(account.balance - order.marginFrozen)
     account.marginUsed = this.#recomputeFor(account)
+    this.#recordNotional(account, notional, order.at)
     return { ok: true, order }
   }
 
@@ -1828,6 +2375,8 @@ class FuturesStore {
 
   /** 主动平仓：按当前对手价成交，保证金 + 盈亏记回余额。合约过期后只能等交割（票 96）。 */
   async close ({ id, at = this.#nowMs() }) {
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
     const index = this.#state.positions.findIndex((position) => position.id === id)
     if (index < 0) return { ok: false, error: 'no-position' }
     const position = this.#state.positions[index]
@@ -2198,13 +2747,15 @@ class FuturesStore {
       // 票 96：这个账户自己的成交流水（交割后 peer 窗口要能看到「交割」）。
       trades: (account.trades ?? []).slice(0, FUTURES_VIEW_TRADES).map((trade) => ({ ...trade })),
       seq: account.lastSeq,
-      epoch: this.#state.epoch
+      epoch: this.#state.epoch,
+      pending: roundCoin(account.pending ?? 0)
     }
   }
 
   /** 流水号 +1：只有「peer 必须看见」的变动才动它（本机自己的买卖不影响别人的账）。 */
   #bumpAccount (account) {
-    this.#state.seq += 1
+    // 票 98：切模式也会推进 seq；下一次动钱必须严格大于模式那一次的 seq。
+    this.#state.seq = Math.max(this.#state.seq, this.#state.modeSeq, account.lastSeq) + 1
     account.lastSeq = this.#state.seq
     return account.lastSeq
   }
@@ -2283,7 +2834,10 @@ class FuturesStore {
     return {
       balance: roundCoin(this.#state.balance),
       marginUsed: roundCoin(this.#state.marginUsed),
-      equity: roundCoin(this.#state.balance + this.#state.marginUsed)
+      equity: roundCoin(this.#state.balance + this.#state.marginUsed),
+      mode: this.modeOf(),
+      pending: roundCoin(this.#state.pending),
+      disabled: this.#state.disabled
     }
   }
 

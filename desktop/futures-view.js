@@ -149,7 +149,8 @@
       weekPct: weekPct === null ? '—' : formatPct(weekPct),
       weekTone: weekPnl > 0 ? 'up' : weekPnl < 0 ? 'down' : 'flat',
       insurance: formatCoin(insurance),
-      shortfall: formatCoin(shortfall)
+      shortfall: formatCoin(shortfall),
+      mode: modeOf(view)
     }
   }
 
@@ -393,6 +394,9 @@
     if (view === null || view === undefined) {
       return { kind: 'starting', text: '期货市场还没就绪，稍等一拍。', action: null }
     }
+    // 票 98：关掉/回滚过时先报关闭——这时候没有报价、没有托管，说别的都像 bug。
+    const mode = modeOf(view)
+    if (mode.kind === 'off') return { kind: 'off', text: mode.text, action: null }
     if (view.ready === false) {
       // 对端没升级时房主的账户发不过来，界面得说清楚是谁的问题。
       if (view.peer !== undefined && view.peer !== null && view.peer.ready === false) {
@@ -410,6 +414,11 @@
       const text = typeof session.text === 'string' && session.text !== '' ? session.text : '本周期已收盘。'
       return { kind: 'closed', text, action: null }
     }
+    // 票 98：影子模式没有报价也要说清楚是「只记账」，不能落成「周末休市」。
+    if (session !== null && typeof session === 'object' && session.kind === 'shadow') {
+      const text = typeof session.text === 'string' && session.text !== '' ? session.text : mode.text
+      return { kind: 'shadow', text, action: null }
+    }
     const balance = round2(view.balance) ?? 0
     const marginUsed = round2(view.marginUsed) ?? 0
     const hasTrades = Array.isArray(view.trades) && view.trades.length > 0
@@ -421,6 +430,38 @@
       return { kind: 'closed', text: '周末休市：下周一 00:00 开新一周的合约。', action: null }
     }
     return { kind: 'ok', text: '', action: null }
+  }
+
+  /**
+   * 票 98：三档灰度。宿主没下发 `mode` 时按「已上线」画，老版本 payload 不至于整窗变灰；
+   * 存档里 `disabled === true`（回滚过）一律当 `off`。
+   */
+  function modeOf (view) {
+    if (view?.disabled === true) return { kind: 'off', label: '已回滚', text: '回滚过：期货已关闭，托管余额已退回农场。' }
+    const mode = view?.mode
+    if (mode === 'off') return { kind: 'off', label: '未开放', text: '期货未开放：房主还没打开这一层。' }
+    if (mode === 'shadow') return { kind: 'shadow', label: '影子', text: '影子模式：撮合与结算照跑，但只记账，不动农场硬币。' }
+    return { kind: 'live', label: '真钱', text: '' }
+  }
+
+  /** 敞口限额一行：今日已用 / 上限，持仓名义已用 / 上限；影子模式写「日额 0」。 */
+  function capsLine (view) {
+    const dayCap = finite(view?.dayCap)
+    const positionCap = finite(view?.positionCap)
+    if (dayCap === null && positionCap === null) return null
+    const day = round2(view?.dayNotional) ?? 0
+    const used = round2(view?.positionNotional) ?? 0
+    const parts = []
+    if (dayCap !== null) parts.push('今日 ' + formatCoin(day) + ' / ' + formatCoin(dayCap))
+    if (positionCap !== null) parts.push('持仓名义 ' + formatCoin(used) + ' / ' + formatCoin(positionCap))
+    return parts.join(' · ')
+  }
+
+  /** 托管账里待提取的钱（农场硬币撞上限时留下的那部分）。 */
+  function pendingLine (view) {
+    const pending = round2(view?.pending) ?? 0
+    if (pending <= 0) return null
+    return '待提取 ' + formatCoin(pending) + '：农场硬币到上限了，下次提现会先补这一笔。'
   }
 
   /** 窗口标题：本周合约的周号 + 倒计时（宿主没给就只写「期货」）。 */
@@ -445,6 +486,11 @@
     return null
   }
 
+  /** 房主才有切档 / 回滚按钮：peer 视图带 `peer` 字段，房主视图没有。 */
+  function isHostOf (view) {
+    return view?.peer === undefined || view?.peer === null
+  }
+
   /** 一屏要用的全部东西（渲染页调一次就够）。 */
   function build (view, draft, now) {
     const stamp = finite(now) ?? finite(view?.now)
@@ -452,11 +498,18 @@
     const tick = countdown(end, stamp)
     const preview = orderPreview(view, draft)
     const orders = orderRows(view)
+    const mode = modeOf(view)
     return {
       status: statusOf(view),
       title: title({ ...view, now: stamp, slotEnd: end }),
       countdown: tick,
       header: header(view),
+      mode,
+      /** 房主才能看见切档与回滚按钮；peer 只读。 */
+      isHost: isHostOf(view),
+      canTrade: mode.kind === 'live',
+      capsLine: capsLine(view),
+      pendingLine: pendingLine(view),
       quotes: quoteRows(view),
       positions: positionRows(view),
       orders,
@@ -466,7 +519,7 @@
       trades: tradeRows(view),
       preview,
       previewText: previewText(preview),
-      canSubmit: preview.ok === true,
+      canSubmit: preview.ok === true && mode.kind !== 'off',
       limits: limitsOf(view),
       epoch: typeof view?.epoch === 'string' ? view.epoch : ''
     }
@@ -498,6 +551,10 @@
     tradeRows,
     deliveryLine,
     sessionLine,
+    modeOf,
+    capsLine,
+    pendingLine,
+    isHostOf,
     statusOf,
     title,
     weekOf,

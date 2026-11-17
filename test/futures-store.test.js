@@ -70,6 +70,8 @@ async function makeStore (t, { coins = 1000, at = MONDAY, max = 1_000_000 } = {}
   let now = at
   const sink = logSink()
   const store = await createFuturesStore(dir, { farm, now: () => now, log: sink.log })
+  // 票 98：缺省是 shadow（只记账）；这些既有用例写的是 live 的真钱行为，显式切过去。
+  await store.setMode('live')
   return { dir, farm, store, sink, advance: (ms) => { now += ms }, now: () => now }
 }
 
@@ -251,6 +253,7 @@ test('提现：超过农场上限时按 1,000,000 分批，并只扣实收的部
   }))
   // 农场默认上限 1,000,000：第一笔加满，第二笔被静默吞掉，必须只扣实收的那 1,000,000
   const reloaded = await createFuturesStore(dir, { farm, now: () => MONDAY })
+  await reloaded.setMode('live')
 
   const result = await reloaded.withdraw(1_200_000)
   assert.equal(result.ok, true)
@@ -263,6 +266,7 @@ test('票 94：托管余额划出去交给房主账本，农场一分不动', as
   const dir = await tempDir(t)
   const farm = fakeFarm(500)
   const store = await createFuturesStore(dir, { farm, now: () => MONDAY })
+  await store.setMode('live')
   await store.deposit(100)
   assert.equal(store.snapshot().balance, 100)
   assert.equal(farm.state.coins, 400)

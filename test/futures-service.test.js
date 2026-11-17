@@ -66,6 +66,10 @@ async function makeService (t, { farmCoins = 500 } = {}) {
   service.routes = routes
   t.after(() => service.dispose())
   await service.ready
+  // 票 98：缺省 shadow 只记账；既有验收写的是真钱流水，先切 live。
+  const mode = await act(service, { action: 'futures-mode', mode: 'live' })
+  assert.equal(mode.status, 200)
+  assert.equal(mode.body.ok, true, JSON.stringify(mode.body))
   return { service, clock, dir }
 }
 

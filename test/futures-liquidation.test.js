@@ -84,6 +84,8 @@ function fileState ({ positions = [], balance = 0, insurance = 0, shortfall = 0,
   return {
     version: FUTURES_VERSION,
     epoch: 'fixture-epoch',
+    // 票 98：夹具直接写真钱模式，避免 setMode 往 trades 里多写一条 mode 流水。
+    mode: 'live',
     balance,
     marginUsed: roundCoin(positions.reduce((sum, position) => sum + position.margin, 0)),
     fees: fees ?? { insurance: 0, burned: 0 },
@@ -299,6 +301,7 @@ test('每笔实收费用把 10% 注入保险基金', async (t) => {
     indexOf: () => INDEX,
     log: { warn () {} }
   })
+  await store.setMode('live')
   await store.deposit(1000)
   const opened = await store.open({ crop: 'tomato', side: 'long', margin: 100, leverage: 10, at: T0 })
   assert.equal(opened.ok, true)

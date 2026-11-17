@@ -17,6 +17,13 @@ const FIELDS = {
   'futures-withdraw': ['coins'],
   'futures-open': ['side', 'margin', 'leverage', 'cropId'],
   'futures-close': ['positionId'],
+  // 限价挂单只说「哪边、什么价、几张、几倍」——冻多少保证金由房主按名义算。
+  'futures-place': ['side', 'cropId', 'price', 'lots', 'leverage'],
+  'futures-cancel': ['orderId'],
+  'futures-convert': ['positionId', 'lots'],
+  // 票 98：切档与回滚只有房主按得动，宿主还会再判一次。
+  'futures-mode': ['mode'],
+  'futures-rollback': [],
   'futures-refresh': []
 }
 

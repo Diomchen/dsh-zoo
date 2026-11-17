@@ -378,6 +378,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     'futures-withdraw',
     'futures-open',
     'futures-close',
+    'futures-place',
+    'futures-cancel',
+    'futures-convert',
+    'futures-mode',
+    'futures-rollback',
     'futures-refresh'
   ]
   /**
@@ -394,8 +399,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const FUTURES_MAX_ORDERS = 8
   /** 交易阶段只认这三个值（票 96）：别的新词一律当没下发。 */
   const FUTURES_SESSION_KINDS = ['trading', 'expired', 'weekend']
-  /** 成交类型白名单（票 96）：开/平/交割/转现货/强平。 */
-  const FUTURES_TRADE_KINDS = ['open', 'close', 'delivery', 'convert', 'liquidation']
+  /** 成交类型白名单（票 96/98）：开/平/交割/转现货/强平/切档。 */
+  const FUTURES_TRADE_KINDS = ['open', 'close', 'delivery', 'convert', 'liquidation', 'mode']
+  /** 灰度档位（票 98）：关 / 影子 / 真钱。 */
+  const FUTURES_MODES = ['off', 'shadow', 'live']
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS, FUTURES_SUBMIT_ACTIONS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
@@ -2505,6 +2512,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
     if (!FUTURES_SUBMIT_ACTIONS.includes(action)) return null
     if (action === 'futures-refresh') return { action }
+    // 票 98：房主切档与回滚。`futures-rollback` 不带字段；`futures-mode` 只认三个档位。
+    if (action === 'futures-rollback') return { action }
+    if (action === 'futures-mode') {
+      const mode = FUTURES_MODES.includes(raw.mode) ? raw.mode : null
+      return mode === null ? null : { action, mode }
+    }
     if (action === 'futures-deposit' || action === 'futures-withdraw') {
       const coins = strictBoardInt(raw.coins, 1, MAX_FARM_COINS)
       return coins === null ? null : { action, coins }
@@ -2512,6 +2525,27 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (action === 'futures-close') {
       const positionId = normalizeUuid(raw.positionId)
       return positionId === null ? null : { action, positionId }
+    }
+    if (action === 'futures-cancel') {
+      const orderId = normalizeUuid(raw.orderId)
+      return orderId === null ? null : { action, orderId }
+    }
+    if (action === 'futures-place') {
+      const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
+      const lots = strictBoardInt(raw.lots, 1, 100000)
+      const leverage = FUTURES_LEVERAGES.includes(raw.leverage) ? raw.leverage : null
+      const cropId = normalizeBoardCropId(raw.cropId)
+      if (side === null || lots === null || leverage === null || cropId === null) return null
+      // 限价按分记（价格原生的两位小数），不接受 0、负数、NaN 和超大数。
+      const price = Number(raw.price)
+      if (!Number.isFinite(price) || price <= 0 || price > FUTURES_MAX_MARGIN) return null
+      return { action, side, lots, leverage, cropId, price: Math.round(price * 100) / 100 }
+    }
+    if (action === 'futures-convert') {
+      const positionId = normalizeUuid(raw.positionId)
+      const lots = strictBoardInt(raw.lots, 1, 100000)
+      if (positionId === null || lots === null) return null
+      return { action, positionId, lots }
     }
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, FUTURES_MAX_MARGIN)

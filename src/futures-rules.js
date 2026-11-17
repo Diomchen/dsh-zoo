@@ -48,6 +48,17 @@ export const FUTURES_LEVERAGES = Object.freeze([1, 3, 10, 20])
  * 协议层直接引用这一份，避免「规则层认 place、线上却不认」的漂移（测试有断言）。
  */
 export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit', 'place', 'convert'])
+/**
+ * 票 98：灰度三档。`off` 完全不开门；`shadow` 只记账（撮合/结算/强平/交割照跑，但
+ * 充值提现不碰农场硬币）；`live` 才是真钱。缺省是 `shadow`——新装的实例先看账，
+ * 确认无误再由房主切到 `live`。
+ */
+export const FUTURES_MODES = Object.freeze(['off', 'shadow', 'live'])
+export const FUTURES_DEFAULT_MODE = 'shadow'
+/** 票 98：单账户一个自然日的**新开仓/新挂单**名义上限（影子模式的日额是 0）。 */
+export const DAILY_NOTIONAL_CAP = 5000
+/** 票 98：单账户同时持有的仓位名义 + 挂单冻结名义上限。 */
+export const POSITION_NOTIONAL_CAP = 20000
 export const MAX_MARGIN = 1_000_000
 /** 合约编号里的作物部分只认小写字母数字与下划线，防手改文件塞进路径分隔符。 */
 const CONTRACT_ID_RE = /^([a-z][a-z0-9_]*)-(\d{4})W(\d{2})$/

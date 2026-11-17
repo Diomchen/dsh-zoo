@@ -65,7 +65,7 @@ import {
   stealSucceeds
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
-import { createFuturesStore, initialFuturesView } from './futures.js'
+import { createFuturesStore, FUTURES_ERROR_TEXT, initialFuturesView } from './futures.js'
 import {
   contractWindowOf,
   FUTURES_LEVERAGES,
@@ -251,6 +251,43 @@ export const FUTURES_HELLO_MS = 30 * 1000
 /** 房主记住对端源地址的时长：10 分钟没再收到这个人的包，允许它换端口重新 hello。 */
 export const FUTURES_PEER_BIND_MS = 10 * 60 * 1000
 /**
+ * 票 98：同源地址限速——10 秒窗口内最多 20 个期货报文，第 21 个起静默丢。
+ * 计数器只按 `from.address` 分组，不按 deviceId（deviceId 可以伪造，源地址不能）。
+ */
+export const FUTURES_RATE_LIMIT = 20
+export const FUTURES_RATE_WINDOW_MS = 10 * 1000
+
+/**
+ * 票 98：同源限速器的可测试实现。窗口从该地址第一次发包起算，10 秒后自动重置；
+ * 空地址（回环/测试里拿不到来源）不计数。`onLimit` 只在超限时回调，服务层用它 warnOnce。
+ */
+export function createFuturesRateLimiter ({
+  limit = FUTURES_RATE_LIMIT,
+  windowMs = FUTURES_RATE_WINDOW_MS,
+  now = Date.now,
+  onLimit = null
+} = {}) {
+  const buckets = new Map()
+  return {
+    allows (address) {
+      if (typeof address !== 'string' || address === '') return true
+      const at = Number(now())
+      let bucket = buckets.get(address)
+      if (bucket === undefined || at - bucket.start >= windowMs) {
+        bucket = { start: at, count: 0 }
+        buckets.set(address, bucket)
+      }
+      bucket.count += 1
+      if (bucket.count > limit) {
+        if (typeof onLimit === 'function') onLimit(address, bucket.count)
+        return false
+      }
+      return true
+    }
+  }
+}
+
+/**
  * 访客动作（ticket 43）：首次 + 两次重发（间隔约 500ms），1.8 秒没结果就明确超时。
  * 重发**复用同一个 requestId 和同一串字节**；主人侧按 requestId 回放缓存，不重复落账。
  */
@@ -328,6 +365,10 @@ export function createService (ctx, options = {}) {
   const futuresTickMs = positiveOption(options.futuresTickMs, FUTURES_SETTLE_MS, 10)
   const futuresSyncMs = positiveOption(options.futuresSyncMs, FUTURES_SYNC_MS, 10)
   const futuresHelloMs = positiveOption(options.futuresHelloMs, FUTURES_HELLO_MS, 10)
+  // 票 98：同源 20 包/10 秒。测试 harness 把 hello/sync 调到几十毫秒，
+  // 会瞬间打满默认配额；这里让测试单独调高阈值，生产保持 20/10s。
+  const futuresRateLimit = positiveOption(options.futuresRateLimit, FUTURES_RATE_LIMIT, 1)
+  const futuresRateWindowMs = positiveOption(options.futuresRateWindowMs, FUTURES_RATE_WINDOW_MS, 1)
   /**
    * 票 94：房主身份默认由「自己和已放行的期货邻居里 deviceId 最小那台」选举出来
    * （两边各自算，答案一致，不用协商包）。测试用 `futuresHost: true/false` 钉死，
@@ -427,6 +468,13 @@ export function createService (ctx, options = {}) {
   let futuresSyncAt = 0
   /** 票 94：最近一次给我们发账目的房主（窗口上显示用；只在内存里）。 */
   let futuresHostSeen = null
+  /** 票 98：同源地址的期货报文计数：address → { start, count }（10 秒窗口）。 */
+  const futuresRate = createFuturesRateLimiter({
+    limit: futuresRateLimit,
+    windowMs: futuresRateWindowMs,
+    now: () => futuresClock(),
+    onLimit: (address) => warnOnce('futures-rate', '期货报文来自 ' + address + ' 太快，已丢弃（' + futuresRateLimit + ' 包/' + Math.round(futuresRateWindowMs / 1000) + ' 秒）')
+  })
   let contractsReadyAt = 0
   /** 在飞雇佣：requestId → { deviceId, data, attempts, deadline, resolve, timer, done }。 */
   const workRequests = new Map()
@@ -1346,6 +1394,7 @@ export function createService (ctx, options = {}) {
     // 结算本来是 tick 自己做的；这条动作只给脚本和验收用（幂等，多跑一次不多入账）。
     if (action === 'futures-settle') {
       if (futures === null) return { ok: false, error: 'starting' }
+      if (futures.modeOf() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
       const result = await futures.settleDue(futuresClock())
       if (result?.ok === true) refreshFuturesWindow()
       return result
@@ -1353,11 +1402,47 @@ export function createService (ctx, options = {}) {
     // 窗口的倒计时归零时请宿主「结这一根 + 重推一拍」（票 93）。幂等：没仓位就没账可记。
     if (action === 'futures-refresh') {
       if (futures === null) return { ok: false, error: 'starting' }
+      if (futures.modeOf() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
       await futures.settleDue(futuresClock())
       // 票 96：倒计时走完这一拍也要立刻交割，不能等下一个 15 秒 tick。
       await futures.expireDue(futuresClock())
       const state = futuresWindowView()
       return { ok: true, action: 'futures-refresh', state }
+    }
+    // 票 98：灰度开关只能由房主拨；影子/真钱切换写进账本流水，peer 靠 settle 跟随。
+    if (action === 'futures-mode') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      if (!isFuturesHost()) {
+        return { ok: false, error: 'not-host', notice: FUTURES_ERROR_TEXT['not-host'] }
+      }
+      const result = await futures.setMode(body?.mode, futuresClock())
+      if (result?.ok === true) {
+        refreshFuturesWindow()
+        broadcastFuturesSettle()
+      }
+      return result
+    }
+    // 票 98：回滚——强平全部仓位、托管余额退回农场、存档 disabled 并切 off。
+    if (action === 'futures-rollback') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      if (!isFuturesHost()) {
+        return { ok: false, error: 'not-host', notice: FUTURES_ERROR_TEXT['not-host'] }
+      }
+      const result = await futures.rollback({ at: futuresClock() })
+      if (result?.ok === true) {
+        refreshFuturesWindow()
+        refreshFarmWindow()
+        broadcastFuturesSettle()
+      }
+      return result
+    }
+    // 票 98：影子对账（房主/单机）。返回的是账本与真实农场的差额，只读。
+    if (action === 'futures-reconcile') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      if (!isFuturesHost()) {
+        return { ok: false, error: 'not-host', notice: FUTURES_ERROR_TEXT['not-host'] }
+      }
+      return futures.reconcile()
     }
     if (action === 'futures-window') return handleFuturesOpen()
 
@@ -2578,7 +2663,23 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
+   * 票 98：当前生效的灰度模式。账本还没读出来时按缺省 shadow 处理——宁可少收钱，
+   * 也不要在启动的几十毫秒里误判成 live。
+   */
+  function futuresMode () {
+    return futures === null ? 'shadow' : futures.modeOf()
+  }
+
+  /**
+   * 票 98：同源地址限速。10 秒窗口内最多 20 个期货报文；超出的静默丢，
+   * 每个地址只告警一次。`from.address` 是 UDP 源地址，伪造 deviceId 也绕不过去。
+   */
+  function futuresRateAllows (from) {
+    return futuresRate.allows(typeof from?.address === 'string' ? from.address : '')
+  }
+
+  /**
+   * 票 98：盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
    * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
    * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
    * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
@@ -5086,6 +5187,12 @@ export function createService (ctx, options = {}) {
             // ticket 43：任何一条带 skinPort 的报文都顺手记下邻居的 LAN 端口。
             // 不能只靠 noteVisitorSkin：那一条要求 skinId，没装素材源的邻居端口会被漏掉。
             notePeerLanPort(packet)
+            // 票 98：off 时期货报文一律不理（入站静默丢，连 hello 也不回）；
+            // 其余模式按 UDP 源地址限速，超出的包直接丢，不落账、不回执。
+            if (typeof packet.type === 'string' && packet.type.startsWith('futures-')) {
+              if (futuresMode() === 'off') return
+              if (!futuresRateAllows(from)) return
+            }
             // 任意 work-* 报文都证明「对方还在」：离线结算用最后心跳/最后报文。
             if (typeof packet.type === 'string' && packet.type.startsWith('work-')) {
               noteContractSeen(packet.deviceId)
@@ -6518,6 +6625,9 @@ export function createService (ctx, options = {}) {
       delta,
       positions,
       orders,
+      // 票 98：模式与待提取余额随快照下发，peer 窗口据此显示 shadow/off 与「待提取」。
+      mode: futures.modeOf(),
+      pending: account.pending ?? 0,
       insurance: fund.insurance,
       shortfall: fund.shortfall
     }
@@ -6535,6 +6645,8 @@ export function createService (ctx, options = {}) {
   /** 房主侧：把最新账目推给一台 hello 过的对端。没绑定的邻居一个字节都不发。 */
   function sendFuturesSettle (deviceId, { delta = 0 } = {}) {
     if (disposed || futures === null || discovery === null) return false
+    // 票 98：off 时出站一律不发，连已经绑定的邻居也不再推账。
+    if (futures.modeOf() === 'off') return false
     if (!isFuturesHost()) return false
     if (!futuresPeers.has(deviceId)) return false
     let data
@@ -6558,6 +6670,7 @@ export function createService (ctx, options = {}) {
    */
   function broadcastFuturesSettle (targets = null) {
     if (disposed || futures === null || !isFuturesHost()) return 0
+    if (futures.modeOf() === 'off') return 0
     let ids = []
     if (Array.isArray(targets)) ids = targets
     else ids = [...futuresPeers.keys()]
@@ -6696,6 +6809,9 @@ export function createService (ctx, options = {}) {
         positions: packet.positions,
         orders: packet.orders,
         trades: packet.trades,
+        // 票 98：模式跟随房主；pending 是该 peer 账户的待提取余额。
+        mode: packet.mode,
+        pending: packet.pending,
         at: futuresClock()
       })
     } catch (error) {
@@ -6710,6 +6826,7 @@ export function createService (ctx, options = {}) {
   /** 票 94：不是房主时向期货邻居报一声到（30 秒一台最多一次）。 */
   function announceFutures (now = futuresClock()) {
     if (disposed || futures === null || discovery === null) return 0
+    if (futures.modeOf() === 'off') return 0
     if (isFuturesHost()) return 0
     const selfId = room.snapshot().self?.deviceId
     if (!isDeviceId(selfId)) return 0
@@ -6730,6 +6847,7 @@ export function createService (ctx, options = {}) {
   /** 票 94：不是房主时每 30 秒跟房主对一次账；还没账目副本时改成 hello 要一份。 */
   function syncFutures (now = futuresClock()) {
     if (disposed || futures === null || discovery === null) return false
+    if (futures.modeOf() === 'off') return false
     if (isFuturesHost()) return false
     if (now - futuresSyncAt < futuresSyncMs) return false
     const replica = futures.replicaOf()
@@ -6791,6 +6909,13 @@ export function createService (ctx, options = {}) {
     const trades = replica === null ? [] : (replica.trades ?? []).map((trade) => ({ ...trade }))
     const balance = replica === null ? 0 : replica.balance
     const marginUsed = replica === null ? 0 : replica.marginUsed
+    // 票 98：模式跟随房主（settle 里带过来）；副本还没有时用本机缺省 shadow。
+    const mode = replica === null ? view.mode : (replica.mode ?? view.mode)
+    const session = mode === 'off'
+      ? { kind: 'off', text: '期货未开放' }
+      : mode === 'shadow'
+        ? { kind: 'shadow', text: '影子模式：只记账，不动农场硬币' }
+        : view.session
     const upgraded = futuresPeerIds().length > 0
     const stale = room.snapshot().neighbors.some((neighbor) => {
       if (neighbor?.status !== 'allowed') return false
@@ -6811,6 +6936,10 @@ export function createService (ctx, options = {}) {
       // （房主一条 settle 只带两个数），所以它是「最近 8 条流水里看得见的强平笔数」。
       insurance: replica === null ? view.insurance : replica.insurance,
       shortfall: replica === null ? view.shortfall : replica.shortfall,
+      // 票 98：影子/关闭状态与待提取余额以房主副本为准。
+      mode,
+      session,
+      pending: replica === null ? 0 : (replica.pending ?? 0),
       liquidationCount: replica === null
         ? 0
         : (replica.trades ?? []).filter((trade) => trade.kind === 'liquidation').length,
@@ -6833,6 +6962,7 @@ export function createService (ctx, options = {}) {
    * `pending:true` 就是窗口上的「已发给房主，等一拍回执」。
    */
   function futuresOrderPending (action, order) {
+    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     const hostId = futuresHostId()
     if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
@@ -6861,6 +6991,7 @@ export function createService (ctx, options = {}) {
    * 没有 orderId 直接拒（协议层也会拒，这里先给一句人话）。
    */
   function futuresCancelPending (orderId) {
+    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (typeof orderId !== 'string' || orderId.trim() === '') return { ok: false, error: 'bad-order' }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     const hostId = futuresHostId()
@@ -6891,6 +7022,7 @@ export function createService (ctx, options = {}) {
    * （`transferOut`，不退回农场）。指令发不出去就把钱原路退回农场，不吞玩家的币。
    */
   async function futuresPeerDeposit (rawCoins) {
+    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     if (futuresHostId() === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     const funded = await futures.deposit(rawCoins)
@@ -6920,6 +7052,7 @@ export function createService (ctx, options = {}) {
    * 让拒绝只可能来自并发成交（下一拍 settle 会纠正账目）。这是明确的取舍，报告里写清。
    */
   async function futuresConvertPending (rawPositionId, rawLots) {
+    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     if (futuresHostId() === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     const positionId = typeof rawPositionId === 'string' ? rawPositionId.trim().toLowerCase() : ''
@@ -7235,6 +7368,8 @@ export function createService (ctx, options = {}) {
    */
   async function runFuturesTick () {
     if (futures === null || disposed) return
+    // 票 98：off 时连定时结算都停（账本保留，重新切回 live 不会被旧行情补刀）。
+    if (futures.modeOf() === 'off') return
     let settled = null
     try {
       settled = await futures.settleDue(futuresClock())

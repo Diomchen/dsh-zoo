@@ -236,7 +236,7 @@ function futuresKeys (type) {
     'futures-hello': ['v', 'type', 'deviceId', 'at'],
     'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
     'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
-    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall'],
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'pending'],
     'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq']
   }[type]
 }
@@ -1197,7 +1197,10 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     trades: [],
     // 票 97：基金/欠账始终在线，缺省 0。
     insurance: 0,
-    shortfall: 0
+    shortfall: 0,
+    // 票 98：模式缺省 shadow、待提取缺省 0。
+    mode: 'shadow',
+    pending: 0
   })
 
   // 票 95：`orders` 是可选的（票 94 的调用方不带），不带就是空盘口，字段始终在线。
@@ -1208,6 +1211,13 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
   assert.deepEqual(bare.packet.trades, [])
   // 票 97：基金与欠账同样可选，缺省 0，字段始终在线。
   assert.deepEqual([bare.packet.insurance, bare.packet.shortfall], [0, 0])
+  // 票 98：模式与待提取同样可选；缺省 shadow / 0。
+  assert.deepEqual([bare.packet.mode, bare.packet.pending], ['shadow', 0])
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ mode: 'turbo' })), /invalid futures mode/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ pending: -1 })), /invalid futures pending/)
+  assert.equal(parsePacket(encodeFuturesSettle(validFuturesSettle({ mode: 'live', pending: 12.5 }))).packet.pending,
+    12.5
+  )
 
   // 金额到分、张数与杠杆夹取由编码端统一做：不是整数分就拒，不四舍五入蒙过去。
   assert.throws(() => encodeFuturesSettle(validFuturesSettle({ balance: -1 })), /invalid futures balance/)
@@ -1238,6 +1248,8 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
   )
 
   const base = { v: PROTOCOL_VERSION, type: 'futures-settle', deviceId: body.deviceId, at: FUTURES_AT, epoch: 'e1', seq: 1, balance: 10, marginUsed: 0 }
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], mode: 'turbo' })).reason, 'mode')
+  assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [], pending: -1 })).reason, 'pending')
   assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [...eight, validFuturesPosition()] })).reason, 'positions')
   assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [validFuturesPosition({ contract: 'tomato-47' })] })).reason, 'positions')
   assert.equal(parsePacket(encodeJson({ ...base, delta: 0, positions: [validFuturesPosition({ side: 'both' })] })).reason, 'positions')
@@ -1299,6 +1311,16 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
   const blown = parsePacket(encodeFuturesSettle(validFuturesSettle({ trades: [liquidation] })))
   assert.equal(blown.ok, true)
   assert.deepEqual(blown.packet.trades, [liquidation])
+
+  // 票 98：灰度切换流水只带 note，lots/price/fee 固定 0，允许没有 crop/contract/side。
+  const mode = { at: FUTURES_AT, kind: 'mode', note: 'shadow', lots: 0, price: 0, fee: 0 }
+  const switched = parsePacket(encodeFuturesSettle(validFuturesSettle({ trades: [mode] })))
+  assert.equal(switched.ok, true)
+  assert.deepEqual(switched.packet.trades, [mode])
+  assert.equal(
+    parsePacket(encodeJson({ ...base, delta: 0, positions: [], trades: [{ ...mode, note: 'turbo' }] })).reason,
+    'trades'
+  )
 
   // 票 97：基金余额与欠账往返；负数/非整数分连编码都过不去，解码侧落 'insurance' / 'shortfall'。
   const funded = parsePacket(encodeFuturesSettle(validFuturesSettle({ insurance: 3.2, shortfall: 0.8 })))
