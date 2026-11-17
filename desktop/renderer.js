@@ -3011,6 +3011,8 @@
    * 重放一次「穿透 → 可交互」，用户不用重启 helper、也不用把鼠标移开再移回来。
    */
   let pressSeen = false
+  /** 最近一次「只有 up、没有 down」的时刻；兜底点击只在它之后的 120ms 内生效。 */
+  let lostUpAt = 0
   /**
    * 真实输入的心跳（ticket 30）：只数 `isTrusted` 的按下/抬起，合成事件一律不算。
    * 冒烟锁住输入时也不数——那是测试在用 sendInputEvent 驱动，不是人真的点了。
@@ -3024,6 +3026,7 @@
     const lost = kind === 'up' && !pressSeen
     if (kind === 'down') pressSeen = true
     else pressSeen = false
+    if (lost) lostUpAt = performance.now()
     try {
       api.reportInput(lost ? { type: 'lost-down' } : { type: kind })
     } catch {
@@ -3033,6 +3036,29 @@
 
   window.addEventListener('pointerdown', onTrustedPointer, { capture: true, passive: true })
   window.addEventListener('pointerup', onTrustedPointer, { capture: true, passive: true })
+
+  /**
+   * 丢 down 时的兜底点击（票 78）。
+   *
+   * 这台机器上 `WM_LBUTTONDOWN` 根本没投到窗口（`/dsh-zoo/desktop` 里
+   * `windowMessages.leftDown` 恒 0，`leftUp` 却一直在涨），于是浏览器永远凑不出一个
+   * 完整的 `click`：右键菜单能弹出来（`contextmenu` 由 up 触发），但菜单项、面板按钮
+   * 全点不动。up 既然到了，就在同一位置补一次合成 click ——只补「这次 up 之前没看到
+   * down」的那一次，别的机器上真 down 到了就不会重复触发。
+   */
+  window.addEventListener('pointerup', (event) => {
+    if (!event.isTrusted || inputLocked) return
+    if (lostUpAt === 0 || performance.now() - lostUpAt > 120) return
+    const hit = document.elementFromPoint(event.clientX, event.clientY)
+    const clickable = hit === null ? null : hit.closest('button, [data-lp-action], .lp-pet')
+    if (clickable === null) return
+    clickable.dispatchEvent(new MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+      clientX: event.clientX,
+      clientY: event.clientY
+    }))
+  }, { capture: false })
 
   window.addEventListener('pointercancel', () => {
     pressSeen = false
@@ -3126,6 +3152,13 @@
 
   function frame (now) {
     rafId = requestAnimationFrame(frame)
+
+  // 弹层矩形的心跳：窗口失焦时 rAF 会被系统降频甚至停掉，只靠逐帧上报续不住 overlay 矩形，
+  // 主进程判过期后整块菜单变「窗外」，菜单画着却点不动（票 92）。定时器再续一份。
+  setInterval(() => {
+    if (uiRects().length > 0) reportOverlayRects(false)
+  }, 500)
+
     const dt = lastFrameAt === 0
       ? 1 / 60
       : Math.min(shared.PHYSICS.MAX_DT, Math.max(0, (now - lastFrameAt) / 1000))
@@ -3174,6 +3207,15 @@
   // 接线
   // -------------------------------------------------------------------------
 
+  // 探针回应（票 92）：主进程发现矩形过期时会敲一下，这里立刻全量重报，
+  // 让「长时间运行后窗口失联」自己恢复，不用重启插件。
+  if (api && typeof api.onProbe === 'function') {
+    api.onProbe(() => {
+      reportRects(true)
+      reportOverlayRects(true)
+      reportHover(hoverInside)
+    })
+  }
   if (api && typeof api.onScene === 'function') api.onScene(applyScene)
   if (api && typeof api.onActionResult === 'function') api.onActionResult(handleActionResult)
   if (api && typeof api.onRenameUnavailable === 'function') {
