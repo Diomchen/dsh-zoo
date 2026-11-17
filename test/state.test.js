@@ -4,7 +4,7 @@
  * 两个字段任何时候都是数组；gifts 只列最近 20 件、最新在前，带 path 与 status。
  */
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -149,6 +149,38 @@ test('/state：bring 之后 backpack 出现 FIFO 顺序的条目；service.snaps
   }
   assert.deepEqual(service.snapshot().backpack, state.body.backpack)
   assert.deepEqual(service.snapshot().gifts, state.body.gifts)
+})
+
+test('/state：红包进背包后 giftId 能回来，内容按 packet 原样落盘', async (t) => {
+  // 现场回归：红包加进背包后 handleBringAction 读 added.item.id，
+  // 而 handleBringPacket 当时没回 item，于是钱和东西都动了，窗口却只收到
+  // 「这次操作没有完成」。这条用例把「回执 + 落盘形状」一起钉住。
+  const dir = await tempDir(t)
+  const service = makeService(t, dir)
+  await service.ready
+
+  const sent = await call(service, '/dsh-zoo/action', {
+    method: 'POST',
+    body: { action: 'bring', gift: { kind: 'packet', packet: { coins: 5 }, note: '' } }
+  })
+  assert.equal(sent.status, 200)
+  assert.equal(sent.body.ok, true)
+  assert.equal(typeof sent.body.giftId, 'string')
+  assert.match(sent.body.notice, /红包装进背包/)
+  assert.equal(sent.body.count, 1)
+
+  const state = await call(service, '/dsh-zoo/state')
+  assert.equal(state.body.backpack.length, 1)
+  const [item] = state.body.backpack
+  assert.equal(item.kind, 'packet')
+  assert.equal(item.packet.coins, 5)
+  assert.equal(state.body.farm.coins, 25)
+
+  // 落盘必须是 packet，不能退化成 text（否则重启后整只红包蒸发）。
+  const onDisk = JSON.parse(await readFile(join(dir, 'backpack.json'), 'utf8'))
+  assert.equal(onDisk.items.length, 1)
+  assert.equal(onDisk.items[0].kind, 'packet')
+  assert.deepEqual(onDisk.items[0].packet, { coins: 5, crops: {}, seeds: {} })
 })
 
 test('ticket 44：/state.contracts 始终是完整空形状；farm.guard/worker 来自唯一守卫计算点', async (t) => {
