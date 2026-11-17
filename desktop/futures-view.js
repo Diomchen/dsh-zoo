@@ -77,6 +77,20 @@
     return (pct < 0 ? '−' : '+') + Math.abs(pct).toFixed(2) + '%'
   }
 
+  /** 交割价与四根收盘价：保留四位，方便用户自己加总复核到分。 */
+  function formatDeliveryPrice (value) {
+    const num = finite(value)
+    return num === null ? '—' : num.toFixed(4)
+  }
+
+  /** 时间戳 → HH:mm；无效值写「—」（成交表与挂单表共用）。 */
+  function formatClock (value) {
+    const num = finite(value)
+    if (num === null) return '—'
+    const date = new Date(num)
+    return String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0')
+  }
+
   /** 倒计时 mm:ss；到点后显示 00:00 并把 `atEnd` 置真，窗口据此请宿主再推一拍。 */
   function countdown (at, now) {
     const target = finite(at)
@@ -115,12 +129,15 @@
     }
   }
 
-  /** 顶部：可用余额 / 占用保证金 / 总权益 / 本周盈亏与收益率。 */
+  /** 顶部：可用余额 / 占用保证金 / 总权益 / 本周盈亏与收益率 / 保险基金 / 欠账。 */
   function header (view) {
     const balance = round2(view?.balance) ?? 0
     const marginUsed = round2(view?.marginUsed) ?? 0
     const equity = round2(view?.equity) ?? round2(balance + marginUsed) ?? 0
     const weekPnl = round2(view?.week?.pnl) ?? 0
+    // 票 96 的两个兜底数：宿主还没下发时按 0 画，别显示成「—」像丢了数据。
+    const insurance = round2(view?.insurance) ?? 0
+    const shortfall = round2(view?.shortfall) ?? 0
     // 收益率的分母用「本周开始时的权益」近似：现在权益 − 本周盈亏。
     const base = equity - weekPnl
     const weekPct = base > 0 ? weekPnl / base : null
@@ -130,7 +147,9 @@
       equity: formatCoin(equity),
       weekPnl: formatSigned(weekPnl),
       weekPct: weekPct === null ? '—' : formatPct(weekPct),
-      weekTone: weekPnl > 0 ? 'up' : weekPnl < 0 ? 'down' : 'flat'
+      weekTone: weekPnl > 0 ? 'up' : weekPnl < 0 ? 'down' : 'flat',
+      insurance: formatCoin(insurance),
+      shortfall: formatCoin(shortfall)
     }
   }
 
@@ -283,25 +302,87 @@
     return rows
   }
 
-  /** 成交记录：最近 20 条，最新在前。 */
+  /** 作物展示名：优先用宿主下发的目录，没有目录时退回 id。 */
+  function cropNameOf (view, cropId) {
+    if (typeof cropId !== 'string' || cropId === '') return null
+    const crops = Array.isArray(view?.crops) ? view.crops : []
+    for (const crop of crops) {
+      if (crop?.id !== cropId) continue
+      return typeof crop.label === 'string' && crop.label !== '' ? crop.label : cropId
+    }
+    return cropId
+  }
+
+  /**
+   * 我的挂单（票 95）：合约 / 方向 / 限价 / 张数 / 剩余 / 冻结保证金。
+   * 价格与张数照账本原样；冻结是「还压着的钱」，两位小数。
+   */
+  function orderRows (view) {
+    const orders = Array.isArray(view?.orders) ? view.orders : []
+    const rows = []
+    for (const order of orders) {
+      const price = round2(order?.price)
+      const lots = finite(order?.lots)
+      if (price === null || price <= 0 || lots === null || lots < 1) continue
+      const contract = typeof order?.contract === 'string' && order.contract !== '' ? order.contract : null
+      const name = cropNameOf(view, order?.crop) ?? contract
+      rows.push({
+        id: typeof order?.id === 'string' ? order.id : null,
+        label: name ?? '—',
+        side: order?.side === 'short' ? '空' : '多',
+        sideText: order?.side === 'short' ? '做空' : '做多',
+        price: formatPrice(price),
+        lots: String(lots),
+        lotsLeft: String(finite(order?.lotsLeft) ?? 0),
+        marginFrozen: formatCoin(order?.marginFrozen ?? 0),
+        at: formatClock(order?.at)
+      })
+    }
+    return rows
+  }
+
+  /** 成交记录：最近 20 条，最新在前。票 96 的交割/转现货/强平也要说清楚。 */
   function tradeRows (view) {
     const trades = Array.isArray(view?.trades) ? view.trades : []
+    const kindText = { open: '开', close: '平', delivery: '交', convert: '转', liquidation: '强' }
     return trades.slice(0, 20).map((trade) => {
-      const at = finite(trade?.at)
-      const date = at === null ? null : new Date(at)
       return {
-        time: date === null
-          ? '—'
-          : String(date.getHours()).padStart(2, '0') + ':' + String(date.getMinutes()).padStart(2, '0'),
+        time: formatClock(trade?.at),
         contract: typeof trade?.contract === 'string' ? trade.contract : '—',
         side: trade?.side === 'short' ? '空' : '多',
         sideKey: trade?.side === 'short' ? 'short' : 'long',
-        kind: trade?.kind === 'close' ? '平' : '开',
+        kind: kindText[trade?.kind] ?? '开',
         price: formatPrice(trade?.price),
         lots: String(finite(trade?.lots) ?? 0),
         fee: formatCoin(trade?.fee ?? 0)
       }
     })
+  }
+
+  /**
+   * 到期日交割窗口（票 96）一句话：交割价 + 四根收盘价，带各自的时刻。
+   * 四根缺一或缺价就返回 null（残缺窗口不硬画一个复核不了的数）。
+   */
+  function deliveryLine (view) {
+    const delivery = view?.delivery
+    if (delivery === null || typeof delivery !== 'object' || Array.isArray(delivery)) return null
+    const price = finite(delivery.price)
+    const closes = Array.isArray(delivery.closes) ? delivery.closes.map((value) => finite(value)) : []
+    if (price === null || price <= 0 || closes.length !== 4 || closes.some((value) => value === null)) return null
+    const at = finite(delivery.at)
+    const parts = closes.map((value, index) => {
+      if (at === null) return formatDeliveryPrice(value)
+      return formatClock(at - (3 - index) * SLOT_MS) + ' ' + formatDeliveryPrice(value)
+    })
+    return '交割价 ' + formatDeliveryPrice(price) + '（' + parts.join(' / ') + '）'
+  }
+
+  /** 交易阶段提示：交易中不打扰，到期/周末才贴一行。 */
+  function sessionLine (view) {
+    const session = view?.session
+    if (session === null || typeof session !== 'object' || Array.isArray(session)) return null
+    if (session.kind === 'trading') return null
+    return typeof session.text === 'string' && session.text !== '' ? session.text : null
   }
 
   /**
@@ -322,6 +403,12 @@
     // 自己是 peer 时窗口照常可看，但要有「等房主」的底注，不能显示成空账户。
     if (view.peer !== undefined && view.peer !== null && view.peer.ready === false) {
       return { kind: 'starting', text: view.peer.text ?? '对端未升级，期货不可用。', action: null }
+    }
+    // 票 96：账本说已到期/周末时，哪怕余额为空也先报「收盘」，文案用宿主给的那句。
+    const session = view.session
+    if (session !== null && typeof session === 'object' && (session.kind === 'expired' || session.kind === 'weekend')) {
+      const text = typeof session.text === 'string' && session.text !== '' ? session.text : '本周期已收盘。'
+      return { kind: 'closed', text, action: null }
     }
     const balance = round2(view.balance) ?? 0
     const marginUsed = round2(view.marginUsed) ?? 0
@@ -364,6 +451,7 @@
     const end = slotEndOf(view)
     const tick = countdown(end, stamp)
     const preview = orderPreview(view, draft)
+    const orders = orderRows(view)
     return {
       status: statusOf(view),
       title: title({ ...view, now: stamp, slotEnd: end }),
@@ -371,6 +459,10 @@
       header: header(view),
       quotes: quoteRows(view),
       positions: positionRows(view),
+      orders,
+      orderCount: orders.length,
+      deliveryLine: deliveryLine(view),
+      sessionLine: sessionLine(view),
       trades: tradeRows(view),
       preview,
       previewText: previewText(preview),
@@ -392,6 +484,8 @@
     formatCoin,
     formatSigned,
     formatPct,
+    formatDeliveryPrice,
+    formatClock,
     countdown,
     slotEndOf,
     limitsOf,
@@ -400,7 +494,10 @@
     orderPreview,
     previewText,
     positionRows,
+    orderRows,
     tradeRows,
+    deliveryLine,
+    sessionLine,
     statusOf,
     title,
     weekOf,

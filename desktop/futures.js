@@ -140,6 +140,22 @@
     el('tradesEmpty').hidden = rows.length > 0
   }
 
+  function paintOrders (rows) {
+    const body = el('orders')
+    body.textContent = ''
+    for (const row of rows) {
+      const tr = document.createElement('tr')
+      const cells = [row.label, row.sideText, row.price, row.lots, row.lotsLeft, row.marginFrozen]
+      for (const text of cells) {
+        const td = document.createElement('td')
+        td.textContent = text
+        tr.appendChild(td)
+      }
+      body.appendChild(tr)
+    }
+    el('ordersEmpty').hidden = rows.length > 0
+  }
+
   function render () {
     const view = state.view
     state.now = Date.now()
@@ -155,10 +171,21 @@
     el('equity').textContent = built.header.equity
     el('weekPnl').textContent = built.header.weekPnl + ' · ' + built.header.weekPct
     el('weekPnl').className = built.header.weekTone
+    el('insurance').textContent = built.header.insurance
+    el('shortfall').textContent = built.header.shortfall
+
+    // 到期日的四根收盘价：有就横在报价表上方，没有就整行藏掉。
+    el('delivery').textContent = built.deliveryLine ?? ''
+    el('delivery').hidden = built.deliveryLine === null
+    // 收盘/周末的说明：常驻一行，比一闪而过的 toast 好核对。
+    el('session').textContent = built.sessionLine ?? ''
+    el('session').hidden = built.sessionLine === null
 
     paintQuotes(built.quotes)
     paintPositions(built.positions)
+    paintOrders(built.orders)
     paintTrades(built.trades)
+    el('ordersTitle').textContent = built.orderCount > 0 ? '我的挂单 · ' + built.orderCount : '我的挂单'
 
     el('pLots').textContent = built.previewText.lots
     el('pNotional').textContent = built.previewText.notional

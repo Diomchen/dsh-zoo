@@ -390,6 +390,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   /** `/state` 与窗口最多画多少手/多少笔：与账本的视图上限同值。 */
   const FUTURES_MAX_POSITIONS = 20
   const FUTURES_MAX_TRADES = 20
+  /** 「我的挂单」最多 8 条：一屏画得下，也压住整包体积。 */
+  const FUTURES_MAX_ORDERS = 8
+  /** 交易阶段只认这三个值（票 96）：别的新词一律当没下发。 */
+  const FUTURES_SESSION_KINDS = ['trading', 'expired', 'weekend']
+  /** 成交类型白名单（票 96）：开/平/交割/转现货/强平。 */
+  const FUTURES_TRADE_KINDS = ['open', 'close', 'delivery', 'convert', 'liquidation']
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS, FUTURES_SUBMIT_ACTIONS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
@@ -2339,6 +2345,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const num = (value, fallback = null) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
     const text = (value) => (typeof value === 'string' ? value.slice(0, 64) : null)
+    // 兜底字段（保险基金 / 欠账 / 强平次数）：负数与坏值都按 0，不让窗口画出负基金。
+    const nonNegative = (value) => {
+      const result = num(value)
+      return result === null || result < 0 ? 0 : result
+    }
 
     const quotes = {}
     if (raw.quotes !== null && typeof raw.quotes === 'object' && !Array.isArray(raw.quotes)) {
@@ -2375,9 +2386,63 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         lots: num(item.lots, 0),
         price: num(item.price, 0),
         fee: num(item.fee, 0),
-        kind: item.kind === 'close' ? 'close' : 'open'
+        kind: FUTURES_TRADE_KINDS.includes(item.kind) ? item.kind : 'open'
       }))
       : []
+
+    // 自己的挂单（票 95）：坏条目整条丢——半条挂单会让「剩余/冻结」对不上账。
+    const orders = []
+    if (Array.isArray(raw.orders)) {
+      for (const item of raw.orders.slice(0, FUTURES_MAX_ORDERS)) {
+        if (item === null || typeof item !== 'object' || Array.isArray(item)) continue
+        const id = text(item.id)
+        const side = item.side === 'short' ? 'short' : item.side === 'long' ? 'long' : null
+        const price = num(item.price)
+        const lots = num(item.lots)
+        const lotsLeft = num(item.lotsLeft)
+        const leverage = num(item.leverage)
+        const marginFrozen = num(item.marginFrozen)
+        if (id === null || id === '' || side === null) continue
+        if (price === null || price <= 0 || !Number.isInteger(lots) || lots < 1) continue
+        if (!Number.isInteger(lotsLeft) || lotsLeft < 0 || lotsLeft > lots) continue
+        if (leverage === null || leverage <= 0 || marginFrozen === null || marginFrozen < 0) continue
+        orders.push({
+          id,
+          crop: text(item.crop),
+          contract: text(item.contract) ?? '—',
+          side,
+          price,
+          lots,
+          lotsLeft,
+          leverage,
+          marginFrozen,
+          at: num(item.at)
+        })
+      }
+    }
+
+    // 交易阶段（票 96）：`text` 只留 60 字，渲染层整行贴出去。
+    const sessionRaw = raw.session
+    const session = sessionRaw !== null && typeof sessionRaw === 'object' && !Array.isArray(sessionRaw) &&
+      FUTURES_SESSION_KINDS.includes(sessionRaw.kind)
+      ? {
+          kind: sessionRaw.kind,
+          text: typeof sessionRaw.text === 'string' ? sessionRaw.text.slice(0, 60) : ''
+        }
+      : null
+
+    // 到期日交割窗口（票 96）：四根收盘价必须都是数字、顺序照抄；坏窗口整块丢。
+    let delivery = null
+    if (raw.delivery !== null && typeof raw.delivery === 'object' && !Array.isArray(raw.delivery)) {
+      const closes = Array.isArray(raw.delivery.closes)
+        ? raw.delivery.closes.map((value) => num(value)).filter((value) => value !== null).slice(0, 4)
+        : []
+      const price = num(raw.delivery.price)
+      const contract = text(raw.delivery.contract)
+      if (contract !== null && contract !== '' && price !== null && price > 0 && closes.length > 0) {
+        delivery = { contract, closes, price, at: num(raw.delivery.at) }
+      }
+    }
 
     const crops = Array.isArray(raw.crops)
       ? raw.crops.slice(0, BOARD_MAX_LIMITS).filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item)).map((item) => ({
@@ -2401,7 +2466,14 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       closed: num(raw.closed, 0),
       positionCount: num(raw.positionCount, positions.length),
       positions,
+      orders,
       trades,
+      session,
+      delivery,
+      // 票 96 的兜底账：宿主还没下发时窗口画 0，不画「—」。
+      insurance: nonNegative(raw.insurance),
+      shortfall: nonNegative(raw.shortfall),
+      liquidationCount: nonNegative(raw.liquidationCount),
       week: raw.week !== null && typeof raw.week === 'object'
         ? { start: num(raw.week.start, 0), pnl: num(raw.week.pnl, 0) }
         : { start: 0, pnl: 0 },
