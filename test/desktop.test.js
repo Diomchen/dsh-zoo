@@ -762,6 +762,42 @@ function fakeClock () {
   }
 }
 
+test('manager：helper 换代后「农场开着」归零，不会把右键钉在关窗分支', () => {
+  const clock = fakeClock()
+  const children = []
+  const manager = createDesktop({
+    desktopHost: true,
+    platform: 'darwin',
+    env: { DSH_HOME: '/tmp/dsh-home', ELECTRON_RUN_AS_NODE: '1', DSH_ZOO_ELECTRON: '/opt/electron' },
+    exists: (candidate) => candidate === '/opt/electron',
+    spawn: () => {
+      const child = fakeChild(5000 + children.length)
+      children.push(child)
+      return child
+    },
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    pingMs: 100000
+  })
+  manager.start()
+
+  // 还没 ready：新 helper 手里没有窗，不能报「开着」。
+  assert.equal(manager.status().ready, false)
+  assert.equal(manager.status().farmOpen, false)
+
+  children[0].emitLine({ type: 'ready', pid: 5000, workArea: { x: 0, y: 30, width: 1000, height: 700 } })
+  children[0].emitLine({ type: 'farm-window-state', open: true })
+  assert.equal(manager.status().farmOpen, true)
+
+  // helper 死了：它开的窗跟着没了，宿主不能再记着开着的窗。
+  children[0].kill('SIGKILL')
+  assert.equal(manager.status().ready, false)
+  assert.equal(manager.status().farmOpen, false, '进程没了，窗口状态必须归零')
+  assert.equal(manager.status().boardOpen, false)
+  manager.dispose()
+})
+
 test('manager：不可用时只打一行日志、不 spawn、start 不抛', () => {
   const infos = []
   const warns = []

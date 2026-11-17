@@ -113,20 +113,22 @@ function callAction (service, body) {
 }
 
 /** 只记录场景/窗口命令/action-result 的桌面替身；不 spawn Electron。 */
-function desktopDouble () {
+function desktopDouble (options = {}) {
   const calls = { scenes: [], windows: [], results: [] }
   let onEvent = null
   let farmOpen = false
+  /** helper 是否已 ready：宿主据此判断“窗开着”这件事还算不算数。 */
+  const readyFlag = options.ready !== false
   return {
     calls,
-    factory (options) {
-      onEvent = options.onEvent
+    factory (factoryOptions) {
+      onEvent = factoryOptions.onEvent
       return {
         start () { return { ok: true, pid: 4242 } },
         update (scene) { calls.scenes.push(scene); return true },
         resync (scene) { calls.scenes.push(scene); return true },
         // ticket 46：宿主读这个数决定右键「农场」是开还是关。
-        status () { return { farmOpen } },
+        status () { return { ready: readyFlag, farmOpen } },
         farmWindow (payload) {
           calls.windows.push(payload)
           if (payload.close === true) farmOpen = false
@@ -254,6 +256,27 @@ test('farm-open：窗口拿完整农场；场景没有 controls.farm；再点一
   const noDesktopClose = await callAction(offline, { action: 'farm-close' })
   assert.equal(noDesktopClose.status, 409)
   assert.equal(noDesktopClose.body.error, 'desktop-off')
+})
+
+test('farm-open：helper 没 ready 时不能信它上次报的“开着”，得重新开窗', async (t) => {
+  // 卡死现场：helper 崩了重启，宿主还记着 farmOpen:true，右键「农场」次次走关窗。
+  const dir = await tempDir(t)
+  const desktop = desktopDouble({ ready: false })
+  const service = makeService(t, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => NOON
+  })
+  await service.ready
+  desktop.ready()
+
+  const opened = await callAction(service, { action: 'farm-open' })
+  assert.equal(opened.status, 200)
+  assert.equal(opened.body.window, 'opened', '没 ready 的 helper 手里不可能有窗，必须开而不是关')
+  assert.equal(desktop.calls.windows.at(-1).open, true)
+  assert.equal(desktop.calls.windows.some((payload) => payload.close === true), false)
 })
 
 test('窗口动作：farm-plant → 39 的 store → action-result；开着的窗口自动刷新', async (t) => {
