@@ -256,42 +256,59 @@ test('同一拍多个仓位：先按触发时刻，再按建仓时间，最后�
   assert.equal(store.snapshot({ at: T1 }).liquidationCount, 4)
 })
 
+/**
+ * 沿 15 秒网格往后找「能精确构造出亏空 target」的那一拍行情。
+ *
+ * 亏空 = 保证金 + 盈亏（按分取整）再补上收不上来的平仓费，能不能正好等于 3.00
+ * 取决于那一刻的公允价。`T0` 是按本地时区构造的，CI 跑 UTC、开发机跑 +08 时
+ * 落在不同的瞬间，公允价也就不同——曾经在 UTC 下扫不到 3.00 直接断言失败。
+ * 所以这里不钉死某一瞬间，而是在同一分钟内（价格恒定）往后找第一拍能构造出来的。
+ */
+function holeFixture (target, from = T0, spanMs = 4 * 60 * 60 * 1000) {
+  for (let at = from; at <= from + spanMs; at += 60 * 1000) {
+    const contract = contractOf('tomato', at)
+    if (contract === null) continue
+    const price = fairAt(contract, at)
+    const scenario = scenarioForHole(price, target)
+    if (scenario === null) continue
+    return { at, contract, price, ...scenario }
+  }
+  return null
+}
+
 test('保险基金先垫亏空，垫不上才记欠账；余额永不为负', async (t) => {
-  const contract = contractOf('tomato', T0)
-  const price = fairAt(contract, T0)
-  const found = scenarioForHole(price, 3)
-  assert.ok(found, '能找到亏空正好 3.00 的建仓价')
-  const { entry, lots, leverage, margin, pnl } = found
+  const found = holeFixture(3)
+  assert.ok(found !== null, '能找到亏空正好 3.00 的建仓价（往后 4 小时都没有，行情规则改过？）')
+  const { at, contract, price, entry, lots, leverage, margin, pnl } = found
   assert.ok(roundCoin(margin + pnl) < 0, '这一笔确实亏穿')
 
-  const position = positionOf({ id: 'pos-hole', contract, at: T0, entry, lots, leverage })
+  const position = positionOf({ id: 'pos-hole', contract, at, entry, lots, leverage })
 
   // ① 基金 10：亏空 3 全由基金垫，欠账不动。
-  const rich = await makeStore(t, { at: T0, balance: 40, insurance: 10, positions: [position] })
-  await rich.store.settleDue(T0)
-  const richView = rich.store.snapshot({ at: T0 })
+  const rich = await makeStore(t, { at, balance: 40, insurance: 10, positions: [position] })
+  await rich.store.settleDue(at)
+  const richView = rich.store.snapshot({ at })
   assert.equal(richView.insurance, 7)
   assert.equal(richView.shortfall, 0)
   assert.equal(richView.balance, 40, '亏空不进余额，余额不为负')
   assert.ok(richView.balance >= 0)
 
   // ② 基金 0：亏空全额记欠账，不向玩家追缴。
-  const broke = await makeStore(t, { at: T0, balance: 40, insurance: 0, positions: [position] })
-  await broke.store.settleDue(T0)
-  const brokeView = broke.store.snapshot({ at: T0 })
+  const broke = await makeStore(t, { at, balance: 40, insurance: 0, positions: [position] })
+  await broke.store.settleDue(at)
+  const brokeView = broke.store.snapshot({ at })
   assert.equal(brokeView.insurance, 0)
   assert.equal(brokeView.shortfall, 3)
   assert.equal(brokeView.balance, 40)
   assert.ok(brokeView.balance >= 0)
 
   // ③ 基金 1：垫掉 1，剩下 2 记欠账。
-  const half = await makeStore(t, { at: T0, balance: 40, insurance: 1, positions: [position] })
-  await half.store.settleDue(T0)
-  const halfView = half.store.snapshot({ at: T0 })
+  const half = await makeStore(t, { at, balance: 40, insurance: 1, positions: [position] })
+  await half.store.settleDue(at)
+  const halfView = half.store.snapshot({ at })
   assert.equal(halfView.insurance, 0)
   assert.equal(halfView.shortfall, 2)
 })
-
 test('每笔实收费用把 10% 注入保险基金', async (t) => {
   const dir = await tempDir(t)
   let now = T0

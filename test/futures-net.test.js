@@ -29,6 +29,9 @@ function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+/** 到期交割要等房主真的跑完一拍 tick：CI 只有 2 核、又是并发跑全量，等宽一点。 */
+const DELIVERY_WAIT_MS = 20_000
+
 async function waitFor (predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
@@ -344,11 +347,11 @@ test('票 96：周五 20:00 房主到期交割，peer 的余额与持仓同步�
     a: { futuresNow: () => clock.at },
     b: { futuresNow: () => clock.at }
   })
-  await waitFor(() => a.futuresWindow().peer.ready === true)
+  await waitFor(() => a.futuresWindow().peer.ready === true, DELIVERY_WAIT_MS)
 
   const deposit = await callAction(a, { action: 'futures-deposit', coins: 200 })
   assert.equal(deposit.body.pending, true)
-  await waitFor(() => a.futuresWindow().balance === 200)
+  await waitFor(() => a.futuresWindow().balance === 200, DELIVERY_WAIT_MS)
   const opened = await callAction(a, {
     action: 'futures-open',
     cropId: 'tomato',
@@ -357,11 +360,14 @@ test('票 96：周五 20:00 房主到期交割，peer 的余额与持仓同步�
     leverage: 10
   })
   assert.equal(opened.body.pending, true)
-  await waitFor(() => a.futuresWindow().positionCount === 1)
+  await waitFor(() => a.futuresWindow().positionCount === 1, DELIVERY_WAIT_MS)
 
   // 拨到到期整点：房主 tick 会先盯市、再走 expireDue 的交割。
   clock.at = new Date(2026, 10, 20, 20, 0, 0).getTime()
-  await waitFor(() => b.futuresAccountOf(aId).positions.length === 0 && a.futuresWindow().positionCount === 0)
+  await waitFor(
+    () => b.futuresAccountOf(aId).positions.length === 0 && a.futuresWindow().positionCount === 0,
+    DELIVERY_WAIT_MS
+  )
 
   const peerWindow = a.futuresWindow()
   const hostAccount = b.futuresAccountOf(aId)
