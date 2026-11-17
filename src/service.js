@@ -44,6 +44,7 @@ import { createDiscovery } from './discovery.js'
 import {
   FARM_LOG_VIEW_LIMIT,
   FARM_LOG_WINDOW_LIMIT,
+  MAX_STACK,
   PLOT_IDS,
   createFarmStore,
   initialFarmView
@@ -66,13 +67,16 @@ import {
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
 import { createFuturesStore, initialFuturesView } from './futures.js'
 import {
+  contractWindowOf,
   FUTURES_LEVERAGES,
   LOT_SIZE,
   MM_SPREAD,
+  notionalOf,
   pnlOf,
   roundCoin,
   SLOT_MS,
-  TAKER_FEE_RATE
+  TAKER_FEE_RATE,
+  takerFeeOf
 } from './futures-rules.js'
 import { buildLeague, watcherCounts } from './trading-league.js'
 import {
@@ -1288,6 +1292,21 @@ export function createService (ctx, options = {}) {
       if (result?.ok === true) refreshFuturesWindow()
       return result
     }
+    // 票 96：转现货。房主在账本里平仓并把作物记到房主农场；peer 的作物记在 peer 本机农场。
+    if (action === 'futures-convert') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      if (!isFuturesHost()) return futuresConvertPending(body?.positionId, body?.lots)
+      const result = await futures.convertToSpot({
+        positionId: body?.positionId,
+        lots: body?.lots,
+        at: futuresClock()
+      })
+      if (result?.ok === true) {
+        refreshFuturesWindow()
+        refreshFarmWindow()
+      }
+      return result
+    }
     // 票 95：挂限价单。peer 只发「限价、方向、张数、杠杆」，冻结多少保证金由房主算。
     if (action === 'futures-place') {
       if (futures === null) return { ok: false, error: 'starting' }
@@ -1335,6 +1354,8 @@ export function createService (ctx, options = {}) {
     if (action === 'futures-refresh') {
       if (futures === null) return { ok: false, error: 'starting' }
       await futures.settleDue(futuresClock())
+      // 票 96：倒计时走完这一拍也要立刻交割，不能等下一个 15 秒 tick。
+      await futures.expireDue(futuresClock())
       const state = futuresWindowView()
       return { ok: true, action: 'futures-refresh', state }
     }
@@ -2546,7 +2567,9 @@ export function createService (ctx, options = {}) {
     const now = futuresClock()
     // 票 94：非房主看的是房主最近一份 settle 的副本；本机账本只当「没连上时」的底座。
     if (!isFuturesHost()) return futuresPeerWindow(now)
-    const view = futures === null ? initialFuturesView() : futures.snapshot({ at: now })
+    // 票 96：交付窗口跟当前选中的作物走，切作物时四根收盘价与交割价一起换。
+    const crop = boardCropOf(boardCrops())
+    const view = futures === null ? initialFuturesView() : futures.snapshot({ at: now, crop })
     return {
       ...view,
       ready: futures !== null,
@@ -6471,7 +6494,19 @@ export function createService (ctx, options = {}) {
       marginFrozen: order.marginFrozen,
       at: order.at
     }))
-    return encodeFuturesSettle({
+    // 票 96：交割/转现货的成交流水。协议上限 8 条，多的留在房主账本里。
+    const trades = (account.trades ?? []).slice(0, 8).map((trade) => ({
+      at: trade.at,
+      crop: trade.crop,
+      contract: trade.contract,
+      side: trade.side,
+      lots: trade.lots,
+      price: trade.price,
+      fee: trade.fee,
+      kind: trade.kind,
+      ...(trade.kind === 'delivery' ? { deliveryFee: trade.deliveryFee } : {})
+    }))
+    const body = {
       deviceId: room.snapshot().self.deviceId,
       at,
       epoch: account.epoch,
@@ -6481,7 +6516,16 @@ export function createService (ctx, options = {}) {
       delta,
       positions,
       orders
-    })
+    }
+    // 票 96：整包硬上限 4 KiB。满仓 + 满挂单时 8 条流水可能塞不下，逐条减到能发为止。
+    for (let keep = trades.length; keep >= 0; keep -= 1) {
+      try {
+        return encodeFuturesSettle({ ...body, trades: trades.slice(0, keep) })
+      } catch (error) {
+        if (!String(error?.message ?? '').includes('packet too large')) throw error
+      }
+    }
+    throw new Error('protocol: packet too large')
   }
 
   /** 房主侧：把最新账目推给一台 hello 过的对端。没绑定的邻居一个字节都不发。 */
@@ -6530,6 +6574,7 @@ export function createService (ctx, options = {}) {
     }
     if (packet.kind === 'close') return roundCoin(Number(result?.credit) || 0)
     if (packet.kind === 'place') return roundCoin(-(Number(result?.order?.marginFrozen) || 0))
+    if (packet.kind === 'convert') return roundCoin(Number(result?.delta) || 0)
     return 0
   }
 
@@ -6576,6 +6621,13 @@ export function createService (ctx, options = {}) {
         })
         // 票 95：挂上就撮一次，贴着对手价的单立刻成交（peer 的下一拍 settle 会带回仓位）。
         if (result?.ok === true) await futures.matchDue(at)
+      } else if (packet.kind === 'convert') {
+        // 票 96：peer 的作物已经在它本机入库，房主这边只平合约、记账并把差额推回去。
+        result = await futures.hostConvert(packet.deviceId, {
+          positionId: packet.positionId,
+          lots: packet.lots,
+          at
+        })
       } else {
         return
       }
@@ -6639,6 +6691,7 @@ export function createService (ctx, options = {}) {
         marginUsed: packet.marginUsed,
         positions: packet.positions,
         orders: packet.orders,
+        trades: packet.trades,
         at: futuresClock()
       })
     } catch (error) {
@@ -6724,11 +6777,14 @@ export function createService (ctx, options = {}) {
    * `peer.text` 是给窗口的一句人话：对端还是老版本时直接说清「期货不可用」。
    */
   function futuresPeerWindow (now) {
-    const view = futures === null ? initialFuturesView() : futures.snapshot({ at: now })
+    // 票 96：交割窗口按「当前选中的作物」算；没有选择时 store 退回目录第一项。
+    const crop = boardCropOf(boardCrops())
+    const view = futures === null ? initialFuturesView() : futures.snapshot({ at: now, crop })
     const replica = futures === null ? null : futures.replicaOf()
     const positions = futuresReplicaPositions(replica, now)
     // 票 95：自己的挂单也只从房主的副本里取（本地账本在 peer 侧不记挂单）。
     const orders = replica === null ? [] : replica.orders.map((order) => ({ ...order }))
+    const trades = replica === null ? [] : (replica.trades ?? []).map((trade) => ({ ...trade }))
     const balance = replica === null ? 0 : replica.balance
     const marginUsed = replica === null ? 0 : replica.marginUsed
     const upgraded = futuresPeerIds().length > 0
@@ -6751,8 +6807,8 @@ export function createService (ctx, options = {}) {
       positionCount: positions.length,
       orders,
       orderCount: orders.length,
-      // 周报/成交明细是房主的账，协议里没有这两样：对端窗口留空形状，不假装有。
-      trades: [],
+      // 票 96：交割/转现货的流水由房主随 settle 带过来；周报仍留空（协议没有）。
+      trades,
       week: { start: 0, pnl: 0 },
       ready: futures !== null,
       role: 'peer',
@@ -6841,6 +6897,69 @@ export function createService (ctx, options = {}) {
       // 钱刚从农场进来，这里理论上不会失败；真失败了只留账在托管账户里，不静默抹掉。
       warnOnce('futures-transfer-out', '期货充值划账失败：' + String(moved?.error))
     }
+    refreshFuturesWindow()
+    return sent
+  }
+
+  /**
+   * 票 96：peer 转现货。作物进的是**本机农场**，合约在房主账本上平。
+   *
+   * 跨机没有事务，只能把顺序排成「先入作物、再发指令」：发送失败就把作物退回去；
+   * 房主那边若拒单，作物已经落袋——所以发送前按 replica 把仓位、余额、容量全部预检一遍，
+   * 让拒绝只可能来自并发成交（下一拍 settle 会纠正账目）。这是明确的取舍，报告里写清。
+   */
+  async function futuresConvertPending (rawPositionId, rawLots) {
+    if (disposed || discovery === null) return { ok: false, error: 'network-off' }
+    if (futuresHostId() === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
+    const positionId = typeof rawPositionId === 'string' ? rawPositionId.trim().toLowerCase() : ''
+    if (positionId === '') return { ok: false, error: 'no-position' }
+    const replica = futures.replicaOf()
+    if (replica === null) return { ok: false, error: 'no-account', notice: '还没收到房主账目，等一拍再试。' }
+    const position = replica.positions.find((entry) => entry.id === positionId)
+    if (position === undefined) return { ok: false, error: 'no-position' }
+    const lots = Number(rawLots)
+    if (!Number.isInteger(lots) || lots < 1 || lots > position.lots) return { ok: false, error: 'bad-lots' }
+    // 先用仓位自己的合约判断到期：到期后 quoteOf 必然为 null，不能笼统说成「指数没就绪」。
+    const window = contractWindowOf(position.contract)
+    if (window === null) return { ok: false, error: 'bad-contract' }
+    if (futuresClock() >= window.expireAt) {
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，不能转现货。' }
+    }
+    const quote = futures.quoteOf(position.crop, futuresClock())
+    if (quote === null) return { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
+    const qty = lots * LOT_SIZE
+    const held = farm === null ? 0 : Number(farm.snapshot()?.crops?.[position.crop] ?? 0)
+    if (held + qty > MAX_STACK) {
+      return { ok: false, error: 'no-space', notice: '作物库存放不下这么多，先收一批。' }
+    }
+    const fair = roundCoin(quote.fair)
+    const cost = roundCoin(qty * fair)
+    const fee = takerFeeOf(cost)
+    const marginPart = lots === position.lots
+      ? position.margin
+      : roundCoin(position.margin * lots / position.lots)
+    const pnl = pnlOf({ lots, entry: position.entry, exit: fair, side: position.side })
+    const credit = Math.max(0, roundCoin(marginPart + pnl))
+    if (replica.balance + credit < roundCoin(cost + fee)) {
+      return { ok: false, error: 'no-coins', notice: '余额不够按公允价买下这些现货。' }
+    }
+    let added = null
+    try {
+      added = farm === null ? null : await farm.addCrop(position.crop, qty)
+    } catch {
+      return { ok: false, error: 'farm-refused', notice: '作物没能入库，转现货取消。' }
+    }
+    if (added?.ok !== true || added.qty !== qty) {
+      if (added?.ok === true && added.qty > 0) await farm.takeCropOf(position.crop, added.qty)
+      return { ok: false, error: 'farm-refused', notice: '作物没能入库，转现货取消。' }
+    }
+    const sent = futuresOrderPending('futures-convert', { kind: 'convert', positionId, lots })
+    if (sent.ok !== true) {
+      await farm.takeCropOf(position.crop, qty)
+      refreshFarmWindow()
+      return sent
+    }
+    refreshFarmWindow()
     refreshFuturesWindow()
     return sent
   }
@@ -7098,45 +7217,63 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 期货结算（票 92）单独一班车：整根是 15 分钟，60 秒的农活 tick 最迟会晚半分钟才结算，
-   * 窗口上的持仓会停在「上一根」的价位上。15 秒一拍正好是 OU 的一步：到点就把浮盈亏
-   * 按收盘价入账（盯市，仓位不删），没事可做时 `settleDue` 直接返回、不落盘。
+   * 票 96：一拍三件事，顺序不能换——先盯市、再撮合、最后交割。
+   * 交割放在撮合之后：这一拍新成交的仓位还没盯过市，不能拿交割价直接结掉；
+   * 交割放在下一拍盯市之前：到期后价格已经不属于这张合约，不能再按它盯市。
+   * 15 秒一拍正好是 OU 的一步；没事可做时各步直接返回、不落盘。
    */
+  async function runFuturesTick () {
+    if (futures === null || disposed) return
+    let settled = null
+    try {
+      settled = await futures.settleDue(futuresClock())
+    } catch (error) {
+      // 盯市这一拍失败也要继续走交割：到期合约不能因为一次坏账就永远挂在账上。
+      warnOnce('futures-tick', '期货结算失败：' + message(error))
+    }
+    // 盯市改了余额/持仓价：窗口开着就推新的一拍（票 93）。
+    if (Array.isArray(settled?.settled) && settled.settled.length > 0) refreshFuturesWindow()
+    // 票 94：远端账户也盯市了 → 只把变了的那几份账目推回给各自的对端。
+    if (Array.isArray(settled?.remotes) && settled.remotes.length > 0) {
+      broadcastFuturesSettle(settled.remotes.map((entry) => entry.deviceId))
+      refreshFuturesWindow()
+    }
+    // 票 95：结算之后撮合这一拍（价格优先、同价时间优先；MM 扫单也在里面）。
+    try {
+      const matched = await futures.matchDue(futuresClock())
+      if (matched?.ok === true && matched.fills > 0) {
+        const targets = Array.isArray(matched.accounts) && matched.accounts.length > 0
+          ? matched.accounts.map((entry) => entry.deviceId)
+          : null
+        // 有人成交：把新仓位/新余额推回给相关对端（没有就全体重推一遍，账永远是整份的）。
+        broadcastFuturesSettle(targets)
+        refreshFuturesWindow()
+      }
+    } catch (error) {
+      warnOnce('futures-match', '期货撮合失败：' + message(error))
+    }
+    // 票 96：到期交割（撤单退保证金 + 现金结清）。指数没就绪时 expireDue 会跳过，下一拍再试。
+    try {
+      const expired = await futures.expireDue(futuresClock())
+      if (Array.isArray(expired?.remotes) && expired.remotes.length > 0) {
+        broadcastFuturesSettle(expired.remotes.map((entry) => entry.deviceId))
+      }
+      if (expired?.ok === true && Array.isArray(expired.deliveries) && expired.deliveries.length > 0) {
+        refreshFuturesWindow()
+      }
+    } catch (error) {
+      warnOnce('futures-expire', '期货交割失败：' + message(error))
+    }
+    // 票 94：同一班车顺手做「报到」和「对账」。两条都按 30 秒节流，15 秒一拍正好两拍一次。
+    announceFutures()
+    syncFutures()
+  }
+
   function startFuturesSettleTick () {
     if (futuresTimer !== null || disposed) return
     futuresTimer = setInterval(() => {
       if (futures === null) return
-      let settled = null
-      try {
-        settled = futures.settleDue(futuresClock())
-      } catch (error) {
-        warnOnce('futures-tick', '期货结算失败：' + message(error))
-        return
-      }
-      // 盯市改了余额/持仓价：窗口开着就推新的一拍（票 93）。
-      if (Array.isArray(settled?.settled) && settled.settled.length > 0) refreshFuturesWindow()
-      // 票 94：远端账户也盯市了 → 只把变了的那几份账目推回给各自的对端。
-      if (Array.isArray(settled?.remotes) && settled.remotes.length > 0) {
-        broadcastFuturesSettle(settled.remotes.map((entry) => entry.deviceId))
-        refreshFuturesWindow()
-      }
-      // 票 95：结算之后撮合这一拍（价格优先、同价时间优先；MM 扫单也在里面）。
-      // 必须在 settle 之后：成交开的是新仓位，下一拍才轮到它盯市，不会「刚成交就被结算」。
-      void Promise.resolve()
-        .then(() => futures.matchDue(futuresClock()))
-        .then((matched) => {
-          if (matched?.ok !== true || !(matched.fills > 0)) return
-          const targets = Array.isArray(matched.accounts) && matched.accounts.length > 0
-            ? matched.accounts.map((entry) => entry.deviceId)
-            : null
-          // 有人成交：把新仓位/新余额推回给相关对端（没有就全体重推一遍，账永远是整份的）。
-          broadcastFuturesSettle(targets)
-          refreshFuturesWindow()
-        })
-        .catch((error) => warnOnce('futures-match', '期货撮合失败：' + message(error)))
-      // 票 94：同一班车顺手做「报到」和「对账」。两条都按 30 秒节流，15 秒一拍正好两拍一次。
-      announceFutures()
-      syncFutures()
+      void runFuturesTick()
     }, futuresTickMs)
     futuresTimer.unref?.()
   }

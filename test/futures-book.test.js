@@ -177,8 +177,8 @@ test('matchOrders：支持部分成交，maker 剩多少吃多少；未到时间
   assert.deepEqual(due, [{ makerId: 'ask-early', takerId: 'bid', lots: 2, price: 5 }])
 })
 
-test('FUTURES_ORDER_KINDS：规则层与协议层是同一份白名单，且包含 place', () => {
-  assert.deepEqual([...FUTURES_ORDER_KINDS], ['open', 'close', 'deposit', 'place'])
+test('FUTURES_ORDER_KINDS：规则层与协议层是同一份白名单，且包含 place 与 convert', () => {
+  assert.deepEqual([...FUTURES_ORDER_KINDS], ['open', 'close', 'deposit', 'place', 'convert'])
   assert.deepEqual([...PROTOCOL_ORDER_KINDS], [...FUTURES_ORDER_KINDS])
 })
 

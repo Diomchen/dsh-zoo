@@ -129,8 +129,9 @@ function optionsFor (dir, port, targetPort, overrides = {}) {
 async function connectedPair (t, overrides = {}) {
   const dirA = await tempDir(t)
   const dirB = await tempDir(t)
-  await seedFarm(dirA)
-  await seedFarm(dirB)
+  const coins = overrides.coins ?? 500
+  await seedFarm(dirA, coins)
+  await seedFarm(dirB, coins)
   const b = makeService(t, optionsFor(dirB, 0, 0, { futuresHost: true, ...overrides.b }))
   await b.ready
   const bPort = b.localPort()
@@ -285,6 +286,82 @@ test('票 94：过一根之后两边盯市的余额仍然逐分一致（假时�
   // 盯市会把 entry 挪到这一根的价（同一份账，两边同一个数）。
   assert.equal(peerWindow.positions[0].entry, hostAccount.positions[0].entry)
   assert.notEqual(peerWindow.positions[0].entry, beforeEntry)
+})
+
+test('票 96：peer 转现货把作物入本机仓库，房主平合约并按公允价结钱', async (t) => {
+  const clock = { at: new Date(2026, 10, 19, 12, 0, 0).getTime() }
+  const { a, b, aId } = await connectedPair(t, {
+    coins: 2000,
+    a: { futuresNow: () => clock.at },
+    b: { futuresNow: () => clock.at }
+  })
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  const deposit = await callAction(a, { action: 'futures-deposit', coins: 2000 })
+  assert.equal(deposit.body.pending, true)
+  await waitFor(() => a.futuresWindow().balance === 2000)
+  const opened = await callAction(a, {
+    action: 'futures-open',
+    cropId: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 10
+  })
+  assert.equal(opened.body.pending, true)
+  await waitFor(() => a.futuresWindow().positionCount === 1)
+  const positionId = a.futuresWindow().positions[0].id
+  const beforeCrops = Number(a.snapshot().farm.crops.tomato ?? 0)
+
+  const converted = await callAction(a, { action: 'futures-convert', positionId, lots: 1 })
+  assert.equal(converted.body.pending, true, JSON.stringify(converted.body))
+  await waitFor(() => b.futuresAccountOf(aId).positions.length === 0 && a.futuresWindow().positionCount === 0)
+
+  assert.equal(a.snapshot().farm.crops.tomato, beforeCrops + 100)
+  assert.equal(a.futuresWindow().balance, b.futuresAccountOf(aId).balance)
+  const trades = a.futuresWindow().trades.filter((entry) => entry.kind === 'convert')
+  assert.equal(trades.length, 1)
+  assert.equal(trades[0].lots, 1)
+  assert.ok(trades[0].fee > 0)
+})
+
+test('票 96：周五 20:00 房主到期交割，peer 的余额与持仓同步清零并收到交割流水', async (t) => {
+  const clock = { at: new Date(2026, 10, 20, 19, 0, 0).getTime() }
+  const { a, b, aId } = await connectedPair(t, {
+    a: { futuresNow: () => clock.at },
+    b: { futuresNow: () => clock.at }
+  })
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  const deposit = await callAction(a, { action: 'futures-deposit', coins: 200 })
+  assert.equal(deposit.body.pending, true)
+  await waitFor(() => a.futuresWindow().balance === 200)
+  const opened = await callAction(a, {
+    action: 'futures-open',
+    cropId: 'tomato',
+    side: 'long',
+    margin: 50,
+    leverage: 10
+  })
+  assert.equal(opened.body.pending, true)
+  await waitFor(() => a.futuresWindow().positionCount === 1)
+
+  // 拨到到期整点：房主 tick 会先盯市、再走 expireDue 的交割。
+  clock.at = new Date(2026, 10, 20, 20, 0, 0).getTime()
+  await waitFor(() => b.futuresAccountOf(aId).positions.length === 0 && a.futuresWindow().positionCount === 0)
+
+  const peerWindow = a.futuresWindow()
+  const hostAccount = b.futuresAccountOf(aId)
+  assert.equal(peerWindow.marginUsed, 0)
+  assert.equal(hostAccount.marginUsed, 0)
+  assert.equal(peerWindow.balance, hostAccount.balance)
+  assert.equal(peerWindow.session.kind, 'expired')
+  assert.match(peerWindow.delivery.contract, /-2026W47$/)
+  const delivery = peerWindow.trades.filter((entry) => entry.kind === 'delivery')
+  assert.equal(delivery.length, 1)
+  assert.equal(delivery[0].contract, 'tomato-2026W47')
+  assert.equal(delivery[0].lots, 1)
+  assert.equal(typeof delivery[0].deliveryFee, 'number')
+  assert.equal(hostAccount.trades.filter((entry) => entry.kind === 'delivery').length, 1)
 })
 
 test('票 94：同一条 settle 只算一次，倒退的 seq 丢掉，新 epoch 直接采纳', async (t) => {

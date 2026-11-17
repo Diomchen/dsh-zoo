@@ -44,10 +44,10 @@ export const FEE_BURN_SHARE = 0.9
 /** 杠杆白名单：期货有价差与偏离，不用盘口那套 1/5/20。 */
 export const FUTURES_LEVERAGES = Object.freeze([1, 3, 10, 20])
 /**
- * 期货指令的种类（票 95）：开仓/平仓/充值/挂限价单。
+ * 期货指令的种类（票 95 / 96）：开仓/平仓/充值/挂限价单/转现货。
  * 协议层直接引用这一份，避免「规则层认 place、线上却不认」的漂移（测试有断言）。
  */
-export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit', 'place'])
+export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit', 'place', 'convert'])
 export const MAX_MARGIN = 1_000_000
 /** 合约编号里的作物部分只认小写字母数字与下划线，防手改文件塞进路径分隔符。 */
 const CONTRACT_ID_RE = /^([a-z][a-z0-9_]*)-(\d{4})W(\d{2})$/
@@ -210,6 +210,48 @@ export function fairPriceOf ({ indexPrice, crop, contractId, at }) {
   const index = Number(indexPrice)
   if (!Number.isFinite(index) || index <= 0) return null
   return index * Math.exp(ouDeviation({ crop, contractId, at }))
+}
+
+/**
+ * 交割结算窗口的四根收盘价（票 96）：到期前 19:15 / 19:30 / 19:45 / 20:00 四个
+ * 15 分钟 slot 边界的公允价，逐根到分。没有指数或任意一根算不出来就整组返回 null，
+ * 让调用方等下一拍，而不是拿残缺的窗口硬算一个交割价。
+ */
+export function deliveryClosesOf ({ crop, contractId, indexOf, at }) {
+  // 有合约 id 就必须认得它；只有完全没给 id 时才用 (crop, at) 反推，坏 id 不能悄悄退回本周合约。
+  const window = contractId === undefined || contractId === null
+    ? (at === undefined || at === null ? null : contractOf(crop, at))
+    : contractWindowOf(contractId)
+  if (window === null) return null
+  if (typeof indexOf !== 'function') return null
+  let indexPrice = null
+  try {
+    // 用合约自己的作物取指数：调用方只给 contractId 时也能算，不会被 undefined 带偏。
+    indexPrice = indexOf(window.crop)
+  } catch {
+    return null
+  }
+  if (!Number.isFinite(Number(indexPrice)) || Number(indexPrice) <= 0) return null
+  const closes = []
+  for (let back = 3; back >= 0; back -= 1) {
+    const price = fairPriceOf({
+      indexPrice,
+      crop: window.crop,
+      contractId: window.id,
+      at: window.expireAt - back * SLOT_MS
+    })
+    if (price === null) return null
+    closes.push(roundCoin(price))
+  }
+  return closes
+}
+
+/** 交割价 = 四根收盘价的算术平均，到分；窗口复核用的是同一组已到分的收盘价。 */
+export function deliveryPriceOf (input) {
+  const closes = deliveryClosesOf(input)
+  if (closes === null) return null
+  const sum = closes.reduce((total, price) => total + price, 0)
+  return roundCoin(sum / closes.length)
 }
 
 /** 做市商两侧报价；`side` 是吃单方向：long 吃 ask、short 吃 bid。 */

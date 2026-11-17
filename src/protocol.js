@@ -119,6 +119,8 @@ export const MAX_FUTURES_COIN = 1_000_000_000
 export const MAX_FUTURES_SEQ = 2 ** 31 - 1
 /** 一条持仓的张数上限：与 `src/futures.js` 的 `MAX_QUANTITY` 同量级（100 张一手 × 一万手）。 */
 export const MAX_FUTURES_LOTS = 1_000_000
+/** settle 里最多带 8 条成交流水（交割/转现货回执）；再多就挤占持仓与挂单的 4 KiB 预算。 */
+export const MAX_FUTURES_TRADES = 8
 /**
  * 雇工挂牌的真实可用性（ticket 44）：`ready` / `off` / `visiting` / `working`。
  * 枚举与 `src/contracts-rules.js` 同源；`null` 只为兼容旧版本保留。
@@ -885,6 +887,62 @@ function normalizeFuturesOrders (value) {
   return orders
 }
 
+/**
+ * settle 里的一条成交流水（票 96）：交割与转现货要能让 peer 窗口看见。
+ * 与盘上账本的 trade 同形；交割额外带 `deliveryFee`，坏一条整包丢。
+ */
+function normalizeFuturesTrade (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return null
+  const at = normalizeDigestAt(value.at)
+  if (at === null) return null
+  if (!isCropId(value.crop)) return null
+  if (typeof value.contract !== 'string' || !FUTURES_CONTRACT_RE.test(value.contract)) return null
+  if (!isFuturesSide(value.side)) return null
+  if (!Number.isInteger(value.lots) || value.lots < 1 || value.lots > MAX_FUTURES_LOTS) return null
+  const price = normalizeFuturesPositiveCoin(value.price)
+  if (price === null) return null
+  const fee = normalizeFuturesCoin(value.fee)
+  if (fee === null) return null
+  const kind = value.kind === 'close'
+    ? 'close'
+    : value.kind === 'open'
+      ? 'open'
+      : value.kind === 'delivery'
+        ? 'delivery'
+        : value.kind === 'convert'
+          ? 'convert'
+          : null
+  if (kind === null) return null
+  const trade = {
+    at,
+    crop: value.crop,
+    contract: value.contract,
+    side: value.side,
+    lots: value.lots,
+    price,
+    fee,
+    kind
+  }
+  if (kind === 'delivery') {
+    const deliveryFee = normalizeFuturesCoin(value.deliveryFee)
+    if (deliveryFee === null) return null
+    trade.deliveryFee = deliveryFee
+  }
+  return trade
+}
+
+function normalizeFuturesTrades (value) {
+  if (!Array.isArray(value)) return null
+  if (value.length > MAX_FUTURES_TRADES) return null
+  const trades = []
+  for (const entry of value) {
+    const trade = normalizeFuturesTrade(entry)
+    if (trade === null) return null
+    trades.push(trade)
+  }
+  return trades
+}
+
 /** 五包共用的 `at`：缺省取本地时钟；坏时间整包丢（与 digest 同一套判定）。 */
 function futuresStamp (at, now) {
   const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
@@ -994,6 +1052,8 @@ function buildPacket ({
   price,
   lots,
   orders,
+  // 票 96：settle 里的成交流水（交割/转现货回执）
+  trades,
   orderId,
   epoch,
   seq,
@@ -1305,6 +1365,13 @@ function buildPacket ({
       const safePlace = normalizeFuturesPlace({ crop, side, price, lots, leverage })
       if (safePlace === null) throw new Error('protocol: invalid futures place')
       packet = { ...base, at: stamp, kind, ...safePlace }
+    } else if (kind === 'convert') {
+      // 票 96：转现货只带仓位与张数；价格、盈亏、手续费全由房主按同一套规则算。
+      if (!isVisitId(positionId)) throw new Error('protocol: invalid futures positionId')
+      if (!Number.isInteger(lots) || lots < 1 || lots > MAX_FUTURES_LOTS) {
+        throw new Error('protocol: invalid futures lots')
+      }
+      packet = { ...base, at: stamp, kind, positionId: positionId.toLowerCase(), lots }
     } else {
       // 充值只带金币数量：钱从房主那边的农场账户走，peer 不自己扣。
       if (!Number.isInteger(coins) || coins < 1 || coins > MAX_FUTURES_COIN) {
@@ -1342,6 +1409,9 @@ function buildPacket ({
     // 票 95：挂单是可选字段（老调用方不带 = 空盘口），带了就必须整份合法。
     const safeOrders = orders === undefined ? [] : normalizeFuturesOrders(orders)
     if (safeOrders === null) throw new Error('protocol: invalid futures orders')
+    // 票 96：成交流水（交割/转现货）也是可选字段；不带就是空，带了必须整份合法。
+    const safeTrades = trades === undefined ? [] : normalizeFuturesTrades(trades)
+    if (safeTrades === null) throw new Error('protocol: invalid futures trades')
     packet = {
       ...base,
       at: stamp,
@@ -1351,7 +1421,8 @@ function buildPacket ({
       marginUsed: safeMarginUsed,
       delta: safeDelta,
       positions: safePositions,
-      orders: safeOrders
+      orders: safeOrders,
+      trades: safeTrades
     }
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
@@ -1537,7 +1608,7 @@ export function encodeFuturesCancel ({ deviceId, at, orderId, positionId, now } 
   return encodePacket({ type: 'futures-cancel', deviceId, at, orderId, positionId, now })
 }
 
-export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, orders, now } = {}) {
+export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, marginUsed, delta = 0, positions, orders, trades, now } = {}) {
   return encodePacket({
     type: 'futures-settle',
     deviceId,
@@ -1549,6 +1620,7 @@ export function encodeFuturesSettle ({ deviceId, at, epoch, seq, balance, margin
     delta,
     positions,
     orders,
+    trades,
     now
   })
 }
@@ -2134,6 +2206,12 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       if (place === null) return fail('place')
       return { ok: true, packet: { ...base, ...place } }
     }
+    if (raw.kind === 'convert') {
+      // 票 96：只收仓位 id 与张数；价格/费用由房主算。
+      if (!isVisitId(raw.positionId)) return fail('position-id')
+      if (!Number.isInteger(raw.lots) || raw.lots < 1 || raw.lots > MAX_FUTURES_LOTS) return fail('lots')
+      return { ok: true, packet: { ...base, positionId: raw.positionId.toLowerCase(), lots: raw.lots } }
+    }
     if (!Number.isInteger(raw.coins) || raw.coins < 1 || raw.coins > MAX_FUTURES_COIN) return fail('coins')
     return { ok: true, packet: { ...base, coins: raw.coins } }
   }
@@ -2175,6 +2253,9 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     // 票 95：挂单可选（老 peer 不发 = 空盘口）；给了就必须整份合法。
     const orders = raw.orders === undefined ? [] : normalizeFuturesOrders(raw.orders)
     if (orders === null) return fail('orders')
+    // 票 96：成交流水可选（老 peer 不发 = 空）；给了就必须整份合法。
+    const trades = raw.trades === undefined ? [] : normalizeFuturesTrades(raw.trades)
+    if (trades === null) return fail('trades')
     return {
       ok: true,
       packet: {
@@ -2188,7 +2269,8 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         marginUsed,
         delta,
         positions,
-        orders
+        orders,
+        trades
       }
     }
   }

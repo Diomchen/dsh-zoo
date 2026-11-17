@@ -69,20 +69,26 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { CROP_IDS, CROPS, isCropId } from './farm-rules.js'
-import { MAX_COINS } from './farm.js'
+import { MAX_COINS, MAX_STACK } from './farm.js'
 import { parseJsonText } from './json-text.js'
 // 票 94：远端账户的键就是协议里的 deviceId，形状校验只认那一份真相（protocol 不 import 本文件）。
 import { isDeviceId, FUTURES_MAX_POSITIONS, FUTURES_MAX_ORDERS } from './protocol.js'
 import {
+  DAY_MS,
+  DELIVERY_FEE_RATE,
+  HOUR_MS,
   SLOT_MS,
   contractOf,
   contractWindowOf,
+  deliveryClosesOf,
+  deliveryPriceOf,
   fairPriceOf,
   feeSplitOf,
   fillPriceOf,
   isFuturesLeverage,
   isFuturesSide,
   isMarginAmount,
+  LOT_SIZE,
   lotsFor,
   marginOf,
   matchOrders,
@@ -150,13 +156,17 @@ export function initialFuturesState () {
     // 票 94：房主替 peer 托管的账户、账本流水号，以及 peer 侧的只读副本（副本不落盘）。
     seq: 0,
     remotes: {},
-    replica: null
+    replica: null,
+    // 票 96：已交割的合约（contractId → 交割时刻），以及保证金亏穿的累计缺口。
+    // 缺口先记账，票 97 的保险基金兜底再决定从哪补。
+    delivered: {},
+    shortfall: 0
   }
 }
 
 /** 一个远端账户的空壳（房主第一次见到某个 deviceId 时用）。 */
 function initialRemoteAccount (seq = 0, at = 0) {
-  return { balance: 0, marginUsed: 0, positions: [], orders: [], lastSeq: seq, updatedAt: at }
+  return { balance: 0, marginUsed: 0, positions: [], orders: [], trades: [], lastSeq: seq, updatedAt: at }
 }
 
 /**
@@ -177,7 +187,10 @@ export function initialFuturesView () {
     orders: [],
     orderCount: 0,
     week: { start: 0, pnl: 0 },
-    quotes: {}
+    quotes: {},
+    // 票 96：到期日窗口与本周所处的交易阶段；还没读盘时先按「交易中」占位。
+    delivery: null,
+    session: { kind: 'trading', text: '交易中' }
   }
 }
 
@@ -210,10 +223,24 @@ function normalizeTrade (raw) {
   const lots = positiveInt(raw.lots, MAX_QUANTITY)
   const price = finiteNumber(raw.price)
   const fee = nonNegativeCoin(raw.fee)
-  const kind = raw.kind === 'close' ? 'close' : raw.kind === 'open' ? 'open' : null
+  const kind = raw.kind === 'close'
+    ? 'close'
+    : raw.kind === 'open'
+      ? 'open'
+      : raw.kind === 'delivery'
+        ? 'delivery'
+        : raw.kind === 'convert'
+          ? 'convert'
+          : null
   if (at === null || at <= 0 || crop === null || contract === null || side === null) return null
   if (lots === null || price === null || price <= 0 || fee === null || kind === null) return null
-  return { at, crop, contract: contract.id, side, lots, price, fee, kind }
+  const trade = { at, crop, contract: contract.id, side, lots, price, fee, kind }
+  if (kind === 'delivery') {
+    const deliveryFee = nonNegativeCoin(raw.deliveryFee)
+    if (deliveryFee === null) return null
+    trade.deliveryFee = deliveryFee
+  }
+  return trade
 }
 
 /**
@@ -292,7 +319,18 @@ function normalizeRemoteAccount (raw) {
   // 保证金一律以「仓位 + 挂单冻结」为准（与本地账本同一取舍）：删仓位/撤单之后不会留下凭空冻结的钱。
   const margin = positions.reduce((sum, position) => sum + position.margin, 0) +
     orders.reduce((sum, order) => sum + order.marginFrozen, 0)
-  return { balance, marginUsed: roundCoin(margin), positions, orders, lastSeq, updatedAt }
+  // 票 96：远端成交流水（peer 窗口的「成交记录」靠它同步）；坏记录只丢自己。
+  const trades = []
+  if (raw.trades !== undefined) {
+    if (!Array.isArray(raw.trades)) return null
+    for (const entry of raw.trades) {
+      const trade = normalizeTrade(entry)
+      if (trade === null) continue
+      if (trades.length >= FUTURES_TRADE_LIMIT) break
+      trades.push(trade)
+    }
+  }
+  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt }
 }
 
 /**
@@ -474,6 +512,27 @@ export function normalizeFuturesFile (value) {
     }
   }
 
+  // 票 96：已交割合约与保证金缺口。老文件没有这两个键，按空值处理（不算修补）。
+  if (value.delivered !== undefined) {
+    if (value.delivered === null || typeof value.delivered !== 'object' || Array.isArray(value.delivered)) {
+      repaired += 1
+    } else {
+      for (const [contractId, rawAt] of Object.entries(value.delivered)) {
+        const window = contractWindowOf(contractId)
+        const at = finiteNumber(rawAt)
+        if (window === null || at === null || at <= 0) {
+          repaired += 1
+          continue
+        }
+        state.delivered[window.id] = at
+      }
+    }
+  }
+
+  const shortfall = value.shortfall === undefined ? 0 : nonNegativeCoin(value.shortfall)
+  if (shortfall === null) repaired += 1
+  else state.shortfall = shortfall
+
   // 保证金是「从余额划走的钱」：仓位/挂单丢了、保证金还在，账会凭空多钱或少钱。
   // 仓位 + 挂单冻结的总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
   const expectedMargin = roundCoin(
@@ -504,7 +563,10 @@ function toFileState (state) {
     tradedAt: state.tradedAt,
     // 票 94：流水号与替别人托管的账户（`replica` 不落盘，见文件头）。
     seq: state.seq,
-    remotes: remoteFileState(state.remotes)
+    remotes: remoteFileState(state.remotes),
+    // 票 96：交割标记与累计缺口（缺口是「亏穿保证金的钱」，负余额不允许出现）。
+    delivered: { ...state.delivered },
+    shortfall: roundCoin(state.shortfall)
   }
 }
 
@@ -516,6 +578,7 @@ function remoteFileState (remotes) {
       marginUsed: roundCoin(account.marginUsed),
       positions: account.positions.map((position) => ({ ...position })),
       orders: account.orders.map((order) => ({ ...order })),
+      trades: (account.trades ?? []).map((trade) => ({ ...trade })),
       lastSeq: account.lastSeq,
       updatedAt: account.updatedAt
     }
@@ -619,8 +682,9 @@ class FuturesStore {
   }
 
   /** 只读快照：调用方随便改返回值，改不到账本。 */
-  snapshot ({ at = this.#nowMs(), positionLimit = FUTURES_VIEW_POSITIONS, tradeLimit = FUTURES_VIEW_TRADES } = {}) {
+  snapshot ({ at = this.#nowMs(), crop = null, positionLimit = FUTURES_VIEW_POSITIONS, tradeLimit = FUTURES_VIEW_TRADES } = {}) {
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const focus = isCropId(crop) ? crop : CROP_IDS[0]
     const quotes = {}
     for (const cropId of CROP_IDS) {
       const quote = this.quoteOf(cropId, stamp)
@@ -646,8 +710,54 @@ class FuturesStore {
       orderCount: this.#state.orders.length,
       week: { start: this.#weekStartOf(stamp), pnl: this.#weekPnl(stamp) },
       quotes,
+      // 票 96：到期日窗口 + 当前阶段。`crop` 只影响这两块，行情仍是全目录。
+      delivery: this.#deliveryOf(focus, stamp),
+      session: this.#sessionOf(focus, stamp),
       now: stamp
     }
+  }
+
+  /**
+   * 票 96：到期日（周五）的交割窗口。19:15/19:30/19:45/20:00 四根收盘价从
+   * `deliveryClosesOf` 来，交割价与窗口复核共用同一组到分数值。
+   * 20:00 之后 `contractOf` 已返回 null，这里用「到期前一毫秒」把本周合约取回来。
+   */
+  #deliveryOf (crop, stamp) {
+    if (new Date(stamp).getDay() !== 5) return null
+    let window = contractOf(crop, stamp)
+    if (window === null) {
+      const monday = startOfWeek(stamp)
+      window = contractOf(crop, monday + 4 * DAY_MS + 20 * HOUR_MS - 1)
+    }
+    if (window === null) return null
+    const closes = deliveryClosesOf({
+      crop,
+      contractId: window.id,
+      indexOf: (cropId) => this.#indexOf(cropId),
+      at: stamp
+    })
+    return {
+      contract: window.id,
+      closes,
+      // 窗口展示的价格必须等于上面四根的均价，不能再用一次 indexOf 重算（指数可能在这一瞬跳动）。
+      price: closes === null
+        ? null
+        : roundCoin(closes.reduce((sum, value) => sum + value, 0) / closes.length),
+      at: window.expireAt
+    }
+  }
+
+  /** 票 96：交易中 / 已到期 / 周末三态；文案由账本层统一给，窗口不自己拼。 */
+  #sessionOf (crop, stamp) {
+    const contract = contractOf(crop, stamp)
+    if (contract !== null) {
+      return { kind: 'trading', text: contract.id + ' 交易中，周五 20:00 到期。' }
+    }
+    const day = new Date(stamp).getDay()
+    if (day === 5) {
+      return { kind: 'expired', text: '合约已到期，本周合约已交割，下周一 00:00 开新合约。' }
+    }
+    return { kind: 'weekend', text: '周末休市，本周合约已交割，下周一 00:00 开新合约。' }
   }
 
   #unrealizedOf (position, at) {
@@ -747,7 +857,12 @@ class FuturesStore {
     // 一条 settle 最多 8 条持仓：超了协议就装不下，所以房主必须在这里拒绝，而不是发不出去。
     if (account.positions.length >= FUTURES_MAX_POSITIONS) return { ok: false, error: 'position-limit' }
     const quote = this.quoteOf(crop, stamp)
-    if (quote === null) return { ok: false, error: 'market-closed' }
+    if (quote === null) {
+      return this.#closedError(crop, stamp) ?? { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
+    }
+    if (this.#state.delivered[quote.contract.id] !== undefined) {
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，周五 20:00 后停止交易。' }
+    }
     const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
     const lots = lotsFor({ notional, price })
@@ -816,6 +931,16 @@ class FuturesStore {
     const seq = this.#bumpAccount(account)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
+    this.#recordRemoteTrade(account, {
+      at: stamp,
+      crop: position.crop,
+      contract: position.contract,
+      side: position.side === 'long' ? 'short' : 'long',
+      lots: position.lots,
+      price: exit,
+      fee: 0,
+      kind: 'close'
+    })
     const persisted = await this.#persist()
     return {
       ok: true,
@@ -831,6 +956,323 @@ class FuturesStore {
   }
 
   /**
+   * 票 96：转现货的公共算式——先校验并算好所有数字，调用方再决定要不要动农场/账户。
+   * 保证金按张数比例释放（部分平仓），盈亏按当前公允价（mid）结算，手续费按现货名义收一腿。
+   */
+  #convertPlan (account, positionId, rawLots, stamp) {
+    const index = account.positions.findIndex((position) => position.id === positionId)
+    if (index < 0) return { ok: false, error: 'no-position' }
+    const position = account.positions[index]
+    const lots = positiveInt(rawLots, MAX_QUANTITY)
+    if (lots === null || lots > position.lots) return { ok: false, error: 'bad-lots' }
+    const window = contractWindowOf(position.contract)
+    if (window === null) return { ok: false, error: 'bad-contract' }
+    if (this.#state.delivered[position.contract] !== undefined || stamp >= window.expireAt) {
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，不能转现货。' }
+    }
+    const quote = this.quoteOf(position.crop, stamp)
+    if (quote === null) return { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
+    const fair = roundCoin(quote.fair)
+    const qty = lots * LOT_SIZE
+    const cost = roundCoin(qty * fair)
+    const fee = takerFeeOf(cost)
+    const marginPart = lots === position.lots
+      ? position.margin
+      : roundCoin(position.margin * lots / position.lots)
+    const pnl = pnlOf({ lots, entry: position.entry, exit: fair, side: position.side })
+    const credit = Math.max(0, roundCoin(marginPart + pnl))
+    if (account.balance + credit < roundCoin(cost + fee)) {
+      return { ok: false, error: 'no-coins', notice: '托管余额不够按公允价买下这些现货。' }
+    }
+    return {
+      ok: true,
+      index,
+      position,
+      lots,
+      qty,
+      fair,
+      cost,
+      fee,
+      marginPart,
+      pnl,
+      credit,
+      delta: roundCoin(credit - cost - fee)
+    }
+  }
+
+  /**
+   * 票 96：转现货（本地账户）。先算、再入农场、最后一次性改账本；任何一步失败都回滚。
+   * 口径是「平掉 N 张 → 释放保证金与浮盈 → 用余额按当前公允价买 N×100 个作物」，
+   * 所以不是「保证金直接换作物」，余额不够时仍然会 `no-coins`。
+   */
+  async convertToSpot ({ positionId, lots, at = this.#nowMs() } = {}) {
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const plan = this.#convertPlan(this.#state, positionId, lots, stamp)
+    if (plan.ok !== true) return plan
+    const current = Number(this.#farm.snapshot()?.crops?.[plan.position.crop]) || 0
+    if (current + plan.qty > MAX_STACK) {
+      return { ok: false, error: 'no-space', notice: '这种作物的仓库放不下这么多现货。' }
+    }
+    const before = {
+      balance: this.#state.balance,
+      marginUsed: this.#state.marginUsed,
+      closed: this.#state.closed,
+      tradedAt: this.#state.tradedAt,
+      positions: this.#state.positions.map((position) => ({ ...position })),
+      trades: this.#state.trades.map((trade) => ({ ...trade })),
+      fees: { ...this.#state.fees },
+      week: { ...this.#state.week }
+    }
+    let added = null
+    try {
+      added = await this.#farm.addCrop(plan.position.crop, plan.qty)
+    } catch {
+      // 农场抛异常时账本还没动，直接按拒单处理；不能把账本改成「付了钱没拿到货」。
+      return { ok: false, error: 'farm-refused', notice: '农场没有收下这批现货。' }
+    }
+    if (added === null || added?.ok !== true || Number(added.qty) !== plan.qty) {
+      const got = added?.ok === true ? Number(added.qty) || 0 : 0
+      if (got > 0) await this.#farm.takeCropOf(plan.position.crop, got)
+      return { ok: false, error: 'farm-refused', notice: '农场没有收下这批现货。' }
+    }
+
+    const position = this.#state.positions[plan.index]
+    this.#state.balance = roundCoin(this.#state.balance + plan.delta)
+    if (plan.lots === position.lots) this.#state.positions.splice(plan.index, 1)
+    else {
+      position.lots -= plan.lots
+      position.margin = roundCoin(position.margin - plan.marginPart)
+    }
+    this.#state.marginUsed = this.#recomputeMarginUsed()
+    this.#state.closed += 1
+    this.#state.tradedAt = stamp
+    this.#bookPnl(plan.pnl, stamp)
+    this.#chargeFee(plan.fee)
+    this.#recordTrade({
+      at: stamp,
+      crop: position.crop,
+      contract: position.contract,
+      side: position.side === 'long' ? 'short' : 'long',
+      lots: plan.lots,
+      price: plan.fair,
+      fee: plan.fee,
+      kind: 'convert'
+    })
+    const persisted = await this.#persist()
+    if (persisted === false) {
+      await this.#farm.takeCropOf(plan.position.crop, plan.qty)
+      this.#state.balance = before.balance
+      this.#state.marginUsed = before.marginUsed
+      this.#state.closed = before.closed
+      this.#state.tradedAt = before.tradedAt
+      this.#state.positions = before.positions
+      this.#state.trades = before.trades
+      this.#state.fees = before.fees
+      this.#state.week = before.week
+      return { ok: false, error: 'write-failed', notice: '账本没写进去，本次转现货已回滚。' }
+    }
+    return {
+      ok: true,
+      action: 'futures-convert',
+      positionId: plan.position.id,
+      crop: plan.position.crop,
+      lots: plan.lots,
+      qty: plan.qty,
+      price: plan.fair,
+      cost: plan.cost,
+      fee: plan.fee,
+      marginPart: plan.marginPart,
+      pnl: plan.pnl,
+      credit: plan.credit,
+      delta: plan.delta,
+      ...this.#view(),
+      persisted
+    }
+  }
+
+  /** 房主：替 peer 转现货。作物不进房主农场——peer 在自己机器上入仓，这里只结钱与合约。 */
+  async hostConvert (deviceId, { positionId, lots, at = this.#nowMs() } = {}) {
+    const key = this.#remoteKey(deviceId)
+    if (key === null) return { ok: false, error: 'bad-device' }
+    const account = this.#state.remotes[key]
+    if (account === undefined) return { ok: false, error: 'no-position' }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const plan = this.#convertPlan(account, positionId, lots, stamp)
+    if (plan.ok !== true) return plan
+    const position = account.positions[plan.index]
+    account.balance = roundCoin(account.balance + plan.delta)
+    if (plan.lots === position.lots) account.positions.splice(plan.index, 1)
+    else {
+      position.lots -= plan.lots
+      position.margin = roundCoin(position.margin - plan.marginPart)
+    }
+    account.marginUsed = this.#recomputeFor(account)
+    account.updatedAt = stamp
+    const seq = this.#bumpAccount(account)
+    this.#state.closed += 1
+    this.#state.tradedAt = stamp
+    this.#chargeFee(plan.fee)
+    this.#recordRemoteTrade(account, {
+      at: stamp,
+      crop: position.crop,
+      contract: position.contract,
+      side: position.side === 'long' ? 'short' : 'long',
+      lots: plan.lots,
+      price: plan.fair,
+      fee: plan.fee,
+      kind: 'convert'
+    })
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-convert',
+      positionId: position.id,
+      crop: position.crop,
+      lots: plan.lots,
+      qty: plan.qty,
+      price: plan.fair,
+      cost: plan.cost,
+      fee: plan.fee,
+      marginPart: plan.marginPart,
+      pnl: plan.pnl,
+      credit: plan.credit,
+      delta: plan.delta,
+      account: this.#accountView(account, stamp),
+      seq,
+      persisted
+    }
+  }
+
+  /**
+   * 票 96：一个账户的到期处理——先撤该合约全部挂单（退冻结），再按交割价现金结清全部仓位。
+   * `credit = max(0, margin + pnl)`；亏穿保证金的差额累计进 `state.shortfall`（票 97 兜底）。
+   * 交割费按交割名义收 0.1%，从释放出来的钱里扣；扣完仍不够时也记缺口，余额绝不为负。
+   */
+  #deliverAccount (account, window, price, stamp, local) {
+    const kept = []
+    let cancelled = 0
+    for (const order of account.orders) {
+      if (order.contract !== window.id) {
+        kept.push(order)
+        continue
+      }
+      account.balance = roundCoin(account.balance + order.marginFrozen)
+      cancelled += 1
+    }
+    account.orders = kept
+
+    const remaining = []
+    const delivered = []
+    for (const position of account.positions) {
+      if (position.contract !== window.id) {
+        remaining.push(position)
+        continue
+      }
+      const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit: price, side: position.side })
+      const credit = Math.max(0, roundCoin(position.margin + pnl))
+      const deliveryFee = roundCoin(notionalOf({ lots: position.lots, price }) * DELIVERY_FEE_RATE)
+      let net = roundCoin(credit - deliveryFee)
+      let gap = Math.max(0, -roundCoin(position.margin + pnl))
+      if (net < 0) {
+        gap = roundCoin(gap - net)
+        net = 0
+      }
+      this.#state.shortfall = roundCoin(this.#state.shortfall + gap)
+      account.balance = roundCoin(account.balance + net)
+      this.#state.closed += 1
+      this.#chargeFee(deliveryFee)
+      const trade = {
+        at: stamp,
+        crop: position.crop,
+        contract: position.contract,
+        side: position.side === 'long' ? 'short' : 'long',
+        lots: position.lots,
+        price,
+        fee: deliveryFee,
+        kind: 'delivery',
+        deliveryFee
+      }
+      if (local) {
+        this.#bookPnl(pnl, stamp)
+        this.#recordTrade(trade)
+      } else {
+        this.#recordRemoteTrade(account, trade)
+      }
+      delivered.push({ position: { ...position }, pnl, credit, deliveryFee, net, gap })
+    }
+    account.positions = remaining
+    account.marginUsed = this.#recomputeFor(account)
+    return { cancelled, delivered }
+  }
+
+  /**
+   * 票 96：到期交割（幂等）。只碰「已过 20:00、还没交割、且本地或远端还有仓/单」的合约；
+   * 交割价取四根收盘均价，指数缺失时整张合约跳过、等下一拍，不拿残缺价格硬结。
+   */
+  async expireDue (at = this.#nowMs()) {
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const contracts = new Set()
+    for (const position of this.#state.positions) contracts.add(position.contract)
+    for (const order of this.#state.orders) contracts.add(order.contract)
+    for (const account of Object.values(this.#state.remotes)) {
+      for (const position of account.positions) contracts.add(position.contract)
+      for (const order of account.orders) contracts.add(order.contract)
+    }
+
+    const deliveries = []
+    const remotes = []
+    for (const contractId of [...contracts].sort()) {
+      const window = contractWindowOf(contractId)
+      if (window === null || stamp < window.expireAt) continue
+      if (this.#state.delivered[contractId] !== undefined) continue
+      const price = deliveryPriceOf({
+        crop: window.crop,
+        contractId,
+        indexOf: (cropId) => this.#indexOf(cropId),
+        at: stamp
+      })
+      if (price === null) continue
+
+      const local = this.#deliverAccount(this.#state, window, price, stamp, true)
+      const accounts = []
+      for (const [deviceId, account] of Object.entries(this.#state.remotes).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+        const before = account.lastSeq
+        const result = this.#deliverAccount(account, window, price, stamp, false)
+        if (result.cancelled === 0 && result.delivered.length === 0) continue
+        account.updatedAt = stamp
+        const seq = this.#bumpAccount(account)
+        if (seq === before) continue
+        accounts.push({ deviceId, seq, account: this.#accountView(account, stamp) })
+      }
+      remotes.push(...accounts)
+      this.#state.delivered[contractId] = stamp
+      this.#state.tradedAt = stamp
+      deliveries.push({
+        contract: contractId,
+        crop: window.crop,
+        price,
+        at: stamp,
+        cancelled: local.cancelled,
+        positions: local.delivered.length
+      })
+    }
+
+    if (deliveries.length === 0) {
+      return { ok: true, action: 'futures-expire', deliveries: [], remotes: [] }
+    }
+    this.#state.marginUsed = this.#recomputeMarginUsed()
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-expire',
+      deliveries,
+      remotes,
+      ...this.#view(),
+      persisted
+    }
+  }
+
+  /**
    * 一个远端账户的只读视图（房主拿它拼 `futures-settle`，窗口拿它画别人的账）。
    * 不抛异常：未知账户返回一份零账户，调用方不用先问「有没有」。
    */
@@ -839,7 +1281,7 @@ class FuturesStore {
     const key = this.#remoteKey(deviceId)
     const account = key === null ? undefined : this.#state.remotes[key]
     if (account === undefined) {
-      return { balance: 0, marginUsed: 0, equity: 0, positions: [], orders: [], seq: 0, epoch: this.#state.epoch }
+      return { balance: 0, marginUsed: 0, equity: 0, positions: [], orders: [], trades: [], seq: 0, epoch: this.#state.epoch }
     }
     return this.#accountView(account, stamp, positionLimit)
   }
@@ -851,7 +1293,7 @@ class FuturesStore {
    * 说明房主换了账本（重启/换人），旧的 lastSeq 一笔作废、直接采纳新账。
    * 不写盘：这是房主账本的缓存（见文件头）。
    */
-  applySettle ({ epoch, seq, balance, marginUsed, positions, orders, at = this.#nowMs() } = {}) {
+  applySettle ({ epoch, seq, balance, marginUsed, positions, orders, trades, at = this.#nowMs() } = {}) {
     // 先验形状再看新旧：坏包必须被「拒」，不能被当成「旧的」悄悄咽下去。
     if (typeof epoch !== 'string' || epoch === '' || epoch.length > MAX_ID_LENGTH) {
       return { ok: false, error: 'bad-epoch' }
@@ -878,6 +1320,13 @@ class FuturesStore {
       const order = normalizeReplicaOrder(entry)
       if (order !== null) accountOrders.push(order)
     }
+    // 票 96：交割/转现货的成交流水。老房主不发 `trades` 时按空数组处理。
+    if (trades !== undefined && !Array.isArray(trades)) return { ok: false, error: 'bad-trades' }
+    const accountTrades = []
+    for (const entry of Array.isArray(trades) ? trades.slice(0, FUTURES_VIEW_TRADES) : []) {
+      const trade = normalizeTrade(entry)
+      if (trade !== null) accountTrades.push(trade)
+    }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     this.#state.replica = {
       epoch,
@@ -886,6 +1335,7 @@ class FuturesStore {
       marginUsed: safeMarginUsed,
       positions: accountPositions,
       orders: accountOrders,
+      trades: accountTrades,
       updatedAt: stamp
     }
     return { ok: true, applied: true }
@@ -901,8 +1351,19 @@ class FuturesStore {
       balance: roundCoin(replica.balance),
       marginUsed: roundCoin(replica.marginUsed),
       positions: replica.positions.map((position) => ({ ...position })),
-      orders: replica.orders.map((order) => ({ ...order }))
+      orders: replica.orders.map((order) => ({ ...order })),
+      trades: (replica.trades ?? []).map((trade) => ({ ...trade }))
     }
+  }
+
+  /** 票 96：周五 20:00 与周末都按 `market-closed` 拒绝，只有文案区分；已有仓位走 `contract-expired`。 */
+  #closedError (crop, stamp) {
+    if (contractOf(crop, stamp) !== null) return null
+    const monday = startOfWeek(stamp)
+    if (stamp < monday + 5 * DAY_MS) {
+      return { ok: false, error: 'market-closed', notice: '合约已到期，周五 20:00 后停止交易。' }
+    }
+    return { ok: false, error: 'market-closed', notice: '周末休市，下周一 00:00 开新合约。' }
   }
 
   /** 吃单开仓：做多吃卖一、做空吃买一；保证金与手续费当场从余额划走。 */
@@ -913,7 +1374,12 @@ class FuturesStore {
     if (!isFuturesLeverage(leverage)) return { ok: false, error: 'bad-leverage' }
     const stamp = Number(at)
     const quote = this.quoteOf(crop, stamp)
-    if (quote === null) return { ok: false, error: 'market-closed' }
+    if (quote === null) {
+      return this.#closedError(crop, stamp) ?? { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
+    }
+    if (this.#state.delivered[quote.contract.id] !== undefined) {
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，周五 20:00 后停止交易。' }
+    }
     const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
     const lots = lotsFor({ notional, price })
@@ -1075,7 +1541,9 @@ class FuturesStore {
       for (const order of account.orders) contracts.add(order.contract)
     }
     for (const contract of [...contracts].sort()) {
-      if (contractWindowOf(contract) === null) continue
+      const window = contractWindowOf(contract)
+      // 票 96：20:00 整点之后这张合约只剩“撤单 + 交割”，不再撮合，避免到期后凭空开仓。
+      if (window === null || stamp >= window.expireAt) continue
       const pools = this.#orderPools(contract)
       if (pools.orders.length === 0) continue
       const due = matchOrders({ orders: pools.orders, contract, at: stamp })
@@ -1119,8 +1587,13 @@ class FuturesStore {
     if (count === null) return { ok: false, error: 'bad-lots' }
     if (!isFuturesLeverage(leverage)) return { ok: false, error: 'bad-leverage' }
     const contract = contractOf(crop, stamp)
-    if (contract === null) return { ok: false, error: 'market-closed' }
-    if (stamp >= contract.expireAt) return { ok: false, error: 'contract-expired' }
+    if (contract === null) {
+      return this.#closedError(crop, stamp) ?? { ok: false, error: 'market-closed', notice: '现货指数未就绪。' }
+    }
+    // 票 96：已交割的合约即使时钟被拨回也不许再挂单。
+    if (this.#state.delivered[contract.id] !== undefined) {
+      return { ok: false, error: 'contract-expired', notice: '合约已到期，周五 20:00 后停止交易。' }
+    }
     const limitPrice = roundCoin(limit)
     const marginFrozen = marginOf({ lots: count, price: limitPrice, leverage })
     if (!(marginFrozen > 0) || marginFrozen > MAX_MARGIN) return { ok: false, error: 'bad-margin' }
@@ -1500,6 +1973,8 @@ class FuturesStore {
       positions,
       // 票 95：这个账户自己的挂单（房主据此拼 settle）。
       orders: account.orders.map((order) => ({ ...order })),
+      // 票 96：这个账户自己的成交流水（交割后 peer 窗口要能看到「交割」）。
+      trades: (account.trades ?? []).slice(0, FUTURES_VIEW_TRADES).map((trade) => ({ ...trade })),
       seq: account.lastSeq,
       epoch: this.#state.epoch
     }
@@ -1555,6 +2030,13 @@ class FuturesStore {
   #recordTrade (trade) {
     this.#state.trades.unshift(trade)
     if (this.#state.trades.length > FUTURES_TRADE_LIMIT) this.#state.trades.length = FUTURES_TRADE_LIMIT
+  }
+
+  /** 票 96：远端账户的成交流水，与本地同一截断规则。 */
+  #recordRemoteTrade (account, trade) {
+    if (!Array.isArray(account.trades)) account.trades = []
+    account.trades.unshift(trade)
+    if (account.trades.length > FUTURES_TRADE_LIMIT) account.trades.length = FUTURES_TRADE_LIMIT
   }
 
   #chargeFee (fee) {
