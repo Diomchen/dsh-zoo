@@ -415,6 +415,12 @@
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
+  // 顶栏的「×」：无边框窗口没有系统关闭按钮，这颗是唯一看得见的出口（Esc 仍可用）。
+  el('close').addEventListener('click', () => {
+    if (state.composing) return
+    bridge.close()
+  })
+
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return
     if (state.composing) return

@@ -204,3 +204,53 @@ test('desktop/futures.js 的限价挂单按钮把意图交给宿主，价格与�
   assert.equal(submitted[0].lots, 3)
   assert.equal(submitted[0].cropId, 'tomato')
 })
+
+test('desktop/futures.js 顶栏的「×」交给宿主关窗（无边框窗口没有系统按钮）', () => {
+  const view = require(join(ROOT, 'desktop', 'futures-view.js'))
+  const handlers = new Map()
+  let closed = 0
+  const document = fakeDocument()
+  const originalGet = document.getElementById.bind(document)
+  document.getElementById = (id) => {
+    const node = originalGet(id)
+    if (!node.__wired) {
+      node.__wired = true
+      node.addEventListener = (event, fn) => handlers.set(id + ':' + event, fn)
+    }
+    return node
+  }
+  const sandbox = {
+    console,
+    document,
+    window: {
+      dshZooFuturesView: view,
+      dshZooFutures: {
+        onState () {},
+        onResult () {},
+        onComposing () {},
+        submit () { return true },
+        close () { closed += 1 },
+        ready () {}
+      },
+      prompt: () => null,
+      addEventListener () {}
+    },
+    setTimeout: () => 1,
+    clearTimeout () {},
+    setInterval: () => 1,
+    clearInterval () {}
+  }
+  sandbox.globalThis = sandbox
+  vm.runInNewContext(readFileSync(join(ROOT, 'desktop', 'futures.js'), 'utf8'), sandbox, { filename: 'futures.js' })
+
+  const close = handlers.get('close:click')
+  assert.equal(typeof close, 'function', '顶栏 × 应该有监听')
+  close()
+  assert.equal(closed, 1)
+
+  // 无边框窗口靠这三样才「像一扇窗」：画出来的窗框、能拖的顶栏、看得见的关闭按钮。
+  const html = readFileSync(join(ROOT, 'desktop', 'futures.html'), 'utf8')
+  assert.match(html, /id="close"/)
+  assert.match(html, /-webkit-app-region: drag/)
+  assert.match(html, /#app \{[^}]*border: 2px solid/)
+})
