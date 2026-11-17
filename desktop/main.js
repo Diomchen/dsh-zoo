@@ -1066,7 +1066,7 @@ function applyDecision (reason) {
     return
   }
   const now = Date.now()
-  const local = currentLocalPoint(now)
+  const { point: local, mixedDpi } = hitPointFor(now)
   revokeStaleBusy(now)
   const rects = liveRects(now)
   const inside = local !== null && shared.hitTestRects(rects, local) !== null
@@ -1084,7 +1084,8 @@ function applyDecision (reason) {
     busyAt: busy.at,
     busySince: busy.since,
     // 调试里 freeze 表示「渲染端已经死了」：这时连兜底也必须停，验证 fail-closed。
-    allowMainFallback: hover.frozen !== true,
+    // 混合缩放时 OS 坐标不可信，同样不许 main-fallback 拿它开窗（票 94）。
+    allowMainFallback: hover.frozen !== true && mixedDpi !== true,
     now
   })
   setIgnore(!decision.interactive, decision.reason || reason)
@@ -1231,6 +1232,9 @@ let lastPointSource = null
  * 混合 DPI 下以渲染端上报的 CSS 指针为准（它和命中矩形同一套坐标系），其余情况仍用 OS 光标——
  * 单屏/同缩放时这等于原来的行为，主进程的独立复核一点都不放松。调试用的固定光标优先于一切，
  * 免得测试被 DPI 分支带偏。
+ *
+ * 返回 `{ point, source }`：source 是这一拍采信的来源（`renderer` / `os` / null），
+ * 调用方还要按 `mixedDpiDisplays()` 决定这份坐标能不能作数（票 94）。
  */
 function currentLocalPoint (now) {
   const picked = shared.chooseLocalPoint({
@@ -1242,13 +1246,36 @@ function currentLocalPoint (now) {
     area: localArea()
   })
   lastPointSource = picked.source
-  return picked.point
+  return picked
+}
+
+/**
+ * 这一拍命中判定实际能用的本地坐标（票 93 / 票 94）。
+ *
+ * 混合缩放下 OS 光标的本地坐标本身是错位的：窗口按一块屏渲染，光标却按另一块屏折算。
+ * 所以只认渲染端上报的 CSS 指针；拿不到（过期/未上报/坏形状）就返回 `point: null`，
+ * 让调用方 fail-closed 回穿透 —— 不能再拿错位坐标去开 `main-fallback`，否则光标明明不在
+ * 宠物上，窗口也会在 300ms 后接管鼠标。
+ *
+ * 调试用的固定光标（`pointerOverride`）是明确的「假装光标在这里」，不参与这条收紧。
+ */
+function hitPointFor (now) {
+  const picked = currentLocalPoint(now)
+  const mixedDpi = pointerOverride === null && mixedDpiDisplays(now)
+  return {
+    point: mixedDpi && picked.source !== 'renderer' ? null : picked.point,
+    source: picked.source,
+    mixedDpi
+  }
 }
 
 function emitHit (reason) {
-  const local = currentLocalPoint(Date.now())
+  const now = Date.now()
+  // 和 applyDecision 用同一份「能作数的坐标」：混合缩放拿不到渲染端指针时，
+  // 这条 hit 的 inside 也必须是 false（票 94），诊断口不能自说自话。
+  const { point: local } = hitPointFor(now)
   const screenPoint = pointerOverride ?? safeCursorPoint()
-  const rects = liveRects(Date.now())
+  const rects = liveRects(now)
   const rect = local === null ? null : shared.hitTestRects(rects, local)
   const bounds = win !== null && !win.isDestroyed() ? win.getBounds() : null
   const hitKey = (ignoreState.ignoring === false ? '1' : '0') + '|' + (rect !== null && typeof rect.id === 'string' ? rect.id : '')
