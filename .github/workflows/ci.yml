@@ -142,5 +142,10 @@ jobs:
             echo "dsh-zoo@${version} 已经在 npm 上了，跳过"
             exit 0
           fi
+          # 1.9.0-windows-test.1 这种预发布不能顶掉 latest，走 next。
+          dist_tag=latest
+          case "$version" in
+            *-*) dist_tag=next ;;
+          esac
           npm whoami
-          npm publish --access public --registry=https://registry.npmjs.org
+          npm publish --access public --registry=https://registry.npmjs.org --tag "$dist_tag"

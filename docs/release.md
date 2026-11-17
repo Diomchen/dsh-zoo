@@ -347,6 +347,9 @@ npm 不是上架 dsh-market 的必要条件；发布后市场会多显示下载�
 版本号已经在 npm 上时 job 直接跳过 —— 重推同一个 tag 不会让流水线变红，
 但也意味着**漏发的版本没法靠重推 tag 补上**，只能改 `version` 发新 tag 或本地手动发。
 
+正式版本推到 `latest`；`1.9.0-windows-test.1` 这类预发布推到 `next`，不会顶掉 `latest`
+（要装测试版得写 `npm i dsh-zoo@next`）。
+
 #### 密钥 = 本机 npm 的那条 token
 
 `NPM_TOKEN` 就是 `~/.npmrc` 里 `//registry.npmjs.org/:_authToken=` 后面那串，换 token 时重设：
