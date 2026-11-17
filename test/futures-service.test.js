@@ -144,19 +144,27 @@ test('脚本级验收：充值 100 → 开多 → 一根结算 → 平仓 → �
     '权益 = 余额 + 保证金 = 本金 − 手续费'
   )
 
-  // 等一根走完：结算在本拍 tick 里做，幂等（票面要求「一根只结算一次」）
+  // 等一根走完：盯市结算在本拍 tick 里做，幂等（票面要求「一根只结算一次」）
   clock.advance(SLOT_MS)
   const settle = await act(service, { action: 'futures-settle' })
   assert.equal(settle.body.ok, true)
   assert.equal(settle.body.settled.length, 1)
   assert.equal(settle.body.settled[0].position.id, position.id)
+  const marketToMarketPnl = settle.body.settled[0].pnl
 
   const settled = await state(service)
-  assert.equal(settled.futures.positions.length, 0)
-  assert.equal(settled.futures.marginUsed, 0)
-  assert.equal(settled.futures.closed, 1)
+  assert.equal(settled.futures.positions.length, 1, '盯市之后仓位还在，只是入场价换成了收盘价')
+  assert.equal(settled.futures.positions[0].entry, settle.body.settled[0].price)
+  assert.equal(settled.futures.marginUsed, position.margin, '保证金不动')
+  assert.equal(settled.futures.closed, 0)
 
-  // 再开一次再平掉，走手动平仓那条路
+  // 手动平掉这一笔
+  const closeFirst = await act(service, { action: 'futures-close', positionId: position.id })
+  assert.equal(closeFirst.body.ok, true, JSON.stringify(closeFirst.body))
+  assert.equal((await state(service)).futures.positions.length, 0)
+  assert.equal((await state(service)).futures.marginUsed, 0)
+
+  // 再开一次再平掉，确认平仓这条路反复走也没问题
   clock.advance(HOUR_MS)
   const second = await act(service, {
     action: 'futures-open', cropId: 'tomato', side: 'short', margin: 20, leverage: 20
@@ -181,7 +189,7 @@ test('脚本级验收：充值 100 → 开多 → 一根结算 → 平仓 → �
   // 守恒：农场现在 = 初始 − 充值 + 提现；托管剩下的零头（分）仍在账上
   assert.equal(final.farm.coins, farmBefore - 100 + Math.floor(view.balance))
   // 两边加起来 = 初始 − 手续费 + 盈亏：钱没有凭空出现，也没有凭空消失
-  const totalPnl = settle.body.settled[0].pnl + close.body.pnl
+  const totalPnl = marketToMarketPnl + closeFirst.body.pnl + close.body.pnl
   assert.equal(
     roundCoin(final.farm.coins + final.futures.balance),
     roundCoin(farmBefore - final.futures.fees.insurance - final.futures.fees.burned + totalPnl)

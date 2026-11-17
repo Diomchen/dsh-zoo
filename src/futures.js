@@ -4,7 +4,7 @@
  * 形状（SPEC v11「futures.json」的 **加法子集**，协议与撮合由票 94/95 补）：
  *   {
  *     "version": 1,
- *     "epoch": "…uuid…",                       // 首次落盘时生成；票 94 用它判「换了一本账」
+ *     "epoch": "…uuid…",                       // 每次启动换新；票 94 用它判「换了一本账」
  *     "balance": 120.5,                        // 托管账户可用余额（币，到分）
  *     "marginUsed": 100,                       // 冻结的保证金（币，到分）
  *     "fees": { "insurance": 0.12, "burned": 1.08 },
@@ -21,10 +21,10 @@
  *   - **钱先进托管账户**：充值是 `farm.spendCoins`，提现是 `farm.addCoins`；托管余额与
  *     农场硬币物理隔离，`/state` 里的「总权益 = balance + marginUsed」才是玩家的钱。
  *   - **张数由名义价值决定**：`lots = floor(保证金 × 杠杆 ÷ (成交价 × 100))`，至少一张；
- *     这也是为什么手填 1 币保证金也能开——它买的是最小的一手，不是「1 币名义」。
- *   - **每根收盘结算一次，靠仓位自己记结算时点**：每个仓位带 `settleSlot`（开仓那一根的
- *     末尾），结算后仓位被删掉，所以重启、补算、快进时钟都不会重复入账——不需要额外的
- *     「结算到第几根」游标（那个游标反而会在补算时和真实仓位对不上）。
+ *     这也是为什么手填 1 币保证金也能开——它买的是最小的一张合约，不是「1 币名义」。
+ *   - **每根收盘盯市一次，靠仓位自己记结算时点**：每个仓位带 `settleSlot`（下一根结算的
+ *     根号），结算时把浮盈亏记进余额、入场价改成收盘价、仓位继续持有——所以重启、补算、
+ *     快进时钟都不会重复入账，也不需要额外的「结算到第几根」游标。
  *   - **手续费拆到分**：`fees.insurance + fees.burned` 永远等于收过的 taker 费之和。
  *
  * 容错与 `src/farm.js` / `src/market.js` / `src/trading.js` 同一套路：
@@ -120,6 +120,7 @@ export function initialFuturesView () {
     equity: 0,
     fees: { insurance: 0, burned: 0 },
     closed: 0,
+    positionCount: 0,
     positions: [],
     quotes: {}
   }
@@ -289,6 +290,8 @@ class FuturesStore {
       this.#warnOnce('entries', '期货账本有 ' + normalized.repaired + ' 处格式不对，已按默认值修补')
     }
     // 不落盘：坏文件留在盘上等下一次动钱覆盖，读的时候不自作主张改写用户的账。
+    // epoch 每次启动换新（SPEC v11）：它是「这一本账」的身份，票 94 用它判 peer 的状态过期了。
+    this.#state.epoch = randomUUID()
   }
 
   #nowMs () {
@@ -333,6 +336,7 @@ class FuturesStore {
       equity: roundCoin(this.#state.balance + this.#state.marginUsed),
       fees: { ...this.#state.fees },
       closed: this.#state.closed,
+      positionCount: this.#state.positions.length,
       positions,
       quotes
     }
@@ -440,18 +444,21 @@ class FuturesStore {
     }
   }
 
-  /** 主动平仓：按当前对手价成交，保证金 + 盈亏记回余额。 */
+  /** 主动平仓：按当前对手价成交，保证金 + 盈亏记回余额。合约过期后只能等交割（票 96）。 */
   async close ({ id, at = this.#nowMs() }) {
     const index = this.#state.positions.findIndex((position) => position.id === id)
     if (index < 0) return { ok: false, error: 'no-position' }
     const position = this.#state.positions[index]
     const stamp = Number(at)
+    const window = contractWindowOf(position.contract)
+    if (window === null) return { ok: false, error: 'bad-contract' }
+    if (stamp >= window.expireAt) return { ok: false, error: 'contract-expired' }
     const quote = this.quoteOf(position.crop, stamp)
     if (quote === null) return { ok: false, error: 'market-closed' }
     const exit = fillPriceOf(quote, position.side === 'long' ? 'short' : 'long')
     const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit, side: position.side })
     this.#state.positions.splice(index, 1)
-    this.#state.marginUsed = roundCoin(this.#state.marginUsed - position.margin)
+    this.#state.marginUsed = this.#recomputeMarginUsed()
     const credit = Math.max(0, roundCoin(position.margin + pnl))
     this.#state.balance = roundCoin(this.#state.balance + credit)
     this.#state.closed += 1
@@ -470,10 +477,12 @@ class FuturesStore {
   }
 
   /**
-   * 逐根结算：结算所有「开仓那一根已经走完」的仓位，按那一根末尾的公允价。
+   * 逐根盯市：结算所有「这一根已经走完」的仓位，按那一根的收盘公允价重估。
    *
-   * 结算时点由仓位自己的 `settleSlot` 决定，所以重复调用、重启、补算都是同一条路径；
-   * 盈亏超过保证金时按「亏光保证金」处理（真正的逐 tick 强平是票 97）。
+   * 盯市 = 把浮盈浮亏记进 `balance`，入场价改成收盘价，仓位继续持有、保证金不动——
+   * 这样周合约才拿得住一整周，票 97 的逐 tick 强平也才有对象可强。
+   * 权益归零（亏光保证金）就当场强平：保证金没收，仓位删除。
+   * 结算时点由仓位自己的 `settleSlot` 决定，所以重复调用、重启、补算走同一条路径。
    */
   async settleDue (at = this.#nowMs()) {
     const stamp = Number(at)
@@ -482,22 +491,60 @@ class FuturesStore {
       const position = this.#state.positions[i]
       const settleAt = position.settleSlot * SLOT_MS
       if (!(settleAt <= stamp)) continue
-      const quote = this.quoteOf(position.crop, settleAt)
-      if (quote === null) continue // 没有行情的作物不结（账本不动，下一拍再试）
-      const exit = fillPriceOf(quote, position.side === 'long' ? 'short' : 'long')
-      const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit, side: position.side })
-      const credit = Math.max(0, roundCoin(position.margin + pnl))
-      const liquidated = pnl <= -position.margin
-      this.#state.positions.splice(i, 1)
-      this.#state.marginUsed = roundCoin(this.#state.marginUsed - position.margin)
-      this.#state.balance = roundCoin(this.#state.balance + credit)
-      this.#state.closed += 1
-      this.#state.tradedAt = settleAt
-      settled.push({ position: { ...position }, exit, pnl, credit, liquidated, at: settleAt })
+      const window = contractWindowOf(position.contract)
+      if (window === null) continue
+      // 到期那一根没有「下一根」了：按到期前一毫秒的价结算，否则周五最后一根的仓位
+      // 会因为 contractOf() 在到期后返回 null 而永远结不掉。
+      const priceAt = Math.min(settleAt, window.expireAt - 1)
+      const price = this.#fairAt(position.crop, position.contract, priceAt)
+      if (price === null) continue // 没有指数的作物不结（账本不动，下一拍再试）
+      const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit: price, side: position.side })
+      const liquidated = roundCoin(position.margin + pnl) <= 0
+      if (liquidated) {
+        // 亏光保证金：保证金没收，仓位删除（票 97 会把这条路径做细）
+        this.#state.positions.splice(i, 1)
+        this.#state.marginUsed = this.#recomputeMarginUsed()
+        this.#state.closed += 1
+        settled.push({
+          position: { ...position },
+          price,
+          pnl,
+          credit: 0,
+          liquidated: true,
+          at: priceAt
+        })
+        continue
+      }
+      this.#state.balance = roundCoin(this.#state.balance + pnl)
+      position.entry = price
+      position.settleSlot = this.#slotOf(priceAt) + 1
+      this.#state.tradedAt = priceAt
+      settled.push({
+        position: { ...position },
+        price,
+        pnl,
+        credit: pnl,
+        liquidated: false,
+        at: priceAt
+      })
     }
     if (settled.length === 0) return { ok: true, action: 'futures-settle', settled }
     const persisted = await this.#persist()
     return { ok: true, action: 'futures-settle', settled, ...this.#view(), persisted }
+  }
+
+  /** 某个合约在某一刻的公允价：用仓位自己的合约，不被「本周合约」顶替。 */
+  #fairAt (crop, contractId, at) {
+    const indexPrice = this.#indexOf(crop)
+    const price = fairPriceOf({ indexPrice, crop, contractId, at })
+    return price === null ? null : roundCoin(price)
+  }
+
+  /** 保证金占用一律以仓位为准：删仓位之后不会留下凭空冻结的钱。 */
+  #recomputeMarginUsed () {
+    let sum = 0
+    for (const position of this.#state.positions) sum = roundCoin(sum + position.margin)
+    return sum
   }
 
   #chargeFee (fee) {

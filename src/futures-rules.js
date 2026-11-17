@@ -62,9 +62,23 @@ export function hash32 (text) {
   return hash >>> 0
 }
 
-/** 散列 → [0, 1)。 */
+/** murmur3 的尾混合：让末位的一个字符也能把整个 32 位搅乱。 */
+function fmix32 (value) {
+  let hash = value >>> 0
+  hash ^= hash >>> 16
+  hash = Math.imul(hash, 0x85ebca6b)
+  hash ^= hash >>> 13
+  hash = Math.imul(hash, 0xc2b2ae35)
+  hash ^= hash >>> 16
+  return hash >>> 0
+}
+/**
+ * 散列 → [0, 1)。先过一遍 fmix（murmur3 的尾混合）再归一：FNV-1a 对「只差最后一个字符」
+ * 的两个串会输出只差一个常数的值，不过尾混合的话 `:1`…`:4` 四个数共线，
+ * 四数相加的方差能到 3.8 而不是 1——正态就被放大成 1.9 倍。
+ */
 export function unitHash (text) {
-  return hash32(text) / 4294967296
+  return fmix32(hash32(text)) / 4294967296
 }
 
 /**
@@ -161,20 +175,19 @@ export function contractWindowOf (id) {
 }
 
 /**
- * 偏离（对数尺度）：`ou(t) = Σ σ√dt · e^{-λ·k·dt} · z(t-k·dt)`，k 从 0 到 960。
+ * 偏离（对数尺度）：`ou(t) = Σ shock · e^{-λ·k·dt} · z(t-k·dt)`，k 从 0 到 960。
  *
  * 这是 OU 过程的截断表示——每一步的冲击按半衰期衰减，越早的冲击权重越小。
- * 平稳标准差约 `σ√(halfLife/LN2/dt) / √2`……不必背下来：单机实测持仓期间偏离
- * 在 ±3% 量级，价格不可能被推到离谱的位置。
+ * `OU_SIGMA` 是**偏离本身的平稳标准差**（0.4%），所以每步冲击取
+ * `σ·√(1−e^{−2λdt})`，平稳时 `Σ decay^{2k}·shock² = σ²` 正好成立：
+ * 公允价围着现货指数摆动，标准差就是文档里写的那个 0.4%，不是把 0.4% 当每步冲击。
  */
 export function ouDeviation ({ crop, contractId, at }) {
   const stamp = Number(at)
   if (!Number.isFinite(stamp)) return 0
   const step = OU_STEP_MS
   const decay = Math.exp(-LN2 * step / OU_HALF_LIFE_MS)
-  // 每一步的**冲击**是 σ；衰减后叠加出来的平稳标准差约 σ·√(1/(1−e^{−2λdt})) ≈ 9.3σ，
-  // 也就是偏离 Index 的常态在 ±3.7% 以内——文档里写的「σ 0.4%」说的是冲击，不是波动率。
-  const shock = OU_SIGMA
+  const shock = OU_SIGMA * Math.sqrt(1 - decay * decay)
   const cell = Math.floor(stamp / step)
   const key = 'futures:' + crop + ':' + contractId + ':ou:'
   let sum = 0

@@ -148,7 +148,7 @@ test('开仓：周五 20:00 之后没有合约', async (t) => {
   assert.equal(result.error, 'market-closed')
 })
 
-test('结算：一根结束时按收盘公允价结清，重复调用不重复入账', async (t) => {
+test('盯市：一根结束时按收盘公允价重估，仓位继续持有，重复调用不重复入账', async (t) => {
   const at = MONDAY + 3 * HOUR_MS
   const { store, advance } = await makeStore(t, { coins: 5000, at })
   await store.deposit(1000)
@@ -159,38 +159,70 @@ test('结算：一根结束时按收盘公允价结清，重复调用不重复�
   const settled = await store.settleDue()
   assert.equal(settled.settled.length, 1)
   assert.equal(settled.settled[0].position.id, position.id)
+  assert.equal(settled.settled[0].liquidated, false)
 
   const contract = contractOf('tomato', at)
-  const settleAt = (position.settleSlot) * SLOT_MS
-  const fair = fairPriceOf({ indexPrice: CROPS.tomato.base, crop: 'tomato', contractId: contract.id, at: settleAt })
-  const exit = fillPriceOf(quotesOf(fair), 'short')
-  const expectedPnl = pnlOf({ lots: position.lots, entry: position.entry, exit, side: 'long' })
+  const settleAt = position.settleSlot * SLOT_MS
+  const fair = roundCoin(fairPriceOf({
+    indexPrice: CROPS.tomato.base, crop: 'tomato', contractId: contract.id, at: settleAt
+  }))
+  const expectedPnl = pnlOf({ lots: position.lots, entry: position.entry, exit: fair, side: 'long' })
+  assert.equal(settled.settled[0].price, fair, '按收盘公允价（中间价）结，不再吃买卖价差')
 
-  const view = store.snapshot()
-  assert.equal(view.marginUsed, 0)
-  assert.equal(view.balance, roundCoin(1000 - opened.fee + expectedPnl))
-  assert.equal(view.positions.length, 0)
+  const view = store.snapshot({ at: settleAt })
+  assert.equal(view.positions.length, 1, '盯市不删仓位，周合约才拿得住')
+  assert.equal(view.positions[0].entry, fair, '入场价改成收盘价，浮盈亏已经落袋')
+  assert.equal(view.positions[0].settleSlot, Math.floor(settleAt / SLOT_MS) + 1)
+  assert.equal(view.marginUsed, position.margin, '保证金不动')
+  assert.equal(view.balance, roundCoin(1000 - position.margin - opened.fee + expectedPnl))
 
-  // 再跑一次：没有可结算的仓位，余额一分不动（幂等）
+  // 再跑一次：这一根已经结过（settleSlot 前进过），余额一分不动
   const again = await store.settleDue()
   assert.equal(again.settled.length, 0)
   assert.equal(store.snapshot().balance, view.balance)
 })
 
-test('结算：重启后不会把已经结掉的仓位再结一次', async (t) => {
+test('盯市：重启后不会把已经结过的那一根再结一次', async (t) => {
   const { store, dir, farm } = await makeStore(t, { coins: 5000 })
   await store.deposit(1000)
   const at = MONDAY + 3 * HOUR_MS
   await store.open({ crop: 'tomato', side: 'long', margin: 100, leverage: 10, at })
-  const before = store.snapshot({ at })
   const reloaded = await createFuturesStore(dir, { farm, now: () => at + SLOT_MS })
   const settled = await reloaded.settleDue()
   assert.equal(settled.settled.length, 1)
-  const after = reloaded.snapshot()
-  assert.equal(after.positions.length, 0)
-  // 重启前的余额（含已扣的保证金与费用）是账本的锚点
-  assert.ok(after.balance > 0)
-  assert.ok(before.marginUsed > 0)
+  const afterFirst = reloaded.snapshot().balance
+
+  const again = await createFuturesStore(dir, { farm, now: () => at + SLOT_MS })
+  const settledAgain = await again.settleDue()
+  assert.equal(settledAgain.settled.length, 0, '第二本账不该再结一次')
+  assert.equal(again.snapshot().balance, afterFirst)
+})
+
+test('epoch：每次启动换新，盘上的旧值只当历史', async (t) => {
+  const { store, dir, farm } = await makeStore(t, { coins: 5000 })
+  await store.deposit(100)
+  const first = store.snapshot().epoch
+  assert.match(first, /^[0-9a-f-]{36}$/)
+  const reloaded = await createFuturesStore(dir, { farm, now: () => MONDAY })
+  assert.notEqual(reloaded.snapshot().epoch, first, '换一本账就要换一个 epoch')
+})
+
+test('到期守卫：周五最后一根开的仓结得掉；过期后手动平仓被拒', async (t) => {
+  const { store } = await makeStore(t, { coins: 5000 })
+  await store.deposit(1000)
+  const window = contractOf('tomato', MONDAY)
+  // 周五 19:50 开仓：这一根的收盘正好是 20:00（到期那一毫秒）
+  const at = window.expireAt - 10 * 60 * 1000
+  const opened = await store.open({ crop: 'tomato', side: 'long', margin: 100, leverage: 10, at })
+  assert.equal(opened.ok, true, JSON.stringify(opened.ok))
+
+  const settled = await store.settleDue(at + SLOT_MS)
+  assert.equal(settled.settled.length, 1, '到期那一根不能变成永远结不掉的僵尸仓位')
+
+  const loser = await store.open({ crop: 'tomato', side: 'short', margin: 100, leverage: 10, at })
+  const closed = await store.close({ id: loser.position.id, at: window.expireAt + 60 * 1000 })
+  assert.equal(closed.ok, false)
+  assert.equal(closed.error, 'contract-expired')
 })
 
 test('平仓：按对手价成交，保证金+盈亏回到余额', async (t) => {
@@ -210,20 +242,21 @@ test('平仓：按对手价成交，保证金+盈亏回到余额', async (t) => 
 
 test('提现：超过农场上限时按 1,000,000 分批，并只扣实收的部分', async (t) => {
   const dir = await tempDir(t)
-  const farm = fakeFarm(0, { max: 2_000_000 })
+  const farm = fakeFarm(0)
   const store = await createFuturesStore(dir, { farm, now: () => MONDAY })
   // 直接改盘上的余额到 1,500,000（托管账户没有上限，农场才有）
   await writeFile(join(dir, FUTURES_FILE), JSON.stringify({
     version: 1, epoch: 'e', balance: 1_500_000, marginUsed: 0,
     fees: { insurance: 0, burned: 0 }, positions: [], closed: 0, tradedAt: 0
   }))
+  // 农场默认上限 1,000,000：第一笔加满，第二笔被静默吞掉，必须只扣实收的那 1,000,000
   const reloaded = await createFuturesStore(dir, { farm, now: () => MONDAY })
 
   const result = await reloaded.withdraw(1_200_000)
   assert.equal(result.ok, true)
-  assert.equal(result.coins, 1_200_000)
-  assert.equal(farm.state.coins, 1_200_000)
-  assert.equal(reloaded.snapshot().balance, 300_000)
+  assert.equal(result.coins, 1_000_000, '只有农场实收的那部分才算提走')
+  assert.equal(farm.state.coins, 1_000_000)
+  assert.equal(reloaded.snapshot().balance, 500_000, '没加进去的 200,000 留在托管账户里')
 })
 
 test('坏文件：按空账本运行、只告警一次、不写回盘上的坏内容', async (t) => {

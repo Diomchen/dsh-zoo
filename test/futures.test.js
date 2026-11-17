@@ -84,15 +84,15 @@ test('偏离：同样的输入永远同一个数，clamp 在合理范围', () =>
   const first = ouDeviation({ crop: 'tomato', contractId: contract.id, at })
   const second = ouDeviation({ crop: 'tomato', contractId: contract.id, at })
   assert.equal(first, second)
-  assert.ok(Math.abs(first) < 0.2, '单点偏离不该超过 20%')
+  assert.ok(Math.abs(first) < 0.02, '单点偏离不该超过 2%（σ 是 0.4%）')
 
   // 换 15 秒就是另一个数（噪声在走），但相邻两点不会跳崖
   const next = ouDeviation({ crop: 'tomato', contractId: contract.id, at: at + 15 * 1000 })
   assert.notEqual(first, next)
-  assert.ok(Math.abs(next - first) < 0.06)
+  assert.ok(Math.abs(next - first) < 0.01)
 })
 
-test('偏离：均值接近 0、平稳标准差不超出文档量级', () => {
+test('偏离：均值接近 0、平稳标准差就是 0.4%', () => {
   const contract = contractOf('tomato', MONDAY)
   const values = []
   // 每 30 分钟取一个点（相隔一个半衰期），样本近似独立；逐 15 秒取样会把同一条
@@ -103,10 +103,27 @@ test('偏离：均值接近 0、平稳标准差不超出文档量级', () => {
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length
   const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length
   const sd = Math.sqrt(variance)
-  assert.ok(Math.abs(mean) < 0.012, '均值应接近 0，实测 ' + mean)
-  assert.ok(sd > 0.01 && sd < 0.08, '标准差应在 1%–8% 之间，实测 ' + sd)
-  // 平稳标准差 ≈ σ / √(1 − e^{−2λdt})；记忆 960 步足够覆盖 8 个半衰期
+  assert.ok(Math.abs(mean) < 0.002, '均值应接近 0，实测 ' + mean)
+  assert.ok(sd > 0.003 && sd < 0.005, '平稳标准差应约等于 OU_SIGMA = 0.4%，实测 ' + sd)
+  // 记忆 960 步 = 8 个半衰期，足够把截断误差压到千分之一
   assert.ok(OU_MEMORY_STEPS >= 900)
+})
+
+test('偏离：均值回归——大幅偏离之后会往 0 走，而不是继续漂', () => {
+  const contract = contractOf('tomato', MONDAY)
+  // 找出一个 |dev| 明显偏大的时刻，往后看半个半衰期，它应该更靠近 0
+  let worst = 0
+  let worstAt = MONDAY
+  for (let k = 0; k < 200; k += 1) {
+    const at = MONDAY + k * 15 * 60 * 1000
+    const dev = ouDeviation({ crop: 'tomato', contractId: contract.id, at })
+    if (Math.abs(dev) > Math.abs(worst)) {
+      worst = dev
+      worstAt = at
+    }
+  }
+  const later = ouDeviation({ crop: 'tomato', contractId: contract.id, at: worstAt + 15 * 60 * 1000 })
+  assert.ok(Math.abs(later) < Math.abs(worst) + 0.002, '半个半衰期之后不该离 0 更远')
 })
 
 test('公允价：index × exp(偏离)；指数不是正数返回 null', () => {

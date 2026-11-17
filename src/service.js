@@ -221,6 +221,8 @@ export const ARMED_GIFT_MS = 5 * 60 * 1000
 export const STATE_GIFT_LIMIT = 20
 /** 农场 tick（SPEC v5「存储」）：每 60 秒推进生长/露水，保存由 store 节流。 */
 export const FARM_TICK_MS = 60 * 1000
+/** 期货结算（票 92）：15 秒一拍，正好是 OU 偏离的一步；整根到点时不必等农活那一拍。 */
+export const FUTURES_SETTLE_MS = 15 * 1000
 /**
  * 访客动作（ticket 43）：首次 + 两次重发（间隔约 500ms），1.8 秒没结果就明确超时。
  * 重发**复用同一个 requestId 和同一串字节**；主人侧按 requestId 回放缓存，不重复落账。
@@ -295,6 +297,8 @@ export function createService (ctx, options = {}) {
   const armedGiftMs = positiveOption(options.armedGiftMs, ARMED_GIFT_MS, 10)
   // 农场（ticket 39）：tick 节拍与测试时钟都可注入；生产默认 60 秒 / Date.now。
   const farmTickMs = positiveOption(options.farmTickMs, FARM_TICK_MS, 10)
+  // 期货（票 92）：结算节拍。15 秒 = OU 的一步，整根到点时窗口不用等农活那一拍。
+  const futuresTickMs = positiveOption(options.futuresTickMs, FUTURES_SETTLE_MS, 10)
   const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
   // 季节与节日跟农场共用测试时钟；生产就是 Date.now。
   const seasonNow = farmNow ?? (() => Date.now())
@@ -811,6 +815,7 @@ export function createService (ctx, options = {}) {
   let visitTimer = null
   let autoVisitTimer = null
   let farmTimer = null
+  let futuresTimer = null
   let contractTimer = null
   // 当前出门请求的重试状态；只活在 service，room 只记“在请求中/已抵达”。
   let request = null
@@ -2381,17 +2386,6 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
-   * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
-   * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
-   * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
-   *
-   * 票 90：图与风向只带**当前选中的那一种作物**。一次全发时 15 种作物 ×4 周期 ×24 根
-   * 归一化后约 308 KiB，超过 helper 单行 256 KiB 上限，`encodeMessage()` 返回 null，
-   * 窗口根本打不开（还误报成桌面层没在运行）。其余作物切过去时走 `trading-charts`
-   * 按需拉；`limits.crops` 仍然是完整目录，作物条/下单白名单不受影响。
-   */
-  /**
    * 期货（票 92）：`/state` 里的一份只读视图。store 没起来时给空形状，窗口与脚本
    * 按同一套字段读，不用到处判 undefined。
    */
@@ -2406,6 +2400,17 @@ export function createService (ctx, options = {}) {
     return prices?.[cropId]?.price ?? null
   }
 
+  /**
+   * 盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
+   * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
+   * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
+   * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
+   *
+   * 票 90：图与风向只带**当前选中的那一种作物**。一次全发时 15 种作物 ×4 周期 ×24 根
+   * 归一化后约 308 KiB，超过 helper 单行 256 KiB 上限，`encodeMessage()` 返回 null，
+   * 窗口根本打不开（还误报成桌面层没在运行）。其余作物切过去时走 `trading-charts`
+   * 按需拉；`limits.crops` 仍然是完整目录，作物条/下单白名单不受影响。
+   */
   function tradingWindowView () {
     const now = tradingClock()
     const view = trading === null
@@ -4939,6 +4944,7 @@ export function createService (ctx, options = {}) {
 
       // 农场是本机玩法，跟联不联网无关：没有桌面层、没有网络也照样长。
       if (!disposed) startFarmTick()
+      if (!disposed) startFuturesSettleTick()
       // 合同的到期/失联/重试也不依赖网络；没有 discovery 时 sendTo 自然是 no-op。
       if (!disposed) startContractTimer()
 
@@ -4953,6 +4959,7 @@ export function createService (ctx, options = {}) {
       room.setBridge({ ok: false, reason: 'error' })
       // 农场已经读出来的话，tick 不陪网络一起降级。
       if (!disposed) startFarmTick()
+      if (!disposed) startFuturesSettleTick()
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
       if (options.network !== false) {
         startNeighborTick()
@@ -6389,6 +6396,24 @@ export function createService (ctx, options = {}) {
     farmTimer.unref?.()
   }
 
+  /**
+   * 期货结算（票 92）单独一班车：整根是 15 分钟，60 秒的农活 tick 最迟会晚半分钟才结算，
+   * 窗口上的持仓会停在「上一根」的价位上。15 秒一拍正好是 OU 的一步：到点就把浮盈亏
+   * 按收盘价入账（盯市，仓位不删），没事可做时 `settleDue` 直接返回、不落盘。
+   */
+  function startFuturesSettleTick () {
+    if (futuresTimer !== null || disposed) return
+    futuresTimer = setInterval(() => {
+      if (futures === null) return
+      try {
+        futures.settleDue(futuresClock())
+      } catch (error) {
+        warnOnce('futures-tick', '期货结算失败：' + message(error))
+      }
+    }, futuresTickMs)
+    futuresTimer.unref?.()
+  }
+
   function startAutoVisitTimer () {
     if (autoVisitTimer !== null || disposed || discovery === null) return
     autoVisitTimer = setInterval(() => {
@@ -7400,6 +7425,10 @@ export function createService (ctx, options = {}) {
         clearInterval(farmTimer)
         farmTimer = null
       }
+      if (futuresTimer !== null) {
+        clearInterval(futuresTimer)
+        futuresTimer = null
+      }
       if (contractTimer !== null) {
         clearInterval(contractTimer)
         contractTimer = null
@@ -7434,6 +7463,7 @@ export function createService (ctx, options = {}) {
       trading = null
       season = null
       market = null
+      futures = null
       digestLimiter.clear()
       peerDigests.clear()
       marketDigestAt = Number.NEGATIVE_INFINITY
