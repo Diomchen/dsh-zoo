@@ -2037,8 +2037,14 @@ function farmBounds () {
 
 function openFarmWindow () {
   if (farmWin !== null && !farmWin.isDestroyed()) {
-    farmWin.focus()
     // 已经开着：把最新农场推一遍（可能刚在别处种/收过）。
+    // 窗口可能只是被藏起来了（切隐藏/最小化/别处失焦），这时 focus() 不会把它显出来。
+    try {
+      if (!farmWin.isVisible()) farmWin.show()
+    } catch {
+      // 正在销毁：交给下面的 focus 失败/关闭路径
+    }
+    farmWin.focus()
     sendFarmState()
     return true
   }
@@ -2092,6 +2098,9 @@ function openFarmWindow () {
     clearFarmTimer()
     notifyFarmWindowState()
   })
+  // 被藏起来/重新显出来也要让宿主知道：右键「农场」按真实可见性切换。
+  created.on('show', notifyFarmWindowState)
+  created.on('hide', notifyFarmWindowState)
   created.once('ready-to-show', () => {
     if (farmWin !== created || created.isDestroyed()) return
     created.show()
@@ -2120,9 +2129,19 @@ function closeFarmWindow (reason) {
 /**
  * 把农场小窗的真实开关报给宿主（ticket 46）：首次 ready 时 dedupe 会被重置。
  * 只报变化；×/Esc/宿主 `close:true`/hide/退出都汇到这一条。
+ *
+ * 「开着」以 `isVisible()` 为准而不是「对象还在」：窗口被藏起来时宿主应当可以
+ * 再点一次「农场」把它 `show()` 出来，而不是被当成开着的窗走关窗分支。
  */
 function notifyFarmWindowState () {
-  const open = farmWin !== null && !farmWin.isDestroyed()
+  let open = false
+  if (farmWin !== null && !farmWin.isDestroyed()) {
+    try {
+      open = farmWin.isVisible()
+    } catch {
+      open = false
+    }
+  }
   if (open === lastFarmWindowOpen) return
   lastFarmWindowOpen = open
   writeEvent({ type: 'farm-window-state', open })

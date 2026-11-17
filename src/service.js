@@ -2069,8 +2069,11 @@ export function createService (ctx, options = {}) {
   function farmWindowOpenNow () {
     if (desktop !== null && typeof desktop.status === 'function') {
       const status = desktop.status()
-      if (status !== null && typeof status === 'object' && typeof status.farmOpen === 'boolean') {
-        return status.farmOpen
+      if (status !== null && typeof status === 'object') {
+        // helper 没 ready 时它手里不可能有窗（刚拉起/刚崩）：当成关着，
+        // 否则一次重启就能让「农场」永远走关窗分支，只能重启插件解开。
+        if (status.ready === false) return false
+        if (typeof status.farmOpen === 'boolean') return status.farmOpen
       }
     }
     return farmWindowOpened === true

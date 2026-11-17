@@ -133,6 +133,21 @@ export function createDesktop (options = {}) {
   let farmWindowOpen = false
   /** 盘口小窗的真实开关状态（票 79）：同一套语义，×/Esc 关窗也会报上来。 */
   let boardWindowOpen = false
+
+  /**
+   * 换了一代 helper（拉起/退出/ready）就把两个"窗开着"的标志清零。
+   *
+   * 以前只在收到 `farm-window-state` 时才改，于是出现一种卡死：helper 在农场窗
+   * 开着的时候崩了或被我杀掉重启，新 helper 手里一扇窗都没有，却因为
+   * `lastFarmWindowOpen` 从 null 开始、状态没「变化」而一直不上报；宿主还记着
+   * `farmOpen: true`，右键「农场」次次走关窗分支 → 点多少次都开不出来，
+   * 只能重启插件。宁可多报一次「关着」，也不要带着上一代的窗口状态。
+   */
+  function resetWindowState () {
+    farmWindowOpen = false
+    boardWindowOpen = false
+  }
+
   let lastError = null
   let helperErrors = 0
   /**
@@ -235,6 +250,8 @@ export function createDesktop (options = {}) {
     }
     child = spawned
     ready = false
+    // 新 helper 手里没有任何插件窗：不能继承上一代的 farmOpen/boardOpen。
+    resetWindowState()
     workArea = null
     displays = []
     stdoutParser.reset()
@@ -277,6 +294,7 @@ export function createDesktop (options = {}) {
       }
       child = null
       ready = false
+      resetWindowState()
       lastPongAt = 0
       pongKilled = false
       settlePending('helper-error')
@@ -288,6 +306,8 @@ export function createDesktop (options = {}) {
       if (child !== spawned) return
       child = null
       ready = false
+      // 进程没了，它开的窗也一起没了：别让宿主的「农场开着」留成僵尸状态。
+      resetWindowState()
       workArea = null
       displays = []
       lastPongAt = 0
@@ -464,6 +484,8 @@ export function createDesktop (options = {}) {
     lastEvent = event
     if (event.type === 'ready') {
       ready = true
+      // 新一代 helper 刚连上：它手里还没有任何插件窗（旧进程的窗随进程一起没了）。
+      resetWindowState()
       workArea = event.workArea
       displays = Array.isArray(event.displays) ? event.displays : []
       notePong()
@@ -826,9 +848,11 @@ export function createDesktop (options = {}) {
       lastEvent,
       lastStatus,
       // ticket 46：右键「农场」按这个开关（用户用 ×/Esc 关窗也会同步过来）。
-      farmOpen: farmWindowOpen,
+      // 只有 helper 真的 ready 才算「开着」：没连上时它手里不可能有窗，
+      // 不能让上一代留下的 true 把右键菜单钉死在「关窗」分支上。
+      farmOpen: ready === true && farmWindowOpen === true,
       // 票 79：右键「盘口」同理。
-      boardOpen: boardWindowOpen,
+      boardOpen: ready === true && boardWindowOpen === true,
       assetRoots: assetRoots.slice(),
       giftsRoot,
       stderr: stderrLines.slice(),
