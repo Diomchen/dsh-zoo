@@ -499,6 +499,12 @@ _Avoid_: 逐笔结算, 清算, clearing, settlement batch
 基金空了就记账（`shortfall`）不追债——亏损仍然以保证金为限，余额永不为负。
 _Avoid_: 风险准备金, 公益金, reserve fund
 
+**做市商账 (House)**：
+跟做市商成交的那部分盈亏的对手方（`house`）：玩家赚 P，`house` 就 `-P`；玩家亏 P，就 `+P`。
+于是 `农场 + 余额 + 占用 + 待提取 + 销毁桶 + 保险基金 + house` 恒定——凭空造币/销币一眼看得见。
+纸面账户的盈亏不进这里，也不进周榜。
+_Avoid_: 系统账户, 庄家, market maker account, treasury
+
 **账户档位 (Account Mode)**：
 每个账户自己选的结算口径：`shadow`（纸面，缺省）或 `live`（真钱）。
 房主不管别人玩不玩真钱，也不管别人暂停不暂停；纸面账户照样能开仓挂单，

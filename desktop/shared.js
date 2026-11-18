@@ -2535,6 +2535,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       // 票 96 的兜底账：宿主还没下发时窗口画 0，不画「—」。
       insurance: nonNegative(raw.insurance),
       shortfall: nonNegative(raw.shortfall),
+      // 1.12.4：做市商净盈亏，允许为负（负 = 系统净付出），所以走 `num` 而不是 `nonNegative`。
+      house: num(raw.house, 0),
       liquidationCount: nonNegative(raw.liquidationCount),
       week: raw.week !== null && typeof raw.week === 'object'
         ? { start: num(raw.week.start, 0), pnl: num(raw.week.pnl, 0) }

@@ -94,7 +94,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "trades": [{ "at": 1700000000000, "crop": "tomato", "contract": "tomato-20261117",
                "side": "short", "lots": 1, "price": 4.87, "fee": 0.49,
                "kind": "liquidation" }],
-  "insurance": 3.2, "shortfall": 0.8, "mode": "live", "accountMode": "live",
+  "insurance": 3.2, "shortfall": 0.8, "house": -12.4, "mode": "live", "accountMode": "live",
   "paused": false, "pending": 0 }
 { "v": 1, "type": "futures-sync", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "lastSeq": 7 }
@@ -163,6 +163,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `orders`（挂单） | `futures-settle` | 可选，缺省 = 空盘口；最多 `8` 条 `{ id, crop, contract, side, price, lots, lotsLeft, leverage, marginFrozen, at }`。`lots` 是原始张数、`lotsLeft` 是剩余张数（1..`lots`），`price` 是到分的正数，`marginFrozen` 是剩余部分压着的保证金；坏一条整包丢 |
 | `trades`（成交） | `futures-settle` | 可选，缺省 = 空；最多 `8` 条 `{ at, crop, contract, side, lots, price, fee, kind }`。`kind` 只认 `open` / `close` / `delivery` / `convert` / `liquidation` / `mode`；`delivery` 额外带 `deliveryFee`（到分、≥0）。`mode` 是灰度切换的审计流水，只带 `{ at, kind:'mode', note:'off'\|'shadow'\|'live', lots:0, price:0, fee:0 }`，没有 `crop`/`contract`/`side`。`side` 记的是**成交那一腿**（多单平仓记 `short`）；`liquidation` 的 `price` 就是强平触发价、`fee` 是实际收到的费用。坏一条整包丢 |
 | `insurance` / `shortfall` | `futures-settle` | 可选，缺省 `0`；保险基金余额与累计欠账，到分的金币数（≥0）。它们是**房主账本的全局数**，peer 只显示不参与计算（票 97） |
+| `house` | `futures-settle` | 可选，缺省 `0`；做市商那一侧的累计净盈亏（**可以为负**，负 = 玩家整体从系统净赚走）。跟 `insurance` 一样是房主账本的全局数，peer 只显示（1.12.4） |
 | `mode` | `futures-settle` | 可选，缺省 `shadow`；市场闸门（房主那台的开关），只能是 `off` / `shadow` / `live`。peer 以它决定是否跟随房主停发报文（票 98） |
 | `accountMode` | `futures-settle`、`futures-mode` | 可选，缺省 `null`（= 沿用本地选择）；这个**账户自己**的档位，只认 `shadow`（纸面）/ `live`（真钱）。settle 里由房主回传，`futures-mode` 里由 peer 申报（1.10.0） |
 | `paused` | `futures-settle`、`futures-pause` | 可选，缺省 `false`；这个**账户自己**按下的暂停，只停自己。settle 里由房主回传（只在该账户暂停时为 `true`），`futures-pause` 里由 peer 申报（1.12.0） |
@@ -930,7 +931,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | `futures-hello` | peer → 房主 | `at` | 无（每 peer 30 秒最多 1 条） |
 | `futures-order` | peer → 房主 | `kind` +（`crop`/`side`/`margin`/`leverage` 或 `positionId` 或 `coins` 或 `crop`/`side`/`price`/`lots`/`leverage`） | 无（房主逐条记账，重复包靠源地址门控挡） |
 | `futures-cancel` | peer → 房主 | `orderId`（票 96 起也认 `positionId`，至少一个） | 无（撤单本身幂等：单子没了就回 `no-order`） |
-| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` / `orders` / `trades` / `insurance` / `shortfall` / `mode` / `pending` | `(epoch, seq)` |
+| `futures-settle` | 房主 → peer | `epoch` / `seq` / `balance` / `marginUsed` / `delta` / `positions` / `orders` / `trades` / `insurance` / `shortfall` / `house` / `mode` / `pending` / `accountMode` / `paused` | `(epoch, seq)` |
 | `futures-sync` | peer → 房主 | `epoch` / `lastSeq` | 无（每 30 秒最多 1 条，房主收到就回一份 settle） |
 
 1. **房主选举**：`[本机 deviceId, ...带 futures 能力位的已放行邻居]` 排序取最小，两端算出
@@ -1008,7 +1009,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
 | 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
 | 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
-| 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符；`insurance`/`shortfall` ≥0；`mode` 只认 `off`/`shadow`/`live`；`pending` ≥0 |
+| 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符；`insurance`/`shortfall` ≥0；`house` 为有限数（**可以为负**）；`mode` 只认 `off`/`shadow`/`live`；`pending` ≥0 |
 | 期货限额 | 单账户日交易额 `max(5,000, 5 × 权益)`（1.12.2 起随权益放大，权益 = 余额 + 已占保证金）、持仓名义 20,000；同源地址 20 包/10 秒 |
 | 期货广播 | `futures-settle` 每账户每根 1 条；`futures-sync` 1 条/30 秒；整包 ≤4 KiB（8 条持仓 + 8 条挂单仍在内） |
 | 期货价格 | 指数锚现货价（已被行情夹在 `[base×0.5, base×2]`）；做市价差 0.2%；吃单费 0.1%（9 成销毁、1 成进保险） |

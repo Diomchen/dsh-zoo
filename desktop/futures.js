@@ -270,6 +270,8 @@
     el('weekPnl').className = built.header.weekTone
     el('insurance').textContent = built.header.insurance
     el('shortfall').textContent = built.header.shortfall
+    el('house').textContent = built.header.house
+    el('house').className = built.header.houseTone
 
     // 到期日的四根收盘价：有就横在报价表上方，没有就整行藏掉。
     el('delivery').textContent = built.deliveryLine ?? ''

@@ -141,7 +141,8 @@ export {
   FUTURES_DEFAULT_ACCOUNT_MODE,
   FUTURES_DEFAULT_MODE,
   FUTURES_MODES,
-  POSITION_NOTIONAL_CAP
+  POSITION_NOTIONAL_CAP,
+  isFuturesAccountMode
 }
 
 /**
@@ -255,6 +256,9 @@ export function initialFuturesState () {
     insurance: 0,
     shortfall: 0,
     liquidationCount: 0,
+    // 1.12.4：做市商那一侧的累计盈亏（`house -= pnl`）。玩家赚的钱从这儿出、亏的钱进这儿，
+    // 所以「玩家盈亏 + house + 硬币总量」三项才闭合。允许为负：负得越多，说明系统净付出越多。
+    house: 0,
     // 票 98：灰度模式（off/shadow/live）、按自然日的成交额、待提取余额、回滚停用标记。
     // `farmAnchor/farmIn/farmOut` 只服务于对账：影子模式没有真实流动，所以差额恒为 0。
     mode: FUTURES_DEFAULT_MODE,
@@ -544,6 +548,9 @@ export function normalizeLedgerSnapshot (raw) {
     ? 0
     : (Number.isInteger(raw.liquidationCount) && raw.liquidationCount >= 0 ? raw.liquidationCount : null)
   if (liquidationCount === null) return null
+  // 1.12.4：做市商净盈亏允许为负（负 = 系统净付出）。
+  const house = raw.house === undefined ? 0 : finiteNumber(raw.house)
+  if (house === null) return null
   const delivered = {}
   if (raw.delivered !== undefined && raw.delivered !== null) {
     if (typeof raw.delivered !== 'object' || Array.isArray(raw.delivered)) return null
@@ -554,7 +561,7 @@ export function normalizeLedgerSnapshot (raw) {
       delivered[window.id] = stampedAt
     }
   }
-  return { v: 1, epoch, seq, at, hostId, insurance, shortfall, liquidationCount, delivered, accounts }
+  return { v: 1, epoch, seq, at, hostId, insurance, shortfall, liquidationCount, house, delivered, accounts }
 }
 
 /** 快照里一个账户的线上形状：本地账本和远端账户共用一份序列化，省得两边漂。 */
@@ -790,6 +797,11 @@ export function normalizeFuturesFile (value) {
   if (liquidationCount === null) repaired += 1
   else state.liquidationCount = liquidationCount
 
+  // 1.12.4：做市商净盈亏（老存档没有这个字段，当 0）。
+  const house = value.house === undefined ? 0 : finiteNumber(value.house)
+  if (house === null) repaired += 1
+  else state.house = house
+
   // 票 98：灰度模式与限额进度。缺字段是旧版本，按缺省值处理且不算修补；
   // 非法的模式名则必须当坏账修掉（否则窗口会显示一个谁都不认识的状态）。
   const mode = value.mode === undefined
@@ -884,6 +896,8 @@ function toFileState (state) {
     // 票 97：保险基金余额与累计强平笔数（基金余额会被亏空花掉，`fees.insurance` 只增不减）。
     insurance: roundCoin(state.insurance),
     liquidationCount: state.liquidationCount,
+    // 1.12.4：做市商净盈亏（玩家盈亏的反数），允许为负。
+    house: roundCoin(state.house),
     // 票 98：模式、日额进度、待提取、回滚标记与对账锚点。
     mode: state.mode,
     dayStart: state.dayStart,
@@ -1038,17 +1052,25 @@ class FuturesStore {
   }
 
   /**
-   * 1.10.0：某个账户这一刻的档位。账户自己选了就按账户的；没选就跟随市场档位
-   * （市场是 `off` 时这里按 `shadow` 解释——它本来也开不了新仓，不能把纸面钱当真钱算）。
+   * 1.10.0：某个账户这一刻的档位。
+   *
+   * 1.12.4：自己的档位**自己说了算**——本机账户优先读本地 `accountMode`，房主回执只用来
+   * 覆盖「本地还没选过」的情况。以前先读 `replica.accountMode`，房主那边记成 null 时就会
+   * 落回 `modeOf()`，于是「房主是纸面」把所有人都按成纸面，切了也不生效。
+   * 都没选过时按纸面算：纸面是安全侧，不会拿别人的真钱下注。
    */
   #accountModeOf (account) {
-    // peer 侧：房主回过话就以房主账本里的档位为准（本地那次切换只是先手一步）。
     if (account === this.#state) {
+      const own = this.#state.accountMode
+      if (isFuturesAccountMode(own)) return own
       const mirrored = this.#state.replica?.accountMode
       if (isFuturesAccountMode(mirrored)) return mirrored
+    } else {
+      const chosen = account?.accountMode
+      if (isFuturesAccountMode(chosen)) return chosen
     }
-    const chosen = account?.accountMode
-    if (isFuturesAccountMode(chosen)) return chosen
+    // 谁都没选过（老存档）：跟着市场档位走——1.9 之前 `live` 就是「全场真钱」，
+    // 那批存档读出来不能突然变成纸面。
     return this.modeOf() === 'live' ? 'live' : 'shadow'
   }
 
@@ -1200,6 +1222,8 @@ class FuturesStore {
       insurance: roundCoin(this.#state.insurance),
       shortfall: roundCoin(this.#state.shortfall),
       liquidationCount: this.#state.liquidationCount,
+      // 1.12.4：做市商净盈亏——玩家赢的就是从这里付出去的，负得越多说明系统净付出越多。
+      house: roundCoin(this.#state.house),
       // 票 98：模式、日额进度/上限、持仓上限、待提取与回滚标记。
       // 1.10.0：`mode` 是市场闸门，`accountMode` 是本账户自己的档位（真钱/纸面）。
       mode: this.modeOf(),
@@ -1750,6 +1774,7 @@ class FuturesStore {
     const seq = this.#bumpAccount(account)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
+    this.#bookPnl(pnl, stamp, account)
     this.#recordRemoteTrade(account, {
       at: stamp,
       crop: position.crop,
@@ -1935,6 +1960,7 @@ class FuturesStore {
     this.#state.closed += 1
     this.#state.tradedAt = stamp
     this.#chargeFee(plan.fee, account)
+    this.#bookPnl(plan.pnl, stamp, account)
     this.#recordRemoteTrade(account, {
       at: stamp,
       crop: position.crop,
@@ -2022,6 +2048,7 @@ class FuturesStore {
         this.#bookPnl(pnl, stamp)
         this.#recordTrade(trade)
       } else {
+        this.#bookPnl(pnl, stamp, account)
         this.#recordRemoteTrade(account, trade)
       }
       delivered.push({
@@ -2150,6 +2177,7 @@ class FuturesStore {
     trades,
     insurance,
     shortfall,
+    house,
     mode,
     accountMode,
     paused,
@@ -2195,6 +2223,9 @@ class FuturesStore {
     const safeInsurance = insurance === undefined ? 0 : nonNegativeCoin(insurance)
     const safeShortfall = shortfall === undefined ? 0 : nonNegativeCoin(shortfall)
     if (safeInsurance === null || safeShortfall === null) return { ok: false, error: 'bad-fund' }
+    // 1.12.4：做市商净盈亏（允许为负，老房主不发时按 0，不判坏包）。
+    const safeHouse = house === undefined ? 0 : finiteNumber(house)
+    if (safeHouse === null) return { ok: false, error: 'bad-fund' }
     // 票 98：房主把当前模式与待提取余额一起下发；老房主不发时按缺省处理，不判坏包。
     const safeMode = mode === undefined
       ? FUTURES_DEFAULT_MODE
@@ -2220,6 +2251,7 @@ class FuturesStore {
       trades: accountTrades,
       insurance: safeInsurance,
       shortfall: safeShortfall,
+      house: safeHouse,
       mode: safeMode,
       accountMode: safeAccountMode,
       paused: safePaused,
@@ -2245,6 +2277,7 @@ class FuturesStore {
       insurance: roundCoin(state.insurance),
       shortfall: roundCoin(state.shortfall),
       liquidationCount: state.liquidationCount,
+      house: roundCoin(state.house),
       delivered: { ...state.delivered },
       accounts
     }
@@ -2309,6 +2342,7 @@ class FuturesStore {
     state.insurance = ledger.insurance
     state.shortfall = ledger.shortfall
     state.liquidationCount = ledger.liquidationCount
+    state.house = ledger.house
     state.delivered = { ...ledger.delivered }
     state.remotes = remotes
     if (own !== null) {
@@ -2354,6 +2388,8 @@ class FuturesStore {
       // 票 97：房主广播过来的全局基金/欠账（peer 只读）。
       insurance: roundCoin(replica.insurance ?? 0),
       shortfall: roundCoin(replica.shortfall ?? 0),
+      // 1.12.4：做市商净盈亏（负 = 系统净付出）。
+      house: roundCoin(replica.house ?? 0),
       // 票 98：模式与待提取余额也跟随房主；1.10.0：账户档位同样以房主回传的为准。
       mode: FUTURES_MODES.includes(replica.mode) ? replica.mode : FUTURES_DEFAULT_MODE,
       accountMode: isFuturesAccountMode(replica.accountMode) ? replica.accountMode : null,
@@ -3112,6 +3148,7 @@ class FuturesStore {
       account.balance = roundCoin(account.balance + credit)
       account.marginUsed = this.#recomputeFor(account)
       if (paidFee > 0) this.#chargeFee(paidFee, account)
+      this.#bookPnl(hit.pnl, hit.at, account)
       this.#recordRemoteTrade(account, {
         at: hit.at,
         crop: position.crop,
@@ -3178,6 +3215,7 @@ class FuturesStore {
       account.balance = roundCoin(account.balance + outcome.pnl)
       position.entry = outcome.price
       position.settleSlot = this.#slotOf(outcome.at) + 1
+      this.#bookPnl(outcome.pnl, outcome.at, account)
       settled.push({
         position: { ...position },
         price: outcome.price,
@@ -3302,10 +3340,20 @@ class FuturesStore {
     return roundCoin(this.#state.week.pnl)
   }
 
-  #bookPnl (pnl, at) {
+  /**
+   * 记一笔已实现盈亏：进周榜，同时把做市商那一侧记上反数（`house -= pnl`）。
+   *
+   * 1.12.4：以前这里只动周榜，硬币凭空增减——玩家赚的 100 是系统印的，亏的 100 是系统销的。
+   * 现在每一笔已实现盈亏（平仓、交割、强平、盯市）都从 `house` 里进出，账本才闭合。
+   * 纸面账户既不进榜也不进 `house`：假钱统计进去只会让数字变成假的。
+   */
+  #bookPnl (pnl, at, account = this.#state) {
+    if (!Number.isFinite(pnl) || pnl === 0) return
+    if (this.#accountModeOf(account) === 'shadow') return
     const start = this.#weekStartOf(at)
     if (this.#state.week.start !== start) this.#state.week = { start, pnl: 0 }
     this.#state.week.pnl = roundCoin(this.#state.week.pnl + pnl)
+    this.#state.house = roundCoin(this.#state.house - pnl)
   }
 
   /** 成交流水：最新在前，硬截 50 条（盘上不留无限增长的账）。 */
@@ -3340,7 +3388,9 @@ class FuturesStore {
     return {
       insurance: roundCoin(this.#state.insurance),
       shortfall: roundCoin(this.#state.shortfall),
-      liquidationCount: this.#state.liquidationCount
+      liquidationCount: this.#state.liquidationCount,
+      // 1.12.4：做市商净盈亏（玩家盈亏的反数），负 = 系统净付出。
+      house: roundCoin(this.#state.house)
     }
   }
 
@@ -3353,7 +3403,9 @@ class FuturesStore {
       accountMode: this.accountMode(),
       pending: roundCoin(this.#state.pending),
       paused: this.#state.paused === true,
-      disabled: this.#state.disabled
+      disabled: this.#state.disabled,
+      // 1.12.4：做市商净盈亏（玩家盈亏的反数），窗口据此显示「系统净付出」。
+      house: roundCoin(this.#state.house)
     }
   }
 

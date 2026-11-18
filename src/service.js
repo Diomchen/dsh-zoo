@@ -65,7 +65,13 @@ import {
   stealSucceeds
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
-import { createFuturesStore, FUTURES_ERROR_TEXT, initialFuturesView } from './futures.js'
+import {
+  createFuturesStore,
+  FUTURES_DEFAULT_ACCOUNT_MODE,
+  FUTURES_ERROR_TEXT,
+  initialFuturesView,
+  isFuturesAccountMode
+} from './futures.js'
 import {
   contractWindowOf,
   FUTURES_LEVERAGES,
@@ -6736,7 +6742,9 @@ export function createService (ctx, options = {}) {
       paused: account.paused === true,
       pending: account.pending ?? 0,
       insurance: fund.insurance,
-      shortfall: fund.shortfall
+      shortfall: fund.shortfall,
+      // 1.12.4：做市商净盈亏（房主账本的全局数），peer 窗口显示「系统净付出」。
+      house: fund.house
     }
     // 票 96：整包硬上限 4 KiB。满仓 + 满挂单时 8 条流水可能塞不下，逐条减到能发为止。
     for (let keep = trades.length; keep >= 0; keep -= 1) {
@@ -7205,13 +7213,15 @@ export function createService (ctx, options = {}) {
     const trades = replica === null ? [] : (replica.trades ?? []).map((trade) => ({ ...trade }))
     const balance = replica === null ? 0 : replica.balance
     const marginUsed = replica === null ? 0 : replica.marginUsed
-    // 票 98：模式跟随房主（settle 里带过来）；副本还没有时用本机缺省 shadow。
+    // 票 98：模式跟随房主（settle 里带过来）；副本还没有时用本机缺省。
     const mode = replica === null ? view.mode : (replica.mode ?? view.mode)
-    const session = mode === 'off'
-      ? { kind: 'off', text: '期货未开放' }
-      : mode === 'shadow'
-        ? { kind: 'shadow', text: '影子模式：只记账，不动农场硬币' }
-        : view.session
+    // 1.12.4：档位只看**自己这一本账**。以前 `mode === 'shadow'`（房主自己是纸面）会被写成
+    // 「影子模式：只记账」，看起来像「房主决定你能不能玩真钱」——现在房主的 `mode` 只表示
+    // 它自己那本账，别人的档位由 `accountMode` 单独带过来。
+    const accountMode = replica !== null && isFuturesAccountMode(replica.accountMode)
+      ? replica.accountMode
+      : (isFuturesAccountMode(view.accountMode) ? view.accountMode : FUTURES_DEFAULT_ACCOUNT_MODE)
+    const session = mode === 'off' ? { kind: 'off', text: '期货未开放' } : view.session
     const upgraded = futuresPeerIds().length > 0
     const stale = room.snapshot().neighbors.some((neighbor) => {
       if (neighbor?.status !== 'allowed') return false
@@ -7232,8 +7242,11 @@ export function createService (ctx, options = {}) {
       // （房主一条 settle 只带两个数），所以它是「最近 8 条流水里看得见的强平笔数」。
       insurance: replica === null ? view.insurance : replica.insurance,
       shortfall: replica === null ? view.shortfall : replica.shortfall,
+      // 1.12.4：做市商净盈亏（房主账本的全局数，负 = 系统净付出）。
+      house: replica === null ? (view.house ?? 0) : (replica.house ?? 0),
       // 票 98：影子/关闭状态与待提取余额以房主副本为准。
       mode,
+      accountMode,
       session,
       pending: replica === null ? 0 : (replica.pending ?? 0),
       liquidationCount: replica === null

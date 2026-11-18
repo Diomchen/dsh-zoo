@@ -241,7 +241,7 @@ function futuresKeys (type) {
     'futures-hello': ['v', 'type', 'deviceId', 'at'],
     'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
     'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
-    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'accountMode', 'paused', 'pending'],
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'house', 'mode', 'accountMode', 'paused', 'pending'],
     'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq'],
     'futures-mode': ['v', 'type', 'deviceId', 'at', 'accountMode'],
     'futures-pause': ['v', 'type', 'deviceId', 'at', 'paused'],
@@ -1212,6 +1212,8 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     // 票 97：基金/欠账始终在线，缺省 0。
     insurance: 0,
     shortfall: 0,
+    // 1.12.4：做市商净盈亏始终可读，缺省 0。
+    house: 0,
     // 票 98：模式缺省 shadow、待提取缺省 0。
     mode: 'shadow',
     // 1.10.0：账户档位可选，缺省 null。
