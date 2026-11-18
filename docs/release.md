@@ -22,6 +22,12 @@ GitHub Release 正文就是 [`releases/1.10.0.md`](releases/1.10.0.md)。
 取消，纸面也能正经交易（5,000 名义日额、20,000 持仓上限）。顺手修了窗口归一化没放行
 `mode`/`dayCap`/`peer` 等字段导致徽章与限额行永远为空的老 bug。
 
+同一版还补了红包的三处漏接：`desktop-pets` 不认 `packet`（红包卡从没进过场景）、`room` 的
+`visitorGift` 把红包降级成字条且 `visit-record` 直接丢字段、记录页 `FARM_LOG_KINDS` 白名单漏
+`packet`。没拆的红包卡改贴在自己宠物旁边（拆开或 24 小时退回才消失），`farm.json` 新增
+`packetLog`（≤50 条，老文件自动从流水补齐），农场「记录」页顶上钉一块「红包记录」。
+测试 1211 用例 / 1210 通过 / 1 跳过。
+
 ## 1.9.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.9.0.md`](releases/1.9.0.md)。
