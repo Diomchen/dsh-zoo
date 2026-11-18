@@ -21,7 +21,9 @@ import {
   createRateLimiter,
   encodeFuturesCancel,
   encodeFuturesHello,
+  encodeFuturesMode,
   encodeFuturesOrder,
+  encodeFuturesPause,
   encodeFuturesSettle,
   encodeFuturesSync,
   encodeHeartbeat,
@@ -1426,4 +1428,40 @@ test('票 95：8 个持仓 + 8 条挂单同时装满也仍在 4 KiB 之内', () 
   // 线上只带剩余张数：`lots` 是原始张数，`lotsLeft` 才是还能成交的部分。
   assert.equal(parsed.packet.orders[0].lots, 1_000_000)
   assert.equal(parsed.packet.orders[0].lotsLeft, 1_000_000)
+})
+
+test('1.12.5：futures-mode / futures-pause 真的能编码上线（以前掉进 beacon 分支，抛 invalid port）', () => {
+  const deviceId = 'ac416c63-8ad0-457d-976c-e69d7e806af2'
+
+  // 档位申报：这是「切真钱」唯一的上线通道，编码失败就等于点了没反应。
+  const mode = parsePacket(encodeFuturesMode({ deviceId, at: Date.now(), accountMode: 'live' }))
+  assert.equal(mode.ok, true, JSON.stringify(mode))
+  assert.equal(mode.packet.type, 'futures-mode')
+  assert.equal(mode.packet.accountMode, 'live')
+  assert.equal(typeof mode.packet.at, 'number')
+
+  // 暂停申报。
+  const pause = parsePacket(encodeFuturesPause({ deviceId, at: Date.now(), paused: true }))
+  assert.equal(pause.ok, true, JSON.stringify(pause))
+  assert.equal(pause.packet.type, 'futures-pause')
+  assert.equal(pause.packet.paused, true)
+
+  // settle 里的账户档位、暂停、做市商账都要真的带出去（不是编码时被 destructuring 吞掉）。
+  const settle = parsePacket(encodeFuturesSettle({
+    deviceId,
+    at: Date.now(),
+    epoch: 'e1',
+    seq: 3,
+    balance: 100,
+    marginUsed: 0,
+    delta: 0,
+    positions: [],
+    house: -3.5,
+    accountMode: 'live',
+    paused: true
+  }))
+  assert.equal(settle.ok, true, JSON.stringify(settle))
+  assert.equal(settle.packet.house, -3.5, 'house 不能只存在调用方的对象里')
+  assert.equal(settle.packet.accountMode, 'live')
+  assert.equal(settle.packet.paused, true)
 })
