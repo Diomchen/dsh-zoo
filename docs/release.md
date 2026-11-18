@@ -11,6 +11,16 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.13.1 版本记录
+
+GitHub Release 正文就是 [`releases/1.13.1.md`](releases/1.13.1.md)。
+
+这一版只动期货。桌面那一跳的字段白名单补齐（充值/提现/挂单/转现货/全部转/切档/暂停
+这些动作以前点了不生效）；档位以本机为准并在没被房主确认时每 30 秒补发；
+`futures-mode`/`futures-pause` 两个报文以前编不出字节（掉进兜底分支抛 `invalid port`）；
+peer 的账以房主副本为准；仓位记开仓档位；peer 提现改成「报意图 + 房主放款」(`futures-withdraw`
++ `settle.payout`)；原生确认/输入框换成窗内确认条。顺带修了 CI 在 Linux 上 `ENOTEMPTY` 的假红。
+
 ## 1.13.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.13.0.md`](releases/1.13.0.md)。
