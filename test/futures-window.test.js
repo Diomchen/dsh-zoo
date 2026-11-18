@@ -380,6 +380,64 @@ test('shared：票 98 的挂单/撤单/转现货/切档动作各有白名单', (
   assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-rollback' }), { action: 'futures-rollback' })
 })
 
+test('shared：票 109 的「全部转现货」只收 1–8 笔，坏 id / 坏张数整条拒', () => {
+  const id = '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60'
+  const other = '1c8d2f1f-2f3b-4b5c-8b4f-2e3d4c5b6a71'
+  assert.deepEqual(
+    shared.normalizeFuturesAction({ action: 'futures-convert-all', positions: [{ id, lots: 2 }, { id: other, lots: 5 }] }),
+    { action: 'futures-convert-all', positions: [{ id, lots: 2 }, { id: other, lots: 5 }] }
+  )
+  // 空清单 / 超过 8 笔 / 坏 id / 张数为 0 都不收。
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert-all', positions: [] }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert-all' }), null)
+  const many = Array.from({ length: 9 }, () => ({ id, lots: 1 }))
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert-all', positions: many }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert-all', positions: [{ id: 'nope', lots: 1 }] }), null)
+  assert.equal(shared.normalizeFuturesAction({ action: 'futures-convert-all', positions: [{ id, lots: 0 }] }), null)
+})
+
+test('视图模型：票 109 交割前 30 分钟提醒，并给出「全部转」的开关', () => {
+  const draft = { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }
+  const held = [{
+    id: '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60',
+    crop: 'tomato',
+    contract: 'tomato-20261117',
+    side: 'long',
+    lots: 2,
+    entry: 5,
+    margin: 50,
+    leverage: 20,
+    unrealized: 1
+  }]
+  const quoteAt = (expireAt) => ({
+    tomato: { fair: 5, bid: 4.99, ask: 5.01, contract: { id: 'tomato-20261117', openAt: TUESDAY - 20 * 3600 * 1000, expireAt } }
+  })
+
+  const soon = view.build(
+    sampleView({ mode: 'live', accountMode: 'live', quotes: quoteAt(TUESDAY + 20 * 60 * 1000), positions: held }),
+    draft,
+    TUESDAY
+  )
+  assert.equal(soon.expiry.urgent, true)
+  assert.match(soon.expiry.text, /距交割还有 \d+ 分钟/)
+  assert.equal(soon.canConvertAll, true)
+
+  // 还早：不提醒，但「全部转」仍然可用（想提前收货不用等提醒）。
+  const later = view.build(
+    sampleView({ mode: 'live', quotes: quoteAt(TUESDAY + 6 * 3600 * 1000), positions: held }),
+    draft,
+    TUESDAY + 3600 * 1000
+  )
+  assert.equal(later.expiry.text, null)
+  assert.equal(later.expiry.urgent, false)
+  assert.equal(later.canConvertAll, true)
+
+  // 已到期：提醒改成「只能现金结算」；关市时按钮灰掉。
+  const expired = view.build(sampleView({ mode: 'live', quotes: quoteAt(TUESDAY), positions: held }), draft, TUESDAY + 60 * 1000)
+  assert.match(expired.expiry.text, /只能现金结算/)
+  assert.equal(view.build(sampleView({ mode: 'off', quotes: quoteAt(TUESDAY + 6 * 3600 * 1000) }), draft, TUESDAY).canConvertAll, false)
+})
+
 test('视图模型：账户档位是纸面也能交易；关市才画成关闭', () => {
   const draft = { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }
   const paper = view.build(

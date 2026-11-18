@@ -25,7 +25,9 @@
     askedRefreshAt: 0,
     busy: false,
     // 1.10.0：上一拍画出来的账户档位（切换按钮用它算「下一档」）。
-    account: null
+    account: null,
+    // 票 109：「全部转」要提交的持仓清单（id + 张数），每拍重算。
+    convertTargets: []
   }
 
   function toast (text) {
@@ -243,6 +245,15 @@
     paintTrades(built.trades)
     el('ordersTitle').textContent = built.orderCount > 0 ? '我的挂单 · ' + built.orderCount : '我的挂单'
 
+    // 票 109：交割前的提醒，与「全部转」按钮同一处——错过就只能现金结算。
+    const expiry = built.expiry ?? { text: null, urgent: false }
+    el('expiryHint').textContent = expiry.text ?? ''
+    el('expiryHint').hidden = expiry.text === null
+    el('convertAll').disabled = built.canConvertAll !== true || state.busy
+    state.convertTargets = (built.positions ?? [])
+      .filter((row) => typeof row.id === 'string' && row.lotsValue > 0)
+      .map((row) => ({ id: row.id, lots: row.lotsValue }))
+
     el('pLots').textContent = built.previewText.lots
     el('pNotional').textContent = built.previewText.notional
     el('pMargin').textContent = built.previewText.margin
@@ -362,6 +373,17 @@
       bridge.submit({ action: 'futures-convert', positionId: convertId, lots })
       setTimeout(() => { state.busy = false; render() }, 3000)
     }
+  })
+
+  // 票 109：一次把全部持仓转成现货。钱不够/仓库放不下的那几笔会被宿主拒，剩下的照转。
+  el('convertAll').addEventListener('click', () => {
+    if (state.busy) return
+    const targets = Array.isArray(state.convertTargets) ? state.convertTargets : []
+    if (targets.length === 0) return
+    if (!window.confirm('把这 ' + targets.length + ' 笔持仓全部按公允价转成现货？')) return
+    state.busy = true
+    bridge.submit({ action: 'futures-convert-all', positions: targets })
+    setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
   el('orders').addEventListener('click', (event) => {

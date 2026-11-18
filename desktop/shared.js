@@ -386,6 +386,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     'futures-place',
     'futures-cancel',
     'futures-convert',
+    'futures-convert-all',
     'futures-mode',
     'futures-account-mode',
     'futures-rollback',
@@ -2601,6 +2602,19 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       const lots = strictBoardInt(raw.lots, 1, 100000)
       if (positionId === null || lots === null) return null
       return { action, positionId, lots }
+    }
+    // 票 109：一次把持仓全部转成现货。窗口只报「哪几笔、各多少张」，价格与钱都由宿主算。
+    if (action === 'futures-convert-all') {
+      const list = Array.isArray(raw.positions) ? raw.positions : null
+      if (list === null || list.length === 0 || list.length > 8) return null
+      const positions = []
+      for (const item of list) {
+        const id = normalizeUuid(item?.id)
+        const lots = strictBoardInt(item?.lots, 1, 100000)
+        if (id === null || lots === null) return null
+        positions.push({ id, lots })
+      }
+      return { action, positions }
     }
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, FUTURES_MAX_MARGIN)

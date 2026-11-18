@@ -1359,6 +1359,52 @@ export function createService (ctx, options = {}) {
       }
       return result
     }
+    // 票 109：一次把全部持仓转成现货。窗口只报「哪几笔、各多少张」；
+    // 房主逐笔算，某笔钱不够/仓库放不下就跳过它、继续下一笔（部分成功也用得上）。
+    if (action === 'futures-convert-all') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      const wanted = Array.isArray(body?.positions) ? body.positions.slice(0, 8) : []
+      if (wanted.length === 0) return { ok: false, error: 'bad-positions' }
+      if (!isFuturesHost()) {
+        let sent = 0
+        for (const item of wanted) {
+          const pending = futuresConvertPending(item?.id, item?.lots)
+          if (pending?.ok === true) sent += 1
+        }
+        return sent > 0
+          ? { ok: true, action: 'futures-convert-all', sent }
+          : { ok: false, error: 'pending-failed' }
+      }
+      let done = 0
+      let failed = 0
+      let lastNotice = null
+      for (const item of wanted) {
+        const result = await futures.convertToSpot({
+          positionId: item?.id,
+          lots: item?.lots,
+          at: futuresClock()
+        })
+        if (result?.ok === true) {
+          done += 1
+        } else {
+          failed += 1
+          if (typeof result?.notice === 'string') lastNotice = result.notice
+        }
+      }
+      if (done > 0) {
+        refreshFuturesWindow()
+        refreshFarmWindow()
+      }
+      return {
+        ok: done > 0,
+        action: 'futures-convert-all',
+        converted: done,
+        failed,
+        notice: done > 0
+          ? null
+          : (lastNotice ?? '一笔都没转成：余额不够按公允价买现货，或者仓库放不下。')
+      }
+    }
     // 票 95：挂限价单。peer 只发「限价、方向、张数、杠杆」，冻结多少保证金由房主算。
     if (action === 'futures-place') {
       if (futures === null) return { ok: false, error: 'starting' }

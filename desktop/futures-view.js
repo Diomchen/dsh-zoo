@@ -116,6 +116,34 @@
     return (Math.floor(now / SLOT_MS) + 1) * SLOT_MS
   }
 
+  /**
+   * 票 109：交割倒计时。所有报价共用同一张日合约，取其中最早的 `expireAt`。
+   * 收盘前 30 分钟开始提醒——想收货就点「转」，过了 20:00 只能现金结算。
+   */
+  const EXPIRE_WARN_MS = 30 * 60 * 1000
+  function expiryOf (view, now) {
+    const stamp = finite(now)
+    let at = null
+    const quotes = view?.quotes !== null && typeof view?.quotes === 'object' && !Array.isArray(view?.quotes)
+      ? Object.values(view.quotes)
+      : []
+    for (const quote of quotes) {
+      const expireAt = finite(quote?.contract?.expireAt)
+      if (expireAt === null || expireAt <= 0) continue
+      if (at === null || expireAt < at) at = expireAt
+    }
+    if (at === null || stamp === null) return { at, urgent: false, text: null }
+    const left = at - stamp
+    if (left <= 0) return { at, urgent: true, text: '这张合约已到期，只能现金结算了。' }
+    if (left > EXPIRE_WARN_MS) return { at, urgent: false, text: null }
+    const minutes = Math.max(1, Math.ceil(left / 60000))
+    return {
+      at,
+      urgent: true,
+      text: '距交割还有 ' + minutes + ' 分钟：想收货就点「转」按公允价买现货，到期后只能现金结算。'
+    }
+  }
+
   function limitsOf (view) {
     const limits = view?.limits ?? {}
     const leverages = Array.isArray(limits.leverages) && limits.leverages.length > 0
@@ -524,6 +552,8 @@
     const preview = orderPreview(view, draft)
     const orders = orderRows(view)
     const mode = modeOf(view)
+    const positions = positionRows(view)
+    const expiry = expiryOf(view, stamp)
     return {
       status: statusOf(view),
       title: title({ ...view, now: stamp, slotEnd: end }),
@@ -539,7 +569,10 @@
       capsLine: capsLine(view),
       pendingLine: pendingLine(view),
       quotes: quoteRows(view),
-      positions: positionRows(view),
+      positions,
+      /** 票 109：一次把全部持仓转成现货；只有能交易、且真有持仓时才给按。 */
+      canConvertAll: positions.length > 0 && mode.kind !== 'off' && expiry.at !== null,
+      expiry,
       orders,
       orderCount: orders.length,
       deliveryLine: deliveryLine(view),
@@ -569,6 +602,7 @@
     formatClock,
     countdown,
     slotEndOf,
+    expiryOf,
     limitsOf,
     header,
     quoteRows,

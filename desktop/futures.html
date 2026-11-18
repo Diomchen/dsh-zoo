@@ -151,6 +151,10 @@
     padding: 1px 5px; cursor: pointer; font: inherit; font-size: 11px;
   }
   .close-btn + .close-btn { margin-left: 4px; }
+  /* 票 109：交割前提醒——持仓表头下面一条，红字只在收盘前 30 分钟出现。 */
+  .expiry-hint { padding: 4px 10px; font-size: 11px; color: var(--danger); border-bottom: 1px solid var(--soft); }
+  .bulk-btn { float: right; margin-left: 8px; font-size: 11px; }
+  .bulk-btn:disabled { opacity: .45; cursor: default; }
   .limit { margin-top: 6px; font-variant-numeric: tabular-nums; }
   .limit .lbl { color: var(--muted); font-size: 12px; }
   .limit .hint { color: var(--danger); font-size: 12px; }
@@ -249,7 +253,8 @@
 
   <div class="bottom">
     <section>
-      <h2>持仓</h2>
+      <h2>持仓<button class="close-btn bulk-btn" id="convertAll" type="button" title="把全部持仓按公允价转成现货（到期后只能现金结算）">全部转</button></h2>
+      <div class="expiry-hint" id="expiryHint" hidden></div>
       <div class="scroll">
         <table>
           <thead><tr><th>合约</th><th>方向</th><th>张</th><th>入场</th><th>保证金</th><th>强平</th><th>浮盈亏</th><th></th></tr></thead>

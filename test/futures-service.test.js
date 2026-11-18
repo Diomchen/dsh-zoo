@@ -240,3 +240,53 @@ test('拒绝路径：坏参数、余额不够、周末休市都说人话，账�
   assert.equal(closed.body.error, 'market-closed')
   assert.equal((await state(service)).futures.quotes.tomato, undefined, '周末行情也应该是空的')
 })
+
+test('票 109：一次把多笔持仓转成现货，转不动的那笔单独跳过', async (t) => {
+  const { service } = await makeService(t, { farmCoins: 5000 })
+  await act(service, { action: 'futures-deposit', coins: 2000 })
+  const first = await act(service, {
+    action: 'futures-open', cropId: 'tomato', side: 'long', margin: 100, leverage: 20
+  })
+  assert.equal(first.body.ok, true, JSON.stringify(first.body))
+  const second = await act(service, {
+    action: 'futures-open', cropId: 'rice', side: 'long', margin: 100, leverage: 20
+  })
+  assert.equal(second.body.ok, true, JSON.stringify(second.body))
+
+  const before = await state(service)
+  assert.equal(before.futures.positions.length, 2)
+  const coinsBefore = before.farm.coins
+
+  // 一笔真转（1 张），一笔拿不存在的 id 来凑数：前者成、后者算失败，整体仍算成功。
+  const batch = await act(service, {
+    action: 'futures-convert-all',
+    positions: [
+      { id: first.body.position.id, lots: 1 },
+      { id: '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60', lots: 1 }
+    ]
+  })
+  assert.equal(batch.body.ok, true, JSON.stringify(batch.body))
+  assert.equal(batch.body.converted, 1)
+  assert.equal(batch.body.failed, 1)
+
+  const after = await state(service)
+  const remaining = after.futures.positions.find((row) => row.id === first.body.position.id)
+  assert.ok(remaining, '只转 1 张，那笔持仓还在，只是少了一张')
+  assert.equal(remaining.lots, first.body.position.lots - 1)
+  assert.ok(after.futures.positions.some((row) => row.id === second.body.position.id), '没点名的那笔不动')
+  assert.ok(after.futures.balance < before.futures.balance, '按公允价买现货，余额是往下走的')
+
+  // 一笔都转不动：整体 ok:false，给一句人话，账本不动。
+  const nothing = await act(service, {
+    action: 'futures-convert-all',
+    positions: [{ id: second.body.position.id, lots: 100000 }]
+  })
+  assert.equal(nothing.body.ok, false)
+  assert.equal(typeof nothing.body.notice, 'string')
+  assert.equal((await state(service)).futures.positions.length, 2)
+  assert.equal((await state(service)).farm.crops.tomato.qty, after.farm.crops.tomato.qty)
+
+  const empty = await act(service, { action: 'futures-convert-all', positions: [] })
+  assert.equal(empty.body.ok, false)
+  assert.equal(empty.body.error, 'bad-positions')
+})

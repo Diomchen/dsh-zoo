@@ -11,6 +11,17 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.11.0 版本记录
+
+GitHub Release 正文就是 [`releases/1.11.0.md`](releases/1.11.0.md)。
+
+交割说清楚 + 「全部转」：交割仍然只有现金一种（四根收盘均价结清、交割费 0.1%），
+但窗口在收盘前 30 分钟会亮红字提醒「想收货就点转」，持仓表头右侧多了「全部转」按钮，
+一次把整批持仓按公允价买成现货；逐笔算钱、逐笔跳过转不动的（余额不够或仓库放不下），
+一笔都没转成才报错。新增本地动作 `futures-convert-all`（≤8 条 `{id, lots}`），
+peer 侧拆成逐笔 `futures-convert`，协议报文没变。视图多 `expiry` / `canConvertAll` 两个字段。
+测试：1214 用例 / 1213 通过 / 1 跳过 / 0 失败。
+
 ## 1.10.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.10.0.md`](releases/1.10.0.md)。
