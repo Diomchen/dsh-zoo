@@ -1106,6 +1106,11 @@ function buildPacket ({
   // 票 98：settle 里附带的灰度模式与待提取余额
   mode,
   pending,
+  // 1.12.4：做市商净盈亏（可以为负）
+  house,
+  // 1.12.0：账户自己的暂停（futures-pause）与档位（futures-mode）
+  paused,
+  accountMode,
   lastSeq,
   caps,
   purpose,
@@ -1417,6 +1422,16 @@ function buildPacket ({
   } else if (type === 'futures-hello') {
     // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，at 会在这里消失。
     packet = { ...base, at: futuresStamp(at, now) }
+  } else if (type === 'futures-pause') {
+    // 1.12.0：账户自己按的暂停。漏了这条分支会掉进 beacon 那条，报「invalid port」。
+    const stamp = futuresStamp(at, now)
+    if (typeof paused !== 'boolean') throw new Error('protocol: invalid futures paused')
+    packet = { ...base, at: stamp, paused }
+  } else if (type === 'futures-mode') {
+    // 1.10.0：账户自己的档位申报。
+    const stamp = futuresStamp(at, now)
+    if (!isFuturesAccountMode(accountMode)) throw new Error('protocol: invalid futures account mode')
+    packet = { ...base, at: stamp, accountMode }
   } else if (type === 'futures-order') {
     // 只带「做什么」。成交价、保证金、余额一律不上线：房主算，peer 信不信由它。
     const stamp = futuresStamp(at, now)
@@ -1492,6 +1507,18 @@ function buildPacket ({
     if (safeMode === null) throw new Error('protocol: invalid futures mode')
     const safePending = pending === undefined ? 0 : normalizeFuturesCoin(pending)
     if (safePending === null) throw new Error('protocol: invalid futures pending')
+    // 1.12.4：做市商净盈亏（有限数，可以为负）。
+    const safeHouse = house === undefined ? 0 : house
+    if (typeof safeHouse !== 'number' || !Number.isFinite(safeHouse)) {
+      throw new Error('protocol: invalid futures house')
+    }
+    // 1.12.0：账户档位与暂停都是可选字段（老房主不发 = 沿用本地）。
+    const safeAccountMode = accountMode === undefined || accountMode === null
+      ? null
+      : (isFuturesAccountMode(accountMode) ? accountMode : undefined)
+    if (safeAccountMode === undefined) throw new Error('protocol: invalid futures account mode')
+    const safePaused = paused === undefined ? false : paused
+    if (typeof safePaused !== 'boolean') throw new Error('protocol: invalid futures paused')
     packet = {
       ...base,
       at: stamp,
@@ -1505,9 +1532,12 @@ function buildPacket ({
       trades: safeTrades,
       insurance: safeInsurance,
       shortfall: safeShortfall,
+      house: safeHouse,
       mode: safeMode,
       pending: safePending
     }
+    if (safeAccountMode !== null) packet.accountMode = safeAccountMode
+    if (safePaused === true) packet.paused = true
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
     const stamp = futuresStamp(at, now)

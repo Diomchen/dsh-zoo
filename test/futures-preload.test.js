@@ -130,3 +130,36 @@ test('暂停与切档只带一个布尔/枚举，别的一律不过桥', () => {
   assert.equal(api.submit({ action: 'futures-account-mode', accountMode: 'live', balance: 1 }), true)
   assert.deepEqual(plain(sent[1].payload), { action: 'futures-account-mode', accountMode: 'live' })
 })
+
+/**
+ * 四跳白名单的最后一跳（1.12.5）
+ *
+ * 窗口里的一个字段要过四道门才到 store：`futures-preload.js` 的 FIELDS →
+ * `desktop/shared.js` 的 `normalizeFuturesAction` → `desktop/main.js` 的
+ * `dsh-zoo:futures-submit` → `src/service.js` 里 `handleDesktopAction` 的显式拷贝。
+ * 最后这一跳从 1.9 起就没抄 `coins`/`price`/`lots`/`mode`，于是窗口里点「充值」
+ * 到宿主只剩一句「金额不对」、点「切到纸面」只剩一句「未知的账户档位。」
+ * ——测试全走 `service.action`（HTTP 同形），漏了这一跳也没人发现。
+ * 这里直接对源码做一次对账：preload 放行的每个字段，宿主都必须显式接住。
+ */
+test('preload 放行的每个字段，宿主那一跳都要显式接住（否则报错跟按钮毫无关系）', () => {
+  const preload = readFileSync(path.join(ROOT, 'desktop', 'futures-preload.js'), 'utf8')
+  const service = readFileSync(path.join(ROOT, 'src', 'service.js'), 'utf8')
+  const fields = new Set()
+  for (const line of preload.split('\n')) {
+    const match = /^\s*'futures-[a-z-]+':\s*\[([^\]]*)\]/.exec(line)
+    if (match === null) continue
+    for (const raw of match[1].split(',')) {
+      const name = raw.trim().replace(/^'|'$/g, '')
+      if (name !== '') fields.add(name)
+    }
+  }
+  assert.ok(fields.size >= 10, 'preload 的字段表应该解析出一批字段，实际 ' + fields.size)
+  const missing = []
+  for (const field of fields) {
+    const copied = new RegExp('\\b' + field + ':\\s*event\\.' + field + '\\b').test(service) ||
+      new RegExp('Array\\.isArray\\(event\\.' + field + '\\)').test(service)
+    if (!copied) missing.push(field)
+  }
+  assert.deepEqual(missing, [], '这些字段在 handleDesktopAction 那一跳被丢了：' + missing.join('、'))
+})

@@ -213,11 +213,15 @@ test('票 94：peer 报到后房主回一份 settle，窗口认出 role=peer 与
 })
 
 test('1.12.4：房主自己那本账的档位不再画成 peer 的「影子模式」', async (t) => {
-  const { a, b } = await connectedPair(t)
+  const { a, b, aId } = await connectedPair(t)
   await waitFor(() => a.futuresWindow().peer.ready === true)
 
-  // peer 自己选真钱：窗口上就该是真钱，合约该是「交易中」，而不是「影子模式」。
+  // peer 自己选真钱：房主那本账上必须真的记成 live（1.12.5 之前这条报文根本编不出来，
+  // 掉进 beacon 分支抛 「invalid port」，于是点了没反应、房主永远当你是纸面）。
   await callAction(a, { action: 'futures-account-mode', accountMode: 'live' })
+  await waitFor(() => b.futuresAccountOf(aId).accountMode === 'live')
+  assert.equal(b.futuresAccountOf(aId).accountMode, 'live', '房主要收到 peer 的档位申报')
+
   await waitFor(() => a.futuresWindow().accountMode === 'live')
   const peer = a.futuresWindow()
   assert.equal(peer.accountMode, 'live')
