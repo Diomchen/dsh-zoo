@@ -51,6 +51,17 @@ const chartEl = document.getElementById('chart')
 const chartEmptyEl = document.getElementById('chart-empty')
 const chartSettleHintEl = document.getElementById('chart-settle-hint')
 const slotNoteEl = document.getElementById('slot-note')
+const tickerEl = document.getElementById('ticker')
+const tickerTextEl = document.getElementById('ticker-text')
+const tickerFlowEl = document.getElementById('ticker-flow')
+const newsPopEl = document.getElementById('news-pop')
+const newsPopTimeEl = document.getElementById('news-pop-time')
+const newsPopTitleEl = document.getElementById('news-pop-title')
+const newsPopBodyEl = document.getElementById('news-pop-body')
+const newsPopSourceEl = document.getElementById('news-pop-source')
+const newsPopImpactEl = document.getElementById('news-pop-impact')
+const newsPopCalendarEl = document.getElementById('news-pop-calendar')
+const newsPopCloseEl = document.getElementById('news-pop-close')
 const displayToggleEl = document.getElementById('display-toggle')
 const displayPopEl = document.getElementById('display-pop')
 const chartTypeOptionsEl = document.getElementById('chart-type-options')
@@ -58,7 +69,10 @@ const themeOptionsEl = document.getElementById('theme-options')
 const sideRowEl = document.getElementById('side-row')
 const marginRowEl = document.getElementById('margin-row')
 const leverageRowEl = document.getElementById('leverage-row')
+const leverageQuipEl = document.getElementById('leverage-quip')
+const leverageQuipCloseEl = document.getElementById('leverage-quip-close')
 const previewEl = document.getElementById('preview')
+const feeNoteEl = document.getElementById('fee-note')
 const liquidationEl = document.getElementById('order-liquidation')
 const submitEl = document.getElementById('submit')
 const orderHintEl = document.getElementById('order-hint')
@@ -94,7 +108,7 @@ const RESULT_CODE_TEXT = {
   'bad-crop': '这种作物暂时没有盘口。',
   'bad-side': '方向只有做多和做空。',
   'bad-margin': '保证金要是 1 到 1,000,000 之间的整数硬币。',
-  'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20×）。',
+  'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20× / 50× / 100×）。',
   'bad-target': '目标价超出这张图的价格范围，换一个价再挂。',
   'no-order': '这张挂单已经成交或撤掉了，刷新一下就好。',
   'no-coin': '硬币不够，先去种地或卖点作物。',
@@ -139,6 +153,9 @@ let chartsFailed = null
 let side = 'long'
 let margin = 50
 let leverage = 1
+let lastLeverage = null
+let leverageQuipRequested = false
+let leverageQuipTimer = null
 let crop = null
 /** 票 84：选中的 K 线周期（只活在窗口里；切换不发 IPC，也不影响结算）。 */
 let timeframe = '15m'
@@ -165,6 +182,12 @@ let barEnd = 0
 let refreshAsked = false
 /** 第一次收到数据时把焦点放到第一个控件上（窗口刚弹出，键盘就能用）。 */
 let focusedOnce = false
+
+/** 便签/消息卡里的长标题按码点截断；SVG text 不会自动省略。 */
+function clipText (value, max) {
+  const chars = Array.from(String(value ?? ''))
+  return chars.length <= max ? chars.join('') : chars.slice(0, max - 1).join('') + '…'
+}
 
 function setTone (element, tone) {
   element.dataset.tone = tone
@@ -300,6 +323,68 @@ function paintCrosshair (hit) {
     group.append(svgText(row.label, { class: 'crosshair-label', x, y }))
     group.append(svgText(row.text, { class: 'crosshair-value', x: x + 14, y }))
   }
+  if (Array.isArray(card.newsRows) && card.newsRows.length > 0) {
+    const ruleY = card.top + 66
+    group.append(svgEl('line', {
+      class: 'crosshair-rule',
+      x1: card.left + 9,
+      x2: card.left + card.width - 9,
+      y1: ruleY,
+      y2: ruleY
+    }))
+    for (let index = 0; index < card.newsRows.length; index += 1) {
+      const row = card.newsRows[index]
+      const y = card.newsTop + index * card.newsLineHeight
+      group.append(svgText(row.icon, {
+        class: 'crosshair-news-icon ' + row.tone,
+        x: card.left + 9,
+        y
+      }))
+      group.append(svgText(clipText(row.text, 24), {
+        class: 'crosshair-news-text',
+        x: card.left + 20,
+        y
+      }))
+    }
+    if (card.newsMore) {
+      group.append(svgText(clipText(card.newsMore, 24), {
+        class: 'crosshair-news-more',
+        x: card.left + 20,
+        y: card.newsTop + card.newsRows.length * card.newsLineHeight + 4
+      }))
+    }
+  }
+  if (Array.isArray(card.flowRows) && card.flowRows.length > 0) {
+    const ruleY = card.flowTop - 9
+    group.append(svgEl('line', {
+      class: 'crosshair-rule',
+      x1: card.left + 9,
+      x2: card.left + card.width - 9,
+      y1: ruleY,
+      y2: ruleY
+    }))
+    for (let index = 0; index < card.flowRows.length; index += 1) {
+      const row = card.flowRows[index]
+      const y = card.flowTop + index * card.newsLineHeight
+      group.append(svgText(row.icon, {
+        class: 'crosshair-flow-icon ' + row.tone,
+        x: card.left + 9,
+        y
+      }))
+      group.append(svgText(clipText(row.text, 24), {
+        class: 'crosshair-flow-text',
+        x: card.left + 20,
+        y
+      }))
+    }
+    if (card.flowMore) {
+      group.append(svgText(clipText(card.flowMore, 24), {
+        class: 'crosshair-flow-more',
+        x: card.left + 20,
+        y: card.flowTop + card.flowRows.length * card.newsLineHeight + 4
+      }))
+    }
+  }
   chartEl.append(group)
 }
 
@@ -360,6 +445,22 @@ function renderChart (board) {
   windEl.setAttribute('aria-label', '风向 ' + hint.label + ' ' + hint.confidenceText + '，' + hint.note)
   setTone(windEl, hint.tone)
   slotNoteEl.textContent = chart.slotText
+  // 票 106：快讯条只画 view 给的文本；没有消息时写「今日暂无消息」。
+  const ticker = chart.ticker
+  tickerEl.dataset.tone = ticker.tone
+  tickerEl.dataset.hasNews = ticker.hasNews ? 'true' : 'false'
+  tickerTextEl.textContent = ticker.text
+  tickerFlowEl.textContent = ticker.flowText ?? ''
+  tickerFlowEl.hidden = !(ticker.flowText)
+  tickerFlowEl.dataset.tone = ticker.flowTone ?? 'flat'
+  if (ticker.flowText && ticker.whaleCount > 0) {
+    const whale = document.createElement('span')
+    whale.className = 'ticker-whale'
+    whale.textContent = '鲸 ' + ticker.whaleCount
+    tickerFlowEl.append(whale)
+  }
+  tickerEl.title = ticker.text + (ticker.flowText ? ' · ' + ticker.flowText : '')
+  tickerEl.setAttribute('aria-label', '快讯：' + ticker.text)
   // 票 89：没有独立的图例行；底价/入场/强平在图的右端各有标签，少一行小字。
   updateCropArrows()
   ensureCropVisible()
@@ -622,6 +723,61 @@ function renderChart (board) {
       transform: 'rotate(-1.4 ' + (tag.x + tag.width / 2) + ' ' + tag.centerY + ')'
     }))
   }
+  // 票 106：消息标记画在清晰层的最上面；小圆点 + 大事件的方向箭头。
+  if (Array.isArray(geometry.newsMarks) && geometry.newsMarks.length > 0) {
+    const newsLayer = svgEl('g', { class: 'chart-news' })
+    for (const mark of geometry.newsMarks) {
+      newsLayer.append(svgEl('circle', {
+        class: 'news-dot ' + mark.tone,
+        cx: mark.x,
+        cy: mark.y,
+        r: mark.rarity >= 2 ? 3.4 : 2.4,
+        'vector-effect': 'non-scaling-stroke'
+      }))
+      if (mark.rarity >= 2 || mark.tone === 'vol') {
+        newsLayer.append(svgEl('circle', {
+          class: 'news-ring ' + mark.tone,
+          cx: mark.x,
+          cy: mark.y,
+          r: mark.rarity >= 3 ? 5.2 : 4.4,
+          'vector-effect': 'non-scaling-stroke'
+        }))
+      }
+    }
+    crisp.append(newsLayer)
+  }
+  if (Array.isArray(geometry.flowMarks) && geometry.flowMarks.length > 0) {
+    const flowLayer = svgEl('g', { class: 'chart-flow' })
+    for (const mark of geometry.flowMarks) {
+      if (Number.isFinite(mark.stemTop)) {
+        flowLayer.append(svgEl('line', {
+          class: 'flow-stem ' + mark.tone,
+          x1: mark.x,
+          x2: mark.x,
+          y1: mark.stemTop,
+          y2: mark.y - (mark.whale ? 4 : 3),
+          'vector-effect': 'non-scaling-stroke'
+        }))
+      }
+      flowLayer.append(svgEl('circle', {
+        class: 'flow-dot ' + mark.tone,
+        cx: mark.x,
+        cy: mark.y,
+        r: mark.whale ? 3.4 : 2.6,
+        'vector-effect': 'non-scaling-stroke'
+      }))
+      if (mark.whale) {
+        flowLayer.append(svgEl('circle', {
+          class: 'flow-ring ' + mark.tone,
+          cx: mark.x,
+          cy: mark.y,
+          r: 5.2,
+          'vector-effect': 'non-scaling-stroke'
+        }))
+      }
+    }
+    crisp.append(flowLayer)
+  }
   ink.append(ticksInk)
   chartEl.append(crisp)
 
@@ -629,6 +785,44 @@ function renderChart (board) {
   if (chartPointer !== null) {
     paintCrosshair(view.crosshairAt(geometry, chartPointer.x, chartPointer.y))
   }
+}
+
+/**
+ * 票 106：消息详情卡。数据全部来自纯视图（标题/正文/来源/影响/今日日程）；
+ * 这里只负责填 DOM 与显隐，不自己拼文案、不自己算影响。
+ */
+function hideNewsDetail () {
+  if (newsPopEl === null) return
+  newsPopEl.hidden = true
+}
+
+function showNewsDetail (id) {
+  if (lastBoard === null || newsPopEl === null) return
+  const detail = view.newsDetailView(lastBoard, id)
+  if (detail === null) {
+    hideNewsDetail()
+    return
+  }
+  newsPopTimeEl.textContent = detail.timeText + (detail.cropName === '' ? '' : ' · ' + detail.cropName)
+  newsPopTitleEl.textContent = detail.title
+  newsPopBodyEl.textContent = detail.body === '' ? '这条消息没有更多正文。' : detail.body
+  newsPopSourceEl.textContent = detail.source === '' ? '来源未注明' : detail.source
+  newsPopImpactEl.textContent = detail.magText
+  const calendar = view.calendarView(lastBoard, Date.now()).slice(0, 5)
+  newsPopCalendarEl.textContent = ''
+  for (const row of calendar) {
+    const item = document.createElement('li')
+    const left = document.createElement('span')
+    left.textContent = row.text
+    const right = document.createElement('span')
+    right.textContent = row.countdown
+    item.append(left, right)
+    newsPopCalendarEl.append(item)
+  }
+  const calendarBox = newsPopCalendarEl.parentElement
+  if (calendarBox !== null) calendarBox.hidden = calendar.length === 0
+  newsPopEl.hidden = false
+  newsPopCloseEl.focus({ preventScroll: true })
 }
 
 /** 最近一次渲染出来的 board view：点击挂单时拿 view 算好的 target/band，不再自己解析一遍。 */
@@ -661,22 +855,48 @@ function renderOrder (board) {
     button.title = choice.disabled ? (choice.disabledReason ?? '') : ''
     marginRowEl.append(button)
   }
-  leverageRowEl.textContent = ''
-  for (const choice of order.leverages) {
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'chip'
-    button.dataset.leverage = String(choice.leverage)
+  // 票 107 扩展：杠杆档位驱动整窗边框特效；只写 data-*，样式在 CSS 里。
+  const leverageTier = view.leverageTierOf(order.leverage)
+  document.body.dataset.leverageTier = leverageTier
+  document.body.dataset.leverage = String(order.leverage)
+  const enteredExtreme = order.leverage >= 100 &&
+    (lastLeverage !== 100 || leverageQuipRequested)
+  if (enteredExtreme) {
+    showLeverageQuip()
+  } else if (order.leverage < 100) {
+    hideLeverageQuip()
+  }
+  lastLeverage = order.leverage
+  leverageQuipRequested = false
+  // 杠杆按钮不每秒重建：边框动效要靠「选中态变化」触发，重建会把动画每秒重置一次。
+  // 只有白名单本身变了（老宿主 → 新宿主）才换 DOM。
+  const existingLeverageButtons = Array.from(leverageRowEl.querySelectorAll('[data-leverage]'))
+  const sameLeverages = existingLeverageButtons.length === order.leverages.length &&
+    existingLeverageButtons.every((button, index) =>
+      button.dataset.leverage === String(order.leverages[index].leverage))
+  let leverageButtons = existingLeverageButtons
+  if (!sameLeverages) {
+    leverageRowEl.textContent = ''
+    leverageButtons = order.leverages.map((choice) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'chip'
+      button.dataset.leverage = String(choice.leverage)
+      leverageRowEl.append(button)
+      return button
+    })
+  }
+  for (let index = 0; index < order.leverages.length; index += 1) {
+    const choice = order.leverages[index]
+    const button = leverageButtons[index]
+    if (button === undefined) continue
     button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
     button.textContent = choice.label
-    leverageRowEl.append(button)
+    button.title = choice.title ?? ('杠杆 ' + choice.leverage + '×')
   }
-  // 票 101：手续费写在杠杆旁边——下单当场就要看见，不能等结算才知道。
-  const feeNote = document.createElement('span')
-  feeNote.className = 'chip-note'
-  feeNote.textContent = order.feeText
-  feeNote.title = '开仓和平仓各收名义价值（保证金 × 杠杆）的 0.2%，结算时一次扣清。'
-  leverageRowEl.append(feeNote)
+  // 票 101/2026-11-18：手续费挪到第二行——四档杠杆（含 100×）需要整条 chip 的宽度。
+  feeNoteEl.textContent = order.feeText
+  feeNoteEl.title = '开仓和平仓各收名义价值（保证金 × 杠杆）的 0.2%，结算时一次扣清。'
   // 票 91：横条第二行只放「涨 1% +0.5 · 跌 1% −0.5 · 强平价 —」这一句；
   // 完整预览句（带杠杆/保证金）仍在 `order.preview` 里，给旧调用方和测试。
   previewEl.textContent = order.previewShort
@@ -895,6 +1115,13 @@ function renderLeague (board) {
   }
   // 票 89：卡片头只留「情绪 观望」；「1 人」这种计数不再挤在标题行。
   sentimentEl.textContent = league.sentiment.text
+  if (league.sentiment.flowText) {
+    const flowNote = document.createElement('span')
+    flowNote.className = 'sentiment-flow'
+    flowNote.textContent = league.sentiment.flowText
+    flowNote.dataset.tone = league.sentiment.flowTone ?? 'flat'
+    sentimentEl.append(flowNote)
+  }
   sentimentEl.dataset.tone = league.sentiment.tone
   // 只有自己：榜照画（自己那行），下面补一句「等邻居上线」。
   neighborEmptyEl.hidden = league.hasPeers
@@ -955,6 +1182,7 @@ function focusElementOf (key) {
   if (key === 'submit') return submitEl
   if (key === 'close-button') return closeButton
   if (key === 'display-toggle') return displayToggleEl
+  if (key === 'ticker') return tickerEl
   if (key === 'crop-prev') return cropPrevEl
   if (key === 'crop-next') return cropNextEl
   if (key === 'limit-toggle') return limitToggleEl
@@ -1155,6 +1383,30 @@ function tick () {
   submitAction({ action: 'trading-refresh' })
 }
 
+/**
+ * 100× 的漫画气泡（2026-11-18）：只在「切到 100×」或用户再次点 100× 时弹，
+ * 6.5 秒自动收；× / Esc 也能关。解除 hidden 前强制一次 reflow，让 pop 动画重新播。
+ */
+function hideLeverageQuip () {
+  if (leverageQuipTimer !== null) {
+    clearTimeout(leverageQuipTimer)
+    leverageQuipTimer = null
+  }
+  if (leverageQuipEl !== null) leverageQuipEl.hidden = true
+}
+
+function showLeverageQuip () {
+  if (leverageQuipEl === null) return
+  if (leverageQuipTimer !== null) clearTimeout(leverageQuipTimer)
+  leverageQuipEl.hidden = true
+  void leverageQuipEl.offsetWidth
+  leverageQuipEl.hidden = false
+  leverageQuipTimer = setTimeout(() => {
+    leverageQuipTimer = null
+    leverageQuipEl.hidden = true
+  }, 8000)
+}
+
 function showToast (text, kind = 'info') {
   const item = document.createElement('div')
   item.className = 'toast' + (kind === 'error' ? ' error' : '')
@@ -1193,11 +1445,38 @@ chartEl.addEventListener('pointerleave', () => {
   paintCrosshair(null)
 })
 
+// 票 106：点有消息的 K 线打开详情卡；没有消息就什么都不做（不挡原来的十字线）。
+chartEl.addEventListener('click', (event) => {
+  if (chartGeometry === null) return
+  const point = chartPointOf(event)
+  if (point === null) return
+  const hit = view.crosshairAt(chartGeometry, point.x, point.y)
+  if (hit === null || !Array.isArray(hit.newsRows) || hit.newsRows.length === 0) return
+  showNewsDetail(hit.newsRows[0].id)
+  // 别让同一次点击冒泡到「外点关闭」——否则详情卡刚开就被自己关掉。
+  event.stopPropagation()
+})
+
+tickerEl.addEventListener('click', (event) => {
+  event.stopPropagation()
+  if (lastBoard === null) return
+  const id = lastBoard.chart !== null && lastBoard.chart !== undefined &&
+    lastBoard.chart.ticker !== null && lastBoard.chart.ticker !== undefined
+    ? lastBoard.chart.ticker.id
+    : null
+  if (typeof id === 'string' && id !== '') showNewsDetail(id)
+})
+
+newsPopCloseEl.addEventListener('click', () => {
+  hideNewsDetail()
+})
+
 cropTabsEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-crop]')
   if (button === null || button.dataset.crop === '') return
   if (button.dataset.crop !== crop) chartsFailed = null
   crop = button.dataset.crop
+  hideNewsDetail()
   ensureCharts()
   render()
 })
@@ -1276,6 +1555,8 @@ leverageRowEl.addEventListener('click', (event) => {
   if (button === null || button.disabled) return
   const chosen = Number(button.dataset.leverage)
   if (Number.isFinite(chosen)) leverage = chosen
+  // 已经选中 100× 时再点一次也重新弹气泡；每秒的被动重画不会触发。
+  if (chosen === 100) leverageQuipRequested = true
   render()
 })
 
@@ -1386,9 +1667,22 @@ positionsEl.addEventListener('click', (event) => {
 closeButton.addEventListener('click', () => api?.close())
 
 // 票 91：Esc 先收弹层（显示 → 到价），都没有才关窗；旧行为（Esc 关窗）保留在最后一步。
+leverageQuipCloseEl?.addEventListener('click', (event) => {
+  event.stopPropagation()
+  hideLeverageQuip()
+})
+
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     event.preventDefault()
+    if (!newsPopEl.hidden) {
+      hideNewsDetail()
+      return
+    }
+    if (leverageQuipEl !== null && !leverageQuipEl.hidden) {
+      hideLeverageQuip()
+      return
+    }
     if (displayOpen) {
       displayOpen = false
       render()
@@ -1423,6 +1717,10 @@ document.addEventListener('keydown', (event) => {
 // 动作，再收弹层——否则第一次点外面会被“重画”吃掉，看起来像点不动。
 document.addEventListener('click', (event) => {
   const target = event.target
+  if (!newsPopEl.hidden && !newsPopEl.contains(target) && !tickerEl.contains(target) && target !== tickerEl) {
+    hideNewsDetail()
+    return
+  }
   if (displayOpen && !displayPopEl.contains(target) && !displayToggleEl.contains(target)) {
     displayOpen = false
     render()
@@ -1471,7 +1769,12 @@ api?.onResult((result) => {
     const cropId = typeof result.crop === 'string' ? result.crop : null
     if (result.ok === true && cropId !== null &&
       result.timeframes !== null && typeof result.timeframes === 'object') {
-      chartCache.set(cropId, { timeframes: result.timeframes, hint: result.hint ?? null })
+      chartCache.set(cropId, {
+        timeframes: result.timeframes,
+        hint: result.hint ?? null,
+        news: result.news ?? null,
+        flow: result.flow ?? null
+      })
       chartsFailed = null
     } else {
       // 这一种拉不到（坏作物/超时）：先退出加载态，别让风扇一直转；用户再点一下可以重试。

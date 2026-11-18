@@ -30,10 +30,14 @@
 规格见 [SPEC v11](.scratch/dsh-zoo/SPEC-v11.md)；票 92–99 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。盘口与期货是两层：盘口对着机器，期货对着人。
 
+「盘口行情 v5 / 消息面 / LAN 真人流」的决策见 [ADR-0038](docs/adr/0038-board-v5-news-and-lan-flow.md)，
+规格见 [SPEC v12](.scratch/dsh-zoo/SPEC-v12.md)；票 103–108 在
+[`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。A 期是行情 v5 + 消息面，B 期接 LAN 真人资金流（票 107）。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
 农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
 
-盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
+盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment` / `news` / `ticker` / `calendar`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`、`payload.news`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪 / 消息面 / 快讯条 / 日程 / 资金流 / 冲击 / 资金流带”同义。
 
 期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode` / `paused`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位 / 暂停”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
@@ -347,7 +351,7 @@ _Avoid_: 删除, 拔掉, delete, remove
 
 **盘口 (Board)**：
 一层独立于现货交易所的 15 分钟合约市场：做多/做空，用农场硬币下注，收盘结算。
-它不是订单簿，也不交割作物；行情由确定性种子算出，没人交易也照走。
+它不是订单簿，也不交割作物；行情由 v5 确定性底盘 + 每日消息面 + LAN 真人资金流算出，没人交易也照走。
 窗口约 760×700，从桌面右键「盘口」或农场窗的「盘口」按钮打开。
 _Avoid_: 交易所, 市场, exchange, market, 订单簿
 
@@ -359,7 +363,7 @@ _Avoid_: 期货, 现货, futures, spot
 
 **一根 (Bar)**：
 15 分钟一根的 K 线 = 1 个 slot；一根里有 15 个 1 分钟 **tick**。收盘价就是结算价，
-`slot + 作物 + 版本盐` 相同就在所有机器上得到同一张图。
+`slot + 作物 + 版本盐` 相同就在所有机器上得到同一张图；消息在公布分钟一次性跳价。
 _Avoid_: 周期, 蜡烛, candle, period
 
 **保证金 (Margin)**：
@@ -369,13 +373,16 @@ _Avoid_: 周期, 蜡烛, candle, period
 _Avoid_: 本金, 押金, 仓位价值, deposit, stake
 
 **杠杆 (Leverage)**：
-保证金的放大倍数，只有 1× / 5× / 20×。盈亏 = 保证金 × 杠杆 × 价格变化；
-杠杆越高，强平线离入场价越近。
+保证金的放大倍数，只有 1× / 5× / 20× / 50× / 100×。盈亏 = 保证金 × 杠杆 × 价格变化；
+杠杆越高，强平线离入场价越近。选中的杠杆 chip 边框按档位给出不同的风险提示
+（1× 安静 / 5× 青风双环 / 20× 琥珀脉冲 / 50× 紫电双环 / 100× 彩虹旋转 + 放射速度线 + 心跳发光；
+切到 100× 会弹漫画气泡「老实赚钱，很枯燥吧。」，8 秒自动收，也可 × / Esc 关），
+它只影响外观，不改变定价、强平线或手续费。
 _Avoid_: 倍数, 倍率, multiplier, x
 
 **强平 (Liquidation)**：
 保证金亏完时系统自动平仓：做多 `现价 ≤ 入场 × (1 − 1/杠杆)`，做空相反；1× 没有强平线。
-强平只亏保证金、不欠钱；20× 的插针可能一把清空硬币。
+强平只亏保证金、不欠钱；50×/100× 的插针（约 1.9%/0.95% 逆行）就可能一把清空硬币。
 _Avoid_: 爆仓, 清算, 平仓, margin call
 
 **止损 (Stop Loss)**：
@@ -404,6 +411,44 @@ _Avoid_: 预测, 信号, 指标, signal, forecast
 到价挂单的目标价也必须落在这个带里，否则永远不会成交。
 _Avoid_: 基准价, 现价, base price (作为同义词时)
 
+**消息面 (News)**：
+盘口的确定性事件表：每个作物每天 4–6 条、全市场 2–3 条，另有每天 5 个固定日程。
+每条事件有公布时刻、方向、幅度、标题/正文/来源；公布瞬间一次性跳价，之后按 72 小时半衰期
+缓慢淡去。文本只用于展示，价格只认事件里的 `jump`/`storm`。
+_Avoid_: 新闻, 资讯, 事件流, feed, news feed
+
+**关键 K (Key Bar)**：
+有头条/黑天鹅/传闻，或 `|收盘/开盘 − 1| ≥ 4%`、近 24 根涨跌幅排前 3 的一根 K 线；
+上面画小旗，hover 便签多出「消息面」两行，点开是消息详情。
+_Avoid_: 重点 K, 信号 K, signal bar
+
+**资金流 (Flow)**：
+盘口里的真人开/平/止损/强平/到价成交事件；500 名义 ≈ 0.30%，按 2 小时半衰期淡去。
+单笔 ≤0.6%、单设备单根 ≤1.2%/日 ≤4%、每作物水平 ≤1.5%；P2P 事件带传播，没有房主。
+成交价含一半自身冲击，往返净冲击 ≈0；它不是 LAN 情绪，也不是成交量。
+_Avoid_: 成交量, 资金量, 情绪, 流入流出 (作为同义词时)
+
+**冲击 (Impact)**：
+一条资金流事件对对数价格的推动 `u`；公开价按 `exp(u)` 跳，成交价只取一半。
+_Avoid_: 滑点 (作为同义词时), 涨跌幅, 推动力
+
+**资金流水平 (Flow Level)**：
+所有未过期资金流事件按半衰期衰减后的和，夹在 ±1.5%；和消息面叠加后合计夹在 ±6%。
+_Avoid_: 资金流, 净流入, flow
+
+**资金流同步 (Flow Sync)**：
+`board-flow-sync` 请求 + `board-flow`（`sync:true`）回包；补最近 24 小时，新邻居/重连时发，
+同一邻居 60 秒最多一次，一次最多 64 条。
+_Avoid_: 补单, 重放, replay
+
+**快讯条 (Ticker)**：
+图头下 16px 的一条：最近一条消息 + 影响，点击打开消息详情；没有消息时写「今日暂无消息，行情照走」。
+_Avoid_: 跑马灯, 滚动条, news bar
+
+**消息详情 (News Detail)**：
+盘口窗内的浮层卡：标题、正文、来源、影响、相关作物和今日 5 条日程；外点 / Esc / × 关闭。
+_Avoid_: 弹窗, 新闻页, article
+
 **周榜 (Weekly Leaderboard)**：
 `trading-digest` 收来的真人（本机 + 已放行邻居）本周交易盈亏，按金币降序；没有 NPC。
 每台机器每 30 秒最多发一条，接收端只认 ≤2 分钟新鲜、最多 8 条持仓的报文；
@@ -412,7 +457,7 @@ _Avoid_: 排行榜, 天梯, 赛季榜, ranking, ladder
 
 **LAN 情绪 (LAN Sentiment)**：
 本机 + 邻居当前持仓的多空计数（多 N · 空 M）；一条仓位都没有时写「观望」。
-它只数大家报上来的方向，不做加权，也不影响行情。
+它只数大家报上来的方向，不做加权，也不影响行情；真人资金流是另一条 `flow`，不是情绪加权。
 _Avoid_: 市场情绪, 多空比, 指数, market mood
 
 ## 期货（日合约 · 房主清算）

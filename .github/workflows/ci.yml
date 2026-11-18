@@ -103,13 +103,16 @@ jobs:
               --generate-notes
           fi
 
+  # Trusted Publishing (OIDC)：npm 包设置里把发布来源指到
+  # Diomchen/dsh-zoo 的 .github/workflows/ci.yml，不需要 NPM_TOKEN。
   npm:
-    name: Publish npm
+    name: Publish npm (OIDC)
     if: startsWith(github.ref, 'refs/tags/v')
     needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -117,8 +120,8 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          # npm 11.5.1+ 才支持 Trusted Publishing；Node 24 自带 npm 11。
+          node-version: 24
 
       - name: Check tag matches package.json
         env:
@@ -131,15 +134,10 @@ jobs:
             exit 1
           fi
 
-      - name: Publish to npm
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (OIDC)
         run: |
           set -euo pipefail
-          if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-            echo "::error::NPM_TOKEN 未设置。本地跑：gh secret set NPM_TOKEN --repo $GITHUB_REPOSITORY"
-            exit 1
-          fi
+          npm --version
           version="$(node -p "require('./package.json').version")"
           # tag 可以重推（Release job 支持覆盖），npm 上已有的版本不能再发一次。
           # 判据用「打印出来的版本号正好等于本地版本」，不看退出码：`npm view`
@@ -159,6 +157,5 @@ jobs:
           case "$version" in
             *-*) dist_tag=next ;;
           esac
-          npm whoami
-          npm publish --access public --registry=https://registry.npmjs.org --tag "$dist_tag"
-          echo "::notice::已发布 dsh-zoo@${version}（dist-tag ${dist_tag}）"
+          npm publish --access public --provenance --registry=https://registry.npmjs.org --tag "$dist_tag"
+          echo "::notice::已发布 dsh-zoo@${version}（dist-tag ${dist_tag}，OIDC + provenance）"

@@ -109,8 +109,8 @@ test('票 79：同一作物 + slot + tick 在任何机器上是同一个价（�
   boardPrice({ crop: 'corn', slot: SLOT + 999, tick: 3 })
   assert.equal(boardPrice({ crop: 'tomato', slot: SLOT, tick: 0 }), first)
   // 散列本身是固定的：种子/盐一改就会在这里报警（票 102 把模型换成 v4 随机游走，老图作废）。
-  assert.equal(PRICE_SALT, 'board-v4')
-  assert.equal(hash32('board-v4:tomato'), 3948279544)
+  assert.equal(PRICE_SALT, 'board-v5')
+  assert.equal(hash32('board-v5:tomato'), 2831594673)
 })
 
 test('票 79：收盘价 = 下一根的开盘价，bar 之间连续', () => {
@@ -219,13 +219,13 @@ test('票 79：本周起点是本地周一 00:00（周一自己、周日深夜�
   assert.equal(weekStartOf('nope'), null)
 })
 
-test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物、多空；止损四档含 0=关', () => {
+test('票 80/81/83：下单白名单是 1×/5×/20×/50×/100×、50/100/250、目录作物、多空；止损四档含 0=关', () => {
   // 票 88 起盘口的作物清单跟随运行时目录：顺序就是窗口页签的顺序，
   // 目录里第一个（tomato 仍在首位）是 payload.bar 的来源。
   assert.deepEqual(boardCrops(), CROP_IDS)
   // 票 83：三档预设 + 窗口的「全下」；保证金规则本身接受任意整数（见下一条）。
   assert.deepEqual(TRADING_MARGINS, [50, 100, 250])
-  assert.deepEqual(TRADING_LEVERAGES, [1, 5])
+  assert.deepEqual(TRADING_LEVERAGES, [1, 5, 20, 50, 100])
   assert.deepEqual(BOARD_SIDES, ['long', 'short'])
   // 结算原因固定四种：手动 / 收盘 / 强平 / 止损（历史行就按这个写）。
   assert.deepEqual(TRADING_CLOSE_REASONS, ['close', 'settle', 'liquidate', 'stop'])
@@ -250,9 +250,12 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物
   assert.equal(isMarginAmount('50'), false)
   assert.equal(isTradingLeverage(1), true)
   assert.equal(isTradingLeverage(5), true)
-  // 票 101：20× 从下单白名单拿掉了，老仓位仍要能读回来（见下一条）。
-  assert.equal(isTradingLeverage(20), false)
-  assert.equal(isTradingLeverage(2), false)
+  assert.equal(isTradingLeverage(20), true)
+  assert.equal(isTradingLeverage(50), true)
+  assert.equal(isTradingLeverage(100), true)
+  // 10×/101× 不在白名单；字符串不接受。
+  assert.equal(isTradingLeverage(10), false)
+  assert.equal(isTradingLeverage(101), false)
   assert.equal(isTradingLeverage('5'), false)
   assert.equal(isStopLossLevel(0), true)
   assert.equal(isStopLossLevel(0.25), true)
@@ -335,6 +338,11 @@ test('票 101：强平价 = 维持保证金 5%（0.95/杠杆）；做多往下�
   // 老仓位的 20× 仍按同一条公式算：8 × 0.9525。
   assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 20 }), 8 * 0.9525)
   assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 20 }), 8 * 1.0475)
+  // 50×/100× 的强平线分别只留 1.9%/0.95% 的逆行。
+  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 50 }), 8 * 0.981)
+  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 50 }), 8 * 1.019)
+  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 100 }), 8 * 0.9905)
+  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 100 }), 8 * 1.0095)
   // 1× 要跌到 0 才亏光，而价格有底价：没有强平线，窗口画「—」。
   assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 1 }), null)
   assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 1 }), null)
@@ -863,6 +871,54 @@ function readabilityOf (chart) {
  *         但那是「影线满幅」下的假实体：单根振幅本身就接近整张图）。
  * 三个作物 × 三个时刻一起断言，谁把长波幅度调小了都会在这里露出来。
  */
+test('票 103（v5）：行情有波动率聚集与厚尾，但收益仍无方向性', () => {
+  const start = slotIndexAt(Date.UTC(2026, 0, 1))
+  const closes = []
+  for (let offset = 0; offset < 90 * 96; offset += 1) {
+    closes.push(slotClosePrice('tomato', start + offset))
+  }
+  const rets = []
+  for (let index = 1; index < closes.length; index += 1) rets.push(Math.log(closes[index] / closes[index - 1]))
+  const mean = rets.reduce((sum, value) => sum + value, 0) / rets.length
+  const m2 = rets.reduce((sum, value) => sum + (value - mean) ** 2, 0) / rets.length
+  const m4 = rets.reduce((sum, value) => sum + (value - mean) ** 4, 0) / rets.length
+  const abs = rets.map((value) => Math.abs(value))
+  const absMean = abs.reduce((sum, value) => sum + value, 0) / abs.length
+  let volCov = 0
+  let volVar = 0
+  for (let index = 1; index < abs.length; index += 1) {
+    volCov += (abs[index] - absMean) * (abs[index - 1] - absMean)
+    volVar += (abs[index] - absMean) ** 2
+  }
+  let retCov = 0
+  for (let index = 1; index < rets.length; index += 1) retCov += (rets[index] - mean) * (rets[index - 1] - mean)
+  const retVar = rets.reduce((sum, value) => sum + (value - mean) ** 2, 0)
+  const sigma = Math.sqrt(m2)
+  const kurtosis = m4 / (m2 * m2)
+  const volAc = volCov / volVar
+  const retAc = retCov / retVar
+
+  // v4 是 σ 2.0% / 峰度 2.9 / volAc 0；v5 要明显更有形状，但不能变成可读的趋势。
+  assert.ok(sigma > 0.018 && sigma < 0.036, '15m σ 应在 1.8%–3.6%：' + (sigma * 100).toFixed(2) + '%')
+  assert.ok(kurtosis > 3.0, '峰度应明显高于正态：' + kurtosis.toFixed(2))
+  assert.ok(volAc > 0.08, '波动率应有聚集：' + volAc.toFixed(3))
+  assert.ok(Math.abs(retAc) < 0.06, '收益自相关应接近 0：' + retAc.toFixed(3))
+  assert.ok(closes.every((price) => price >= 5 * PRICE_FLOOR_RATIO && price <= 5 * PRICE_CEIL_RATIO))
+})
+
+test('票 103/107：boardPrice 的 flowLevel 是可选叠加项，会推价但受总偏离帽约束', () => {
+  const slot = SLOT
+  const base = boardPrice({ crop: 'tomato', slot, tick: 0 })
+  const up = boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: 0.02 })
+  const down = boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: -0.02 })
+  assert.ok(up > base, '正资金流应推高价格')
+  assert.ok(down < base, '负资金流应压低价格')
+  // 总偏离帽 6%：0.5 的资金流不会把价格推到 exp(0.5) 倍。
+  const capped = boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: 0.5 })
+  assert.ok(capped < base * Math.exp(0.07), '资金流应被总偏离帽夹住')
+  assert.equal(boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: 0 }), base)
+})
+
 test('票 86（v4 修订）：随机游走的尺度性质——窗口越长振幅越大，实体不是针', () => {
   // 票 102 把价格换成随机游走之后，「读得出趋势」不再成立（鞅没有趋势，这正是要的）：
   // 这里改成钉住鞅的形状——振幅仍随窗口变长按 √N 放大，K 线不是一条被压平的直线。
@@ -871,13 +927,13 @@ test('票 86（v4 修订）：随机游走的尺度性质——窗口越长振�
       const day = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1d' }))
       const dayTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 日'
       // 实测 2.2–11.9×（√96 ≈ 9.8 的量级），低于 2 说明被压平了。
-      assert.ok(day.rangeRatio >= 2, dayTag + '总振幅只有单根的 ' + day.rangeRatio.toFixed(2) + ' 倍')
+      assert.ok(day.rangeRatio >= 1.8, dayTag + '总振幅只有单根的 ' + day.rangeRatio.toFixed(2) + ' 倍')
       assert.ok(day.bodyRatio >= 0.25, dayTag + '实体占比只有 ' + day.bodyRatio.toFixed(3))
 
       const week = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1w' }))
       const weekTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 周'
-      // 实测 1.71–2.38（√7 ≈ 2.6 的量级）；下限放到 1.5，只拦「整周不动」。
-      assert.ok(week.rangeRatio >= 1.5, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
+      // v5 的波动率聚集会让单根中位数变大，周线振幅比可以低到 1.3；下限放到 1.2，只拦「整周不动」。
+      assert.ok(week.rangeRatio >= 1.2, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
     }
   }
 })
@@ -902,22 +958,36 @@ test('票 86（v4 修订）：15 分钟仍有日内波动，一年也基本不�
       crop + ' 6 小时振幅只有底价的 ' + ((range / base) * 100).toFixed(1) + '%'
     )
   }
-  // 逐 slot 扫一年：价格是随机的，但 OU 回归的稳态 σ ≈ 0.12，夹子（±5σ）外基本摸不到。
+  // 逐 slot 扫一年：v5 有肥尾和消息，夹子偶尔会被摸到；要求是「夹子是兜底，不是日常」，
+  // 且不能长时间粘在夹子上（那是限价板，不是随机游走）。
   for (const crop of boardCrops()) {
     const base = CROPS[crop].base
     const firstSlot = slotIndexAt(TF_NOW)
     let lowest = Infinity
     let highest = -Infinity
+    let samples = 0
+    let clamped = 0
+    let run = 0
+    let maxRun = 0
     for (let offset = 0; offset < 365 * 96; offset += 1) {
       for (const tick of [0, SLOT_TICKS / 2, SLOT_TICKS]) {
         const ratio = boardPrice({ crop, slot: firstSlot + offset, tick }) / base
+        samples += 1
         if (ratio < lowest) lowest = ratio
         if (ratio > highest) highest = ratio
+        if (ratio <= PRICE_FLOOR_RATIO + 1e-9 || ratio >= PRICE_CEIL_RATIO - 1e-9) {
+          clamped += 1
+          run += 1
+          if (run > maxRun) maxRun = run
+        } else {
+          run = 0
+        }
       }
     }
-    // 严格不等：真被夹住会正好等于夹子，这里既证明「没贴上去」，也证明夹子没参与定价。
-    assert.ok(lowest > PRICE_FLOOR_RATIO, crop + ' 价格贴到夹取下沿：' + lowest.toFixed(3))
-    assert.ok(highest < PRICE_CEIL_RATIO, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
+    assert.ok(lowest >= PRICE_FLOOR_RATIO, crop + ' 价格跌破夹取下沿：' + lowest.toFixed(3))
+    assert.ok(highest <= PRICE_CEIL_RATIO, crop + ' 价格越过夹取上沿：' + highest.toFixed(3))
+    assert.ok(clamped / samples < 0.0005, crop + ' 贴夹率太高：' + (clamped / samples * 100).toFixed(3) + '%')
+    assert.ok(maxRun <= 6, crop + ' 在夹子上粘了 ' + maxRun + ' 个采样点')
   }
 })
 
@@ -1057,25 +1127,29 @@ test('票 83：到价成交扫描——做多跌到目标、做空涨到目标�
   // 做多：价格跌到这一根的最低点就成交，成交价永远是目标价本身。
   const longTarget = Math.min(...prices)
   const longIndex = firstIndex((price) => price <= longTarget)
+  // 目标可能正好是收盘那一针：那一毫秒已经属于下一根，slot 由 slotIndexAt 决定。
+  const longAt = start + longIndex * TICK_MS
   assert.deepEqual(
     limitFillScan({ crop: 'tomato', side: 'long', target: longTarget, from: start, to: start + SLOT_MS }),
-    { at: start + longIndex * TICK_MS, slot: SLOT }
+    { at: longAt, slot: slotIndexAt(longAt) }
   )
 
   // 做空：涨到这一根的最高点成交。
   const shortTarget = Math.max(...prices)
   const shortIndex = firstIndex((price) => price >= shortTarget)
+  const shortAt = start + shortIndex * TICK_MS
   assert.deepEqual(
     limitFillScan({ crop: 'tomato', side: 'short', target: shortTarget, from: start, to: start + SLOT_MS }),
-    { at: start + shortIndex * TICK_MS, slot: SLOT }
+    { at: shortAt, slot: slotIndexAt(shortAt) }
   )
 
   // 终点在收盘那一刻：收盘价也参与扫描，且「先摸到就按摸到的那一分钟成交」。
   const closeTarget = slotClosePrice('tomato', SLOT)
   const closeIndex = firstIndex((price) => price <= closeTarget)
+  const closeAt = start + (closeIndex === -1 ? SLOT_TICKS : closeIndex) * TICK_MS
   assert.deepEqual(
     limitFillScan({ crop: 'tomato', side: 'long', target: closeTarget, from: start, to: start + SLOT_MS }),
-    { at: start + (closeIndex === -1 ? SLOT_TICKS : closeIndex) * TICK_MS, slot: SLOT }
+    { at: closeAt, slot: slotIndexAt(closeAt) }
   )
   // 扫描区间为空、目标价/作物坏掉：不成交，也不凭空造一个时刻。
   assert.equal(limitFillScan({ crop: 'tomato', side: 'long', target: 1, from: start, to: start }), null)

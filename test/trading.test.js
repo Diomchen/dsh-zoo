@@ -211,6 +211,52 @@ async function seedLegacy20 (dir, { clock, farm, margin = 50, side = 'long' }) {
   return openStore(dir, { clock, farm })
 }
 
+test('票 103/105：v1 账本迁到 v2，未平仓位按 v5 现价 re-base，开仓时间/顺序不变', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)
+  const farm = fakeFarm(500)
+  const openedAt = SLOT_EDGE - 2 * SLOT_MS
+  const oldEntry = 4.2
+  await writeTrading(dir, {
+    version: 1,
+    week: { start: weekStartOf(clock.now()), pnl: 0, base: 500 },
+    positions: [{
+      id: '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d',
+      crop: 'tomato',
+      side: 'long',
+      margin: 100,
+      leverage: 5,
+      entry: oldEntry,
+      openedAt,
+      slot: slotIndexAt(openedAt),
+      stopLoss: 0
+    }],
+    orders: [],
+    history: []
+  })
+
+  const store = await openStore(dir, { clock, farm })
+  const view = store.view({ now: clock.now() })
+  const file = await readTrading(dir)
+  assert.equal(file.version, TRADING_VERSION)
+  assert.equal(file.flow.tape.length, 0)
+  assert.equal(file.positions.length, 1)
+  const position = file.positions[0]
+  assert.equal(position.openedAt, openedAt, '开仓时间不动，列表顺序才不会乱')
+  assert.equal(position.rebasedAt, clock.now(), '路径检查从 re-base 时刻起算')
+  assert.ok(Math.abs(position.entry - markPrice({ crop: 'tomato', now: clock.now() })) < 1e-12)
+  assert.ok(Math.abs(position.entry - oldEntry) > 1e-6, '旧 v4 入场价应被替换')
+  assert.ok(Math.abs(view.positions[0].pnl) < 1e-9, 're-base 后浮盈从 0 开始')
+  assert.equal(view.locked, 100, '保证金仍然锁着')
+
+  // 重启一次：slot 必须由 rebasedAt 派生，否则会被当成「上一根的仓位」结掉。
+  const reopened = await openStore(dir, { clock, farm })
+  const after = reopened.view({ now: clock.now() })
+  assert.equal(after.positions.length, 1, '重启后仓位还在')
+  assert.equal(after.positions[0].entry, position.entry)
+  assert.ok(Math.abs(after.positions[0].pnl) < 1e-9)
+})
+
 test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与可用分得清', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)
@@ -251,7 +297,7 @@ test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与�
   // 磁盘上就是契约形状：没有硬币余额，只有本周/持仓/挂单/历史。
   const file = await readTrading(dir)
   assert.equal(file.version, TRADING_VERSION)
-  assert.deepEqual(Object.keys(file).sort(), ['history', 'orders', 'positions', 'version', 'week'])
+  assert.deepEqual(Object.keys(file).sort(), ['flow', 'history', 'orders', 'positions', 'version', 'week'])
   assert.equal(file.week.start, MONDAY)
   assert.equal(file.positions.length, 2)
   assert.equal('coins' in file, false)
@@ -619,7 +665,7 @@ test('票 79：读盘归一化不认白名单之外的字段', () => {
   assert.equal(normalizeTradingFile({}).state.week.start, null)
 })
 
-test('票 80：5×/20× 开仓落盘；持仓带强平价与止损档，1× 没有强平线', async (t) => {
+test('票 80：5×/20×/50×/100× 开仓落盘；持仓带强平价与止损档，1× 没有强平线', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)
   const farm = fakeFarm(1000)
@@ -628,32 +674,43 @@ test('票 80：5×/20× 开仓落盘；持仓带强平价与止损档，1× 没�
   const one = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 1 })
   const five = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 5 })
   const twenty = await store.openPosition({ crop: 'tomato', side: 'short', margin: 100, leverage: 20 })
+  const fifty = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 50 })
+  const hundred = await store.openPosition({ crop: 'tomato', side: 'long', margin: 50, leverage: 100 })
   assert.equal(one.ok, true, JSON.stringify(one))
   assert.equal(five.ok, true, JSON.stringify(five))
-  assert.equal(twenty.error, 'bad-leverage', '20× 已经不在下单白名单里')
-  assert.equal(farm.wallet.coins, 900, '两手各扣各的保证金')
+  assert.equal(twenty.ok, true, JSON.stringify(twenty))
+  assert.equal(fifty.ok, true, JSON.stringify(fifty))
+  assert.equal(hundred.ok, true, JSON.stringify(hundred))
+  assert.equal(farm.wallet.coins, 700, '五手各扣各的保证金')
 
   const now = SLOT_EDGE + 3 * TICK_MS
   const view = store.view({ now })
-  const [first, second] = view.positions
+  const [first, second, third, fourth, fifth] = view.positions
   // 1× 没有强平线：窗口画「—」。
   assert.equal(first.liquidation, null)
   assert.equal(first.stopLoss, 0, '止损默认关')
   // 5× 的强平价 = entry × (1 ∓ 0.95/杠杆)，和纯规则同源。
   assert.equal(second.leverage, 5)
   assert.equal(second.liquidation, liquidationPriceOf({ side: 'long', entry: second.entry, leverage: 5 }))
+  assert.equal(third.leverage, 20)
+  assert.equal(fourth.leverage, 50)
+  assert.equal(fourth.liquidation, liquidationPriceOf({ side: 'long', entry: fourth.entry, leverage: 50 }))
+  assert.equal(fifth.leverage, 100)
+  assert.equal(fifth.liquidation, liquidationPriceOf({ side: 'long', entry: fifth.entry, leverage: 100 }))
 
   // 磁盘上：杠杆、止损落盘；强平价是派生字段，不落盘（改 entry 后它会立刻变假）。
   const file = await readTrading(dir)
-  assert.deepEqual(file.positions.map((position) => position.leverage), [1, 5])
-  assert.deepEqual(file.positions.map((position) => position.stopLoss), [0, 0])
+  assert.deepEqual(file.positions.map((position) => position.leverage), [1, 5, 20, 50, 100])
+  assert.deepEqual(file.positions.map((position) => position.stopLoss), [0, 0, 0, 0, 0])
   assert.equal('liquidation' in file.positions[0], false)
 
   // 重启：杠杆与强平价都读得回来（5×/20× 不会因为读盘被降级）。
   const restarted = await openStore(dir, { clock, farm })
   const again = restarted.view({ now })
-  assert.deepEqual(again.positions.map((position) => position.leverage), [1, 5])
+  assert.deepEqual(again.positions.map((position) => position.leverage), [1, 5, 20, 50, 100])
   assert.equal(again.positions[1].liquidation, second.liquidation)
+  assert.equal(again.positions[3].liquidation, fourth.liquidation)
+  assert.equal(again.positions[4].liquidation, fifth.liquidation)
 
   // 老 20× 仓位：读得回来，强平价照旧按 0.95/20 算（票 101 的兼容承诺）。
   const legacyDir = await tempDir(t)
