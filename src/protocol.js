@@ -377,7 +377,9 @@ export const PACKET_TYPES = Object.freeze([
   'futures-settle',
   'futures-sync',
   // 1.10.0：账户自己的档位申报（peer → 房主）。
-  'futures-mode'
+  'futures-mode',
+  // 1.12.0：账户自己按的暂停申报（peer → 房主）。
+  'futures-pause'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -1675,6 +1677,7 @@ export function encodeFuturesSettle ({
   shortfall = 0,
   mode = FUTURES_DEFAULT_MODE,
   accountMode = null,
+  paused = false,
   pending = 0,
   now
 } = {}) {
@@ -1698,7 +1701,17 @@ export function encodeFuturesSettle ({
   }
   // 1.10.0：账户档位是可选字段（老 peer 不发 = 不知道，按 null）。
   if (isFuturesAccountMode(accountMode)) packet.accountMode = accountMode
+  // 1.12.0：账户自己的暂停开关，只在按下时带字段（缺省 = 没暂停）。
+  if (paused === true) packet.paused = true
   return encodePacket(packet)
+}
+
+/**
+ * 1.12.0：账户申报自己按下的暂停（peer → 房主）。
+ * 只带一个布尔值：房主据此拒绝这个账户的新单，别人的账一概不动。
+ */
+export function encodeFuturesPause ({ deviceId, at, paused, now } = {}) {
+  return encodePacket({ type: 'futures-pause', deviceId, at, paused: paused === true, now })
 }
 
 /**
@@ -2285,6 +2298,23 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     }
   }
 
+  // 1.12.0：账户申报自己按下的暂停。只是一个布尔值。
+  if (raw.type === 'futures-pause') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (typeof raw.paused !== 'boolean') return fail('paused')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        paused: raw.paused
+      }
+    }
+  }
+
   if (raw.type === 'futures-order') {
     const at = normalizeDigestAt(raw.at)
     if (at === null) return fail('at')
@@ -2374,6 +2404,9 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       ? null
       : (isFuturesAccountMode(raw.accountMode) ? raw.accountMode : undefined)
     if (accountMode === undefined) return fail('account-mode')
+    // 1.12.0：账户自己的暂停可选（老房主不发 = 没暂停）。
+    const paused = raw.paused === undefined ? false : raw.paused
+    if (typeof paused !== 'boolean') return fail('paused')
     return {
       ok: true,
       packet: {
@@ -2393,6 +2426,7 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         shortfall,
         mode,
         accountMode,
+        paused,
         pending
       }
     }

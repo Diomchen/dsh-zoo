@@ -464,11 +464,30 @@
   }
 
   /**
+   * 1.12.0：暂停是**每个人自己的事**。房主按下去只停自己那本账，停不了别人的市；
+   * 所以窗口里不再有「关市」，只有「暂停 / 继续」和「退出」（只退自己）。
+   */
+  function pauseOf (view) {
+    if (view?.disabled === true) {
+      return { paused: false, label: '已退出', text: '', toggleLabel: null }
+    }
+    if (view?.paused === true) {
+      return {
+        paused: true,
+        label: '暂停中',
+        text: '你暂停了：新仓、挂单都停下，已开的仓和余额完好，提现和转现货照常。',
+        toggleLabel: '继续交易'
+      }
+    }
+    return { paused: false, label: '交易中', text: '', toggleLabel: '暂停交易' }
+  }
+
+  /**
    * 票 98：市场闸门。房主只留「关市 / 开市」这一道；档位（真钱/纸面）是每个账户
    * 自己的事，见 `accountModeOf`。存档里 `disabled === true`（回滚过）一律当 `off`。
    */
   function modeOf (view) {
-    if (view?.disabled === true) return { kind: 'off', label: '已回滚', text: '回滚过：期货已关闭，托管余额已退回农场。' }
+    if (view?.disabled === true) return { kind: 'off', label: '已退出', text: '退回过：这个账户的期货已关闭，托管余额已退回你自己的农场。' }
     const mode = view?.mode
     if (mode === 'off') return { kind: 'off', label: '未开放', text: '期货未开放：房主还没打开这一层。' }
     return { kind: 'open', label: '开市', text: '' }
@@ -552,26 +571,32 @@
     const preview = orderPreview(view, draft)
     const orders = orderRows(view)
     const mode = modeOf(view)
+    const pause = pauseOf(view)
     const positions = positionRows(view)
     const expiry = expiryOf(view, stamp)
+    // 「能不能下单」= 市场开着 + 自己没暂停。暂停只锁新仓，不平仓不锁提现。
+    const open = mode.kind !== 'off'
+    const live = open && pause.paused !== true
     return {
       status: statusOf(view),
       title: title({ ...view, now: stamp, slotEnd: end }),
       countdown: tick,
       header: header(view),
       mode,
+      pause,
       account: accountModeOf(view),
       /** 房主才能关市 / 回滚；peer 只读。 */
       isHost: isHostOf(view),
-      /** 1.10.0：档位是每个人自己的，只有关市时才不能动。 */
-      canSwitchAccount: mode.kind !== 'off',
-      canTrade: mode.kind !== 'off',
+      /** 1.10.0：档位是每个人自己的，只有退出后才不能动。 */
+      canSwitchAccount: open,
+      canTrade: live,
+      canPause: open,
       capsLine: capsLine(view),
       pendingLine: pendingLine(view),
       quotes: quoteRows(view),
       positions,
-      /** 票 109：一次把全部持仓转成现货；只有能交易、且真有持仓时才给按。 */
-      canConvertAll: positions.length > 0 && mode.kind !== 'off' && expiry.at !== null,
+      /** 票 109：一次把全部持仓转成现货；暂停也能转（那是减风险）。 */
+      canConvertAll: positions.length > 0 && open && expiry.at !== null,
       expiry,
       orders,
       orderCount: orders.length,
@@ -580,7 +605,7 @@
       trades: tradeRows(view),
       preview,
       previewText: previewText(preview),
-      canSubmit: preview.ok === true && mode.kind !== 'off',
+      canSubmit: preview.ok === true && live,
       limits: limitsOf(view),
       epoch: typeof view?.epoch === 'string' ? view.epoch : ''
     }
@@ -614,6 +639,7 @@
     deliveryLine,
     sessionLine,
     modeOf,
+    pauseOf,
     accountModeOf,
     capsLine,
     pendingLine,

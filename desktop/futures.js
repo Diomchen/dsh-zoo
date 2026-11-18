@@ -26,6 +26,8 @@
     busy: false,
     // 1.10.0：上一拍画出来的账户档位（切换按钮用它算「下一档」）。
     account: null,
+    // 1.12.0：上一拍画出来的暂停状态（按钮用它算「切到哪一档」）。
+    pause: null,
     // 票 109：「全部转」要提交的持仓清单（id + 张数），每拍重算。
     convertTargets: []
   }
@@ -182,19 +184,22 @@
   }
 
   /**
-   * 1.10.0：档位条。左边是**这本账**的档位（纸面/真钱），旁边一颗切换按钮；
-   * 房主多一条开市/关市与回滚。老版本 payload 没有账户档位就整行藏掉。
+   * 1.10.0 / 1.12.0：档位条。左边是**这本账**的档位（纸面/真钱），旁边一颗切换按钮；
+   * 右边是「暂停 / 继续」与「退出」——三件事都只作用于自己这本账，谁都点得动。
+   * 老版本 payload 没有账户档位就整行藏掉。
    */
   function paintMode (built) {
     const bar = el('modebar')
     const account = built.account
     const mode = built.mode
+    const pause = built.pause
     if (!account || typeof account.kind !== 'string') {
       bar.hidden = true
       return
     }
     bar.hidden = false
     state.account = account
+    state.pause = pause ?? null
     const chip = el('accountChip')
     chip.textContent = account.label ?? '—'
     chip.className = 'chip ' + account.kind
@@ -207,11 +212,12 @@
     const pending = typeof built.pendingLine === 'string' ? built.pendingLine : ''
     el('pending').textContent = pending
     el('pending').hidden = pending === ''
-    el('modeSwitch').hidden = built.isHost !== true
-    // 关市按钮只在开市时可点，开市按钮只在关市时可点。
-    el('closeMarket').disabled = built.isHost !== true || closed
-    el('openMarket').disabled = built.isHost !== true || !closed
-    el('rollback').disabled = built.isHost !== true
+    // 1.12.0：暂停 / 继续只停自己；退出只退自己。
+    const paused = pause !== null && pause !== undefined && pause.paused === true
+    el('pauseText').textContent = paused ? (pause.text || '') : ''
+    el('pauseBtn').textContent = (pause && pause.toggleLabel) || (paused ? '继续交易' : '暂停交易')
+    el('pauseBtn').disabled = built.canPause !== true
+    el('rollback').disabled = closed
   }
 
   function render () {
@@ -441,25 +447,19 @@
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
-  // 房主：开市 / 关市（关市会停掉所有人的交易，但不退余额——回滚才退）。
-  el('closeMarket').addEventListener('click', () => {
+  // 1.12.0：暂停 / 继续——只停自己这本账（房主按下去也停不了别人）。
+  el('pauseBtn').addEventListener('click', () => {
     if (state.busy) return
-    if (!window.confirm('关市会让所有人立刻不能交易（余额留在托管里）。继续？')) return
+    const paused = state.pause !== null && state.pause !== undefined && state.pause.paused === true
     state.busy = true
-    bridge.submit({ action: 'futures-mode', mode: 'off' })
+    bridge.submit({ action: 'futures-pause', paused: !paused })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
-  el('openMarket').addEventListener('click', () => {
-    if (state.busy) return
-    state.busy = true
-    bridge.submit({ action: 'futures-mode', mode: 'live' })
-    setTimeout(() => { state.busy = false; render() }, 3000)
-  })
-
+  // 1.12.0：退出——强平自己的仓位、余额退回自己的农场，别人的账一分不动。
   el('rollback').addEventListener('click', () => {
     if (state.busy) return
-    if (!window.confirm('回滚会把所有人的托管余额退回农场、并关掉期货。继续？')) return
+    if (!window.confirm('退出会把你的仓位按当前价强平、余额退回你的农场，并关掉你这本账。继续？')) return
     state.busy = true
     bridge.submit({ action: 'futures-rollback' })
     setTimeout(() => { state.busy = false; render() }, 3000)

@@ -11,6 +11,16 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.12.0 版本记录
+
+GitHub Release 正文就是 [`releases/1.12.0.md`](releases/1.12.0.md)。
+
+分权收尾：`off` 不再是房主手里的全局闸门。每个账户有自己的 `paused`——按了只停自己
+的新仓与新挂单，平仓/撤单/转现货/提现照常；`futures-rollback` 只强平自己、只退自己的
+托管余额，peer 调用回 `not-owner`。新增报文 `futures-pause { paused }` 与 settle 的
+可选字段 `paused`；老动作 `futures-mode{mode:'off'}` 保留为「暂停自己」的别名，`mode`
+字段继续回传但不再拦截任何动作。窗口顶栏三颗按钮：切档、暂停/继续、退出。
+
 ## 1.11.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.11.0.md`](releases/1.11.0.md)。

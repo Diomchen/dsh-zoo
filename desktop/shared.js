@@ -389,6 +389,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     'futures-convert-all',
     'futures-mode',
     'futures-account-mode',
+    // 1.12.0：暂停 / 继续只作用于自己这本账。
+    'futures-pause',
     'futures-rollback',
     'futures-refresh'
   ]
@@ -2512,6 +2514,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       mode: FUTURES_MODES.includes(raw.mode) ? raw.mode : null,
       accountMode: FUTURES_ACCOUNT_MODES.includes(raw.accountMode) ? raw.accountMode : 'shadow',
       disabled: raw.disabled === true,
+      // 1.12.0：这个账户自己按的暂停（房主按下去也停不了别人，所以只看自己）。
+      paused: raw.paused === true,
       pending: nonNegative(raw.pending),
       dayCap: num(raw.dayCap),
       dayNotional: nonNegative(raw.dayNotional),
@@ -2573,6 +2577,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (action === 'futures-account-mode') {
       const accountMode = FUTURES_ACCOUNT_MODES.includes(raw.accountMode) ? raw.accountMode : null
       return accountMode === null ? null : { action, accountMode }
+    }
+    // 1.12.0：暂停 / 继续自己的账（只认布尔，缺字段按「继续」）。
+    if (action === 'futures-pause') {
+      return typeof raw.paused === 'boolean' ? { action, paused: raw.paused } : null
     }
     if (action === 'futures-deposit' || action === 'futures-withdraw') {
       const coins = strictBoardInt(raw.coins, 1, MAX_FARM_COINS)

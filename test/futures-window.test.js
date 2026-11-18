@@ -481,6 +481,57 @@ test('视图模型：账户档位是纸面也能交易；关市才画成关闭',
   assert.equal(off.canSwitchAccount, false)
 })
 
+test('视图模型：1.12.0 暂停只停自己——按钮写「继续交易」，新单变灰，平仓照常', () => {
+  const draft = { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }
+  const running = view.build(sampleView({ mode: 'live', paused: false }), draft, TUESDAY)
+  assert.equal(running.pause.paused, false)
+  assert.equal(running.pause.label, '交易中')
+  assert.equal(running.pause.toggleLabel, '暂停交易')
+  assert.equal(running.canPause, true)
+  assert.equal(running.canTrade, true)
+
+  const paused = view.build(sampleView({ mode: 'live', paused: true }), draft, TUESDAY)
+  assert.equal(paused.pause.paused, true)
+  assert.equal(paused.pause.label, '暂停中')
+  assert.equal(paused.pause.toggleLabel, '继续交易')
+  assert.match(paused.pause.text, /暂停/)
+  // 新仓关门，但合约还在、市场没关——「暂停」不是「休市」。
+  assert.equal(paused.canTrade, false)
+  assert.equal(paused.canSubmit, false)
+  assert.equal(paused.status.kind !== 'off', true)
+  // 减风险的动作（转现货）在暂停时仍然给按。
+  const withPosition = view.build(
+    sampleView({
+      mode: 'live',
+      paused: true,
+      positions: [
+        {
+          id: 'p1',
+          crop: 'tomato',
+          contract: 'tomato-20261117',
+          side: 'long',
+          lots: 1,
+          entry: 5,
+          margin: 50,
+          leverage: 20,
+          openedAt: TUESDAY,
+          unrealized: 10
+        }
+      ]
+    }),
+    draft,
+    TUESDAY
+  )
+  assert.equal(withPosition.canConvertAll, true)
+
+  // 退出之后：暂停键失效，文案改成「已退出」。
+  const quit = view.build(sampleView({ mode: 'live', disabled: true }), draft, TUESDAY)
+  assert.equal(quit.mode.kind, 'off')
+  assert.equal(quit.pause.label, '已退出')
+  assert.equal(quit.canPause, false)
+  assert.equal(quit.canTrade, false)
+})
+
 test('shared：futures-window 命令带整份视图，缺字段有默认', () => {
   const command = shared.normalizeHostCommand({ type: 'futures-window', id: 'c1', open: true, state: sampleView() })
   assert.equal(command.ok, true)

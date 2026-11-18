@@ -24,7 +24,9 @@
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
 「期货 / 日合约 / 房主清算」的决策见 [ADR-0032](docs/adr/0032-futures-host-as-clearinghouse.md)
-与 [ADR-0034](docs/adr/0034-futures-daily-contracts.md)，
+与 [ADR-0034](docs/adr/0034-futures-daily-contracts.md)；「档位、暂停、退出都归账户自己」
+见 [ADR-0035](docs/adr/0035-account-level-futures-mode.md) 与
+[ADR-0036](docs/adr/0036-account-level-pause-and-self-rollback.md)。
 规格见 [SPEC v11](.scratch/dsh-zoo/SPEC-v11.md)；票 92–99 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。盘口与期货是两层：盘口对着机器，期货对着人。
 
@@ -33,7 +35,7 @@
 
 盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
 
-期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
+期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode` / `paused`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位 / 暂停”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
 ## Language
 
@@ -499,9 +501,19 @@ _Avoid_: 风险准备金, 公益金, reserve fund
 
 **账户档位 (Account Mode)**：
 每个账户自己选的结算口径：`shadow`（纸面，缺省）或 `live`（真钱）。
-房主不管别人玩不玩真钱，只保留开市/关市这道全局闸门；纸面账户照样能开仓挂单，
+房主不管别人玩不玩真钱，也不管别人暂停不暂停；纸面账户照样能开仓挂单，
 但只跟做市商成交，纸面手续费与亏空不进真钱保险基金。
 _Avoid_: 模式, mode（那是市场闸门 `off`/`live`）, 灰度档
+
+**暂停 (Pause)**：
+每个账户自己的开关：暂停后新仓与挂单被拒（`paused`），已有仓位、余额、挂单都留着；
+平仓、撤单、转现货、提现照常。房主按下去也只停自己——**没有人能停别人的市**。
+_Avoid_: 关市, 休市, halt, 停盘
+
+**退出 (Self Rollback)**：
+每个账户自己的收摊动作：按当前公允价强平自己的仓位、自己的余额退回自己的农场、
+这本账标 `disabled` 并保留数据。**只退自己**，别人的托管余额一分不动。
+_Avoid_: 回滚, rollback（旧名，指房主替全场退）
 
 **纸面账户 (Paper Account)**：
 `accountMode: 'shadow'` 的账户：撮合、盯市、强平、交割全跑，钱只在托管账里动，不写自己的 `farm.json`。
