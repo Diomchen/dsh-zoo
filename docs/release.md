@@ -11,6 +11,16 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.11.0 版本记录
+
+GitHub Release 正文就是 [`releases/1.11.0.md`](releases/1.11.0.md)。
+
+盘口 v12：行情 v5（波动率聚集/时段/风暴/肥尾）、确定性消息面、关键 K 与快讯/详情，
+以及无房主的 LAN 真人资金流 `board-flow` / `board-flow-sync`；50×/100× 杠杆与选中
+杠杆 chip 的日漫边框动效，100× 会弹「老实赚钱，很枯燥吧。」漫画气泡。
+`PRICE_SALT` 升到 `board-v5`，旧图作废；`trading.json` 升到 v2，未平仓位按新行情
+re-base 入场价。npm 发布改用 OIDC Trusted Publishing，不再使用长期 `NPM_TOKEN`。
+
 ## 1.10.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.10.0.md`](releases/1.10.0.md)。
@@ -353,11 +363,12 @@ gh pr create --repo awesome-dsh-plugin/awesome-dsh-plugin \
 - 截图：在仓库根放 `screenshots.json`，列 1–8 张仓库内图片的相对路径；市场和网站会自动展示。
   不写也没关系。
 
-### 发布到 npm（CI 自动）
+### 发布到 npm（CI 自动，OIDC）
 
 npm 不是上架 dsh-market 的必要条件；发布后市场会多显示下载量，并会优先使用 npm 预构建包。
-这一步现在由 CI 做：推 tag 后 `Publish npm` job 在 `Test` 通过时跑
-`npm publish --access public`，用的是仓库 secret `NPM_TOKEN`。
+这一步现在由 CI 做：推 tag 后 `Publish npm (OIDC)` job 在 `Test` 通过时跑
+`npm publish --access public --provenance`。**不需要 `NPM_TOKEN`**：GitHub Actions
+用 OIDC 换 npm 的短期发布凭证；CI 使用 Node 24（npm 11.5.1+）和 `id-token: write`。
 
 版本号已经在 npm 上时 job 直接跳过 —— 重推同一个 tag 不会让流水线变红，
 但也意味着**漏发的版本没法靠重推 tag 补上**，只能改 `version` 发新 tag 或本地手动发。
@@ -365,25 +376,25 @@ npm 不是上架 dsh-market 的必要条件；发布后市场会多显示下载�
 正式版本推到 `latest`；`1.9.0-windows-test.1` 这类预发布推到 `next`，不会顶掉 `latest`
 （要装测试版得写 `npm i dsh-zoo@next`）。
 
-#### 密钥 = 本机 npm 的那条 token
+#### 一次性配置 Trusted Publisher
 
-`NPM_TOKEN` 就是 `~/.npmrc` 里 `//registry.npmjs.org/:_authToken=` 后面那串，换 token 时重设：
+在 npm 包页面：
 
-```sh
-token="$(sed -n 's|^//registry\.npmjs\.org/:_authToken=\(.*\)$|\1|p' ~/.npmrc)"
-printf '%s' "$token" | gh secret set NPM_TOKEN --repo Diomchen/dsh-zoo
-gh secret list --repo Diomchen/dsh-zoo   # 只能看到更新时间，值读不回来
-```
+1. **Settings → Trusted publishing → GitHub Actions**；
+2. Organization/user 填 `Diomchen`；
+3. Repository 填 `dsh-zoo`；
+4. Workflow filename 填 `ci.yml`；
+5. Environment 留空（CI 的 npm job 没有用 environment）。
 
-token 用 granular 的，权限 `Read and write (publish and stage)`，勾上
-`Bypass two-factor authentication`；选成 `stage only` 只能把版本送进暂存区。
-往 npm 发必须走 `registry.npmjs.org`（本机默认 registry 是 npmmirror，发镜像会被拒），
-CI 里已经写死 `--registry=https://registry.npmjs.org`。
+配好后，tag 触发的 `ci.yml` 会自动拿到 OIDC 凭证。没有配置时发布会失败，
+错误通常会说没有权限或需要 authentication；这时不要回退去加长期 token，
+先检查上面的四个字段，尤其是 workflow 文件名必须正好是 `ci.yml`。
 
 #### 前置条件
 
 1. `package.json` 不能有 `"private": true`（本项目已移除）；
-2. `repository` 要指回 `https://github.com/Diomchen/dsh-zoo`（provenance/来源链接靠它）。
+2. `repository` 要指回 `https://github.com/Diomchen/dsh-zoo`（provenance/来源链接靠它）；
+3. npm 账号要对 `dsh-zoo` 有发布权限，并已在该包上配置上面的 Trusted Publisher。
 
 #### 兜底：本地手动发
 
@@ -391,14 +402,11 @@ CI 挂了又急着发版时，先 checkout 到对应 tag（`package.json` 的版
 
 ```sh
 git checkout v1.0.0
+npm login   # 或用本机已有 token
 npm publish --registry=https://registry.npmjs.org --access public
 ```
 
-#### 以后想换掉长期 token
-
-npm 正在收紧「绕过 2FA 的 token」用于发包，长期方案是 Trusted Publishing（OIDC）：
-在 npm 包设置里把发布来源指到 `Diomchen/dsh-zoo` 的 `.github/workflows/ci.yml`，
-再给 job 加 `id-token: write`、去掉 `NODE_AUTH_TOKEN`。现在 token 方案还能用，先不折腾。
+本地手动发仍走长期 token/交互登录；CI 的 OIDC 只作用于 GitHub Actions 里的 tag 发布。
 
 npm 包和精选列表是自动关联的，不需要在 YAML 里写 `npm:` 字段。
 
