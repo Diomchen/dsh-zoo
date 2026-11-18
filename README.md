@@ -4,7 +4,7 @@
 
 # dsh-zoo
 
-<p align="center">局域网里的 DSH 宠物：会串门，会带东西，还能种地、偷菜和做盘口。</p>
+<p align="center">局域网里的 DSH 宠物：会串门，会带东西，还能种地、偷菜、做盘口和期货。</p>
 
 <p align="center">
   <a href="https://github.com/Diomchen/dsh-zoo/actions/workflows/ci.yml"><img src="https://github.com/Diomchen/dsh-zoo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
@@ -20,17 +20,31 @@ dsh-zoo 是给 DeepSeek Harness 装的插件。装上之后，你的桌面上会
 
 > 只想先跑起来？直接跳到 [三分钟上手](#三分钟上手)。
 
-> 下面这些图都是**示意图**，不是真实截图。桌面上的宠物来自 `dsh-pet`，长什么样由你装的
-> 素材决定；图里用柴犬、橘猫和兔子，只是因为它们比通用小人好认。图是 SVG，源文件在
-> [`assets/screens/`](assets/screens/)，想改文案或配色直接编辑就行。
+> 下面这些图都是**示意图**，不是真实截图：窗口里的数字、邻居和作物都是编出来的。宠物不是
+> 画的——它们是从 `dsh-pet` / `maodie-pet` 的真实素材里截的帧，直接嵌在 SVG 里；你装什么皮，
+> 桌面上看到的就是什么。图源在 [`assets/screens/`](assets/screens/)，宠物帧在
+> [`assets/pets/`](assets/pets/)，想改文案或配色直接编辑就行。
 
 ## 先看一眼
 
 <p align="center">
-  <img src="assets/screens/desktop.svg" alt="桌面上的柴犬宠物、来串门的橘猫，以及新邻居放行卡" width="880">
+  <img src="assets/screens/desktop.svg" alt="桌面上的两只 dsh-pet 宠物、悬停弹层和新邻居放行卡" width="880">
 </p>
 
 <p align="center"><em>桌面上：自己的宠物、来串门的邻居，以及第一次见面时的放行卡。</em></p>
+
+### 宠物长什么样
+
+<p align="center">
+  <img src="assets/screens/pets.svg" alt="dsh-pet 的宠物：待机、写代码、睡觉，以及换一张 maodie 猫皮" width="860">
+</p>
+
+<p align="center"><em>动作、外观和名字都归 <a href="https://github.com/PC2005-cloud/dsh-pet">dsh-pet</a>；最右边那只橘猫是
+<a href="https://github.com/Edwardpch/maodie-pet">maodie-pet</a> 的皮。</em></p>
+
+- 动作一百多个：待机、写代码、睡觉、吃饭、拆礼物……右键「动作」里按分类点播。
+- 换皮只换外观和动作，不动名字、身份、串门记录和农场；邻居也看得见你的皮。
+- 没装 `dsh-pet` 也能跑（宠物退成通用小人）；装了但关掉桌面层，网络功能照常。
 
 ## 它能陪你做什么
 
@@ -45,6 +59,7 @@ dsh-zoo 是给 DeepSeek Harness 装的插件。装上之后，你的桌面上会
 - **雇工**：挂牌出租自己的宠物看家；合同 2–8 小时，工资预付，按实际时长结算。
 - **交易所**：本机做市，买种子、卖作物；邻居的行情汇总成局域网指数。
 - **盘口**：15 分钟合约，做多/做空、1×/5×/20×/50×/100×、开平各 0.2% 手续费、农场硬币下注、真人周榜（按收益率排）。
+- **期货**：一天一张日合约、20:00 现金交割；做多/做空、1×/3×/10×/20×、做市商连续报价，也能和邻居互相成交；纸面/真钱自己切，房主只是记账。
 - **多外观**：用 `skin.json` 注册素材源；换皮不动名字、身份、记录和农场。
 
 > **平台**：桌面宠物支持 **macOS / Windows**。Linux 或 web profile 没有桌面层，
@@ -100,20 +115,21 @@ node scripts/uninstall.mjs
 ## 桌面上会发生什么
 
 <p align="center">
-  <img src="assets/screens/menu.svg" alt="宠物右键菜单：打开软件、带派、农场、盘口、动作和外观" width="720">
+  <img src="assets/screens/menu.svg" alt="宠物右键菜单：打开软件、带派、农场、盘口、期货、动作和外观" width="720">
 </p>
 
 | 操作 | 结果 |
 | --- | --- |
 | 悬停自己 | 弹出「串门 / 改名」；它不在家时桌面换成胶囊（见下） |
-| 右键自己 | 打开软件 / 带派 / 农场 / 盘口 / 回到初始位置 / 重载配置 / 扫描外观 / 动作 / 外观 |
+| 右键自己 | 打开软件 / 带派 / 农场 / 盘口 / 期货 / 回到初始位置 / 重载配置 / 扫描外观 / 动作 / 外观 |
 | 拖动宠物 | 抓起来，松手按轨迹投掷 |
 | 点访客 | 送客 |
 | 点礼物卡 | 打开 / 在文件夹里显示 / 复制（字条）/ 扔掉；红包是「拆开」 |
 | 右键「农场」 | 打开农场小窗；再点一次、点 × 或按 Esc 关闭 |
 | 右键「盘口」 | 打开盘口小窗；再点一次、点 × 或按 Esc 关闭 |
-| 拖盘口窗 | 按住标题栏的 `⠿` 握把拖动；松手位置会记住 |
-| 点窗口外面 | 农场 / 带派 / 改名 / 盘口四扇小窗一起收起 |
+| 右键「期货」 | 打开期货小窗；再点一次、点 × 或按 Esc 关闭 |
+| 拖盘口 / 期货窗 | 按住标题栏的 `⠿` 握把拖动；松手位置会记住 |
+| 点窗口外面 | 农场 / 带派 / 改名 / 盘口 / 期货五扇小窗一起收起 |
 
 右键菜单里的「重载配置」会重读 `settings.json` 和 `skin.json`，并重建桌面，不会占用崩溃退避次数。
 菜单只挂自己的宠物：访客和空白桌面都不会弹。
@@ -168,7 +184,7 @@ node scripts/uninstall.mjs
 礼物永远不会自动打开或执行：打开、显示、复制、扔掉、拆红包，都只在用户点卡片时发生。
 
 <p align="center">
-  <img src="assets/screens/gift.svg" alt="访客留下的礼物卡：一张写在横线纸上的字条，和一只写着福字的红包" width="860">
+  <img src="assets/screens/gift.svg" alt="访客留下的礼物卡：一张写在横线纸上的字条、一只写着福字的红包，旁边是两只真实宠物" width="860">
 </p>
 
 | 项 | 限制 |
@@ -441,7 +457,7 @@ node scripts/uninstall.mjs
 <details>
 <summary><strong>农场数据文件与降级</strong></summary>
 
-农场三个文件和 `visits.json` / `backpack.json` / `trading.json` 同一套路：带 `version: 1`、可手改、可删；
+农场三个文件和 `visits.json` / `backpack.json` / `trading.json` / `futures.json` 同一套路：带 `version: 1`、可手改、可删；
 损坏时按默认值运行并只告警一次；写入串行 + 临时文件 rename。删掉 `farm.json` 就是重新开局。
 
 | 文件 | 内容 |
@@ -450,6 +466,7 @@ node scripts/uninstall.mjs
 | `market.json` | 十种作物的 `base/price/volume24h/at`、最近 200 笔成交、局域网指数 |
 | `contracts.json` | `outgoing`（我是雇主）与 `incoming`（我是雇工）两份合同列表 |
 | `trading.json` | 本周盈亏、持仓、到价挂单、最近 200 条结算历史（不含硬币余额） |
+| `futures.json` | 期货托管余额、持仓、挂单、成交、账户档位/暂停、保险基金与欠账（纸面账也记在这里） |
 
 | 情况 | 看到 |
 | --- | --- |
@@ -482,7 +499,7 @@ node scripts/uninstall.mjs
 Esc 关闭，关掉之后宿主仍然每分钟结算。窗口可拖标题栏移动，位置记在 Electron 的
 `userData/board-window.json`（macOS 默认在 `~/Library/Application Support/dsh-zoo-desktop/`；
 下次打开夹回当前工作区，离屏/坏文件回落居中）；点窗口外面（桌面/别的应用/宠物）会收起
-盘口、农场、带派、改名四扇插件窗，正在输入法合成时这一条跳过（[ADR-0029](docs/adr/0029-window-drag-and-dismiss.md)）。
+盘口、期货、农场、带派、改名五扇插件窗，正在输入法合成时这一条跳过（[ADR-0029](docs/adr/0029-window-drag-and-dismiss.md)）。
 
 | 规则 | 怎么算 |
 | --- | --- |
@@ -558,6 +575,12 @@ Esc 关闭，关掉之后宿主仍然每分钟结算。窗口可拖标题栏移�
 
 盘口是 15 分钟的涨跌彩票，期货是**真的市场**：一天一张合约、有到期日、有做市商报价、
 可以和邻居互相成交、到期现金交割或转成现货作物。它不是盘口换皮，两者并存、互不写同一份状态。
+
+<p align="center">
+  <img src="assets/screens/futures.svg" alt="期货小窗：三张日合约的买卖报价、纸面/真钱档位、下单、持仓、挂单和最近成交" width="820">
+</p>
+
+<p align="center"><em>示意图：纸面账户、10× 做多 2 手小番茄；收盘前 30 分钟提醒「转现货」，20:00 现金交割。</em></p>
 
 入口：桌面右键「期货」，或菜单里的「期货」；窗口同样是 760×700，位置记在
 `userData/futures-window.json`。关掉窗口不影响结算——结算是宿主的活。
@@ -644,7 +667,8 @@ peer 的档位与暂停会以 `futures-mode` / `futures-pause` 报文报给房�
 ## 换一张皮
 
 想用其他宠物包的外观，把它的动作目录写进 `~/.dsh/dsh-zoo/skin.json`。
-下面这个例子来自 [`maodie-pet`](https://github.com/Edwardpch/maodie-pet)：
+下面这个例子来自 [`maodie-pet`](https://github.com/Edwardpch/maodie-pet)——README 示意图里那只橘猫
+就是它：
 
 ```json
 {
@@ -682,6 +706,8 @@ peer 的档位与暂停会以 `futures-mode` / `futures-pause` 报文报给房�
 | `farm.json` | 农场：地块、仓库、硬币、露水、挂牌和农场日志 |
 | `season.json` | 当前节日进度/领取、四季来客的随机窗口与结算状态；可删，删了重建 |
 | `market.json` | 本机交易所：价格、成交历史、局域网指数 |
+| `trading.json` | 盘口：本周盈亏、持仓、到价挂单、结算历史 |
+| `futures.json` | 期货：托管余额、持仓、挂单、成交、账户档位/暂停、保险基金与欠账 |
 | `contracts.json` | 雇佣合同（`outgoing` 我是雇主 / `incoming` 我是雇工） |
 | `backpack.json` | 待捎礼物，最多 2 件 |
 | `gifts/` | 收到的礼物，每件一个目录 |
@@ -723,7 +749,7 @@ Windows 首次会弹 Defender 防火墙，需要给**专用网络**放行。文�
 
 | 方法与路径 | 用途 |
 | --- | --- |
-| `GET /dsh-zoo/state` | 邻居、访客、开关、背包、礼物、农场、交易所、合同和盘口 |
+| `GET /dsh-zoo/state` | 邻居、访客、开关、背包、礼物、农场、交易所、合同、盘口和期货 |
 | `POST /dsh-zoo/action` | 放行、串门、改名、换皮、礼物、农场、买卖、雇佣等本机动作 |
 | `POST /dsh-zoo/self-state` | 其他本机插件上报「我现在在干嘛」 |
 | `GET /dsh-zoo/desktop` | 桌面 helper 的实时状态 |
@@ -746,10 +772,12 @@ Windows 首次会弹 Defender 防火墙，需要给**专用网络**放行。文�
 | 看田 | `farm-look` / `farm-raid` |
 | 窗口 | `farm-open` |
 | 盘口 | `trading-open` / `trading-close` / `trading-refresh` / `trading-open-position` / `trading-close-position` / `trading-set-stop` / `trading-place-order` / `trading-cancel-order` / `trading-charts` |
+| 期货 | `futures-open` / `futures-close` / `futures-window` / `futures-refresh` / `futures-deposit` / `futures-withdraw` / `futures-place` / `futures-cancel` / `futures-convert` / `futures-convert-all` / `futures-account-mode` / `futures-pause` / `futures-rollback` / `futures-reconcile` |
 
 每个 action 的 body、返回值和错误码见 [`docs/protocol.md`](docs/protocol.md)。
 `state` 里最常看的是 `neighbors`、`prompt`、`visitors`、`skin`、`backpack`、`gifts`、
-`farm`、`market`、`contracts` 和 `trading`（盘口视图：硬币、本周盈亏、持仓、挂单、历史、周榜）。
+`farm`、`market`、`contracts`、`trading` 和 `futures`（盘口：硬币、本周盈亏、持仓、挂单、历史、周榜；
+期货：托管余额、持仓、挂单、成交、账户档位/暂停、保险基金）。
 
 ```sh
 # 查看邻居和待放行队列
@@ -772,7 +800,7 @@ curl -s -X POST http://127.0.0.1:<DSH端口>/dsh-zoo/self-state \
 ## 和 dsh-pet 的关系
 
 - [`dsh-pet`](https://github.com/PC2005-cloud/dsh-pet) 提供宠物本体：名字、动作、外观和桌宠窗口；
-  `dsh-zoo` 只做联机、串门和画布。
+  `dsh-zoo` 只做联机、串门和画布。README 示意图里的宠物帧也是从它和它的皮里截的。
 - 名字只有一份：源头是 `dsh-pet` 的 `pets[].name`，`dsh-zoo` 只是镜像；没装 `dsh-pet` 时
   回落到主机名或「我」，以 `identity.json` 为准。桌面上的「改名」装了 `dsh-pet` 就写回它
   （写不进去整体失败，不会只改一半），没装则写 `identity.json`。
@@ -930,6 +958,8 @@ node scripts/verify-catalog-sync.mjs <host>
   行情种子公开，懂代码的人可以预计算下一根（和「不做强防作弊」一致），要更公平得上 commit-reveal。
 - 盘口窗口约 760×700，关掉后宿主继续每分钟结算；到价挂单只在本机、不跨机，也不做部分成交。
   强平/止损按 1 分钟网格检查——落在两根 tick 之间的极端插针只能按相邻分钟成交。
+- 期货窗口同样是 760×700；关掉后宿主照常每 15 秒盯市、强平和交割，托管余额和持仓在房主账本里。
+  一天只有一张日合约，20:00 后和周末休市，不持仓过夜。
 
 ## 文档
 
@@ -937,11 +967,10 @@ node scripts/verify-catalog-sync.mjs <host>
 - 桌面 helper、点击穿透、场景 v3、素材协议：[`desktop/README.md`](desktop/README.md)
 - 领域词汇：[`CONTEXT.md`](CONTEXT.md)
 - 决策记录：[`docs/adr/`](docs/adr/)（季节时钟/四季作物/来客与冻住见 ADR-0020～0023，
-  盘口见 ADR-0028）
-- 四季与季候来客规格：[`.scratch/dsh-zoo/SPEC-v8.md`](.scratch/dsh-zoo/SPEC-v8.md)
-- 盘口规格：[`.scratch/dsh-zoo/SPEC-v10.md`](.scratch/dsh-zoo/SPEC-v10.md)
+  盘口见 ADR-0028 / ADR-0033，期货见 ADR-0032～0035）
+- 期货上手、窗口地图与报错对照：[`docs/play-futures.md`](docs/play-futures.md)
 - 发布与上架 dsh-market：[`docs/release.md`](docs/release.md)
-- 开发笔记与验收截图：[`.scratch/dsh-zoo/`](.scratch/dsh-zoo/)
+- 开发笔记与验收截图：`.scratch/dsh-zoo/`（本地目录，不随仓库发布）
 
 ## 致谢
 
@@ -949,7 +978,10 @@ node scripts/verify-catalog-sync.mjs <host>
   没有它，dsh-zoo 就没有宠物可联机。
 - [`Edwardpch/maodie-pet`](https://github.com/Edwardpch/maodie-pet)：示例皮肤和动作素材，
   `skin.json` 的例子就是照着它写的。
+- README 示意图里的宠物帧直接取自这两个素材包（`assets/pets/`），版权归原作者；素材**禁止商用**，
+  二创在公开渠道须署名。
 
 ## 许可证
 
-MIT
+代码 MIT。`assets/pets/`（以及嵌在示意图里的宠物帧）来自 `dsh-pet` / `maodie-pet`，版权归原作者，
+**不适用** MIT：素材禁止商用，二创在公开渠道须署名。
