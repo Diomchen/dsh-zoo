@@ -6030,7 +6030,20 @@ export function createService (ctx, options = {}) {
         target: event.target ?? undefined,
         orderId: event.orderId ?? undefined,
         // 「带派」小窗的提交（ticket 24）带一件待放物品；其余动作这里是 undefined。
-        gift: event.gift ?? undefined
+        gift: event.gift ?? undefined,
+        // 1.12.5：期货窗自己的三个字段。这一跳漏一个，到 store 就只剩「未知的账户档位。」
+        // 或者「暂停开关只接受 true / false」——四跳白名单（preload → IPC → shared →
+        // 这里）少抄一处，按钮点了没反应，报的错还跟按的那个按钮毫无关系。
+        accountMode: event.accountMode ?? undefined,
+        paused: event.paused ?? undefined,
+        positions: Array.isArray(event.positions) ? event.positions : undefined,
+        // 1.12.5：期货窗的充值/提现（coins）、限价挂单（price/lots）、转现货（lots）、
+        // 老档位入口（mode）。这四个从 1.9 起就没抄过来——窗口里点「充值」到宿主只剩
+        // 一句「金额不对」，而测试全走 service.action（HTTP 同形），四跳白名单漏了也没人发现。
+        coins: event.coins ?? undefined,
+        price: event.price ?? undefined,
+        lots: event.lots ?? undefined,
+        mode: event.mode ?? undefined
       })
     } catch (error) {
       warn(ctx, '桌面控件动作失败（' + event.action + '）：' + message(error))
