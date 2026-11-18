@@ -1024,8 +1024,8 @@ class FuturesStore {
     return null
   }
 
-  #limitError (code) {
-    return { ok: false, error: code, notice: FUTURES_ERROR_TEXT[code] }
+  #limitError (code, notice = FUTURES_ERROR_TEXT[code]) {
+    return { ok: false, error: code, notice }
   }
 
   /** 本地自然日 00:00（票 98 的日额按本地时区归零）。 */
@@ -1070,11 +1070,18 @@ class FuturesStore {
     const owner = account ?? this.#state
     this.#rollDayFor(owner, stamp)
     const cap = DAILY_NOTIONAL_CAP
+    const usedDay = roundCoin(owner.dayNotional)
     if (owner.dayNotional + amount >= cap) {
-      return this.#limitError('daily-cap')
+      // 说清楚「还剩多少」：光一句「已到上限」看不出差多少，窗口也没法提示下一单该缩到多小。
+      return this.#limitError('daily-cap',
+        '今日交易额已到上限：上限 ' + cap + ' 名义，已用 ' + usedDay + '，这笔要 ' + amount +
+        '，明天 00:00 重置。')
     }
-    if (this.#notionalOfAccount(account) + amount >= POSITION_NOTIONAL_CAP) {
-      return this.#limitError('notional-cap')
+    const usedPosition = this.#notionalOfAccount(account)
+    if (usedPosition + amount >= POSITION_NOTIONAL_CAP) {
+      return this.#limitError('notional-cap',
+        '持仓名义已到上限：上限 ' + POSITION_NOTIONAL_CAP + ' 名义，已用 ' + usedPosition +
+        '，这笔要 ' + amount + '，先平掉一点再开。')
     }
     return null
   }

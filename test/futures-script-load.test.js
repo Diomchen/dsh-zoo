@@ -255,3 +255,30 @@ test('desktop/futures.js 顶栏的「×」交给宿主关窗（无边框窗口�
   assert.match(html, /-webkit-app-region: drag/)
   assert.match(html, /#app \{[^}]*border: 2px solid/)
 })
+
+
+test('desktop/futures.js 把宿主给的拒绝原因显示出来，而不是「没成交，再试一次」', () => {
+  const view = require(join(ROOT, 'desktop', 'futures-view.js'))
+  let onResult = null
+  const bridge = {
+    onState () {},
+    onResult (fn) { onResult = fn },
+    onComposing () {},
+    submit () { return true },
+    close () {},
+    ready () {}
+  }
+  const { document } = loadWindowScript('futures.js', { bridge, view })
+  assert.equal(typeof onResult, 'function', '脚本应该把 onResult 接上')
+
+  // 宿主给的是 { ok, notice, code }：notice 必须原样显示（1.12.1 之前看的是 message，全被吞掉）。
+  onResult({ ok: false, code: 'daily-cap', notice: '今日交易额已到上限：上限 5000 名义，已用 3500，这笔要 1560，明天 00:00 重置。' })
+  assert.match(document.getElementById('toast').textContent, /^今日交易额已到上限：/)
+
+  // 宿主没给 notice 时按错误码兜底，至少说出「为什么」。
+  onResult({ ok: false, code: 'no-balance' })
+  assert.match(document.getElementById('toast').textContent, /余额不够/)
+
+  onResult({ ok: false, code: 'daily-cap' })
+  assert.match(document.getElementById('toast').textContent, /明天 00:00/)
+})

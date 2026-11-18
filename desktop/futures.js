@@ -41,6 +41,26 @@
   }
 
   /**
+   * 宿主没给 `notice` 时的兜底文案：按错误码说一句人话。
+   * 这些码来自 `src/futures.js` 的 `FUTURES_ERROR_TEXT`，窗口只补「宿主没说」的那几种。
+   */
+  const RESULT_TEXT = {
+    'daily-cap': '今天的交易额用完了，明天 00:00 重置。',
+    'notional-cap': '持仓名义到上限了，先平掉一点再开。',
+    'position-limit': '持仓笔数到上限了，先平掉一笔。',
+    'order-limit': '挂单已经有 8 笔了，先撤一笔。',
+    'no-balance': '托管余额不够：先充一点再下单。',
+    paused: '你暂停了期货交易，点「继续交易」再来。',
+    disabled: '这个账户已经退出了，要重新充值才会开一张新账。',
+    'market-closed': '现在不在交易时段。',
+    'self-trade': '不能跟自己成交，换个价或换个方向。',
+    'bad-market-order': '这笔市价单的形状不对（方向/保证金/杠杆）。',
+    'bad-order': '这笔挂单的形状不对（价格/张数/杠杆）。',
+    timeout: '宿主没回话，稍等一下再试。',
+    'host-unavailable': '连不上房主，等一下再试。'
+  }
+
+  /**
    * 窗口 → 宿主。preload 会按动作白名单再筛一遍：没登记的动作 `submit()` 返回 false、
    * 一个字节都不发（1.10–1.12 的切档/全部转/暂停就这么「点了没反应」过）。
    * 所以这里不吞返回值——发不出去至少说一句，别让按钮看起来像坏了。
@@ -503,7 +523,12 @@
       return
     }
     state.busy = false
-    toast(typeof result?.message === 'string' && result.message !== '' ? result.message : '没成交，再试一次。')
+    // 宿主回的是 `{ ok, notice, code }`（不是 `message`）：以前只认 `message`，
+    // 于是所有拒绝都显示同一句「没成交，再试一次」——把人挡在门外还不说为什么。
+    const said = typeof result?.notice === 'string' && result.notice !== ''
+      ? result.notice
+      : (typeof result?.message === 'string' && result.message !== '' ? result.message : '')
+    toast(said !== '' ? said : (RESULT_TEXT[result?.code] ?? '没成交，再试一次。'))
     render()
   })
   bridge.onComposing((flag) => { state.composing = flag })

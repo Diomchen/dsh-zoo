@@ -214,7 +214,7 @@ test('票 98：日额 4,999 通过、5,000 拒', async (t) => {
   const second = await store.open({ crop: CROP, side: 'long', margin: 1, leverage: 1, at: NOW })
   assert.equal(second.ok, false)
   assert.equal(second.error, 'daily-cap')
-  assert.equal(second.notice, '今日交易额已到上限。')
+  assert.match(second.notice, /^今日交易额已到上限：/)
   assert.equal(store.snapshot().dayNotional, 4999, '拒单不累计日额')
 })
 
@@ -257,7 +257,7 @@ test('票 98：持仓名义 19,999 通过、20,000 拒', async (t) => {
   const second = await store.open({ crop: CROP, side: 'long', margin: 1, leverage: 1, at: NOW })
   assert.equal(second.ok, false)
   assert.equal(second.error, 'notional-cap')
-  assert.equal(second.notice, '持仓名义已到上限。')
+  assert.match(second.notice, /^持仓名义已到上限：/) 
   assert.equal(store.snapshot({ at: NOW }).positions.length, 2, '拒单不建仓')
 })
 

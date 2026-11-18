@@ -250,8 +250,11 @@
     if (cropId === null) return { ok: false, reason: '选作物', ...base }
     const price = round2(side === 'long' ? quote?.ask : quote?.bid)
     if (price === null || price <= 0) return { ok: false, reason: '这张合约现在不能交易', ...base }
-    const notional = round2(margin * leverage) ?? 0
-    const lots = Math.max(1, Math.floor(notional / (price * lotSize)))
+    const wanted = round2(margin * leverage) ?? 0
+    const lots = Math.max(1, Math.floor(wanted / (price * lotSize)))
+    // 名义是「真实张数 × 一张多少单位 × 价」：保证金太小、张数被抬到 1 张时，
+    // 名义会比「保证金 × 杠杆」大得多（1 张 15.54 的蓝莓 = 1,554 名义，不是 100）。
+    const notionalReal = round2(lots * lotSize * price) ?? 0
     const usedMargin = round2((lots * lotSize * price) / leverage) ?? 0
     const fee = round2(lots * lotSize * price * takerFeeRate) ?? 0
     const move = 1 / leverage
@@ -264,7 +267,7 @@
       leverage,
       price,
       lots,
-      notional,
+      notional: notionalReal,
       margin: usedMargin,
       fee,
       liquidation,
