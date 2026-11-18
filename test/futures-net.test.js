@@ -212,6 +212,27 @@ test('票 94：peer 报到后房主回一份 settle，窗口认出 role=peer 与
   assert.equal(b.futuresHost(), bId)
 })
 
+test('1.12.4：房主自己那本账的档位不再画成 peer 的「影子模式」', async (t) => {
+  const { a, b } = await connectedPair(t)
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  // peer 自己选真钱：窗口上就该是真钱，合约该是「交易中」，而不是「影子模式」。
+  await callAction(a, { action: 'futures-account-mode', accountMode: 'live' })
+  await waitFor(() => a.futuresWindow().accountMode === 'live')
+  const peer = a.futuresWindow()
+  assert.equal(peer.accountMode, 'live')
+  assert.equal(peer.session.kind, 'trading', 'peer 的 session 不该被房主的档位顶掉')
+  assert.notEqual(peer.session.text ?? '', '影子模式：只记账，不动农场硬币')
+  assert.equal(peer.canTrade, true)
+
+  // 房主自己按「暂停」只停自己那本账，peer 的市场照旧。
+  await callAction(b, { action: 'futures-pause', paused: true })
+  await waitFor(() => b.futuresWindow().paused === true)
+  const after = a.futuresWindow()
+  assert.equal(after.session.kind, 'trading', '房主暂停自己不该把邻居的市场关掉')
+  assert.equal(after.canTrade, true)
+})
+
 test('票 94：房主替 peer 充值 + 开仓，peer 窗口的余额/持仓与房主账本一致', async (t) => {
   const { a, b, aId } = await connectedPair(t)
   await waitFor(() => a.futuresWindow().peer.ready === true)

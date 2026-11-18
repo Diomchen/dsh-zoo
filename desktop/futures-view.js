@@ -166,6 +166,8 @@
     // 票 96 的两个兜底数：宿主还没下发时按 0 画，别显示成「—」像丢了数据。
     const insurance = round2(view?.insurance) ?? 0
     const shortfall = round2(view?.shortfall) ?? 0
+    // 1.12.4：做市商净盈亏。负 = 系统净付出（玩家整体赢了多少），正 = 系统净收。
+    const house = round2(view?.house) ?? 0
     // 收益率的分母用「本周开始时的权益」近似：现在权益 − 本周盈亏。
     const base = equity - weekPnl
     const weekPct = base > 0 ? weekPnl / base : null
@@ -178,6 +180,8 @@
       weekTone: weekPnl > 0 ? 'up' : weekPnl < 0 ? 'down' : 'flat',
       insurance: formatCoin(insurance),
       shortfall: formatCoin(shortfall),
+      house: formatSigned(house),
+      houseTone: house > 0 ? 'up' : house < 0 ? 'down' : 'flat',
       mode: modeOf(view)
     }
   }

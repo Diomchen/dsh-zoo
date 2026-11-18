@@ -1719,6 +1719,7 @@ export function encodeFuturesSettle ({
   trades,
   insurance = 0,
   shortfall = 0,
+  house = 0,
   mode = FUTURES_DEFAULT_MODE,
   accountMode = null,
   paused = false,
@@ -1743,6 +1744,8 @@ export function encodeFuturesSettle ({
     pending,
     now
   }
+  // 1.12.4：做市商净盈亏，只在非 0 时带字段（负数是合法的：负 = 系统净付出）。
+  if (Number.isFinite(house) && house !== 0) packet.house = house
   // 1.10.0：账户档位是可选字段（老 peer 不发 = 不知道，按 null）。
   if (isFuturesAccountMode(accountMode)) packet.accountMode = accountMode
   // 1.12.0：账户自己的暂停开关，只在按下时带字段（缺省 = 没暂停）。
@@ -2524,6 +2527,12 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     if (insurance === null) return fail('insurance')
     const shortfall = raw.shortfall === undefined ? 0 : normalizeFuturesCoin(raw.shortfall)
     if (shortfall === null) return fail('shortfall')
+    // 1.12.4：做市商净盈亏可选、允许为负（老房主不发 = 0）。
+    let house = 0
+    if (raw.house !== undefined) {
+      if (typeof raw.house !== 'number' || !Number.isFinite(raw.house)) return fail('house')
+      house = raw.house
+    }
     // 票 98：模式缺省按 shadow（新装实例的缺省）；显式给了就必须在三值白名单里。
     const mode = raw.mode === undefined
       ? FUTURES_DEFAULT_MODE
@@ -2556,6 +2565,7 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         trades,
         insurance,
         shortfall,
+        house,
         mode,
         accountMode,
         paused,
