@@ -799,7 +799,7 @@ test('票 91：版面常量是「作物条 40 / 图 268 / 下单横条 104 / 底
   assert.equal(view.BOARD_WIDTH, 760)
   assert.equal(view.BOARD_HEIGHT, 700)
   assert.equal(view.CHART_WIDTH, 720)
-  assert.equal(view.CHART_HEIGHT, 228)
+  assert.equal(view.CHART_HEIGHT, 212)
   assert.deepEqual(view.LAYOUT.columns.left, ['positions', 'history'])
   // 票 91：下单搬去图下横条，右列只剩真人周榜。
   assert.deepEqual(view.LAYOUT.columns.right, ['league'])
@@ -828,7 +828,7 @@ test('票 91：版面常量是「作物条 40 / 图 268 / 下单横条 104 / 底
 
   const board = view.boardView(tfPayload(), { crop: 'tomato', now: SLOT_EDGE })
   assert.equal(board.chart.geometry.width, 720)
-  assert.equal(board.chart.geometry.height, 228)
+  assert.equal(board.chart.geometry.height, 212)
   assert.ok(board.chart.geometry.timeTicks.length >= 3)
   // 老 payload（只有 charts，没有 timeframes/start/end）不抛：图照画，时间轴没数据就留空。
   const legacy = view.boardView(payload(), { crop: 'tomato', now: SLOT_EDGE })
@@ -845,8 +845,8 @@ test('票 91：版面常量是「作物条 40 / 图 268 / 下单横条 104 / 底
   assert.match(html, /grid-template-rows: 40px 268px 104px minmax\(0, 1fr\)/)
   assert.match(html, /class="card chart-card"/)
   assert.match(html, /class="card order-bar"/)
-  assert.match(html, /viewBox="0 0 720 228"/)
-  assert.match(html, /\.chart-svg \{[\s\S]*?height: 228px/)
+  assert.match(html, /viewBox="0 0 720 212"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 212px/)
   assert.doesNotMatch(html, /grid-template-areas:[\s\S]{0,80}'chart order'/)
   // 页面本身不滚（内层列表可以滚），窗口内容 760×700 内收住。
   assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)

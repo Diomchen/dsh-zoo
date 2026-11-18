@@ -79,6 +79,7 @@ import {
   takerFeeOf
 } from './futures-rules.js'
 import { buildLeague, watcherCounts } from './trading-league.js'
+import { calendarForDay, newsForWindow } from './board-news.js'
 import {
   BOARD_TIMEFRAMES,
   PRICE_CEIL_RATIO,
@@ -2500,6 +2501,40 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 盘口窗的消息面（票 104/105）：当前作物最近 24 小时 + 未来 1 小时的消息全文，
+   * 以及今日 5 条日程。bar 上的 lite 事件只带标题/方向/影响；详情卡用这里的正文。
+   */
+  function tradingNewsView (now, crop) {
+    const items = typeof crop !== 'string' || crop === ''
+      ? []
+      : newsForWindow({ crop, now, limit: 20 }).map((event) => ({
+          id: event.id,
+          at: event.at,
+          crop: event.crop,
+          kind: event.kind,
+          tone: event.tone,
+          mag: event.jump,
+          title: event.title,
+          body: event.body,
+          source: event.source,
+          rarity: event.rarity
+        }))
+    const calendar = calendarForDay({ now }).map((row) => ({
+      id: row.id,
+      at: row.at,
+      crop: row.crop,
+      cropName: row.cropName,
+      title: row.title,
+      source: row.source,
+      mag: row.mag,
+      tone: row.tone,
+      countdownMs: Math.max(0, row.at - now),
+      done: row.at <= now
+    }))
+    return { items, calendar }
+  }
+
+  /**
    * 盘口窗切到另一种作物时的按需拉图（票 90）。
    *
    * 为什么单独一条动作：一份 payload 只装得下当前作物的四个周期；窗口切页签时
@@ -2518,12 +2553,15 @@ export function createService (ctx, options = {}) {
     }
     tradingBoardCrop = crop
     const now = tradingClock()
+    const news = tradingNewsView(now, crop)
     return {
       ok: true,
       action: 'trading-charts',
       crop,
       timeframes: tradingTimeframesView(now, [crop]),
-      hint: tradingHintView(now, [crop])
+      hint: tradingHintView(now, [crop]),
+      // 没有消息就不带这个键：老窗口/老测试看到的仍是原来的五字段形状。
+      ...(news.items.length === 0 && news.calendar.length === 0 ? {} : { news })
     }
   }
 
@@ -2726,6 +2764,10 @@ export function createService (ctx, options = {}) {
       bar: tradingBarView(now, activeCrop),
       timeframes: tradingTimeframesView(now, active),
       hint: tradingHintView(now, active),
+      ...(() => {
+        const news = tradingNewsView(now, activeCrop)
+        return news.items.length === 0 && news.calendar.length === 0 ? {} : { news }
+      })(),
       positions: newestFirst(view.positions, 'openedAt'),
       // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
       // 不会把 240 手假装成 200 手（评审 P1）。

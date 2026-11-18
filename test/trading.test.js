@@ -251,7 +251,7 @@ test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与�
   // 磁盘上就是契约形状：没有硬币余额，只有本周/持仓/挂单/历史。
   const file = await readTrading(dir)
   assert.equal(file.version, TRADING_VERSION)
-  assert.deepEqual(Object.keys(file).sort(), ['history', 'orders', 'positions', 'version', 'week'])
+  assert.deepEqual(Object.keys(file).sort(), ['flow', 'history', 'orders', 'positions', 'version', 'week'])
   assert.equal(file.week.start, MONDAY)
   assert.equal(file.positions.length, 2)
   assert.equal('coins' in file, false)

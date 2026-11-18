@@ -310,7 +310,7 @@ test('票 83 最终 e2e：开窗 → 5× 开仓 → 设止损 → 到价成交 �
 
   // 7) 存档：挂单空、仓位空、历史两条、没有余额字段。
   const file = await readTradingOrNull(dir)
-  assert.equal(file.version, 1)
+  assert.equal(file.version, 2)
   assert.deepEqual(file.orders, [])
   assert.deepEqual(file.positions, [])
   assert.equal(file.history.length, 2)

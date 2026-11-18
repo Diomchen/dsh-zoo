@@ -201,7 +201,7 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
 
   // 4) 存档就是契约形状；硬币余额不在盘口文件里。
   const file = await readTrading(dir)
-  assert.equal(file.version, 1)
+  assert.equal(file.version, 2)
   assert.equal(file.week.start, weekStartOf(OPEN_AT))
   assert.deepEqual(file.positions, [])
   assert.deepEqual(file.orders, [])

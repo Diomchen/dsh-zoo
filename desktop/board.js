@@ -51,6 +51,16 @@ const chartEl = document.getElementById('chart')
 const chartEmptyEl = document.getElementById('chart-empty')
 const chartSettleHintEl = document.getElementById('chart-settle-hint')
 const slotNoteEl = document.getElementById('slot-note')
+const tickerEl = document.getElementById('ticker')
+const tickerTextEl = document.getElementById('ticker-text')
+const newsPopEl = document.getElementById('news-pop')
+const newsPopTimeEl = document.getElementById('news-pop-time')
+const newsPopTitleEl = document.getElementById('news-pop-title')
+const newsPopBodyEl = document.getElementById('news-pop-body')
+const newsPopSourceEl = document.getElementById('news-pop-source')
+const newsPopImpactEl = document.getElementById('news-pop-impact')
+const newsPopCalendarEl = document.getElementById('news-pop-calendar')
+const newsPopCloseEl = document.getElementById('news-pop-close')
 const displayToggleEl = document.getElementById('display-toggle')
 const displayPopEl = document.getElementById('display-pop')
 const chartTypeOptionsEl = document.getElementById('chart-type-options')
@@ -165,6 +175,12 @@ let barEnd = 0
 let refreshAsked = false
 /** 第一次收到数据时把焦点放到第一个控件上（窗口刚弹出，键盘就能用）。 */
 let focusedOnce = false
+
+/** 便签/消息卡里的长标题按码点截断；SVG text 不会自动省略。 */
+function clipText (value, max) {
+  const chars = Array.from(String(value ?? ''))
+  return chars.length <= max ? chars.join('') : chars.slice(0, max - 1).join('') + '…'
+}
 
 function setTone (element, tone) {
   element.dataset.tone = tone
@@ -300,6 +316,37 @@ function paintCrosshair (hit) {
     group.append(svgText(row.label, { class: 'crosshair-label', x, y }))
     group.append(svgText(row.text, { class: 'crosshair-value', x: x + 14, y }))
   }
+  if (Array.isArray(card.newsRows) && card.newsRows.length > 0) {
+    const ruleY = card.top + 66
+    group.append(svgEl('line', {
+      class: 'crosshair-rule',
+      x1: card.left + 9,
+      x2: card.left + card.width - 9,
+      y1: ruleY,
+      y2: ruleY
+    }))
+    for (let index = 0; index < card.newsRows.length; index += 1) {
+      const row = card.newsRows[index]
+      const y = card.newsTop + index * card.newsLineHeight
+      group.append(svgText(row.icon, {
+        class: 'crosshair-news-icon ' + row.tone,
+        x: card.left + 9,
+        y
+      }))
+      group.append(svgText(clipText(row.text, 27), {
+        class: 'crosshair-news-text',
+        x: card.left + 20,
+        y
+      }))
+    }
+    if (card.newsMore) {
+      group.append(svgText(clipText(card.newsMore, 24), {
+        class: 'crosshair-news-more',
+        x: card.left + 20,
+        y: card.newsTop + card.newsRows.length * card.newsLineHeight + 4
+      }))
+    }
+  }
   chartEl.append(group)
 }
 
@@ -360,6 +407,13 @@ function renderChart (board) {
   windEl.setAttribute('aria-label', '风向 ' + hint.label + ' ' + hint.confidenceText + '，' + hint.note)
   setTone(windEl, hint.tone)
   slotNoteEl.textContent = chart.slotText
+  // 票 106：快讯条只画 view 给的文本；没有消息时写「今日暂无消息」。
+  const ticker = chart.ticker
+  tickerEl.dataset.tone = ticker.tone
+  tickerEl.dataset.hasNews = ticker.hasNews ? 'true' : 'false'
+  tickerTextEl.textContent = ticker.text
+  tickerEl.title = ticker.text
+  tickerEl.setAttribute('aria-label', '快讯：' + ticker.text)
   // 票 89：没有独立的图例行；底价/入场/强平在图的右端各有标签，少一行小字。
   updateCropArrows()
   ensureCropVisible()
@@ -622,6 +676,29 @@ function renderChart (board) {
       transform: 'rotate(-1.4 ' + (tag.x + tag.width / 2) + ' ' + tag.centerY + ')'
     }))
   }
+  // 票 106：消息标记画在清晰层的最上面；小圆点 + 大事件的方向箭头。
+  if (Array.isArray(geometry.newsMarks) && geometry.newsMarks.length > 0) {
+    const newsLayer = svgEl('g', { class: 'chart-news' })
+    for (const mark of geometry.newsMarks) {
+      newsLayer.append(svgEl('circle', {
+        class: 'news-dot ' + mark.tone,
+        cx: mark.x,
+        cy: mark.y,
+        r: mark.rarity >= 2 ? 3.4 : 2.4,
+        'vector-effect': 'non-scaling-stroke'
+      }))
+      if (mark.rarity >= 2 || mark.tone === 'vol') {
+        newsLayer.append(svgEl('circle', {
+          class: 'news-ring ' + mark.tone,
+          cx: mark.x,
+          cy: mark.y,
+          r: mark.rarity >= 3 ? 5.2 : 4.4,
+          'vector-effect': 'non-scaling-stroke'
+        }))
+      }
+    }
+    crisp.append(newsLayer)
+  }
   ink.append(ticksInk)
   chartEl.append(crisp)
 
@@ -629,6 +706,44 @@ function renderChart (board) {
   if (chartPointer !== null) {
     paintCrosshair(view.crosshairAt(geometry, chartPointer.x, chartPointer.y))
   }
+}
+
+/**
+ * 票 106：消息详情卡。数据全部来自纯视图（标题/正文/来源/影响/今日日程）；
+ * 这里只负责填 DOM 与显隐，不自己拼文案、不自己算影响。
+ */
+function hideNewsDetail () {
+  if (newsPopEl === null) return
+  newsPopEl.hidden = true
+}
+
+function showNewsDetail (id) {
+  if (lastBoard === null || newsPopEl === null) return
+  const detail = view.newsDetailView(lastBoard, id)
+  if (detail === null) {
+    hideNewsDetail()
+    return
+  }
+  newsPopTimeEl.textContent = detail.timeText + (detail.cropName === '' ? '' : ' · ' + detail.cropName)
+  newsPopTitleEl.textContent = detail.title
+  newsPopBodyEl.textContent = detail.body === '' ? '这条消息没有更多正文。' : detail.body
+  newsPopSourceEl.textContent = detail.source === '' ? '来源未注明' : detail.source
+  newsPopImpactEl.textContent = detail.magText
+  const calendar = view.calendarView(lastBoard, Date.now()).slice(0, 5)
+  newsPopCalendarEl.textContent = ''
+  for (const row of calendar) {
+    const item = document.createElement('li')
+    const left = document.createElement('span')
+    left.textContent = row.text
+    const right = document.createElement('span')
+    right.textContent = row.countdown
+    item.append(left, right)
+    newsPopCalendarEl.append(item)
+  }
+  const calendarBox = newsPopCalendarEl.parentElement
+  if (calendarBox !== null) calendarBox.hidden = calendar.length === 0
+  newsPopEl.hidden = false
+  newsPopCloseEl.focus({ preventScroll: true })
 }
 
 /** 最近一次渲染出来的 board view：点击挂单时拿 view 算好的 target/band，不再自己解析一遍。 */
@@ -1193,11 +1308,35 @@ chartEl.addEventListener('pointerleave', () => {
   paintCrosshair(null)
 })
 
+// 票 106：点有消息的 K 线打开详情卡；没有消息就什么都不做（不挡原来的十字线）。
+chartEl.addEventListener('click', (event) => {
+  if (chartGeometry === null) return
+  const point = chartPointOf(event)
+  if (point === null) return
+  const hit = view.crosshairAt(chartGeometry, point.x, point.y)
+  if (hit === null || !Array.isArray(hit.newsRows) || hit.newsRows.length === 0) return
+  showNewsDetail(hit.newsRows[0].id)
+})
+
+tickerEl.addEventListener('click', () => {
+  if (lastBoard === null) return
+  const id = lastBoard.chart !== null && lastBoard.chart !== undefined &&
+    lastBoard.chart.ticker !== null && lastBoard.chart.ticker !== undefined
+    ? lastBoard.chart.ticker.id
+    : null
+  if (typeof id === 'string' && id !== '') showNewsDetail(id)
+})
+
+newsPopCloseEl.addEventListener('click', () => {
+  hideNewsDetail()
+})
+
 cropTabsEl.addEventListener('click', (event) => {
   const button = event.target.closest('[data-crop]')
   if (button === null || button.dataset.crop === '') return
   if (button.dataset.crop !== crop) chartsFailed = null
   crop = button.dataset.crop
+  hideNewsDetail()
   ensureCharts()
   render()
 })
@@ -1389,6 +1528,10 @@ closeButton.addEventListener('click', () => api?.close())
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     event.preventDefault()
+    if (!newsPopEl.hidden) {
+      hideNewsDetail()
+      return
+    }
     if (displayOpen) {
       displayOpen = false
       render()
@@ -1423,6 +1566,10 @@ document.addEventListener('keydown', (event) => {
 // 动作，再收弹层——否则第一次点外面会被“重画”吃掉，看起来像点不动。
 document.addEventListener('click', (event) => {
   const target = event.target
+  if (!newsPopEl.hidden && !newsPopEl.contains(target) && !tickerEl.contains(target) && target !== tickerEl) {
+    hideNewsDetail()
+    return
+  }
   if (displayOpen && !displayPopEl.contains(target) && !displayToggleEl.contains(target)) {
     displayOpen = false
     render()

@@ -86,7 +86,7 @@ import {
 export { TRADING_CLOSE_REASONS }
 
 export const TRADING_FILE = 'trading.json'
-export const TRADING_VERSION = 1
+export const TRADING_VERSION = 2
 /** 结算历史最多 200 条；`/state` 与盘口窗只取最近 50 条。 */
 export const MAX_TRADING_HISTORY = 200
 export const TRADING_VIEW_HISTORY = 50
@@ -154,8 +154,23 @@ function initialTradingState (now, base) {
     week: { start: weekStartOf(now) ?? 0, pnl: 0, base },
     positions: [],
     orders: [],
-    history: []
+    history: [],
+    // B 期的 LAN 资金流带：A 期只落一个空壳，版本 1 → 2 的迁移也把它补上。
+    flow: { base: {}, tape: [], seq: 0 }
   }
+}
+
+/** 资金流账本的空壳/归一化：A 期不写、不读；B 期才有内容。坏形状一律退回空壳。 */
+function normalizeFlow (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { flow: { base: {}, tape: [], seq: 0 }, repaired: value === undefined ? 0 : 1 }
+  }
+  const base = value.base !== null && typeof value.base === 'object' && !Array.isArray(value.base)
+    ? { ...value.base }
+    : {}
+  const tape = Array.isArray(value.tape) ? value.tape.slice(0, 500) : []
+  const seq = Number.isInteger(value.seq) && value.seq >= 0 ? value.seq : 0
+  return { flow: { base, tape, seq }, repaired: 0 }
 }
 
 function copyHistory (entry) {
@@ -417,25 +432,30 @@ function normalizeOrders (value) {
  */
 export function normalizeTradingFile (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0 }
+    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0, migrated: false }
   }
-  if (value.version !== undefined && value.version !== TRADING_VERSION) {
-    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0 }
+  // v1 → v2：v1 没有 flow 字段，未平仓位的 entry 是 v4 行情的价；load 里会按 v5 re-base。
+  const migrated = value.version === undefined || value.version === 1
+  if (!migrated && value.version !== TRADING_VERSION) {
+    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0, migrated: false }
   }
   const week = normalizeWeek(value.week)
   const positions = normalizePositions(value.positions)
   const orders = normalizeOrders(value.orders)
   const history = normalizeHistory(value.history)
+  const flow = normalizeFlow(value.flow)
   return {
     state: {
       version: TRADING_VERSION,
       week: week.week,
       positions: positions.positions,
       orders: orders.orders,
-      history: history.history
+      history: history.history,
+      flow: flow.flow
     },
     corrupt: false,
-    repaired: week.repaired + positions.repaired + orders.repaired + history.repaired
+    repaired: week.repaired + positions.repaired + orders.repaired + history.repaired + flow.repaired,
+    migrated
   }
 }
 
@@ -449,7 +469,12 @@ function toFileState (state) {
     },
     positions: state.positions.map(copyPosition),
     orders: state.orders.map(copyOrder),
-    history: state.history.map(copyHistory)
+    history: state.history.map(copyHistory),
+    flow: {
+      base: { ...(state.flow?.base ?? {}) },
+      tape: Array.isArray(state.flow?.tape) ? state.flow.tape.slice(0, 500) : [],
+      seq: Number.isInteger(state.flow?.seq) && state.flow.seq >= 0 ? state.flow.seq : 0
+    }
   }
 }
 
@@ -535,6 +560,23 @@ class TradingStore {
     } else if (normalized.repaired > 0) {
       this.#warnOnce('entries', '盘口里有 ' + normalized.repaired + ' 处格式不对，已按默认值修补')
     }
+    // v1 → v2：老仓位的 entry 是 v4 行情的价。按 v5 现价重新入场（PnL 从 0 开始），
+    // 而不是让一次行情升级把仓位按一张它们没见过的图结算（ADR-0035 决定 4）。
+    let rebased = 0
+    if (normalized.migrated === true) {
+      for (const position of this.#state.positions) {
+        if (position.settling !== undefined) continue
+        const entry = markPrice({ crop: position.crop, now })
+        if (entry === null) continue
+        position.entry = entry
+        // 开仓时间/顺序不动（列表按它排序）；路径检查改从 re-base 时刻起算。
+        position.rebasedAt = now
+        rebased += 1
+      }
+      if (rebased > 0) {
+        this.#warnOnce('price-v5', '行情升级到 v5，' + rebased + ' 个未平仓位按新行情重新入场')
+      }
+    }
 
     // 先跨周（只清本周盈亏，硬币不动），再补结算：这次补出来的盈亏算本周的。
     const rolled = this.#rollWeek(now)
@@ -563,7 +605,7 @@ class TradingStore {
     const closed = await this.#settleDue(now)
     // 坏文件不覆盖（等下一次动作/tick 再写）；补出来的补结算、跨周与修补要立刻落盘。
     if (!normalized.corrupt &&
-      (resumed || refunded || matched || rolled || closed || normalized.repaired > 0)) {
+      (resumed || refunded || matched || rolled || closed || normalized.repaired > 0 || rebased > 0 || normalized.migrated === true)) {
       await this.#persist(true)
     }
   }
@@ -955,13 +997,14 @@ class TradingStore {
    * `pathScan` 的 3 天上限在账本里永远碰不到（它防的是别处传入的离谱区间）。
    */
   #triggerOf (position, horizon) {
+    const baseFrom = position.rebasedAt ?? position.openedAt
     const liquidationFrom = Math.max(
-      position.openedAt,
-      this.#checked.get(position.id) ?? position.openedAt
+      baseFrom,
+      this.#checked.get(position.id) ?? baseFrom
     )
     const stopFrom = Math.max(
-      position.openedAt,
-      this.#stopFrom.get(position.id) ?? position.openedAt
+      baseFrom,
+      this.#stopFrom.get(position.id) ?? baseFrom
     )
     return pathScan({
       crop: position.crop,
@@ -978,7 +1021,7 @@ class TradingStore {
 
   /** 记住「这手仓位的强平已经检查到这个时刻」；时钟往后退时不倒着走。 */
   #rememberCheck (position, horizon) {
-    const previous = this.#checked.get(position.id) ?? position.openedAt
+    const previous = this.#checked.get(position.id) ?? position.rebasedAt ?? position.openedAt
     if (horizon > previous) this.#checked.set(position.id, horizon)
   }
 

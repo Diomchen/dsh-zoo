@@ -481,6 +481,7 @@
       }
       /* ------------------------------ 图带 ------------------------------ */
       .chart-card {
+        position: relative;
         display: flex;
         flex-direction: column;
         padding: 5px 10px;
@@ -697,12 +698,179 @@
         font-variant-numeric: tabular-nums;
         white-space: nowrap;
       }
-      /* 图 228：viewBox 720×228；轴字/便签 11px（全窗唯一允许的 11px）。 */
+      /* 图 212：viewBox 720×212；轴字/便签 11px（全窗唯一允许的 11px）。 */
+      /* 票 106：图头下 16px 快讯条；不滚动、不推版面，点击打开消息详情。 */
+      .chart-ticker {
+        flex: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        height: 16px;
+        min-width: 0;
+        padding: 0 2px;
+        border: 0;
+        background: transparent;
+        color: var(--ink-soft);
+        font-size: 12px;
+        line-height: 1;
+        text-align: left;
+        cursor: pointer;
+      }
+      .chart-ticker[data-has-news='false'] {
+        cursor: default;
+        color: var(--muted);
+      }
+      .chart-ticker .ticker-label {
+        flex: none;
+        padding: 1px 5px;
+        border-radius: 6px 5px 7px 5px;
+        background: var(--amber-soft);
+        color: var(--amber-ink);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+      .chart-ticker[data-tone='up'] .ticker-label {
+        background: var(--emerald-soft);
+        color: var(--emerald-deep);
+      }
+      .chart-ticker[data-tone='down'] .ticker-label {
+        background: var(--rose-soft);
+        color: var(--rose-ink);
+      }
+      .chart-ticker .ticker-text {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-weight: 600;
+      }
+      .chart-ticker .ticker-dot {
+        flex: none;
+        width: 5px;
+        height: 5px;
+        border-radius: 50%;
+        background: var(--amber);
+      }
+      .chart-ticker[data-has-news='true'] .ticker-dot {
+        animation: ticker-pulse 2.4s ease-in-out infinite;
+      }
+      @keyframes ticker-pulse {
+        0%, 100% { opacity: 0.45; }
+        50% { opacity: 1; }
+      }
+      /* 消息标记：小圆点 + 大事件的方向箭头；画在清晰层，不套手绘滤镜。 */
+      .chart-svg .news-dot {
+        stroke: #fffdf8;
+        stroke-width: 1;
+      }
+      .chart-svg .news-dot.up { fill: var(--emerald); }
+      .chart-svg .news-dot.down { fill: var(--rose); }
+      .chart-svg .news-dot.vol { fill: var(--amber); }
+      .chart-svg .news-ring {
+        fill: none;
+        stroke-width: 1.2;
+        pointer-events: none;
+      }
+      .chart-svg .news-ring.up { stroke: var(--emerald-deep); }
+      .chart-svg .news-ring.down { stroke: var(--rose-ink); }
+      .chart-svg .news-ring.vol { stroke: var(--amber-ink); }
+      /* 消息详情：图内浮层，不新开窗；外点 / Esc / × 关闭。 */
+      .news-pop {
+        position: absolute;
+        top: 42px;
+        left: 18px;
+        z-index: 6;
+        width: 340px;
+        max-height: 218px;
+        overflow: auto;
+        padding: 10px 12px 11px;
+        border: 2px solid var(--ink);
+        border-radius: 13px 11px 14px 10px;
+        background: var(--card);
+        box-shadow: 4px 4px 0 rgba(47, 58, 52, 0.12);
+        color: var(--ink);
+      }
+      .news-pop[hidden] {
+        display: none;
+      }
+      .news-pop-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .news-pop-close {
+        flex: none;
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border: 1px solid var(--line-strong);
+        border-radius: 50%;
+        background: var(--paper);
+        color: var(--ink-soft);
+        font-size: 14px;
+        line-height: 1;
+        cursor: pointer;
+      }
+      .news-pop h3 {
+        margin: 5px 0 4px;
+        font-size: 13px;
+        line-height: 1.35;
+      }
+      .news-pop p {
+        margin: 0 0 6px;
+        font-size: 12px;
+        line-height: 1.5;
+        color: var(--ink-soft);
+      }
+      .news-pop-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        margin: 0 0 7px;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .news-pop-calendar {
+        margin-top: 7px;
+        padding-top: 6px;
+        border-top: 1px dashed var(--line-strong);
+      }
+      .news-pop-calendar b {
+        display: block;
+        margin-bottom: 3px;
+        font-size: 12px;
+        color: var(--ink-soft);
+      }
+      .news-pop-calendar ul {
+        margin: 0;
+        padding: 0;
+        list-style: none;
+      }
+      .news-pop-calendar li {
+        display: flex;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 1px 0;
+        font-size: 12px;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .news-pop-calendar li span:first-child {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .chart-svg {
         display: block;
         flex: none;
         width: 100%;
-        height: 228px;
+        height: 212px;
         font-family: inherit;
         shape-rendering: geometricPrecision;
       }
@@ -878,6 +1046,26 @@
         font-weight: 600;
         fill: var(--ink);
         font-variant-numeric: tabular-nums;
+      }
+      .chart-svg .crosshair-rule {
+        stroke: #e6ddcf;
+        stroke-width: 1;
+        stroke-dasharray: 2 4;
+      }
+      .chart-svg .crosshair-news-icon {
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .chart-svg .crosshair-news-icon.up { fill: var(--emerald-deep); }
+      .chart-svg .crosshair-news-icon.down { fill: var(--rose-ink); }
+      .chart-svg .crosshair-news-icon.vol { fill: var(--amber-ink); }
+      .chart-svg .crosshair-news-text {
+        font-size: 11px;
+        fill: var(--ink-soft);
+      }
+      .chart-svg .crosshair-news-more {
+        font-size: 11px;
+        fill: var(--muted);
       }
       .chart-empty {
         margin: 0;
@@ -1761,15 +1949,37 @@
             <span class="chart-settle-hint" id="chart-settle-hint" data-visible="false"></span>
             <span class="slot-note" id="slot-note">—</span>
           </div>
+          <button class="chart-ticker" id="ticker" type="button" data-tone="flat" data-has-news="false">
+            <span class="ticker-dot" aria-hidden="true"></span>
+            <span class="ticker-label">快讯</span>
+            <span class="ticker-text" id="ticker-text">今日暂无消息，行情照走</span>
+          </button>
           <svg
             class="chart-svg"
             id="chart"
-            viewBox="0 0 720 228"
+            viewBox="0 0 720 212"
             preserveAspectRatio="none"
             role="img"
             aria-label="K 线"
           ></svg>
           <p class="chart-empty" id="chart-empty" hidden>行情还在算</p>
+          <!-- 票 106：消息详情卡（图内浮层，不新开窗）。 -->
+          <div class="news-pop" id="news-pop" role="dialog" aria-label="消息详情" hidden>
+            <div class="news-pop-head">
+              <span id="news-pop-time">—</span>
+              <button class="news-pop-close" id="news-pop-close" type="button" aria-label="关闭消息">×</button>
+            </div>
+            <h3 id="news-pop-title">—</h3>
+            <p id="news-pop-body"></p>
+            <div class="news-pop-meta">
+              <span id="news-pop-source"></span>
+              <span id="news-pop-impact"></span>
+            </div>
+            <div class="news-pop-calendar">
+              <b>今日日程</b>
+              <ul id="news-pop-calendar"></ul>
+            </div>
+          </div>
         </section>
 
         <!-- 票 91 下单横条：整宽两排，图下直接开仓；到价面板是向下的浮层。 -->

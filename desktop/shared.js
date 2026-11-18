@@ -273,6 +273,14 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   /** 宿主给 24 根 + 当前一根；留一点余量，换根数时不必两边同改。 */
   const BOARD_MAX_BARS = 40
   const BOARD_MAX_TICK = 15
+  /** 票 105：一根 K 线最多带几条 lite 消息；窗口顶层最多多少条全文/日程。 */
+  const BOARD_MAX_NEWS_PER_BAR = 2
+  const BOARD_MAX_NEWS_ITEMS = 20
+  const BOARD_MAX_NEWS_CALENDAR = 8
+  const BOARD_MAX_NEWS_TITLE = 60
+  const BOARD_MAX_NEWS_BODY = 160
+  const BOARD_MAX_NEWS_SOURCE = 40
+  const BOARD_MAX_NEWS_COUNT = 80
   /**
    * 盘口 K 线周期（票 84）：与 `src/trading-rules.js` 的 `BOARD_TIMEFRAMES` 同源，
    * `test/farm-constants-drift.test.js` 有 drift 断言盯着两边。
@@ -1992,9 +2000,73 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       open: raw[BOARD_BAR_INDEX.open],
       high: raw[BOARD_BAR_INDEX.high],
       low: raw[BOARD_BAR_INDEX.low],
-      close: raw[BOARD_BAR_INDEX.close]
+      close: raw[BOARD_BAR_INDEX.close],
+      // 票 105：第 8 项是可选的 lite 消息数组；老宿主没有这一项就是 []。
+      news: raw[7]
     }
   }
+  /**
+   * 一根 K 线上的 lite 消息（票 105）：id/时间/第几分钟/方向/影响/标题/稀有度/种类。
+   * 坏一条丢一条，不整根丢；老宿主没有 news 就是空数组。
+   */
+  function normalizeBoardNewsItem (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const id = normalizeText(raw.id, null, MAX_ID_LENGTH)
+    const at = normalizeBoardInt(raw.at, 0, Number.MAX_SAFE_INTEGER)
+    const title = normalizeText(raw.title, null, BOARD_MAX_NEWS_TITLE)
+    if (id === null || at === null || title === null) return null
+    const tone = raw.tone === 'up' || raw.tone === 'down' || raw.tone === 'vol' ? raw.tone : 'vol'
+    const off = normalizeBoardInt(raw.off, 0, BOARD_MAX_TICK) ?? 0
+    const mag = normalizeBoardNumber(raw.mag, -1, 1) ?? 0
+    const rarity = normalizeBoardInt(raw.rarity, 0, 3) ?? 0
+    const kind = normalizeText(raw.kind, '', 16)
+    return { id, at, off, tone, mag, title, rarity, kind }
+  }
+
+  function normalizeBoardBarNews (raw) {
+    const news = []
+    for (const candidate of Array.isArray(raw) ? raw : []) {
+      if (news.length >= BOARD_MAX_NEWS_PER_BAR) break
+      const item = normalizeBoardNewsItem(candidate)
+      if (item !== null) news.push(item)
+    }
+    return news
+  }
+
+  /** 窗口顶层的消息全文 + 今日日程（票 105）。老宿主没有这一块时是空表。 */
+  function normalizeBoardNews (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const items = []
+    for (const candidate of Array.isArray(source.items) ? source.items : []) {
+      if (items.length >= BOARD_MAX_NEWS_ITEMS) break
+      const item = normalizeBoardNewsItem(candidate)
+      if (item === null) continue
+      const crop = normalizeBoardCropId(candidate.crop)
+      const body = normalizeText(candidate.body, null, BOARD_MAX_NEWS_BODY)
+      const sourceText = normalizeText(candidate.source, null, BOARD_MAX_NEWS_SOURCE)
+      items.push({ ...item, crop, body, source: sourceText })
+    }
+    const calendar = []
+    for (const candidate of Array.isArray(source.calendar) ? source.calendar : []) {
+      if (calendar.length >= BOARD_MAX_NEWS_CALENDAR) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const at = normalizeBoardInt(candidate.at, 0, Number.MAX_SAFE_INTEGER)
+      const title = normalizeText(candidate.title, null, BOARD_MAX_NEWS_TITLE)
+      if (at === null || title === null) continue
+      calendar.push({
+        at,
+        crop: normalizeBoardCropId(candidate.crop),
+        cropName: normalizeText(candidate.cropName, '', BOARD_MAX_NEWS_SOURCE),
+        title,
+        tone: candidate.tone === 'up' || candidate.tone === 'down' || candidate.tone === 'vol' ? candidate.tone : 'vol',
+        mag: normalizeBoardNumber(candidate.mag, -1, 1) ?? 0,
+        countdownMs: normalizeBoardInt(candidate.countdownMs, 0, 24 * 60 * 60 * 1000) ?? 0,
+        done: candidate.done === true
+      })
+    }
+    return { items: items.slice(0, BOARD_MAX_NEWS_COUNT), calendar }
+  }
+
   function normalizeBoardBar (raw) {
     const fields = boardBarFields(raw)
     if (fields === null) return null
@@ -2006,6 +2078,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (slot === null || open === null || high === null || low === null || close === null) return null
     // 票 84：`start`/`end` 是这一根的真实毫秒边界（窗口的时间标签靠它）。
     // 老宿主没有这两个字段时保留 null，不因为少一个标签就把整根丢掉。
+    const news = normalizeBoardBarNews(fields.news)
     return {
       slot,
       start: normalizeBoardInt(fields.start, 0, Number.MAX_SAFE_INTEGER),
@@ -2013,7 +2086,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       open,
       high,
       low,
-      close
+      close,
+      // 没有消息就不带这个键：老测试/老窗口看到的仍是原来的 7 字段形状。
+      ...(news.length === 0 ? {} : { news })
     }
   }
 
@@ -2036,7 +2111,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       price,
       // 票 84：粗周期没有「本根第几分钟」，宿主发 null 时必须原样留着（别被 ?? 0 改成 0）。
       tick: raw.tick === null ? null : (normalizeBoardNumber(raw.tick, 0, BOARD_MAX_TICK) ?? 0),
-      remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0
+      remainingMs: normalizeBoardInt(raw.remainingMs, 0, 24 * 60 * 60 * 1000) ?? 0,
+      ...(normalizeBoardBarNews(raw.news).length === 0 ? {} : { news: normalizeBoardBarNews(raw.news) })
     }
   }
 
@@ -2264,6 +2340,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
           ? raw.hint
           : {}
       ),
+      // 票 105：消息全文 + 今日日程；老宿主没有就是空表，空表也不带这个键。
+      ...(() => {
+        const news = normalizeBoardNews(raw.news)
+        return news.items.length === 0 && news.calendar.length === 0 ? {} : { news }
+      })(),
       bar: barRaw === null
         ? null
         : {

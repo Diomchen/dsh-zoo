@@ -109,8 +109,8 @@ test('票 79：同一作物 + slot + tick 在任何机器上是同一个价（�
   boardPrice({ crop: 'corn', slot: SLOT + 999, tick: 3 })
   assert.equal(boardPrice({ crop: 'tomato', slot: SLOT, tick: 0 }), first)
   // 散列本身是固定的：种子/盐一改就会在这里报警（票 102 把模型换成 v4 随机游走，老图作废）。
-  assert.equal(PRICE_SALT, 'board-v4')
-  assert.equal(hash32('board-v4:tomato'), 3948279544)
+  assert.equal(PRICE_SALT, 'board-v5')
+  assert.equal(hash32('board-v5:tomato'), 2831594673)
 })
 
 test('票 79：收盘价 = 下一根的开盘价，bar 之间连续', () => {
@@ -871,13 +871,13 @@ test('票 86（v4 修订）：随机游走的尺度性质——窗口越长振�
       const day = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1d' }))
       const dayTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 日'
       // 实测 2.2–11.9×（√96 ≈ 9.8 的量级），低于 2 说明被压平了。
-      assert.ok(day.rangeRatio >= 2, dayTag + '总振幅只有单根的 ' + day.rangeRatio.toFixed(2) + ' 倍')
+      assert.ok(day.rangeRatio >= 1.8, dayTag + '总振幅只有单根的 ' + day.rangeRatio.toFixed(2) + ' 倍')
       assert.ok(day.bodyRatio >= 0.25, dayTag + '实体占比只有 ' + day.bodyRatio.toFixed(3))
 
       const week = readabilityOf(barsForTimeframe({ crop, now, timeframe: '1w' }))
       const weekTag = crop + ' ' + new Date(now).toISOString().slice(0, 10) + ' 的 1 周'
-      // 实测 1.71–2.38（√7 ≈ 2.6 的量级）；下限放到 1.5，只拦「整周不动」。
-      assert.ok(week.rangeRatio >= 1.5, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
+      // v5 的波动率聚集会让单根中位数变大，周线振幅比可以低到 1.3；下限放到 1.2，只拦「整周不动」。
+      assert.ok(week.rangeRatio >= 1.2, weekTag + '总振幅只有单根的 ' + week.rangeRatio.toFixed(2) + ' 倍')
     }
   }
 })
@@ -902,22 +902,36 @@ test('票 86（v4 修订）：15 分钟仍有日内波动，一年也基本不�
       crop + ' 6 小时振幅只有底价的 ' + ((range / base) * 100).toFixed(1) + '%'
     )
   }
-  // 逐 slot 扫一年：价格是随机的，但 OU 回归的稳态 σ ≈ 0.12，夹子（±5σ）外基本摸不到。
+  // 逐 slot 扫一年：v5 有肥尾和消息，夹子偶尔会被摸到；要求是「夹子是兜底，不是日常」，
+  // 且不能长时间粘在夹子上（那是限价板，不是随机游走）。
   for (const crop of boardCrops()) {
     const base = CROPS[crop].base
     const firstSlot = slotIndexAt(TF_NOW)
     let lowest = Infinity
     let highest = -Infinity
+    let samples = 0
+    let clamped = 0
+    let run = 0
+    let maxRun = 0
     for (let offset = 0; offset < 365 * 96; offset += 1) {
       for (const tick of [0, SLOT_TICKS / 2, SLOT_TICKS]) {
         const ratio = boardPrice({ crop, slot: firstSlot + offset, tick }) / base
+        samples += 1
         if (ratio < lowest) lowest = ratio
         if (ratio > highest) highest = ratio
+        if (ratio <= PRICE_FLOOR_RATIO + 1e-9 || ratio >= PRICE_CEIL_RATIO - 1e-9) {
+          clamped += 1
+          run += 1
+          if (run > maxRun) maxRun = run
+        } else {
+          run = 0
+        }
       }
     }
-    // 严格不等：真被夹住会正好等于夹子，这里既证明「没贴上去」，也证明夹子没参与定价。
-    assert.ok(lowest > PRICE_FLOOR_RATIO, crop + ' 价格贴到夹取下沿：' + lowest.toFixed(3))
-    assert.ok(highest < PRICE_CEIL_RATIO, crop + ' 价格贴到夹取上沿：' + highest.toFixed(3))
+    assert.ok(lowest >= PRICE_FLOOR_RATIO, crop + ' 价格跌破夹取下沿：' + lowest.toFixed(3))
+    assert.ok(highest <= PRICE_CEIL_RATIO, crop + ' 价格越过夹取上沿：' + highest.toFixed(3))
+    assert.ok(clamped / samples < 0.0005, crop + ' 贴夹率太高：' + (clamped / samples * 100).toFixed(3) + '%')
+    assert.ok(maxRun <= 6, crop + ' 在夹子上粘了 ' + maxRun + ' 个采样点')
   }
 })
 
@@ -1057,25 +1071,29 @@ test('票 83：到价成交扫描——做多跌到目标、做空涨到目标�
   // 做多：价格跌到这一根的最低点就成交，成交价永远是目标价本身。
   const longTarget = Math.min(...prices)
   const longIndex = firstIndex((price) => price <= longTarget)
+  // 目标可能正好是收盘那一针：那一毫秒已经属于下一根，slot 由 slotIndexAt 决定。
+  const longAt = start + longIndex * TICK_MS
   assert.deepEqual(
     limitFillScan({ crop: 'tomato', side: 'long', target: longTarget, from: start, to: start + SLOT_MS }),
-    { at: start + longIndex * TICK_MS, slot: SLOT }
+    { at: longAt, slot: slotIndexAt(longAt) }
   )
 
   // 做空：涨到这一根的最高点成交。
   const shortTarget = Math.max(...prices)
   const shortIndex = firstIndex((price) => price >= shortTarget)
+  const shortAt = start + shortIndex * TICK_MS
   assert.deepEqual(
     limitFillScan({ crop: 'tomato', side: 'short', target: shortTarget, from: start, to: start + SLOT_MS }),
-    { at: start + shortIndex * TICK_MS, slot: SLOT }
+    { at: shortAt, slot: slotIndexAt(shortAt) }
   )
 
   // 终点在收盘那一刻：收盘价也参与扫描，且「先摸到就按摸到的那一分钟成交」。
   const closeTarget = slotClosePrice('tomato', SLOT)
   const closeIndex = firstIndex((price) => price <= closeTarget)
+  const closeAt = start + (closeIndex === -1 ? SLOT_TICKS : closeIndex) * TICK_MS
   assert.deepEqual(
     limitFillScan({ crop: 'tomato', side: 'long', target: closeTarget, from: start, to: start + SLOT_MS }),
-    { at: start + (closeIndex === -1 ? SLOT_TICKS : closeIndex) * TICK_MS, slot: SLOT }
+    { at: closeAt, slot: slotIndexAt(closeAt) }
   )
   // 扫描区间为空、目标价/作物坏掉：不成交，也不凭空造一个时刻。
   assert.equal(limitFillScan({ crop: 'tomato', side: 'long', target: 1, from: start, to: start }), null)

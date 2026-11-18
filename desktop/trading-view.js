@@ -46,7 +46,8 @@
   const BOARD_WIDTH = 760
   const BOARD_HEIGHT = 700
   const CHART_WIDTH = 720
-  const CHART_HEIGHT = 228
+  /** 票 106：图高从 228 让 16px 给快讯条；卡片总高 268 不变。 */
+  const CHART_HEIGHT = 212
   const CHART_PADDING = Object.freeze({ top: 8, right: 4, bottom: 6, left: 4 })
   /** 右侧价格轴 + 底部时间轴的留白；文字不套滤镜，所以轴标签不会被画出锯齿。 */
   const CHART_AXIS_PADDING = Object.freeze({ top: 14, right: 62, bottom: 26, left: 10 })
@@ -60,6 +61,8 @@
   const HEADER_HEIGHT = 50
   const CROP_STRIP_HEIGHT = 40
   const CHART_CARD_HEIGHT = 268
+  /** 图头下的快讯条高度；窗口 CSS 与测试共用。 */
+  const TICKER_HEIGHT = 16
   const LEAGUE_COLUMN_WIDTH = 300
   /** 下单横条：整宽，两行（方向/保证金/杠杆/主按钮 + 预览/到价/短提示），不滚不裁。 */
   const ORDER_BAR_HEIGHT = 104
@@ -91,6 +94,7 @@
     headerHeight: HEADER_HEIGHT,
     cropStripHeight: CROP_STRIP_HEIGHT,
     chartCardHeight: CHART_CARD_HEIGHT,
+    tickerHeight: TICKER_HEIGHT,
     orderBarHeight: ORDER_BAR_HEIGHT,
     chart: Object.freeze({
       width: CHART_WIDTH,
@@ -986,7 +990,8 @@
         high: bar.high,
         low: bar.low,
         wickTop: yOf(bar.high),
-        wickBottom: yOf(bar.low)
+        wickBottom: yOf(bar.low),
+        news: Array.isArray(bar.news) ? bar.news : []
       }
     })
     const forming = current === null
@@ -1000,8 +1005,33 @@
           wickTop: yOf(current.high),
           wickBottom: yOf(current.low),
           price: current.price,
-          tick: toNumber(current.tick) ?? 0
+          tick: toNumber(current.tick) ?? 0,
+          news: Array.isArray(current.news) ? current.news : []
         }
+    // 票 106：把每根的关键消息变成一个小标记；最多 3 个，超出由 hover 便签写「还有 N 条」。
+    const newsMarks = []
+    const markNews = (candle, news) => {
+      const list = Array.isArray(news) ? news.slice(0, 3) : []
+      for (let index = 0; index < list.length; index += 1) {
+        const item = list[index]
+        const tone = item.tone === 'down' ? 'down' : item.tone === 'up' ? 'up' : 'vol'
+        const y = tone === 'down'
+          ? Math.min(plot.top + plot.height - 2, candle.wickBottom + 6 + index * 5)
+          : Math.max(plot.top + 2, candle.wickTop - 6 - index * 5)
+        newsMarks.push({
+          id: item.id,
+          at: item.at,
+          title: item.title,
+          tone,
+          rarity: toNumber(item.rarity) ?? 0,
+          x: candle.centerX,
+          y,
+          barIndex: candle.index
+        })
+      }
+    }
+    for (const candle of scaled) markNews(candle, candle.news)
+    if (forming !== null) markNews(forming, forming.news)
     const lineLabels = { base: '底价', entry: '入场', liquidation: '强平' }
     const lines = [
       { key: 'base', value: Number.isFinite(base) ? base : null },
@@ -1041,6 +1071,7 @@
       slotWidth,
       bars: scaled,
       forming,
+      newsMarks,
       lines,
       priceLine: current === null ? null : { value: current.price, y: yOf(current.price) },
       grid: [plot.top, plot.top + plot.height / 2, plot.top + plot.height],
@@ -1386,11 +1417,34 @@
       { key: 'low', label: '低', text: formatPrice(values.low) },
       { key: 'close', label: '收', text: formatPrice(values.close) }
     ]
+    // 票 106：便签下半区放这个时间点的消息；最多 2 条，更多写「还有 N 条」。
+    const news = Array.isArray(nearest.news) ? nearest.news.slice(0, 2) : []
+    const newsRows = news.map((item) => {
+      const mag = toNumber(item.mag) ?? 0
+      const off = toNumber(item.off)
+      const when = geometry.timeframe === CONTRACT_TIMEFRAME && off !== null
+        ? '第' + (Math.floor(off) + 1) + '分钟 '
+        : ''
+      const impact = item.tone === 'vol' ? '波动放大' : formatSigned(mag * 100, 1) + '%'
+      return {
+        id: item.id,
+        tone: item.tone,
+        text: when + item.title + ' · ' + impact,
+        icon: item.tone === 'down' ? '▼' : item.tone === 'up' ? '▲' : '≈'
+      }
+    })
+    const totalNews = Array.isArray(nearest.news) ? nearest.news.length : 0
+    const newsMore = totalNews > newsRows.length
+      ? '还有 ' + (totalNews - newsRows.length) + ' 条，点开看'
+      : ''
     const text = timeText + ' 开 ' + formatPrice(values.open) + ' 高 ' + formatPrice(values.high) +
-      ' 低 ' + formatPrice(values.low) + ' 收 ' + formatPrice(values.close)
+      ' 低 ' + formatPrice(values.low) + ' 收 ' + formatPrice(values.close) +
+      (newsRows.length > 0 ? '；' + newsRows.map((row) => row.text).join('；') : '')
     // 票 89：轴/便签字号提到 11px 后，便签要宽一点、高一点才不挤；仍整体夹在绘图区里。
-    const cardWidth = Math.min(210, Math.max(96, plot.width - 8))
-    const cardHeight = Math.min(78, Math.max(40, plot.height - 8))
+    // 票 106：有消息时加高到 300×122 左右；无消息仍是 210×78。
+    const cardWidth = Math.min(300, Math.max(210, plot.width - 8))
+    const newsBlock = newsRows.length > 0 ? 14 + newsRows.length * 15 + (newsMore === '' ? 0 : 12) : 0
+    const cardHeight = Math.min(Math.max(40, plot.height - 8), 78 + newsBlock)
     // 便签放指针右上方；靠右就翻到左边，靠上就翻到下面，最后再整体夹进绘图区。
     let left = nearest.centerX + 12
     if (left + cardWidth > plot.left + plot.width - 4) left = nearest.centerX - cardWidth - 12
@@ -1408,6 +1462,8 @@
       timeText,
       title: timeText + (forming ? ' · 进行中' : ''),
       rows,
+      newsRows,
+      newsMore,
       text,
       card: {
         left,
@@ -1416,6 +1472,10 @@
         height: cardHeight,
         timeText,
         rows,
+        newsRows,
+        newsMore,
+        newsTop: top + 76,
+        newsLineHeight: 15,
         text
       },
       highlight: {
@@ -1424,6 +1484,100 @@
         width: nearest.width + 4,
         height: Math.max(4, nearest.wickBottom - nearest.wickTop + 4)
       }
+    }
+  }
+
+  /**
+   * 票 106：图头下的快讯条。优先最近一条已经发生的消息；还没发生就显示最近的一条预告。
+   * 没有消息时给一句「今日暂无消息，行情照走」；窗口只照着画。
+   */
+  function tickerView (payload, now = null) {
+    const items = payload !== null && typeof payload === 'object' &&
+      payload.news !== null && typeof payload.news === 'object' &&
+      Array.isArray(payload.news.items)
+      ? payload.news.items
+      : []
+    if (items.length === 0) {
+      return {
+        hasNews: false,
+        id: null,
+        at: null,
+        tone: 'flat',
+        title: '',
+        text: '今日暂无消息，行情照走'
+      }
+    }
+    const stamp = toNumber(now)
+    let item = items[0]
+    if (stamp !== null) {
+      const past = items
+        .filter((entry) => (toNumber(entry.at) ?? 0) <= stamp)
+        .sort((left, right) => (toNumber(right.at) ?? 0) - (toNumber(left.at) ?? 0))
+      const future = items
+        .filter((entry) => (toNumber(entry.at) ?? 0) > stamp)
+        .sort((left, right) => (toNumber(left.at) ?? 0) - (toNumber(right.at) ?? 0))
+      item = past[0] ?? future[0] ?? items[0]
+    }
+    const at = toNumber(item.at)
+    const mag = toNumber(item.mag) ?? 0
+    const impact = item.tone === 'vol' ? '波动放大' : formatSigned(mag * 100, 1) + '%'
+    const timeText = at === null ? '—' : formatClock(at)
+    return {
+      hasNews: true,
+      id: item.id,
+      at,
+      tone: item.tone,
+      title: item.title,
+      text: timeText + ' ' + item.title + ' · ' + impact
+    }
+  }
+
+  /** 票 106：今日日程（5 条），窗口按本机时钟倒计时；已公布写「已公布」。 */
+  function calendarView (payload, now = null) {
+    const rows = payload !== null && typeof payload === 'object' &&
+      payload.news !== null && typeof payload.news === 'object' &&
+      Array.isArray(payload.news.calendar)
+      ? payload.news.calendar
+      : []
+    const stamp = toNumber(now) ?? Date.now()
+    return rows.map((row) => {
+      const at = toNumber(row.at)
+      const diff = at === null ? 0 : at - stamp
+      const done = diff <= 0
+      return {
+        at,
+        done,
+        cropName: row.cropName,
+        title: row.title,
+        tone: row.tone,
+        text: (at === null ? '—' : formatClock(at)) + ' ' + row.title,
+        countdown: done ? '已公布' : formatCountdown(diff)
+      }
+    })
+  }
+
+  /** 票 106：详情卡取一条消息的全文；找不到返回 null（老宿主/坏 id 不编内容）。 */
+  function newsDetailView (payload, id) {
+    if (typeof id !== 'string' || id === '') return null
+    const items = payload !== null && typeof payload === 'object' &&
+      payload.news !== null && typeof payload.news === 'object' &&
+      Array.isArray(payload.news.items)
+      ? payload.news.items
+      : []
+    const item = items.find((entry) => entry !== null && typeof entry === 'object' && entry.id === id)
+    if (item === undefined) return null
+    const at = toNumber(item.at)
+    const mag = toNumber(item.mag) ?? 0
+    return {
+      id: item.id,
+      at,
+      timeText: at === null ? '—' : formatClock(at),
+      title: item.title,
+      body: item.body ?? '',
+      source: item.source ?? '',
+      tone: item.tone,
+      magText: item.tone === 'vol' ? '波动放大' : formatSigned(mag * 100, 1) + '%',
+      cropName: cropNameOf(payload, item.crop)
     }
   }
 
@@ -1441,7 +1595,8 @@
     width = CHART_WIDTH,
     height = CHART_HEIGHT,
     loading = false,
-    chartType = DISPLAY_DEFAULTS.chartType
+    chartType = DISPLAY_DEFAULTS.chartType,
+    now = null
   } = {}) {
     const selected = pickCrop(payload, crop)
     const period = pickTimeframe(payload, timeframe)
@@ -1479,6 +1634,11 @@
       timeframeLabel: label,
       timeframes: timeframesView(payload, period),
       hasChart: geometry !== null,
+      // 票 106：快讯条 + 详情卡的数据（老宿主没有 news 时是空表）。
+      ticker: tickerView(payload, now),
+      news: payload !== null && typeof payload === 'object' && payload.news !== null && typeof payload.news === 'object'
+        ? { items: Array.isArray(payload.news.items) ? payload.news.items : [], calendar: Array.isArray(payload.news.calendar) ? payload.news.calendar : [] }
+        : { items: [], calendar: [] },
       // 票 90：切到还没拉图的作物时画「正在加载」，和「宿主没发/坏了」区分开。
       loading: loading === true && geometry === null,
       // 票 89：空态一行；「K 线一分钟才动一格」这类解释不再挂在窗口上。
@@ -2033,8 +2193,12 @@
         width,
         height,
         loading: chartsLoading === true,
-        chartType: display.chartType
+        chartType: display.chartType,
+        now
       }),
+      news: safe !== null && typeof safe === 'object' && safe.news !== null && typeof safe.news === 'object'
+        ? safe.news
+        : { items: [], calendar: [] },
       // 票 91：显示弹层的按钮/文案/黑白标记都来自这里；`board.js` 只照着画。
       display,
       order,
@@ -2087,6 +2251,9 @@
     chartAxes,
     priceTagOf,
     crosshairAt,
+    tickerView,
+    calendarView,
+    newsDetailView,
     candleSketchOf,
     chartView,
     displayPrefs,
