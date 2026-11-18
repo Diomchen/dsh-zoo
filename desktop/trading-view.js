@@ -1434,7 +1434,8 @@
       return {
         id: item.id,
         tone: item.tone,
-        text: when + item.title + ' · ' + impact,
+        // 影响放前面：卡片窄，标题可以被省略，但「+1.4%」必须一眼看见。
+        text: when + impact + ' · ' + item.title,
         icon: item.tone === 'down' ? '▼' : item.tone === 'up' ? '▲' : '≈'
       }
     })
@@ -1465,7 +1466,8 @@
       y: crosshairY,
       candle: nearest,
       timeText,
-      title: timeText + (forming ? ' · 进行中' : ''),
+      title: timeText + (forming ? ' · 进行中' : '') +
+        (totalNews > 0 ? ' · ' + totalNews + ' 条消息' : ''),
       rows,
       newsRows,
       newsMore,

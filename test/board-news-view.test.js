@@ -161,6 +161,7 @@ test('票 106：十字线便签加高并带消息行；没有消息保持 78 高
   assert.equal(hit.newsRows.length, 1)
   assert.match(hit.newsRows[0].text, /第6分钟/)
   assert.match(hit.newsRows[0].text, /霜冻/)
+  assert.match(hit.newsRows[0].text, /\+1\.4%/)
   assert.ok(hit.card.height > 78, '有消息的便签应加高')
   assert.ok(hit.card.newsTop > hit.card.top)
   assert.match(hit.text, /霜冻/)
