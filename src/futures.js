@@ -158,7 +158,43 @@ export const FUTURES_ERROR_TEXT = Object.freeze({
   'bad-mode': '未知的期货模式。',
   'bad-account-mode': '未知的账户档位。',
   paused: '你暂停了期货交易，继续之后才能开仓或挂单。',
-  'not-owner': '这份账在房主那台，先把仓位平掉、余额提回农场就行。'
+  'not-owner': '这份账在房主那台，先把仓位平掉、余额提回农场就行。',
+  // 1.12.3：下面这些以前只有错误码、没有文案，窗口就退化成「没成交，再试一次」。
+  // 服务层出口会用它补齐 `notice`，所以这里宁可写得啰嗦，也别让用户看代码。
+  'bad-amount': '金额不对：要写正整数（1 到 1,000,000 币）。',
+  'no-coin': '农场硬币不够。',
+  'farm-refused': '农场那边没有办成这笔操作。',
+  'bad-crop': '没有这个作物。',
+  'bad-side': '方向只认「做多」或「做空」。',
+  'bad-margin': '保证金不对：要写 1 到 1,000,000 的整数币。',
+  'bad-leverage': '杠杆只认 1、3、10、20 倍。',
+  'bad-price': '价格不对：要写正的币数，最多两位小数。',
+  'bad-lots': '张数不对：要写 1 到 1,000,000 的整数。',
+  'bad-device': '不认识的邻居（设备号不对）。',
+  'bad-contract': '合约编号不认识。',
+  'contract-expired': '合约已到期，20:00 后停止交易。',
+  'market-closed': '现在没有可交易的合约（周末休市，或已经收盘）。',
+  'no-balance': '托管余额不够：先充值，或者把仓位平掉。',
+  'no-position': '没有这个仓位（可能已经平掉或交割了）。',
+  'no-order': '没有这个挂单（可能已经成交或撤掉）。',
+  'no-space': '仓库放不下这么多现货。',
+  'no-coins': '硬币不够。',
+  'position-limit': '持仓条数到上限了，先平掉几笔。',
+  'order-limit': '挂单条数到上限了，先撤掉几笔。',
+  'self-trade': '不能跟自己的挂单成交。',
+  'bad-order': '挂单参数不对。',
+  'bad-market-order': '市价单参数不对。',
+  'bad-positions': '这批持仓的编号或张数不对。',
+  'write-failed': '存盘失败：磁盘写不进去。',
+  'bad-paused': '暂停开关只接受 true / false。',
+  'bad-epoch': '账本代号不对。',
+  'bad-seq': '账本流水号不对。',
+  'bad-account': '账本里的账户不对。',
+  'bad-orders': '账本里的挂单不对。',
+  'bad-trades': '账本里的流水不对。',
+  'bad-fund': '账本里的保险基金数字不对。',
+  'bad-pending': '账本里的待提取数字不对。',
+  'bad-ledger': '账本快照不对。'
 })
 
 const MAX_ID_LENGTH = 64
@@ -1523,11 +1559,14 @@ class FuturesStore {
     if (spent === null || spent.ok !== true) {
       return { ok: false, error: spent?.error === 'no-coin' ? 'no-coin' : 'farm-refused' }
     }
-    this.#state.balance = roundCoin(this.#state.balance + spent.qty)
-    this.#state.farmIn = roundCoin(this.#state.farmIn + spent.qty)
+    // 农场的契约是「要么整笔划出来，要么失败」；真有实现只回 `ok` 不回 `qty` 时，按我们请求的
+    // 金额记账——否则农场扣了钱、托管没加钱，用户的硬币就这么没了（QA 探针踩到过）。
+    const credited = roundCoin(Number.isFinite(Number(spent.qty)) ? Number(spent.qty) : coins)
+    this.#state.balance = roundCoin(this.#state.balance + credited)
+    this.#state.farmIn = roundCoin(this.#state.farmIn + credited)
     this.#state.tradedAt = this.#nowMs()
     const persisted = await this.#persist()
-    return { ok: true, action: 'futures-deposit', coins: spent.qty, ...this.#view(), persisted }
+    return { ok: true, action: 'futures-deposit', coins: credited, ...this.#view(), persisted }
   }
 
   /**
