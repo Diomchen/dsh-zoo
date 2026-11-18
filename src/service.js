@@ -1068,9 +1068,24 @@ export function createService (ctx, options = {}) {
     return { ...result, notice: result.notice ? result.notice + ' ' + text : text }
   }
 
+  /**
+   * 1.12.3：期货的每个失败都该带一句人话。
+   *
+   * 账本层很多分支只回 `{ ok: false, error: 'bad-price' }`——窗口拿到没有 `notice` 的结果，
+   * 只能退化成「没成交，再试一次」，等于把「价格写错了」说成「网络抽风」。统一在出口按
+   * 错误码补一句，写死的中文留在 `FUTURES_ERROR_TEXT` 一处，别让两个 map 各说一套。
+   */
+  function explainedFutures (action, result) {
+    if (typeof action !== 'string' || action.slice(0, 8) !== 'futures-') return result
+    if (result === null || result === undefined || result.ok !== false) return result
+    if (typeof result.notice === 'string' && result.notice.length > 0) return result
+    const text = FUTURES_ERROR_TEXT[result.error]
+    return text === undefined ? result : { ...result, notice: text }
+  }
+
   async function handleAction (body) {
     try {
-      return await handleActionInner(body)
+      return explainedFutures(body?.action, await handleActionInner(body))
     } finally {
       // 任何 action 都可能间接触发一次串门完成（拒绝清场、召回、到期）：
       // 统一在出口把内存记录交给 visits.json，并补发需要发的 visit-recall。

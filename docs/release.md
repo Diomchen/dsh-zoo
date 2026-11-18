@@ -21,6 +21,19 @@ GitHub Release 正文就是 [`releases/1.13.0.md`](releases/1.13.0.md)。
 `PRICE_SALT` 升到 `board-v5`，旧图作废；`trading.json` 升到 v2，未平仓位按新行情
 re-base 入场价。npm 发布改用 OIDC Trusted Publishing，不再使用长期 `NPM_TOKEN`。
 
+## 什么时候发版
+
+**纯修复不单独发版。** 只改文案、补校验、修一个按钮、加一句提示这类改动，直接提交到 `main`
+就行，不升 `package.json`、不写 `docs/releases/<version>.md`、不打 tag——攒着等下个功能版本一起发。
+
+发版的触发条件是「有新东西能讲」：
+
+- 新机制、新报文、新窗口、新玩法（哪怕是内部实现换了一代）；
+- 或者一段时间里攒下的修复足够写成一篇「这次修了什么」。
+
+判断标准只有一条：**Release 正文能不能写出让玩家关心的一段话。**
+写不出来就说明这次不该发版，提交就够了。发版本身不花钱，但玩家的更新成本是真的。
+
 ## 1.12.2 版本记录
 
 GitHub Release 正文就是 [`releases/1.12.2.md`](releases/1.12.2.md)。

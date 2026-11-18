@@ -340,3 +340,33 @@ test('1.12.0：暂停与退出都是「自己的事」——按了只停自己�
   assert.equal(after.futures.positions.length, 0)
   assert.ok(after.futures.balance < 1, '余额几乎全退回农场，托管账只剩零头')
 })
+
+test('失败的动作都带人话：服务出口按错误码补齐 notice', async (t) => {
+  const { service } = await makeService(t)
+
+  // 账本层的拒绝只带代码（`no-position`），服务出口要按错误码补一句。
+  const noPosition = await act(service, {
+    action: 'futures-close',
+    positionId: '99999999-9999-4999-8999-999999999999'
+  })
+  // 失败一律 409（`sendJson(res, result.ok ? 200 : 409, result)`），但正文必须带一句话。
+  assert.equal(noPosition.status, 409)
+  assert.equal(noPosition.body.ok, false)
+  assert.equal(noPosition.body.error, 'no-position')
+  assert.match(noPosition.body.notice, /没有这个仓位/)
+
+  // 参数校验层的拒绝同样要说清楚，不能只回 `bad-margin`。
+  const badMargin = await act(service, {
+    action: 'futures-open', cropId: 'tomato', side: 'long', margin: 0, leverage: 10
+  })
+  assert.equal(badMargin.status, 409)
+  assert.equal(badMargin.body.ok, false)
+  assert.equal(typeof badMargin.body.error, 'string')
+  assert.match(badMargin.body.notice, /\S/, '失败结果必须带一句中文说明')
+  assert.notEqual(badMargin.body.notice, '没成交，再试一次。')
+
+  // 成功的结果不该被塞多余的 notice。
+  const okDeposit = await act(service, { action: 'futures-deposit', coins: 10 })
+  assert.equal(okDeposit.body.ok, true)
+  assert.equal(okDeposit.body.notice, undefined)
+})
