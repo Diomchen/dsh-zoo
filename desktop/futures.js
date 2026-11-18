@@ -40,6 +40,19 @@
     toast.timer = setTimeout(() => node.classList.remove('show'), 2600)
   }
 
+  /**
+   * 窗口 → 宿主。preload 会按动作白名单再筛一遍：没登记的动作 `submit()` 返回 false、
+   * 一个字节都不发（1.10–1.12 的切档/全部转/暂停就这么「点了没反应」过）。
+   * 所以这里不吞返回值——发不出去至少说一句，别让按钮看起来像坏了。
+   */
+  function send (payload) {
+    const accepted = bridge.submit(payload)
+    if (accepted === false) {
+      toast('这个操作发不出去：窗口的动作白名单里没有它，更新插件后重开窗口试试。')
+    }
+    return accepted
+  }
+
   /** 重建杠杆按钮与作物下拉（清单来自宿主，不硬编码）。 */
   function syncControls (limits, crops) {
     const bar = el('leverage')
@@ -278,7 +291,7 @@
     if (state.composing) return
     if (state.now - state.askedRefreshAt < 5000) return
     state.askedRefreshAt = state.now
-    bridge.submit({ action: 'futures-refresh' })
+    send({ action: 'futures-refresh' })
   }
 
   function applyView (view) {
@@ -325,7 +338,7 @@
       return
     }
     state.busy = true
-    const accepted = bridge.submit({
+    const accepted = send({
       action: 'futures-open',
       side: state.draft.side,
       margin: Math.trunc(state.draft.margin),
@@ -351,7 +364,7 @@
       return
     }
     state.busy = true
-    bridge.submit({ action: 'futures-withdraw', coins })
+    send({ action: 'futures-withdraw', coins })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -360,7 +373,7 @@
     if (typeof positionId === 'string' && positionId !== '') {
       if (state.busy) return
       state.busy = true
-      bridge.submit({ action: 'futures-close', positionId })
+      send({ action: 'futures-close', positionId })
       setTimeout(() => { state.busy = false; render() }, 3000)
       return
     }
@@ -376,7 +389,7 @@
       }
       if (state.busy) return
       state.busy = true
-      bridge.submit({ action: 'futures-convert', positionId: convertId, lots })
+      send({ action: 'futures-convert', positionId: convertId, lots })
       setTimeout(() => { state.busy = false; render() }, 3000)
     }
   })
@@ -388,7 +401,7 @@
     if (targets.length === 0) return
     if (!window.confirm('把这 ' + targets.length + ' 笔持仓全部按公允价转成现货？')) return
     state.busy = true
-    bridge.submit({ action: 'futures-convert-all', positions: targets })
+    send({ action: 'futures-convert-all', positions: targets })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -397,7 +410,7 @@
     if (typeof orderId !== 'string' || orderId === '') return
     if (state.busy) return
     state.busy = true
-    bridge.submit({ action: 'futures-cancel', orderId })
+    send({ action: 'futures-cancel', orderId })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -420,7 +433,7 @@
     }
     hint.textContent = ''
     state.busy = true
-    const accepted = bridge.submit({
+    const accepted = send({
       action: 'futures-place',
       side: state.draft.side,
       cropId: state.draft.cropId,
@@ -443,7 +456,7 @@
     if (!account || (account.next !== 'live' && account.next !== 'shadow')) return
     if (account.next === 'live' && !window.confirm('把这本账切到真钱？之后充值/提现都动农场硬币，盈亏也是真的。')) return
     state.busy = true
-    bridge.submit({ action: 'futures-account-mode', accountMode: account.next })
+    send({ action: 'futures-account-mode', accountMode: account.next })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -452,7 +465,7 @@
     if (state.busy) return
     const paused = state.pause !== null && state.pause !== undefined && state.pause.paused === true
     state.busy = true
-    bridge.submit({ action: 'futures-pause', paused: !paused })
+    send({ action: 'futures-pause', paused: !paused })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -461,7 +474,7 @@
     if (state.busy) return
     if (!window.confirm('退出会把你的仓位按当前价强平、余额退回你的农场，并关掉你这本账。继续？')) return
     state.busy = true
-    bridge.submit({ action: 'futures-rollback' })
+    send({ action: 'futures-rollback' })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 

@@ -11,6 +11,16 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.12.1 版本记录
+
+GitHub Release 正文就是 [`releases/1.12.1.md`](releases/1.12.1.md)。
+
+窗口白名单补齐：`desktop/futures-preload.js` 的 `FIELDS` 补上 `futures-account-mode`（1.10.0
+切档）、`futures-pause`（1.12.0 暂停/继续）、`futures-convert-all`（1.11.0 全部转，1–8 笔
+`{ id, lots }`），三个按钮不再「点了没反应」；`desktop/futures.js` 的提交统一走 `send()`，
+被 preload 拦下时弹一句人话。新增 `test/futures-preload.test.js` 对齐两份白名单，以后忘登记会红。
+同时补上 `docs/play-futures.md`（玩家手册）。
+
 ## 1.12.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.12.0.md`](releases/1.12.0.md)。

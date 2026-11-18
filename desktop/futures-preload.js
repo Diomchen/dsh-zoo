@@ -21,10 +21,31 @@ const FIELDS = {
   'futures-place': ['side', 'cropId', 'price', 'lots', 'leverage'],
   'futures-cancel': ['orderId'],
   'futures-convert': ['positionId', 'lots'],
-  // 票 98：切档与回滚只有房主按得动，宿主还会再判一次。
+  // 1.11.0：持仓表头的「全部转」——只报「转哪几笔、各几张」，价格与余额全在宿主算。
+  'futures-convert-all': ['positions'],
+  // 1.10.0：账户自己的档位；房主那边只剩「开市/关市」的兜底入口 `futures-mode`。
+  'futures-account-mode': ['accountMode'],
+  // 1.12.0：自己的暂停；退出（回滚）也只退自己。
+  'futures-pause': ['paused'],
   'futures-mode': ['mode'],
   'futures-rollback': [],
   'futures-refresh': []
+}
+
+/** 「全部转」最多报 8 笔，每笔只留 id 与张数；别的一律不过桥（宿主还会再校验一次）。 */
+const CONVERT_ALL_LIMIT = 8
+
+function convertAllPositions (raw) {
+  if (!Array.isArray(raw)) return null
+  if (raw.length < 1 || raw.length > CONVERT_ALL_LIMIT) return null
+  const out = []
+  for (const item of raw) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) return null
+    if (typeof item.id !== 'string' || item.id.length === 0 || item.id.length > 64) return null
+    if (!Number.isInteger(item.lots) || item.lots < 1 || item.lots > 100000) return null
+    out.push({ id: item.id, lots: item.lots })
+  }
+  return out
 }
 
 function pick (action, raw) {
@@ -34,6 +55,13 @@ function pick (action, raw) {
   const out = { action }
   for (const key of allowed) {
     const value = raw[key]
+    // 数组字段不能「缺省就跳过」：缺了 positions 的「全部转」等于空操作，得整条拒。
+    if (key === 'positions') {
+      const positions = convertAllPositions(value)
+      if (positions === null) return null
+      out.positions = positions
+      continue
+    }
     if (value === undefined) continue
     out[key] = value
   }
