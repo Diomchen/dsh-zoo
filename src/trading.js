@@ -1,9 +1,9 @@
 /**
- * 盘口账本（票 79/80）：`<dataDir>/trading.json` v1。
+ * 盘口账本（票 79/80）：`<dataDir>/trading.json` v2。
  *
  * 形状（SPEC v10「硬币与账本」）：
  *   {
- *     "version": 1,
+ *     "version": 2,
  *     "week": { "start": 1763308800000, "pnl": 0, "base": 30 },
  *     "positions": [
  *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
@@ -18,7 +18,8 @@
  *     "history": [
  *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
  *         "entry": 5.12, "exit": 5.3, "pnl": 8, "reason": "liquidate", "at": 1763309700000 }
- *     ]
+ *     ],
+ *     "flow": { "base": {}, "tape": [], "seq": 0 }
  *   }
  *
  * 三条产品规则决定这里的形状：
@@ -31,12 +32,14 @@
  *     只补后半段，绝不重复铸币（与 `src/contracts.js` 的 beginSettle/finishSettle 同源，
  *     宁可少退一次也不重复发钱）。
  *
- * 票 80 只做**加法**（`version` 还是 1）：每个仓位多存一个 `stopLoss` 档位；
+ * 票 80/83 是**加法**（当时 `version` 仍为 1）：仓位多存 `stopLoss`，账本多存 `orders`；
+ * 票 103 把 `version` 升到 2：v1 的未平仓位按 `board-v5` 现价 re-base 入场价、写 `rebasedAt`，
+ * 路径检查与「活到哪一根」从 re-base 时刻起算；`openedAt`/顺序不动。
  * 强平价不落盘——它由 `side + entry + leverage` 现算（`liquidationPriceOf`），
  * 存一份就会和改过的 entry/杠杆对不上。逐分钟的强平/止损检查全在 `pathScan()`：
  * tick、插针、快进时钟、离线补算走同一条路，账本这里只负责「先写意图再动钱」。
  *
- * 票 83 的到价挂单同样是**加法**（`version` 仍为 1，老文件 orders 缺省 = 空数组）：
+ * 票 83 的到价挂单同样是**加法**（当时 `version` 仍为 1，老文件 orders 缺省 = 空数组）：
  * 挂单在**下单那一刻**就 `spendCoins(margin)` 把保证金锁进农场，所以成交时不用再动钱，
  * 也不可能出现「到价了但硬币不够」；成交只把订单换成仓位（同一次写盘，原子）。
  * 退款是跨文件的（farm.json），照抄结算的意图模式：先写 `refunding` 再 `addCoins`，
