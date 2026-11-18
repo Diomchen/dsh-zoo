@@ -272,10 +272,12 @@ test('票 94：房主替 peer 充值 + 开仓，peer 窗口的余额/持仓与�
   assert.equal(b.futuresAccountOf(aId).balance, 100)
   // 房主自己的农场硬币不动：peer 的余额只是「你在我这里的可用额度」。
   assert.equal(b.snapshot().farm.coins, 500)
-  // peer 那边真的花了 100 个币：农场少 100，本机托管归零，房主账本多 100（不凭空生币）。
+  // peer 那边真的花了 100 个币：农场少 100，房主账本多 100（不凭空生币）。
+  // 本机账本是房主账本的镜像，所以 `futures()` 也该是 100——以前这里是「本机托管归零」，
+  // 于是窗口（读副本）和本机账（读本机）成了两个数，那正是要修的 bug。
   assert.equal(a.snapshot().farm.coins, 400)
-  assert.equal(a.futures().balance, 0)
-  assert.equal(a.snapshot().farm.coins + a.futures().balance + b.snapshot().farm.coins +
+  assert.equal(a.futures().balance, b.futuresAccountOf(aId).balance)
+  assert.equal(a.snapshot().farm.coins + b.snapshot().farm.coins +
     b.futuresAccountOf(aId).balance, 1000)
 
   const opened = await callAction(a, {

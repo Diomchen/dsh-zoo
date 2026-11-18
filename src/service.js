@@ -1362,6 +1362,11 @@ export function createService (ctx, options = {}) {
     }
     if (action === 'futures-withdraw') {
       if (futures === null) return { ok: false, error: 'starting' }
+      // 票 94：peer 的余额只是房主账本的镜像，本地提现等于拿房主的账给自家农场凭空加币。
+      // 钱要从托管账户里出来，只能在房主那台点（协议里还没有「peer 提现意图」）。
+      if (!isFuturesHost() && futures.replicaOf() !== null) {
+        return { ok: false, error: 'not-owner', notice: FUTURES_ERROR_TEXT['not-owner'] }
+      }
       const result = await futures.withdraw(body?.coins)
       if (result?.ok === true) refreshFuturesWindow()
       return result
