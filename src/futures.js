@@ -45,8 +45,10 @@
  * 另从 `balance` 扣。撤单只退**剩余未成交**那部分。所以任何时刻都有
  * `marginUsed = Σ 仓位保证金 + Σ 挂单冻结保证金`，`balance + marginUsed` 才是总权益。
  *
- * peer 侧的副本（`replica`）**不落盘**：它只是房主账本的缓存，重启后 30 秒内就会重新同步，
- * 写盘只会多一份可能过期的副本。
+ * peer 侧的副本（`replica`）**不落盘**（它是内存里的缓存，重启后 30 秒内会重新同步），但副本里的
+ * **账户数字要镜像进本机账本**：房主是唯一清算权威，peer 的余额/占用/仓位/挂单必须跟副本走，
+ * 否则窗口（读副本）和本机账本（读本机）会长期各说各话。本机额外留着的只有自己的审计流水
+ * （`trades`，`kind: 'mode'` 这类）和「还没收到副本」时的降级视图。
  *
  * 四条产品规则决定这里的形状：
  *   - **钱先进托管账户**：充值是 `farm.spendCoins`，提现是 `farm.addCoins`；托管余额与
@@ -1227,23 +1229,28 @@ class FuturesStore {
       const quote = this.quoteOf(cropId, stamp)
       if (quote !== null) quotes[cropId] = quote
     }
-    const positions = this.#state.positions.slice(0, positionLimit).map((position) => ({
+    // 副本在的时候，账户数字一律读副本：本机账本只是它的镜像，房主才是清算权威。
+    // 本地动作（充值/开仓/切档）能改到 `#state`，但改不到这里——所以副本一到，数字立刻归位。
+    const account = this.#mirrorOf() ?? this.#state
+    const positions = account.positions.slice(0, positionLimit).map((position) => ({
       ...position,
       quote: this.quoteOf(position.crop, stamp),
       unrealized: this.#unrealizedOf(position, stamp)
     }))
+    const balance = roundCoin(account.balance)
+    const marginUsed = roundCoin(account.marginUsed)
     return {
       epoch: this.#state.epoch,
-      balance: roundCoin(this.#state.balance),
-      marginUsed: roundCoin(this.#state.marginUsed),
-      equity: roundCoin(this.#state.balance + this.#state.marginUsed),
+      balance,
+      marginUsed,
+      equity: roundCoin(balance + marginUsed),
       fees: { ...this.#state.fees },
       // 票 97：保险基金余额、累计欠账、累计强平笔数（窗口顶部展示）。
-      insurance: roundCoin(this.#state.insurance),
-      shortfall: roundCoin(this.#state.shortfall),
+      insurance: roundCoin(account.insurance),
+      shortfall: roundCoin(account.shortfall),
       liquidationCount: this.#state.liquidationCount,
       // 1.12.4：做市商净盈亏——玩家赢的就是从这里付出去的，负得越多说明系统净付出越多。
-      house: roundCoin(this.#state.house),
+      house: roundCoin(account.house),
       // 票 98：模式、日额进度/上限、持仓上限、待提取与回滚标记。
       // 1.10.0：`mode` 是市场闸门，`accountMode` 是本账户自己的档位（真钱/纸面）。
       mode: this.modeOf(),
@@ -1251,19 +1258,20 @@ class FuturesStore {
       dayNotional: roundCoin(this.#state.dayNotional),
       dayCap: this.#dayCapOf(this.#state),
       positionCap: POSITION_NOTIONAL_CAP,
-      pending: roundCoin(this.#state.pending),
+      pending: roundCoin(account.pending),
       disabled: this.#state.disabled,
       paused: this.#state.paused === true,
       // 1.12.0：本地没暂停、账也没回滚，就能开新仓（别人暂停不影响你）。
       canTrade: this.#state.disabled !== true && this.#state.paused !== true,
       errorText: FUTURES_ERROR_TEXT,
       closed: this.#state.closed,
-      positionCount: this.#state.positions.length,
+      positionCount: account.positions.length,
       positions,
+      // 流水是本机自己的审计记录（谁在什么时候切过档、暂停过），副本不覆盖它，它也不进余额/占用。
       trades: this.#state.trades.slice(0, Math.max(0, Number(tradeLimit) || 0)).map((trade) => ({ ...trade })),
       // 票 95：自己的挂单（窗口画「我的挂单」，撮合后 lotsLeft 会变）。
-      orders: this.#state.orders.map((order) => ({ ...order })),
-      orderCount: this.#state.orders.length,
+      orders: account.orders.map((order) => ({ ...order })),
+      orderCount: account.orders.length,
       week: { start: this.#weekStartOf(stamp), pnl: this.#weekPnl(stamp) },
       quotes,
       // 票 96：到期日窗口 + 当前阶段。`crop` 只影响这两块，行情仍是全目录。
@@ -2102,6 +2110,8 @@ class FuturesStore {
    * 交割价取四根收盘均价，指数缺失时整张合约跳过、等下一拍，不拿残缺价格硬结。
    */
   async expireDue (at = this.#nowMs()) {
+    // 到期交割同样由房主算：peer 本地交割一次、房主副本回来再交割一次，就是两笔现金。
+    if (this.#mirrorOf() !== null) return { ok: true, action: 'futures-expire', deliveries: [], remotes: [] }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const contracts = new Set()
     for (const position of this.#state.positions) contracts.add(position.contract)
@@ -2288,6 +2298,10 @@ class FuturesStore {
       pending: safePending,
       updatedAt: stamp
     }
+    // 房主是唯一清算权威：副本里的账户数字立刻镜像进本机账本，`snapshot()`、`/state`、
+    // 以及重启后读的 `futures.json` 才不会停在本机算过的旧数上。流水（`trades`）不镜像——
+    // 那是本机自己的审计记录，房主的流水只随副本给窗口画图。
+    this.#mirrorAccounts(stamp)
     return { ok: true, applied: true }
   }
 
@@ -2604,6 +2618,8 @@ class FuturesStore {
    * `entry` = 成交价），按成交名义向双方各收 0.1%，并记一条 `kind:'open'` 的成交流水。
    */
   async matchDue (at = this.#nowMs()) {
+    // 撮合只发生在房主那本账上；peer 的挂单要等房主撮合完、随副本回来才知道成交没有。
+    if (this.#mirrorOf() !== null) return { ok: true, action: 'futures-match', fills: 0, accounts: [], ...this.#view() }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     await this.settleDue(stamp)
     let fills = 0
@@ -3009,6 +3025,10 @@ class FuturesStore {
    * 结算时点由仓位自己的 `settleSlot` 决定，所以重复调用、重启、补算走同一条路径。
    */
   async settleDue (at = this.#nowMs()) {
+    // peer 不是清算所：副本在的时候，盯市、强平、交割全由房主算完随副本发下来。本地再按
+    // 镜像仓位算一遍，同一根行情就入了两次账（余额越算越多、entry 被推着走）——这是
+    // 「本机账和房主账各说各话」的另一半原因。所以这里只报「无事发生」，数字等下一拍副本。
+    if (this.#mirrorOf() !== null) return { ok: true, action: 'futures-settle', settled: [] }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const settled = []
     // 票 97：先把这一拍所有该强平的仓位找出来、排好队；强平之间互不影响，顺序只为可复现。
@@ -3454,19 +3474,85 @@ class FuturesStore {
     }
   }
 
+  /**
+   * 等账本写完盘。`applySettle` 是同步返回的（宿主收到 UDP 包就调），镜像落盘只能排进写队列，
+   * 需要对齐盘上内容的场合（测试、退出前）用它等一等。
+   */
+  async flush () {
+    await this.#writeChain
+  }
+
   #view () {
+    // 和 `snapshot()` 一样以副本为准，否则 settle 的返回值会和窗口显示的数字对不上。
+    const account = this.#mirrorOf() ?? this.#state
+    const balance = roundCoin(account.balance)
+    const marginUsed = roundCoin(account.marginUsed)
     return {
-      balance: roundCoin(this.#state.balance),
-      marginUsed: roundCoin(this.#state.marginUsed),
-      equity: roundCoin(this.#state.balance + this.#state.marginUsed),
+      balance,
+      marginUsed,
+      equity: roundCoin(balance + marginUsed),
       mode: this.modeOf(),
       accountMode: this.accountMode(),
-      pending: roundCoin(this.#state.pending),
+      pending: roundCoin(account.pending),
       paused: this.#state.paused === true,
       disabled: this.#state.disabled,
       // 1.12.4：做市商净盈亏（玩家盈亏的反数），窗口据此显示「系统净付出」。
-      house: roundCoin(this.#state.house)
+      house: roundCoin(account.house)
     }
+  }
+
+  /** 副本就是房主的账：它在的时候，账户数字只认它。 */
+  #mirrorOf () {
+    const replica = this.#state.replica
+    return replica === null || typeof replica !== 'object' ? null : replica
+  }
+
+  /**
+   * 把副本里的账户数字写回本机账本（peer 的账是房主账本的镜像）。
+   *
+   * 只动「钱」：余额、占用、待提取、仓位、挂单，以及房主账本的全局数（保险基金/欠账/做市商）。
+   * 本机的审计流水、档位、暂停开关一律不动——那是这台机器自己的记录与偏好。
+   * 仓位/挂单要补成本地读盘格式（`openedAt`/`slot`/`settleSlot`/`deviceId`），否则重启时
+   * `normalizeFuturesFile` 会把它们当坏条目丢掉，还会白报一次「格式不对」。
+   */
+  #mirrorAccounts (stamp) {
+    const replica = this.#state.replica
+    if (replica === null || typeof replica !== 'object') return
+    const before = this.#accountSignature()
+    const known = new Map(this.#state.positions.map((position) => [position.id, position]))
+    this.#state.balance = replica.balance
+    this.#state.marginUsed = replica.marginUsed
+    this.#state.pending = replica.pending
+    this.#state.insurance = replica.insurance
+    this.#state.shortfall = replica.shortfall
+    this.#state.house = replica.house
+    this.#state.positions = replica.positions.map((position) => {
+      // 房主不记「什么时候开的仓」：第一次镜像时按收到副本的时刻补，之后按 id 沿用，
+      // 免得每次 settle 都把结算时点往后推一根。
+      const previous = known.get(position.id)
+      const openedAt = previous !== undefined && Number.isFinite(previous.openedAt) && previous.openedAt > 0
+        ? previous.openedAt
+        : stamp
+      const slot = this.#slotOf(openedAt)
+      return { ...position, openedAt, slot, settleSlot: slot + 1 }
+    })
+    this.#state.orders = replica.orders.map((order) => ({ ...order, deviceId: LOCAL_ORDER_DEVICE }))
+    // 数字没变就不写盘：peer 每 15 秒收一拍 settle，白写一次文件没有意义。
+    if (this.#accountSignature() !== before) void this.#persist()
+  }
+
+  /** 账户数字的指纹：判断镜像有没有真改到账本，据此决定要不要落盘。 */
+  #accountSignature () {
+    return JSON.stringify([
+      this.#state.balance,
+      this.#state.marginUsed,
+      this.#state.pending,
+      this.#state.insurance,
+      this.#state.shortfall,
+      this.#state.house,
+      this.#state.positions,
+      this.#state.orders
+    ])
   }
 
   #persist () {
