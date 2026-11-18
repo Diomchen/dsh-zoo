@@ -3929,6 +3929,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
             command.timeframes = timeframes
             const hints = normalizeBoardHints(raw.hint)
             if (Object.keys(hints).length > 0) command.hint = hints
+            // 票 105：按需拉图时把这一种作物的消息面一起带回来。
+            const news = normalizeBoardNews(raw.news)
+            if (news.items.length > 0 || news.calendar.length > 0) command.news = news
           }
         }
         return { ok: true, command }

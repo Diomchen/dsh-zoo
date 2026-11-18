@@ -571,6 +571,8 @@ class TradingStore {
         position.entry = entry
         // 开仓时间/顺序不动（列表按它排序）；路径检查改从 re-base 时刻起算。
         position.rebasedAt = now
+        // slot 是「活到哪一根」的派生字段：不挪到当前根，load 会把老仓位当收盘仓位结掉。
+        position.slot = slotIndexAt(now)
         rebased += 1
       }
       if (rebased > 0) {

@@ -574,7 +574,10 @@
       typeof hints[crop] === 'object') {
       hint[crop] = hints[crop]
     }
-    return { timeframes, hint }
+    const news = chartsCropOf(payload) === crop && payload.news !== null && typeof payload.news === 'object'
+      ? payload.news
+      : null
+    return { timeframes, hint, news }
   }
 
   /**
@@ -631,15 +634,15 @@
       const cached = cache.get(crop)
       if (cached !== null && typeof cached === 'object' && cached.timeframes !== null &&
         typeof cached.timeframes === 'object') {
-        return { crop, timeframes: cached.timeframes, hint: cached.hint ?? null, from: 'cache' }
+        return { crop, timeframes: cached.timeframes, hint: cached.hint ?? null, news: cached.news ?? null, from: 'cache' }
       }
     }
     const fromPayload = chartsFromPayload(payload, crop)
-    if (fromPayload === null) return { crop, timeframes: null, hint: null, from: null }
+    if (fromPayload === null) return { crop, timeframes: null, hint: null, news: null, from: null }
     if (cache !== null && typeof cache === 'object' && typeof cache.set === 'function') {
       cache.set(crop, fromPayload)
     }
-    return { crop, timeframes: fromPayload.timeframes, hint: fromPayload.hint, from: 'payload' }
+    return { crop, timeframes: fromPayload.timeframes, hint: fromPayload.hint, news: fromPayload.news ?? null, from: 'payload' }
   }
 
   /**
@@ -680,6 +683,8 @@
         [crop]: hintEntry
       }
     }
+    // 票 105：按需拉图带回的消息面跟着这一种作物走。
+    if (charts.news !== null && typeof charts.news === 'object') next.news = charts.news
     return next
   }
 
@@ -2111,6 +2116,8 @@
     order.push('crop-next')
     // 票 84：周期页签紧跟在作物页签后面（DOM 里也是这样），键盘能直接切周期。
     for (const timeframe of limits.timeframes) order.push('timeframe:' + timeframe.id)
+    // 票 106：图头下的快讯条可点开消息详情，也进 Tab 顺序。
+    order.push('ticker')
     for (const side of Object.keys(SIDE_LABELS)) order.push('side:' + side)
     for (const margin of limits.margins) order.push('margin:' + margin)
     // 「全下」按钮的金额每包变，用语义键 `margin:all-in`（focusKeyOf 认 data-all-in）。

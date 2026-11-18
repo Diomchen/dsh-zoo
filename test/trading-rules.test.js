@@ -863,6 +863,54 @@ function readabilityOf (chart) {
  *         但那是「影线满幅」下的假实体：单根振幅本身就接近整张图）。
  * 三个作物 × 三个时刻一起断言，谁把长波幅度调小了都会在这里露出来。
  */
+test('票 103（v5）：行情有波动率聚集与厚尾，但收益仍无方向性', () => {
+  const start = slotIndexAt(Date.UTC(2026, 0, 1))
+  const closes = []
+  for (let offset = 0; offset < 90 * 96; offset += 1) {
+    closes.push(slotClosePrice('tomato', start + offset))
+  }
+  const rets = []
+  for (let index = 1; index < closes.length; index += 1) rets.push(Math.log(closes[index] / closes[index - 1]))
+  const mean = rets.reduce((sum, value) => sum + value, 0) / rets.length
+  const m2 = rets.reduce((sum, value) => sum + (value - mean) ** 2, 0) / rets.length
+  const m4 = rets.reduce((sum, value) => sum + (value - mean) ** 4, 0) / rets.length
+  const abs = rets.map((value) => Math.abs(value))
+  const absMean = abs.reduce((sum, value) => sum + value, 0) / abs.length
+  let volCov = 0
+  let volVar = 0
+  for (let index = 1; index < abs.length; index += 1) {
+    volCov += (abs[index] - absMean) * (abs[index - 1] - absMean)
+    volVar += (abs[index] - absMean) ** 2
+  }
+  let retCov = 0
+  for (let index = 1; index < rets.length; index += 1) retCov += (rets[index] - mean) * (rets[index - 1] - mean)
+  const retVar = rets.reduce((sum, value) => sum + (value - mean) ** 2, 0)
+  const sigma = Math.sqrt(m2)
+  const kurtosis = m4 / (m2 * m2)
+  const volAc = volCov / volVar
+  const retAc = retCov / retVar
+
+  // v4 是 σ 2.0% / 峰度 2.9 / volAc 0；v5 要明显更有形状，但不能变成可读的趋势。
+  assert.ok(sigma > 0.018 && sigma < 0.036, '15m σ 应在 1.8%–3.6%：' + (sigma * 100).toFixed(2) + '%')
+  assert.ok(kurtosis > 3.0, '峰度应明显高于正态：' + kurtosis.toFixed(2))
+  assert.ok(volAc > 0.08, '波动率应有聚集：' + volAc.toFixed(3))
+  assert.ok(Math.abs(retAc) < 0.06, '收益自相关应接近 0：' + retAc.toFixed(3))
+  assert.ok(closes.every((price) => price >= 5 * PRICE_FLOOR_RATIO && price <= 5 * PRICE_CEIL_RATIO))
+})
+
+test('票 103/107：boardPrice 的 flowLevel 是可选叠加项，会推价但受总偏离帽约束', () => {
+  const slot = SLOT
+  const base = boardPrice({ crop: 'tomato', slot, tick: 0 })
+  const up = boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: 0.02 })
+  const down = boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: -0.02 })
+  assert.ok(up > base, '正资金流应推高价格')
+  assert.ok(down < base, '负资金流应压低价格')
+  // 总偏离帽 6%：0.5 的资金流不会把价格推到 exp(0.5) 倍。
+  const capped = boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: 0.5 })
+  assert.ok(capped < base * Math.exp(0.07), '资金流应被总偏离帽夹住')
+  assert.equal(boardPrice({ crop: 'tomato', slot, tick: 0, flowLevel: 0 }), base)
+})
+
 test('票 86（v4 修订）：随机游走的尺度性质——窗口越长振幅越大，实体不是针', () => {
   // 票 102 把价格换成随机游走之后，「读得出趋势」不再成立（鞅没有趋势，这正是要的）：
   // 这里改成钉住鞅的形状——振幅仍随窗口变长按 √N 放大，K 线不是一条被压平的直线。

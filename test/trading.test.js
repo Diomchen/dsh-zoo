@@ -211,6 +211,45 @@ async function seedLegacy20 (dir, { clock, farm, margin = 50, side = 'long' }) {
   return openStore(dir, { clock, farm })
 }
 
+test('票 103/105：v1 账本迁到 v2，未平仓位按 v5 现价 re-base，开仓时间/顺序不变', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)
+  const farm = fakeFarm(500)
+  const openedAt = SLOT_EDGE - 2 * SLOT_MS
+  const oldEntry = 4.2
+  await writeTrading(dir, {
+    version: 1,
+    week: { start: weekStartOf(clock.now()), pnl: 0, base: 500 },
+    positions: [{
+      id: '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d',
+      crop: 'tomato',
+      side: 'long',
+      margin: 100,
+      leverage: 5,
+      entry: oldEntry,
+      openedAt,
+      slot: slotIndexAt(openedAt),
+      stopLoss: 0
+    }],
+    orders: [],
+    history: []
+  })
+
+  const store = await openStore(dir, { clock, farm })
+  const view = store.view({ now: clock.now() })
+  const file = await readTrading(dir)
+  assert.equal(file.version, TRADING_VERSION)
+  assert.equal(file.flow.tape.length, 0)
+  assert.equal(file.positions.length, 1)
+  const position = file.positions[0]
+  assert.equal(position.openedAt, openedAt, '开仓时间不动，列表顺序才不会乱')
+  assert.equal(position.rebasedAt, clock.now(), '路径检查从 re-base 时刻起算')
+  assert.ok(Math.abs(position.entry - markPrice({ crop: 'tomato', now: clock.now() })) < 1e-12)
+  assert.ok(Math.abs(position.entry - oldEntry) > 1e-6, '旧 v4 入场价应被替换')
+  assert.ok(Math.abs(view.positions[0].pnl) < 1e-9, 're-base 后浮盈从 0 开始')
+  assert.equal(view.locked, 100, '保证金仍然锁着')
+})
+
 test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与可用分得清', async (t) => {
   const dir = await tempDir(t)
   const clock = makeClock(SLOT_EDGE + 3 * TICK_MS)

@@ -28,10 +28,14 @@
 规格见 [SPEC v11](.scratch/dsh-zoo/SPEC-v11.md)；票 92–99 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。盘口与期货是两层：盘口对着机器，期货对着人。
 
+「盘口行情 v5 / 消息面 / LAN 真人流」的决策见 [ADR-0036](docs/adr/0036-board-v5-news-and-lan-flow.md)，
+规格见 [SPEC v12](.scratch/dsh-zoo/SPEC-v12.md)；票 103–108 在
+[`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。A 期是行情 v5 + 消息面，B 期才接真人资金流。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
 农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
 
-盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
+盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment` / `news` / `ticker` / `calendar`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`、`payload.news`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪 / 消息面 / 快讯条 / 日程”同义。
 
 期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
@@ -338,8 +342,8 @@ _Avoid_: 删除, 拔掉, delete, remove
 
 **盘口 (Board)**：
 一层独立于现货交易所的 15 分钟合约市场：做多/做空，用农场硬币下注，收盘结算。
-它不是订单簿，也不交割作物；行情由确定性种子算出，没人交易也照走。
-窗口约 760×700，从桌面右键「盘口」或农场窗的「盘口」按钮打开。
+它不是订单簿，也不交割作物；行情由 v5 确定性底盘 + 每日消息面算出，没人交易也照走；
+B 期起才叠加 LAN 真人的资金流。窗口约 760×700，从桌面右键「盘口」或农场窗的「盘口」按钮打开。
 _Avoid_: 交易所, 市场, exchange, market, 订单簿
 
 **合约 (Contract)**：
@@ -350,7 +354,7 @@ _Avoid_: 期货, 现货, futures, spot
 
 **一根 (Bar)**：
 15 分钟一根的 K 线 = 1 个 slot；一根里有 15 个 1 分钟 **tick**。收盘价就是结算价，
-`slot + 作物 + 版本盐` 相同就在所有机器上得到同一张图。
+`slot + 作物 + 版本盐` 相同就在所有机器上得到同一张图；消息在公布分钟一次性跳价。
 _Avoid_: 周期, 蜡烛, candle, period
 
 **保证金 (Margin)**：
@@ -394,6 +398,25 @@ _Avoid_: 预测, 信号, 指标, signal, forecast
 盘口价围绕作物底价生成，夹在底价的 0.55–1.75 倍；K 线上的「底价」参考线就是它。
 到价挂单的目标价也必须落在这个带里，否则永远不会成交。
 _Avoid_: 基准价, 现价, base price (作为同义词时)
+
+**消息面 (News)**：
+盘口的确定性事件表：每个作物每天 4–6 条、全市场 2–3 条，另有每天 5 个固定日程。
+每条事件有公布时刻、方向、幅度、标题/正文/来源；公布瞬间一次性跳价，之后按 72 小时半衰期
+缓慢淡去。文本只用于展示，价格只认事件里的 `jump`/`storm`。
+_Avoid_: 新闻, 资讯, 事件流, feed, news feed
+
+**关键 K (Key Bar)**：
+有头条/黑天鹅/传闻，或 `|收盘/开盘 − 1| ≥ 4%`、近 24 根涨跌幅排前 3 的一根 K 线；
+上面画小旗，hover 便签多出「消息面」两行，点开是消息详情。
+_Avoid_: 重点 K, 信号 K, signal bar
+
+**快讯条 (Ticker)**：
+图头下 16px 的一条：最近一条消息 + 影响，点击打开消息详情；没有消息时写「今日暂无消息，行情照走」。
+_Avoid_: 跑马灯, 滚动条, news bar
+
+**消息详情 (News Detail)**：
+盘口窗内的浮层卡：标题、正文、来源、影响、相关作物和今日 5 条日程；外点 / Esc / × 关闭。
+_Avoid_: 弹窗, 新闻页, article
 
 **周榜 (Weekly Leaderboard)**：
 `trading-digest` 收来的真人（本机 + 已放行邻居）本周交易盈亏，按金币降序；没有 NPC。

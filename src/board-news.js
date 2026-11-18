@@ -1100,7 +1100,7 @@ export function calendarForDay ({ crop = null, now } = {}) {
 
 /** 事件模板的只读快照：测试用来查覆盖率与文案长度。 */
 export function newsTemplateSnapshot () {
-  return TEMPLATES.map((template) => ({
+  return TEMPLATES.concat(CALENDAR_TEMPLATES).map((template) => ({
     id: template.id,
     kind: template.kind,
     tone: template.tone,

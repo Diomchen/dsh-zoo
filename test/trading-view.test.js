@@ -1278,6 +1278,8 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
     'crop-next',
     // 老 payload 只有 15 分一档，周期页签照样进 Tab 顺序（票 84）。
     'timeframe:15m',
+    // 票 106：快讯条在周期页签之后、下单之前。
+    'ticker',
     'side:long', 'side:short',
     'margin:50', 'margin:100', 'margin:250', 'margin:all-in',
     'leverage:1', 'leverage:5',

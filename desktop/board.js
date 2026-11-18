@@ -1070,6 +1070,7 @@ function focusElementOf (key) {
   if (key === 'submit') return submitEl
   if (key === 'close-button') return closeButton
   if (key === 'display-toggle') return displayToggleEl
+  if (key === 'ticker') return tickerEl
   if (key === 'crop-prev') return cropPrevEl
   if (key === 'crop-next') return cropNextEl
   if (key === 'limit-toggle') return limitToggleEl
@@ -1621,7 +1622,7 @@ api?.onResult((result) => {
     const cropId = typeof result.crop === 'string' ? result.crop : null
     if (result.ok === true && cropId !== null &&
       result.timeframes !== null && typeof result.timeframes === 'object') {
-      chartCache.set(cropId, { timeframes: result.timeframes, hint: result.hint ?? null })
+      chartCache.set(cropId, { timeframes: result.timeframes, hint: result.hint ?? null, news: result.news ?? null })
       chartsFailed = null
     } else {
       // 这一种拉不到（坏作物/超时）：先退出加载态，别让风扇一直转；用户再点一下可以重试。
