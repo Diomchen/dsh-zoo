@@ -259,6 +259,40 @@ test('红包 24 小时有效期：meta 里记着到期时间，方便界面倒�
   })
 })
 
+test('待拆红包列表：拆过、退回、过期、字条都不列，回来的带 expiresAt', async () => {
+  const PENDING = '55555555-5555-4555-8555-555555555551'
+  const CLAIMED = '55555555-5555-4555-8555-555555555552'
+  const RETURNED = '55555555-5555-4555-8555-555555555553'
+  const OLD = '55555555-5555-4555-8555-555555555554'
+  const NOTE = '55555555-5555-4555-8555-555555555555'
+  await withDir(async (dir) => {
+    const gifts = await createGiftStore(dir)
+    const now = 1_700_000_000_000
+    const from = { deviceId: FROM, nickname: '阿蟹' }
+    await gifts.receivePacket({ id: PENDING, from, packet: { coins: 12 }, note: '买糖', receivedAt: now - 1000 })
+    await gifts.receivePacket({ id: CLAIMED, from, packet: { coins: 1 }, receivedAt: now - 1000 })
+    await gifts.receivePacket({ id: RETURNED, from, packet: { coins: 1 }, receivedAt: now - 1000 })
+    await gifts.receivePacket({ id: OLD, from, packet: { coins: 1 }, receivedAt: now - PACKET_TTL_MS })
+    await gifts.receiveText({ id: NOTE, from, text: '只有一句话', receivedAt: now - 1000 })
+    await gifts.claimPacket(CLAIMED, async () => ({ ok: true }))
+    await gifts.markReturned(RETURNED, now - 500)
+
+    const pending = gifts.pendingPackets(now)
+    assert.deepEqual(pending.map((record) => record.id), [PENDING])
+    // 卡要显示「还剩多久退回」，到期时刻由账本算好，渲染端不另记一份 TTL。
+    assert.equal(pending[0].expiresAt, now - 1000 + PACKET_TTL_MS)
+    assert.equal(pending[0].from.nickname, '阿蟹')
+    assert.equal(pending[0].note, '买糖')
+
+    // 刚过期、`expirePackets` 还没轮到的那一段也不列：点开也只会失败。
+    assert.deepEqual(gifts.pendingPackets(now + PACKET_TTL_MS), [])
+
+    // 拆开之后卡片必须自己消失（宿主下一帧就不再输出它）。
+    await gifts.claimPacket(PENDING, async () => ({ ok: true }))
+    assert.deepEqual(gifts.pendingPackets(now), [])
+  })
+})
+
 test('红包进串门请求：不会把别的东西挤掉', () => {
   const buffer = encodeVisitRequest({
     deviceId: FROM,

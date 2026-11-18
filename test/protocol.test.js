@@ -229,6 +229,10 @@ function futuresPayload (type, deviceId) {
   if (type === 'futures-cancel') return { ...base, orderId: randomUUID() }
   if (type === 'futures-sync') return { ...base, epoch: 'e1', lastSeq: 3 }
   if (type === 'futures-mode') return { ...base, accountMode: 'live' }
+  if (type === 'futures-pause') return { ...base, paused: true }
+  if (type === 'futures-ledger') {
+    return { ...base, epoch: 'e1', seq: 3, hostId: deviceId, index: 0, total: 1, chunk: '{"a":1}' }
+  }
   return { ...base, epoch: 'e1', seq: 3, balance: 10, marginUsed: 0, delta: 0, positions: [], orders: [], trades: [], insurance: 0, shortfall: 0 }
 }
 
@@ -237,9 +241,11 @@ function futuresKeys (type) {
     'futures-hello': ['v', 'type', 'deviceId', 'at'],
     'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
     'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
-    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'accountMode', 'pending'],
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'accountMode', 'paused', 'pending'],
     'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq'],
-    'futures-mode': ['v', 'type', 'deviceId', 'at', 'accountMode']
+    'futures-mode': ['v', 'type', 'deviceId', 'at', 'accountMode'],
+    'futures-pause': ['v', 'type', 'deviceId', 'at', 'paused'],
+    'futures-ledger': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'hostId', 'index', 'total', 'chunk']
   }[type]
 }
 
@@ -798,6 +804,10 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'futures-sync',
     // 1.10.0：账户自己申报档位（真钱/纸面），房主据此记账
     'futures-mode',
+    // 1.12.0：账户自己申报暂停（只停自己，停不了别人的市）
+    'futures-pause',
+    // 1.12.0（B）：整本账快照分片（换房主时重建账本）
+    'futures-ledger',
     // 票 107：盘口 LAN 资金流与同步请求
     'board-flow',
     'board-flow-sync'
@@ -1245,6 +1255,8 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     mode: 'shadow',
     // 1.10.0：账户档位可选，缺省 null。
     accountMode: null,
+    // 1.12.0：账户自己的暂停，缺省 false。
+    paused: false,
     pending: 0
   })
 

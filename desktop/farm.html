@@ -1872,6 +1872,21 @@
         justify-content: flex-start;
       }
 
+      /* 置顶的红包记录（票 79 补）：和下面的流水拉开一点距离，一眼能分清。 */
+      .log-packets {
+        margin-bottom: 10px;
+        padding: 8px 8px 7px;
+        border: 1px solid rgba(200, 74, 49, 0.35);
+        border-radius: 12px;
+        background: rgba(200, 74, 49, 0.05);
+      }
+      .log-packets[hidden] {
+        display: none;
+      }
+      .log-packets h2 {
+        color: #b4341f;
+      }
+
       /* 雇工页（ticket 44）：挂牌 → 合同 → 邻居挂牌，三块卡；字段带单位与就地校验。 */
       .hire-box {
         display: flex;
@@ -2355,6 +2370,11 @@
         </section>
 
         <section class="page" id="page-log" role="tabpanel" aria-label="记录" hidden>
+          <!-- 票 79 补：红包就那么几条，却会被埋在几百条种下/收货里——单独置顶一块，打开记录页第一眼就看见。 -->
+          <section class="log log-packets" id="log-packets" aria-label="红包记录" hidden>
+            <h2>红包记录</h2>
+            <ul id="log-packet-list"></ul>
+          </section>
           <section class="log">
             <h2>最近 100 条</h2>
             <ul id="log"></ul>

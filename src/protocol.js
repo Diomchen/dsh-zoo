@@ -379,6 +379,10 @@ export const PACKET_TYPES = Object.freeze([
   'futures-sync',
   // 1.10.0：账户自己的档位申报（peer → 房主）。
   'futures-mode',
+  // 1.12.0：账户自己按的暂停申报（peer → 房主）。
+  'futures-pause',
+  // 1.12.0（B）：整本账快照的分片（房主 → peer），换房主时用来重建账本。
+  'futures-ledger',
   // 票 107：盘口 LAN 资金流。老版本按「未知类型」整包丢掉，不崩。
   'board-flow',
   'board-flow-sync'
@@ -1717,6 +1721,7 @@ export function encodeFuturesSettle ({
   shortfall = 0,
   mode = FUTURES_DEFAULT_MODE,
   accountMode = null,
+  paused = false,
   pending = 0,
   now
 } = {}) {
@@ -1740,7 +1745,35 @@ export function encodeFuturesSettle ({
   }
   // 1.10.0：账户档位是可选字段（老 peer 不发 = 不知道，按 null）。
   if (isFuturesAccountMode(accountMode)) packet.accountMode = accountMode
+  // 1.12.0：账户自己的暂停开关，只在按下时带字段（缺省 = 没暂停）。
+  if (paused === true) packet.paused = true
   return encodePacket(packet)
+}
+
+/**
+ * 1.12.0：账户申报自己按下的暂停（peer → 房主）。
+ * 只带一个布尔值：房主据此拒绝这个账户的新单，别人的账一概不动。
+ */
+export function encodeFuturesPause ({ deviceId, at, paused, now } = {}) {
+  return encodePacket({ type: 'futures-pause', deviceId, at, paused: paused === true, now })
+}
+
+/** 1.12.0（B）：整本账快照的一个分片。`chunk` 是 JSON 字符串的一段，房主按序发、peer 拼。 */
+export const FUTURES_LEDGER_MAX_CHUNK = 2800
+export const FUTURES_LEDGER_MAX_PARTS = 8
+
+export function encodeFuturesLedger ({ deviceId, at, epoch, seq, hostId, index, total, chunk, now } = {}) {
+  return encodePacket({
+    type: 'futures-ledger',
+    deviceId,
+    at,
+    epoch,
+    seq,
+    hostId,
+    index,
+    total,
+    chunk
+  }, { now })
 }
 
 /**
@@ -2367,6 +2400,53 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     }
   }
 
+  // 1.12.0：账户申报自己按下的暂停。只是一个布尔值。
+  if (raw.type === 'futures-pause') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (typeof raw.paused !== 'boolean') return fail('paused')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        paused: raw.paused
+      }
+    }
+  }
+
+  // 1.12.0（B）：整本账快照的分片。房主按序发，peer 按 `(epoch, seq, total)` 拼回来；
+  // 分片本身没有语义，只保证「不超过上限、序号自洽」。
+  if (raw.type === 'futures-ledger') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (typeof raw.epoch !== 'string' || raw.epoch.length > 64) return fail('epoch')
+    if (!(Number.isInteger(raw.seq) && raw.seq >= 0)) return fail('seq')
+    if (typeof raw.hostId !== 'string' || raw.hostId === '' || raw.hostId.length > 64) return fail('host-id')
+    if (!(Number.isInteger(raw.total) && raw.total >= 1 && raw.total <= FUTURES_LEDGER_MAX_PARTS)) return fail('total')
+    if (!(Number.isInteger(raw.index) && raw.index >= 0 && raw.index < raw.total)) return fail('index')
+    if (typeof raw.chunk !== 'string' || raw.chunk.length === 0 || raw.chunk.length > FUTURES_LEDGER_MAX_CHUNK) {
+      return fail('chunk')
+    }
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        epoch: raw.epoch,
+        seq: raw.seq,
+        hostId: raw.hostId,
+        index: raw.index,
+        total: raw.total,
+        chunk: raw.chunk
+      }
+    }
+  }
+
   if (raw.type === 'futures-order') {
     const at = normalizeDigestAt(raw.at)
     if (at === null) return fail('at')
@@ -2456,6 +2536,9 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       ? null
       : (isFuturesAccountMode(raw.accountMode) ? raw.accountMode : undefined)
     if (accountMode === undefined) return fail('account-mode')
+    // 1.12.0：账户自己的暂停可选（老房主不发 = 没暂停）。
+    const paused = raw.paused === undefined ? false : raw.paused
+    if (typeof paused !== 'boolean') return fail('paused')
     return {
       ok: true,
       packet: {
@@ -2475,6 +2558,7 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         shortfall,
         mode,
         accountMode,
+        paused,
         pending
       }
     }

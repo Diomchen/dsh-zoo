@@ -11,15 +11,59 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
-## 1.11.0 版本记录
+## 1.13.0 版本记录
 
-GitHub Release 正文就是 [`releases/1.11.0.md`](releases/1.11.0.md)。
+GitHub Release 正文就是 [`releases/1.13.0.md`](releases/1.13.0.md)。
 
 盘口 v12：行情 v5（波动率聚集/时段/风暴/肥尾）、确定性消息面、关键 K 与快讯/详情，
 以及无房主的 LAN 真人资金流 `board-flow` / `board-flow-sync`；50×/100× 杠杆与选中
 杠杆 chip 的日漫边框动效，100× 会弹「老实赚钱，很枯燥吧。」漫画气泡。
 `PRICE_SALT` 升到 `board-v5`，旧图作废；`trading.json` 升到 v2，未平仓位按新行情
 re-base 入场价。npm 发布改用 OIDC Trusted Publishing，不再使用长期 `NPM_TOKEN`。
+
+## 1.12.2 版本记录
+
+GitHub Release 正文就是 [`releases/1.12.2.md`](releases/1.12.2.md)。
+
+日额跟权益走：上限从死数 5,000 改成 `max(5,000, 5 × 权益)`（权益 = 余额 + 已占保证金），
+`snapshot().dayCap` 与窗口的限额行都按账户实时算。顺带修两个落盘 bug：`accountMode`
+以前不落盘（一按暂停 `mode` 变 `off`，重启后就被反推成纸面，充值/提现会按错档位走），
+远端账户的 `accountMode`/`paused`/`disabled` 也不落盘（房主重启后邻居自动「复活」）；
+老入口 `futures-mode{mode}` 现在等价于「把这个账户自己设成那个档位」，不再只翻闸门。
+
+## 1.12.1 版本记录
+
+GitHub Release 正文就是 [`releases/1.12.1.md`](releases/1.12.1.md)。
+
+窗口白名单补齐：`desktop/futures-preload.js` 的 `FIELDS` 补上 `futures-account-mode`（1.10.0
+切档）、`futures-pause`（1.12.0 暂停/继续）、`futures-convert-all`（1.11.0 全部转，1–8 笔
+`{ id, lots }`），三个按钮不再「点了没反应」；`desktop/futures.js` 的提交统一走 `send()`，
+被 preload 拦下时弹一句人话。新增 `test/futures-preload.test.js` 对齐两份白名单，以后忘登记会红。
+同时补上 `docs/play-futures.md`（玩家手册）。
+
+## 1.12.0 版本记录
+
+GitHub Release 正文就是 [`releases/1.12.0.md`](releases/1.12.0.md)。
+
+分权收尾：`off` 不再是房主手里的全局闸门。每个账户有自己的 `paused`——按了只停自己
+的新仓与新挂单，平仓/撤单/转现货/提现照常；`futures-rollback` 只强平自己、只退自己的
+托管余额，peer 调用回 `not-owner`。新增报文 `futures-pause { paused }` 与 settle 的
+可选字段 `paused`；老动作 `futures-mode{mode:'off'}` 保留为「暂停自己」的别名，`mode`
+字段继续回传但不再拦截任何动作。窗口顶栏三颗按钮：切档、暂停/继续、退出。
+
+## 1.11.0 版本记录
+
+GitHub Release 正文就是 [`releases/1.11.0.md`](releases/1.11.0.md)。
+
+交割说清楚 + 「全部转」：交割仍然只有现金一种（四根收盘均价结清、交割费 0.1%），
+但窗口在收盘前 30 分钟会亮红字提醒「想收货就点转」，持仓表头右侧多了「全部转」按钮，
+一次把整批持仓按公允价买成现货；逐笔算钱、逐笔跳过转不动的（余额不够或仓库放不下），
+一笔都没转成才报错。新增本地动作 `futures-convert-all`（≤8 条 `{id, lots}`），
+peer 侧拆成逐笔 `futures-convert`，协议报文没变。视图多 `expiry` / `canConvertAll` 两个字段。
+另一件事（票 110）：市价开仓先吃邻居的挂单（同合约、同本账、价格不比做市商差的，按价格优先），
+成交价是挂单价，剩下的张数才跟做市商成交——玩家之间从此真的对上了手；吃空的挂单当场摘掉。
+主动平仓、强平、交割仍按做市商报价 / 公允价走。
+测试：1217 用例 / 1216 通过 / 1 跳过 / 0 失败。
 
 ## 1.10.0 版本记录
 
@@ -31,6 +75,12 @@ GitHub Release 正文就是 [`releases/1.10.0.md`](releases/1.10.0.md)。
 做市商成交，永不吃真钱玩家的单；纸面手续费不进保险基金、亏空不记欠账。原来的「影子日额 0」
 取消，纸面也能正经交易（5,000 名义日额、20,000 持仓上限）。顺手修了窗口归一化没放行
 `mode`/`dayCap`/`peer` 等字段导致徽章与限额行永远为空的老 bug。
+
+同一版还补了红包的三处漏接：`desktop-pets` 不认 `packet`（红包卡从没进过场景）、`room` 的
+`visitorGift` 把红包降级成字条且 `visit-record` 直接丢字段、记录页 `FARM_LOG_KINDS` 白名单漏
+`packet`。没拆的红包卡改贴在自己宠物旁边（拆开或 24 小时退回才消失），`farm.json` 新增
+`packetLog`（≤50 条，老文件自动从流水补齐），农场「记录」页顶上钉一块「红包记录」。
+测试 1211 用例 / 1210 通过 / 1 跳过。
 
 ## 1.9.0 版本记录
 

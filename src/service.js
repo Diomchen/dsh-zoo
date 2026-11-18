@@ -115,7 +115,7 @@ import {
   isFreshPeerDigest,
   marketView
 } from './market.js'
-import { backpackErrorText, giftPrepareFailedText, packetErrorText } from './gift-text.js'
+import { backpackErrorText, giftPrepareFailedText, packetErrorText, packetSummaryText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
   GIFT_RATE_PER_DAY,
@@ -168,6 +168,10 @@ import {
   encodeFuturesSettle,
   encodeFuturesSync,
   encodeFuturesMode,
+  encodeFuturesPause,
+  encodeFuturesLedger,
+  FUTURES_LEDGER_MAX_CHUNK,
+  FUTURES_LEDGER_MAX_PARTS,
   normalizeSkinId,
   PEER_LOST_MS,
   VISIT_MAX_MS,
@@ -476,6 +480,10 @@ export function createService (ctx, options = {}) {
   const futuresPeers = new Map()
   /** 票 94：对端 hello 的节流表（deviceId → 上次发送时刻）。 */
   const futuresHelloAt = new Map()
+  /** 1.12.0（B）：正在拼装的整本账快照（`epoch:seq:hostId` → 分片），最多留三份。 */
+  const futuresLedgerParts = new Map()
+  /** 1.12.0（B）：15 秒一拍，两拍（30 秒）广播一次整本账。 */
+  let futuresLedgerTick = 0
   /** 票 94：非房主上次 sync 的时刻。 */
   let futuresSyncAt = 0
   /** 票 94：最近一次给我们发账目的房主（窗口上显示用；只在内存里）。 */
@@ -1380,6 +1388,52 @@ export function createService (ctx, options = {}) {
       }
       return result
     }
+    // 票 109：一次把全部持仓转成现货。窗口只报「哪几笔、各多少张」；
+    // 房主逐笔算，某笔钱不够/仓库放不下就跳过它、继续下一笔（部分成功也用得上）。
+    if (action === 'futures-convert-all') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      const wanted = Array.isArray(body?.positions) ? body.positions.slice(0, 8) : []
+      if (wanted.length === 0) return { ok: false, error: 'bad-positions' }
+      if (!isFuturesHost()) {
+        let sent = 0
+        for (const item of wanted) {
+          const pending = futuresConvertPending(item?.id, item?.lots)
+          if (pending?.ok === true) sent += 1
+        }
+        return sent > 0
+          ? { ok: true, action: 'futures-convert-all', sent }
+          : { ok: false, error: 'pending-failed' }
+      }
+      let done = 0
+      let failed = 0
+      let lastNotice = null
+      for (const item of wanted) {
+        const result = await futures.convertToSpot({
+          positionId: item?.id,
+          lots: item?.lots,
+          at: futuresClock()
+        })
+        if (result?.ok === true) {
+          done += 1
+        } else {
+          failed += 1
+          if (typeof result?.notice === 'string') lastNotice = result.notice
+        }
+      }
+      if (done > 0) {
+        refreshFuturesWindow()
+        refreshFarmWindow()
+      }
+      return {
+        ok: done > 0,
+        action: 'futures-convert-all',
+        converted: done,
+        failed,
+        notice: done > 0
+          ? null
+          : (lastNotice ?? '一笔都没转成：余额不够按公允价买现货，或者仓库放不下。')
+      }
+    }
     // 票 95：挂限价单。peer 只发「限价、方向、张数、杠杆」，冻结多少保证金由房主算。
     if (action === 'futures-place') {
       if (futures === null) return { ok: false, error: 'starting' }
@@ -1419,7 +1473,6 @@ export function createService (ctx, options = {}) {
     // 结算本来是 tick 自己做的；这条动作只给脚本和验收用（幂等，多跑一次不多入账）。
     if (action === 'futures-settle') {
       if (futures === null) return { ok: false, error: 'starting' }
-      if (futures.modeOf() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
       const result = await futures.settleDue(futuresClock())
       if (result?.ok === true) refreshFuturesWindow()
       return result
@@ -1427,25 +1480,30 @@ export function createService (ctx, options = {}) {
     // 窗口的倒计时归零时请宿主「结这一根 + 重推一拍」（票 93）。幂等：没仓位就没账可记。
     if (action === 'futures-refresh') {
       if (futures === null) return { ok: false, error: 'starting' }
-      if (futures.modeOf() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
       await futures.settleDue(futuresClock())
       // 票 96：倒计时走完这一拍也要立刻交割，不能等下一个 15 秒 tick。
       await futures.expireDue(futuresClock())
       const state = futuresWindowView()
       return { ok: true, action: 'futures-refresh', state }
     }
-    // 票 98：灰度开关只能由房主拨；影子/真钱切换写进账本流水，peer 靠 settle 跟随。
-    if (action === 'futures-mode') {
+    // 1.12.0：暂停 / 继续**自己**的交易。谁都能按，按下去只停自己：别人的仓、别人的单
+    // 一概不动。房主这一下也不再是「关市」——停不了别人的市，这是分权之后唯一说得通的语义。
+    if (action === 'futures-pause' || action === 'futures-mode') {
       if (futures === null) return { ok: false, error: 'starting' }
-      if (!isFuturesHost()) {
-        return { ok: false, error: 'not-host', notice: FUTURES_ERROR_TEXT['not-host'] }
-      }
-      const result = await futures.setMode(body?.mode, futuresClock())
-      if (result?.ok === true) {
+      // `futures-mode` 是 1.12.0 之前的老入口：现在它等价于「把这个账户自己设成那个档位」，
+      // 所以要连 `accountMode` 一起改，只翻 `paused` 会留下一个「暂停回来又变纸面」的坑。
+      const local = action === 'futures-mode'
+        ? await futures.setMode(body?.mode, futuresClock())
+        : await futures.setPaused(body?.paused === true, futuresClock())
+      if (local?.ok !== true) return local
+      if (isFuturesHost()) {
         refreshFuturesWindow()
         broadcastFuturesSettle()
+        return local
       }
-      return result
+      const sent = sendFuturesPause(local.paused)
+      refreshFuturesWindow()
+      return { ...local, sent }
     }
     // 1.10.0：切**自己**的档位。房主就地改；peer 先本地记账再申报给房主（钱在
     // 自己的农场上扣，房主只决定这本账按真钱还是纸面结算）。
@@ -1462,17 +1520,15 @@ export function createService (ctx, options = {}) {
       refreshFuturesWindow()
       return { ...local, sent }
     }
-    // 票 98：回滚——强平全部仓位、托管余额退回农场、存档 disabled 并切 off。
+    // 1.12.0：退出（**只退自己**）。强平自己的仓位、把余额退回自己的农场、把自己标成停用；
+    // 别人的账一分不动。peer 的账在房主那台，回 not-owner 并提示先平仓再提现。
     if (action === 'futures-rollback') {
       if (futures === null) return { ok: false, error: 'starting' }
-      if (!isFuturesHost()) {
-        return { ok: false, error: 'not-host', notice: FUTURES_ERROR_TEXT['not-host'] }
-      }
       const result = await futures.rollback({ at: futuresClock() })
       if (result?.ok === true) {
         refreshFuturesWindow()
         refreshFarmWindow()
-        broadcastFuturesSettle()
+        if (isFuturesHost()) broadcastFuturesSettle()
       }
       return result
     }
@@ -2320,6 +2376,8 @@ export function createService (ctx, options = {}) {
       season: seasonView(view),
       // 记录页要完整的一份（≤100）；`/state.farm.log` 仍按 SPEC 只给 20。
       log: view.log.slice(0, FARM_LOG_WINDOW_LIMIT),
+      // 红包单独攒的一份（≤50）：流水会被种下/收获挤掉，红包记录不能跟着没。
+      packets: view.packetLog ?? [],
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
       carried: carriedView()
     }
@@ -4793,6 +4851,13 @@ export function createService (ctx, options = {}) {
       if (!claimed.ok) {
         return { ok: false, error: claimed.error, notice: packetErrorText(claimed.error) }
       }
+      // 记录页（票 79 补）：拆开这一笔也要留痕，不然卡片一收就查不到收过谁的红包。
+      await farm.notePacket({
+        direction: 'in',
+        event: 'claimed',
+        who: claimed.gift.from?.nickname,
+        text: packetSummary(claimed.gift.packet)
+      })
       refreshFarmWindow()
       return {
         ok: true,
@@ -4846,19 +4911,9 @@ export function createService (ctx, options = {}) {
     return { ok: false, error: 'not-implemented', action }
   }
 
-  /** 红包内容的可读摘要：`20 硬币 · 小番茄 ×3 · 稻米种子 ×1`。 */
-  function packetSummary (packet) {
-    if (packet === null || typeof packet !== 'object') return '空红包'
-    const parts = []
-    if (packet.coins > 0) parts.push(packet.coins + ' 硬币')
-    for (const [cropId, qty] of Object.entries(packet.crops ?? {})) {
-      parts.push((CROPS[cropId]?.name ?? cropId) + ' ×' + qty)
-    }
-    for (const [cropId, qty] of Object.entries(packet.seeds ?? {})) {
-      parts.push((CROPS[cropId]?.name ?? cropId) + '种子 ×' + qty)
-    }
-    return parts.length === 0 ? '空红包' : parts.join(' · ')
-  }
+  // 红包内容的可读摘要住 gift-text.js：桌面卡片、串门气泡和这里的回执说的必须是
+  // 同一句话（一处改了另一处没改，用户就会看到“12 硬币”和“3 硬币”两种说法）。
+  const packetSummary = packetSummaryText
 
   /** 红包每日限额：一天最多寄 3 只，本地午夜重置。 */
   const PACKET_DAILY_LIMIT = 3
@@ -5327,7 +5382,6 @@ export function createService (ctx, options = {}) {
             // 票 98：off 时期货报文一律不理（入站静默丢，连 hello 也不回）；
             // 其余模式按 UDP 源地址限速，超出的包直接丢，不落账、不回执。
             if (typeof packet.type === 'string' && packet.type.startsWith('futures-')) {
-              if (futuresMode() === 'off') return
               if (!futuresRateAllows(from)) return
             }
             // 任意 work-* 报文都证明「对方还在」：离线结算用最后心跳/最后报文。
@@ -5437,6 +5491,12 @@ export function createService (ctx, options = {}) {
             } else if (packet.type === 'futures-mode') {
               // 1.10.0：邻居申报自己的档位（真钱/纸面）。只有房主受账。
               void handleFuturesMode(packet, from)
+            } else if (packet.type === 'futures-pause') {
+              // 1.12.0：邻居申报自己按下的暂停。同样只有房主受账。
+              void handleFuturesPause(packet, from)
+            } else if (packet.type === 'futures-ledger') {
+              // 1.12.0（B）：房主广播的整本账快照分片。peer 拼齐了才落盘。
+              handleFuturesLedger(packet)
             } else {
               room.observeBeacon(packet)
               // 票 59：beacon 里带着邻居的作物目录指纹，不一致就问一次。
@@ -5987,7 +6047,11 @@ export function createService (ctx, options = {}) {
     const dropped = droppedVisitors(snapshot)
     if (dropped > 0) room.noteSceneOverflow(dropped)
     // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 dshzoo:// URL。
-    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
+    // 还没拆的红包也得进场景（票 79）：卡片只贴访客的话，访客一走红包就彻底没有入口。
+    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, {
+      thumbOf: giftThumb,
+      packetInbox: gifts === null ? null : gifts.pendingPackets()
+    })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const assetRoots = assetRootsFor(activeSkin)
     // 目录也进签名：两张皮的素材同名但不同目录时，换皮必须让渲染端跟着换根（ticket 33）。
@@ -6883,6 +6947,8 @@ export function createService (ctx, options = {}) {
       mode: futures.modeOf(),
       // 1.10.0：这个账户自己的档位（真钱/纸面），peer 窗口的徽章以它为准。
       accountMode: account.accountMode,
+      // 1.12.0：这个账户自己按的暂停，随账目回传（不是「房主关了市」）。
+      paused: account.paused === true,
       pending: account.pending ?? 0,
       insurance: fund.insurance,
       shortfall: fund.shortfall
@@ -6902,7 +6968,6 @@ export function createService (ctx, options = {}) {
   function sendFuturesSettle (deviceId, { delta = 0 } = {}) {
     if (disposed || futures === null || discovery === null) return false
     // 票 98：off 时出站一律不发，连已经绑定的邻居也不再推账。
-    if (futures.modeOf() === 'off') return false
     if (!isFuturesHost()) return false
     if (!futuresPeers.has(deviceId)) return false
     let data
@@ -6945,13 +7010,97 @@ export function createService (ctx, options = {}) {
     }
   }
 
+  /** 1.12.0：peer 把自己按的暂停申报给房主；发不出去就等下一拍 sync 重来。 */
+  function sendFuturesPause (paused) {
+    if (disposed || futures === null) return false
+    const host = futuresHostId()
+    if (host === null || host === room.snapshot().self.deviceId) return false
+    let data
+    try {
+      data = encodeFuturesPause({
+        deviceId: room.snapshot().self.deviceId,
+        at: futuresClock(),
+        paused: paused === true,
+        now: Date.now()
+      })
+    } catch (error) {
+      warnOnce('futures-pause-send', '暂停状态发不出去：' + message(error))
+      return false
+    }
+    try {
+      return discovery.sendTo(host, data) === true
+    } catch (error) {
+      warnOnce('futures-pause-send', '暂停状态发不出去：' + message(error))
+      return false
+    }
+  }
+
   /**
-   * 房主侧：每台对端各推**自己的**账目（不是同一个人的账转给别人）。
+   * 1.12.0（B）：房主每 30 秒广播一份**整本账**快照，分片发（一包上限 4 KiB）。
+   *
+   * 目的只有一个：房主掉线、两边改选之后，新房主手上有账可接管，而不是开一本空账。
+   * 快照只保留最新一份，peer 侧落盘在 `futures.json` 的 `ledger` 字段里。
+   */
+  function broadcastFuturesLedger () {
+    if (disposed || futures === null || discovery === null || !isFuturesHost()) return 0
+    const peers = [...futuresPeers.keys()]
+    if (peers.length === 0) return 0
+    let snapshot
+    let json
+    try {
+      snapshot = futures.ledgerSnapshotOf({
+        hostId: room.snapshot().self.deviceId,
+        at: futuresClock()
+      })
+      json = JSON.stringify(snapshot)
+    } catch (error) {
+      warnOnce('futures-ledger-build', '整本账快照打不出来：' + message(error))
+      return 0
+    }
+    const chunks = []
+    for (let index = 0; index < json.length; index += FUTURES_LEDGER_MAX_CHUNK) {
+      chunks.push(json.slice(index, index + FUTURES_LEDGER_MAX_CHUNK))
+    }
+    if (chunks.length === 0 || chunks.length > FUTURES_LEDGER_MAX_PARTS) {
+      warnOnce('futures-ledger-large', '整本账快照太大（' + chunks.length + ' 片），这一轮不发')
+      return 0
+    }
+    let sent = 0
+    for (const deviceId of peers) {
+      for (let index = 0; index < chunks.length; index += 1) {
+        let data
+        try {
+          data = encodeFuturesLedger({
+            deviceId: room.snapshot().self.deviceId,
+            at: futuresClock(),
+            epoch: snapshot.epoch,
+            seq: snapshot.seq,
+            hostId: snapshot.hostId,
+            index,
+            total: chunks.length,
+            chunk: chunks[index],
+            now: Date.now()
+          })
+        } catch (error) {
+          warnOnce('futures-ledger-send', '整本账快照发不出去：' + message(error))
+          break
+        }
+        try {
+          if (discovery.sendTo(deviceId, data) === true) sent += 1
+        } catch (error) {
+          warnOnce('futures-ledger-send', '整本账快照发不出去：' + message(error))
+          break
+        }
+      }
+    }
+    return sent
+  }
+
+  /** 房主侧：每台对端各推**自己的**账目（不是同一个人的账转给别人）。
    * `targets` 只给「这一拍刚结算完的账户」用，避免盯市把所有人的包都重发一遍。
    */
   function broadcastFuturesSettle (targets = null) {
     if (disposed || futures === null || !isFuturesHost()) return 0
-    if (futures.modeOf() === 'off') return 0
     let ids = []
     if (Array.isArray(targets)) ids = targets
     else ids = [...futuresPeers.keys()]
@@ -7085,6 +7234,63 @@ export function createService (ctx, options = {}) {
     sendFuturesSettle(packet.deviceId)
   }
 
+  /** 1.12.0：对端申报自己按的暂停。受理后立刻回一份新账目，对方窗口马上看到。 */
+  async function handleFuturesPause (packet, from) {
+    if (disposed || futures === null || !isFuturesHost()) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    if (!futuresBindPeer(packet.deviceId, from)) return
+    let result = null
+    try {
+      result = await futures.setRemotePaused(packet.deviceId, packet.paused, futuresClock())
+    } catch (error) {
+      warnOnce('futures-pause', '暂停状态没能落账：' + message(error))
+      return
+    }
+    if (result?.ok !== true) {
+      warnOnce('futures-pause-' + String(result?.error), '暂停状态被拒：' + String(result?.error))
+      return
+    }
+    sendFuturesSettle(packet.deviceId)
+  }
+
+  /**
+   * 1.12.0（B）：收到房主广播的整本账快照。分片按 `(epoch, seq)` 攒，齐了再落盘；
+   * 只认当前房主的包（换房主期间两个人都可能发，认最后一个也算错，所以宁可丢）。
+   */
+  function handleFuturesLedger (packet) {
+    if (disposed || futures === null || isFuturesHost()) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    if (futuresHostOverride === null && packet.deviceId !== futuresHostId()) return
+    const key = packet.epoch + ':' + packet.seq + ':' + packet.hostId
+    let slot = futuresLedgerParts.get(key)
+    if (slot === undefined || slot.total !== packet.total) {
+      slot = { total: packet.total, parts: new Array(packet.total).fill(null), at: futuresClock() }
+      futuresLedgerParts.set(key, slot)
+      // 只留最近三份拼装中的快照：换房主时旧片永远拼不齐，攒着就是泄漏。
+      if (futuresLedgerParts.size > 3) {
+        const oldest = [...futuresLedgerParts.keys()][0]
+        if (oldest !== key) futuresLedgerParts.delete(oldest)
+      }
+    }
+    slot.parts[packet.index] = packet.chunk
+    if (slot.parts.some((part) => part === null)) return
+    futuresLedgerParts.delete(key)
+    let snapshot = null
+    try {
+      snapshot = JSON.parse(slot.parts.join(''))
+    } catch (error) {
+      warnOnce('futures-ledger-parse', '整本账快照拼不成 JSON：' + message(error))
+      return
+    }
+    void futures.applyLedgerSnapshot(snapshot).then((result) => {
+      if (result?.ok !== true) {
+        warnOnce('futures-ledger-' + String(result?.error), '整本账快照被拒：' + String(result?.error))
+      }
+    }).catch((error) => {
+      warnOnce('futures-ledger-apply', '整本账快照存不下来：' + message(error))
+    })
+  }
+
   /** 票 94：对端每 30 秒对一次账。房主直接回整份账户——gap 再大也不会算错。 */
   function handleFuturesSync (packet, from) {
     if (disposed || futures === null || !isFuturesHost()) return
@@ -7116,6 +7322,8 @@ export function createService (ctx, options = {}) {
         mode: packet.mode,
         // 1.10.0：房主账本里这个账户的档位（老房主不发 = null）。
         accountMode: packet.accountMode ?? null,
+        // 1.12.0：这个账户自己按的暂停（老房主不发 = false）。
+        paused: packet.paused === true,
         pending: packet.pending,
         at: futuresClock()
       })
@@ -7131,7 +7339,6 @@ export function createService (ctx, options = {}) {
   /** 票 94：不是房主时向期货邻居报一声到（30 秒一台最多一次）。 */
   function announceFutures (now = futuresClock()) {
     if (disposed || futures === null || discovery === null) return 0
-    if (futures.modeOf() === 'off') return 0
     if (isFuturesHost()) return 0
     const selfId = room.snapshot().self?.deviceId
     if (!isDeviceId(selfId)) return 0
@@ -7152,7 +7359,6 @@ export function createService (ctx, options = {}) {
   /** 票 94：不是房主时每 30 秒跟房主对一次账；还没账目副本时改成 hello 要一份。 */
   function syncFutures (now = futuresClock()) {
     if (disposed || futures === null || discovery === null) return false
-    if (futures.modeOf() === 'off') return false
     if (isFuturesHost()) return false
     if (now - futuresSyncAt < futuresSyncMs) return false
     const replica = futures.replicaOf()
@@ -7267,7 +7473,6 @@ export function createService (ctx, options = {}) {
    * `pending:true` 就是窗口上的「已发给房主，等一拍回执」。
    */
   function futuresOrderPending (action, order) {
-    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     const hostId = futuresHostId()
     if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
@@ -7296,7 +7501,6 @@ export function createService (ctx, options = {}) {
    * 没有 orderId 直接拒（协议层也会拒，这里先给一句人话）。
    */
   function futuresCancelPending (orderId) {
-    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (typeof orderId !== 'string' || orderId.trim() === '') return { ok: false, error: 'bad-order' }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     const hostId = futuresHostId()
@@ -7327,7 +7531,6 @@ export function createService (ctx, options = {}) {
    * （`transferOut`，不退回农场）。指令发不出去就把钱原路退回农场，不吞玩家的币。
    */
   async function futuresPeerDeposit (rawCoins) {
-    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     if (futuresHostId() === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     const funded = await futures.deposit(rawCoins)
@@ -7357,7 +7560,6 @@ export function createService (ctx, options = {}) {
    * 让拒绝只可能来自并发成交（下一拍 settle 会纠正账目）。这是明确的取舍，报告里写清。
    */
   async function futuresConvertPending (rawPositionId, rawLots) {
-    if (futuresMode() === 'off') return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     if (futuresHostId() === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     const positionId = typeof rawPositionId === 'string' ? rawPositionId.trim().toLowerCase() : ''
@@ -7674,7 +7876,6 @@ export function createService (ctx, options = {}) {
   async function runFuturesTick () {
     if (futures === null || disposed) return
     // 票 98：off 时连定时结算都停（账本保留，重新切回 live 不会被旧行情补刀）。
-    if (futures.modeOf() === 'off') return
     let settled = null
     try {
       settled = await futures.settleDue(futuresClock())
@@ -7718,6 +7919,40 @@ export function createService (ctx, options = {}) {
     // 票 94：同一班车顺手做「报到」和「对账」。两条都按 30 秒节流，15 秒一拍正好两拍一次。
     announceFutures()
     syncFutures()
+    // 1.12.0（B）：接替房主时先用落盘的那份账本接管，再用整本账向邻居广播。
+    if (isFuturesHost()) {
+      adoptFuturesLedgerIfPossible()
+      futuresLedgerTick += 1
+      if (futuresLedgerTick % 2 === 0) broadcastFuturesLedger()
+    }
+  }
+
+  /**
+   * 1.12.0（B）：本机刚当上房主、自己的账还是空的时候，用上一任房主落盘的快照接管。
+   * 只在「空账本」时接管——已经有账就不覆盖，否则两边会互相打架。
+   */
+  function adoptFuturesLedgerIfPossible () {
+    if (disposed || futures === null) return 0
+    let ledger = null
+    try {
+      ledger = futures.adoptableLedger()
+    } catch (error) {
+      warnOnce('futures-ledger-adoptable', '接管前的检查失败：' + message(error))
+      return 0
+    }
+    if (ledger === null) return 0
+    const selfId = room.snapshot().self.deviceId
+    void futures.adoptLedger(ledger, { selfId, at: futuresClock() }).then((result) => {
+      if (result?.ok !== true) {
+        warnOnce('futures-ledger-adopt', '接管账本失败：' + String(result?.error))
+        return
+      }
+      refreshFuturesWindow()
+      broadcastFuturesSettle()
+    }).catch((error) => {
+      warnOnce('futures-ledger-adopt', '接管账本失败：' + message(error))
+    })
+    return 1
   }
 
   function startFuturesSettleTick () {
@@ -8001,6 +8236,17 @@ export function createService (ctx, options = {}) {
       if (backpack !== null) await backpack.releaseOut(carried.id, visitId)
       carried = null
     }
+    // 记录页（票 79 补）：红包**真的上路**了才记一笔——被「对方版本不支持」扣在背包、
+    // 或整包超 4 KiB 被编码层丢掉，都不该在记录里写成「已送出」。
+    if (sent.ok && !sent.giftDropped && sent.gift?.kind === 'packet' && farm !== null) {
+      await farm.notePacket({
+        direction: 'out',
+        event: 'sent',
+        who: begun.visit.nickname,
+        text: packetSummary(sent.gift.packet)
+      })
+      refreshFarmWindow()
+    }
     // 字条没带上（太长/坏形状/整包超 4 KiB）或背包那件文件读不出来：串门照常，
     // 但必须在本机说一句，不能让人以为东西已经送出去了。
     const notice = sent.giftDropped ? room.noteGiftDropped() : skipped
@@ -8146,6 +8392,16 @@ export function createService (ctx, options = {}) {
     }
     sendGiftReceipt(packet.deviceId, packet.visitId, gift.id)
     notifyPacketArrived(saved.gift)
+    // 记录页（票 79 补）：收到的红包也要留一条，不然卡片被拆掉/退掉之后就查不到是谁什么时候给的。
+    if (farm !== null) {
+      await farm.notePacket({
+        direction: 'in',
+        event: 'arrived',
+        who: saved.gift.from?.nickname,
+        text: packetSummary(saved.gift.packet)
+      })
+      refreshFarmWindow()
+    }
   }
 
   /** 收到红包时在桌面场景里亮一张卡（卡片本身来自 /state 的 gifts）。 */
@@ -8518,6 +8774,18 @@ export function createService (ctx, options = {}) {
     }
     log.info('红包退回来了：' + packetSummary(contents))
     sendPacketReturned(packet.deviceId, giftId)
+    // 记录页（票 79 补）：东西回到我手上，记成「退回」——谁没拆就用对方昵称说清楚。
+    if (farm !== null) {
+      const neighbor = (room.snapshot().neighbors ?? [])
+        .find((entry) => entry.deviceId === packet.deviceId)
+      await farm.notePacket({
+        direction: 'in',
+        event: 'returned',
+        who: neighbor?.nickname,
+        text: packetSummary(contents)
+      })
+      refreshFarmWindow()
+    }
     refreshBringWindow()
     return true
   }

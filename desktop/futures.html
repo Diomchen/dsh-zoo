@@ -51,6 +51,7 @@
   .modebar .modeText { color: var(--muted); }
   .modebar .caps { color: var(--muted); }
   .modebar .pending { color: var(--danger); }
+  .modebar .pauseText { color: var(--muted); }
   .modebar[hidden] { display: none; }
   .modebar .grow { flex: 1; }
   .modebar .hostOnly { display: flex; align-items: center; gap: 6px; }
@@ -151,6 +152,10 @@
     padding: 1px 5px; cursor: pointer; font: inherit; font-size: 11px;
   }
   .close-btn + .close-btn { margin-left: 4px; }
+  /* 票 109：交割前提醒——持仓表头下面一条，红字只在收盘前 30 分钟出现。 */
+  .expiry-hint { padding: 4px 10px; font-size: 11px; color: var(--danger); border-bottom: 1px solid var(--soft); }
+  .bulk-btn { float: right; margin-left: 8px; font-size: 11px; }
+  .bulk-btn:disabled { opacity: .45; cursor: default; }
   .limit { margin-top: 6px; font-variant-numeric: tabular-nums; }
   .limit .lbl { color: var(--muted); font-size: 12px; }
   .limit .hint { color: var(--danger); font-size: 12px; }
@@ -188,8 +193,9 @@
     <button class="winClose" id="close" type="button" aria-label="关闭期货" title="关闭（Esc）">×</button>
   </header>
 
-  <!-- 票 98 / 1.10.0：档位是每个账户自己的事。左边徽章写「这本账是纸面还是真钱」，
-       旁边一颗切换按钮任何人都能用；房主另有一条「开市/关市」与回滚。 -->
+  <!-- 票 98 / 1.10.0 / 1.12.0：档位与暂停都是**每个账户自己的事**。左边徽章写「这本账是
+       纸面还是真钱」，旁边一颗切换按钮任何人都能用；「暂停 / 继续」只停自己那本账，
+       房主按下去也停不了别人的市；「退出」只退自己的余额。 -->
   <div class="modebar" id="modebar" hidden>
     <span class="chip" id="accountChip">—</span>
     <span class="modeText" id="accountText"></span>
@@ -197,11 +203,9 @@
     <span class="caps mono" id="caps"></span>
     <span class="pending" id="pending" hidden></span>
     <span class="grow"></span>
-    <span class="hostOnly" id="modeSwitch" hidden>
-      <button type="button" id="openMarket">开市</button>
-      <button type="button" id="closeMarket" class="dangerBtn">关市</button>
-      <button type="button" id="rollback" class="dangerBtn">回滚</button>
-    </span>
+    <span class="pauseText" id="pauseText"></span>
+    <button type="button" id="pauseBtn" class="accountBtn">暂停交易</button>
+    <button type="button" id="rollback" class="dangerBtn">退出</button>
   </div>
 
   <section class="quotes">
@@ -249,7 +253,8 @@
 
   <div class="bottom">
     <section>
-      <h2>持仓</h2>
+      <h2>持仓<button class="close-btn bulk-btn" id="convertAll" type="button" title="把全部持仓按公允价转成现货（到期后只能现金结算）">全部转</button></h2>
+      <div class="expiry-hint" id="expiryHint" hidden></div>
       <div class="scroll">
         <table>
           <thead><tr><th>合约</th><th>方向</th><th>张</th><th>入场</th><th>保证金</th><th>强平</th><th>浮盈亏</th><th></th></tr></thead>

@@ -240,3 +240,103 @@ test('拒绝路径：坏参数、余额不够、周末休市都说人话，账�
   assert.equal(closed.body.error, 'market-closed')
   assert.equal((await state(service)).futures.quotes.tomato, undefined, '周末行情也应该是空的')
 })
+
+test('票 109：一次把多笔持仓转成现货，转不动的那笔单独跳过', async (t) => {
+  const { service } = await makeService(t, { farmCoins: 5000 })
+  await act(service, { action: 'futures-deposit', coins: 2000 })
+  const first = await act(service, {
+    action: 'futures-open', cropId: 'tomato', side: 'long', margin: 100, leverage: 20
+  })
+  assert.equal(first.body.ok, true, JSON.stringify(first.body))
+  const second = await act(service, {
+    action: 'futures-open', cropId: 'rice', side: 'long', margin: 100, leverage: 20
+  })
+  assert.equal(second.body.ok, true, JSON.stringify(second.body))
+
+  const before = await state(service)
+  assert.equal(before.futures.positions.length, 2)
+  const coinsBefore = before.farm.coins
+
+  // 一笔真转（1 张），一笔拿不存在的 id 来凑数：前者成、后者算失败，整体仍算成功。
+  const batch = await act(service, {
+    action: 'futures-convert-all',
+    positions: [
+      { id: first.body.position.id, lots: 1 },
+      { id: '0b7c1f0e-1f2a-4a4b-9a3e-1d2c3b4a5f60', lots: 1 }
+    ]
+  })
+  assert.equal(batch.body.ok, true, JSON.stringify(batch.body))
+  assert.equal(batch.body.converted, 1)
+  assert.equal(batch.body.failed, 1)
+
+  const after = await state(service)
+  const remaining = after.futures.positions.find((row) => row.id === first.body.position.id)
+  assert.ok(remaining, '只转 1 张，那笔持仓还在，只是少了一张')
+  assert.equal(remaining.lots, first.body.position.lots - 1)
+  assert.ok(after.futures.positions.some((row) => row.id === second.body.position.id), '没点名的那笔不动')
+  assert.ok(after.futures.balance < before.futures.balance, '按公允价买现货，余额是往下走的')
+
+  // 一笔都转不动：整体 ok:false，给一句人话，账本不动。
+  const nothing = await act(service, {
+    action: 'futures-convert-all',
+    positions: [{ id: second.body.position.id, lots: 100000 }]
+  })
+  assert.equal(nothing.body.ok, false)
+  assert.equal(typeof nothing.body.notice, 'string')
+  assert.equal((await state(service)).futures.positions.length, 2)
+  assert.equal((await state(service)).farm.crops.tomato.qty, after.farm.crops.tomato.qty)
+
+  const empty = await act(service, { action: 'futures-convert-all', positions: [] })
+  assert.equal(empty.body.ok, false)
+  assert.equal(empty.body.error, 'bad-positions')
+})
+
+test('1.12.0：暂停与退出都是「自己的事」——按了只停自己，提现照常', async (t) => {
+  const { service } = await makeService(t, { farmCoins: 5000 })
+  await act(service, { action: 'futures-deposit', coins: 1000 })
+  const opened = await act(service, {
+    action: 'futures-open', cropId: 'tomato', side: 'long', margin: 100, leverage: 10
+  })
+  assert.equal(opened.body.ok, true, JSON.stringify(opened.body))
+
+  // 暂停：窗口立刻显示「暂停中」，新仓被拒，但合约还在、仓位还在。
+  const paused = await act(service, { action: 'futures-pause', paused: true })
+  assert.equal(paused.status, 200)
+  assert.equal(paused.body.ok, true, JSON.stringify(paused.body))
+  assert.equal(paused.body.paused, true)
+  const blockedOpen = await act(service, {
+    action: 'futures-open', cropId: 'tomato', side: 'long', margin: 100, leverage: 10
+  })
+  assert.equal(blockedOpen.body.ok, false)
+  assert.equal(blockedOpen.body.error, 'paused')
+  const pausedState = await state(service)
+  assert.equal(pausedState.futures.paused, true)
+  assert.equal(pausedState.futures.session.kind, 'trading', '暂停不等于休市')
+  assert.equal(pausedState.futures.positions.length, 1)
+
+  // 减风险照常：平仓、提现。
+  const closed = await act(service, { action: 'futures-close', positionId: opened.body.position.id })
+  assert.equal(closed.body.ok, true, JSON.stringify(closed.body))
+  const coinsBefore = (await state(service)).farm.coins
+  const out = await act(service, { action: 'futures-withdraw', coins: 50 })
+  assert.equal(out.body.ok, true, JSON.stringify(out.body))
+  assert.equal(out.body.credited, 50, JSON.stringify(out.body))
+
+  // 继续交易：按钮回到「交易中」。
+  const resumed = await act(service, { action: 'futures-pause', paused: false })
+  assert.equal(resumed.body.paused, false)
+  assert.equal((await state(service)).futures.paused, false)
+
+  // 老入口 `futures-mode{off}` 仍然能用，但语义已经变成「暂停自己」。
+  const legacy = await act(service, { action: 'futures-mode', mode: 'off' })
+  assert.equal(legacy.body.ok, true)
+  assert.equal((await state(service)).futures.paused, true)
+
+  // 退出：只退自己，退完这本账停用。
+  const rolled = await act(service, { action: 'futures-rollback' })
+  assert.equal(rolled.body.ok, true, JSON.stringify(rolled.body))
+  const after = await state(service)
+  assert.equal(after.futures.disabled, true)
+  assert.equal(after.futures.positions.length, 0)
+  assert.ok(after.futures.balance < 1, '余额几乎全退回农场，托管账只剩零头')
+})

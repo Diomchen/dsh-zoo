@@ -169,6 +169,97 @@ test('bring-window 的红包底数要穿过白名单和主进程，不能在中�
   assert.match(main, /packet: command\.packet/)
 })
 
+test('红包卡不能跟着访客一起消失：访客不在时改锚自己（票 79 补）', async () => {
+  // 真实故障：卡片按「访客在不在」决定去留，访客几秒后走了，卡一收，界面上再没有地方
+  // 点「拆开」——红包躺在 gifts/ 里直到 24 小时自动退回。宿主侧由 desktop-pets 发常驻卡
+  // （见 test/packet-inbox.test.js），渲染端这边必须两处都认「还没拆的红包」：
+  //   1. syncGifts 不能因为 `pets` 里没有那位访客就跳过这张卡；
+  //   2. layoutUi 的锚点退回 promptAnchor（自己），而不是 hideGiftCard。
+  const renderer = await readFile(path.join(root, 'desktop/renderer.js'), 'utf8')
+  assert.match(renderer, /function giftOutlivesVisitor \(gift\)/)
+  assert.match(renderer, /return gift\.kind === 'packet' && gift\.status === 'received'/)
+  // 两处都得问过 giftOutlivesVisitor：syncGifts 放行一张、layoutUi 给它一个锚点。
+  assert.match(renderer, /!pets\.has\('visitor:' \+ gift\.deviceId\) && !giftOutlivesVisitor\(gift\)/)
+  assert.match(renderer, /else if \(giftOutlivesVisitor\(entry\)\) anchor = promptAnchor\(\)/)
+  assert.doesNotMatch(renderer, /if \(!pets\.has\('visitor:' \+ gift\.deviceId\)\) continue/)
+})
+
+test('记录页的白名单要认得红包：宿主写了、桌面不能把它丢掉（票 79 补）', () => {
+  // 这条是「记录页看不到红包」的真正原因：宿主 farm.log 里有条目，但 helper 的
+  // FARM_LOG_KINDS 白名单没有 packet，下发桌面时整条被丢掉，渲染端根本没收到。
+  const now = Date.now()
+  const window = shared.normalizeFarmWindow({
+    open: true,
+    farm: {
+      log: [
+        { at: now, kind: 'packet', qty: 0, event: 'claimed', direction: 'in', who: '测试邻居', text: '2 硬币' },
+        { at: now - 1, kind: 'packet', qty: 0, event: 'sent', direction: 'out', who: '爸爸', text: '12 硬币 · 小番茄 ×2' },
+        { at: now - 2, kind: 'packet', qty: 0, event: 'bogus', direction: 'sideways', who: '阿蟹', text: '币'.repeat(200) },
+        { at: now - 3, kind: 'plant', qty: 1, crop: 'tomato' }
+      ]
+    }
+  })
+  const log = window.farm.log
+  assert.deepEqual(log.map((entry) => entry.kind), ['packet', 'packet', 'packet', 'plant'])
+  assert.equal(log[0].event, 'claimed')
+  assert.equal(log[0].direction, 'in')
+  assert.equal(log[0].who, '测试邻居')
+  assert.equal(log[0].text, '2 硬币')
+  assert.equal(log[1].direction, 'out')
+  // 不认识的步骤/方向不猜：条目留着、这两个字段丢掉；内容超长夹到 60 码点。
+  assert.equal('event' in log[2], false)
+  assert.equal('direction' in log[2], false)
+  assert.equal(Array.from(log[2].text).length, 60)
+
+  // 票 79 补：红包另存的那一份也要能过 helper 的窄口，不然「流水里被挤掉就再也看不到」。
+  const withPackets = shared.normalizeFarmWindow({
+    open: true,
+    farm: {
+      log: [{ at: now, kind: 'plant', qty: 1, crop: 'tomato' }],
+      packets: [
+        { at: now, kind: 'packet', qty: 0, event: 'claimed', direction: 'in', who: '测试邻居', text: '2 硬币' },
+        { at: now - 1, kind: 'plant', qty: 1, crop: 'tomato' },
+        { at: now - 2, kind: 'packet', qty: 0, event: 'arrived', direction: 'in', who: '爸爸', text: '' }
+      ]
+    }
+  })
+  assert.deepEqual(withPackets.farm.packets.map((entry) => entry.event), ['claimed', 'arrived'], '只收红包，别的混不进来')
+  assert.equal(withPackets.farm.packets[0].who, '测试邻居')
+  assert.equal(shared.normalizeFarmWindow({ open: true, farm: { log: [] } }).farm.packets, undefined, '老宿主不给就不塞空字段')
+})
+
+test('红包记录要在农场「记录」页里能看懂（票 79 补）', async () => {
+  // 记录页只认 LOG_TEXT 里的 kind：不加这一行，红包记录会画成「动作」。
+  // 而且四种步骤（收到/拆开/送出/退回）必须各说一句话，不能都写成「红包」。
+  const farmUi = await readFile(path.join(root, 'desktop/farm.js'), 'utf8')
+  assert.match(farmUi, /packet: '红包'/)
+  const branch = farmUi.match(/function packetLogText \(entry\)[\s\S]*?\n\}/)
+  assert.ok(branch !== null, '红包文案要有自己的一份（置顶块与流水共用）')
+  for (const event of ['claimed', 'sent', 'returned']) {
+    assert.match(branch[0], new RegExp(`entry\\.event === '${event}'`), event)
+  }
+  assert.match(branch[0], /还没拆/, '没拆的红包要说明还在等')
+  assert.match(farmUi, /if \(entry\.kind === 'packet'\) \{\r?\n\s+return packetLogText\(entry\)/)
+})
+
+test('红包记录置顶：流水里几十条种下/收货，红包不能埋在下面（票 79 补）', async () => {
+  // 现场：红包记录确实画出来了，但在「最近 100 条」里排到第 30 行开外，
+  // 窗口一屏只露十来行——用户翻不到就等于没有。所以记录页顶上单钉一块。
+  const html = await readFile(path.join(root, 'desktop/farm.html'), 'utf8')
+  const section = html.match(/<section class="log log-packets" id="log-packets"[\s\S]*?<\/section>/)
+  assert.ok(section !== null, '记录页要有置顶的红包记录块')
+  assert.match(section[0], /<h2>红包记录<\/h2>/)
+  assert.match(section[0], /<ul id="log-packet-list"><\/ul>/)
+  assert.match(html, /\.log-packets\[hidden\] \{\r?\n\s+display: none;/, '块要能被 hidden 关掉')
+
+  const farmUi = await readFile(path.join(root, 'desktop/farm.js'), 'utf8')
+  assert.match(farmUi, /const packetSectionEl = document\.getElementById\('log-packets'\)/)
+  assert.match(farmUi, /const packetListEl = document\.getElementById\('log-packet-list'\)/)
+  assert.match(farmUi, /const packets = farm !== null && Array\.isArray\(farm\.packets\)/, '要取宿主单独攒的那一份')
+  assert.match(farmUi, /packetSectionEl\.hidden = packets\.length === 0/, '没有红包时整块不出现')
+  assert.match(farmUi, /for \(const entry of packets\) packetListEl\.appendChild\(logRow\(entry\)\)/)
+})
+
 test('红包面板比字条高：窗口要够高，底栏要钉住，不然「取消 / 放进背包」会掉出可视区', async () => {
   const main = await readFile(path.join(root, 'desktop/main.js'), 'utf8')
   const height = main.match(/const GIFT_HEIGHT = (\d+)/)

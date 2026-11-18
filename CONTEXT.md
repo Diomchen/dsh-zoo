@@ -24,11 +24,13 @@
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。
 
 「期货 / 日合约 / 房主清算」的决策见 [ADR-0032](docs/adr/0032-futures-host-as-clearinghouse.md)
-与 [ADR-0034](docs/adr/0034-futures-daily-contracts.md)，
+与 [ADR-0034](docs/adr/0034-futures-daily-contracts.md)；「档位、暂停、退出都归账户自己」
+见 [ADR-0035](docs/adr/0035-account-level-futures-mode.md) 与
+[ADR-0036](docs/adr/0036-account-level-pause-and-self-rollback.md)。
 规格见 [SPEC v11](.scratch/dsh-zoo/SPEC-v11.md)；票 92–99 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。盘口与期货是两层：盘口对着机器，期货对着人。
 
-「盘口行情 v5 / 消息面 / LAN 真人流」的决策见 [ADR-0036](docs/adr/0036-board-v5-news-and-lan-flow.md)，
+「盘口行情 v5 / 消息面 / LAN 真人流」的决策见 [ADR-0038](docs/adr/0038-board-v5-news-and-lan-flow.md)，
 规格见 [SPEC v12](.scratch/dsh-zoo/SPEC-v12.md)；票 103–108 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。A 期是行情 v5 + 消息面，B 期接 LAN 真人资金流（票 107）。
 
@@ -37,7 +39,7 @@
 
 盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment` / `news` / `ticker` / `calendar`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`、`payload.news`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪 / 消息面 / 快讯条 / 日程 / 资金流 / 冲击 / 资金流带”同义。
 
-期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
+期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode` / `paused`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位 / 暂停”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
 ## Language
 
@@ -147,8 +149,15 @@ _Avoid_: 队列, 草稿箱, 发送箱, outbox
 **礼物卡 (Gift Card)**：
 访客捎来东西时，它旁边出现的那张卡片：谁捎的、是什么、打开 / 在文件夹里显示 / 扔掉。
 红包卡多一个「拆开」按钮，拆开后写「已拆」。
-卡片跟着这一次串门走——访客回家卡片就收起，礼物本身留在磁盘上。
+字条和文件跟着这一次串门走——访客回家卡片就收起，东西本身留在磁盘上。
+**没拆的红包例外**：卡片一直贴在自己宠物旁边，直到拆开、或者 24 小时后退回，免得错过一次串门就再也点不到。
 _Avoid_: 弹窗, 通知, toast, 横幅
+
+**红包记录 (Packet Log)**：
+农场窗口「记录」页顶上单独那一块，只列红包：收到、拆开、送出、退回各一句。
+红包不跟种下/收获的流水挤在一起——流水一天几百条，红包一天最多几只，混在一起就被冲没了。
+宿主在 `farm.json` 的 `packetLog` 里单独攒一份（≤50 条），升级前的老文件会把流水里剩下的红包捞回来。
+_Avoid_: 账本, 流水, 通知栏
 
 **外观包 (Bundle)**：
 宠物来串门时自带的一小包东西：一张清单（它是谁、有哪些动作）+ 这些动作的 WebM 文件。
@@ -486,6 +495,8 @@ _Avoid_: 大盘, 基准, benchmark
 **报价 (Quote)**：
 做市商挂在公允价两侧的买一/卖一（各让 0.2%），随时可吃；吃单付 taker 费。
 玩家挂的限价单进另一个队列，每 15 秒撮合一次（有新单进来会立刻再撮一次，不等下一拍）。
+市价开仓**先吃邻居的挂单**再吃做市商的报价（票 110）：同一合约、同一本账、价格不比做市商差的才吃，成交价是挂单价。
+主动平仓、强平、交割仍按做市商报价 / 公允价走。
 _Avoid_: 盘口, 深度, order book, 挂单簿
 
 **托管账户 (Escrow Account)**：
@@ -509,12 +520,13 @@ _Avoid_: 爆仓, 清算, margin call
 _Avoid_: 结算价（盘口口径）, 收盘价, expiry price
 
 **交割 (Delivery)**：
-到期把持仓按交割价结清：默认现金（差额进/出 `balance`），玩家也可以主动「转现货」拿作物。
-_Avoid_: 行权, 到期, exercise, expiry
+到期把持仓按交割价结清：**只有现金**（差额进/出 `balance`），没有实物交割。
+想拿作物要提前自己「转现货」，窗口在收盘前 30 分钟会提醒。
+_Avoid_: 行权, 到期, exercise, expiry, 实物交割
 
 **转现货 (Convert to Spot)**：
 把期货仓位换成实物：按公允价成交现货 + 平掉等量合约，两步原子完成。
-它是玩家主动行为，不是到期默认路径。
+它是玩家主动行为，不是到期默认路径；窗口支持一笔一笔转，也支持表头「全部转」（钱不够或仓库放不下的那几笔跳过）。
 _Avoid_: 提货, 交割, 换仓, roll
 
 **盯市 (Mark to Market)**：
@@ -534,18 +546,35 @@ _Avoid_: 风险准备金, 公益金, reserve fund
 
 **账户档位 (Account Mode)**：
 每个账户自己选的结算口径：`shadow`（纸面，缺省）或 `live`（真钱）。
-房主不管别人玩不玩真钱，只保留开市/关市这道全局闸门；纸面账户照样能开仓挂单，
+房主不管别人玩不玩真钱，也不管别人暂停不暂停；纸面账户照样能开仓挂单，
 但只跟做市商成交，纸面手续费与亏空不进真钱保险基金。
 _Avoid_: 模式, mode（那是市场闸门 `off`/`live`）, 灰度档
+
+**暂停 (Pause)**：
+每个账户自己的开关：暂停后新仓与挂单被拒（`paused`），已有仓位、余额、挂单都留着；
+平仓、撤单、转现货、提现照常。房主按下去也只停自己——**没有人能停别人的市**。
+_Avoid_: 关市, 休市, halt, 停盘
+
+**退出 (Self Rollback)**：
+每个账户自己的收摊动作：按当前公允价强平自己的仓位、自己的余额退回自己的农场、
+这本账标 `disabled` 并保留数据。**只退自己**，别人的托管余额一分不动。
+_Avoid_: 回滚, rollback（旧名，指房主替全场退）
 
 **纸面账户 (Paper Account)**：
 `accountMode: 'shadow'` 的账户：撮合、盯市、强平、交割全跑，钱只在托管账里动，不写自己的 `farm.json`。
 日额与持仓名义上限跟真钱账户一样，只是数是纸面的。
+
+**账本快照 (Ledger Snapshot)**：
+房主每 30 秒打包一次的全量账（`{ epoch, seq, accounts[] }`），按 2,800 字符切片用 `futures-ledger`
+广播，peer 只留最新一份并落盘在 `futures.json` 的 `ledger` 字段。换房主时用它接管：
+余额、持仓、挂单原样回来，最多丢最后半分钟的成交。已经记过账的节点不会被覆盖。
+_Avoid_: 备份, 导出, dump
 _Avoid_: 影子模式（旧名，指整台机器都在纸面）, 模拟盘, 测试模式, dry run
 
 **日额 (Daily Cap)**：
-单个账户一天能开的仓与挂单的名义总额（默认 5,000 币，本地 00:00 归零）。
-纸面账户同样有 5,000 名义的纸面日额。和它并列的是同时持仓名义上限（20,000 币）。
+单个账户一天能开的仓与挂单的名义总额（本地 00:00 归零）。上限是 5,000 币的地板，
+权益越大越宽——按 `max(5,000, 5 × 权益)` 算，权益 = 余额 + 已占保证金。
+纸面账户同样按纸面权益算。和它并列的是同时持仓名义上限（20,000 币）。
 _Avoid_: 限额, 额度, quota
 
 **待提取 (Pending Withdrawal)**：

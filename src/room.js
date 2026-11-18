@@ -476,7 +476,7 @@ export function createRoom ({
       lastSeen: visitor.lastSeen,
       endsAt: visitor.endsAt ?? null,
       // 只加字段、不改名：没有礼物的访客，快照形状与 ticket 10 完全一致。
-      ...(visitor.gift === undefined ? {} : { gift: { ...visitor.gift } })
+      ...(visitor.gift === undefined ? {} : { gift: copyGift(visitor.gift) })
     }
   }
 
@@ -500,6 +500,10 @@ export function createRoom ({
    * 入站礼物：协议层已经清洗过一遍，这里再过一遍白名单（room 也会被单测直接喂）。
    * 返回的状态永远是 pending——真正收下要等 service 把 note.txt/文件写成功。
    * 文件礼物只带 name/size（渲染端要画文件名与大小）；sha256 与路径都不进快照。
+   *
+   * 红包（票 79）把内容与祝福语原样带进快照：卡片上要写“里面装了什么”，
+   * 「拆开」之前一分钱都不动账（ADR-0027）。少了这一支，红包会被下面那条
+   * 兜底当成字条——桌面上就只剩一张没有正文的空卡，永远拆不开。
    */
   function visitorGift (value) {
     const gift = normalizeGift(value)
@@ -509,7 +513,32 @@ export function createRoom ({
     if (gift.kind === 'file') {
       return { id: gift.id, kind: 'file', name: gift.name, size: gift.size, status: 'pending' }
     }
+    if (gift.kind === 'packet') {
+      return copyGift({
+        id: gift.id,
+        kind: 'packet',
+        packet: gift.packet,
+        ...(gift.note === undefined ? {} : { note: gift.note }),
+        status: 'pending'
+      })
+    }
     return { id: gift.id, kind: 'text', text: gift.text, status: 'pending' }
+  }
+
+  /**
+   * 礼物的一份可改拷贝。红包里的 `packet.crops/seeds` 是嵌套对象，浅拷贝会让
+   * 快照与内存共用同一张表——渲染端（或任何读快照的人）改一下就会改到 room 里。
+   */
+  function copyGift (gift) {
+    if (gift.kind !== 'packet') return { ...gift }
+    return {
+      ...gift,
+      packet: {
+        coins: gift.packet.coins,
+        crops: { ...gift.packet.crops },
+        seeds: { ...gift.packet.seeds }
+      }
+    }
   }
 
   function rememberDiscardedGift (giftId) {

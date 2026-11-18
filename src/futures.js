@@ -87,6 +87,8 @@ import { isDeviceId, FUTURES_MAX_POSITIONS, FUTURES_MAX_ORDERS } from './protoco
 import {
   DAY_MS,
   DAILY_NOTIONAL_CAP,
+  DAILY_NOTIONAL_MULTIPLE,
+  dailyNotionalCapFor,
   DELIVERY_FEE_RATE,
   FUTURES_ACCOUNT_MODES,
   FUTURES_DEFAULT_ACCOUNT_MODE,
@@ -133,6 +135,8 @@ export const FUTURES_VIEW_TRADES = 20
 // 票 98：灰度模式与敞口限额都由规则层定义，账本层与协议层共用同一份，避免三处各写一套。
 export {
   DAILY_NOTIONAL_CAP,
+  DAILY_NOTIONAL_MULTIPLE,
+  dailyNotionalCapFor,
   FUTURES_ACCOUNT_MODES,
   FUTURES_DEFAULT_ACCOUNT_MODE,
   FUTURES_DEFAULT_MODE,
@@ -152,11 +156,16 @@ export const FUTURES_ERROR_TEXT = Object.freeze({
   'rate-limited': '请求太频繁，已限速。',
   'not-host': '只有房主能操作。',
   'bad-mode': '未知的期货模式。',
-  'bad-account-mode': '未知的账户档位。'
+  'bad-account-mode': '未知的账户档位。',
+  paused: '你暂停了期货交易，继续之后才能开仓或挂单。',
+  'not-owner': '这份账在房主那台，先把仓位平掉、余额提回农场就行。'
 })
 
 const MAX_ID_LENGTH = 64
 const MAX_QUANTITY = 1_000_000
+// 1.12.0（B）：一本账最多几个账户。局域网里一台机器一个账户，16 已经是宽松上限；
+// 再大就不该硬塞进 4 KiB 的 UDP 包，宁可让快照分片失败也不把包撑爆。
+const LEDGER_MAX_ACCOUNTS = 16
 /** 本地挂单的 deviceId 占位：真正的设备号只出现在 `remotes` 的键上。 */
 export const LOCAL_ORDER_DEVICE = 'local'
 
@@ -214,18 +223,25 @@ export function initialFuturesState () {
     // `farmAnchor/farmIn/farmOut` 只服务于对账：影子模式没有真实流动，所以差额恒为 0。
     mode: FUTURES_DEFAULT_MODE,
     // 1.10.0：本账户自己的档位（`shadow` 纸面 / `live` 真钱）。`null` = 跟随上面的市场档位，
-    // 老存档读出来就是这个值。房主关市（`mode: 'off'`）仍然是全局闸门，谁也绕不过去。
+    // 老存档读出来就是这个值。1.12.0 起 `mode` 只用于显示：暂停自己会把它写成 `off`，
+    // 但它不再拦别人——闸门只看账户自己的 `disabled` / `paused`。
     accountMode: null,
     dayStart: 0,
     dayNotional: 0,
     pending: 0,
     disabled: false,
+    // 1.12.0：每个账户自己的「暂停交易」开关。房主关市只关自己，不再拦别人——
+    // 停别人的市这件事在 LAN 里没有正当性（谁都能拔网线，但没人能替别人按暂停）。
+    paused: false,
     farmAnchor: 0,
     farmIn: 0,
     farmOut: 0,
     // 票 98：模式变更的版本号。模式是全局状态，不挂在某个远端账户上；
     // 推进它并把 peer 的 seq 对齐，切档后的第一份 settle 才不会被当成重复包。
-    modeSeq: 0
+    modeSeq: 0,
+    // 1.12.0（B）：最近一次从房主收到的整本账快照。换房主时用它重建——
+    // 只记一份、只留最新（`(epoch, seq)` 大的那份），别的不攒。
+    ledger: null
   }
 }
 
@@ -242,7 +258,9 @@ function initialRemoteAccount (seq = 0, at = 0) {
     pending: 0,
     dayStart: 0,
     dayNotional: 0,
-    accountMode: null
+    accountMode: null,
+    paused: false,
+    disabled: false
   }
 }
 
@@ -444,7 +462,82 @@ function normalizeRemoteAccount (raw) {
       trades.push(trade)
     }
   }
-  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode }
+  // 1.12.0：暂停与退出标记也要跟着落盘，否则房主重启后远端账户会「自己恢复交易」。
+  const paused = raw.paused === undefined ? false : raw.paused
+  if (typeof paused !== 'boolean') return null
+  const disabled = raw.disabled === undefined ? false : raw.disabled
+  if (typeof disabled !== 'boolean') return null
+  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode, paused, disabled }
+}
+
+/**
+ * 1.12.0（B）：房主广播的整本账快照。
+ *
+ * 只有一件事要保证：**换房主时能用它把账重建出来**。所以快照里每个账户都带齐
+ * 余额、仓位、挂单、成交流水、档位、暂停/退出标记；市场层的保险基金、欠账、交割标记
+ * 也一并带走。校验从严——坏一个字段就整份丢掉，宁可不接管也不能接管一份半截账。
+ */
+export function normalizeLedgerSnapshot (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const epoch = typeof raw.epoch === 'string' ? raw.epoch.slice(0, 64) : ''
+  const seq = Number.isInteger(raw.seq) && raw.seq >= 0 ? raw.seq : null
+  const at = finiteNumber(raw.at)
+  if (seq === null || at === null || at < 0) return null
+  const hostId = typeof raw.hostId === 'string' && raw.hostId !== '' && raw.hostId.length <= MAX_ID_LENGTH
+    ? raw.hostId
+    : null
+  if (hostId === null) return null
+  if (!Array.isArray(raw.accounts) || raw.accounts.length === 0 || raw.accounts.length > LEDGER_MAX_ACCOUNTS) return null
+  const accounts = []
+  const seen = new Set()
+  for (const entry of raw.accounts) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
+    const deviceId = typeof entry.deviceId === 'string' && entry.deviceId !== '' && entry.deviceId.length <= MAX_ID_LENGTH
+      ? entry.deviceId
+      : null
+    if (deviceId === null || seen.has(deviceId)) return null
+    seen.add(deviceId)
+    const account = normalizeRemoteAccount(entry)
+    if (account === null) return null
+    accounts.push({ deviceId, ...account })
+  }
+  const insurance = raw.insurance === undefined ? 0 : nonNegativeCoin(raw.insurance)
+  const shortfall = raw.shortfall === undefined ? 0 : nonNegativeCoin(raw.shortfall)
+  if (insurance === null || shortfall === null) return null
+  const liquidationCount = raw.liquidationCount === undefined
+    ? 0
+    : (Number.isInteger(raw.liquidationCount) && raw.liquidationCount >= 0 ? raw.liquidationCount : null)
+  if (liquidationCount === null) return null
+  const delivered = {}
+  if (raw.delivered !== undefined && raw.delivered !== null) {
+    if (typeof raw.delivered !== 'object' || Array.isArray(raw.delivered)) return null
+    for (const [contractId, value] of Object.entries(raw.delivered)) {
+      const window = contractWindowOf(contractId)
+      const stampedAt = finiteNumber(value)
+      if (window === null || stampedAt === null || stampedAt <= 0) return null
+      delivered[window.id] = stampedAt
+    }
+  }
+  return { v: 1, epoch, seq, at, hostId, insurance, shortfall, liquidationCount, delivered, accounts }
+}
+
+/** 快照里一个账户的线上形状：本地账本和远端账户共用一份序列化，省得两边漂。 */
+function accountSnapshotOf (account) {
+  return {
+    balance: roundCoin(account.balance),
+    marginUsed: roundCoin(account.marginUsed),
+    positions: account.positions.map((position) => ({ ...position })),
+    orders: account.orders.map((order) => ({ ...order })),
+    trades: (account.trades ?? []).slice(0, FUTURES_TRADE_LIMIT).map((trade) => ({ ...trade })),
+    lastSeq: account.lastSeq ?? 0,
+    updatedAt: account.updatedAt ?? 0,
+    pending: roundCoin(account.pending ?? 0),
+    dayStart: account.dayStart ?? 0,
+    dayNotional: roundCoin(account.dayNotional ?? 0),
+    accountMode: account.accountMode ?? null,
+    paused: account.paused === true,
+    disabled: account.disabled === true
+  }
 }
 
 /**
@@ -685,6 +778,17 @@ export function normalizeFuturesFile (value) {
   if (typeof disabled !== 'boolean') repaired += 1
   else state.disabled = disabled
 
+  // 1.12.0：老存档没有 `paused`，缺省就是「没暂停」。
+  const paused = value.paused === undefined ? false : value.paused
+  if (typeof paused !== 'boolean') repaired += 1
+  else state.paused = paused
+
+  // 1.12.2：账户档位落盘了就以盘上为准；老存档没有这个字段，留 null 走 `mode` 反推。
+  if (value.accountMode !== undefined && value.accountMode !== null) {
+    if (isFuturesAccountMode(value.accountMode)) state.accountMode = value.accountMode
+    else repaired += 1
+  }
+
   const farmAnchor = value.farmAnchor === undefined ? 0 : nonNegativeCoin(value.farmAnchor)
   const farmIn = value.farmIn === undefined ? 0 : nonNegativeCoin(value.farmIn)
   const farmOut = value.farmOut === undefined ? 0 : nonNegativeCoin(value.farmOut)
@@ -698,6 +802,14 @@ export function normalizeFuturesFile (value) {
   const modeSeq = value.modeSeq === undefined ? 0 : value.modeSeq
   if (!(Number.isInteger(modeSeq) && modeSeq >= 0)) repaired += 1
   else state.modeSeq = modeSeq
+
+  // 1.12.0（B）：上一次收到的整本账快照。缺字段是旧版本（没这一版就没有快照），
+  // 不算修补；但既然是坏账就必须丢掉——接管一份半截账比不接管更糟。
+  if (value.ledger !== undefined && value.ledger !== null) {
+    const ledger = normalizeLedgerSnapshot(value.ledger)
+    if (ledger === null) repaired += 1
+    else state.ledger = ledger
+  }
 
   // 保证金是「从余额划走的钱」：仓位/挂单丢了、保证金还在，账会凭空多钱或少钱。
   // 仓位 + 挂单冻结的总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
@@ -742,10 +854,16 @@ function toFileState (state) {
     dayNotional: roundCoin(state.dayNotional),
     pending: roundCoin(state.pending),
     disabled: state.disabled,
+    paused: state.paused === true,
+    // 1.12.2：档位要落盘。以前只靠 `mode` 反推，一按暂停（mode 变 off）就退回「纸面」，
+    // 重启后更是直接丢——充值、提现、结算都会按错档位走。
+    accountMode: isFuturesAccountMode(state.accountMode) ? state.accountMode : null,
     farmAnchor: roundCoin(state.farmAnchor),
     farmIn: roundCoin(state.farmIn),
     farmOut: roundCoin(state.farmOut),
-    modeSeq: state.modeSeq
+    modeSeq: state.modeSeq,
+    // 1.12.0（B）：整本账快照（只有 peer 会存，房主这边是 null）。
+    ledger: state.ledger === null ? null : state.ledger
   }
 }
 
@@ -762,7 +880,11 @@ function remoteFileState (remotes) {
       updatedAt: account.updatedAt,
       pending: roundCoin(account.pending ?? 0),
       dayStart: account.dayStart ?? 0,
-      dayNotional: roundCoin(account.dayNotional ?? 0)
+      dayNotional: roundCoin(account.dayNotional ?? 0),
+      // 1.12.2：这三样以前都没落盘，房主一重启，邻居就自动变回「纸面、没暂停、没退出」。
+      accountMode: isFuturesAccountMode(account.accountMode) ? account.accountMode : null,
+      paused: account.paused === true,
+      disabled: account.disabled === true
     }
   }
   return out
@@ -899,23 +1021,41 @@ class FuturesStore {
     return this.#accountModeOf(this.#state)
   }
 
-  #disabled () {
-    return this.#state.disabled || this.modeOf() === 'off'
+  /** 账户权益：余额 + 已占保证金（不含浮盈——浮盈每 15 秒变，额度不该跟着抖）。 */
+  #equityOf (account) {
+    const target = account ?? this.#state
+    const balance = Number.isFinite(target?.balance) ? target.balance : 0
+    const used = Number.isFinite(target?.marginUsed) ? target.marginUsed : 0
+    return roundCoin(balance + used)
   }
 
-  /** 统一的交易入口闸门：回滚后 `disabled`，房主切 `off` 后一律拒绝。 */
-  #gate () {
-    if (this.#state.disabled) {
+  /** 1.12.2：今天的日额上限——地板 5,000，权益多的人按 5 × 权益放大。 */
+  #dayCapOf (account) {
+    return dailyNotionalCapFor(this.#equityOf(account))
+  }
+
+  #disabled (account = this.#state) {
+    return account?.disabled === true
+  }
+
+  /**
+   * 统一的交易入口闸门（1.12.0）：**只看这个账户自己**。
+   *
+   * `disabled` = 自己退出过；`paused` = 自己按了暂停。房主的「关市」不再出现在这里——
+   * 一台机器停不了别人的仓，这是 LAN 里唯一说得通的分权。
+   */
+  #gate (account = this.#state) {
+    if (this.#disabled(account)) {
       return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     }
-    if (this.modeOf() === 'off') {
-      return { ok: false, error: 'off', notice: FUTURES_ERROR_TEXT.off }
+    if (account?.paused === true) {
+      return { ok: false, error: 'paused', notice: FUTURES_ERROR_TEXT.paused }
     }
     return null
   }
 
-  #limitError (code) {
-    return { ok: false, error: code, notice: FUTURES_ERROR_TEXT[code] }
+  #limitError (code, notice = FUTURES_ERROR_TEXT[code]) {
+    return { ok: false, error: code, notice }
   }
 
   /** 本地自然日 00:00（票 98 的日额按本地时区归零）。 */
@@ -959,12 +1099,19 @@ class FuturesStore {
     if (amount === null || amount <= 0) return null
     const owner = account ?? this.#state
     this.#rollDayFor(owner, stamp)
-    const cap = DAILY_NOTIONAL_CAP
+    const cap = this.#dayCapOf(owner)
+    const usedDay = roundCoin(owner.dayNotional)
     if (owner.dayNotional + amount >= cap) {
-      return this.#limitError('daily-cap')
+      // 说清楚「还剩多少」：光一句「已到上限」看不出差多少，窗口也没法提示下一单该缩到多小。
+      return this.#limitError('daily-cap',
+        '今日交易额已到上限：上限 ' + cap + ' 名义，已用 ' + usedDay + '，这笔要 ' + amount +
+        '，明天 00:00 重置。')
     }
-    if (this.#notionalOfAccount(account) + amount >= POSITION_NOTIONAL_CAP) {
-      return this.#limitError('notional-cap')
+    const usedPosition = this.#notionalOfAccount(account)
+    if (usedPosition + amount >= POSITION_NOTIONAL_CAP) {
+      return this.#limitError('notional-cap',
+        '持仓名义已到上限：上限 ' + POSITION_NOTIONAL_CAP + ' 名义，已用 ' + usedPosition +
+        '，这笔要 ' + amount + '，先平掉一点再开。')
     }
     return null
   }
@@ -1022,10 +1169,13 @@ class FuturesStore {
       mode: this.modeOf(),
       accountMode: this.accountMode(),
       dayNotional: roundCoin(this.#state.dayNotional),
-      dayCap: DAILY_NOTIONAL_CAP,
+      dayCap: this.#dayCapOf(this.#state),
       positionCap: POSITION_NOTIONAL_CAP,
       pending: roundCoin(this.#state.pending),
       disabled: this.#state.disabled,
+      paused: this.#state.paused === true,
+      // 1.12.0：本地没暂停、账也没回滚，就能开新仓（别人暂停不影响你）。
+      canTrade: this.#state.disabled !== true && this.#state.paused !== true,
       errorText: FUTURES_ERROR_TEXT,
       closed: this.#state.closed,
       positionCount: this.#state.positions.length,
@@ -1044,24 +1194,25 @@ class FuturesStore {
   }
 
   /**
-   * 票 98：房主切换灰度模式。切换本身写一条 `kind:'mode'` 的审计流水（价格/张数为 0），
-   * 并重置日额与对账锚点——从切换这一刻起重新按真实流动算差额。
+   * 1.12.0：暂停 / 继续**自己的**交易。
+   *
+   * 这是「关市」下放之后唯一还需要的开关：暂停后不能开仓、不能挂单，已有仓位照常盯市、
+   * 强平、交割，想减仓随时可以平——停的是「新风险」，不是「逃生的门」。
    */
-  async setMode (rawMode, at = this.#nowMs()) {
-    if (!FUTURES_MODES.includes(rawMode)) {
-      return { ok: false, error: 'bad-mode', notice: FUTURES_ERROR_TEXT['bad-mode'] }
+  async setPaused (rawPaused, at = this.#nowMs()) {
+    if (typeof rawPaused !== 'boolean') {
+      return { ok: false, error: 'bad-paused', notice: '暂停开关只接受 true / false。' }
     }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
-    this.#state.mode = rawMode
-    // 日额只按自然日归零，不因切模式重置（否则 live→shadow→live 能刷出新的 5,000）。
-    this.#rollDay(stamp)
-    this.#state.farmAnchor = this.#farmCoins()
-    this.#state.farmIn = 0
-    this.#state.farmOut = 0
-    this.#recordTrade({ at: stamp, kind: 'mode', note: rawMode, lots: 0, price: 0, fee: 0 })
-    // 模式是全局账目的一部分：推进模式版本号，并把已有远端账户都对齐到它。
-    // 否则 peer 会把「同一 seq 的新模式」当成重复包丢掉，窗口一直停在旧档位。
-    // 还没建账的 peer 由 `accountOf()` 返回 `modeSeq`，同样能收到这次模式变化。
+    if (this.#disabled()) {
+      return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
+    }
+    this.#state.paused = rawPaused
+    // 1.12.2：`mode` 只是市场闸门的投影；暂停/继续都不该把账户自己的档位抹成纸面。
+    if (rawPaused) this.#state.mode = 'off'
+    else if (this.#state.mode === 'off') this.#state.mode = this.accountMode() === 'live' ? 'live' : 'shadow'
+    this.#state.tradedAt = stamp
+    this.#recordTrade({ at: stamp, kind: 'mode', note: rawPaused ? 'off' : 'live', lots: 0, price: 0, fee: 0 })
     this.#state.modeSeq += 1
     this.#state.seq = Math.max(this.#state.seq, this.#state.modeSeq)
     for (const account of Object.values(this.#state.remotes)) {
@@ -1071,12 +1222,63 @@ class FuturesStore {
     const persisted = await this.#persist()
     return {
       ok: true,
-      action: 'futures-mode',
-      mode: rawMode,
-      disabled: this.#state.disabled,
+      action: 'futures-pause',
+      paused: rawPaused,
+      mode: this.#state.mode,
       ...this.#view(),
       persisted
     }
+  }
+
+  /** 房主替 peer 记下它自己按的暂停（peer 那台已经先本地按下去了）。 */
+  async setRemotePaused (deviceId, rawPaused, at = this.#nowMs()) {
+    if (typeof rawPaused !== 'boolean') {
+      return { ok: false, error: 'bad-paused', notice: '暂停开关只接受 true / false。' }
+    }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const account = this.#remoteAccount(deviceId, stamp)
+    if (account === null) return { ok: false, error: 'bad-device' }
+    if (this.#disabled(account)) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
+    account.paused = rawPaused
+    this.#bumpAccount(account, stamp)
+    this.#recordRemoteTrade(deviceId, {
+      at: stamp,
+      kind: 'mode',
+      note: rawPaused ? 'off' : 'live',
+      lots: 0,
+      price: 0,
+      fee: 0
+    }, stamp)
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-pause',
+      accountMode: this.#accountModeOf(account),
+      paused: rawPaused,
+      account: this.#accountView(deviceId, stamp),
+      seq: account.lastSeq,
+      persisted
+    }
+  }
+
+  /**
+   * 票 98 的老接口，1.12.0 起退化成「暂停自己 / 继续自己」：
+   * `off` = 按下暂停，`shadow` / `live` = 继续（并记住市场档位，只用于显示）。
+   */
+  async setMode (rawMode, at = this.#nowMs()) {
+    if (!FUTURES_MODES.includes(rawMode)) {
+      return { ok: false, error: 'bad-mode', notice: FUTURES_ERROR_TEXT['bad-mode'] }
+    }
+    const result = await this.setPaused(rawMode === 'off', at)
+    if (result.ok !== true) return result
+    if (rawMode === 'off') return { ...result, action: 'futures-mode' }
+    // 1.12.2：老入口 `futures-mode` 以前是「市场档位」，现在等价于「把这个账户自己设成那个档位」。
+    // 只改 `mode` 不改 `accountMode` 的话，账户档位仍然是纸面，充值也就仍然不碰农场。
+    const applied = await this.setAccountMode(rawMode === 'live' ? 'live' : 'shadow', at)
+    if (applied.ok !== true) return applied
+    this.#state.mode = rawMode
+    const persisted = await this.#persist()
+    return { ...result, action: 'futures-mode', mode: rawMode, accountMode: this.accountMode(), persisted }
   }
 
   /**
@@ -1089,8 +1291,9 @@ class FuturesStore {
     if (!isFuturesAccountMode(rawMode)) {
       return { ok: false, error: 'bad-account-mode', notice: FUTURES_ERROR_TEXT['bad-account-mode'] }
     }
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
+    if (this.#disabled()) {
+      return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
+    }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     this.#state.accountMode = rawMode
     this.#state.tradedAt = stamp
@@ -1113,11 +1316,10 @@ class FuturesStore {
     if (!isFuturesAccountMode(rawMode)) {
       return { ok: false, error: 'bad-account-mode', notice: FUTURES_ERROR_TEXT['bad-account-mode'] }
     }
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const account = this.#remoteAccount(deviceId, stamp)
     if (account === null) return { ok: false, error: 'bad-device' }
+    if (this.#disabled(account)) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     account.accountMode = rawMode
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
@@ -1161,36 +1363,31 @@ class FuturesStore {
   }
 
   /**
-   * 票 98：回滚。顺序是「撤掉所有挂单释放冻结 → 按当前公允价强平本地与远端仓位 →
-   * 托管余额逐笔退回农场（撞上限的留在托管账标 pending）→ 存档 disabled、模式 off」。
+   * 1.12.0：退出（只作用于**自己**这一本账）。
+   *
+   * 顺序：撤掉自己的挂单释放冻结 → 按当前公允价强平自己的仓位 → 托管余额退回自己的农场
+   * （撞上限的部分留在托管账标 pending）→ 自己的账户标 `disabled`。别人的账、别人的钱一概不碰：
+   * 房主退出不再替全场退款，也不会把邻居的余额记到自己农场上（票 98 的那条偏差就此消掉）。
    * 数据不删：仓位/流水都还在，只是不能再开新仓。
    */
   async rollback ({ at = this.#nowMs() } = {}) {
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    // peer 的账在房主那台，本地只有副本；替它「回滚」只会把两边账本扯歪。
+    if (this.#state.replica !== null && this.#state.replica !== undefined) {
+      return { ok: false, error: 'not-owner', notice: FUTURES_ERROR_TEXT['not-owner'] }
+    }
     // 先确认每个仓位都拿得到当前公允价；有一个拿不到就整笔取消，避免“平到一半”。
     const targets = []
     for (const position of this.#state.positions) {
       const price = this.#fairAt(position.crop, position.contract, stamp)
-      if (price === null) return { ok: false, error: 'market-closed', notice: '有仓位拿不到公允价，回滚已取消。' }
+      if (price === null) return { ok: false, error: 'market-closed', notice: '有仓位拿不到公允价，退出已取消。' }
       targets.push({ account: this.#state, position, local: true, deviceId: 'local', price })
-    }
-    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
-      for (const position of account.positions) {
-        const price = this.#fairAt(position.crop, position.contract, stamp)
-        if (price === null) return { ok: false, error: 'market-closed', notice: '有仓位拿不到公允价，回滚已取消。' }
-        targets.push({ account, position, local: false, deviceId, price })
-      }
     }
 
     // 撤单：冻结的保证金先回到余额，才能整笔退给农场。
     for (const order of this.#state.orders) this.#state.balance = roundCoin(this.#state.balance + order.marginFrozen)
     this.#state.orders = []
     this.#state.marginUsed = this.#recomputeMarginUsed()
-    for (const account of Object.values(this.#state.remotes)) {
-      for (const order of account.orders) account.balance = roundCoin(account.balance + order.marginFrozen)
-      account.orders = []
-      account.marginUsed = this.#recomputeFor(account)
-    }
 
     for (const target of targets) {
       const pnl = pnlOf({
@@ -1210,13 +1407,9 @@ class FuturesStore {
 
     const refunds = []
     refunds.push(await this.#refundAccount(this.#state, 'local'))
-    for (const [deviceId, account] of Object.entries(this.#state.remotes)) {
-      refunds.push(await this.#refundAccount(account, deviceId))
-    }
 
     this.#state.disabled = true
-    this.#state.mode = 'off'
-    this.#state.dayNotional = 0
+    this.#state.paused = false
     this.#recordTrade({ at: stamp, kind: 'mode', note: 'off', lots: 0, price: 0, fee: 0 })
     const persisted = await this.#persist()
     return {
@@ -1224,7 +1417,7 @@ class FuturesStore {
       action: 'futures-rollback',
       refunds,
       disabled: true,
-      mode: 'off',
+      mode: this.#state.mode,
       ...this.#view(),
       pending: roundCoin(this.#state.pending),
       persisted
@@ -1284,8 +1477,9 @@ class FuturesStore {
    * 单独画一枚徽章（`accountMode`），不再顶替合约状态。
    */
   #sessionOf (crop, stamp) {
-    // 票 98：房主关市优先于合约状态——off 时连「今天有没有合约」都不该显示。
-    if (this.#state.disabled || this.modeOf() === 'off') {
+    // 1.12.0：只有自己退出过（`disabled`）才盖住合约状态；暂停只是「不开新仓」，
+    // 行情、平仓、交割照旧，所以这里不拦。
+    if (this.#state.disabled) {
       return { kind: 'off', text: '期货未开放' }
     }
     const contract = contractOf(crop, stamp)
@@ -1345,8 +1539,8 @@ class FuturesStore {
    * 纸面档（`accountMode: 'shadow'`）不碰农场：整笔都算「已提现」，只在托管账上减。
    */
   async withdraw (rawCoins) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
+    // 提现是把钱拿回来，属于减风险：暂停着也要能提（暂停锁的是「新仓」，不是「逃生门」）。
+    if (this.#disabled()) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     // 提现不受农场单次上限约束：正是「一次提一大笔」才需要分批。
     const coins = positiveInt(rawCoins, Number.MAX_SAFE_INTEGER)
     if (coins === null) return { ok: false, error: 'bad-amount' }
@@ -1426,13 +1620,14 @@ class FuturesStore {
    * 房主只负责记「你在我这里有这么多可用余额」（peer 那边已经在 `transferOut` 里扣过）。
    */
   async hostDeposit (deviceId, rawCoins, at = this.#nowMs()) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     const coins = positiveInt(rawCoins, MAX_COINS)
     if (coins === null) return { ok: false, error: 'bad-amount' }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const account = this.#remoteAccount(deviceId, stamp)
     if (account === null) return { ok: false, error: 'bad-device' }
+    // 1.12.0：充值也只看这个账户自己（暂停/退出的人不收钱）。
+    const blocked = this.#gate(account)
+    if (blocked !== null) return blocked
     account.balance = roundCoin(account.balance + coins)
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
@@ -1442,8 +1637,6 @@ class FuturesStore {
 
   /** 房主：替 peer 开仓（票 94）——校验、定价、收费与 `open()` 是同一套函数，只是账记在 `remotes` 上。 */
   async hostOpen (deviceId, { crop, side, margin, leverage, at = this.#nowMs() } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     if (!isCropId(crop)) return { ok: false, error: 'bad-crop' }
     if (!isFuturesSide(side)) return { ok: false, error: 'bad-side' }
     if (!isMarginAmount(margin)) return { ok: false, error: 'bad-margin' }
@@ -1451,6 +1644,9 @@ class FuturesStore {
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const account = this.#remoteAccount(deviceId, stamp)
     if (account === null) return { ok: false, error: 'bad-device' }
+    // 1.12.0：闸门看的是**这个账户自己**的暂停/退出，不是房主的状态。
+    const blocked = this.#gate(account)
+    if (blocked !== null) return blocked
     // 一条 settle 最多 8 条持仓：超了协议就装不下，所以房主必须在这里拒绝，而不是发不出去。
     if (account.positions.length >= FUTURES_MAX_POSITIONS) return { ok: false, error: 'position-limit' }
     const quote = this.quoteOf(crop, stamp)
@@ -1460,49 +1656,28 @@ class FuturesStore {
     if (this.#state.delivered[quote.contract.id] !== undefined) {
       return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
-    const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
-    const lots = lotsFor({ notional, price })
-    const usedMargin = marginOf({ lots, price, leverage })
-    const fee = takerFeeOf(notionalOf({ lots, price }))
-    const total = roundCoin(usedMargin + fee)
+    // 票 110：市价单先吃邻居的挂单，剩下才找做市商。
+    const plan = this.#planMarketOpen(account, { quote, side, notional, leverage })
     // 余额先判：买不起的单本来就该回 no-balance（不该被说成限额）；
     // 买得起才看日额/持仓两道闸门，被限额拒绝时账上一分不动。
-    if (account.balance < total) return { ok: false, error: 'no-balance' }
+    if (account.balance < roundCoin(plan.margin + plan.fee)) return { ok: false, error: 'no-balance' }
     const limited = this.#checkLimits(account, notional, stamp)
     if (limited !== null) return limited
 
-    account.balance = roundCoin(account.balance - total)
-    const slot = this.#slotOf(stamp)
-    const position = {
-      id: randomUUID(),
-      crop,
-      contract: quote.contract.id,
-      side,
-      lots,
-      entry: price,
-      margin: usedMargin,
-      leverage,
-      openedAt: stamp,
-      slot,
-      settleSlot: slot + 1
-    }
-    account.positions.push(position)
-    account.marginUsed = this.#recomputeFor(account)
+    const filled = this.#commitMarketOpen(account, { crop, quote, side, leverage, stamp, plan, local: false })
+    const position = filled.positions[0]
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
     this.#recordNotional(account, notional, stamp)
-    // 手续费从 peer 的余额里出，落在本机的保险/销毁桶里（钱确实动了，费账就得跟着动）；
-    // 纸面账户的费是纸面的，`#chargeFee` 会按账户档位丢掉。
-    this.#chargeFee(fee, account)
     const persisted = await this.#persist()
     return {
       ok: true,
       action: 'futures-open',
       position: { ...position },
-      lots,
-      price,
-      fee,
+      lots: filled.lots,
+      price: filled.price,
+      fee: filled.fee,
       account: this.#accountView(account, stamp),
       seq,
       persisted
@@ -1511,12 +1686,12 @@ class FuturesStore {
 
   /** 房主：替 peer 平仓（票 94）。规则与 `close()` 相同；别人的盈亏不进本机的周成绩。 */
   async hostClose (deviceId, { id, at = this.#nowMs() } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const account = this.#state.remotes[key]
     if (account === undefined) return { ok: false, error: 'no-position' }
+    // 平仓是减风险：账户暂停着也允许（停的是「新风险」，不是「逃生的门」）。
+    if (this.#disabled(account)) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     const index = account.positions.findIndex((position) => position.id === id)
     if (index < 0) return { ok: false, error: 'no-position' }
     const position = account.positions[index]
@@ -1611,8 +1786,8 @@ class FuturesStore {
    * 所以不是「保证金直接换作物」，余额不够时仍然会 `no-coins`。
    */
   async convertToSpot ({ positionId, lots, at = this.#nowMs() } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
+    // 转现货是减风险：暂停着也允许。
+    if (this.#disabled()) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const plan = this.#convertPlan(this.#state, positionId, lots, stamp)
     if (plan.ok !== true) return plan
@@ -1699,12 +1874,12 @@ class FuturesStore {
 
   /** 房主：替 peer 转现货。作物不进房主农场——peer 在自己机器上入仓，这里只结钱与合约。 */
   async hostConvert (deviceId, { positionId, lots, at = this.#nowMs() } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const account = this.#state.remotes[key]
     if (account === undefined) return { ok: false, error: 'no-position' }
+    // 转现货也是减风险，暂停着照样能动。
+    if (this.#disabled(account)) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
     const plan = this.#convertPlan(account, positionId, lots, stamp)
     if (plan.ok !== true) return plan
@@ -1938,6 +2113,7 @@ class FuturesStore {
     shortfall,
     mode,
     accountMode,
+    paused,
     pending,
     at = this.#nowMs()
   } = {}) {
@@ -1992,6 +2168,9 @@ class FuturesStore {
       ? null
       : (isFuturesAccountMode(accountMode) ? accountMode : undefined)
     if (safeAccountMode === undefined) return { ok: false, error: 'bad-account-mode' }
+    // 1.12.0：账户自己按的暂停，房主随账目回传（老房主不发 = 没暂停）。
+    if (paused !== undefined && typeof paused !== 'boolean') return { ok: false, error: 'bad-paused' }
+    const safePaused = paused === true
     this.#state.replica = {
       epoch,
       lastSeq: seq,
@@ -2004,10 +2183,121 @@ class FuturesStore {
       shortfall: safeShortfall,
       mode: safeMode,
       accountMode: safeAccountMode,
+      paused: safePaused,
       pending: safePending,
       updatedAt: stamp
     }
     return { ok: true, applied: true }
+  }
+
+  /** 1.12.0（B）：把整本账打成一份可广播的快照。 */
+  ledgerSnapshotOf ({ hostId = '', at = this.#nowMs() } = {}) {
+    const state = this.#state
+    const accounts = [{ deviceId: hostId, ...accountSnapshotOf(state) }]
+    for (const [deviceId, account] of Object.entries(state.remotes)) {
+      accounts.push({ deviceId, ...accountSnapshotOf(account) })
+    }
+    return {
+      v: 1,
+      epoch: state.epoch,
+      seq: state.seq,
+      at,
+      hostId,
+      insurance: roundCoin(state.insurance),
+      shortfall: roundCoin(state.shortfall),
+      liquidationCount: state.liquidationCount,
+      delivered: { ...state.delivered },
+      accounts
+    }
+  }
+
+  /** peer 侧收下快照：只留最新的一份，供换房主时接管。 */
+  async applyLedgerSnapshot (raw) {
+    const ledger = normalizeLedgerSnapshot(raw)
+    if (ledger === null) return { ok: false, error: 'bad-ledger' }
+    const current = this.#state.ledger
+    const older = current !== null && current !== undefined &&
+      (current.epoch === ledger.epoch ? current.seq >= ledger.seq : current.at > ledger.at)
+    if (older) {
+      return { ok: true, action: 'futures-ledger', applied: false, epoch: current.epoch, seq: current.seq }
+    }
+    this.#state.ledger = ledger
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-ledger',
+      applied: true,
+      epoch: ledger.epoch,
+      seq: ledger.seq,
+      accounts: ledger.accounts.length,
+      persisted
+    }
+  }
+
+  /** 本机账本还是空的、手上又有一份别人广播的快照 → 该接管了。 */
+  adoptableLedger () {
+    const ledger = this.#state.ledger
+    if (ledger === null || ledger === undefined) return null
+    const state = this.#state
+    // 判断「空」只看账本内容，不看 epoch：`#persist()` 会给空账本补一个随机 epoch。
+    if (Object.keys(state.remotes).length > 0) return null
+    if (state.balance > 0 || state.marginUsed > 0 || state.pending > 0) return null
+    if (state.positions.length > 0 || state.orders.length > 0) return null
+    if (state.trades.length > 0) return null
+    if (state.disabled === true) return null
+    return ledger
+  }
+
+  /**
+   * 1.12.0（B）：接手别人广播的整本账。
+   *
+   * 谁是本机（`selfId`）谁的账就落进本地账本，其余进 `remotes`；认不出的账户直接跳过
+   * （换机器/改 deviceId 之后旧账户就留在快照里，不动它比乱认强）。
+   */
+  async adoptLedger (raw, { selfId = '', at = this.#nowMs() } = {}) {
+    const ledger = normalizeLedgerSnapshot(raw)
+    if (ledger === null) return { ok: false, error: 'bad-ledger' }
+    if (typeof selfId !== 'string' || selfId === '') return { ok: false, error: 'bad-device' }
+    const state = this.#state
+    const own = ledger.accounts.find((account) => account.deviceId === selfId) ?? null
+    const remotes = {}
+    for (const account of ledger.accounts) {
+      if (account.deviceId === selfId) continue
+      remotes[account.deviceId] = normalizeRemoteAccount(account)
+    }
+    state.epoch = ledger.epoch
+    state.seq = Math.max(state.seq, ledger.seq)
+    state.insurance = ledger.insurance
+    state.shortfall = ledger.shortfall
+    state.liquidationCount = ledger.liquidationCount
+    state.delivered = { ...ledger.delivered }
+    state.remotes = remotes
+    if (own !== null) {
+      state.balance = own.balance
+      state.marginUsed = own.marginUsed
+      state.positions = own.positions.map((position) => ({ ...position }))
+      state.orders = own.orders.map((order) => ({ ...order }))
+      state.trades = own.trades.map((trade) => ({ ...trade }))
+      state.pending = own.pending
+      state.dayStart = own.dayStart
+      state.dayNotional = own.dayNotional
+      state.accountMode = own.accountMode
+      state.paused = own.paused === true
+      state.disabled = own.disabled === true
+    }
+    state.tradedAt = at
+    // 接管完就把快照放下：账本已经变成活的，再留一份只会让下一次判断「空不空」变糊。
+    state.ledger = null
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-ledger-adopt',
+      epoch: ledger.epoch,
+      seq: ledger.seq,
+      accounts: ledger.accounts.length,
+      adoptedSelf: own !== null,
+      persisted
+    }
   }
 
   /** peer 侧的只读副本；从没收到过 settle 就是 null（窗口据此显示「等对端」）。 */
@@ -2028,6 +2318,7 @@ class FuturesStore {
       // 票 98：模式与待提取余额也跟随房主；1.10.0：账户档位同样以房主回传的为准。
       mode: FUTURES_MODES.includes(replica.mode) ? replica.mode : FUTURES_DEFAULT_MODE,
       accountMode: isFuturesAccountMode(replica.accountMode) ? replica.accountMode : null,
+      paused: replica.paused === true,
       pending: roundCoin(replica.pending ?? 0)
     }
   }
@@ -2057,46 +2348,33 @@ class FuturesStore {
     if (this.#state.delivered[quote.contract.id] !== undefined) {
       return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
-    const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
-    const lots = lotsFor({ notional, price })
-    const usedMargin = marginOf({ lots, price, leverage })
-    const fee = takerFeeOf(notionalOf({ lots, price }))
-    const total = roundCoin(usedMargin + fee)
-    const shadow = this.accountMode() === 'shadow'
-    if (this.#state.balance < total) return { ok: false, error: 'no-balance' }
+    // 票 110：市价单先吃邻居的挂单，剩下才找做市商——「你赚的钱是邻居亏的钱」从这里开始。
+    const plan = this.#planMarketOpen(this.#state, { quote, side, notional, leverage })
+    if (this.#state.balance < roundCoin(plan.margin + plan.fee)) return { ok: false, error: 'no-balance' }
     const limited = this.#checkLimits(this.#state, notional, stamp)
     if (limited !== null) return limited
-
-    this.#state.balance = roundCoin(this.#state.balance - total)
-    this.#state.marginUsed = roundCoin(this.#state.marginUsed + usedMargin)
-    const slot = this.#slotOf(stamp)
-    const position = {
-      id: randomUUID(),
+    const filled = this.#commitMarketOpen(this.#state, { crop, quote, side, leverage, stamp, plan, local: true })
+    const position = filled.positions[0]
+    this.#recordNotional(this.#state, notional, stamp)
+    this.#recordTrade({
+      at: stamp,
       crop,
       contract: quote.contract.id,
       side,
-      lots,
-      entry: price,
-      margin: usedMargin,
-      leverage,
-      openedAt: stamp,
-      slot,
-      settleSlot: slot + 1
-    }
-    this.#state.positions.push(position)
-    this.#state.tradedAt = stamp
-    this.#recordNotional(this.#state, notional, stamp)
-    this.#chargeFee(fee, this.#state)
-    this.#recordTrade({ at: stamp, crop, contract: quote.contract.id, side, lots, price, fee, kind: 'open' })
+      lots: filled.lots,
+      price: filled.price,
+      fee: filled.fee,
+      kind: 'open'
+    })
     const persisted = await this.#persist()
     return {
       ok: true,
       action: 'futures-open',
       position: { ...position },
-      lots,
-      price,
-      fee,
+      lots: filled.lots,
+      price: filled.price,
+      fee: filled.fee,
       ...this.#view(),
       persisted
     }
@@ -2122,8 +2400,6 @@ class FuturesStore {
 
   /** 房主：替 peer 挂单——规则与 `place()` 同一套，账记在 `remotes[deviceId]` 上。 */
   async hostPlace (deviceId, { crop, side, price, lots, leverage, at = this.#nowMs() } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
@@ -2132,6 +2408,9 @@ class FuturesStore {
     prepared.order.deviceId = key
     const account = this.#remoteAccount(deviceId, stamp)
     if (account === null) return { ok: false, error: 'bad-device' }
+    // 1.12.0：挂单是加风险，按这个账户自己的暂停/退出拦。
+    const blocked = this.#gate(account)
+    if (blocked !== null) return blocked
     const placed = this.#placeInto(account, prepared)
     if (placed.ok !== true) return placed
     account.updatedAt = stamp
@@ -2152,9 +2431,9 @@ class FuturesStore {
    * 别人的单回 `not-yours`（不泄漏「这单存在」以外的信息），不存在回 `no-order`。
    */
   async cancel ({ orderId, at = this.#nowMs(), deviceId = null } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     if (isDeviceId(deviceId)) return this.hostCancel(deviceId, { orderId, at })
+    // 撤单是减风险：暂停着也允许把单撤掉。
+    if (this.#disabled()) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     const id = typeof orderId === 'string' && orderId !== '' && orderId.length <= MAX_ID_LENGTH ? orderId : null
     if (id === null) return { ok: false, error: 'bad-order' }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
@@ -2178,14 +2457,14 @@ class FuturesStore {
 
   /** 房主：替 peer 撤单。 */
   async hostCancel (deviceId, { orderId, at = this.#nowMs() } = {}) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
     const key = this.#remoteKey(deviceId)
     if (key === null) return { ok: false, error: 'bad-device' }
     const id = typeof orderId === 'string' && orderId !== '' && orderId.length <= MAX_ID_LENGTH ? orderId : null
     if (id === null) return { ok: false, error: 'bad-order' }
     const account = this.#state.remotes[key]
     if (account === undefined) return { ok: false, error: 'no-order' }
+    // 撤单不制造新风险，暂停着也允许。
+    if (this.#disabled(account)) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     const index = account.orders.findIndex((order) => order.id === id)
     if (index < 0) return { ok: false, error: this.#orderOwnerOf(id) === null ? 'no-order' : 'not-yours' }
     const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
@@ -2471,10 +2750,97 @@ class FuturesStore {
   }
 
 
+  /**
+   * 票 110（B 方案）：市价单先吃邻居的挂单。
+   *
+   * 同一合约、同一本账（纸面与真钱不交叉）、对手方向、价格不劣于做市商那一侧的挂单，
+   * 按价格优先取走；同价按挂单先后。成交价就是挂单价——比做市商便宜的那部分，是邻居让的。
+   */
+  #bookParts (account, { contract, side, lots, touch }) {
+    const pools = this.#orderPools(contract)
+    const book = this.#accountModeOf(account)
+    const opposite = side === 'long' ? 'short' : 'long'
+    const eligible = []
+    for (const order of pools.orders) {
+      if (order.side !== opposite || !(order.lotsLeft > 0)) continue
+      if (this.#orderModeOf(pools, order) !== book) continue
+      const limit = Number(order.price)
+      if (!Number.isFinite(limit) || limit <= 0) continue
+      if (side === 'long' ? limit > touch : limit < touch) continue
+      const owner = pools.owners.get(order.id)
+      if (owner === undefined) continue
+      eligible.push({ order, owner })
+    }
+    eligible.sort((a, b) => {
+      const delta = Number(a.order.price) - Number(b.order.price)
+      return side === 'long' ? delta : -delta
+    })
+    const parts = []
+    let left = lots
+    for (const entry of eligible) {
+      if (left <= 0) break
+      const take = Math.min(left, entry.order.lotsLeft)
+      if (!(take > 0)) continue
+      parts.push({ order: entry.order, owner: entry.owner, lots: take, price: Number(entry.order.price) })
+      left -= take
+    }
+    return { parts, left }
+  }
+
+  /** 算一笔市价开仓会吃到什么价：邻居那部分按挂单价，余量按做市商那一侧。 */
+  #planMarketOpen (account, { quote, side, notional, leverage }) {
+    const touch = fillPriceOf(quote, side)
+    const lots = lotsFor({ notional, price: touch })
+    const { parts: bookParts, left } = this.#bookParts(account, { contract: quote.contract.id, side, lots, touch })
+    const parts = [...bookParts]
+    if (left > 0) parts.push({ lots: left, price: touch })
+    let margin = 0
+    let fee = 0
+    for (const part of parts) {
+      margin += marginOf({ lots: part.lots, price: part.price, leverage })
+      fee += takerFeeOf(notionalOf({ lots: part.lots, price: part.price }))
+    }
+    return { lots, touch, parts, margin: roundCoin(margin), fee: roundCoin(fee) }
+  }
+
+  /** 落账：邻居那几笔先给 maker 开仓（保证金从冻结里出），再给 taker 开仓、扣保证金与手续费。 */
+  #commitMarketOpen (account, { crop, quote, side, leverage, stamp, plan, local }) {
+    const positions = []
+    for (const part of plan.parts) {
+      if (part.order !== undefined) {
+        const frozen = this.#takeFrozen(part.order, part.lots)
+        this.#openFromOrder(part.owner, part.order, part.lots, part.price, frozen, stamp)
+      }
+      const slot = this.#slotOf(stamp)
+      const position = {
+        id: randomUUID(),
+        crop,
+        contract: quote.contract.id,
+        side,
+        lots: part.lots,
+        entry: part.price,
+        margin: marginOf({ lots: part.lots, price: part.price, leverage }),
+        leverage,
+        openedAt: stamp,
+        slot,
+        settleSlot: slot + 1
+      }
+      account.positions.push(position)
+      positions.push(position)
+    }
+    account.balance = roundCoin(account.balance - plan.margin - plan.fee)
+    account.marginUsed = this.#recomputeFor(account)
+    this.#chargeFee(plan.fee, account)
+    // 吃空的挂单当场摘掉：`lotsLeft: 0` 留在账本里，settle 的 `orders` 就成了坏字段。
+    this.#pruneOrders()
+    if (local) this.#state.tradedAt = stamp
+    return { positions, lots: plan.lots, price: plan.touch, margin: plan.margin, fee: plan.fee }
+  }
+
   /** 主动平仓：按当前对手价成交，保证金 + 盈亏记回余额。合约过期后只能等交割（票 96）。 */
   async close ({ id, at = this.#nowMs() }) {
-    const blocked = this.#gate()
-    if (blocked !== null) return blocked
+    // 平仓是减风险：暂停着也允许（停的是「新风险」，不是「逃生的门」）。
+    if (this.#disabled()) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     const index = this.#state.positions.findIndex((position) => position.id === id)
     if (index < 0) return { ok: false, error: 'no-position' }
     const position = this.#state.positions[index]
@@ -2849,7 +3215,10 @@ class FuturesStore {
       epoch: this.#state.epoch,
       pending: roundCoin(account.pending ?? 0),
       // 1.10.0：这个账户自己的档位（peer 窗口据此显示「真钱 / 纸面」）。
-      accountMode: this.#accountModeOf(account)
+      accountMode: this.#accountModeOf(account),
+      // 1.12.0：这个账户自己按的暂停 / 退出（房主据此拒绝新单）。
+      paused: account.paused === true,
+      disabled: account.disabled === true
     }
   }
 
@@ -2944,6 +3313,7 @@ class FuturesStore {
       mode: this.modeOf(),
       accountMode: this.accountMode(),
       pending: roundCoin(this.#state.pending),
+      paused: this.#state.paused === true,
       disabled: this.#state.disabled
     }
   }

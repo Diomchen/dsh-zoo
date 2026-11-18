@@ -11,7 +11,7 @@
  *      且单设备单根/单日有上限，`mergeFlowEvents()` 会在接收端再算一遍，不信发送端。
  *
  * 「事件带」是最终一致的：正常 1–2 秒内所有机器看到同一笔流水；迟到/丢包靠
- * `board-flow-sync` 补。A 期没有这一层，B 期才接（ADR-0036）。
+ * `board-flow-sync` 补。A 期没有这一层，B 期才接（ADR-0038）。
  */
 
 export const FLOW_K = 0.003

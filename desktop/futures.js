@@ -25,7 +25,11 @@
     askedRefreshAt: 0,
     busy: false,
     // 1.10.0：上一拍画出来的账户档位（切换按钮用它算「下一档」）。
-    account: null
+    account: null,
+    // 1.12.0：上一拍画出来的暂停状态（按钮用它算「切到哪一档」）。
+    pause: null,
+    // 票 109：「全部转」要提交的持仓清单（id + 张数），每拍重算。
+    convertTargets: []
   }
 
   function toast (text) {
@@ -34,6 +38,39 @@
     node.classList.add('show')
     clearTimeout(toast.timer)
     toast.timer = setTimeout(() => node.classList.remove('show'), 2600)
+  }
+
+  /**
+   * 宿主没给 `notice` 时的兜底文案：按错误码说一句人话。
+   * 这些码来自 `src/futures.js` 的 `FUTURES_ERROR_TEXT`，窗口只补「宿主没说」的那几种。
+   */
+  const RESULT_TEXT = {
+    'daily-cap': '今天的交易额用完了，明天 00:00 重置。',
+    'notional-cap': '持仓名义到上限了，先平掉一点再开。',
+    'position-limit': '持仓笔数到上限了，先平掉一笔。',
+    'order-limit': '挂单已经有 8 笔了，先撤一笔。',
+    'no-balance': '托管余额不够：先充一点再下单。',
+    paused: '你暂停了期货交易，点「继续交易」再来。',
+    disabled: '这个账户已经退出了，要重新充值才会开一张新账。',
+    'market-closed': '现在不在交易时段。',
+    'self-trade': '不能跟自己成交，换个价或换个方向。',
+    'bad-market-order': '这笔市价单的形状不对（方向/保证金/杠杆）。',
+    'bad-order': '这笔挂单的形状不对（价格/张数/杠杆）。',
+    timeout: '宿主没回话，稍等一下再试。',
+    'host-unavailable': '连不上房主，等一下再试。'
+  }
+
+  /**
+   * 窗口 → 宿主。preload 会按动作白名单再筛一遍：没登记的动作 `submit()` 返回 false、
+   * 一个字节都不发（1.10–1.12 的切档/全部转/暂停就这么「点了没反应」过）。
+   * 所以这里不吞返回值——发不出去至少说一句，别让按钮看起来像坏了。
+   */
+  function send (payload) {
+    const accepted = bridge.submit(payload)
+    if (accepted === false) {
+      toast('这个操作发不出去：窗口的动作白名单里没有它，更新插件后重开窗口试试。')
+    }
+    return accepted
   }
 
   /** 重建杠杆按钮与作物下拉（清单来自宿主，不硬编码）。 */
@@ -180,19 +217,22 @@
   }
 
   /**
-   * 1.10.0：档位条。左边是**这本账**的档位（纸面/真钱），旁边一颗切换按钮；
-   * 房主多一条开市/关市与回滚。老版本 payload 没有账户档位就整行藏掉。
+   * 1.10.0 / 1.12.0：档位条。左边是**这本账**的档位（纸面/真钱），旁边一颗切换按钮；
+   * 右边是「暂停 / 继续」与「退出」——三件事都只作用于自己这本账，谁都点得动。
+   * 老版本 payload 没有账户档位就整行藏掉。
    */
   function paintMode (built) {
     const bar = el('modebar')
     const account = built.account
     const mode = built.mode
+    const pause = built.pause
     if (!account || typeof account.kind !== 'string') {
       bar.hidden = true
       return
     }
     bar.hidden = false
     state.account = account
+    state.pause = pause ?? null
     const chip = el('accountChip')
     chip.textContent = account.label ?? '—'
     chip.className = 'chip ' + account.kind
@@ -205,11 +245,12 @@
     const pending = typeof built.pendingLine === 'string' ? built.pendingLine : ''
     el('pending').textContent = pending
     el('pending').hidden = pending === ''
-    el('modeSwitch').hidden = built.isHost !== true
-    // 关市按钮只在开市时可点，开市按钮只在关市时可点。
-    el('closeMarket').disabled = built.isHost !== true || closed
-    el('openMarket').disabled = built.isHost !== true || !closed
-    el('rollback').disabled = built.isHost !== true
+    // 1.12.0：暂停 / 继续只停自己；退出只退自己。
+    const paused = pause !== null && pause !== undefined && pause.paused === true
+    el('pauseText').textContent = paused ? (pause.text || '') : ''
+    el('pauseBtn').textContent = (pause && pause.toggleLabel) || (paused ? '继续交易' : '暂停交易')
+    el('pauseBtn').disabled = built.canPause !== true
+    el('rollback').disabled = closed
   }
 
   function render () {
@@ -243,6 +284,15 @@
     paintTrades(built.trades)
     el('ordersTitle').textContent = built.orderCount > 0 ? '我的挂单 · ' + built.orderCount : '我的挂单'
 
+    // 票 109：交割前的提醒，与「全部转」按钮同一处——错过就只能现金结算。
+    const expiry = built.expiry ?? { text: null, urgent: false }
+    el('expiryHint').textContent = expiry.text ?? ''
+    el('expiryHint').hidden = expiry.text === null
+    el('convertAll').disabled = built.canConvertAll !== true || state.busy
+    state.convertTargets = (built.positions ?? [])
+      .filter((row) => typeof row.id === 'string' && row.lotsValue > 0)
+      .map((row) => ({ id: row.id, lots: row.lotsValue }))
+
     el('pLots').textContent = built.previewText.lots
     el('pNotional').textContent = built.previewText.notional
     el('pMargin').textContent = built.previewText.margin
@@ -261,7 +311,7 @@
     if (state.composing) return
     if (state.now - state.askedRefreshAt < 5000) return
     state.askedRefreshAt = state.now
-    bridge.submit({ action: 'futures-refresh' })
+    send({ action: 'futures-refresh' })
   }
 
   function applyView (view) {
@@ -308,7 +358,7 @@
       return
     }
     state.busy = true
-    const accepted = bridge.submit({
+    const accepted = send({
       action: 'futures-open',
       side: state.draft.side,
       margin: Math.trunc(state.draft.margin),
@@ -334,7 +384,7 @@
       return
     }
     state.busy = true
-    bridge.submit({ action: 'futures-withdraw', coins })
+    send({ action: 'futures-withdraw', coins })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -343,7 +393,7 @@
     if (typeof positionId === 'string' && positionId !== '') {
       if (state.busy) return
       state.busy = true
-      bridge.submit({ action: 'futures-close', positionId })
+      send({ action: 'futures-close', positionId })
       setTimeout(() => { state.busy = false; render() }, 3000)
       return
     }
@@ -359,9 +409,20 @@
       }
       if (state.busy) return
       state.busy = true
-      bridge.submit({ action: 'futures-convert', positionId: convertId, lots })
+      send({ action: 'futures-convert', positionId: convertId, lots })
       setTimeout(() => { state.busy = false; render() }, 3000)
     }
+  })
+
+  // 票 109：一次把全部持仓转成现货。钱不够/仓库放不下的那几笔会被宿主拒，剩下的照转。
+  el('convertAll').addEventListener('click', () => {
+    if (state.busy) return
+    const targets = Array.isArray(state.convertTargets) ? state.convertTargets : []
+    if (targets.length === 0) return
+    if (!window.confirm('把这 ' + targets.length + ' 笔持仓全部按公允价转成现货？')) return
+    state.busy = true
+    send({ action: 'futures-convert-all', positions: targets })
+    setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
   el('orders').addEventListener('click', (event) => {
@@ -369,7 +430,7 @@
     if (typeof orderId !== 'string' || orderId === '') return
     if (state.busy) return
     state.busy = true
-    bridge.submit({ action: 'futures-cancel', orderId })
+    send({ action: 'futures-cancel', orderId })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -392,7 +453,7 @@
     }
     hint.textContent = ''
     state.busy = true
-    const accepted = bridge.submit({
+    const accepted = send({
       action: 'futures-place',
       side: state.draft.side,
       cropId: state.draft.cropId,
@@ -415,31 +476,25 @@
     if (!account || (account.next !== 'live' && account.next !== 'shadow')) return
     if (account.next === 'live' && !window.confirm('把这本账切到真钱？之后充值/提现都动农场硬币，盈亏也是真的。')) return
     state.busy = true
-    bridge.submit({ action: 'futures-account-mode', accountMode: account.next })
+    send({ action: 'futures-account-mode', accountMode: account.next })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
-  // 房主：开市 / 关市（关市会停掉所有人的交易，但不退余额——回滚才退）。
-  el('closeMarket').addEventListener('click', () => {
+  // 1.12.0：暂停 / 继续——只停自己这本账（房主按下去也停不了别人）。
+  el('pauseBtn').addEventListener('click', () => {
     if (state.busy) return
-    if (!window.confirm('关市会让所有人立刻不能交易（余额留在托管里）。继续？')) return
+    const paused = state.pause !== null && state.pause !== undefined && state.pause.paused === true
     state.busy = true
-    bridge.submit({ action: 'futures-mode', mode: 'off' })
+    send({ action: 'futures-pause', paused: !paused })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
-  el('openMarket').addEventListener('click', () => {
-    if (state.busy) return
-    state.busy = true
-    bridge.submit({ action: 'futures-mode', mode: 'live' })
-    setTimeout(() => { state.busy = false; render() }, 3000)
-  })
-
+  // 1.12.0：退出——强平自己的仓位、余额退回自己的农场，别人的账一分不动。
   el('rollback').addEventListener('click', () => {
     if (state.busy) return
-    if (!window.confirm('回滚会把所有人的托管余额退回农场、并关掉期货。继续？')) return
+    if (!window.confirm('退出会把你的仓位按当前价强平、余额退回你的农场，并关掉你这本账。继续？')) return
     state.busy = true
-    bridge.submit({ action: 'futures-rollback' })
+    send({ action: 'futures-rollback' })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
@@ -468,7 +523,12 @@
       return
     }
     state.busy = false
-    toast(typeof result?.message === 'string' && result.message !== '' ? result.message : '没成交，再试一次。')
+    // 宿主回的是 `{ ok, notice, code }`（不是 `message`）：以前只认 `message`，
+    // 于是所有拒绝都显示同一句「没成交，再试一次」——把人挡在门外还不说为什么。
+    const said = typeof result?.notice === 'string' && result.notice !== ''
+      ? result.notice
+      : (typeof result?.message === 'string' && result.message !== '' ? result.message : '')
+    toast(said !== '' ? said : (RESULT_TEXT[result?.code] ?? '没成交，再试一次。'))
     render()
   })
   bridge.onComposing((flag) => { state.composing = flag })

@@ -85,7 +85,11 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/*.tgz --clobber
             if [ -f "$notes" ]; then
-              gh release edit "$TAG" --title "dsh-zoo $TAG" --notes-file "$notes"
+              # --draft=false：1.12.0 重打 tag 时留下过一份草稿，谁也没发出去；
+              # 这条路径得能把它一起收尾，不然 Release 永远停在草稿里。
+              gh release edit "$TAG" --title "dsh-zoo $TAG" --draft=false --notes-file "$notes"
+            else
+              gh release edit "$TAG" --title "dsh-zoo $TAG" --draft=false
             fi
           elif [ -f "$notes" ]; then
             gh release create "$TAG" dist/*.tgz \

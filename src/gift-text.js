@@ -13,6 +13,7 @@
  *   2. received 不给状态文案：东西已经到手，卡片上该是字条本身，不是一句解释。
  */
 
+import { CROPS } from './farm-rules.js'
 import { normalizeNickname, sanitizeGiftName } from './protocol.js'
 
 const FALLBACK_NICKNAME = '邻居'
@@ -54,13 +55,33 @@ export function isGiftReason (value) {
 }
 
 /**
- * 卡片标题。kind 目前只有 'text'；文件礼物是 ticket 25 的事，
- * 这里先按词表给出一个不丢信息的说法，免得 25 再补一遍标题。
+ * 卡片标题。三种 kind 各一句话：字条 / 文件（ticket 25）/ 红包（票 79）。
+ * 标题里只说“捎来的是什么”，里面装了多少由 `packetSummaryText` 那行正文回答。
  */
 export function giftTitleText (nickname, kind = 'text') {
   const name = normalizeNickname(nickname) ?? FALLBACK_NICKNAME
   if (kind === 'file') return `「${name}」捎来一个文件`
+  if (kind === 'packet') return `「${name}」捎来一只红包`
   return `「${name}」捎来一张字条`
+}
+
+/**
+ * 红包内容的可读摘要（票 79）：`20 硬币 · 小番茄 ×3 · 稻米种子 ×1`。
+ *
+ * 桌面卡片正文、`/state` 的礼物视图、拆开/撤回时的气泡都用这一句——三处各写一份，
+ * 迟早会漂成三种说法。作物名取运行时目录，认不出的 id 原样显示，不猜也不吞。
+ */
+export function packetSummaryText (packet) {
+  if (packet === null || typeof packet !== 'object') return '空红包'
+  const parts = []
+  if (packet.coins > 0) parts.push(packet.coins + ' 硬币')
+  for (const [cropId, qty] of Object.entries(packet.crops ?? {})) {
+    parts.push((CROPS[cropId]?.name ?? cropId) + ' ×' + qty)
+  }
+  for (const [cropId, qty] of Object.entries(packet.seeds ?? {})) {
+    parts.push((CROPS[cropId]?.name ?? cropId) + '种子 ×' + qty)
+  }
+  return parts.length === 0 ? '空红包' : parts.join(' · ')
 }
 
 /**

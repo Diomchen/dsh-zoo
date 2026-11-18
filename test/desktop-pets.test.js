@@ -7,6 +7,7 @@ import test from 'node:test'
 import shared from '../desktop/shared.js'
 import { buildHelperArgs } from '../src/desktop-launch.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from '../src/desktop-pets.js'
+import { packetSummaryText } from '../src/gift-text.js'
 import { DSH_PET_ASSET_ENV, resolveDshPetAssetDirs } from '../src/pet-assets.js'
 import { createRoom } from '../src/room.js'
 import { visitReasonText } from '../src/visit-copy.js'
@@ -921,15 +922,17 @@ test('controlsFromSnapshot：礼物卡跟着访客；正文只在 received 时�
   assert.deepEqual(controlsFromSnapshot(null).gifts, [])
 })
 
-test('controlsFromSnapshot：礼物卡没有独立生命周期——访客走了卡片就不在', () => {
+test('controlsFromSnapshot：礼物卡没有独立生命周期——字条/文件随访客走，红包例外', () => {
   const visitorId = '33333333-3333-4333-8333-333333333333'
   const gift = { id: '55555555-5555-4555-8555-555555555555', kind: 'text', text: 'x', status: 'received' }
   const present = controlsFromSnapshot(snapshotWith({
     visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
   }))
   assert.equal(present.gifts.length, 1)
+  // 字条是访客捎来的一句话：人走了就不用再看。
   const gone = controlsFromSnapshot(snapshotWith({ visitors: [] }))
   assert.deepEqual(gone.gifts, [])
+  // 红包是进了背包的一件东西：宿主通过 packetInbox 让它继续留在桌面上（见下一个用例）。
 })
 
 // ---------------------------------------------------------------------------
@@ -994,6 +997,127 @@ test('controlsFromSnapshot：文件卡片带 name/size；缩略图只在 receive
   ]) {
     assert.deepEqual(controlsFromSnapshot(withGift(bad), { thumbOf }).gifts, [], JSON.stringify(bad))
   }
+})
+
+// ---------------------------------------------------------------------------
+// 票 79：红包卡片（正文是“里面装了什么”，祝福语另起一行）
+// ---------------------------------------------------------------------------
+
+test('controlsFromSnapshot：红包卡片带 packet 内容与祝福语，pending 也画（否则点不到拆开）', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const giftId = '55555555-5555-4555-8555-555555555555'
+  const withGift = (gift) => snapshotWith({
+    visitors: [{ deviceId: visitorId, nickname: '阿蟹', anim: null, gift }]
+  })
+  const packet = { coins: 12, crops: { tomato: 2 }, seeds: { rice: 1 } }
+
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'packet', packet, note: ' 买糖 ', status: 'received'
+  })).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'packet',
+    status: 'received',
+    title: '「阿蟹」捎来一只红包',
+    text: '12 硬币 · 小番茄 ×2 · 稻米种子 ×1',
+    packet,
+    note: '买糖'
+  }])
+
+  // 还在落盘：内容已经随报文到了，可以照画；状态行与字条卡同一套词表。
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'packet', packet, status: 'pending'
+  })).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'packet',
+    status: 'pending',
+    title: '「阿蟹」捎来一只红包',
+    text: '12 硬币 · 小番茄 ×2 · 稻米种子 ×1',
+    packet,
+    statusText: '刚到，正在收下…'
+  }])
+
+  // 只有作物、没有硬币；认不出的作物 id 原样显示，不猜名字也不吞。
+  assert.deepEqual(controlsFromSnapshot(withGift({
+    id: giftId, kind: 'packet', packet: { crops: { mystery: 3 } }, status: 'received'
+  })).gifts[0].text, 'mystery ×3')
+
+  // 内容坏掉（空的/不是对象）就整张丢掉：一只拆不开的空红包比不画更糟。
+  for (const bad of [
+    { id: giftId, kind: 'packet', status: 'received' },
+    { id: giftId, kind: 'packet', packet: {}, status: 'received' },
+    { id: giftId, kind: 'packet', packet: { coins: 0, crops: {}, seeds: {} }, status: 'received' },
+    { id: giftId, kind: 'packet', packet: 'x', status: 'received' }
+  ]) {
+    assert.deepEqual(controlsFromSnapshot(withGift(bad)).gifts, [], JSON.stringify(bad))
+  }
+})
+
+test('packetSummaryText：空红包兜底，作物名取运行时目录', () => {
+  assert.equal(packetSummaryText({ coins: 3 }), '3 硬币')
+  assert.equal(packetSummaryText({ seeds: { pea: 2 } }), '豌豆种子 ×2')
+  assert.equal(packetSummaryText(null), '空红包')
+  assert.equal(packetSummaryText({}), '空红包')
+})
+
+test('controlsFromSnapshot：访客走了，还没拆的红包还贴在桌面上（票 79）', () => {
+  const visitorId = '33333333-3333-4333-8333-333333333333'
+  const packet = { coins: 12, crops: { tomato: 2 }, seeds: {} }
+  const record = {
+    id: '55555555-5555-4555-8555-555555555555',
+    kind: 'packet',
+    from: { deviceId: visitorId, nickname: '阿蟹' },
+    packet,
+    note: '买糖',
+    receivedAt: 1000,
+    claimedAt: 0,
+    returnedAt: 0,
+    expiresAt: 86_401_000
+  }
+  const giftId = record.id
+
+  // 访客不在（已经走了 / 场景放不下）：字条卡照旧没有，红包卡必须在，否则这只红包再无入口。
+  assert.deepEqual(controlsFromSnapshot(snapshotWith({ visitors: [] }), { packetInbox: [record] }).gifts, [{
+    deviceId: visitorId,
+    giftId,
+    kind: 'packet',
+    status: 'received',
+    title: '「阿蟹」捎来一只红包',
+    text: '12 硬币 · 小番茄 ×2',
+    packet,
+    note: '买糖',
+    expiresAt: 86_401_000
+  }])
+
+  // 同一只红包已经贴在访客身上：只画一张，而且仍是访客卡（锚点是访客，不带倒计时）。
+  const both = controlsFromSnapshot(snapshotWith({
+    visitors: [{
+      deviceId: visitorId,
+      nickname: '阿蟹',
+      anim: null,
+      gift: { id: giftId, kind: 'packet', packet, status: 'received' }
+    }]
+  }), { packetInbox: [record] })
+  assert.equal(both.gifts.length, 1)
+  assert.equal('expiresAt' in both.gifts[0], false)
+
+  // 坏记录整张丢掉：不是红包 / id 不是 UUID / 谁寄的不知道 / 内容坏了 / 压根不是对象。
+  for (const bad of [
+    { ...record, kind: 'text' },
+    { ...record, id: 'gift-1' },
+    { ...record, from: { nickname: '阿蟹' } },
+    { ...record, from: { deviceId: 'nope', nickname: '阿蟹' } },
+    { ...record, packet: {} },
+    null,
+    'x'
+  ]) {
+    assert.deepEqual(controlsFromSnapshot(snapshotWith(), { packetInbox: [bad] }).gifts, [], JSON.stringify(bad))
+  }
+  // 传错容器不是错误，只是没有卡（宿主没接上这一环时不能把桌面搞崩）。
+  assert.deepEqual(controlsFromSnapshot(snapshotWith(), { packetInbox: 'x' }).gifts, [])
+  assert.deepEqual(controlsFromSnapshot(snapshotWith(), { packetInbox: null }).gifts, [])
+  assert.deepEqual(controlsFromSnapshot(snapshotWith()).gifts, [])
 })
 
 test('皮自带尺寸：比例按 462 算，两只宠物各按自己的宽度排开、共用一条地平线', () => {

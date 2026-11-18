@@ -394,8 +394,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     'futures-place',
     'futures-cancel',
     'futures-convert',
+    'futures-convert-all',
     'futures-mode',
     'futures-account-mode',
+    // 1.12.0：暂停 / 继续只作用于自己这本账。
+    'futures-pause',
     'futures-rollback',
     'futures-refresh'
   ]
@@ -481,12 +484,16 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
    */
   const CROP_IDS = ['pea', 'tomato', 'strawberry', 'radish', 'carrot', 'rice', 'corn', 'watermelon', 'pumpkin', 'grape']
   const FARM_STAGES = ['empty', 'growing', 'mature', 'withered', 'frozen']
-  const FARM_LOG_KINDS = ['plant', 'harvest', 'clear', 'steal', 'help', 'hire', 'settle', 'unlock', 'season', 'event', 'wither', 'freeze', 'thaw', 'omen']
+  // 票 79 补：`packet` 是红包记录（收到/拆开/送出/退回）——漏在这张白名单里，
+  // 宿主写进 farm.log 的红包条目会在下发桌面时被整条丢掉，记录页就永远看不见。
+  const FARM_LOG_KINDS = ['plant', 'harvest', 'clear', 'steal', 'help', 'hire', 'settle', 'unlock', 'season', 'event', 'wither', 'freeze', 'thaw', 'omen', 'packet']
   const MAX_FARM_COINS = 1000000
   const MAX_FARM_STACK = 999
   const MAX_FARM_DEW = 48
   const MAX_FARM_CONTRACTS = 20
   const MAX_FARM_LOG = 200
+  /** 红包记录那一份的上限，与 `src/farm.js` 的 `MAX_PACKET_LOG` 同值。 */
+  const MAX_FARM_PACKETS = 50
   /**
    * 交易所（ticket 41）的窄口：底价表与 `src/farm-rules.js` 同源；
    * 价格夹在 [base×0.5, base×2]，成交历史最多 50 条进窗口。
@@ -1068,6 +1075,15 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     const name = normalizeText(raw.name, '', 24)
     const wither = Number(raw.wither)
     const freeze = Number(raw.freeze)
+    // 票 79 补：红包记录带方向（谁给谁）、步骤（收到/拆开/送出/退回）和里面装了什么。
+    // 内容和昵称一样都是网络来的字：只留可显示的字，长度夹到 60 码点。
+    const packetEvent = raw.event === 'arrived' || raw.event === 'claimed' ||
+      raw.event === 'sent' || raw.event === 'returned'
+      ? raw.event
+      : null
+    const event = raw.kind === 'packet' ? packetEvent : null
+    const direction = raw.direction === 'in' || raw.direction === 'out' ? raw.direction : null
+    const text = raw.kind === 'packet' ? normalizeText(raw.text, '', 240) : ''
     return {
       at: Math.floor(at),
       kind: raw.kind,
@@ -1085,7 +1101,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       ...(Number.isFinite(cost) ? { cost: Math.min(MAX_FARM_COINS, Math.max(0, Math.floor(cost))) } : {}),
       ...(Number.isFinite(wither) ? { wither: Math.min(MAX_FARM_PLOTS, Math.max(0, Math.floor(wither))) } : {}),
       ...(Number.isFinite(freeze) ? { freeze: Math.min(MAX_FARM_PLOTS, Math.max(0, Math.floor(freeze))) } : {}),
-      ...(Number.isFinite(plot) ? { plot: Math.min(MAX_FARM_PLOTS, Math.max(1, Math.floor(plot))) } : {})
+      ...(Number.isFinite(plot) ? { plot: Math.min(MAX_FARM_PLOTS, Math.max(1, Math.floor(plot))) } : {}),
+      ...(event === null ? {} : { event }),
+      ...(direction === null ? {} : { direction }),
+      ...(text === '' ? {} : { text: Array.from(text).slice(0, 60).join('') })
     }
   }
 
@@ -1349,6 +1368,16 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         if (entry !== null) log.push(entry)
       }
     }
+    // 票 79 补：红包单独攒的一份。流水一分钟两条，红包会被挤出去；这一份只收红包。
+    const packets = []
+    if (Array.isArray(raw.packets)) {
+      for (const candidate of raw.packets) {
+        if (packets.length >= MAX_FARM_PACKETS) break
+        const entry = normalizeFarmLogEntry(candidate)
+        if (entry === null || entry.kind !== 'packet') continue
+        packets.push(entry)
+      }
+    }
     const hire = normalizeFarmHire(raw.hire)
     const season = normalizeSeason(raw.season)
     const guard = Number(raw.guard)
@@ -1380,6 +1409,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       ...(hire === null ? {} : { hire }),
       ...(Number.isFinite(guard) ? { guard: Math.min(MAX_FARM_GUARD, Math.max(0, guard)) } : {}),
       log,
+      ...(packets.length === 0 ? {} : { packets }),
       carried: normalizeFarmCarried(raw.carried)
     }
   }
@@ -2603,6 +2633,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       mode: FUTURES_MODES.includes(raw.mode) ? raw.mode : null,
       accountMode: FUTURES_ACCOUNT_MODES.includes(raw.accountMode) ? raw.accountMode : 'shadow',
       disabled: raw.disabled === true,
+      // 1.12.0：这个账户自己按的暂停（房主按下去也停不了别人，所以只看自己）。
+      paused: raw.paused === true,
       pending: nonNegative(raw.pending),
       dayCap: num(raw.dayCap),
       dayNotional: nonNegative(raw.dayNotional),
@@ -2665,6 +2697,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       const accountMode = FUTURES_ACCOUNT_MODES.includes(raw.accountMode) ? raw.accountMode : null
       return accountMode === null ? null : { action, accountMode }
     }
+    // 1.12.0：暂停 / 继续自己的账（只认布尔，缺字段按「继续」）。
+    if (action === 'futures-pause') {
+      return typeof raw.paused === 'boolean' ? { action, paused: raw.paused } : null
+    }
     if (action === 'futures-deposit' || action === 'futures-withdraw') {
       const coins = strictBoardInt(raw.coins, 1, MAX_FARM_COINS)
       return coins === null ? null : { action, coins }
@@ -2693,6 +2729,19 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       const lots = strictBoardInt(raw.lots, 1, 100000)
       if (positionId === null || lots === null) return null
       return { action, positionId, lots }
+    }
+    // 票 109：一次把持仓全部转成现货。窗口只报「哪几笔、各多少张」，价格与钱都由宿主算。
+    if (action === 'futures-convert-all') {
+      const list = Array.isArray(raw.positions) ? raw.positions : null
+      if (list === null || list.length === 0 || list.length > 8) return null
+      const positions = []
+      for (const item of list) {
+        const id = normalizeUuid(item?.id)
+        const lots = strictBoardInt(item?.lots, 1, 100000)
+        if (id === null || lots === null) return null
+        positions.push({ id, lots })
+      }
+      return { action, positions }
     }
     const side = BOARD_SIDES.includes(raw.side) ? raw.side : null
     const margin = strictBoardInt(raw.margin, 1, FUTURES_MAX_MARGIN)
@@ -5139,6 +5188,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     normalizeGiftThumb,
     normalizeLabel,
     normalizeNoteText,
+    // 宿主投影（src/desktop-pets.js）与渲染端用同一份形状判断：卡片上的红包和
+    // 点「拆开」时提交的红包必须是同一种东西，否则一边认一边不认。
+    normalizePacketContents,
     normalizeBackpackText,
     normalizeBringGift,
     normalizeBringWindowItem,

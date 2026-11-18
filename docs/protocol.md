@@ -94,17 +94,28 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "trades": [{ "at": 1700000000000, "crop": "tomato", "contract": "tomato-20261117",
                "side": "short", "lots": 1, "price": 4.87, "fee": 0.49,
                "kind": "liquidation" }],
-  "insurance": 3.2, "shortfall": 0.8, "mode": "live", "accountMode": "live", "pending": 0 }
+  "insurance": 3.2, "shortfall": 0.8, "mode": "live", "accountMode": "live",
+  "paused": false, "pending": 0 }
 { "v": 1, "type": "futures-sync", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "lastSeq": 7 }
 { "v": 1, "type": "futures-mode", "deviceId": "<uuid>", "at": 1700000000000,
   "accountMode": "live" }
+{ "v": 1, "type": "futures-pause", "deviceId": "<uuid>", "at": 1700000000000,
+  "paused": true }
+{ "v": 1, "type": "futures-ledger", "deviceId": "<uuid>", "at": 1700000000000,
+  "epoch": "<uuid>", "seq": 9, "hostId": "<uuid>", "index": 0, "total": 1,
+  "chunk": "{\"v\":1,\"epoch\":\"…\"}" }
 ```
+
+`futures-ledger` 是整本账快照的分片：`chunk` 是一段 JSON 文本，拼起来才是快照本体
+（`{ v, epoch, seq, at, hostId, insurance, shortfall, liquidationCount, delivered, accounts[] }`）。
+房主每 30 秒广播一轮，peer 只留最新一份、落盘在 `futures.json` 的 `ledger` 字段里，
+换房主时用它接管——最多丢最后半分钟的成交，不会丢钱（1.12.0）。
 
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `board-flow` / `board-flow-sync` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` / `futures-ledger` / `board-flow` / `board-flow-sync` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -157,11 +168,12 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `insurance` / `shortfall` | `futures-settle` | 可选，缺省 `0`；保险基金余额与累计欠账，到分的金币数（≥0）。它们是**房主账本的全局数**，peer 只显示不参与计算（票 97） |
 | `mode` | `futures-settle` | 可选，缺省 `shadow`；市场闸门（房主那台的开关），只能是 `off` / `shadow` / `live`。peer 以它决定是否跟随房主停发报文（票 98） |
 | `accountMode` | `futures-settle`、`futures-mode` | 可选，缺省 `null`（= 沿用本地选择）；这个**账户自己**的档位，只认 `shadow`（纸面）/ `live`（真钱）。settle 里由房主回传，`futures-mode` 里由 peer 申报（1.10.0） |
+| `paused` | `futures-settle`、`futures-pause` | 可选，缺省 `false`；这个**账户自己**按下的暂停，只停自己。settle 里由房主回传（只在该账户暂停时为 `true`），`futures-pause` 里由 peer 申报（1.12.0） |
 | `pending` | `futures-settle` | 可选，缺省 `0`；该账户留在托管账、等待下次提取的金币数（到分，≥0）。提现撞农场 1,000,000 上限时产生（票 98） |
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
-`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 6 种 `futures-*`）旧端不认识时整包
+`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 8 种 `futures-*` / `board-flow` / `board-flow-sync`）旧端不认识时整包
 静默丢弃，既不回复也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
@@ -989,16 +1001,26 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 8. **窗口动作**：peer 点 `futures-deposit` / `futures-open` / `futures-close` / `futures-place` /
    `futures-cancel` 只发指令，回 `{ ok: true, pending: true }`，等房主下一拍 settle 才改显示；
    `futures-withdraw` 仍是房主本机动作（只有房主能提自己账上的钱）。
-9. **开市/关市与账户档位（票 98、1.10.0）**：市场闸门只由房主切换（HTTP 动作 `futures-mode`，
-   body `{ mode: 'off'|'live' }`）；谁玩真钱由每个账户自己定：任何账户都能发 `futures-account-mode`
-   动作切自己的 `accountMode`（`shadow` 纸面 / `live` 真钱），peer 再以报文 `futures-mode`
-   `{ accountMode }` 报给房主，房主据此记账并把档位随 settle 回传。纸面与真钱是两本账：
-   撮合按档位分组，纸面单只跟做市商成交、永远不会和真钱单交叉；纸面手续费与亏空不进真钱保险基金、
-   也不记 `shortfall`。切档会在 `trades` 里写一条 `kind:'mode'` 审计流水。
-   `futures-rollback` 先按当前公允价强平全部仓位，
-   再把托管余额逐笔退回各人农场（撞 1,000,000 上限的部分留在 `pending`），最后落盘 `disabled:true`、
-   模式置 `off`；数据保留不删。`futures-reconcile` 返回 `{ farmCoins, custodyTotal, positionsNotional, diff }`，
-   纸面账户的流动 `diff` 恒为 0；`off` 时入站 `futures-*` 静默丢弃、出站不发。
+9. **档位、暂停、退出都归账户自己（票 98 / 1.10.0 / 1.12.0）**：
+   - **档位**：任何账户都能发 `futures-account-mode` 切自己的 `accountMode`（`shadow` 纸面 /
+     `live` 真钱），peer 再以报文 `futures-mode` `{ accountMode }` 报给房主，房主据此记账并把
+     档位随 settle 回传。纸面与真钱是两本账：撮合按档位分组，纸面单只跟做市商成交、永远不会和
+     真钱单交叉；纸面手续费与亏空不进真钱保险基金、也不记 `shortfall`。
+   - **暂停**：任何账户都能发 `futures-pause` `{ paused }`，peer 以报文 `futures-pause` 报给房主；
+     房主只拒绝这个账户的新仓与新挂单（`paused`），平仓/撤单/转现货/提现一律放行。**没有全局关市**：
+     房主按下去也只停自己，别人的报文照发照收。
+   - **退出**：`futures-rollback` 只作用于自己——按当前公允价强平自己的仓位、自己的余额退回自己
+     农场（撞 1,000,000 上限的部分留在自己的 `pending`），落盘 `disabled:true`，数据保留不删。
+     peer 的账在房主那台，peer 调这个动作回 `not-owner`，提示先平仓再提现。
+   - 切档、暂停都会在 `trades` 里写一条 `kind:'mode'` 审计流水。
+   - `futures-reconcile` 返回 `{ farmCoins, custodyTotal, positionsNotional, diff }`，
+     纸面账户的流动 `diff` 恒为 0；账户 `disabled` 后入站 `futures-*` 静默丢弃、出站不发。
+10. **账本复制（1.12.0（B））**：房主每 30 秒把所有账户的整本账打包成快照，按 2,800 字符切片、
+    最多 8 片，用 `futures-ledger` 广播给每个 peer。peer 按 `(epoch, seq)` 只留最新一份，
+    落盘在 `futures.json` 的 `ledger` 字段；房主掉线换人时，新房主若自己的账还是空的
+    （余额、持仓、挂单、流水、`remotes` 全空）就用这份快照接管——`epoch`/`seq` 接着上一任，
+    余额与持仓原样回来，最多丢最后半分钟的成交。已经记过账的节点不会被覆盖。
+    快照里任何一处不合法（`hostId` 空、账户超 16 个、金额为负、合约编号不认识）整份丢弃。
 
 ### 限额与边界
 

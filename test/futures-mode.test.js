@@ -24,6 +24,7 @@ import { createFuturesStore } from '../src/futures.js'
 import {
   SLOT_MS,
   contractOf,
+  dailyNotionalCapFor,
   fillPriceOf,
   lotsFor,
   notionalOf
@@ -125,36 +126,45 @@ test('1.10.0：缺省档位是纸面，充值不碰农场，但纸面照样能�
   assert.equal(store.snapshot().balance, Math.round((beforeWithdraw - 30) * 100) / 100)
 })
 
-test('票 98：off 拒绝一切期货动作，窗口显示「期货未开放」', async (t) => {
-  const { store, farm } = await makeStore(t)
-  const switched = await store.setMode('off', NOW)
-  assert.equal(switched.ok, true)
-  assert.equal(store.snapshot().session.kind, 'off')
-  assert.equal(store.snapshot().session.text, '期货未开放')
+test('1.12.0：暂停只停自己——自己的新仓被拒，平仓/提现照常，邻居完全不受影响', async (t) => {
+  const { store, farm } = await makeStore(t, { coins: 5000, mode: 'live' })
+  const funded = await store.deposit(1000)
+  assert.equal(funded.ok, true)
+  const opened = await store.open({ crop: CROP, side: 'long', margin: 100, leverage: 10, at: NOW })
+  assert.equal(opened.ok, true, JSON.stringify(opened))
+
+  // 老入口 `setMode('off')` 现在等价于「按下自己的暂停」。
+  const paused = await store.setMode('off', NOW)
+  assert.equal(paused.ok, true)
+  assert.equal(store.snapshot().paused, true)
+  assert.equal(store.snapshot().session.kind, 'trading', '暂停不等于休市：合约、行情照旧')
   const audit = store.snapshot().trades[0]
   assert.equal(audit.kind, 'mode')
   assert.equal(audit.note, 'off')
-  assert.equal(audit.price, 0)
-  assert.equal(audit.lots, 0)
 
-  const results = [
+  const blocked = [
     await store.deposit(10),
-    await store.withdraw(10),
     await store.open({ crop: CROP, side: 'long', margin: 10, leverage: 1, at: NOW }),
-    await store.place({ crop: CROP, side: 'long', price: quotePrice(store), lots: 1, leverage: 1, at: NOW }),
-    await store.close({ id: 'whatever', at: NOW }),
-    await store.cancel({ orderId: 'whatever', at: NOW }),
-    await store.convertToSpot({ positionId: 'whatever', lots: 1, at: NOW }),
-    await store.hostDeposit(PEER, 10, NOW),
-    await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 10, leverage: 1, at: NOW })
+    await store.place({ crop: CROP, side: 'long', price: quotePrice(store), lots: 1, leverage: 1, at: NOW })
   ]
-  for (const result of results) {
+  for (const result of blocked) {
     assert.equal(result.ok, false)
-    assert.equal(result.error, 'off')
-    assert.equal(result.notice, '期货未开放。')
+    assert.equal(result.error, 'paused')
+    assert.equal(result.notice, '你暂停了期货交易，继续之后才能开仓或挂单。')
   }
-  assert.equal(farm.state.coins, 500)
-  assert.equal(store.snapshot().balance, 0)
+
+  // 减风险的动作照常：平仓、提现都不该被暂停挡住。
+  const closed = await store.close({ id: opened.position.id, at: NOW })
+  assert.equal(closed.ok, true, JSON.stringify(closed))
+  const out = await store.withdraw(50)
+  assert.equal(out.ok, true, JSON.stringify(out))
+  assert.equal(farm.state.coins > 500, true, '提现把硬币退回农场')
+
+  // 邻居不受影响：房主替 peer 收钱、开仓都照常。
+  const neighbor = await store.hostDeposit(PEER, 300, NOW)
+  assert.equal(neighbor.ok, true, JSON.stringify(neighbor))
+  const neighborOpen = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 100, leverage: 10, at: NOW })
+  assert.equal(neighborOpen.ok, true, JSON.stringify(neighborOpen))
 })
 
 test('票 98：live 真扣真加，农场硬币跟着充提走', async (t) => {
@@ -194,33 +204,56 @@ test('票 98：影子对账 diff 恒为 0；切 live 充提一笔后仍为 0', a
   assert.equal(live.diff, 0)
 })
 
-test('票 98：日额 4,999 通过、5,000 拒', async (t) => {
+test('1.12.2：日额地板 5,000，权益大了按 5 倍放大', async (t) => {
+  assert.equal(dailyNotionalCapFor(0), 5_000)
+  assert.equal(dailyNotionalCapFor(999), 5_000, '小账户仍是地板')
+  assert.equal(dailyNotionalCapFor(2_000), 10_000)
+  assert.equal(dailyNotionalCapFor(20_000), 100_000)
+
   const { store } = await makeStore(t, { coins: 20_000, mode: 'live' })
   await store.deposit(20_000)
-  const first = await store.open({ crop: CROP, side: 'long', margin: 4999, leverage: 1, at: NOW })
-  assert.equal(first.ok, true, JSON.stringify(first))
-  assert.equal(store.snapshot().dayNotional, 4999)
-  assert.equal(store.snapshot().dayCap, 5000)
-
-  const second = await store.open({ crop: CROP, side: 'long', margin: 1, leverage: 1, at: NOW })
-  assert.equal(second.ok, false)
-  assert.equal(second.error, 'daily-cap')
-  assert.equal(second.notice, '今日交易额已到上限。')
-  assert.equal(store.snapshot().dayNotional, 4999, '拒单不累计日额')
+  assert.equal(store.snapshot().dayCap, 100_000, '权益 20,000 的账户日额是 100,000')
 })
 
-test('票 98：日额按账户各算各的，不会互相吃掉额度', async (t) => {
+test('1.12.2：日额用满了就拒，拒单不累计', async (t) => {
+  const { store } = await makeStore(t, { coins: 1_000, mode: 'live' })
+  await store.deposit(1_000)
+  const first = await store.open({ crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(first.ok, true, JSON.stringify(first))
+  const used = store.snapshot().dayNotional
+  assert.ok(used > 4_000 && used < 5_000, `第一笔应吃掉大半地板的日额，实际 ${used}`)
+
+  const second = await store.open({ crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(second.ok, false)
+  assert.equal(second.error, 'daily-cap')
+  assert.match(second.notice, /^今日交易额已到上限：/)
+  assert.equal(store.snapshot().dayNotional, used, '拒单不累计日额')
+})
+
+test('1.12.2：日额按账户各算各的，小额账户到顶不影响大额账户', async (t) => {
   const { store } = await makeStore(t, { mode: 'live' })
   const other = '22222222-2222-4222-8222-222222222222'
-  await store.hostDeposit(PEER, 6000, NOW)
-  await store.hostDeposit(other, 6000, NOW)
-  const first = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 4000, leverage: 1, at: NOW })
-  assert.equal(first.ok, true, JSON.stringify(first))
-  const second = await store.hostOpen(other, { crop: CROP, side: 'long', margin: 4000, leverage: 1, at: NOW })
-  assert.equal(second.ok, true, '另一个账户的日额应独立')
-  const third = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 1000, leverage: 1, at: NOW })
-  assert.equal(third.ok, false)
-  assert.equal(third.error, 'daily-cap')
+  await store.hostDeposit(PEER, 1_000, NOW)
+  await store.hostDeposit(other, 100_000, NOW)
+  const small = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(small.ok, true, JSON.stringify(small))
+  const smallAgain = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(smallAgain.error, 'daily-cap')
+  const big = await store.hostOpen(other, { crop: CROP, side: 'long', margin: 19_000, leverage: 1, at: NOW })
+  assert.equal(big.ok, true, '大额账户的日额是 500,000，不该被小额账户的 5,000 卡住')
+})
+
+test('1.12.2：档位与暂停都落盘，重启后不会被 mode 反推成纸面', async (t) => {
+  const { dir, farm, store } = await makeStore(t, { coins: 5_000, mode: 'live' })
+  await store.setAccountMode('live')
+  await store.setPaused(true, NOW)
+  assert.equal(store.accountMode(), 'live', '暂停不改自己选的档位')
+
+  const again = await reloadStore(t, dir, farm)
+  assert.equal(again.accountMode(), 'live', '重启后仍记得自己选了真钱')
+  assert.equal(again.snapshot().paused, true)
+  await again.setPaused(false, NOW)
+  assert.equal(again.snapshot().mode, 'live', '继续交易之后市场档位也跟着账户档位回来')
 })
 
 test('票 98：持仓名义 19,999 通过、20,000 拒', async (t) => {
@@ -248,7 +281,7 @@ test('票 98：持仓名义 19,999 通过、20,000 拒', async (t) => {
   const second = await store.open({ crop: CROP, side: 'long', margin: 1, leverage: 1, at: NOW })
   assert.equal(second.ok, false)
   assert.equal(second.error, 'notional-cap')
-  assert.equal(second.notice, '持仓名义已到上限。')
+  assert.match(second.notice, /^持仓名义已到上限：/) 
   assert.equal(store.snapshot({ at: NOW }).positions.length, 2, '拒单不建仓')
 })
 
@@ -268,29 +301,32 @@ test('1.10.0：纸面账户也能挂单，只是只跟做市商成交', async (t
   assert.equal(store.snapshot().accountMode, 'shadow')
 })
 
-test('票 98：回滚把托管余额逐笔退回农场，之后不能再开仓', async (t) => {
+test('1.12.0：退出只退自己——自己的余额回自己农场，邻居的托管余额一分不动', async (t) => {
   const { store, farm } = await makeStore(t, { coins: 500, mode: 'live' })
   await store.deposit(400)
   const peer = await store.hostDeposit(PEER, 200, NOW)
   assert.equal(peer.ok, true)
   const before = store.snapshot({ at: NOW })
-  const custody = before.balance + store.accountOf(PEER, { at: NOW }).balance
-  assert.equal(custody, 600)
+  assert.equal(before.balance, 400)
   const farmBeforeRollback = farm.state.coins
 
   const rolled = await store.rollback({ at: NOW })
   assert.equal(rolled.ok, true, JSON.stringify(rolled))
   assert.equal(rolled.disabled, true)
-  assert.equal(rolled.mode, 'off')
   assert.equal(store.snapshot({ at: NOW }).positions.length, 0)
   assert.equal(store.snapshot({ at: NOW }).orders.length, 0)
   assert.equal(store.snapshot({ at: NOW }).disabled, true)
 
   const credited = rolled.refunds.reduce((sum, entry) => sum + entry.credited, 0)
   const pending = rolled.refunds.reduce((sum, entry) => sum + entry.pending, 0)
-  assert.equal(credited + pending, custody, '退款 + 待提取 = 回滚前的托管总额')
+  assert.equal(credited + pending, 400, '退款 + 待提取 = 自己回滚前的托管余额')
   assert.equal(farm.state.coins - farmBeforeRollback, credited, '农场增量等于实退金额')
-  assert.ok(rolled.refunds.some((entry) => entry.deviceId === PEER))
+  assert.equal(rolled.refunds.length, 1, '只退自己那一份')
+
+  // 邻居的钱留在房主账本上：房主退出不再替全场退款，也不把别人的钱记进自己农场。
+  const neighbor = store.accountOf(PEER, { at: NOW })
+  assert.equal(neighbor.balance, 200, '邻居的托管余额原封不动')
+  assert.equal(neighbor.pending, 0, '也不该给邻居记一笔待提取')
 
   const blocked = await store.open({ crop: CROP, side: 'long', margin: 10, leverage: 1, at: NOW })
   assert.equal(blocked.ok, false)
@@ -313,7 +349,7 @@ test('票 98：回滚会按当前公允价强平仓位', async (t) => {
   assert.ok(farm.state.coins > 4000, '平仓后的余额回到农场')
 })
 
-test('票 98：回滚撞 1,000,000 上限时剩余留在托管账并标 pending', async (t) => {
+test('1.12.0：退出撞 1,000,000 上限时，只有自己的余数留在托管账', async (t) => {
   const { store, farm } = await makeStore(t, { coins: 999_900 })
   await store.deposit(300)
   await store.hostDeposit(PEER, 200, NOW)
@@ -323,9 +359,10 @@ test('票 98：回滚撞 1,000,000 上限时剩余留在托管账并标 pending'
   const credited = rolled.refunds.reduce((sum, entry) => sum + entry.credited, 0)
   const pending = rolled.refunds.reduce((sum, entry) => sum + entry.pending, 0)
   assert.equal(credited, 100)
-  assert.equal(pending, 400)
-  assert.equal(store.snapshot({ at: NOW }).pending, 200, '本地没退成的部分留在托管账')
-  assert.equal(store.accountOf(PEER, { at: NOW }).pending, 200)
+  assert.equal(pending, 200)
+  assert.equal(store.snapshot({ at: NOW }).pending, 200, '本地没退成的部分留在自己托管账')
+  assert.equal(store.accountOf(PEER, { at: NOW }).pending, 0, '别人的账不参与自己的退出')
+  assert.equal(store.accountOf(PEER, { at: NOW }).balance, 200)
 })
 
 test('票 98：提现撞上限时 credited 精确、余数留在托管账', async (t) => {

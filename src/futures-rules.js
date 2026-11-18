@@ -67,8 +67,22 @@ export const FUTURES_DEFAULT_ACCOUNT_MODE = 'shadow'
 export function isFuturesAccountMode (value) {
   return FUTURES_ACCOUNT_MODES.includes(value)
 }
-/** 票 98：单账户一个自然日的**新开仓/新挂单**名义上限（影子模式的日额是 0）。 */
+/** 票 98：单账户一个自然日的**新开仓/新挂单**名义上限（地板值，见 `dailyNotionalCapFor`）。 */
 export const DAILY_NOTIONAL_CAP = 5000
+/**
+ * 1.12.2：日额跟账户权益走——`DAILY_NOTIONAL_CAP` 是地板，权益越多额度越大。
+ *
+ * 只按固定 5,000 名义时，一张蓝莓（1 张 = 100 单位 × 15 块 ≈ 1,554 名义）就吃掉三成额度，
+ * 一天只能开三张；而余额几十万的人本来也不该被同样的小额度锁住。
+ * 用权益（余额 + 已占保证金）而不是浮盈：浮盈每 15 秒变一次，额度不该跟着抖。
+ */
+export const DAILY_NOTIONAL_MULTIPLE = 5
+
+/** 单账户今天还能新开多少名义：地板 5,000，或 5 × 权益，取大。 */
+export function dailyNotionalCapFor (equity) {
+  const base = Number.isFinite(equity) && equity > 0 ? equity : 0
+  return Math.max(DAILY_NOTIONAL_CAP, roundCoin(base * DAILY_NOTIONAL_MULTIPLE))
+}
 /** 票 98：单账户同时持有的仓位名义 + 挂单冻结名义上限。 */
 export const POSITION_NOTIONAL_CAP = 20000
 export const MAX_MARGIN = 1_000_000
