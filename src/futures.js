@@ -1460,49 +1460,28 @@ class FuturesStore {
     if (this.#state.delivered[quote.contract.id] !== undefined) {
       return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
-    const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
-    const lots = lotsFor({ notional, price })
-    const usedMargin = marginOf({ lots, price, leverage })
-    const fee = takerFeeOf(notionalOf({ lots, price }))
-    const total = roundCoin(usedMargin + fee)
+    // 票 110：市价单先吃邻居的挂单，剩下才找做市商。
+    const plan = this.#planMarketOpen(account, { quote, side, notional, leverage })
     // 余额先判：买不起的单本来就该回 no-balance（不该被说成限额）；
     // 买得起才看日额/持仓两道闸门，被限额拒绝时账上一分不动。
-    if (account.balance < total) return { ok: false, error: 'no-balance' }
+    if (account.balance < roundCoin(plan.margin + plan.fee)) return { ok: false, error: 'no-balance' }
     const limited = this.#checkLimits(account, notional, stamp)
     if (limited !== null) return limited
 
-    account.balance = roundCoin(account.balance - total)
-    const slot = this.#slotOf(stamp)
-    const position = {
-      id: randomUUID(),
-      crop,
-      contract: quote.contract.id,
-      side,
-      lots,
-      entry: price,
-      margin: usedMargin,
-      leverage,
-      openedAt: stamp,
-      slot,
-      settleSlot: slot + 1
-    }
-    account.positions.push(position)
-    account.marginUsed = this.#recomputeFor(account)
+    const filled = this.#commitMarketOpen(account, { crop, quote, side, leverage, stamp, plan, local: false })
+    const position = filled.positions[0]
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
     this.#recordNotional(account, notional, stamp)
-    // 手续费从 peer 的余额里出，落在本机的保险/销毁桶里（钱确实动了，费账就得跟着动）；
-    // 纸面账户的费是纸面的，`#chargeFee` 会按账户档位丢掉。
-    this.#chargeFee(fee, account)
     const persisted = await this.#persist()
     return {
       ok: true,
       action: 'futures-open',
       position: { ...position },
-      lots,
-      price,
-      fee,
+      lots: filled.lots,
+      price: filled.price,
+      fee: filled.fee,
       account: this.#accountView(account, stamp),
       seq,
       persisted
@@ -2057,46 +2036,33 @@ class FuturesStore {
     if (this.#state.delivered[quote.contract.id] !== undefined) {
       return { ok: false, error: 'contract-expired', notice: '合约已到期，20:00 后停止交易。' }
     }
-    const price = fillPriceOf(quote, side)
     const notional = roundCoin(Number(margin) * Number(leverage))
-    const lots = lotsFor({ notional, price })
-    const usedMargin = marginOf({ lots, price, leverage })
-    const fee = takerFeeOf(notionalOf({ lots, price }))
-    const total = roundCoin(usedMargin + fee)
-    const shadow = this.accountMode() === 'shadow'
-    if (this.#state.balance < total) return { ok: false, error: 'no-balance' }
+    // 票 110：市价单先吃邻居的挂单，剩下才找做市商——「你赚的钱是邻居亏的钱」从这里开始。
+    const plan = this.#planMarketOpen(this.#state, { quote, side, notional, leverage })
+    if (this.#state.balance < roundCoin(plan.margin + plan.fee)) return { ok: false, error: 'no-balance' }
     const limited = this.#checkLimits(this.#state, notional, stamp)
     if (limited !== null) return limited
-
-    this.#state.balance = roundCoin(this.#state.balance - total)
-    this.#state.marginUsed = roundCoin(this.#state.marginUsed + usedMargin)
-    const slot = this.#slotOf(stamp)
-    const position = {
-      id: randomUUID(),
+    const filled = this.#commitMarketOpen(this.#state, { crop, quote, side, leverage, stamp, plan, local: true })
+    const position = filled.positions[0]
+    this.#recordNotional(this.#state, notional, stamp)
+    this.#recordTrade({
+      at: stamp,
       crop,
       contract: quote.contract.id,
       side,
-      lots,
-      entry: price,
-      margin: usedMargin,
-      leverage,
-      openedAt: stamp,
-      slot,
-      settleSlot: slot + 1
-    }
-    this.#state.positions.push(position)
-    this.#state.tradedAt = stamp
-    this.#recordNotional(this.#state, notional, stamp)
-    this.#chargeFee(fee, this.#state)
-    this.#recordTrade({ at: stamp, crop, contract: quote.contract.id, side, lots, price, fee, kind: 'open' })
+      lots: filled.lots,
+      price: filled.price,
+      fee: filled.fee,
+      kind: 'open'
+    })
     const persisted = await this.#persist()
     return {
       ok: true,
       action: 'futures-open',
       position: { ...position },
-      lots,
-      price,
-      fee,
+      lots: filled.lots,
+      price: filled.price,
+      fee: filled.fee,
       ...this.#view(),
       persisted
     }
@@ -2470,6 +2436,93 @@ class FuturesStore {
     return fills
   }
 
+
+  /**
+   * 票 110（B 方案）：市价单先吃邻居的挂单。
+   *
+   * 同一合约、同一本账（纸面与真钱不交叉）、对手方向、价格不劣于做市商那一侧的挂单，
+   * 按价格优先取走；同价按挂单先后。成交价就是挂单价——比做市商便宜的那部分，是邻居让的。
+   */
+  #bookParts (account, { contract, side, lots, touch }) {
+    const pools = this.#orderPools(contract)
+    const book = this.#accountModeOf(account)
+    const opposite = side === 'long' ? 'short' : 'long'
+    const eligible = []
+    for (const order of pools.orders) {
+      if (order.side !== opposite || !(order.lotsLeft > 0)) continue
+      if (this.#orderModeOf(pools, order) !== book) continue
+      const limit = Number(order.price)
+      if (!Number.isFinite(limit) || limit <= 0) continue
+      if (side === 'long' ? limit > touch : limit < touch) continue
+      const owner = pools.owners.get(order.id)
+      if (owner === undefined) continue
+      eligible.push({ order, owner })
+    }
+    eligible.sort((a, b) => {
+      const delta = Number(a.order.price) - Number(b.order.price)
+      return side === 'long' ? delta : -delta
+    })
+    const parts = []
+    let left = lots
+    for (const entry of eligible) {
+      if (left <= 0) break
+      const take = Math.min(left, entry.order.lotsLeft)
+      if (!(take > 0)) continue
+      parts.push({ order: entry.order, owner: entry.owner, lots: take, price: Number(entry.order.price) })
+      left -= take
+    }
+    return { parts, left }
+  }
+
+  /** 算一笔市价开仓会吃到什么价：邻居那部分按挂单价，余量按做市商那一侧。 */
+  #planMarketOpen (account, { quote, side, notional, leverage }) {
+    const touch = fillPriceOf(quote, side)
+    const lots = lotsFor({ notional, price: touch })
+    const { parts: bookParts, left } = this.#bookParts(account, { contract: quote.contract.id, side, lots, touch })
+    const parts = [...bookParts]
+    if (left > 0) parts.push({ lots: left, price: touch })
+    let margin = 0
+    let fee = 0
+    for (const part of parts) {
+      margin += marginOf({ lots: part.lots, price: part.price, leverage })
+      fee += takerFeeOf(notionalOf({ lots: part.lots, price: part.price }))
+    }
+    return { lots, touch, parts, margin: roundCoin(margin), fee: roundCoin(fee) }
+  }
+
+  /** 落账：邻居那几笔先给 maker 开仓（保证金从冻结里出），再给 taker 开仓、扣保证金与手续费。 */
+  #commitMarketOpen (account, { crop, quote, side, leverage, stamp, plan, local }) {
+    const positions = []
+    for (const part of plan.parts) {
+      if (part.order !== undefined) {
+        const frozen = this.#takeFrozen(part.order, part.lots)
+        this.#openFromOrder(part.owner, part.order, part.lots, part.price, frozen, stamp)
+      }
+      const slot = this.#slotOf(stamp)
+      const position = {
+        id: randomUUID(),
+        crop,
+        contract: quote.contract.id,
+        side,
+        lots: part.lots,
+        entry: part.price,
+        margin: marginOf({ lots: part.lots, price: part.price, leverage }),
+        leverage,
+        openedAt: stamp,
+        slot,
+        settleSlot: slot + 1
+      }
+      account.positions.push(position)
+      positions.push(position)
+    }
+    account.balance = roundCoin(account.balance - plan.margin - plan.fee)
+    account.marginUsed = this.#recomputeFor(account)
+    this.#chargeFee(plan.fee, account)
+    // 吃空的挂单当场摘掉：`lotsLeft: 0` 留在账本里，settle 的 `orders` 就成了坏字段。
+    this.#pruneOrders()
+    if (local) this.#state.tradedAt = stamp
+    return { positions, lots: plan.lots, price: plan.touch, margin: plan.margin, fee: plan.fee }
+  }
 
   /** 主动平仓：按当前对手价成交，保证金 + 盈亏记回余额。合约过期后只能等交割（票 96）。 */
   async close ({ id, at = this.#nowMs() }) {
