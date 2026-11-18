@@ -839,7 +839,7 @@ function normalizeFuturesPosition (value) {
   const margin = normalizeFuturesPositiveCoin(value.margin)
   if (margin === null) return null
   if (!isFuturesLeverage(value.leverage)) return null
-  return {
+  const position = {
     id: value.id.toLowerCase(),
     crop: value.crop,
     contract: value.contract,
@@ -849,6 +849,11 @@ function normalizeFuturesPosition (value) {
     margin,
     leverage: value.leverage
   }
+  // 1.13.1：档位跟着仓位走，远端平仓才不至于按「账户此刻的档位」记账。
+  // 老 peer 不发这个字段就省略（回落账户档位），非法值同样当没有——
+  // 一个坏档位不该让整份账被丢掉。
+  if (isFuturesAccountMode(value.accountMode)) position.accountMode = value.accountMode
+  return position
 }
 
 function normalizeFuturesPositions (value) {

@@ -360,7 +360,12 @@ function normalizePosition (raw) {
   if (id === null || crop === null || contract === null || side === null) return null
   if (lots === null || entry === null || entry <= 0 || margin === null || leverage === null) return null
   if (openedAt === null || openedAt <= 0 || slot === null || settleSlot === null) return null
-  return { id, crop, contract: contract.id, side, lots, entry, margin, leverage, openedAt, slot, settleSlot }
+  const position = { id, crop, contract: contract.id, side, lots, entry, margin, leverage, openedAt, slot, settleSlot }
+  // 1.13.1：档位跟着仓位走——开仓那一刻记下来，之后账户再切档也不改这一笔的账。
+  // 老存档没有这个字段，缺省是「跟随账户当前档位」，所以只在值合法时才写这个键：
+  // 盘上的老形状原样不动（不写 null），非法值也当没有，而不是把整条仓位丢掉。
+  if (isFuturesAccountMode(raw.accountMode)) position.accountMode = raw.accountMode
+  return position
 }
 
 /** 一条成交记录：坏记录整条丢掉，不修补（它只是展示用的流水）。 */
@@ -599,7 +604,11 @@ function normalizeReplicaPosition (raw) {
   const leverage = isFuturesLeverage(raw.leverage) ? raw.leverage : null
   if (id === null || crop === null || contract === null || side === null) return null
   if (lots === null || entry === null || entry <= 0 || margin === null || leverage === null) return null
-  return { id, crop, contract: contract.id, side, lots, entry, margin, leverage }
+  const position = { id, crop, contract: contract.id, side, lots, entry, margin, leverage }
+  // 1.13.1：档位也要跟着副本仓位走，否则远端平仓又会按账户当前档位记账。
+  // 老 peer 不发这个字段就当没有（回落账户档位），别因此丢掉整条持仓。
+  if (isFuturesAccountMode(raw.accountMode)) position.accountMode = raw.accountMode
+  return position
 }
 
 /** 副本（peer 侧）里的一条挂单：线上形状，`lotsLeft` 是剩余未成交张数。 */
@@ -1785,7 +1794,7 @@ class FuturesStore {
     const seq = this.#bumpAccount(account)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
-    this.#bookPnl(pnl, stamp, account)
+    this.#bookPnl(pnl, stamp, account, this.#positionModeOf(position, account))
     this.#recordRemoteTrade(account, {
       at: stamp,
       crop: position.crop,
@@ -1878,7 +1887,10 @@ class FuturesStore {
       positions: this.#state.positions.map((position) => ({ ...position })),
       trades: this.#state.trades.map((trade) => ({ ...trade })),
       fees: { ...this.#state.fees },
-      week: { ...this.#state.week }
+      week: { ...this.#state.week },
+      // 1.13.1：`house` 与 `week.pnl` 是同一笔账的两侧，回滚必须一起还原，
+      // 否则「写盘失败」会留下一个动过 house 的账本（总量就地对不上了）。
+      house: this.#state.house
     }
     let added = null
     try {
@@ -1903,8 +1915,10 @@ class FuturesStore {
     this.#state.marginUsed = this.#recomputeMarginUsed()
     this.#state.closed += 1
     this.#state.tradedAt = stamp
-    this.#bookPnl(plan.pnl, stamp)
-    this.#chargeFee(plan.fee, this.#state)
+    // 1.13.1：这一笔按**仓位**的档位记账——账户此刻可能已经切到另一档了。
+    const positionMode = this.#positionModeOf(position, this.#state)
+    this.#bookPnl(plan.pnl, stamp, this.#state, positionMode)
+    this.#chargeFee(plan.fee, this.#state, positionMode)
     this.#recordTrade({
       at: stamp,
       crop: position.crop,
@@ -1926,6 +1940,7 @@ class FuturesStore {
       this.#state.trades = before.trades
       this.#state.fees = before.fees
       this.#state.week = before.week
+      this.#state.house = before.house
       return { ok: false, error: 'write-failed', notice: '账本没写进去，本次转现货已回滚。' }
     }
     return {
@@ -1970,8 +1985,9 @@ class FuturesStore {
     const seq = this.#bumpAccount(account)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
-    this.#chargeFee(plan.fee, account)
-    this.#bookPnl(plan.pnl, stamp, account)
+    const positionMode = this.#positionModeOf(position, account)
+    this.#chargeFee(plan.fee, account, positionMode)
+    this.#bookPnl(plan.pnl, stamp, account, positionMode)
     this.#recordRemoteTrade(account, {
       at: stamp,
       crop: position.crop,
@@ -2029,6 +2045,9 @@ class FuturesStore {
         continue
       }
       const pnl = pnlOf({ lots: position.lots, entry: position.entry, exit: price, side: position.side })
+      // 1.13.1：交割也按**仓位**的档位算。真钱仓位在账户切回纸面后交割，亏空仍要花真钱
+      // 保险基金、手续费仍要进桶——只扣余额不记账，总量就少了一块。
+      const positionMode = this.#positionModeOf(position, account)
       const gross = roundCoin(position.margin + pnl)
       const credit = Math.max(0, gross)
       const deliveryFee = roundCoin(notionalOf({ lots: position.lots, price }) * DELIVERY_FEE_RATE)
@@ -2038,12 +2057,12 @@ class FuturesStore {
       const net = roundCoin(credit - paidFee)
       const gap = roundCoin(Math.max(0, -gross) + Math.max(0, deliveryFee - credit))
       // 1.10.0：纸面账户的亏空是纸面的，不能花真钱保险基金。
-      const covered = this.#accountModeOf(account) === 'shadow'
+      const covered = positionMode === 'shadow'
         ? { paid: 0, owed: 0 }
         : this.#coverHole(gap)
       account.balance = roundCoin(account.balance + net)
       this.#state.closed += 1
-      if (paidFee > 0) this.#chargeFee(paidFee, account)
+      if (paidFee > 0) this.#chargeFee(paidFee, account, positionMode)
       const trade = {
         at: stamp,
         crop: position.crop,
@@ -2056,10 +2075,10 @@ class FuturesStore {
         deliveryFee: paidFee
       }
       if (local) {
-        this.#bookPnl(pnl, stamp)
+        this.#bookPnl(pnl, stamp, this.#state, positionMode)
         this.#recordTrade(trade)
       } else {
-        this.#bookPnl(pnl, stamp, account)
+        this.#bookPnl(pnl, stamp, account, positionMode)
         this.#recordRemoteTrade(account, trade)
       }
       delivered.push({
@@ -2774,7 +2793,10 @@ class FuturesStore {
       leverage: order.leverage,
       openedAt: stamp,
       slot,
-      settleSlot: slot + 1
+      settleSlot: slot + 1,
+      // 1.13.1：maker 的仓位记它**自己账户**的档位——撮合里两家可能是不同档位，
+      // 不能用吃单方（或全局）的档位代替，否则这一笔的盈亏会记到别人头上。
+      accountMode: this.#accountModeOf(account)
     })
     account.marginUsed = this.#recomputeFor(account)
     if (pool.local) {
@@ -2909,7 +2931,9 @@ class FuturesStore {
         leverage,
         openedAt: stamp,
         slot,
-        settleSlot: slot + 1
+        settleSlot: slot + 1,
+        // 1.13.1：开仓这一刻的档位写进仓位。此后账户再切档，这一笔仍按当时的账记。
+        accountMode: this.#accountModeOf(account)
       }
       account.positions.push(position)
       positions.push(position)
@@ -2944,7 +2968,8 @@ class FuturesStore {
     this.#state.balance = roundCoin(this.#state.balance + credit)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
-    this.#bookPnl(pnl, stamp)
+    // 1.13.1：按仓位的档位记账——账户切档不该改这一笔已经发生的账。
+    this.#bookPnl(pnl, stamp, this.#state, this.#positionModeOf(position, this.#state))
     // 平仓是反向的一笔成交：方向反过来记，手续费只有开仓那一下收（交割费由票 96 加）。
     this.#recordTrade({
       at: stamp,
@@ -3022,7 +3047,7 @@ class FuturesStore {
       position.entry = outcome.price
       position.settleSlot = this.#slotOf(outcome.at) + 1
       this.#state.tradedAt = outcome.at
-      this.#bookPnl(outcome.pnl, outcome.at)
+      this.#bookPnl(outcome.pnl, outcome.at, this.#state, this.#positionModeOf(position, this.#state))
       settled.push({
         position: { ...position },
         price: outcome.price,
@@ -3134,7 +3159,10 @@ class FuturesStore {
     const credit = Math.max(0, roundCoin(gross - fee))
     const hole = roundCoin(Math.max(0, -gross) + Math.max(0, fee - Math.max(0, gross)))
     // 1.10.0：同上——纸面账户强平不花真钱保险基金。
-    const covered = this.#accountModeOf(account) === 'shadow' ? { paid: 0, owed: 0 } : this.#coverHole(hole)
+    // 1.13.1：档位按仓位算。真钱仓位在账户切回纸面后被强平，亏空仍要花真钱基金，
+    // 否则这笔亏空既没扣余额也没记账，凭空消失。
+    const positionMode = this.#positionModeOf(position, account)
+    const covered = positionMode === 'shadow' ? { paid: 0, owed: 0 } : this.#coverHole(hole)
 
     const index = account.positions.findIndex((item) => item.id === position.id)
     if (index >= 0) account.positions.splice(index, 1)
@@ -3142,8 +3170,8 @@ class FuturesStore {
       this.#state.balance = roundCoin(this.#state.balance + credit)
       this.#state.marginUsed = this.#recomputeMarginUsed()
       this.#state.tradedAt = hit.at
-      if (paidFee > 0) this.#chargeFee(paidFee, this.#state)
-      this.#bookPnl(hit.pnl, hit.at)
+      if (paidFee > 0) this.#chargeFee(paidFee, this.#state, positionMode)
+      this.#bookPnl(hit.pnl, hit.at, this.#state, positionMode)
       this.#recordTrade({
         at: hit.at,
         crop: position.crop,
@@ -3158,8 +3186,8 @@ class FuturesStore {
     } else {
       account.balance = roundCoin(account.balance + credit)
       account.marginUsed = this.#recomputeFor(account)
-      if (paidFee > 0) this.#chargeFee(paidFee, account)
-      this.#bookPnl(hit.pnl, hit.at, account)
+      if (paidFee > 0) this.#chargeFee(paidFee, account, positionMode)
+      this.#bookPnl(hit.pnl, hit.at, account, positionMode)
       this.#recordRemoteTrade(account, {
         at: hit.at,
         crop: position.crop,
@@ -3226,7 +3254,7 @@ class FuturesStore {
       account.balance = roundCoin(account.balance + outcome.pnl)
       position.entry = outcome.price
       position.settleSlot = this.#slotOf(outcome.at) + 1
-      this.#bookPnl(outcome.pnl, outcome.at, account)
+      this.#bookPnl(outcome.pnl, outcome.at, account, this.#positionModeOf(position, account))
       settled.push({
         position: { ...position },
         price: outcome.price,
@@ -3352,15 +3380,32 @@ class FuturesStore {
   }
 
   /**
+   * 这一笔仓位该按哪个档位记账：优先用它自己开仓时记下的档位；
+   * 老存档、老 peer 的仓位没有这个字段，回落账户当前档位（旧行为，向后兼容）。
+   */
+  #positionModeOf (position, account = this.#state) {
+    if (position !== null && typeof position === 'object' && isFuturesAccountMode(position.accountMode)) {
+      return position.accountMode
+    }
+    return this.#accountModeOf(account)
+  }
+
+  /**
    * 记一笔已实现盈亏：进周榜，同时把做市商那一侧记上反数（`house -= pnl`）。
    *
    * 1.12.4：以前这里只动周榜，硬币凭空增减——玩家赚的 100 是系统印的，亏的 100 是系统销的。
    * 现在每一笔已实现盈亏（平仓、交割、强平、盯市）都从 `house` 里进出，账本才闭合。
    * 纸面账户既不进榜也不进 `house`：假钱统计进去只会让数字变成假的。
+   *
+   * 1.13.1：档位按**仓位**算，不按账户此刻的档位算（`mode` 由 `#positionModeOf()` 给出）。
+   * 以前按账户当前档位判断：真钱仓位在账户切回纸面后平仓，余额照加而 `house` 不动，
+   * 总账凭空多/少币；纸面仓位切到真钱后平仓，又把假钱盈亏记进了 `house` 与周榜。
+   * `mode` 缺省或非法时回落账户当前档位——老存档、老调用点的行为保持不变。
    */
-  #bookPnl (pnl, at, account = this.#state) {
+  #bookPnl (pnl, at, account = this.#state, mode = null) {
     if (!Number.isFinite(pnl) || pnl === 0) return
-    if (this.#accountModeOf(account) === 'shadow') return
+    const book = isFuturesAccountMode(mode) ? mode : this.#accountModeOf(account)
+    if (book === 'shadow') return
     const start = this.#weekStartOf(at)
     if (this.#state.week.start !== start) this.#state.week = { start, pnl: 0 }
     this.#state.week.pnl = roundCoin(this.#state.week.pnl + pnl)
@@ -3383,9 +3428,13 @@ class FuturesStore {
   /**
    * 记一笔手续费的分配。1.10.0：纸面账户（`shadow`）的手续费是纸面的，不能流进
    * 保险基金和销毁桶——那两个桶装的是真钱，纸面费进来等于凭空铸币。
+   *
+   * 1.13.1：`mode` 和 `#bookPnl` 一样按仓位自己的档位算。交割/强平/转现货时手续费已经从
+   * 余额里扣了，如果这里还按账户当前档位跳过，钱就只出不入——恒等式同样会破。
    */
-  #chargeFee (fee, account = null) {
-    if (account !== null && this.#accountModeOf(account) === 'shadow') return
+  #chargeFee (fee, account = null, mode = null) {
+    const book = isFuturesAccountMode(mode) ? mode : (account === null ? null : this.#accountModeOf(account))
+    if (book === 'shadow') return
     const split = feeSplitOf(fee)
     this.#state.fees.insurance = roundCoin(this.#state.fees.insurance + split.insurance)
     this.#state.fees.burned = roundCoin(this.#state.fees.burned + split.burned)
