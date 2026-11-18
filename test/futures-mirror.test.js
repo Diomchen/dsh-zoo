@@ -256,14 +256,16 @@ test('副本还没到时窗口不拿本机数字冒充房主，也不许从副�
   assert.equal(ready.positions.length, 1)
   assert.equal(service.futures().balance, ready.balance)
 
-  // 余额现在是房主账上的：本机提现等于拿房主的账给自家农场凭空加币，只回 not-owner。
+  // 余额是房主账上的：本机不能自己扣账，更不能给自家农场凭空加币。
+  // 1.13.1 起提现改成「报意图」——本机一条字节都不动账，只把申请发出去；
+  // 这里没开网络，所以直接说发不出去，账上 402.07 一分不少。
   const route = routes.find((candidate) => candidate.path === '/dsh-zoo/action')
   assert.ok(route, '应该注册 /dsh-zoo/action')
   const out = await postAction(route, { action: 'futures-withdraw', coins: 10 })
   assert.equal(out.status, 409)
   assert.equal(out.body.ok, false)
-  assert.equal(out.body.error, 'not-owner')
-  assert.equal(service.futures().balance, 402.07, '被拒的提现不能动账')
+  assert.equal(out.body.error, 'network-off')
+  assert.equal(service.futures().balance, 402.07, '没发出去的提现不能动账')
 })
 
 /** 最小的 action 路由驱动：只发一次 POST，够这组用例用。 */

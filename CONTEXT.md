@@ -502,7 +502,15 @@ _Avoid_: 盘口, 深度, order book, 挂单簿
 **托管账户 (Escrow Account)**：
 交易所里的余额，和农场硬币隔开：充值进来才能交易，提现原路退回农场。
 `balance` 是可用，`marginUsed` 是冻结的保证金，两者之和才是账户总额。
+在 peer 上提现不是本地扣账，而是给房主发一张**放款单**（`futures-withdraw`），
+房主扣账后把它塞进下一份账目（`settle` 的 `payout`）带回来，本机收到才加进农场。
 _Avoid_: 钱包, 资金池, wallet, vault
+
+**放款单 (Payout)**：
+房主记在账户上的「这笔钱该退给你」的欠条：`{ at, coins }`。
+`at` 是放款时刻，peer 用它去重（同一张单跟几份账目重发也只加一次币）；
+一次只许挂一张，上一张没落地再提回 `payout-pending`。
+_Avoid_: 转账, 出金, transfer, withdrawal record
 
 **保证金占用 (Margin Used)**：
 开仓时从 `balance` 划走、锁在这笔仓位里的钱。平仓或强平后释放回 `balance`。

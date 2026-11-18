@@ -174,6 +174,7 @@ import {
   encodeFuturesSettle,
   encodeFuturesSync,
   encodeFuturesMode,
+  encodeFuturesWithdraw,
   encodeFuturesPause,
   encodeFuturesLedger,
   FUTURES_LEDGER_MAX_CHUNK,
@@ -1362,10 +1363,10 @@ export function createService (ctx, options = {}) {
     }
     if (action === 'futures-withdraw') {
       if (futures === null) return { ok: false, error: 'starting' }
-      // 票 94：peer 的余额只是房主账本的镜像，本地提现等于拿房主的账给自家农场凭空加币。
-      // 钱要从托管账户里出来，只能在房主那台点（协议里还没有「peer 提现意图」）。
+      // 1.13.1：peer 的余额在房主账上，本机只能申请。房主扣账后把放款随 settle 带回，
+      // peer 收下时（`settlePayout`）才真正加到自家农场。
       if (!isFuturesHost() && futures.replicaOf() !== null) {
-        return { ok: false, error: 'not-owner', notice: FUTURES_ERROR_TEXT['not-owner'] }
+        return requestFuturesWithdraw(body?.coins)
       }
       const result = await futures.withdraw(body?.coins)
       if (result?.ok === true) refreshFuturesWindow()
@@ -5522,6 +5523,9 @@ export function createService (ctx, options = {}) {
             } else if (packet.type === 'futures-pause') {
               // 1.12.0：邻居申报自己按下的暂停。同样只有房主受账。
               void handleFuturesPause(packet, from)
+            } else if (packet.type === 'futures-withdraw') {
+              // 1.13.1：邻居申请提现。房主扣账后把放款随 settle 带回。
+              void handleFuturesWithdraw(packet, from)
             } else if (packet.type === 'futures-ledger') {
               // 1.12.0（B）：房主广播的整本账快照分片。peer 拼齐了才落盘。
               handleFuturesLedger(packet)
@@ -6994,7 +6998,9 @@ export function createService (ctx, options = {}) {
       insurance: fund.insurance,
       shortfall: fund.shortfall,
       // 1.12.4：做市商净盈亏（房主账本的全局数），peer 窗口显示「系统净付出」。
-      house: fund.house
+      house: fund.house,
+      // 1.13.1：还没被这台机器收下的放款。它会跟着后面几拍重复发，peer 按 `at` 去重。
+      payout: account.payout ?? null
     }
     // 票 96：整包硬上限 4 KiB。满仓 + 满挂单时 8 条流水可能塞不下，逐条减到能发为止。
     for (let keep = trades.length; keep >= 0; keep -= 1) {
@@ -7049,6 +7055,34 @@ export function createService (ctx, options = {}) {
       return discovery.sendTo(host, data) === true
     } catch (error) {
       warnOnce('futures-mode-send', '账户档位发不出去：' + message(error))
+      return false
+    }
+  }
+
+  /**
+   * 1.13.1：peer 申请提现。钱在房主账上，本机只能报「想提多少」，扣账与放款由房主决定；
+   * 房主扣完会把这笔放款随 settle 带回，`settlePayout()` 再给自家农场加币。
+   */
+  function sendFuturesWithdraw (coins) {
+    if (disposed || futures === null) return false
+    const host = futuresHostId()
+    if (host === null || host === room.snapshot().self.deviceId) return false
+    let data
+    try {
+      data = encodeFuturesWithdraw({
+        deviceId: room.snapshot().self.deviceId,
+        at: futuresClock(),
+        coins,
+        now: Date.now()
+      })
+    } catch (error) {
+      warnOnce('futures-withdraw-send', '提现申请发不出去：' + message(error))
+      return false
+    }
+    try {
+      return discovery.sendTo(host, data) === true
+    } catch (error) {
+      warnOnce('futures-withdraw-send', '提现申请发不出去：' + message(error))
       return false
     }
   }
@@ -7320,6 +7354,29 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 1.13.1：邻居申请提现。房主扣账、记一笔待放款（`payout`），并立刻回一份 settle，
+   * peer 收到后把币加进自家农场——钱不能从房主农场出，那是房主自己的口袋。
+   */
+  async function handleFuturesWithdraw (packet, from) {
+    if (disposed || futures === null || !isFuturesHost()) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    if (!futuresBindPeer(packet.deviceId, from)) return
+    let result = null
+    try {
+      result = await futures.requestWithdraw(packet.deviceId, packet.coins, futuresClock())
+    } catch (error) {
+      warnOnce('futures-withdraw', '提现申请没记下来：' + message(error))
+      return
+    }
+    if (result?.ok !== true) {
+      warnOnce('futures-withdraw-' + String(result?.error), '提现申请被拒：' + String(result?.error))
+      return
+    }
+    // 不管成败都回一份账目：失败时 peer 也会拿到最新余额，窗口不至于停在旧数上。
+    sendFuturesSettle(packet.deviceId)
+  }
+
+  /**
    * 1.12.0（B）：收到房主广播的整本账快照。分片按 `(epoch, seq)` 攒，齐了再落盘；
    * 只认当前房主的包（换房主期间两个人都可能发，认最后一个也算错，所以宁可丢）。
    */
@@ -7390,6 +7447,8 @@ export function createService (ctx, options = {}) {
         accountMode: packet.accountMode ?? null,
         // 1.12.0：这个账户自己按的暂停（老房主不发 = false）。
         paused: packet.paused === true,
+        // 1.13.1：房主批准的那笔放款（老房主不发 = 没有）。
+        payout: packet.payout ?? null,
         pending: packet.pending,
         at: futuresClock()
       })
@@ -7399,6 +7458,16 @@ export function createService (ctx, options = {}) {
     }
     if (applied?.applied !== true) return
     futuresHostSeen = packet.deviceId
+    // 1.13.1：放款到了就把币加进自家农场。`settlePayout()` 自己按 `at` 去重，
+    // 所以同一笔跟着后面几拍重发也只加一次。
+    void futures.settlePayout().then((payout) => {
+      if (payout?.applied === true) {
+        refreshFarmWindow()
+        refreshFuturesWindow()
+      }
+    }).catch((error) => {
+      warnOnce('futures-payout-apply', '提现的钱没进农场：' + message(error))
+    })
     refreshFuturesWindow()
   }
 
@@ -7554,6 +7623,32 @@ export function createService (ctx, options = {}) {
    * 票 94：非房主的按钮不本地记账，只把指令发给房主，等下一拍 settle 回来。
    * `pending:true` 就是窗口上的「已发给房主，等一拍回执」。
    */
+  /**
+   * 1.13.1：peer 提现——只报意图。
+   *
+   * 两个前提：① 余额在房主账上，本机不能自己扣也不能自己加币；② 放款到账时要能进农场，
+   * 所以先按农场剩下的空间截一刀，少提一点，免得房主扣了账、这边却加不进去。
+   */
+  async function requestFuturesWithdraw (rawCoins) {
+    if (disposed || discovery === null || futures === null) return { ok: false, error: 'network-off' }
+    if (!Number.isInteger(rawCoins) || rawCoins < 1) return { ok: false, error: 'bad-amount' }
+    const room = futures.farmRoom()
+    if (room < 1) {
+      return { ok: false, error: 'no-space', notice: '农场硬币已经到上限了，先花掉一些再提。' }
+    }
+    const coins = Math.min(rawCoins, room)
+    if (sendFuturesWithdraw(coins) !== true) return { ok: false, error: 'no-host' }
+    return {
+      ok: true,
+      action: 'futures-withdraw',
+      coins,
+      queued: true,
+      notice: coins < rawCoins
+        ? '农场快满了，这次先申请提 ' + coins + '，剩下的等提完再来。'
+        : '已申请提现 ' + coins + '，房主确认后到账。'
+    }
+  }
+
   function futuresOrderPending (action, order) {
     if (disposed || discovery === null) return { ok: false, error: 'network-off' }
     const hostId = futuresHostId()

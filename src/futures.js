@@ -178,6 +178,8 @@ export const FUTURES_ERROR_TEXT = Object.freeze({
   'contract-expired': '合约已到期，20:00 后停止交易。',
   'market-closed': '现在没有可交易的合约（周末休市，或已经收盘）。',
   'no-balance': '托管余额不够：先充值，或者把仓位平掉。',
+  // 1.13.1：放款一次只送一笔，上一笔没到账前不接第二笔（否则两笔在途、金额对不上）。
+  'payout-pending': '上一笔放款还没送到，到了再提。',
   'no-position': '没有这个仓位（可能已经平掉或交割了）。',
   'no-order': '没有这个挂单（可能已经成交或撤掉）。',
   'no-space': '仓库放不下这么多现货。',
@@ -272,6 +274,9 @@ export function initialFuturesState () {
     dayNotional: 0,
     pending: 0,
     disabled: false,
+    // 1.13.1：最近一次「已经被农场收下」的放款时刻。房主会把同一笔放款跟着后面几拍
+    // settle 重复下发，靠这个时间戳去重；它是本机私有状态，不随副本覆盖。
+    lastPayoutAt: 0,
     // 1.12.0：每个账户自己的「暂停交易」开关。房主关市只关自己，不再拦别人——
     // 停别人的市这件事在 LAN 里没有正当性（谁都能拔网线，但没人能替别人按暂停）。
     paused: false,
@@ -514,7 +519,23 @@ function normalizeRemoteAccount (raw) {
   if (typeof paused !== 'boolean') return null
   const disabled = raw.disabled === undefined ? false : raw.disabled
   if (typeof disabled !== 'boolean') return null
-  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode, paused, disabled }
+  // 1.13.1：还没被这台机器收下的放款。形状不对就当没有（下一拍房主还会重发）。
+  const payout = normalizePayout(raw.payout)
+  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode, paused, disabled, payout }
+}
+
+/**
+ * 1.13.1：房主批准的一笔放款（peer 提现）。`at` 是幂等键——同一笔会跟着后面几拍
+ * settle 重复下发，peer 只认比本地记录更新的一条；`coins` 是放给这台机器的金币数。
+ *
+ * 形状不对就整条当没有：宁可这笔晚一拍重发，也不能把币加两次或加错数。
+ */
+function normalizePayout (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const at = finiteNumber(raw.at)
+  const coins = nonNegativeCoin(raw.coins)
+  if (at === null || at <= 0 || coins === null || coins <= 0) return null
+  return { at, coins }
 }
 
 /**
@@ -919,6 +940,8 @@ function toFileState (state) {
     // 1.12.2：档位要落盘。以前只靠 `mode` 反推，一按暂停（mode 变 off）就退回「纸面」，
     // 重启后更是直接丢——充值、提现、结算都会按错档位走。
     accountMode: isFuturesAccountMode(state.accountMode) ? state.accountMode : null,
+    // 1.13.1：放款去重用的时间戳（只在 peer 侧有意义，房主那份恒为 0）。
+    lastPayoutAt: roundCoin(state.lastPayoutAt ?? 0),
     farmAnchor: roundCoin(state.farmAnchor),
     farmIn: roundCoin(state.farmIn),
     farmOut: roundCoin(state.farmOut),
@@ -945,7 +968,9 @@ function remoteFileState (remotes) {
       // 1.12.2：这三样以前都没落盘，房主一重启，邻居就自动变回「纸面、没暂停、没退出」。
       accountMode: isFuturesAccountMode(account.accountMode) ? account.accountMode : null,
       paused: account.paused === true,
-      disabled: account.disabled === true
+      disabled: account.disabled === true,
+      // 1.13.1：还没被 peer 确认收下的放款（房主重启后要能继续下发，否则钱卡在账上）。
+      payout: normalizePayout(account.payout)
     }
   }
   return out
@@ -1726,7 +1751,83 @@ class FuturesStore {
     return { ok: true, action: 'futures-deposit', coins, account: this.#accountView(account, stamp), seq, persisted }
   }
 
-  /** 房主：替 peer 开仓（票 94）——校验、定价、收费与 `open()` 是同一套函数，只是账记在 `remotes` 上。 */
+  /**
+   * 1.13.1：房主替 peer 放款。peer 的余额在房主账上，它自己既不能扣本机农场（钱不在那儿），
+   * 也不能凭空加币——所以提现只能是「peer 报意图 → 房主扣账 → 随 settle 放款 → peer 收下」。
+   *
+   * `at` 是这一笔放款的幂等键，同时是 peer 的去重依据：同一笔会跟着后面几拍 settle 重发。
+   * 上一笔还没被确认收下时拒绝第二笔——否则两笔会在途、金额对不上。
+   */
+  async requestWithdraw (deviceId, rawCoins, at = this.#nowMs()) {
+    const coin = positiveInt(rawCoins, MAX_COINS)
+    if (coin === null) return { ok: false, error: 'bad-amount' }
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const account = this.#remoteAccount(deviceId, stamp)
+    if (account === null) return { ok: false, error: 'bad-device' }
+    // 提现是减风险：暂停也放行，但退出（disabled）之后账已经结清，不再放款。
+    if (this.#disabled(account)) return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
+    if (normalizePayout(account.payout) !== null) {
+      return { ok: false, error: 'payout-pending', notice: '上一笔放款还没送到，到了再提。' }
+    }
+    // 只从可用余额里出：占用中的保证金不能提（要先平仓）。
+    if (Math.floor(account.balance) < coin) return { ok: false, error: 'no-balance' }
+    account.balance = roundCoin(account.balance - coin)
+    account.payout = { at: stamp, coins: coin }
+    account.updatedAt = stamp
+    const seq = this.#bumpAccount(account)
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-withdraw',
+      coins: coin,
+      account: this.#accountView(account, stamp),
+      seq,
+      persisted
+    }
+  }
+
+  /**
+   * 1.13.1：peer 收下房主放的那笔款——钱进自家农场。
+   *
+   * 幂等靠 `lastPayoutAt`：房主会把同一笔跟着后面几拍 settle 重复下发，这里只认比记录更新的
+   * 那一条，所以重复包不会加两次币。农场在上限处静默截断，收不下就按实收记并在返回值里说清。
+   */
+  async settlePayout () {
+    const replica = this.#state.replica
+    const payout = normalizePayout(replica === null || replica === undefined ? null : replica.payout)
+    if (payout === null) return { ok: true, applied: false }
+    if (payout.at <= (this.#state.lastPayoutAt ?? 0)) return { ok: true, applied: false }
+    let remaining = payout.coins
+    let credited = 0
+    while (remaining > 0) {
+      const batch = Math.min(MAX_COINS, remaining)
+      const added = await this.#farm.addCoins(batch)
+      if (added === null || added.ok !== true || !(added.qty > 0)) break
+      credited += added.qty
+      remaining -= added.qty
+      if (added.qty < batch) break
+    }
+    this.#state.lastPayoutAt = payout.at
+    this.#state.tradedAt = this.#nowMs()
+    const persisted = await this.#persist()
+    const result = { ok: true, action: 'futures-withdraw', applied: true, coins: credited, credited, ...this.#view(), persisted }
+    if (credited < payout.coins) {
+      result.notice = '农场硬币到上限了，有 ' + roundCoin(payout.coins - credited) + ' 没进来，找房主那台补发一次。'
+    }
+    return result
+  }
+
+  /**
+   * 1.13.1：本机农场还能收多少硬币（上限 `MAX_COINS`）。
+   * peer 提现前按它截一刀：放款到账那一刻农场已经满了，币就加不进来，
+   * 而房主那边已经扣过账——少提一点比钱卡在半路好。
+   */
+  farmRoom () {
+    return Math.max(0, roundCoin(MAX_COINS - this.#farmCoins()))
+  }
+
+  /**
+   * 房主：替 peer 开仓（票 94）——校验、定价、收费与 `open()` 是同一套函数，只是账记在 `remotes` 上。 */
   async hostOpen (deviceId, { crop, side, margin, leverage, at = this.#nowMs() } = {}) {
     if (!isCropId(crop)) return { ok: false, error: 'bad-crop' }
     if (!isFuturesSide(side)) return { ok: false, error: 'bad-side' }
@@ -2221,6 +2322,7 @@ class FuturesStore {
     mode,
     accountMode,
     paused,
+    payout,
     pending,
     at = this.#nowMs()
   } = {}) {
@@ -2281,6 +2383,9 @@ class FuturesStore {
     // 1.12.0：账户自己按的暂停，房主随账目回传（老房主不发 = 没暂停）。
     if (paused !== undefined && typeof paused !== 'boolean') return { ok: false, error: 'bad-paused' }
     const safePaused = paused === true
+    // 1.13.1：房主批准的那笔放款。坏形状就当没有（下一拍房主还会重发），不判整包坏——
+    // 这是一次「给钱」的通知，不该因为它的形状问题让整份账目被丢掉。
+    const safePayout = normalizePayout(payout)
     this.#state.replica = {
       epoch,
       lastSeq: seq,
@@ -2295,6 +2400,7 @@ class FuturesStore {
       mode: safeMode,
       accountMode: safeAccountMode,
       paused: safePaused,
+      payout: safePayout,
       pending: safePending,
       updatedAt: stamp
     }
@@ -3354,7 +3460,9 @@ class FuturesStore {
       accountMode: this.#accountModeOf(account),
       // 1.12.0：这个账户自己按的暂停 / 退出（房主据此拒绝新单）。
       paused: account.paused === true,
-      disabled: account.disabled === true
+      disabled: account.disabled === true,
+      // 1.13.1：还没送到的那笔放款（`{at, coins}`，送过就清空）。
+      payout: normalizePayout(account.payout)
     }
   }
 

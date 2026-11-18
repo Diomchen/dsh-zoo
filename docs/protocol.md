@@ -105,6 +105,8 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 { "v": 1, "type": "futures-ledger", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "seq": 9, "hostId": "<uuid>", "index": 0, "total": 1,
   "chunk": "{\"v\":1,\"epoch\":\"…\"}" }
+{ "v": 1, "type": "futures-withdraw", "deviceId": "<uuid>", "at": 1700000000000,
+  "coins": 500 }
 ```
 
 `futures-ledger` 是整本账快照的分片：`chunk` 是一段 JSON 文本，拼起来才是快照本体
@@ -115,7 +117,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` / `futures-ledger` / `board-flow` / `board-flow-sync` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` / `futures-ledger` / `futures-withdraw` / `board-flow` / `board-flow-sync` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -171,6 +173,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `accountMode` | `futures-settle`、`futures-mode` | 可选，缺省 `null`（= 沿用本地选择）；这个**账户自己**的档位，只认 `shadow`（纸面）/ `live`（真钱）。settle 里由房主回传，`futures-mode` 里由 peer 申报（1.10.0） |
 | `paused` | `futures-settle`、`futures-pause` | 可选，缺省 `false`；这个**账户自己**按下的暂停，只停自己。settle 里由房主回传（只在该账户暂停时为 `true`），`futures-pause` 里由 peer 申报（1.12.0） |
 | `pending` | `futures-settle` | 可选，缺省 `0`；该账户留在托管账、等待下次提取的金币数（到分，≥0）。提现撞农场 1,000,000 上限时产生（票 98） |
+| `payout` | `futures-settle` | 可选，缺省没有；房主批准的一笔放款 `{ at, coins }`（`coins` 为 1..1,000,000 的整数）。同一笔会跟着后面几拍重发，peer 按 `at` 去重后加进自家农场（1.13.1） |
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
@@ -1000,12 +1003,13 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    副本一到，peer 就把里面的**余额/占用/仓位/挂单**镜像回本机账本（`futures.json` 因此也是房主
    账本的镜像，重启后不必等第一拍才对上）；本机额外只留自己的审计流水。副本没到之前窗口显示
    「等对端…」、余额按 0 画，不拿本机数字冒充房主。**peer 不是清算所**：副本存在时本地不做
-   盯市/强平/撮合/交割，也不允许本地提现（回 `not-owner`），这些只有房主说了算。
+   盯市/强平/撮合/交割，也不允许本地扣账提现（钱不在本机），这些只有房主说了算。
 7. **旧邻居**：只有广告了 `futures` 能力位的已放行邻居才会收到这五种包。对方没这一位时
    两边都不发，本机窗口写「对端未升级，期货不可用」；农场、盘口、串门照常。
 8. **窗口动作**：peer 点 `futures-deposit` / `futures-open` / `futures-close` / `futures-place` /
    `futures-cancel` 只发指令，回 `{ ok: true, pending: true }`，等房主下一拍 settle 才改显示；
-   `futures-withdraw` 仍是房主本机动作（只有房主能提自己账上的钱）。
+   提现也走这条路（1.13.1）：peer 发 `futures-withdraw` `{ coins }` 报意图，房主扣账并记一笔
+   `payout`，随 settle 带回，peer 收下时把币加进自家农场（房主本机提现仍是一步到位）。
 9. **档位、暂停、退出都归账户自己（票 98 / 1.10.0 / 1.12.0）**：
    - **档位**：任何账户都能发 `futures-account-mode` 切自己的 `accountMode`（`shadow` 纸面 /
      `live` 真钱），peer 再以报文 `futures-mode` `{ accountMode }` 报给房主，房主据此记账并把

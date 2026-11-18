@@ -381,6 +381,8 @@ export const PACKET_TYPES = Object.freeze([
   'futures-mode',
   // 1.12.0：账户自己按的暂停申报（peer → 房主）。
   'futures-pause',
+  // 1.13.1：peer 的提现意图。钱在房主账上，peer 只能「申请」，由房主扣账后随 settle 带回放款。
+  'futures-withdraw',
   // 1.12.0（B）：整本账快照的分片（房主 → peer），换房主时用来重建账本。
   'futures-ledger',
   // 票 107：盘口 LAN 资金流。老版本按「未知类型」整包丢掉，不崩。
@@ -1116,6 +1118,7 @@ function buildPacket ({
   // 1.12.0：账户自己的暂停（futures-pause）与档位（futures-mode）
   paused,
   accountMode,
+  payout,
   lastSeq,
   caps,
   purpose,
@@ -1437,6 +1440,12 @@ function buildPacket ({
     const stamp = futuresStamp(at, now)
     if (!isFuturesAccountMode(accountMode)) throw new Error('protocol: invalid futures account mode')
     packet = { ...base, at: stamp, accountMode }
+  } else if (type === 'futures-withdraw') {
+    // 1.13.1：peer 只报「想提多少」，扣账与放款都由房主定（同充值那条 coins 校验）。
+    if (!Number.isInteger(coins) || coins < 1 || coins > MAX_FUTURES_COIN) {
+      throw new Error('protocol: invalid futures coins')
+    }
+    packet = { ...base, at: futuresStamp(at, now), coins }
   } else if (type === 'futures-order') {
     // 只带「做什么」。成交价、保证金、余额一律不上线：房主算，peer 信不信由它。
     const stamp = futuresStamp(at, now)
@@ -1524,6 +1533,19 @@ function buildPacket ({
     if (safeAccountMode === undefined) throw new Error('protocol: invalid futures account mode')
     const safePaused = paused === undefined ? false : paused
     if (typeof safePaused !== 'boolean') throw new Error('protocol: invalid futures paused')
+    // 1.13.1：房主批准的一笔放款（peer 提现）。可选；给了就必须是「毫秒时间戳 + 正整数」。
+    // 时间戳是幂等键：同一笔放款会跟着后面几拍 settle 重复下发，peer 只认比上次更新的那条。
+    let safePayout = null
+    if (payout !== undefined && payout !== null) {
+      const payoutAt = typeof payout === 'object' && typeof payout.at === 'number' && Number.isFinite(payout.at) && payout.at > 0
+        ? payout.at
+        : null
+      const payoutCoins = typeof payout === 'object' && Number.isInteger(payout.coins) && payout.coins >= 1 && payout.coins <= MAX_FUTURES_COIN
+        ? payout.coins
+        : null
+      if (payoutAt === null || payoutCoins === null) throw new Error('protocol: invalid futures payout')
+      safePayout = { at: payoutAt, coins: payoutCoins }
+    }
     packet = {
       ...base,
       at: stamp,
@@ -1543,6 +1565,7 @@ function buildPacket ({
     }
     if (safeAccountMode !== null) packet.accountMode = safeAccountMode
     if (safePaused === true) packet.paused = true
+    if (safePayout !== null) packet.payout = safePayout
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
     const stamp = futuresStamp(at, now)
@@ -1758,6 +1781,7 @@ export function encodeFuturesSettle ({
   mode = FUTURES_DEFAULT_MODE,
   accountMode = null,
   paused = false,
+  payout = null,
   pending = 0,
   now
 } = {}) {
@@ -1785,7 +1809,17 @@ export function encodeFuturesSettle ({
   if (isFuturesAccountMode(accountMode)) packet.accountMode = accountMode
   // 1.12.0：账户自己的暂停开关，只在按下时带字段（缺省 = 没暂停）。
   if (paused === true) packet.paused = true
+  // 1.13.1：房主批准的一笔放款。它会跟着后面几拍 settle 重复下发，peer 按 `at` 去重。
+  if (payout !== null && payout !== undefined) packet.payout = payout
   return encodePacket(packet)
+}
+
+/**
+ * 1.13.1：peer 的提现意图（peer → 房主）。只报金额，扣哪个账户、扣多少由房主决定：
+ * 余额在房主账上，peer 自己动不了。房主扣完账把 `payout` 随 settle 带回，peer 才给自家农场加币。
+ */
+export function encodeFuturesWithdraw ({ deviceId, at, coins, now } = {}) {
+  return encodePacket({ type: 'futures-withdraw', deviceId, at, coins, now })
 }
 
 /**
@@ -2455,6 +2489,23 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     }
   }
 
+  // 1.13.1：peer 的提现意图。只有金额，扣账与放款都由房主决定。
+  if (raw.type === 'futures-withdraw') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!Number.isInteger(raw.coins) || raw.coins < 1 || raw.coins > MAX_FUTURES_COIN) return fail('coins')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        coins: raw.coins
+      }
+    }
+  }
+
   // 1.12.0（B）：整本账快照的分片。房主按序发，peer 按 `(epoch, seq, total)` 拼回来；
   // 分片本身没有语义，只保证「不超过上限、序号自洽」。
   if (raw.type === 'futures-ledger') {
@@ -2583,6 +2634,18 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     // 1.12.0：账户自己的暂停可选（老房主不发 = 没暂停）。
     const paused = raw.paused === undefined ? false : raw.paused
     if (typeof paused !== 'boolean') return fail('paused')
+    // 1.13.1：放款可选。`at` 是幂等键，必须有；金额必须是正整数。
+    let payout = null
+    if (raw.payout !== undefined && raw.payout !== null) {
+      const payoutAt = raw.payout !== null && typeof raw.payout === 'object' && typeof raw.payout.at === 'number' && Number.isFinite(raw.payout.at) && raw.payout.at > 0
+        ? raw.payout.at
+        : null
+      const payoutCoins = raw.payout !== null && typeof raw.payout === 'object' && Number.isInteger(raw.payout.coins) && raw.payout.coins >= 1 && raw.payout.coins <= MAX_FUTURES_COIN
+        ? raw.payout.coins
+        : null
+      if (payoutAt === null || payoutCoins === null) return fail('payout')
+      payout = { at: payoutAt, coins: payoutCoins }
+    }
     return {
       ok: true,
       packet: {
@@ -2604,6 +2667,7 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         mode,
         accountMode,
         paused,
+        payout,
         pending
       }
     }
