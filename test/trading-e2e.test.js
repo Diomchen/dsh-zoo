@@ -282,7 +282,7 @@ test('票 82 e2e（评审 P0）：浮盈超出线上展示上限仍出现在邻�
       // 否则编码层整包拒绝，这位玩家会从每个邻居的榜上彻底消失。
       await seedFarm(dir, MAX_WEEK_PNL)
       await writeFile(join(dir, TRADING_FILE), JSON.stringify({
-        version: 1,
+        version: 2,
         week: { start: weekStartOf(now), pnl: 0, base: 1 },
         positions: [{
           id: '3f0f2a1c-1d2e-4b3a-8c9d-0e1f2a3b4c5d',

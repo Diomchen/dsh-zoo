@@ -954,7 +954,12 @@ test('票 90：首包只带当前作物的图与风向，limits 仍列全部作�
   assert.equal(charts.body.ok, true)
   assert.equal(charts.body.action, 'trading-charts')
   assert.equal(charts.body.crop, 'tomato')
-  assert.deepEqual(Object.keys(charts.body), ['ok', 'action', 'crop', 'timeframes', 'hint'])
+  assert.deepEqual(Object.keys(charts.body).filter((key) => key !== 'news'), ['ok', 'action', 'crop', 'timeframes', 'hint'])
+  // 票 105：消息面可能随图一起下发；有就校验形状，没有也不影响。
+  if (charts.body.news !== undefined) {
+    assert.ok(Array.isArray(charts.body.news.items))
+    assert.ok(Array.isArray(charts.body.news.calendar))
+  }
   assert.deepEqual(Object.keys(charts.body.timeframes), ['15m', '1h', '1d', '1w'])
   for (const id of ['15m', '1h', '1d', '1w']) {
     assert.deepEqual(Object.keys(charts.body.timeframes[id]), ['tomato'], id + ' 只回请求的作物')

@@ -333,7 +333,7 @@ function paintCrosshair (hit) {
         x: card.left + 9,
         y
       }))
-      group.append(svgText(clipText(row.text, 27), {
+      group.append(svgText(clipText(row.text, 24), {
         class: 'crosshair-news-text',
         x: card.left + 20,
         y
@@ -1316,9 +1316,12 @@ chartEl.addEventListener('click', (event) => {
   const hit = view.crosshairAt(chartGeometry, point.x, point.y)
   if (hit === null || !Array.isArray(hit.newsRows) || hit.newsRows.length === 0) return
   showNewsDetail(hit.newsRows[0].id)
+  // 别让同一次点击冒泡到「外点关闭」——否则详情卡刚开就被自己关掉。
+  event.stopPropagation()
 })
 
-tickerEl.addEventListener('click', () => {
+tickerEl.addEventListener('click', (event) => {
+  event.stopPropagation()
   if (lastBoard === null) return
   const id = lastBoard.chart !== null && lastBoard.chart !== undefined &&
     lastBoard.chart.ticker !== null && lastBoard.chart.ticker !== undefined
