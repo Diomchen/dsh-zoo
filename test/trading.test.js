@@ -248,6 +248,13 @@ test('票 103/105：v1 账本迁到 v2，未平仓位按 v5 现价 re-base，开
   assert.ok(Math.abs(position.entry - oldEntry) > 1e-6, '旧 v4 入场价应被替换')
   assert.ok(Math.abs(view.positions[0].pnl) < 1e-9, 're-base 后浮盈从 0 开始')
   assert.equal(view.locked, 100, '保证金仍然锁着')
+
+  // 重启一次：slot 必须由 rebasedAt 派生，否则会被当成「上一根的仓位」结掉。
+  const reopened = await openStore(dir, { clock, farm })
+  const after = reopened.view({ now: clock.now() })
+  assert.equal(after.positions.length, 1, '重启后仓位还在')
+  assert.equal(after.positions[0].entry, position.entry)
+  assert.ok(Math.abs(after.positions[0].pnl) < 1e-9)
 })
 
 test('票 79：开仓当场扣硬币；持仓有现价与浮盈亏；锁定与可用分得清', async (t) => {

@@ -256,6 +256,15 @@ function normalizePosition (value) {
   if (openedAt === null) return null
   const settling = normalizeSettling(value.settling)
   const stopLoss = normalizeStopLoss(value.stopLoss)
+  // v1 → v2 的 re-base 时刻：路径检查与「活到哪一根」都从这一刻起算；
+  // 开仓时间/顺序仍用 openedAt，列表不会因为迁移乱掉。
+  let rebasedAt = null
+  let rebasedRepaired = 0
+  if (value.rebasedAt !== undefined) {
+    rebasedAt = timestamp(value.rebasedAt)
+    if (rebasedAt === null) rebasedRepaired = 1
+  }
+  const effectiveStart = rebasedAt ?? openedAt
   return {
     position: {
       id,
@@ -265,12 +274,13 @@ function normalizePosition (value) {
       leverage: value.leverage,
       entry,
       openedAt,
-      // slot 是**派生字段**：按 openedAt 重算，文件里写错了也不信。
-      slot: slotIndexAt(openedAt),
+      // slot 是**派生字段**：按有效起点（re-base 时刻优先）重算，文件里写错了也不信。
+      slot: slotIndexAt(effectiveStart),
       stopLoss: stopLoss.level,
+      ...(rebasedAt === null ? {} : { rebasedAt }),
       ...(settling.settling === null ? {} : { settling: settling.settling })
     },
-    repaired: settling.repaired + stopLoss.repaired
+    repaired: settling.repaired + stopLoss.repaired + rebasedRepaired
   }
 }
 
