@@ -42,7 +42,7 @@ function fakeFarm (coins = 5000) {
 
 async function makeStore (t, { coins = 1000 } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-futures-withdraw-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   const farm = fakeFarm(coins)
   const store = await createFuturesStore(dir, { farm, now: () => NOW })
   return { dir, farm, store }

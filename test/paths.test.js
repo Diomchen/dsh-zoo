@@ -15,7 +15,7 @@ import { apply } from '../index.js'
 
 async function tempHome (t) {
   const home = await mkdtemp(join(tmpdir(), 'dsh-zoo-paths-'))
-  t.after(() => rm(home, { recursive: true, force: true }))
+  t.after(() => rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   return home
 }
 

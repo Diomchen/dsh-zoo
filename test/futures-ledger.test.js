@@ -37,7 +37,7 @@ function fakeFarm (coins) {
 
 async function makeStore (t, { coins = 5000, mode = 'live' } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-futures-ledger-'))
-  t.after(() => rm(dir, { recursive: true, force: true }))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
   if (mode !== 'shadow') {
     await writeFile(join(dir, 'futures.json'), JSON.stringify({ version: 1, mode }), 'utf8')
   }
