@@ -124,8 +124,8 @@ const WALK_MINUTE_SIGMA = 0.0057
 const WALK_PULL = 0.0012
 /** 消息阶跃的慢衰减：72 小时半衰期，单根 < 0.01%，远低于手续费。 */
 const NEWS_PULL = 1 - Math.pow(0.5, 1 / (72 * 60))
-/** `N + F` 合计偏离帽：6%，保证慢衰减带来的回拉也不足以覆盖手续费。 */
-const OVERLAY_CAP = 0.04
+/** `N + F` 合计偏离帽：6%（提案口径），保证慢衰减带来的回拉也不足以覆盖手续费。 */
+const OVERLAY_CAP = 0.06
 /** 波动率乘子的夹取范围：只改幅度，不改方向。 */
 const VOL_MIN = 0.55
 const VOL_MAX = 2.0

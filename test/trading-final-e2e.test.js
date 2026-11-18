@@ -133,6 +133,8 @@ function makeService (t, dir, options = {}) {
     petConfigPath: join(dir, 'missing.jsonc'),
     network: false,
     petBridge: false,
+    // 这些用例钉的是 v5 结算口径；B 期资金流另有专门用例。
+    tradingFlow: false,
     // 有桌面替身时才走 helper；其余用例明确 desktop:false（不 spawn Electron）。
     ...(options.desktopFactory === undefined ? { desktop: false } : {}),
     ...options

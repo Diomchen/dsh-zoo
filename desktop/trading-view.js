@@ -574,10 +574,10 @@
       typeof hints[crop] === 'object') {
       hint[crop] = hints[crop]
     }
-    const news = chartsCropOf(payload) === crop && payload.news !== null && typeof payload.news === 'object'
-      ? payload.news
-      : null
-    return { timeframes, hint, news }
+    const active = chartsCropOf(payload) === crop
+    const news = active && payload.news !== null && typeof payload.news === 'object' ? payload.news : null
+    const flow = active && payload.flow !== null && typeof payload.flow === 'object' ? payload.flow : null
+    return { timeframes, hint, news, flow }
   }
 
   /**
@@ -683,8 +683,9 @@
         [crop]: hintEntry
       }
     }
-    // 票 105：按需拉图带回的消息面跟着这一种作物走。
+    // 票 105/107：按需拉图带回的消息面/资金流跟着这一种作物走。
     if (charts.news !== null && typeof charts.news === 'object') next.news = charts.news
+    if (charts.flow !== null && typeof charts.flow === 'object') next.flow = charts.flow
     return next
   }
 
@@ -923,6 +924,9 @@
     }
     const entry = toNumber(options.entry)
     const liquidation = toNumber(options.liquidation)
+    const flowEvents = Array.isArray(options.flowEvents)
+      ? options.flowEvents.filter((event) => event !== null && typeof event === 'object')
+      : []
     let min = Infinity
     let max = -Infinity
     const consider = (value) => {
@@ -1037,6 +1041,34 @@
     }
     for (const candle of scaled) markNews(candle, candle.news)
     if (forming !== null) markNews(forming, forming.news)
+    // 票 107：资金流标记画在 K 线下方，和消息旗分开；鲸鱼单画大一点。
+    const flowMarks = []
+    const allCandles = forming === null ? scaled : scaled.concat([forming])
+    const used = new Set()
+    for (const event of flowEvents) {
+      const at = toNumber(event.at)
+      if (at === null) continue
+      const candle = allCandles.find((entryCandle) => {
+        const start = toNumber(entryCandle.start)
+        const end = toNumber(entryCandle.end)
+        return start !== null && end !== null && at >= start && at < end
+      })
+      if (candle === undefined) continue
+      const impact = toNumber(event.impact) ?? 0
+      const key = candle.centerX + ':' + Math.round(at / 60000)
+      const stack = [...used].filter((value) => value.startsWith(candle.centerX + ':')).length
+      used.add(key)
+      const y = Math.min(plot.top + plot.height - 2, candle.wickBottom + 7 + stack * 5)
+      flowMarks.push({
+        id: event.id,
+        at,
+        x: candle.centerX,
+        y,
+        tone: impact >= 0 ? 'up' : 'down',
+        whale: Math.abs(impact) >= 0.003,
+        impact
+      })
+    }
     const lineLabels = { base: '底价', entry: '入场', liquidation: '强平' }
     const lines = [
       { key: 'base', value: Number.isFinite(base) ? base : null },
@@ -1077,6 +1109,8 @@
       bars: scaled,
       forming,
       newsMarks,
+      flowEvents,
+      flowMarks,
       lines,
       priceLine: current === null ? null : { value: current.price, y: yOf(current.price) },
       grid: [plot.top, plot.top + plot.height / 2, plot.top + plot.height],
@@ -1443,14 +1477,40 @@
     const newsMore = totalNews > newsRows.length
       ? '还有 ' + (totalNews - newsRows.length) + ' 条，点开看'
       : ''
+    // 票 107：同一根上的资金流事件；最多 2 条。
+    const barStart = toNumber(nearest.start)
+    const barEnd = toNumber(nearest.end)
+    const barFlow = Array.isArray(geometry.flowEvents) && barStart !== null && barEnd !== null
+      ? geometry.flowEvents.filter((event) => {
+          const at = toNumber(event.at)
+          return at !== null && at >= barStart && at < barEnd
+        })
+      : []
+    const flowRows = barFlow.slice(0, 2).map((event) => {
+      const impact = toNumber(event.impact) ?? 0
+      return {
+        id: event.id,
+        tone: impact >= 0 ? 'up' : 'down',
+        icon: Math.abs(impact) >= 0.003 ? '◆' : '·',
+        // 影响放最前：便签只裁 24 字，`+0.30%` 必须一直看得见。
+        text: formatSignedMinus(impact * 100, 2) + '% · ' + (event.name ?? '邻居') + ' ' +
+          flowActionText(event) + ' ' + formatCoins(event.notional)
+      }
+    })
+    const flowMore = barFlow.length > flowRows.length
+      ? '还有 ' + (barFlow.length - flowRows.length) + ' 笔，点开看'
+      : ''
     const text = timeText + ' 开 ' + formatPrice(values.open) + ' 高 ' + formatPrice(values.high) +
       ' 低 ' + formatPrice(values.low) + ' 收 ' + formatPrice(values.close) +
-      (newsRows.length > 0 ? '；' + newsRows.map((row) => row.text).join('；') : '')
+      (newsRows.length > 0 ? '；' + newsRows.map((row) => row.text).join('；') : '') +
+      (flowRows.length > 0 ? '；' + flowRows.map((row) => row.text).join('；') : '')
     // 票 89：轴/便签字号提到 11px 后，便签要宽一点、高一点才不挤；仍整体夹在绘图区里。
     // 票 106：有消息时加高到 300×122 左右；无消息仍是 210×78。
     const cardWidth = Math.min(300, Math.max(210, plot.width - 8))
     const newsBlock = newsRows.length > 0 ? 14 + newsRows.length * 15 + (newsMore === '' ? 0 : 12) : 0
-    const cardHeight = Math.min(Math.max(40, plot.height - 8), 78 + newsBlock)
+    const flowBlock = flowRows.length > 0 ? 10 + flowRows.length * 15 + (flowMore === '' ? 0 : 12) : 0
+    const gap = newsBlock > 0 && flowBlock > 0 ? 4 : 0
+    const cardHeight = Math.min(Math.max(40, plot.height - 8), 78 + newsBlock + flowBlock + gap)
     // 便签放指针右上方；靠右就翻到左边，靠上就翻到下面，最后再整体夹进绘图区。
     let left = nearest.centerX + 12
     if (left + cardWidth > plot.left + plot.width - 4) left = nearest.centerX - cardWidth - 12
@@ -1471,6 +1531,8 @@
       rows,
       newsRows,
       newsMore,
+      flowRows,
+      flowMore,
       text,
       card: {
         left,
@@ -1481,7 +1543,10 @@
         rows,
         newsRows,
         newsMore,
+        flowRows,
+        flowMore,
         newsTop: top + 76,
+        flowTop: top + 76 + (newsBlock > 0 ? newsBlock - 14 + 6 : 0),
         newsLineHeight: 15,
         text
       },
@@ -1505,13 +1570,17 @@
       ? payload.news.items
       : []
     if (items.length === 0) {
+      const flow = flowView(payload)
       return {
         hasNews: false,
         id: null,
         at: null,
         tone: 'flat',
         title: '',
-        text: '今日暂无消息，行情照走'
+        text: '今日暂无消息，行情照走',
+        flowText: flow.hasFlow ? flow.chipText : '',
+        flowTone: flow.tone,
+        whaleCount: flow.whaleCount
       }
     }
     const stamp = toNumber(now)
@@ -1529,13 +1598,17 @@
     const mag = toNumber(item.mag) ?? 0
     const impact = item.tone === 'vol' ? '波动放大' : formatSigned(mag * 100, 1) + '%'
     const timeText = at === null ? '—' : formatClock(at)
+    const flow = flowView(payload)
     return {
       hasNews: true,
       id: item.id,
       at,
       tone: item.tone,
       title: item.title,
-      text: timeText + ' ' + item.title + ' · ' + impact
+      text: timeText + ' ' + item.title + ' · ' + impact,
+      flowText: flow.hasFlow ? flow.chipText : '',
+      flowTone: flow.tone,
+      whaleCount: flow.whaleCount
     }
   }
 
@@ -1612,6 +1685,7 @@
     const display = displayView({ chartType })
     const chart = chartOf(payload, selected, period)
     const current = chart !== null && isFormingBarLike(chart.current) ? chart.current : null
+    const flow = flowView(payload)
     const references = chartReferences(payload, selected, {
       withPosition: onContractBar,
       timeframe: period
@@ -1626,7 +1700,8 @@
         padding: CHART_AXIS_PADDING,
         timeframe: period,
         entry: references.entry,
-        liquidation: references.liquidation
+        liquidation: references.liquidation,
+        flowEvents: flow.events
       })
     const minute = tick === null ? null : Math.min(15, Math.floor(tick) + 1)
     const timeText = current === null ? '—' : timeLabelOf(period, current.start, current.end)
@@ -1641,6 +1716,8 @@
       timeframeLabel: label,
       timeframes: timeframesView(payload, period),
       hasChart: geometry !== null,
+      // 票 107：资金流胶囊/标记/便签行。
+      flow,
       // 票 106：快讯条 + 详情卡的数据（老宿主没有 news 时是空表）。
       ticker: tickerView(payload, now),
       news: payload !== null && typeof payload === 'object' && payload.news !== null && typeof payload.news === 'object'
@@ -1997,6 +2074,42 @@
    * 收益率是**比率**（0.035 = +3.5%，与 SPEC 的 `weekPnl / weekBase` 同口径），
    * 所以显示时乘 100；邻居没报就是 null → 「—」，不拿 0% 冒充。
    */
+  /** 票 107：资金流块的展示口径（水平/本根净流/事件/鲸鱼数）。 */
+  function flowView (payload) {
+    const raw = payload !== null && typeof payload === 'object' ? payload.flow : null
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
+    const level = source === null ? 0 : (toNumber(source.level) ?? 0)
+    const net = source === null ? 0 : (toNumber(source.net) ?? 0)
+    const events = source !== null && Array.isArray(source.events) ? source.events : []
+    const whales = events.filter((event) => event !== null && typeof event === 'object' &&
+      Math.abs(toNumber(event.impact) ?? 0) >= 0.003)
+    const levelText = formatSignedMinus(level * 100, 2) + '%'
+    const netText = formatSignedMinus(net * 100, 2) + '%'
+    const tone = level > 0.0005 ? 'up' : level < -0.0005 ? 'down' : 'flat'
+    return {
+      hasFlow: source !== null,
+      level,
+      net,
+      events,
+      whales,
+      whaleCount: whales.length,
+      levelText,
+      netText,
+      tone,
+      chipText: source === null ? '资金流 —' : '资金流 ' + levelText,
+      netChipText: '净流入 ' + netText
+    }
+  }
+
+  /** 资金流事件的动作文案：开多/开空/平多/平空；强平/止损说清楚是系统平。 */
+  function flowActionText (event) {
+    const side = event.side === 'long' ? '多' : '空'
+    if (event.reason === 'liquidate') return '被强平'
+    if (event.reason === 'stop') return '止损平'
+    if (event.action === 'open') return '开' + side
+    return '平' + side
+  }
+
   function leagueView (payload) {
     const safe = payload !== null && typeof payload === 'object' ? payload : null
     const league = safe !== null && safe.league !== null && typeof safe.league === 'object'
@@ -2069,6 +2182,7 @@
       reported: countOf(watchersRaw.reported)
     }
     const oldVersion = watchers.online > 0 && watchers.reported === 0
+    const flow = flowView(safe)
     return {
       rows,
       // 只有自己一行：窗口要在榜下面补一句「还没有邻居上线…行情照走」。
@@ -2080,7 +2194,13 @@
         short,
         // 全场一条仓位都没有 = 观望（SPEC：「没有仓位写观望」），不画「多 0 · 空 0」。
         text: long === 0 && short === 0 ? '观望' : '多 ' + long + ' · 空 ' + short,
-        tone: long === 0 && short === 0 ? 'flat' : long >= short ? 'long' : 'short'
+        tone: long === 0 && short === 0 ? 'flat' : long >= short ? 'long' : 'short',
+        ...(flow.hasFlow
+          ? {
+              flowText: '净流入 ' + flow.netText + (flow.whaleCount > 0 ? ' · 鲸 ' + flow.whaleCount : ''),
+              flowTone: flow.tone
+            }
+          : {})
       },
       empty: oldVersion
         ? '邻居是旧版本，还没有周报'
@@ -2260,6 +2380,7 @@
     chartAxes,
     priceTagOf,
     crosshairAt,
+    flowView,
     tickerView,
     calendarView,
     newsDetailView,

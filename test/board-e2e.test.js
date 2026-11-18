@@ -77,6 +77,8 @@ function makeService (t, dir, options = {}) {
     network: false,
     desktop: false,
     petBridge: false,
+    // 这些用例钉的是 v5 结算口径；B 期资金流另有专门用例。
+    tradingFlow: false,
     ...options
   })
   service.routes = routes

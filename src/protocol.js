@@ -32,6 +32,7 @@ import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 // 票 101：盘上遗留的 20× 仓位仍要能被读回来（周报/排行榜要显示它们），
 // 所以协议层用 `isStoredLeverage`（1..20），下单白名单仍然是 1×/5×。
 import { isBoardCrop, isBoardSide, isStoredLeverage } from './trading-rules.js'
+import { normalizeFlowEvent } from './board-flow.js'
 // 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
 // 票 95：指令种类（含 `place`）同样只认规则层那一份，协议层 re-export。
 import {
@@ -377,7 +378,10 @@ export const PACKET_TYPES = Object.freeze([
   'futures-settle',
   'futures-sync',
   // 1.10.0：账户自己的档位申报（peer → 房主）。
-  'futures-mode'
+  'futures-mode',
+  // 票 107：盘口 LAN 资金流。老版本按「未知类型」整包丢掉，不崩。
+  'board-flow',
+  'board-flow-sync'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -1106,6 +1110,10 @@ function buildPacket ({
   // 票 59：作物目录与它的指纹
   crops,
   catalogHash,
+  // 票 107：资金流事件与同步起点
+  events,
+  since,
+  sync,
   chunk,
   total,
   entries,
@@ -1197,6 +1205,26 @@ function buildPacket ({
       ...(safePct === null ? {} : { weekPnlPct: safePct }),
       positions: safePositions
     }
+  } else if (type === 'board-flow') {
+    const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
+    if (stamp === null) throw new Error('protocol: invalid board flow time')
+    const list = Array.isArray(events) ? events.slice(0, 16) : []
+    const safe = []
+    for (const candidate of list) {
+      const event = normalizeFlowEvent(candidate)
+      if (event === null) continue
+      // 事件里的 deviceId 一律盖成包上的发送端：伪造别人的流水没有意义。
+      safe.push({ ...event, deviceId: deviceId.toLowerCase() })
+    }
+    packet = { ...base, at: stamp, events: safe, sync: sync === true }
+  } else if (type === 'board-flow-sync') {
+    const stamp = at === undefined ? normalizeDigestAt(now) : normalizeDigestAt(at)
+    if (stamp === null) throw new Error('protocol: invalid board flow sync time')
+    const start = Number(since)
+    if (!Number.isFinite(start) || start < 0 || start > stamp + 5 * 60 * 1000) {
+      throw new Error('protocol: invalid board flow since')
+    }
+    packet = { ...base, at: stamp, since: Math.floor(start) }
   } else if (type === 'farm-action') {
     // 自己的分支，绝不并进 VISIT_TYPES：那条只写四个字段，requestId/action/plotId 会消失。
     if (!isVisitId(visitId)) throw new Error('protocol: invalid visitId')
@@ -1631,6 +1659,20 @@ export function encodeTradingDigest ({ deviceId, at, weekPnl, weekPnlPct, positi
 }
 
 /**
+ * 盘口资金流（票 107）：peer 把自己/收到的流水广播给邻居。
+ * 一包最多 16 条；事件只带 `id/at/crop/action/side/reason/notional/source`，
+ * 冲击由接收端按同一套 `board-flow.js` 现算，不信发送端的 `u`。
+ */
+export function encodeBoardFlow ({ deviceId, at, events, sync = false, now } = {}) {
+  return encodePacket({ type: 'board-flow', deviceId, at, events, sync, now })
+}
+
+/** 要一段流水：`since` 之后的事件，房主/邻居用 `board-flow` 回。 */
+export function encodeBoardFlowSync ({ deviceId, at, since, now } = {}) {
+  return encodePacket({ type: 'board-flow-sync', deviceId, at, since, now })
+}
+
+/**
  * 期货五包（票 94）的窄入口：全部只带账户字段——没有昵称、端口、坐标、自由文本。
  * 编码失败抛异常（本机程序错误）；解析失败返回 `{ok:false, reason}`（网络输入）。
  */
@@ -1999,6 +2041,46 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         weekPnl,
         ...(weekPnlPct === null ? {} : { weekPnlPct }),
         positions
+      }
+    }
+  }
+
+  // 票 107：LAN 资金流。事件里的 deviceId 一律盖成包上的发送端；坏一条丢一条。
+  if (raw.type === 'board-flow') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!Array.isArray(raw.events)) return fail('events')
+    const events = []
+    for (const candidate of raw.events.slice(0, 16)) {
+      const event = normalizeFlowEvent(candidate)
+      if (event === null) continue
+      events.push({ ...event, deviceId: raw.deviceId.toLowerCase() })
+    }
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        events,
+        sync: raw.sync === true
+      }
+    }
+  }
+  if (raw.type === 'board-flow-sync') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    const since = Number(raw.since)
+    if (!Number.isFinite(since) || since < 0 || since > at + 5 * 60 * 1000) return fail('since')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        since: Math.floor(since)
       }
     }
   }

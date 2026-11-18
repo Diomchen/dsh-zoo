@@ -2033,6 +2033,40 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return news
   }
 
+  /** 票 107：资金流事件（窗口只读）；坏一条丢一条。 */
+  function normalizeBoardFlowEvent (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const at = normalizeBoardInt(raw.at, 0, Number.MAX_SAFE_INTEGER)
+    const notional = normalizeBoardInt(raw.notional, 0, 10_000_000)
+    const impact = normalizeBoardNumber(raw.impact, -1, 1)
+    if (at === null || notional === null || impact === null) return null
+    const deviceId = normalizeText(raw.deviceId, '', 64)
+    const name = normalizeText(raw.name, '邻居', 24)
+    const action = raw.action === 'open' || raw.action === 'close' ? raw.action : null
+    const side = raw.side === 'long' || raw.side === 'short' ? raw.side : null
+    if (action === null || side === null) return null
+    const reason = ['manual', 'settle', 'liquidate', 'stop'].includes(raw.reason) ? raw.reason : 'manual'
+    const source = ['board', 'futures', 'farm'].includes(raw.source) ? raw.source : 'board'
+    const id = normalizeText(raw.id, '', 128)
+    return { id, at, deviceId, name, action, side, reason, notional, impact, source }
+  }
+
+  /** 票 107：资金流块 `{ level, net, events }`；老宿主没有就返回空块。 */
+  function normalizeBoardFlow (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const events = []
+    for (const candidate of Array.isArray(source.events) ? source.events : []) {
+      if (events.length >= BOARD_MAX_NEWS_ITEMS) break
+      const event = normalizeBoardFlowEvent(candidate)
+      if (event !== null) events.push(event)
+    }
+    return {
+      level: normalizeBoardNumber(source.level, -1, 1) ?? 0,
+      net: normalizeBoardNumber(source.net, -1, 1) ?? 0,
+      events
+    }
+  }
+
   /** 窗口顶层的消息全文 + 今日日程（票 105）。老宿主没有这一块时是空表。 */
   function normalizeBoardNews (raw) {
     const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
@@ -2345,6 +2379,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         const news = normalizeBoardNews(raw.news)
         return news.items.length === 0 && news.calendar.length === 0 ? {} : { news }
       })(),
+      // 票 107：资金流块；老宿主/没有流水时不带这个键。
+      ...(raw.flow !== null && typeof raw.flow === 'object' && !Array.isArray(raw.flow)
+        ? { flow: normalizeBoardFlow(raw.flow) }
+        : {}),
       bar: barRaw === null
         ? null
         : {
@@ -3932,6 +3970,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
             // 票 105：按需拉图时把这一种作物的消息面一起带回来。
             const news = normalizeBoardNews(raw.news)
             if (news.items.length > 0 || news.calendar.length > 0) command.news = news
+            if (raw.flow !== null && typeof raw.flow === 'object' && !Array.isArray(raw.flow)) {
+              command.flow = normalizeBoardFlow(raw.flow)
+            }
           }
         }
         return { ok: true, command }

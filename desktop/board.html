@@ -745,6 +745,18 @@
         white-space: nowrap;
         font-weight: 600;
       }
+      .chart-ticker .ticker-flow {
+        flex: none;
+        margin-left: auto;
+        padding-left: 8px;
+        border-left: 1px solid var(--line-strong);
+        color: var(--ink-soft);
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .chart-ticker .ticker-flow[data-tone='up'] { color: var(--emerald-deep); }
+      .chart-ticker .ticker-flow[data-tone='down'] { color: var(--rose-ink); }
       .chart-ticker .ticker-dot {
         flex: none;
         width: 5px;
@@ -775,6 +787,21 @@
       .chart-svg .news-ring.up { stroke: var(--emerald-deep); }
       .chart-svg .news-ring.down { stroke: var(--rose-ink); }
       .chart-svg .news-ring.vol { stroke: var(--amber-ink); }
+      /* 票 107：资金流标记画在 K 线下方；鲸鱼单多一圈。 */
+      .chart-svg .flow-dot {
+        stroke: #fffdf8;
+        stroke-width: 1;
+        pointer-events: none;
+      }
+      .chart-svg .flow-dot.up { fill: var(--emerald); }
+      .chart-svg .flow-dot.down { fill: var(--rose); }
+      .chart-svg .flow-ring {
+        fill: none;
+        stroke-width: 1.2;
+        pointer-events: none;
+      }
+      .chart-svg .flow-ring.up { stroke: var(--emerald-deep); }
+      .chart-svg .flow-ring.down { stroke: var(--rose-ink); }
       /* 消息详情：图内浮层，不新开窗；外点 / Esc / × 关闭。 */
       .news-pop {
         position: absolute;
@@ -1064,6 +1091,20 @@
         fill: var(--ink-soft);
       }
       .chart-svg .crosshair-news-more {
+        font-size: 11px;
+        fill: var(--muted);
+      }
+      .chart-svg .crosshair-flow-icon {
+        font-size: 11px;
+        font-weight: 800;
+      }
+      .chart-svg .crosshair-flow-icon.up { fill: var(--emerald-deep); }
+      .chart-svg .crosshair-flow-icon.down { fill: var(--rose-ink); }
+      .chart-svg .crosshair-flow-text {
+        font-size: 11px;
+        fill: var(--ink-soft);
+      }
+      .chart-svg .crosshair-flow-more {
         font-size: 11px;
         fill: var(--muted);
       }
@@ -1603,6 +1644,13 @@
       .sentiment b[data-tone='short'] {
         color: var(--rose-ink);
       }
+      .sentiment small {
+        font-size: 12px;
+        font-weight: 600;
+        opacity: 0.85;
+      }
+      .sentiment small[data-tone='up'] { color: var(--emerald-deep); }
+      .sentiment small[data-tone='down'] { color: var(--rose-ink); }
       /* 票 101：杠杆 chip 后面那颗静态说明（手续费），和 chip 同高、不占鼠标焦点。 */
       .chip-note {
         align-self: center;
@@ -1953,6 +2001,7 @@
             <span class="ticker-dot" aria-hidden="true"></span>
             <span class="ticker-label">快讯</span>
             <span class="ticker-text" id="ticker-text">今日暂无消息，行情照走</span>
+            <span class="ticker-flow" id="ticker-flow" hidden></span>
           </button>
           <svg
             class="chart-svg"

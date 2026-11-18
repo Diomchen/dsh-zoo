@@ -386,6 +386,38 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
         y: 2,
         coordinates: { x: 3, y: 4 }
       }
+    } else if (type === 'board-flow') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        at: 1700000000000,
+        events: [{
+          id: 'flow:1',
+          deviceId,
+          at: 1700000000000,
+          crop: 'tomato',
+          action: 'open',
+          side: 'long',
+          reason: 'manual',
+          notional: 500,
+          source: 'board'
+        }],
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
+    } else if (type === 'board-flow-sync') {
+      raw = {
+        v: PROTOCOL_VERSION,
+        type,
+        deviceId,
+        at: 1700000000000,
+        since: 1699990000000,
+        x: 1,
+        y: 2,
+        coordinates: { x: 3, y: 4 }
+      }
     } else if (type.startsWith('futures-')) {
       raw = { ...futuresPayload(type, deviceId), x: 1, y: 2, coordinates: { x: 3, y: 4 } }
     } else if (type.startsWith('work-')) {
@@ -428,6 +460,10 @@ test('任何报文都不含坐标字段（包括串门报文）', () => {
                 ? ['v', 'type', 'deviceId', 'at', 'prices', 'hire']
                 : type === 'trading-digest'
                   ? ['v', 'type', 'deviceId', 'at', 'weekPnl', 'positions']
+                : type === 'board-flow'
+                  ? ['v', 'type', 'deviceId', 'at', 'events', 'sync']
+                  : type === 'board-flow-sync'
+                    ? ['v', 'type', 'deviceId', 'at', 'since']
                 : type === 'farm-action'
                   ? ['v', 'type', 'deviceId', 'visitId', 'requestId', 'action', 'plotId']
                   : type === 'farm-action-result'
@@ -761,7 +797,10 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'futures-settle',
     'futures-sync',
     // 1.10.0：账户自己申报档位（真钱/纸面），房主据此记账
-    'futures-mode'
+    'futures-mode',
+    // 票 107：盘口 LAN 资金流与同步请求
+    'board-flow',
+    'board-flow-sync'
   ])
 })
 

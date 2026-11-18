@@ -20,7 +20,7 @@ import { FARM_FILE } from '../src/farm.js'
 import { MAX_WEEK_PNL, MAX_WEEK_PNL_PCT } from '../src/protocol.js'
 import { createService } from '../src/service.js'
 import { TRADING_FILE } from '../src/trading.js'
-import { slotIndexAt, weekStartOf } from '../src/trading-rules.js'
+import { markPrice, slotIndexAt, weekStartOf } from '../src/trading-rules.js'
 
 function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -68,6 +68,8 @@ function makeService (t, options = {}) {
     petBridge: false,
     skinServer: false,
     desktop: false,
+    // 这些用例钉的是 v5 结算口径；B 期资金流另有专门用例。
+    tradingFlow: false,
     ...options
   })
   service.routes = routes
@@ -400,4 +402,47 @@ test('票 82（评审 P2）：3 分钟前的周报被盘口新鲜度门丢掉，
   await delay(150)
   assert.equal(b.sendTo(aId, rawDigest(bId, { weekPnl: 888 })), true)
   await waitFor(() => peerRow(a, bId).weekPnl === 888)
+})
+
+test('票 107 e2e：B 开仓 → 资金流广播到 A，A 的 /state 带 level/事件/名字', async (t) => {
+  const desktop = desktopDouble()
+  const { a, b, bId } = await connectedPair(t, {
+    b: { tradingFlow: true },
+    a: {
+      tradingFlow: true,
+      desktop: true,
+      desktopFactory: desktop.factory
+    }
+  })
+  const selfCrop = a.snapshot().trading.limits.crops[0].id
+  const opened = await callAction(b, {
+    action: 'trading-open-position',
+    cropId: selfCrop,
+    side: 'long',
+    margin: 100,
+    leverage: 5
+  })
+  assert.equal(opened.body.ok, true)
+  assert.equal(opened.body.flow.recorded, true)
+  assert.match(opened.body.notice, /把行情推了 \+0\.30%/)
+
+  await waitFor(() => {
+    const flow = a.snapshot().trading.flow
+    return flow !== undefined && Array.isArray(flow.events) && flow.events.length > 0
+  })
+  const flow = a.snapshot().trading.flow
+  assert.ok(Math.abs(flow.level - 0.003) < 1e-9)
+  assert.equal(flow.events[0].deviceId, bId)
+  assert.equal(flow.events[0].action, 'open')
+  assert.equal(flow.events[0].side, 'long')
+  assert.equal(flow.events[0].notional, 500)
+  assert.ok(Math.abs(flow.events[0].impact - 0.003) < 1e-9)
+  assert.equal(typeof flow.events[0].name, 'string')
+  assert.notEqual(flow.events[0].name, '邻居', 'A 应该知道 B 的名字')
+
+  // A 的图也跟着资金流走：同一分钟的价格应比「没有资金流」的纯行情高约 exp(0.003)。
+  const state = a.snapshot().trading
+  const pure = markPrice({ crop: selfCrop, now: Date.now() })
+  assert.ok(state.bar.price > pure * 1.002, 'A 的 bar 价格应包含资金流：' + state.bar.price + ' vs ' + pure)
+  assert.ok(state.timeframes['15m'][selfCrop].current.price > pure * 1.002)
 })

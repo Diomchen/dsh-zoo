@@ -53,6 +53,7 @@ const chartSettleHintEl = document.getElementById('chart-settle-hint')
 const slotNoteEl = document.getElementById('slot-note')
 const tickerEl = document.getElementById('ticker')
 const tickerTextEl = document.getElementById('ticker-text')
+const tickerFlowEl = document.getElementById('ticker-flow')
 const newsPopEl = document.getElementById('news-pop')
 const newsPopTimeEl = document.getElementById('news-pop-time')
 const newsPopTitleEl = document.getElementById('news-pop-title')
@@ -347,6 +348,37 @@ function paintCrosshair (hit) {
       }))
     }
   }
+  if (Array.isArray(card.flowRows) && card.flowRows.length > 0) {
+    const ruleY = card.flowTop - 9
+    group.append(svgEl('line', {
+      class: 'crosshair-rule',
+      x1: card.left + 9,
+      x2: card.left + card.width - 9,
+      y1: ruleY,
+      y2: ruleY
+    }))
+    for (let index = 0; index < card.flowRows.length; index += 1) {
+      const row = card.flowRows[index]
+      const y = card.flowTop + index * card.newsLineHeight
+      group.append(svgText(row.icon, {
+        class: 'crosshair-flow-icon ' + row.tone,
+        x: card.left + 9,
+        y
+      }))
+      group.append(svgText(clipText(row.text, 24), {
+        class: 'crosshair-flow-text',
+        x: card.left + 20,
+        y
+      }))
+    }
+    if (card.flowMore) {
+      group.append(svgText(clipText(card.flowMore, 24), {
+        class: 'crosshair-flow-more',
+        x: card.left + 20,
+        y: card.flowTop + card.flowRows.length * card.newsLineHeight + 4
+      }))
+    }
+  }
   chartEl.append(group)
 }
 
@@ -412,7 +444,10 @@ function renderChart (board) {
   tickerEl.dataset.tone = ticker.tone
   tickerEl.dataset.hasNews = ticker.hasNews ? 'true' : 'false'
   tickerTextEl.textContent = ticker.text
-  tickerEl.title = ticker.text
+  tickerFlowEl.textContent = ticker.flowText ?? ''
+  tickerFlowEl.hidden = !(ticker.flowText)
+  tickerFlowEl.dataset.tone = ticker.flowTone ?? 'flat'
+  tickerEl.title = ticker.text + (ticker.flowText ? ' · ' + ticker.flowText : '')
   tickerEl.setAttribute('aria-label', '快讯：' + ticker.text)
   // 票 89：没有独立的图例行；底价/入场/强平在图的右端各有标签，少一行小字。
   updateCropArrows()
@@ -698,6 +733,28 @@ function renderChart (board) {
       }
     }
     crisp.append(newsLayer)
+  }
+  if (Array.isArray(geometry.flowMarks) && geometry.flowMarks.length > 0) {
+    const flowLayer = svgEl('g', { class: 'chart-flow' })
+    for (const mark of geometry.flowMarks) {
+      flowLayer.append(svgEl('circle', {
+        class: 'flow-dot ' + mark.tone,
+        cx: mark.x,
+        cy: mark.y,
+        r: mark.whale ? 3.2 : 2,
+        'vector-effect': 'non-scaling-stroke'
+      }))
+      if (mark.whale) {
+        flowLayer.append(svgEl('circle', {
+          class: 'flow-ring ' + mark.tone,
+          cx: mark.x,
+          cy: mark.y,
+          r: 5,
+          'vector-effect': 'non-scaling-stroke'
+        }))
+      }
+    }
+    crisp.append(flowLayer)
   }
   ink.append(ticksInk)
   chartEl.append(crisp)
@@ -1010,6 +1067,12 @@ function renderLeague (board) {
   }
   // 票 89：卡片头只留「情绪 观望」；「1 人」这种计数不再挤在标题行。
   sentimentEl.textContent = league.sentiment.text
+  if (league.sentiment.flowText) {
+    const flowNote = document.createElement('small')
+    flowNote.textContent = ' · ' + league.sentiment.flowText
+    flowNote.dataset.tone = league.sentiment.flowTone ?? 'flat'
+    sentimentEl.append(flowNote)
+  }
   sentimentEl.dataset.tone = league.sentiment.tone
   // 只有自己：榜照画（自己那行），下面补一句「等邻居上线」。
   neighborEmptyEl.hidden = league.hasPeers
@@ -1622,7 +1685,12 @@ api?.onResult((result) => {
     const cropId = typeof result.crop === 'string' ? result.crop : null
     if (result.ok === true && cropId !== null &&
       result.timeframes !== null && typeof result.timeframes === 'object') {
-      chartCache.set(cropId, { timeframes: result.timeframes, hint: result.hint ?? null, news: result.news ?? null })
+      chartCache.set(cropId, {
+        timeframes: result.timeframes,
+        hint: result.hint ?? null,
+        news: result.news ?? null,
+        flow: result.flow ?? null
+      })
       chartsFailed = null
     } else {
       // 这一种拉不到（坏作物/超时）：先退出加载态，别让风扇一直转；用户再点一下可以重试。
