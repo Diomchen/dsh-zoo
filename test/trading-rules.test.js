@@ -219,13 +219,13 @@ test('票 79：本周起点是本地周一 00:00（周一自己、周日深夜�
   assert.equal(weekStartOf('nope'), null)
 })
 
-test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物、多空；止损四档含 0=关', () => {
+test('票 80/81/83：下单白名单是 1×/5×/20×/50×/100×、50/100/250、目录作物、多空；止损四档含 0=关', () => {
   // 票 88 起盘口的作物清单跟随运行时目录：顺序就是窗口页签的顺序，
   // 目录里第一个（tomato 仍在首位）是 payload.bar 的来源。
   assert.deepEqual(boardCrops(), CROP_IDS)
   // 票 83：三档预设 + 窗口的「全下」；保证金规则本身接受任意整数（见下一条）。
   assert.deepEqual(TRADING_MARGINS, [50, 100, 250])
-  assert.deepEqual(TRADING_LEVERAGES, [1, 5])
+  assert.deepEqual(TRADING_LEVERAGES, [1, 5, 20, 50, 100])
   assert.deepEqual(BOARD_SIDES, ['long', 'short'])
   // 结算原因固定四种：手动 / 收盘 / 强平 / 止损（历史行就按这个写）。
   assert.deepEqual(TRADING_CLOSE_REASONS, ['close', 'settle', 'liquidate', 'stop'])
@@ -250,9 +250,12 @@ test('票 80/81/83：下单白名单是 1×/5×/20×、50/100/250、目录作物
   assert.equal(isMarginAmount('50'), false)
   assert.equal(isTradingLeverage(1), true)
   assert.equal(isTradingLeverage(5), true)
-  // 票 101：20× 从下单白名单拿掉了，老仓位仍要能读回来（见下一条）。
-  assert.equal(isTradingLeverage(20), false)
-  assert.equal(isTradingLeverage(2), false)
+  assert.equal(isTradingLeverage(20), true)
+  assert.equal(isTradingLeverage(50), true)
+  assert.equal(isTradingLeverage(100), true)
+  // 10×/101× 不在白名单；字符串不接受。
+  assert.equal(isTradingLeverage(10), false)
+  assert.equal(isTradingLeverage(101), false)
   assert.equal(isTradingLeverage('5'), false)
   assert.equal(isStopLossLevel(0), true)
   assert.equal(isStopLossLevel(0.25), true)
@@ -335,6 +338,11 @@ test('票 101：强平价 = 维持保证金 5%（0.95/杠杆）；做多往下�
   // 老仓位的 20× 仍按同一条公式算：8 × 0.9525。
   assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 20 }), 8 * 0.9525)
   assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 20 }), 8 * 1.0475)
+  // 50×/100× 的强平线分别只留 1.9%/0.95% 的逆行。
+  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 50 }), 8 * 0.981)
+  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 50 }), 8 * 1.019)
+  assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 100 }), 8 * 0.9905)
+  assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 100 }), 8 * 1.0095)
   // 1× 要跌到 0 才亏光，而价格有底价：没有强平线，窗口画「—」。
   assert.equal(liquidationPriceOf({ side: 'long', entry: 8, leverage: 1 }), null)
   assert.equal(liquidationPriceOf({ side: 'short', entry: 8, leverage: 1 }), null)

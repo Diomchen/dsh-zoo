@@ -103,6 +103,7 @@ test('票 107：K 线下方画资金流点；鲸鱼单多一圈', () => {
   assert.equal(mark.whale, true)
   assert.ok(mark.x >= geometry.plot.left && mark.x <= geometry.plot.left + geometry.plot.width)
   assert.ok(mark.y >= geometry.plot.top && mark.y <= geometry.plot.top + geometry.plot.height)
+  assert.ok(mark.stemTop >= geometry.plot.top && mark.stemTop <= geometry.plot.top + geometry.plot.height)
 
   const quiet = view.chartGeometry(payloadOf().charts.tomato, {
     width: 720,
@@ -178,6 +179,9 @@ test('票 107：盘口窗有资金流胶囊、标记层与便签行 DOM', async 
   assert.match(html, /id="ticker-flow"/)
   assert.match(html, /\.chart-svg \.flow-dot/)
   assert.match(html, /\.chart-svg \.flow-ring/)
+  assert.match(html, /\.chart-svg \.flow-stem/)
+  assert.match(html, /\.chart-ticker \.ticker-whale/)
+  assert.match(html, /\.sentiment \.sentiment-flow/)
   assert.match(html, /\.chart-svg \.crosshair-flow-text/)
   const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
   assert.match(script, /geometry\.flowMarks/)

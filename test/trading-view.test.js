@@ -42,7 +42,8 @@ const TF_SPAN = { '1h': HOUR_MS, '1d': 24 * HOUR_MS, '1w': 7 * 24 * HOUR_MS }
 
 const LIMITS = {
   margins: [50, 100, 250],
-  leverages: [1, 5],
+  leverages: [1, 5, 20, 50, 100],
+  feeRate: 0.002,
   crops: [
     { id: 'tomato', name: '小番茄' },
     { id: 'carrot', name: '胡萝卜' },
@@ -314,12 +315,22 @@ test('票 81：下单区有三档杠杆（来自 payload）、预览句与作物
   assert.equal(order.margins[1].active, true)
   assert.equal(order.margins[3].allIn, true)
   assert.equal(order.margins[3].disabled, false)
-  assert.deepEqual(order.leverages.map((choice) => choice.leverage), [1, 5])
+  assert.deepEqual(order.leverages.map((choice) => choice.leverage), [1, 5, 20, 50, 100])
   assert.equal(order.leverages[1].active, true)
+  assert.equal(order.feeText, '开平各 0.2%')
   // 白名单之外的方向/保证金/杠杆回到默认值。
   assert.equal(view.orderView(payload(), { side: 'up', margin: 7, leverage: 3 }).side, 'long')
   assert.equal(view.orderView(payload(), { side: 'long', margin: 7 }).margin, 50)
   assert.equal(view.orderView(payload(), { side: 'long', leverage: 3 }).leverage, 1)
+})
+
+test('2026-11-18：杠杆档位驱动边框特效（1× 安静 / 5× 青风 / 20× 警戒 / 50× 紫电 / 100× 极限）', () => {
+  assert.equal(view.leverageTierOf(1), 'calm')
+  assert.equal(view.leverageTierOf(5), 'mid')
+  assert.equal(view.leverageTierOf(20), 'high')
+  assert.equal(view.leverageTierOf(50), 'ultra')
+  assert.equal(view.leverageTierOf(100), 'extreme')
+  assert.equal(view.leverageTierOf(101), 'extreme')
 })
 
 test('票 81：预览句 1× 的强平是「—」；涨跌 1% 的数与 pnlOf 在 ±1% 上一致', () => {
@@ -329,12 +340,16 @@ test('票 81：预览句 1× 的强平是「—」；涨跌 1% 的数与 pnlOf �
     '1× · 50 保证金：涨 1% = +0.5；跌 1% = −0.5；强平 —')
   assert.equal(view.previewView({ margin: 100, leverage: 20 }).text,
     '20× · 100 保证金：涨 1% = +20；跌 1% = −20；强平 −100')
+  assert.equal(view.previewView({ margin: 100, leverage: 50 }).text,
+    '50× · 100 保证金：涨 1% = +50；跌 1% = −50；强平 −100')
+  assert.equal(view.previewView({ margin: 100, leverage: 100 }).text,
+    '100× · 100 保证金：涨 1% = +100；跌 1% = −100；强平 −100')
   assert.equal(view.previewView({ margin: 100, leverage: 5 }).liquidationLoss, 100)
   assert.equal(view.previewView({ margin: 50, leverage: 1 }).liquidationLoss, null)
 
   // 漂移：预览里的「涨 1%」必须等于纯规则 pnlOf 在 +1% 上的结果（反过来也是）。
   for (const margin of [50, 100]) {
-    for (const leverage of [1, 5, 20]) {
+    for (const leverage of [1, 5, 20, 50, 100]) {
       const predicted = view.previewView({ margin, leverage }).perPercent
       const plusOne = pnlOf({ side: 'long', margin, leverage, entry: 100, mark: 101 })
       const minusOne = pnlOf({ side: 'long', margin, leverage, entry: 100, mark: 99 })
@@ -351,8 +366,8 @@ test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式�
     current: { slot: SLOT, open: 100, high: 100, low: 100, price: 100, tick: 0, remainingMs: 1 }
   })
   for (const side of ['long', 'short']) {
-    // 票 101：白名单只剩 1×/5×，20× 不再作为可下单杠杆参与对拍。
-    for (const leverage of [5]) {
+    // 白名单 1×/5×/20×/100×；每一档的强平价都必须和宿主同一条公式。
+    for (const leverage of [5, 20, 100]) {
       const order = view.orderView(at, { side, leverage, margin: 50 })
       assert.equal(
         order.liquidationPrice,
@@ -364,8 +379,8 @@ test('术语 US7/票 81：强平价与宿主 liquidationPriceOf 同一条公式�
         (side === 'long' ? '跌到就平' : '涨到就平'))
     }
   }
-  // 白名单之外的杠杆（老窗口传 20×）回落到 1×，于是没有强平线。
-  assert.equal(view.orderView(at, { leverage: 20, margin: 50 }).leverage, 1)
+  // 白名单之外的杠杆（老窗口传 10×）回落到 1×，于是没有强平线。
+  assert.equal(view.orderView(at, { leverage: 10, margin: 50 }).leverage, 1)
   // 1× 没有强平线：数字是 null，文案是「强平价 —」（SPEC v10 US7）。
   const oneX = view.orderView(at, { leverage: 1, margin: 50 })
   assert.equal(oneX.liquidationPrice, null)
@@ -816,7 +831,7 @@ test('票 91：版面常量是「作物条 40 / 图 268 / 下单横条 104 / 底
   assert.equal(view.LAYOUT.orderBar.submitHeight, 36)
   assert.equal(view.LAYOUT.orderBar.gap, 10)
   assert.equal(view.LAYOUT.orderBar.marginColumns, 4)
-  assert.equal(view.LAYOUT.orderBar.leverageColumns, 3)
+  assert.equal(view.LAYOUT.orderBar.leverageColumns, 5)
   assert.equal(view.LAYOUT.bottom.rightWidth, 300)
   assert.equal(view.LAYOUT.bottom.historyHeight, 88)
   // 760×700 的高度预算必须刚好用完：app 边框 4 + 顶栏 50 + body 上下 padding 14 +
@@ -991,14 +1006,32 @@ test('票 89：跌蜡烛空心——视图给 hollow、DOM 写 data-hollow、CSS
   assert.match(html, /stroke: var\(--rose\)/)
 })
 
-test('票 91：下单横条两排、4/3 档、没有滚动容器；11px 只留给图轴', async () => {
+test('2026-11-18：切到 100× 弹出漫画气泡「老实赚钱，很枯燥吧。」', async () => {
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /id="leverage-quip"/)
+  assert.match(html, /老实赚钱，很枯燥吧。/)
+  assert.match(html, /id="leverage-quip-close"/)
+  assert.match(html, /@keyframes quip-pop/)
+  assert.match(html, /\.leverage-quip:not\(\[hidden\]\)[\s\S]*?animation: quip-pop/)
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /showLeverageQuip/)
+  assert.match(script, /lastLeverage/)
+  assert.match(script, /chosen === 100/)
+})
+
+test('票 91：下单横条两排、4/5 档、没有滚动容器；11px 只留给图轴', async () => {
   const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
   // 票 91：整宽横条里的两排，不再是 300px 窄列里的三行 label+控件。
   assert.match(html, /class="order-row order-row-primary"/)
   assert.match(html, /class="order-row order-row-secondary"/)
   assert.doesNotMatch(html, /\.field-row \{/)
   assert.match(html, /\.order-row \.chip-row\.margins \{[\s\S]*?repeat\(4, 42px\)/)
-  assert.match(html, /\.order-row \.chip-row\.leverages \{[\s\S]*?repeat\(2, 42px\)/)
+  assert.match(html, /\.order-row \.chip-row\.leverages \{[\s\S]*?repeat\(5, 32px\)/)
+  // 100× 的旋转边框在「选择杠杆」的选中 chip 上，reduced-motion 关断。
+  assert.match(html, /data-leverage-tier='extreme'[\s\S]*?\.chip-row\.leverages[\s\S]*?conic-gradient/)
+  assert.match(html, /@keyframes leverage-chip-spin/)
+  assert.match(html, /\.chip-row\.leverages \.chip\[aria-pressed='true'\]::before/)
+  assert.match(html, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?animation: none/)
   // 同一组内相邻点击目标 ≥8px；组与组之间 ≥10px。
   assert.match(html, /\.order-row \.chip-row \{[\s\S]*?gap: 8px/)
   assert.match(html, /\.order-row \{[\s\S]*?gap: 10px/)
@@ -1173,7 +1206,7 @@ test('票 79：空态与坏输入都不抛——没有盘口数据时也能画�
     assert.equal(board.league.hasPeers, false)
     assert.equal(board.hints.neighbors, '等邻居上线')
   }
-  // 老 payload 没有 limits.leverages：杠杆退回 1×（票 101 之后宿主只下发 [1,5]）。
+  // 老 payload 没有 limits.leverages：杠杆退回 1×（当前宿主下发 [1,5,20,100]）。
   const legacy = view.orderView({ coins: { available: 120 } })
   assert.deepEqual(legacy.leverages.map((choice) => choice.leverage), [1])
   assert.equal(legacy.leverage, 1)
@@ -1282,7 +1315,7 @@ test('票 81/评审 P2：Tab 顺序是纯函数——× → 页签 → 下单区
     'ticker',
     'side:long', 'side:short',
     'margin:50', 'margin:100', 'margin:250', 'margin:all-in',
-    'leverage:1', 'leverage:5',
+    'leverage:1', 'leverage:5', 'leverage:20', 'leverage:50', 'leverage:100',
     'limit-toggle', 'limit-input', 'limit-place', 'submit',
     'cancel:' + ORDER_ID,
     'stop:p1', 'close:p1'

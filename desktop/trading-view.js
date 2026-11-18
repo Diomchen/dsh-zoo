@@ -114,7 +114,7 @@
       gap: ORDER_BAR_GAP,
       rows: 2,
       marginColumns: 4,
-      leverageColumns: 3
+      leverageColumns: 5
     }),
     bottom: Object.freeze({
       // 右列只剩周榜，宽度仍是 300（真人周榜的盈亏/收益率按它排）。
@@ -147,6 +147,8 @@
     // 老宿主没有周期清单：只有 15 分一档（它的图就是 `payload.charts`）。
     timeframes: Object.freeze([Object.freeze({ id: '15m', label: '15分' })]),
     historyLimit: 50,
+    // 老宿主没有手续费率：显示 0%（宁可写 0，不凭空编一个 0.2%）。
+    feeRate: 0,
     // 老宿主没有「全下」，也没有目标价带；窗口就不画这两样（照样能开仓）。
     allIn: false,
     targetRatio: null
@@ -418,6 +420,8 @@
       // 票 84：周期页签的顺序与文案全由宿主下发（唯一来源在 `src/trading-rules.js`），
       // 窗口不硬编码「15分/1时/1日/1周」；坏包退回只有 15 分一档。
       timeframes: timeframeEntriesOf(limits.timeframes),
+      // 票 101：手续费率也随包下发；之前漏了这个字段，窗口永远显示「开平各 0%」。
+      feeRate: toNumber(limits.feeRate) ?? FALLBACK_LIMITS.feeRate,
       historyLimit: Number.isInteger(limits.historyLimit) ? limits.historyLimit : FALLBACK_LIMITS.historyLimit,
       // 旧宿主没有这两个字段：不画「全下」、不显示目标价带（宿主照样会校验/拒绝）。
       allIn: limits.allIn === true,
@@ -1064,6 +1068,8 @@
         at,
         x: candle.centerX,
         y,
+        // 虚线短杆把点和 K 线的最低点连起来；线图/蜡烛图都不会悬空。
+        stemTop: Math.min(plot.top + plot.height - 2, candle.wickBottom + 1),
         tone: impact >= 0 ? 'up' : 'down',
         whale: Math.abs(impact) >= 0.003,
         impact
@@ -1762,6 +1768,16 @@
    * 这个数必须与 `src/trading-rules.js` 的 `pnlOf()` 在 ±1% 上一致，
    * `test/trading-view.test.js` 有一条漂移断言盯着它。
    */
+  /** 杠杆档位 → 盘口边框特效（1× 安静 / 5× 青风 / 20× 琥珀警戒 / 100× 极限）。 */
+  function leverageTierOf (leverage) {
+    const value = toNumber(leverage) ?? 1
+    if (value >= 100) return 'extreme'
+    if (value >= 50) return 'ultra'
+    if (value >= 20) return 'high'
+    if (value >= 5) return 'mid'
+    return 'calm'
+  }
+
   function previewView ({ margin, leverage = 1 } = {}) {
     const marginValue = Math.max(0, toNumber(margin) ?? 0)
     const leverageValue = Math.max(1, Math.round(toNumber(leverage) ?? 1))
@@ -1907,7 +1923,11 @@
       leverages: limits.leverages.map((candidate) => ({
         leverage: candidate,
         label: candidate + '×',
-        active: candidate === chosenLeverage
+        active: candidate === chosenLeverage,
+        // 高杠杆按钮的 title 直接写「逆行多少就强平」，不靠颜色/特效才看得懂。
+        title: candidate >= 20
+          ? '高杠杆：逆行 ' + ((1 - 0.05) / candidate * 100).toFixed(2) + '% 触发强平'
+          : '杠杆 ' + candidate + '×'
       })),
       canSubmit,
       hint,
@@ -2394,6 +2414,7 @@
     toggleTheme,
     monoNumber,
     previewView,
+    leverageTierOf,
     orderView,
     focusOrder,
     orderRows,

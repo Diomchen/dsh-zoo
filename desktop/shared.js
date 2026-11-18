@@ -243,10 +243,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const BOARD_REASONS = ['close', 'settle', 'liquidate', 'stop']
   /**
    * 盘口杠杆的形状上限（票 81 / 评审 P2）：与 `src/trading-rules.js` 的 `MAX_LEVERAGE` 同值。
-   * 这一层只守形状（读盘/白名单），1×/5×/20× 的产品白名单由宿主按 `TRADING_LEVERAGES` 校验；
+   * 这一层只守形状（读盘/白名单），1×/5×/20×/50×/100× 的产品白名单由宿主按 `TRADING_LEVERAGES` 校验；
    * `test/farm-constants-drift.test.js` 有 drift 断言盯着两个数相等。
    */
-  const BOARD_MAX_LEVERAGE = 20
+  const BOARD_MAX_LEVERAGE = 100
   /**
    * 止损档位（票 81）：0 = 关，其余是「亏掉保证金的这个比例就平仓」。
    * 窗口的按钮循环「关 → −25% → −50% → −100% → 关」，宿主的 store（票 80）

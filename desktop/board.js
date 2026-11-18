@@ -69,7 +69,10 @@ const themeOptionsEl = document.getElementById('theme-options')
 const sideRowEl = document.getElementById('side-row')
 const marginRowEl = document.getElementById('margin-row')
 const leverageRowEl = document.getElementById('leverage-row')
+const leverageQuipEl = document.getElementById('leverage-quip')
+const leverageQuipCloseEl = document.getElementById('leverage-quip-close')
 const previewEl = document.getElementById('preview')
+const feeNoteEl = document.getElementById('fee-note')
 const liquidationEl = document.getElementById('order-liquidation')
 const submitEl = document.getElementById('submit')
 const orderHintEl = document.getElementById('order-hint')
@@ -105,7 +108,7 @@ const RESULT_CODE_TEXT = {
   'bad-crop': '这种作物暂时没有盘口。',
   'bad-side': '方向只有做多和做空。',
   'bad-margin': '保证金要是 1 到 1,000,000 之间的整数硬币。',
-  'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20×）。',
+  'bad-leverage': '这档杠杆还没开放（只有 1× / 5× / 20× / 50× / 100×）。',
   'bad-target': '目标价超出这张图的价格范围，换一个价再挂。',
   'no-order': '这张挂单已经成交或撤掉了，刷新一下就好。',
   'no-coin': '硬币不够，先去种地或卖点作物。',
@@ -150,6 +153,9 @@ let chartsFailed = null
 let side = 'long'
 let margin = 50
 let leverage = 1
+let lastLeverage = null
+let leverageQuipRequested = false
+let leverageQuipTimer = null
 let crop = null
 /** 票 84：选中的 K 线周期（只活在窗口里；切换不发 IPC，也不影响结算）。 */
 let timeframe = '15m'
@@ -447,6 +453,12 @@ function renderChart (board) {
   tickerFlowEl.textContent = ticker.flowText ?? ''
   tickerFlowEl.hidden = !(ticker.flowText)
   tickerFlowEl.dataset.tone = ticker.flowTone ?? 'flat'
+  if (ticker.flowText && ticker.whaleCount > 0) {
+    const whale = document.createElement('span')
+    whale.className = 'ticker-whale'
+    whale.textContent = '鲸 ' + ticker.whaleCount
+    tickerFlowEl.append(whale)
+  }
   tickerEl.title = ticker.text + (ticker.flowText ? ' · ' + ticker.flowText : '')
   tickerEl.setAttribute('aria-label', '快讯：' + ticker.text)
   // 票 89：没有独立的图例行；底价/入场/强平在图的右端各有标签，少一行小字。
@@ -737,11 +749,21 @@ function renderChart (board) {
   if (Array.isArray(geometry.flowMarks) && geometry.flowMarks.length > 0) {
     const flowLayer = svgEl('g', { class: 'chart-flow' })
     for (const mark of geometry.flowMarks) {
+      if (Number.isFinite(mark.stemTop)) {
+        flowLayer.append(svgEl('line', {
+          class: 'flow-stem ' + mark.tone,
+          x1: mark.x,
+          x2: mark.x,
+          y1: mark.stemTop,
+          y2: mark.y - (mark.whale ? 4 : 3),
+          'vector-effect': 'non-scaling-stroke'
+        }))
+      }
       flowLayer.append(svgEl('circle', {
         class: 'flow-dot ' + mark.tone,
         cx: mark.x,
         cy: mark.y,
-        r: mark.whale ? 3.2 : 2,
+        r: mark.whale ? 3.4 : 2.6,
         'vector-effect': 'non-scaling-stroke'
       }))
       if (mark.whale) {
@@ -749,7 +771,7 @@ function renderChart (board) {
           class: 'flow-ring ' + mark.tone,
           cx: mark.x,
           cy: mark.y,
-          r: 5,
+          r: 5.2,
           'vector-effect': 'non-scaling-stroke'
         }))
       }
@@ -833,22 +855,48 @@ function renderOrder (board) {
     button.title = choice.disabled ? (choice.disabledReason ?? '') : ''
     marginRowEl.append(button)
   }
-  leverageRowEl.textContent = ''
-  for (const choice of order.leverages) {
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'chip'
-    button.dataset.leverage = String(choice.leverage)
+  // 票 107 扩展：杠杆档位驱动整窗边框特效；只写 data-*，样式在 CSS 里。
+  const leverageTier = view.leverageTierOf(order.leverage)
+  document.body.dataset.leverageTier = leverageTier
+  document.body.dataset.leverage = String(order.leverage)
+  const enteredExtreme = order.leverage >= 100 &&
+    (lastLeverage !== 100 || leverageQuipRequested)
+  if (enteredExtreme) {
+    showLeverageQuip()
+  } else if (order.leverage < 100) {
+    hideLeverageQuip()
+  }
+  lastLeverage = order.leverage
+  leverageQuipRequested = false
+  // 杠杆按钮不每秒重建：边框动效要靠「选中态变化」触发，重建会把动画每秒重置一次。
+  // 只有白名单本身变了（老宿主 → 新宿主）才换 DOM。
+  const existingLeverageButtons = Array.from(leverageRowEl.querySelectorAll('[data-leverage]'))
+  const sameLeverages = existingLeverageButtons.length === order.leverages.length &&
+    existingLeverageButtons.every((button, index) =>
+      button.dataset.leverage === String(order.leverages[index].leverage))
+  let leverageButtons = existingLeverageButtons
+  if (!sameLeverages) {
+    leverageRowEl.textContent = ''
+    leverageButtons = order.leverages.map((choice) => {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'chip'
+      button.dataset.leverage = String(choice.leverage)
+      leverageRowEl.append(button)
+      return button
+    })
+  }
+  for (let index = 0; index < order.leverages.length; index += 1) {
+    const choice = order.leverages[index]
+    const button = leverageButtons[index]
+    if (button === undefined) continue
     button.setAttribute('aria-pressed', choice.active ? 'true' : 'false')
     button.textContent = choice.label
-    leverageRowEl.append(button)
+    button.title = choice.title ?? ('杠杆 ' + choice.leverage + '×')
   }
-  // 票 101：手续费写在杠杆旁边——下单当场就要看见，不能等结算才知道。
-  const feeNote = document.createElement('span')
-  feeNote.className = 'chip-note'
-  feeNote.textContent = order.feeText
-  feeNote.title = '开仓和平仓各收名义价值（保证金 × 杠杆）的 0.2%，结算时一次扣清。'
-  leverageRowEl.append(feeNote)
+  // 票 101/2026-11-18：手续费挪到第二行——四档杠杆（含 100×）需要整条 chip 的宽度。
+  feeNoteEl.textContent = order.feeText
+  feeNoteEl.title = '开仓和平仓各收名义价值（保证金 × 杠杆）的 0.2%，结算时一次扣清。'
   // 票 91：横条第二行只放「涨 1% +0.5 · 跌 1% −0.5 · 强平价 —」这一句；
   // 完整预览句（带杠杆/保证金）仍在 `order.preview` 里，给旧调用方和测试。
   previewEl.textContent = order.previewShort
@@ -1068,8 +1116,9 @@ function renderLeague (board) {
   // 票 89：卡片头只留「情绪 观望」；「1 人」这种计数不再挤在标题行。
   sentimentEl.textContent = league.sentiment.text
   if (league.sentiment.flowText) {
-    const flowNote = document.createElement('small')
-    flowNote.textContent = ' · ' + league.sentiment.flowText
+    const flowNote = document.createElement('span')
+    flowNote.className = 'sentiment-flow'
+    flowNote.textContent = league.sentiment.flowText
     flowNote.dataset.tone = league.sentiment.flowTone ?? 'flat'
     sentimentEl.append(flowNote)
   }
@@ -1334,6 +1383,30 @@ function tick () {
   submitAction({ action: 'trading-refresh' })
 }
 
+/**
+ * 100× 的漫画气泡（2026-11-18）：只在「切到 100×」或用户再次点 100× 时弹，
+ * 6.5 秒自动收；× / Esc 也能关。解除 hidden 前强制一次 reflow，让 pop 动画重新播。
+ */
+function hideLeverageQuip () {
+  if (leverageQuipTimer !== null) {
+    clearTimeout(leverageQuipTimer)
+    leverageQuipTimer = null
+  }
+  if (leverageQuipEl !== null) leverageQuipEl.hidden = true
+}
+
+function showLeverageQuip () {
+  if (leverageQuipEl === null) return
+  if (leverageQuipTimer !== null) clearTimeout(leverageQuipTimer)
+  leverageQuipEl.hidden = true
+  void leverageQuipEl.offsetWidth
+  leverageQuipEl.hidden = false
+  leverageQuipTimer = setTimeout(() => {
+    leverageQuipTimer = null
+    leverageQuipEl.hidden = true
+  }, 8000)
+}
+
 function showToast (text, kind = 'info') {
   const item = document.createElement('div')
   item.className = 'toast' + (kind === 'error' ? ' error' : '')
@@ -1482,6 +1555,8 @@ leverageRowEl.addEventListener('click', (event) => {
   if (button === null || button.disabled) return
   const chosen = Number(button.dataset.leverage)
   if (Number.isFinite(chosen)) leverage = chosen
+  // 已经选中 100× 时再点一次也重新弹气泡；每秒的被动重画不会触发。
+  if (chosen === 100) leverageQuipRequested = true
   render()
 })
 
@@ -1592,11 +1667,20 @@ positionsEl.addEventListener('click', (event) => {
 closeButton.addEventListener('click', () => api?.close())
 
 // 票 91：Esc 先收弹层（显示 → 到价），都没有才关窗；旧行为（Esc 关窗）保留在最后一步。
+leverageQuipCloseEl?.addEventListener('click', (event) => {
+  event.stopPropagation()
+  hideLeverageQuip()
+})
+
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape') {
     event.preventDefault()
     if (!newsPopEl.hidden) {
       hideNewsDetail()
+      return
+    }
+    if (leverageQuipEl !== null && !leverageQuipEl.hidden) {
+      hideLeverageQuip()
       return
     }
     if (displayOpen) {

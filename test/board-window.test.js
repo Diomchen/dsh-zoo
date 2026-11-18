@@ -488,8 +488,8 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   // 窗口 / helper / 宿主三处的止损四档是同一组数（改档位时一起改）。
   assert.deepEqual(shared.BOARD_STOP_LEVELS, boardView.stopLevels())
   assert.deepEqual(shared.BOARD_STOP_LEVELS, TRADING_STOP_LEVELS)
-  // 杠杆的形状上限也同源（helper 不再各写一个 20）。
-  assert.equal(shared.BOARD_MAX_LEVERAGE, 20)
+  // 杠杆的形状上限也同源（helper 不再各写一个 100）。
+  assert.equal(shared.BOARD_MAX_LEVERAGE, 100)
   // 票 83：到价挂单 / 撤单的字段白名单。
   assert.deepEqual(
     shared.normalizeBoardAction({
@@ -500,6 +500,7 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-cancel-order', orderId: positionId }),
     { action: 'trading-cancel-order', orderId: positionId })
   for (const bad of [
+    { action: 'trading-place-order', side: 'short', margin: 250, leverage: 101, cropId: 'tomato' },
     { action: 'trading-place-order', side: 'short', margin: 250, leverage: 20, cropId: 'tomato' },
     // 2× 是形状合法、宿主按白名单拒（和开仓同一条分工）；这里只测形状。
     { action: 'trading-place-order', side: 'short', margin: 0, cropId: 'tomato', target: 5.5 },
@@ -1688,7 +1689,7 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.match(html, /repeat\(4, 42px\)/)
   // 票 101：杠杆白名单收到 1×/5×，横条里就两列（方向也是两列）。
   assert.match(html, /\.chip-row\.side \{[\s\S]*?repeat\(2, 42px\)/)
-  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(2, 42px\)/)
+  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(5, 32px\)/)
   assert.doesNotMatch(html, /repeat\(3, 42px\)/)
   const orderBar = /\.order-bar \{([\s\S]*?)\}/.exec(html)
   assert.ok(orderBar, '应有 .order-bar 规则')

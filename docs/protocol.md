@@ -137,7 +137,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `servedMs` / `earned` | `work-settle` | 服务毫秒 0..8 小时；工钱 0..800 的整数；`work-settle-ack` 回的 `earned` 同一范围 |
 | `weekPnl` | `trading-digest` | 本机本周交易盈亏（金币，含未实现，四舍五入到整数）；范围 `[-1,000,000, 1,000,000]` |
 | `weekPnlPct` | `trading-digest` | 可选收益率**比率**（`0.035` = +3.5%）；范围 `[-1000, 1000]`；缺省表示本机没有可用的周起点硬币 |
-| `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20；没有仓位就是空数组 |
+| `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20/50/100；没有仓位就是空数组 |
 | `events` | `board-flow` | 0..16 条资金流事件，每条只有 `{ id, at, crop, action, side, reason, notional, source }`；`action` 只认 `open`/`close`，`side` 只认 `long`/`short`，`reason` 只认 `manual`/`settle`/`liquidate`/`stop`，`source` 只认 `board`/`futures`/`farm`；事件里的 `deviceId` 一律盖成包上的发送端 |
 | `sync` | `board-flow` | 缺省 `false`；`true` 表示这是同步补历史的包，接收端放宽 15 秒实时窗口 |
 | `since` | `board-flow-sync` | 请求方要「这个时刻之后」的事件，非负整数毫秒；接收端回 `board-flow`（`sync:true`），最多 64 条 |
@@ -1016,7 +1016,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 幂等缓存 | `farm-action` 200 条/10 分钟；`work-*` ack 200 条/10 分钟 |
 | 守卫 | 0.3（主人在家）/ 0.5（雇工）/ 0.8（两者），宠物出门/打工时自家 0 |
 | 快照 | HTTP ≤64 KiB；访客宿主 2 秒超时、60 秒冷却 |
-| 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
+| 盘口 | 杠杆 1×/5×/20×/50×/100×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
 | 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
 | 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
 | 盘口资金流 | 单笔 ≤0.6%；单设备单根 ≤1.2%、单日 ≤4%；每作物水平 ≤1.5%；6 条/分钟、40 条/根；同步包 ≤16 条/包、最多 64 条/次 |

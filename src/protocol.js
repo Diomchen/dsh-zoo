@@ -29,8 +29,8 @@ import { CROPS, CROP_IDS, MAX_GUARD, isCropId, MINUTE_MS } from './farm-rules.js
 import { MAX_CROPS, normalizeCropDef } from './crop-catalog.js'
 // 票 82：盘口周报只认盘口的作物/方向/杠杆白名单——白名单的真相在 `src/trading-rules.js`
 // （盘口窗口的按钮也由它下发），协议层不另抄一份。
-// 票 101：盘上遗留的 20× 仓位仍要能被读回来（周报/排行榜要显示它们），
-// 所以协议层用 `isStoredLeverage`（1..20），下单白名单仍然是 1×/5×。
+// 票 101/2026-11-18：协议层用 `isStoredLeverage`（1..100）读回盘上仓位；
+// 下单白名单是 1×/5×/20×/50×/100×。
 import { isBoardCrop, isBoardSide, isStoredLeverage } from './trading-rules.js'
 import { normalizeFlowEvent } from './board-flow.js'
 // 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
@@ -764,8 +764,8 @@ export function normalizeTradingPositions (value) {
     if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
     if (!isBoardCrop(entry.crop)) return null
     if (!isBoardSide(entry.side)) return null
-    // 票 101：白名单收成 1×/5×，但榜上要能显示别人手里的老 20× 仓位——
-    // 这里校验的是「读得回来的杠杆形状」，不是「现在能不能下单」。
+    // 协议只校验「读得回来的杠杆形状」（1..100），不是「现在能不能下单」；
+    // 周报/排行榜要能显示别人手里的 20×/100× 仓位。
     if (!isStoredLeverage(entry.leverage)) return null
     positions.push({ crop: entry.crop, side: entry.side, leverage: entry.leverage })
   }
