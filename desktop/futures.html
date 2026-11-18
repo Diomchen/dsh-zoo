@@ -55,6 +55,13 @@
   .modebar .grow { flex: 1; }
   .modebar .hostOnly { display: flex; align-items: center; gap: 6px; }
   .modebar .hostOnly select { padding: 2px 4px; }
+  /* 1.10.0：账户档位切换按钮（谁都点得动，房主关市时禁用）。 */
+  .modebar .accountBtn {
+    border: 1px solid var(--line-strong); background: var(--paper); color: var(--ink);
+    border-radius: 999px; padding: 1px 9px; cursor: pointer; font: inherit; font-weight: 600;
+  }
+  .modebar .accountBtn:hover:not(:disabled) { background: var(--ink); color: var(--paper); }
+  .modebar .accountBtn:disabled { opacity: .45; cursor: default; }
   .modebar .hostOnly button, .dangerBtn {
     border: 1px solid var(--line); background: transparent; color: var(--ink);
     border-radius: var(--radius); padding: 2px 8px; cursor: pointer; font: inherit;
@@ -181,20 +188,18 @@
     <button class="winClose" id="close" type="button" aria-label="关闭期货" title="关闭（Esc）">×</button>
   </header>
 
-  <!-- 票 98：三档灰度。常态只显示一枚小徽章 + 限额一行；房主才看得到切档与回滚。 -->
+  <!-- 票 98 / 1.10.0：档位是每个账户自己的事。左边徽章写「这本账是纸面还是真钱」，
+       旁边一颗切换按钮任何人都能用；房主另有一条「开市/关市」与回滚。 -->
   <div class="modebar" id="modebar" hidden>
-    <span class="chip" id="modeChip">—</span>
-    <span class="modeText" id="modeText"></span>
+    <span class="chip" id="accountChip">—</span>
+    <span class="modeText" id="accountText"></span>
+    <button type="button" id="accountSwitch" class="accountBtn">切到真钱</button>
     <span class="caps mono" id="caps"></span>
     <span class="pending" id="pending" hidden></span>
     <span class="grow"></span>
     <span class="hostOnly" id="modeSwitch" hidden>
-      <select id="modeSelect" aria-label="灰度档">
-        <option value="off">关闭</option>
-        <option value="shadow">影子</option>
-        <option value="live">真钱</option>
-      </select>
-      <button type="button" id="applyMode">切档</button>
+      <button type="button" id="openMarket">开市</button>
+      <button type="button" id="closeMarket" class="dangerBtn">关市</button>
       <button type="button" id="rollback" class="dangerBtn">回滚</button>
     </span>
   </div>

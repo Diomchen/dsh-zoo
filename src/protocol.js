@@ -35,15 +35,17 @@ import { isBoardCrop, isBoardSide, isStoredLeverage } from './trading-rules.js'
 // 票 94：期货的方向/杠杆白名单也只有一份真相（`src/futures-rules.js` 是不带状态的纯规则）。
 // 票 95：指令种类（含 `place`）同样只认规则层那一份，协议层 re-export。
 import {
+  FUTURES_ACCOUNT_MODES,
   FUTURES_DEFAULT_MODE,
   FUTURES_MODES,
   FUTURES_ORDER_KINDS,
+  isFuturesAccountMode,
   isFuturesLeverage,
   isFuturesSide,
   isMarginAmount
 } from './futures-rules.js'
 
-export { FUTURES_MODES, FUTURES_ORDER_KINDS }
+export { FUTURES_ACCOUNT_MODES, FUTURES_MODES, FUTURES_ORDER_KINDS }
 
 export const PROTOCOL_VERSION = 1
 export const DEFAULT_PORT = 45871
@@ -373,7 +375,9 @@ export const PACKET_TYPES = Object.freeze([
   'futures-order',
   'futures-cancel',
   'futures-settle',
-  'futures-sync'
+  'futures-sync',
+  // 1.10.0：账户自己的档位申报（peer → 房主）。
+  'futures-mode'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -1670,10 +1674,11 @@ export function encodeFuturesSettle ({
   insurance = 0,
   shortfall = 0,
   mode = FUTURES_DEFAULT_MODE,
+  accountMode = null,
   pending = 0,
   now
 } = {}) {
-  return encodePacket({
+  const packet = {
     type: 'futures-settle',
     deviceId,
     at,
@@ -1690,7 +1695,18 @@ export function encodeFuturesSettle ({
     mode,
     pending,
     now
-  })
+  }
+  // 1.10.0：账户档位是可选字段（老 peer 不发 = 不知道，按 null）。
+  if (isFuturesAccountMode(accountMode)) packet.accountMode = accountMode
+  return encodePacket(packet)
+}
+
+/**
+ * 1.10.0：账户申报自己的档位（peer → 房主）。
+ * 只带一个白名单值，不带余额/农场/自由文本——房主按它决定这本账按真钱还是纸面结算。
+ */
+export function encodeFuturesMode ({ deviceId, at, accountMode, now } = {}) {
+  return encodePacket({ type: 'futures-mode', deviceId, at, accountMode, now })
 }
 
 export function encodeFuturesSync ({ deviceId, at, epoch, lastSeq, now } = {}) {
@@ -2252,6 +2268,23 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     }
   }
 
+  // 1.10.0：账户申报自己的档位。只有白名单两个值，别的一律拒。
+  if (raw.type === 'futures-mode') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (!isFuturesAccountMode(raw.accountMode)) return fail('account-mode')
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        accountMode: raw.accountMode
+      }
+    }
+  }
+
   if (raw.type === 'futures-order') {
     const at = normalizeDigestAt(raw.at)
     if (at === null) return fail('at')
@@ -2336,6 +2369,11 @@ export function parsePacket (input, { now = Date.now() } = {}) {
     if (mode === null) return fail('mode')
     const pending = raw.pending === undefined ? 0 : normalizeFuturesCoin(raw.pending)
     if (pending === null) return fail('pending')
+    // 1.10.0：账户档位可选（老房主不发 = null，peer 按自己的设置猜）。
+    const accountMode = raw.accountMode === undefined || raw.accountMode === null
+      ? null
+      : (isFuturesAccountMode(raw.accountMode) ? raw.accountMode : undefined)
+    if (accountMode === undefined) return fail('account-mode')
     return {
       ok: true,
       packet: {
@@ -2354,6 +2392,7 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         insurance,
         shortfall,
         mode,
+        accountMode,
         pending
       }
     }

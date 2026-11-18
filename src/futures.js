@@ -88,6 +88,8 @@ import {
   DAY_MS,
   DAILY_NOTIONAL_CAP,
   DELIVERY_FEE_RATE,
+  FUTURES_ACCOUNT_MODES,
+  FUTURES_DEFAULT_ACCOUNT_MODE,
   FUTURES_DEFAULT_MODE,
   FUTURES_MODES,
   HOUR_MS,
@@ -101,6 +103,7 @@ import {
   fairPriceOf,
   feeSplitOf,
   fillPriceOf,
+  isFuturesAccountMode,
   isFuturesLeverage,
   isFuturesSide,
   isMarginAmount,
@@ -128,7 +131,14 @@ export const FUTURES_TRADE_LIMIT = 50
 export const FUTURES_VIEW_TRADES = 20
 
 // 票 98：灰度模式与敞口限额都由规则层定义，账本层与协议层共用同一份，避免三处各写一套。
-export { DAILY_NOTIONAL_CAP, FUTURES_DEFAULT_MODE, FUTURES_MODES, POSITION_NOTIONAL_CAP }
+export {
+  DAILY_NOTIONAL_CAP,
+  FUTURES_ACCOUNT_MODES,
+  FUTURES_DEFAULT_ACCOUNT_MODE,
+  FUTURES_DEFAULT_MODE,
+  FUTURES_MODES,
+  POSITION_NOTIONAL_CAP
+}
 
 /**
  * 拒绝原因的中文文案（票 98）：窗口、`/state`、日志都从这里取，保证同一错误码
@@ -141,7 +151,8 @@ export const FUTURES_ERROR_TEXT = Object.freeze({
   'notional-cap': '持仓名义已到上限。',
   'rate-limited': '请求太频繁，已限速。',
   'not-host': '只有房主能操作。',
-  'bad-mode': '未知的期货模式。'
+  'bad-mode': '未知的期货模式。',
+  'bad-account-mode': '未知的账户档位。'
 })
 
 const MAX_ID_LENGTH = 64
@@ -202,6 +213,9 @@ export function initialFuturesState () {
     // 票 98：灰度模式（off/shadow/live）、按自然日的成交额、待提取余额、回滚停用标记。
     // `farmAnchor/farmIn/farmOut` 只服务于对账：影子模式没有真实流动，所以差额恒为 0。
     mode: FUTURES_DEFAULT_MODE,
+    // 1.10.0：本账户自己的档位（`shadow` 纸面 / `live` 真钱）。`null` = 跟随上面的市场档位，
+    // 老存档读出来就是这个值。房主关市（`mode: 'off'`）仍然是全局闸门，谁也绕不过去。
+    accountMode: null,
     dayStart: 0,
     dayNotional: 0,
     pending: 0,
@@ -227,7 +241,8 @@ function initialRemoteAccount (seq = 0, at = 0) {
     updatedAt: at,
     pending: 0,
     dayStart: 0,
-    dayNotional: 0
+    dayNotional: 0,
+    accountMode: null
   }
 }
 
@@ -255,9 +270,11 @@ export function initialFuturesView () {
     week: { start: 0, pnl: 0 },
     quotes: {},
     // 票 98：模式、日额进度与上限、待提取、回滚停用——窗口直接照抄这些字段。
+    // 1.10.0：`mode` 是市场闸门（off/shadow/live），`accountMode` 是本账户自己的档位。
     mode: FUTURES_DEFAULT_MODE,
+    accountMode: FUTURES_DEFAULT_ACCOUNT_MODE,
     dayNotional: 0,
-    dayCap: 0,
+    dayCap: DAILY_NOTIONAL_CAP,
     positionCap: POSITION_NOTIONAL_CAP,
     pending: 0,
     disabled: false,
@@ -306,9 +323,9 @@ function normalizeTrade (raw) {
               ? 'liquidation'
               : null
   // 票 98：模式切换流水是审计记录，没有作物/合约/方向，张数与价格都是 0，
-  // 所以必须在常规成交流水校验之前单独放行。
+  // 所以必须在常规成交流水校验之前单独放行。1.10.0：账户级档位复用同一种流水。
   if (kind === 'mode') {
-    const note = FUTURES_MODES.includes(raw.note) ? raw.note : null
+    const note = FUTURES_MODES.includes(raw.note) || FUTURES_ACCOUNT_MODES.includes(raw.note) ? raw.note : null
     if (at === null || at <= 0 || note === null) return null
     return { at, kind, note, lots: 0, price: 0, fee: 0 }
   }
@@ -386,6 +403,11 @@ function normalizeRemoteAccount (raw) {
   if (!(dayStart >= 0)) return null
   const dayNotional = raw.dayNotional === undefined ? 0 : nonNegativeCoin(raw.dayNotional)
   if (dayNotional === null) return null
+  // 1.10.0：账户自己的档位（`shadow` 纸面 / `live` 真钱）；缺省（老存档）跟随全局市场档位。
+  const accountMode = raw.accountMode === undefined || raw.accountMode === null
+    ? null
+    : (isFuturesAccountMode(raw.accountMode) ? raw.accountMode : undefined)
+  if (accountMode === undefined) return null
   const positions = []
   if (raw.positions !== undefined) {
     if (!Array.isArray(raw.positions)) return null
@@ -422,7 +444,7 @@ function normalizeRemoteAccount (raw) {
       trades.push(trade)
     }
   }
-  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional }
+  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode }
 }
 
 /**
@@ -857,6 +879,26 @@ class FuturesStore {
     return this.#state.mode
   }
 
+  /**
+   * 1.10.0：某个账户这一刻的档位。账户自己选了就按账户的；没选就跟随市场档位
+   * （市场是 `off` 时这里按 `shadow` 解释——它本来也开不了新仓，不能把纸面钱当真钱算）。
+   */
+  #accountModeOf (account) {
+    // peer 侧：房主回过话就以房主账本里的档位为准（本地那次切换只是先手一步）。
+    if (account === this.#state) {
+      const mirrored = this.#state.replica?.accountMode
+      if (isFuturesAccountMode(mirrored)) return mirrored
+    }
+    const chosen = account?.accountMode
+    if (isFuturesAccountMode(chosen)) return chosen
+    return this.modeOf() === 'live' ? 'live' : 'shadow'
+  }
+
+  /** 本机账户的档位：充值、提现、开仓、结算文案都按它分真钱与纸面。 */
+  accountMode () {
+    return this.#accountModeOf(this.#state)
+  }
+
   #disabled () {
     return this.#state.disabled || this.modeOf() === 'off'
   }
@@ -907,8 +949,9 @@ class FuturesStore {
   }
 
   /**
-   * 票 98 的两道敞口闸门：先日额、再同时持仓名义。影子模式的日额上限是 0——
-   * 它只允许观察和撮合已有挂单，任何新开仓/新挂单都按 `daily-cap` 拒绝。
+   * 票 98 的两道敞口闸门：先日额、再同时持仓名义。
+   * 1.10.0：纸面账户（`shadow`）同样能交易，只是钱是纸面的，所以日额上限也是满的
+   * `DAILY_NOTIONAL_CAP`——只是它的单永远只跟做市商成交，不与真钱账户的挂单交叉。
    * 返回 null 表示放行。
    */
   #checkLimits (account, notional, stamp) {
@@ -916,7 +959,7 @@ class FuturesStore {
     if (amount === null || amount <= 0) return null
     const owner = account ?? this.#state
     this.#rollDayFor(owner, stamp)
-    const cap = this.modeOf() === 'shadow' ? 0 : DAILY_NOTIONAL_CAP
+    const cap = DAILY_NOTIONAL_CAP
     if (owner.dayNotional + amount >= cap) {
       return this.#limitError('daily-cap')
     }
@@ -975,9 +1018,11 @@ class FuturesStore {
       shortfall: roundCoin(this.#state.shortfall),
       liquidationCount: this.#state.liquidationCount,
       // 票 98：模式、日额进度/上限、持仓上限、待提取与回滚标记。
+      // 1.10.0：`mode` 是市场闸门，`accountMode` 是本账户自己的档位（真钱/纸面）。
       mode: this.modeOf(),
+      accountMode: this.accountMode(),
       dayNotional: roundCoin(this.#state.dayNotional),
-      dayCap: this.modeOf() === 'shadow' ? 0 : DAILY_NOTIONAL_CAP,
+      dayCap: DAILY_NOTIONAL_CAP,
       positionCap: POSITION_NOTIONAL_CAP,
       pending: roundCoin(this.#state.pending),
       disabled: this.#state.disabled,
@@ -1030,6 +1075,60 @@ class FuturesStore {
       mode: rawMode,
       disabled: this.#state.disabled,
       ...this.#view(),
+      persisted
+    }
+  }
+
+  /**
+   * 1.10.0：本机账户切换自己的档位（`shadow` 纸面 / `live` 真钱）。
+   *
+   * 为什么不再由房主统一决定：玩不玩真钱是每个人自己的事。房主只保留「关市」这一道
+   * 全局闸门（`setMode('off')`），关市时谁都不能切、也不能交易。
+   */
+  async setAccountMode (rawMode, at = this.#nowMs()) {
+    if (!isFuturesAccountMode(rawMode)) {
+      return { ok: false, error: 'bad-account-mode', notice: FUTURES_ERROR_TEXT['bad-account-mode'] }
+    }
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    this.#state.accountMode = rawMode
+    this.#state.tradedAt = stamp
+    this.#recordTrade({ at: stamp, kind: 'mode', note: rawMode, lots: 0, price: 0, fee: 0 })
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-account-mode',
+      accountMode: rawMode,
+      ...this.#view(),
+      persisted
+    }
+  }
+
+  /**
+   * 1.10.0：房主替 peer 记下它自己选的档位。钱在 peer 自己的农场上扣，
+   * 房主这里只决定这本账按真钱还是纸面结算。
+   */
+  async setRemoteAccountMode (deviceId, rawMode, at = this.#nowMs()) {
+    if (!isFuturesAccountMode(rawMode)) {
+      return { ok: false, error: 'bad-account-mode', notice: FUTURES_ERROR_TEXT['bad-account-mode'] }
+    }
+    const blocked = this.#gate()
+    if (blocked !== null) return blocked
+    const stamp = Number.isFinite(Number(at)) ? Number(at) : this.#nowMs()
+    const account = this.#remoteAccount(deviceId, stamp)
+    if (account === null) return { ok: false, error: 'bad-device' }
+    account.accountMode = rawMode
+    account.updatedAt = stamp
+    const seq = this.#bumpAccount(account)
+    this.#recordRemoteTrade(account, { at: stamp, kind: 'mode', note: rawMode, lots: 0, price: 0, fee: 0 })
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-account-mode',
+      accountMode: rawMode,
+      account: this.#accountView(account, stamp),
+      seq,
       persisted
     }
   }
@@ -1179,14 +1278,15 @@ class FuturesStore {
     }
   }
 
-  /** 票 96：交易中 / 今日已收盘 / 周末三态；文案由账本层统一给，窗口不自己拼。 */
+  /**
+   * 票 96：交易中 / 今日已收盘 / 周末三态；文案由账本层统一给，窗口不自己拼。
+   * 1.10.0：档位（真钱/纸面）不再是「一种休市状态」——纸面账户照常交易，档位由窗口
+   * 单独画一枚徽章（`accountMode`），不再顶替合约状态。
+   */
   #sessionOf (crop, stamp) {
-    // 票 98：模式优先于合约状态——off 时连「今天有没有合约」都不该显示。
+    // 票 98：房主关市优先于合约状态——off 时连「今天有没有合约」都不该显示。
     if (this.#state.disabled || this.modeOf() === 'off') {
       return { kind: 'off', text: '期货未开放' }
-    }
-    if (this.modeOf() === 'shadow') {
-      return { kind: 'shadow', text: '影子模式：只记账，不动农场硬币' }
     }
     const contract = contractOf(crop, stamp)
     if (contract !== null) {
@@ -1205,13 +1305,13 @@ class FuturesStore {
     return pnlOf({ lots: position.lots, entry: position.entry, exit, side: position.side })
   }
 
-  /** 充值：live 时农场扣 coins、托管余额加同样的数；shadow 只记托管账。 */
+  /** 充值：真钱档农场扣 coins、托管余额加同样的数；纸面档只记托管账。 */
   async deposit (rawCoins) {
     const blocked = this.#gate()
     if (blocked !== null) return blocked
     const coins = positiveInt(rawCoins, MAX_COINS)
     if (coins === null) return { ok: false, error: 'bad-amount' }
-    if (this.modeOf() === 'shadow') {
+    if (this.accountMode() === 'shadow') {
       this.#state.balance = roundCoin(this.#state.balance + coins)
       this.#state.tradedAt = this.#nowMs()
       const persisted = await this.#persist()
@@ -1242,7 +1342,7 @@ class FuturesStore {
    * 农场 `addCoins` 在上限 1,000,000 处**静默截断**，所以这里按 1,000,000 分批并核对
    * 每一批的实收 `qty`：收多少就扣多少，剩下的留在托管账户里，绝不「账上扣了、农场没进」。
    * 票 98：撞上限的余额留在 `balance` 并标 `pending`，同时返回中文 `notice`。
-   * 影子模式不碰农场：整笔都算「已提现」，只在托管账上减。
+   * 纸面档（`accountMode: 'shadow'`）不碰农场：整笔都算「已提现」，只在托管账上减。
    */
   async withdraw (rawCoins) {
     const blocked = this.#gate()
@@ -1252,7 +1352,7 @@ class FuturesStore {
     if (coins === null) return { ok: false, error: 'bad-amount' }
     const available = Math.floor(this.#state.balance)
     if (available < coins) return { ok: false, error: 'no-balance' }
-    if (this.modeOf() === 'shadow') {
+    if (this.accountMode() === 'shadow') {
       this.#state.balance = roundCoin(this.#state.balance - coins)
       this.#state.tradedAt = this.#nowMs()
       const persisted = await this.#persist()
@@ -1368,17 +1468,9 @@ class FuturesStore {
     const total = roundCoin(usedMargin + fee)
     // 余额先判：买不起的单本来就该回 no-balance（不该被说成限额）；
     // 买得起才看日额/持仓两道闸门，被限额拒绝时账上一分不动。
-    // 影子模式例外：日额上限为 0，任何新仓都先按 daily-cap 拒绝，不因余额多少改口。
-    const shadow = this.modeOf() === 'shadow'
-    if (shadow) {
-      const limited = this.#checkLimits(account, notional, stamp)
-      if (limited !== null) return limited
-    }
     if (account.balance < total) return { ok: false, error: 'no-balance' }
-    if (!shadow) {
-      const limited = this.#checkLimits(account, notional, stamp)
-      if (limited !== null) return limited
-    }
+    const limited = this.#checkLimits(account, notional, stamp)
+    if (limited !== null) return limited
 
     account.balance = roundCoin(account.balance - total)
     const slot = this.#slotOf(stamp)
@@ -1400,8 +1492,9 @@ class FuturesStore {
     account.updatedAt = stamp
     const seq = this.#bumpAccount(account)
     this.#recordNotional(account, notional, stamp)
-    // 手续费从 peer 的余额里出，落在本机的保险/销毁桶里（钱确实动了，费账就得跟着动）。
-    this.#chargeFee(fee)
+    // 手续费从 peer 的余额里出，落在本机的保险/销毁桶里（钱确实动了，费账就得跟着动）；
+    // 纸面账户的费是纸面的，`#chargeFee` 会按账户档位丢掉。
+    this.#chargeFee(fee, account)
     const persisted = await this.#persist()
     return {
       ok: true,
@@ -1561,7 +1654,7 @@ class FuturesStore {
     this.#state.closed += 1
     this.#state.tradedAt = stamp
     this.#bookPnl(plan.pnl, stamp)
-    this.#chargeFee(plan.fee)
+    this.#chargeFee(plan.fee, this.#state)
     this.#recordTrade({
       at: stamp,
       crop: position.crop,
@@ -1627,7 +1720,7 @@ class FuturesStore {
     const seq = this.#bumpAccount(account)
     this.#state.closed += 1
     this.#state.tradedAt = stamp
-    this.#chargeFee(plan.fee)
+    this.#chargeFee(plan.fee, account)
     this.#recordRemoteTrade(account, {
       at: stamp,
       crop: position.crop,
@@ -1693,10 +1786,13 @@ class FuturesStore {
       const paidFee = Math.min(deliveryFee, credit)
       const net = roundCoin(credit - paidFee)
       const gap = roundCoin(Math.max(0, -gross) + Math.max(0, deliveryFee - credit))
-      const covered = this.#coverHole(gap)
+      // 1.10.0：纸面账户的亏空是纸面的，不能花真钱保险基金。
+      const covered = this.#accountModeOf(account) === 'shadow'
+        ? { paid: 0, owed: 0 }
+        : this.#coverHole(gap)
       account.balance = roundCoin(account.balance + net)
       this.#state.closed += 1
-      if (paidFee > 0) this.#chargeFee(paidFee)
+      if (paidFee > 0) this.#chargeFee(paidFee, account)
       const trade = {
         at: stamp,
         crop: position.crop,
@@ -1841,6 +1937,7 @@ class FuturesStore {
     insurance,
     shortfall,
     mode,
+    accountMode,
     pending,
     at = this.#nowMs()
   } = {}) {
@@ -1890,6 +1987,11 @@ class FuturesStore {
     if (safeMode === null) return { ok: false, error: 'bad-mode' }
     const safePending = pending === undefined ? 0 : nonNegativeCoin(pending)
     if (safePending === null) return { ok: false, error: 'bad-pending' }
+    // 1.10.0：房主把「你这个账户的档位」回传（peer 窗口据此显示真钱/纸面）。
+    const safeAccountMode = accountMode === undefined || accountMode === null
+      ? null
+      : (isFuturesAccountMode(accountMode) ? accountMode : undefined)
+    if (safeAccountMode === undefined) return { ok: false, error: 'bad-account-mode' }
     this.#state.replica = {
       epoch,
       lastSeq: seq,
@@ -1901,6 +2003,7 @@ class FuturesStore {
       insurance: safeInsurance,
       shortfall: safeShortfall,
       mode: safeMode,
+      accountMode: safeAccountMode,
       pending: safePending,
       updatedAt: stamp
     }
@@ -1922,8 +2025,9 @@ class FuturesStore {
       // 票 97：房主广播过来的全局基金/欠账（peer 只读）。
       insurance: roundCoin(replica.insurance ?? 0),
       shortfall: roundCoin(replica.shortfall ?? 0),
-      // 票 98：模式与待提取余额也跟随房主。
+      // 票 98：模式与待提取余额也跟随房主；1.10.0：账户档位同样以房主回传的为准。
       mode: FUTURES_MODES.includes(replica.mode) ? replica.mode : FUTURES_DEFAULT_MODE,
+      accountMode: isFuturesAccountMode(replica.accountMode) ? replica.accountMode : null,
       pending: roundCoin(replica.pending ?? 0)
     }
   }
@@ -1959,16 +2063,10 @@ class FuturesStore {
     const usedMargin = marginOf({ lots, price, leverage })
     const fee = takerFeeOf(notionalOf({ lots, price }))
     const total = roundCoin(usedMargin + fee)
-    const shadow = this.modeOf() === 'shadow'
-    if (shadow) {
-      const limited = this.#checkLimits(this.#state, notional, stamp)
-      if (limited !== null) return limited
-    }
+    const shadow = this.accountMode() === 'shadow'
     if (this.#state.balance < total) return { ok: false, error: 'no-balance' }
-    if (!shadow) {
-      const limited = this.#checkLimits(this.#state, notional, stamp)
-      if (limited !== null) return limited
-    }
+    const limited = this.#checkLimits(this.#state, notional, stamp)
+    if (limited !== null) return limited
 
     this.#state.balance = roundCoin(this.#state.balance - total)
     this.#state.marginUsed = roundCoin(this.#state.marginUsed + usedMargin)
@@ -1989,7 +2087,7 @@ class FuturesStore {
     this.#state.positions.push(position)
     this.#state.tradedAt = stamp
     this.#recordNotional(this.#state, notional, stamp)
-    this.#chargeFee(fee)
+    this.#chargeFee(fee, this.#state)
     this.#recordTrade({ at: stamp, crop, contract: quote.contract.id, side, lots, price, fee, kind: 'open' })
     const persisted = await this.#persist()
     return {
@@ -2137,12 +2235,18 @@ class FuturesStore {
       if (window === null || stamp >= window.expireAt) continue
       const pools = this.#orderPools(contract)
       if (pools.orders.length === 0) continue
-      const due = matchOrders({ orders: pools.orders, contract, at: stamp })
-      for (const fill of due) {
-        const parties = this.#applyFill(pools, fill, stamp)
-        if (parties === null) continue
-        fills += 1
-        for (const party of parties) if (party.deviceId !== undefined) touched.set(party.deviceId, party.account)
+      // 1.10.0：两本账不交叉——纸面账户的单只碰做市商，真钱账户之间才互相撮合。
+      // 否则纸面账户等于拿假钱去赚真钱玩家的真钱，保险基金迟早被掏空。
+      for (const book of FUTURES_ACCOUNT_MODES) {
+        const orders = pools.orders.filter((order) => this.#orderModeOf(pools, order) === book)
+        if (orders.length < 2) continue
+        const due = matchOrders({ orders, contract, at: stamp })
+        for (const fill of due) {
+          const parties = this.#applyFill(pools, fill, stamp)
+          if (parties === null) continue
+          fills += 1
+          for (const party of parties) if (party.deviceId !== undefined) touched.set(party.deviceId, party.account)
+        }
       }
       // 做市商扫单：这一拍剩下的单里，价格已经穿过对手价的整张吃掉。
       fills += this.#sweepMarketMaker(pools, stamp, touched)
@@ -2212,19 +2316,12 @@ class FuturesStore {
     if (account.orders.length >= FUTURES_MAX_ORDERS) return { ok: false, error: 'order-limit' }
     if (this.#crossesOwn(account.orders, order)) return { ok: false, error: 'self-trade' }
     const notional = roundCoin(order.marginFrozen * order.leverage)
-    // 影子模式连余额都不看：一律 daily-cap（票面要求「新的开仓/挂单」全部拒绝）。
-    const shadow = this.modeOf() === 'shadow'
-    if (shadow) {
-      const limited = this.#checkLimits(account, notional, order.at)
-      if (limited !== null) return limited
-    }
     const cost = roundCoin(order.marginFrozen + takerFeeOf(notionalOf({ lots: order.lots, price: order.price })))
     if (account.balance < cost) return { ok: false, error: 'no-balance' }
     // 票 98：挂单也占日额与同时持仓名义（用冻结保证金还原名义）。
-    if (!shadow) {
-      const limited = this.#checkLimits(account, notional, order.at)
-      if (limited !== null) return limited
-    }
+    // 1.10.0：纸面账户同样能挂单，只是它的单只跟做市商成交（见 `#matchPool`）。
+    const limited = this.#checkLimits(account, notional, order.at)
+    if (limited !== null) return limited
     account.orders.push(order)
     account.balance = roundCoin(account.balance - order.marginFrozen)
     account.marginUsed = this.#recomputeFor(account)
@@ -2252,9 +2349,15 @@ class FuturesStore {
     return null
   }
 
+  /** 1.10.0：一条挂单属于哪本账（`shadow` 纸面 / `live` 真钱）。 */
+  #orderModeOf (pools, order) {
+    const pool = pools.owners.get(order.id)
+    if (pool === undefined) return FUTURES_DEFAULT_ACCOUNT_MODE
+    return this.#accountModeOf(pool.account)
+  }
+
   /** 把一个合约上所有账户的挂单摊平成一盘，`owners` 记住每条单属于谁。 */
-  #orderPools (contract) {
-    const local = { account: this.#state, local: true }
+  #orderPools (contract) {    const local = { account: this.#state, local: true }
     const pools = { local, accounts: [], orders: [], owners: new Map() }
     for (const order of this.#state.orders) {
       if (order.contract !== contract) continue
@@ -2323,7 +2426,7 @@ class FuturesStore {
         orderId: order.id
       })
     }
-    this.#chargeFee(fee)
+    this.#chargeFee(fee, account)
   }
 
   /** 落一笔玩家对玩家的成交；返回吃到的两方（用于给远端账户 +1 流水号）。 */
@@ -2578,7 +2681,8 @@ class FuturesStore {
     const paidFee = Math.min(fee, Math.max(0, gross))
     const credit = Math.max(0, roundCoin(gross - fee))
     const hole = roundCoin(Math.max(0, -gross) + Math.max(0, fee - Math.max(0, gross)))
-    const covered = this.#coverHole(hole)
+    // 1.10.0：同上——纸面账户强平不花真钱保险基金。
+    const covered = this.#accountModeOf(account) === 'shadow' ? { paid: 0, owed: 0 } : this.#coverHole(hole)
 
     const index = account.positions.findIndex((item) => item.id === position.id)
     if (index >= 0) account.positions.splice(index, 1)
@@ -2586,7 +2690,7 @@ class FuturesStore {
       this.#state.balance = roundCoin(this.#state.balance + credit)
       this.#state.marginUsed = this.#recomputeMarginUsed()
       this.#state.tradedAt = hit.at
-      if (paidFee > 0) this.#chargeFee(paidFee)
+      if (paidFee > 0) this.#chargeFee(paidFee, this.#state)
       this.#bookPnl(hit.pnl, hit.at)
       this.#recordTrade({
         at: hit.at,
@@ -2602,7 +2706,7 @@ class FuturesStore {
     } else {
       account.balance = roundCoin(account.balance + credit)
       account.marginUsed = this.#recomputeFor(account)
-      if (paidFee > 0) this.#chargeFee(paidFee)
+      if (paidFee > 0) this.#chargeFee(paidFee, account)
       this.#recordRemoteTrade(account, {
         at: hit.at,
         crop: position.crop,
@@ -2743,7 +2847,9 @@ class FuturesStore {
       trades: (account.trades ?? []).slice(0, FUTURES_VIEW_TRADES).map((trade) => ({ ...trade })),
       seq: account.lastSeq,
       epoch: this.#state.epoch,
-      pending: roundCoin(account.pending ?? 0)
+      pending: roundCoin(account.pending ?? 0),
+      // 1.10.0：这个账户自己的档位（peer 窗口据此显示「真钱 / 纸面」）。
+      accountMode: this.#accountModeOf(account)
     }
   }
 
@@ -2807,7 +2913,12 @@ class FuturesStore {
     if (account.trades.length > FUTURES_TRADE_LIMIT) account.trades.length = FUTURES_TRADE_LIMIT
   }
 
-  #chargeFee (fee) {
+  /**
+   * 记一笔手续费的分配。1.10.0：纸面账户（`shadow`）的手续费是纸面的，不能流进
+   * 保险基金和销毁桶——那两个桶装的是真钱，纸面费进来等于凭空铸币。
+   */
+  #chargeFee (fee, account = null) {
+    if (account !== null && this.#accountModeOf(account) === 'shadow') return
     const split = feeSplitOf(fee)
     this.#state.fees.insurance = roundCoin(this.#state.fees.insurance + split.insurance)
     this.#state.fees.burned = roundCoin(this.#state.fees.burned + split.burned)
@@ -2831,6 +2942,7 @@ class FuturesStore {
       marginUsed: roundCoin(this.#state.marginUsed),
       equity: roundCoin(this.#state.balance + this.#state.marginUsed),
       mode: this.modeOf(),
+      accountMode: this.accountMode(),
       pending: roundCoin(this.#state.pending),
       disabled: this.#state.disabled
     }

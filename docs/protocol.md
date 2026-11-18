@@ -94,15 +94,17 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "trades": [{ "at": 1700000000000, "crop": "tomato", "contract": "tomato-20261117",
                "side": "short", "lots": 1, "price": 4.87, "fee": 0.49,
                "kind": "liquidation" }],
-  "insurance": 3.2, "shortfall": 0.8, "mode": "shadow", "pending": 0 }
+  "insurance": 3.2, "shortfall": 0.8, "mode": "live", "accountMode": "live", "pending": 0 }
 { "v": 1, "type": "futures-sync", "deviceId": "<uuid>", "at": 1700000000000,
   "epoch": "<uuid>", "lastSeq": 7 }
+{ "v": 1, "type": "futures-mode", "deviceId": "<uuid>", "at": 1700000000000,
+  "accountMode": "live" }
 ```
 
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -150,12 +152,13 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `orders`（挂单） | `futures-settle` | 可选，缺省 = 空盘口；最多 `8` 条 `{ id, crop, contract, side, price, lots, lotsLeft, leverage, marginFrozen, at }`。`lots` 是原始张数、`lotsLeft` 是剩余张数（1..`lots`），`price` 是到分的正数，`marginFrozen` 是剩余部分压着的保证金；坏一条整包丢 |
 | `trades`（成交） | `futures-settle` | 可选，缺省 = 空；最多 `8` 条 `{ at, crop, contract, side, lots, price, fee, kind }`。`kind` 只认 `open` / `close` / `delivery` / `convert` / `liquidation` / `mode`；`delivery` 额外带 `deliveryFee`（到分、≥0）。`mode` 是灰度切换的审计流水，只带 `{ at, kind:'mode', note:'off'\|'shadow'\|'live', lots:0, price:0, fee:0 }`，没有 `crop`/`contract`/`side`。`side` 记的是**成交那一腿**（多单平仓记 `short`）；`liquidation` 的 `price` 就是强平触发价、`fee` 是实际收到的费用。坏一条整包丢 |
 | `insurance` / `shortfall` | `futures-settle` | 可选，缺省 `0`；保险基金余额与累计欠账，到分的金币数（≥0）。它们是**房主账本的全局数**，peer 只显示不参与计算（票 97） |
-| `mode` | `futures-settle` | 可选，缺省 `shadow`；房主当前的灰度模式，只能是 `off` / `shadow` / `live`。peer 以它决定窗口文案与是否跟随房主停发报文（票 98） |
+| `mode` | `futures-settle` | 可选，缺省 `shadow`；市场闸门（房主那台的开关），只能是 `off` / `shadow` / `live`。peer 以它决定是否跟随房主停发报文（票 98） |
+| `accountMode` | `futures-settle`、`futures-mode` | 可选，缺省 `null`（= 沿用本地选择）；这个**账户自己**的档位，只认 `shadow`（纸面）/ `live`（真钱）。settle 里由房主回传，`futures-mode` 里由 peer 申报（1.10.0） |
 | `pending` | `futures-settle` | 可选，缺省 `0`；该账户留在托管账、等待下次提取的金币数（到分，≥0）。提现撞农场 1,000,000 上限时产生（票 98） |
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
-`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 5 种 `futures-*`）旧端不认识时整包
+`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 6 种 `futures-*`）旧端不认识时整包
 静默丢弃，既不回复也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
@@ -953,11 +956,16 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 8. **窗口动作**：peer 点 `futures-deposit` / `futures-open` / `futures-close` / `futures-place` /
    `futures-cancel` 只发指令，回 `{ ok: true, pending: true }`，等房主下一拍 settle 才改显示；
    `futures-withdraw` 仍是房主本机动作（只有房主能提自己账上的钱）。
-9. **灰度与回滚（票 98）**：`futures-mode` 只能由房主切换，body `{ mode: 'off'|'shadow'|'live' }`；
-   切换会在 `trades` 里写一条 `kind:'mode'` 审计流水。`futures-rollback` 先按当前公允价强平全部仓位，
+9. **开市/关市与账户档位（票 98、1.10.0）**：市场闸门只由房主切换（HTTP 动作 `futures-mode`，
+   body `{ mode: 'off'|'live' }`）；谁玩真钱由每个账户自己定：任何账户都能发 `futures-account-mode`
+   动作切自己的 `accountMode`（`shadow` 纸面 / `live` 真钱），peer 再以报文 `futures-mode`
+   `{ accountMode }` 报给房主，房主据此记账并把档位随 settle 回传。纸面与真钱是两本账：
+   撮合按档位分组，纸面单只跟做市商成交、永远不会和真钱单交叉；纸面手续费与亏空不进真钱保险基金、
+   也不记 `shortfall`。切档会在 `trades` 里写一条 `kind:'mode'` 审计流水。
+   `futures-rollback` 先按当前公允价强平全部仓位，
    再把托管余额逐笔退回各人农场（撞 1,000,000 上限的部分留在 `pending`），最后落盘 `disabled:true`、
    模式置 `off`；数据保留不删。`futures-reconcile` 返回 `{ farmCoins, custodyTotal, positionsNotional, diff }`，
-   影子模式 `diff` 恒为 0；`off` 时入站 `futures-*` 静默丢弃、出站不发。
+   纸面账户的流动 `diff` 恒为 0；`off` 时入站 `futures-*` 静默丢弃、出站不发。
 
 ### 限额与边界
 

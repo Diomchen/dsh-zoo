@@ -228,6 +228,7 @@ function futuresPayload (type, deviceId) {
   if (type === 'futures-order') return { ...base, kind: 'deposit', coins: 5 }
   if (type === 'futures-cancel') return { ...base, orderId: randomUUID() }
   if (type === 'futures-sync') return { ...base, epoch: 'e1', lastSeq: 3 }
+  if (type === 'futures-mode') return { ...base, accountMode: 'live' }
   return { ...base, epoch: 'e1', seq: 3, balance: 10, marginUsed: 0, delta: 0, positions: [], orders: [], trades: [], insurance: 0, shortfall: 0 }
 }
 
@@ -236,8 +237,9 @@ function futuresKeys (type) {
     'futures-hello': ['v', 'type', 'deviceId', 'at'],
     'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
     'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
-    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'pending'],
-    'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq']
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'mode', 'accountMode', 'pending'],
+    'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq'],
+    'futures-mode': ['v', 'type', 'deviceId', 'at', 'accountMode']
   }[type]
 }
 
@@ -757,7 +759,9 @@ test('默认参数：发现 5 秒、心跳 2 秒、行情 30 秒/新鲜 2 分钟
     'futures-order',
     'futures-cancel',
     'futures-settle',
-    'futures-sync'
+    'futures-sync',
+    // 1.10.0：账户自己申报档位（真钱/纸面），房主据此记账
+    'futures-mode'
   ])
 })
 
@@ -1200,6 +1204,8 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     shortfall: 0,
     // 票 98：模式缺省 shadow、待提取缺省 0。
     mode: 'shadow',
+    // 1.10.0：账户档位可选，缺省 null。
+    accountMode: null,
     pending: 0
   })
 

@@ -98,6 +98,7 @@ function sampleView () {
     now: NOW,
     epoch: 'e1',
     mode: 'live',
+    accountMode: 'live',
     limits: { leverages: [1, 3, 10, 20] },
     crops,
     quotes,
@@ -145,7 +146,7 @@ test('desktop/futures.js 加载不炸，推一份 view 能画到 DOM 上', () =>
   assert.equal(document.getElementById('trades').children.length, 1)
   assert.equal(document.getElementById('quotes').children.length, 2)
   assert.equal(document.getElementById('countdown').textContent.includes(':'), true)
-  assert.equal(document.getElementById('modeChip').textContent, '真钱')
+  assert.equal(document.getElementById('accountChip').textContent, '真钱')
   assert.equal(submitted.length, 0)
 })
 
