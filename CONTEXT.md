@@ -33,7 +33,7 @@
 
 盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪”同义。
 
-期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 影子模式”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
+期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
 
 ## Language
 
@@ -487,14 +487,20 @@ _Avoid_: 逐笔结算, 清算, clearing, settlement batch
 基金空了就记账（`shortfall`）不追债——亏损仍然以保证金为限，余额永不为负。
 _Avoid_: 风险准备金, 公益金, reserve fund
 
-**影子模式 (Shadow Mode)**：
-灰度第一阶段：撮合、结算、强平全跑，但钱只在托管账里动，不写 `farm.json`。
-日额上限这时是 0，只用来观察和对账（记账流水 vs 农场硬币的差额必须为 0）。
-_Avoid_: 模拟盘, 测试模式, dry run, sandbox
+**账户档位 (Account Mode)**：
+每个账户自己选的结算口径：`shadow`（纸面，缺省）或 `live`（真钱）。
+房主不管别人玩不玩真钱，只保留开市/关市这道全局闸门；纸面账户照样能开仓挂单，
+但只跟做市商成交，纸面手续费与亏空不进真钱保险基金。
+_Avoid_: 模式, mode（那是市场闸门 `off`/`live`）, 灰度档
+
+**纸面账户 (Paper Account)**：
+`accountMode: 'shadow'` 的账户：撮合、盯市、强平、交割全跑，钱只在托管账里动，不写自己的 `farm.json`。
+日额与持仓名义上限跟真钱账户一样，只是数是纸面的。
+_Avoid_: 影子模式（旧名，指整台机器都在纸面）, 模拟盘, 测试模式, dry run
 
 **日额 (Daily Cap)**：
-单个账户一天能开的仓与挂单的名义总额（默认 5,000 币，本地 00:00 归零）；
-影子模式下为 0。和它并列的是同时持仓名义上限（20,000 币）。
+单个账户一天能开的仓与挂单的名义总额（默认 5,000 币，本地 00:00 归零）。
+纸面账户同样有 5,000 名义的纸面日额。和它并列的是同时持仓名义上限（20,000 币）。
 _Avoid_: 限额, 额度, quota
 
 **待提取 (Pending Withdrawal)**：

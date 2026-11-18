@@ -23,7 +23,9 @@
     draft: { side: 'long', margin: 50, leverage: 20, cropId: null },
     composing: false,
     askedRefreshAt: 0,
-    busy: false
+    busy: false,
+    // 1.10.0：上一拍画出来的账户档位（切换按钮用它算「下一档」）。
+    account: null
   }
 
   function toast (text) {
@@ -177,27 +179,36 @@
     el('ordersEmpty').hidden = rows.length > 0
   }
 
-  /** 票 98：三档灰度条。老版本 payload 没有 `mode` 就整行藏掉，窗口不该因此变灰。 */
+  /**
+   * 1.10.0：档位条。左边是**这本账**的档位（纸面/真钱），旁边一颗切换按钮；
+   * 房主多一条开市/关市与回滚。老版本 payload 没有账户档位就整行藏掉。
+   */
   function paintMode (built) {
     const bar = el('modebar')
+    const account = built.account
     const mode = built.mode
-    if (!mode || typeof mode.kind !== 'string') {
+    if (!account || typeof account.kind !== 'string') {
       bar.hidden = true
       return
     }
     bar.hidden = false
-    const chip = el('modeChip')
-    chip.textContent = mode.label ?? '—'
-    chip.className = 'chip ' + mode.kind
-    el('modeText').textContent = mode.text ?? ''
+    state.account = account
+    const chip = el('accountChip')
+    chip.textContent = account.label ?? '—'
+    chip.className = 'chip ' + account.kind
+    const closed = mode !== null && mode.kind === 'off'
+    el('accountText').textContent = closed ? (mode.text || '') : (account.text ?? '')
+    const toggle = el('accountSwitch')
+    toggle.textContent = account.toggleLabel ?? '切档'
+    toggle.disabled = built.canSwitchAccount !== true
     el('caps').textContent = typeof built.capsLine === 'string' ? built.capsLine : ''
     const pending = typeof built.pendingLine === 'string' ? built.pendingLine : ''
     el('pending').textContent = pending
     el('pending').hidden = pending === ''
     el('modeSwitch').hidden = built.isHost !== true
-    const select = el('modeSelect')
-    if (document.activeElement !== select) select.value = mode.kind
-    el('applyMode').disabled = built.isHost !== true
+    // 关市按钮只在开市时可点，开市按钮只在关市时可点。
+    el('closeMarket').disabled = built.isHost !== true || closed
+    el('openMarket').disabled = built.isHost !== true || !closed
     el('rollback').disabled = built.isHost !== true
   }
 
@@ -397,13 +408,30 @@
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 
-  el('applyMode').addEventListener('click', () => {
+  // 1.10.0：切自己的档位。切到真钱要确认一次——那之后充提都动农场硬币。
+  el('accountSwitch').addEventListener('click', () => {
     if (state.busy) return
-    const mode = el('modeSelect').value
-    if (mode !== 'off' && mode !== 'shadow' && mode !== 'live') return
-    if (mode === 'live' && !window.confirm('切到真钱档？切完邻居就能用真硬币下单了。')) return
+    const account = state.account
+    if (!account || (account.next !== 'live' && account.next !== 'shadow')) return
+    if (account.next === 'live' && !window.confirm('把这本账切到真钱？之后充值/提现都动农场硬币，盈亏也是真的。')) return
     state.busy = true
-    bridge.submit({ action: 'futures-mode', mode })
+    bridge.submit({ action: 'futures-account-mode', accountMode: account.next })
+    setTimeout(() => { state.busy = false; render() }, 3000)
+  })
+
+  // 房主：开市 / 关市（关市会停掉所有人的交易，但不退余额——回滚才退）。
+  el('closeMarket').addEventListener('click', () => {
+    if (state.busy) return
+    if (!window.confirm('关市会让所有人立刻不能交易（余额留在托管里）。继续？')) return
+    state.busy = true
+    bridge.submit({ action: 'futures-mode', mode: 'off' })
+    setTimeout(() => { state.busy = false; render() }, 3000)
+  })
+
+  el('openMarket').addEventListener('click', () => {
+    if (state.busy) return
+    state.busy = true
+    bridge.submit({ action: 'futures-mode', mode: 'live' })
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
 

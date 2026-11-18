@@ -97,30 +97,32 @@ function positionSeed (margin, price) {
   }
 }
 
-test('票 98：缺省是 shadow，充值提现不碰农场，开仓只动托管', async (t) => {
+test('1.10.0：缺省档位是纸面，充值不碰农场，但纸面照样能开仓', async (t) => {
   const { store, farm } = await makeStore(t)
   const view = store.snapshot({ at: NOW })
-  assert.equal(view.mode, 'shadow')
-  assert.equal(view.session.kind, 'shadow')
-  assert.equal(view.session.text, '影子模式：只记账，不动农场硬币')
+  // 市场闸门还是开着的；「纸面/真钱」是账户自己的事，不再顶替交易阶段。
+  assert.equal(view.accountMode, 'shadow')
+  assert.equal(view.session.kind, 'trading')
 
   const funded = await store.deposit(5000)
   assert.equal(funded.ok, true)
-  assert.equal(farm.state.coins, 500, '影子充值不花农场硬币')
+  assert.equal(farm.state.coins, 500, '纸面充值不花农场硬币')
   assert.equal(store.snapshot().balance, 5000)
 
+  // 纸面账户也有满额名义，只跟做市商成交，不动农场硬币。
   const opened = await store.open({ crop: CROP, side: 'long', margin: 50, leverage: 1, at: NOW })
-  // 影子模式日额上限 0：新开仓一律 daily-cap，不会走到扣款。
-  assert.equal(opened.ok, false)
-  assert.equal(opened.error, 'daily-cap')
-  assert.equal(store.snapshot().balance, 5000)
+  assert.equal(opened.ok, true)
+  assert.equal(farm.state.coins, 500)
+  assert.equal(store.snapshot().positions.length, 1)
 
+  const beforeWithdraw = store.snapshot().balance
   const paid = await store.withdraw(30)
   assert.equal(paid.ok, true)
   assert.equal(paid.credited, 30)
   assert.equal(paid.pending, 0)
-  assert.equal(farm.state.coins, 500, '影子提现不加农场硬币')
-  assert.equal(store.snapshot().balance, 4970)
+  assert.equal(farm.state.coins, 500, '纸面提现不加农场硬币')
+  // 开仓已经花掉保证金与手续费，提现只再减 30。
+  assert.equal(store.snapshot().balance, Math.round((beforeWithdraw - 30) * 100) / 100)
 })
 
 test('票 98：off 拒绝一切期货动作，窗口显示「期货未开放」', async (t) => {
@@ -250,7 +252,7 @@ test('票 98：持仓名义 19,999 通过、20,000 拒', async (t) => {
   assert.equal(store.snapshot({ at: NOW }).positions.length, 2, '拒单不建仓')
 })
 
-test('票 98：影子模式日额上限为 0，新挂单也一律 daily-cap', async (t) => {
+test('1.10.0：纸面账户也能挂单，只是只跟做市商成交', async (t) => {
   const { store } = await makeStore(t)
   await store.deposit(5000)
   const placed = await store.place({
@@ -261,10 +263,9 @@ test('票 98：影子模式日额上限为 0，新挂单也一律 daily-cap', as
     leverage: 1,
     at: NOW
   })
-  assert.equal(placed.ok, false)
-  assert.equal(placed.error, 'daily-cap')
-  assert.equal(placed.notice, '今日交易额已到上限。')
-  assert.equal(store.snapshot().orders.length, 0)
+  assert.equal(placed.ok, true, JSON.stringify(placed))
+  assert.equal(store.snapshot().orders.length, 1)
+  assert.equal(store.snapshot().accountMode, 'shadow')
 })
 
 test('票 98：回滚把托管余额逐笔退回农场，之后不能再开仓', async (t) => {

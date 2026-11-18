@@ -56,6 +56,17 @@ export const FUTURES_ORDER_KINDS = Object.freeze(['open', 'close', 'deposit', 'p
  */
 export const FUTURES_MODES = Object.freeze(['off', 'shadow', 'live'])
 export const FUTURES_DEFAULT_MODE = 'shadow'
+/**
+ * 1.10.0：档位从「市场级」下放到「账户级」。房主只剩「开市 / 关市」这一道全局闸门
+ * （`FUTURES_MODES` 里的 `off`），能不能动真钱由每个账户自己决定——谁都不想玩真钱
+ * 是他的自由，别人的选择也不该把他锁在纸面里。
+ */
+export const FUTURES_ACCOUNT_MODES = Object.freeze(['shadow', 'live'])
+export const FUTURES_DEFAULT_ACCOUNT_MODE = 'shadow'
+
+export function isFuturesAccountMode (value) {
+  return FUTURES_ACCOUNT_MODES.includes(value)
+}
 /** 票 98：单账户一个自然日的**新开仓/新挂单**名义上限（影子模式的日额是 0）。 */
 export const DAILY_NOTIONAL_CAP = 5000
 /** 票 98：单账户同时持有的仓位名义 + 挂单冻结名义上限。 */

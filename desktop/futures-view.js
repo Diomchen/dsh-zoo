@@ -436,15 +436,37 @@
   }
 
   /**
-   * 票 98：三档灰度。宿主没下发 `mode` 时按「已上线」画，老版本 payload 不至于整窗变灰；
-   * 存档里 `disabled === true`（回滚过）一律当 `off`。
+   * 票 98：市场闸门。房主只留「关市 / 开市」这一道；档位（真钱/纸面）是每个账户
+   * 自己的事，见 `accountModeOf`。存档里 `disabled === true`（回滚过）一律当 `off`。
    */
   function modeOf (view) {
     if (view?.disabled === true) return { kind: 'off', label: '已回滚', text: '回滚过：期货已关闭，托管余额已退回农场。' }
     const mode = view?.mode
     if (mode === 'off') return { kind: 'off', label: '未开放', text: '期货未开放：房主还没打开这一层。' }
-    if (mode === 'shadow') return { kind: 'shadow', label: '影子', text: '影子模式：撮合与结算照跑，但只记账，不动农场硬币。' }
-    return { kind: 'live', label: '真钱', text: '' }
+    return { kind: 'open', label: '开市', text: '' }
+  }
+
+  /**
+   * 1.10.0：这本账自己的档位——自己决定跟不跟真钱玩，房主管不着。
+   * 纸面不是看客：它有独立的一本账、独立盈亏，只是只跟做市商成交。
+   */
+  function accountModeOf (view) {
+    if (view?.accountMode === 'live') {
+      return {
+        kind: 'live',
+        label: '真钱',
+        text: '这本账用真硬币：充值/提现都动农场，盈亏也是真的。',
+        toggleLabel: '切到纸面',
+        next: 'shadow'
+      }
+    }
+    return {
+      kind: 'shadow',
+      label: '纸面',
+      text: '这本账是纸面的：撮合与结算照跑，但不动农场硬币，只跟做市商成交。',
+      toggleLabel: '切到真钱',
+      next: 'live'
+    }
   }
 
   /** 敞口限额一行：今日已用 / 上限，持仓名义已用 / 上限；影子模式写「日额 0」。 */
@@ -508,9 +530,12 @@
       countdown: tick,
       header: header(view),
       mode,
-      /** 房主才能看见切档与回滚按钮；peer 只读。 */
+      account: accountModeOf(view),
+      /** 房主才能关市 / 回滚；peer 只读。 */
       isHost: isHostOf(view),
-      canTrade: mode.kind === 'live',
+      /** 1.10.0：档位是每个人自己的，只有关市时才不能动。 */
+      canSwitchAccount: mode.kind !== 'off',
+      canTrade: mode.kind !== 'off',
       capsLine: capsLine(view),
       pendingLine: pendingLine(view),
       quotes: quoteRows(view),
@@ -555,6 +580,7 @@
     deliveryLine,
     sessionLine,
     modeOf,
+    accountModeOf,
     capsLine,
     pendingLine,
     isHostOf,

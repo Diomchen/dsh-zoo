@@ -387,6 +387,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     'futures-cancel',
     'futures-convert',
     'futures-mode',
+    'futures-account-mode',
     'futures-rollback',
     'futures-refresh'
   ]
@@ -406,8 +407,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const FUTURES_SESSION_KINDS = ['trading', 'expired', 'weekend']
   /** 成交类型白名单（票 96/98）：开/平/交割/转现货/强平/切档。 */
   const FUTURES_TRADE_KINDS = ['open', 'close', 'delivery', 'convert', 'liquidation', 'mode']
-  /** 灰度档位（票 98）：关 / 影子 / 真钱。 */
+  /** 市场闸门（票 98）：关 / 影子 / 真钱。1.10.0 起 shadow 只是历史值，实际按账户档位走。 */
   const FUTURES_MODES = ['off', 'shadow', 'live']
+  /** 1.10.0：账户自己的档位——纸面还是真钱，每个账户自己选。 */
+  const FUTURES_ACCOUNT_MODES = ['shadow', 'live']
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS, FUTURES_SUBMIT_ACTIONS)
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
@@ -2476,6 +2479,21 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       marginUsed: num(raw.marginUsed, 0),
       equity: num(raw.equity, 0),
       closed: num(raw.closed, 0),
+      // 票 98 / 1.10.0：市场闸门（off/开市）与**本账户自己的档位**（真钱/纸面）。
+      // 这两个字段以前被窗口的白名单漏掉，导致徽章永远画成「真钱」、限额行永远空着。
+      mode: FUTURES_MODES.includes(raw.mode) ? raw.mode : null,
+      accountMode: FUTURES_ACCOUNT_MODES.includes(raw.accountMode) ? raw.accountMode : 'shadow',
+      disabled: raw.disabled === true,
+      pending: nonNegative(raw.pending),
+      dayCap: num(raw.dayCap),
+      dayNotional: nonNegative(raw.dayNotional),
+      positionCap: num(raw.positionCap),
+      // peer 视角：房主还没回执时窗口要能说清「等对端」。
+      role: raw.role === 'peer' ? 'peer' : 'host',
+      hostId: text(raw.hostId),
+      peer: raw.peer !== null && typeof raw.peer === 'object' && !Array.isArray(raw.peer)
+        ? { ready: raw.peer.ready === true, text: text(raw.peer.text) ?? '' }
+        : null,
       positionCount: num(raw.positionCount, positions.length),
       positions,
       orders,
@@ -2522,6 +2540,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (action === 'futures-mode') {
       const mode = FUTURES_MODES.includes(raw.mode) ? raw.mode : null
       return mode === null ? null : { action, mode }
+    }
+    // 1.10.0：切自己的档位（房主关市时才不给切）。
+    if (action === 'futures-account-mode') {
+      const accountMode = FUTURES_ACCOUNT_MODES.includes(raw.accountMode) ? raw.accountMode : null
+      return accountMode === null ? null : { action, accountMode }
     }
     if (action === 'futures-deposit' || action === 'futures-withdraw') {
       const coins = strictBoardInt(raw.coins, 1, MAX_FARM_COINS)

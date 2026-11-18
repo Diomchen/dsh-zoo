@@ -161,6 +161,7 @@ import {
   encodeFuturesCancel,
   encodeFuturesSettle,
   encodeFuturesSync,
+  encodeFuturesMode,
   normalizeSkinId,
   PEER_LOST_MS,
   VISIT_MAX_MS,
@@ -1424,6 +1425,21 @@ export function createService (ctx, options = {}) {
         broadcastFuturesSettle()
       }
       return result
+    }
+    // 1.10.0：切**自己**的档位。房主就地改；peer 先本地记账再申报给房主（钱在
+    // 自己的农场上扣，房主只决定这本账按真钱还是纸面结算）。
+    if (action === 'futures-account-mode') {
+      if (futures === null) return { ok: false, error: 'starting' }
+      const local = await futures.setAccountMode(body?.accountMode, futuresClock())
+      if (local?.ok !== true) return local
+      if (isFuturesHost()) {
+        refreshFuturesWindow()
+        broadcastFuturesSettle()
+        return local
+      }
+      const sent = sendFuturesMode(local.accountMode)
+      refreshFuturesWindow()
+      return { ...local, sent }
     }
     // 票 98：回滚——强平全部仓位、托管余额退回农场、存档 disabled 并切 off。
     if (action === 'futures-rollback') {
@@ -5297,6 +5313,9 @@ export function createService (ctx, options = {}) {
             } else if (packet.type === 'futures-cancel') {
               // 票 95：撤单。房主按 remotes[peer].orders 撤；peer 收到（正常不会）就当没这回事。
               void handleFuturesCancel(packet, from)
+            } else if (packet.type === 'futures-mode') {
+              // 1.10.0：邻居申报自己的档位（真钱/纸面）。只有房主受账。
+              void handleFuturesMode(packet, from)
             } else {
               room.observeBeacon(packet)
               // 票 59：beacon 里带着邻居的作物目录指纹，不一致就问一次。
@@ -6632,6 +6651,8 @@ export function createService (ctx, options = {}) {
       orders,
       // 票 98：模式与待提取余额随快照下发，peer 窗口据此显示 shadow/off 与「待提取」。
       mode: futures.modeOf(),
+      // 1.10.0：这个账户自己的档位（真钱/纸面），peer 窗口的徽章以它为准。
+      accountMode: account.accountMode,
       pending: account.pending ?? 0,
       insurance: fund.insurance,
       shortfall: fund.shortfall
@@ -6665,6 +6686,31 @@ export function createService (ctx, options = {}) {
       return discovery.sendTo(deviceId, data) === true
     } catch (error) {
       warnOnce('futures-settle-send', '期货账目发不出去：' + message(error))
+      return false
+    }
+  }
+
+  /** 1.10.0：peer 把自己选的档位申报给房主；发不出去就等下一拍 sync 重来。 */
+  function sendFuturesMode (accountMode) {
+    if (disposed || futures === null) return false
+    const host = futuresHostId()
+    if (host === null || host === room.snapshot().self.deviceId) return false
+    let data
+    try {
+      data = encodeFuturesMode({
+        deviceId: room.snapshot().self.deviceId,
+        at: futuresClock(),
+        accountMode,
+        now: Date.now()
+      })
+    } catch (error) {
+      warnOnce('futures-mode-send', '账户档位发不出去：' + message(error))
+      return false
+    }
+    try {
+      return discovery.sendTo(host, data) === true
+    } catch (error) {
+      warnOnce('futures-mode-send', '账户档位发不出去：' + message(error))
       return false
     }
   }
@@ -6787,6 +6833,28 @@ export function createService (ctx, options = {}) {
     sendFuturesSettle(packet.deviceId, { delta: roundCoin(Number(result.released) || 0) })
   }
 
+  /**
+   * 1.10.0：对端申报自己的档位。钱在对方自己的农场上扣，房主只决定这本账按真钱
+   * 还是纸面结算；受理后立刻回一份新账目，让对方的窗口马上看到结果。
+   */
+  async function handleFuturesMode (packet, from) {
+    if (disposed || futures === null || !isFuturesHost()) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    if (!futuresBindPeer(packet.deviceId, from)) return
+    let result = null
+    try {
+      result = await futures.setRemoteAccountMode(packet.deviceId, packet.accountMode, futuresClock())
+    } catch (error) {
+      warnOnce('futures-mode', '账户档位没能落账：' + message(error))
+      return
+    }
+    if (result?.ok !== true) {
+      warnOnce('futures-mode-' + String(result?.error), '账户档位被拒：' + String(result?.error))
+      return
+    }
+    sendFuturesSettle(packet.deviceId)
+  }
+
   /** 票 94：对端每 30 秒对一次账。房主直接回整份账户——gap 再大也不会算错。 */
   function handleFuturesSync (packet, from) {
     if (disposed || futures === null || !isFuturesHost()) return
@@ -6816,6 +6884,8 @@ export function createService (ctx, options = {}) {
         trades: packet.trades,
         // 票 98：模式跟随房主；pending 是该 peer 账户的待提取余额。
         mode: packet.mode,
+        // 1.10.0：房主账本里这个账户的档位（老房主不发 = null）。
+        accountMode: packet.accountMode ?? null,
         pending: packet.pending,
         at: futuresClock()
       })

@@ -11,6 +11,17 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.10.0 版本记录
+
+GitHub Release 正文就是 [`releases/1.10.0.md`](releases/1.10.0.md)。
+
+档位下放到账户：房主只剩开市/关市，每个账户自己选纸面（`shadow`，缺省）或真钱（`live`），
+随时可切（HTTP `futures-account-mode` 或窗口顶栏按钮），peer 以新报文 `futures-mode` 报给房主，
+房主随 `futures-settle` 回传 `accountMode`。纸面与真钱是两本账，撮合按档位分组——纸面单只跟
+做市商成交，永不吃真钱玩家的单；纸面手续费不进保险基金、亏空不记欠账。原来的「影子日额 0」
+取消，纸面也能正经交易（5,000 名义日额、20,000 持仓上限）。顺手修了窗口归一化没放行
+`mode`/`dayCap`/`peer` 等字段导致徽章与限额行永远为空的老 bug。
+
 ## 1.9.0 版本记录
 
 GitHub Release 正文就是 [`releases/1.9.0.md`](releases/1.9.0.md)。

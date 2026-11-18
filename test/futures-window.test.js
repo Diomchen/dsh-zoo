@@ -380,45 +380,47 @@ test('shared：票 98 的挂单/撤单/转现货/切档动作各有白名单', (
   assert.deepEqual(shared.normalizeFuturesAction({ action: 'futures-rollback' }), { action: 'futures-rollback' })
 })
 
-test('视图模型：影子模式先报「只记账」，不落成周末休市；限额与待提取各一行', () => {
-  const view = sampleView({
-    mode: 'shadow',
-    session: { kind: 'shadow', text: '影子模式：只记账，不动农场硬币。' },
-    quotes: {},
-    dayNotional: 0,
-    dayCap: 0,
-    positionCap: 20000,
-    pending: 30
-  })
-})
-
-test('视图模型：影子模式先报「只记账」，不落成周末休市；限额与待提取各一行', () => {
-  const built = view.build(
+test('视图模型：账户档位是纸面也能交易；关市才画成关闭', () => {
+  const draft = { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }
+  const paper = view.build(
     sampleView({
-      mode: 'shadow',
-      session: { kind: 'shadow', text: '影子模式：只记账，不动农场硬币。' },
+      mode: 'live',
+      accountMode: 'shadow',
       quotes: {},
-      dayNotional: 0,
-      dayCap: 0,
+      dayNotional: 1200,
+      dayCap: 5000,
       positionCap: 20000,
-      pending: 30
+      pending: 30,
+      balance: 1000,
+      marginUsed: 0,
+      positions: [],
+      orders: [],
+      trades: []
     }),
-    { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' },
+    draft,
     TUESDAY
   )
-  assert.equal(built.status.kind, 'shadow')
-  assert.match(built.status.text, /只记账/)
-  assert.equal(built.mode.kind, 'shadow')
-  assert.equal(built.mode.label, '影子')
-  assert.match(built.capsLine, /日额|今日/)
-  assert.match(built.pendingLine, /30/)
-  // 影子模式下不给下单：日额上限是 0，按钮该灰着。
-  assert.equal(built.canSubmit, false)
+  // 纸面不再是「看客」：它能下单，只是不碰农场硬币。
+  assert.equal(paper.account.kind, 'shadow')
+  assert.equal(paper.account.label, '纸面')
+  assert.equal(paper.account.next, 'live')
+  assert.match(paper.account.text, /纸面/)
+  assert.equal(paper.canSwitchAccount, true)
+  assert.equal(paper.canTrade, true)
+  assert.match(paper.capsLine, /今日/)
+  assert.match(paper.pendingLine, /30/)
 
-  // 关掉时一律报关闭，即使有报价——没有托管账户，画报价会让人以为能买。
-  const off = view.build(sampleView({ mode: 'off' }), { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }, TUESDAY)
+  // 真钱账户：徽章换成真钱，切换按钮指向纸面。
+  const real = view.build(sampleView({ mode: 'live', accountMode: 'live' }), draft, TUESDAY)
+  assert.equal(real.account.kind, 'live')
+  assert.equal(real.account.label, '真钱')
+  assert.equal(real.account.next, 'shadow')
+
+  // 关市时一律报关闭，即使有报价——那时候谁也不该能下单。
+  const off = view.build(sampleView({ mode: 'off' }), draft, TUESDAY)
   assert.equal(off.status.kind, 'off')
   assert.equal(off.canTrade, false)
+  assert.equal(off.canSwitchAccount, false)
 })
 
 test('shared：futures-window 命令带整份视图，缺字段有默认', () => {
@@ -600,7 +602,10 @@ test('futures-window：开窗下发整份视图；再点一次关闭；× 之后
   // 一份视图能直接交给纯视图模型画出来。
   const painted = view.build(state, { side: 'long', margin: 50, leverage: 20, cropId: state.crops[0].id }, TUESDAY)
   // 票 98：新装的实例默认影子档，窗口先报「只记账」——房主切到真钱之后才轮到余额。
-  assert.equal(painted.status.kind, 'shadow')
+  // 1.10.0：档位在账户自己身上，市场闸门只分「开市/关市」。新装的账户默认纸面。
+  assert.equal(painted.account.kind, 'shadow')
+  assert.equal(painted.mode.kind, 'open')
+  assert.equal(painted.status.kind, 'no-funds')
   assert.equal(painted.quotes.length >= 10, true)
   const live = view.build({ ...state, mode: 'live', session: null }, { side: 'long', margin: 50, leverage: 20, cropId: state.crops[0].id }, TUESDAY)
   assert.equal(live.status.kind, 'no-funds')
