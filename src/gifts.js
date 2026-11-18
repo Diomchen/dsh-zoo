@@ -307,6 +307,27 @@ class GiftStore {
   }
 
   /**
+   * 还没拆的红包，最新在前（票 79：「访客走了也一直贴着」的待拆入口用它）。
+   *
+   * 三种不再画：已经拆开（`claimedAt`）、已经退回（`returnedAt`）、过了 `PACKET_TTL_MS`。
+   *
+   * 最后一条是刻意的：过期但 `expirePackets` 还没轮到的那几百毫秒里，卡片点「拆开」只会
+   * 得到 `packet-claimed/expired` 的失败文案——画一张点了没用的卡比不画更糟。
+   * 跨过 TTL 的卡由 `expirePackets` 退回寄件人，不靠这里。
+   *
+   * `expiresAt` 一并算好：渲染端拿它显示「还剩多久退回」，不用自己再记一份 TTL。
+   */
+  pendingPackets (now = Date.now()) {
+    const at = Number.isFinite(now) && now > 0 ? now : Date.now()
+    return this.list()
+      .filter((record) => record.kind === 'packet' &&
+        record.claimedAt === 0 &&
+        record.returnedAt === 0 &&
+        at < record.receivedAt + PACKET_TTL_MS)
+      .map((record) => ({ ...record, expiresAt: record.receivedAt + PACKET_TTL_MS }))
+  }
+
+  /**
    * 收下一张字条：写 `note.txt` + `meta.json`。
    * 任何失败都只回 `{ ok:false }`，由调用方把卡片标成 failed；异常绝不冒到串门流程里。
    */

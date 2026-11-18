@@ -16,6 +16,7 @@ import {
   FARM_VERSION,
   MAX_COINS,
   MAX_FARM_LOG,
+  MAX_PACKET_LOG,
   MAX_STACK,
   PLOT_IDS,
   START_COINS,
@@ -724,6 +725,140 @@ test('noteHire / noteSettle：日志带 who/wage/hours/earned，仍然只保留�
     await store.noteHire({ who: '邻居', hours: 2, wage: 1 })
   }
   assert.equal(store.snapshot().log.length, MAX_FARM_LOG)
+})
+
+test('notePacket：红包记录带方向/步骤/内容，重启后还在；坏 step 拒绝，不动钱', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+  const coinsBefore = store.snapshot().coins
+
+  assert.equal((await store.notePacket({
+    direction: 'in',
+    event: 'arrived',
+    who: '  阿蟹 ',
+    text: '12 硬币 · 小番茄 ×2'
+  })).ok, true)
+  await store.notePacket({ direction: 'out', event: 'sent', who: '爸爸', text: '3 硬币' })
+  await store.notePacket({ direction: 'in', event: 'claimed', who: '阿蟹', text: '12 硬币 · 小番茄 ×2' })
+  await store.notePacket({ direction: 'in', event: 'returned', who: '爸爸', text: '3 硬币' })
+
+  const log = store.snapshot().log
+  assert.equal(log.length, 4)
+  assert.deepEqual(
+    log.map((entry) => [entry.kind, entry.direction, entry.event, entry.who ?? null]),
+    [
+      ['packet', 'in', 'returned', '爸爸'],
+      ['packet', 'in', 'claimed', '阿蟹'],
+      ['packet', 'out', 'sent', '爸爸'],
+      ['packet', 'in', 'arrived', '阿蟹']
+    ]
+  )
+  assert.equal(log[0].text, '3 硬币')
+  assert.equal(log[3].text, '12 硬币 · 小番茄 ×2')
+  assert.equal(log[3].qty, 0, '红包日志不记数量，钱不在这里动')
+  assert.equal(store.snapshot().coins, coinsBefore)
+
+  // 不认识的步骤直接拒绝：宁可少一条记录，也不要「记录页写了个看不懂的动作」。
+  const bad = await store.notePacket({ direction: 'in', event: 'opened', who: '阿蟹', text: '1 硬币' })
+  assert.equal(bad.ok, false)
+  assert.equal(bad.error, 'bad-action')
+
+  // 过夜：方向和内容都要从白名单里活下来（不然重开一次记录就只剩「红包」两个字）。
+  const reopened = await createFarmStore(dir, { now: clock.now })
+  const reloaded = reopened.snapshot().log
+  assert.equal(reloaded.length, 4)
+  assert.deepEqual(
+    reloaded.map((entry) => [entry.direction, entry.event, entry.text, entry.who ?? null]),
+    [
+      ['in', 'returned', '3 硬币', '爸爸'],
+      ['in', 'claimed', '12 硬币 · 小番茄 ×2', '阿蟹'],
+      ['out', 'sent', '3 硬币', '爸爸'],
+      ['in', 'arrived', '12 硬币 · 小番茄 ×2', '阿蟹']
+    ]
+  )
+})
+
+test('红包记录另存一份：流水被种下/收获挤爆了，红包记录还在（票 79 补）', async (t) => {
+  // 现场：08:35 的红包，10:08 就被自动收菜的流水挤到了第 146 条，
+  // 再过一个多小时连文件都留不住——用户「刚才还能看到，现在又没了」。
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+  await store.notePacket({ direction: 'in', event: 'claimed', who: '测试邻居', text: '2 硬币' })
+  assert.equal(store.snapshot().packetLog.length, 1)
+
+  for (let index = 0; index < MAX_FARM_LOG + 5; index += 1) {
+    await store.noteHire({ who: '邻居', hours: 2, wage: 1 })
+  }
+  const view = store.snapshot()
+  assert.equal(view.log.length, MAX_FARM_LOG)
+  assert.equal(view.log.filter((entry) => entry.kind === 'packet').length, 0, '流水里已经挤没了')
+  assert.deepEqual(
+    view.packetLog.map((entry) => [entry.kind, entry.event, entry.who, entry.text]),
+    [['packet', 'claimed', '测试邻居', '2 硬币']],
+    '红包自己那一份不受流水影响'
+  )
+
+  // 过夜：文件和重开都要在（不写进白名单/不落盘，重开一次就全丢）。
+  const raw = JSON.parse(await readFile(join(dir, FARM_FILE), 'utf8'))
+  assert.equal(raw.packetLog.length, 1)
+  const reopened = await createFarmStore(dir, { now: clock.now })
+  assert.equal(reopened.snapshot().packetLog.length, 1)
+  assert.equal(reopened.snapshot().packetLog[0].text, '2 硬币')
+})
+
+test('红包自己那一份只留最近 50 条', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createFarmStore(dir, { now: makeClock().now })
+  for (let index = 0; index < MAX_PACKET_LOG + 5; index += 1) {
+    await store.notePacket({ direction: 'out', event: 'sent', who: '爸爸', text: index + ' 硬币' })
+  }
+  const packets = store.snapshot().packetLog
+  assert.equal(packets.length, MAX_PACKET_LOG)
+  assert.equal(packets[0].text, MAX_PACKET_LOG + 4 + ' 硬币', '最新的在最前面')
+})
+
+test('老文件里只有流水：升级时把流水里的红包捞进自己那一份', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+  await store.notePacket({ direction: 'in', event: 'claimed', who: '测试邻居', text: '2 硬币' })
+  // 模拟升级前写下的 farm.json：没有 packetLog，红包只躺在 log 里。
+  const raw = JSON.parse(await readFile(join(dir, FARM_FILE), 'utf8'))
+  delete raw.packetLog
+  await writeFile(join(dir, FARM_FILE), JSON.stringify(raw, null, 2) + '\n')
+
+  const reopened = await createFarmStore(dir, { now: clock.now })
+  assert.equal(reopened.snapshot().packetLog.length, 1)
+  assert.equal(reopened.snapshot().packetLog[0].event, 'claimed')
+})
+
+test('notePacket：昵称与内容都来自网络，控制字符清掉、超长截断', async (t) => {
+  const dir = await tempDir(t)
+  const clock = makeClock()
+  const store = await createFarmStore(dir, { now: clock.now })
+
+  await store.notePacket({
+    direction: 'in',
+    event: 'arrived',
+    who: '阿\u0000蟹\u202e',
+    text: '  ' + '币'.repeat(80) + '  '
+  })
+  const entry = store.snapshot().log[0]
+  assert.equal(entry.who, '阿 蟹')
+  assert.equal(Array.from(entry.text).length, 60)
+
+  // 内容为空/坏类型就只留「谁 + 方向 + 步骤」，不写一个空字符串进文件。
+  await store.notePacket({ direction: 'out', event: 'sent', who: '爸爸', text: '   ' })
+  const bare = store.snapshot().log[0]
+  assert.equal('text' in bare, false)
+  await store.notePacket({ direction: 'out', event: 'sent' })
+  assert.equal(store.snapshot().log[0].direction, 'out')
+  assert.equal('who' in store.snapshot().log[0], false)
+  // 没写方向时按「别人给我」记：退回/收到都是这一侧，送出必须显式写 out。
+  await store.notePacket({ event: 'returned' })
+  assert.equal(store.snapshot().log[0].direction, 'in')
 })
 
 test('markHelped：生长中才可帮、+10% 不改 waterings、每块地一次、日志带 who', async (t) => {

@@ -851,6 +851,48 @@ test('文件礼物：访客身上只留 name/size，走 pending → receiving �
 })
 
 // ---------------------------------------------------------------------------
+// 票 79：红包挂在访客上（contents 原样进快照，祝福语跟着走）
+// ---------------------------------------------------------------------------
+
+test('红包礼物：访客身上留 packet 与祝福语，contents 是拷贝；拆开前状态只到 received', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  const giftId = randomUUID()
+  room.observeVisitRequest(giftVisit(id, {
+    gift: { id: giftId, kind: 'packet', packet: { coins: 12, crops: { tomato: 2 } }, note: ' 买糖  ' }
+  }), T0)
+
+  const gift = room.snapshot().visitors[0].gift
+  assert.deepEqual(gift, {
+    id: giftId,
+    kind: 'packet',
+    packet: { coins: 12, crops: { tomato: 2 }, seeds: {} },
+    note: '买糖',
+    status: 'pending'
+  })
+
+  // 快照是拷贝：改里面的作物表不会改到房间里那一份。
+  gift.packet.crops.tomato = 99
+  assert.equal(room.snapshot().visitors[0].gift.packet.crops.tomato, 2)
+
+  // 落盘成功只把状态推到 received：内容还在（卡片上要写里面装了什么）。
+  assert.equal(room.markGiftStatus(id, giftId, 'received'), true)
+  const received = room.snapshot().visitors[0].gift
+  assert.equal(received.status, 'received')
+  assert.deepEqual(received.packet, { coins: 12, crops: { tomato: 2 }, seeds: {} })
+})
+
+test('红包礼物：内容坏掉整件丢掉（不降级成字条），访客照常进门', () => {
+  const id = randomUUID()
+  const room = giftRoom(id)
+  room.observeVisitRequest(giftVisit(id, {
+    gift: { id: randomUUID(), kind: 'packet', packet: {} }
+  }), T0)
+  assert.equal(room.snapshot().visitors.length, 1)
+  assert.equal('gift' in room.snapshot().visitors[0], false)
+})
+
+// ---------------------------------------------------------------------------
 // ticket 43：按 visitId 查活跃访客（农场路由 / farm-action 的唯一授权）
 // ---------------------------------------------------------------------------
 

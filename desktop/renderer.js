@@ -1853,16 +1853,19 @@
   }
 
   /**
-   * 卡片集合完全由 scene.controls.gifts 决定：
+   * 卡片集完全由 scene.controls.gifts 决定：
    *   - 礼物没了 / 访客不在了 → 收起（访客离开时宿主自然不再输出这张卡）；
    *   - 同一 giftId 只画一张，标题/正文/状态原地更新，不重建 DOM（不打断点击）。
+   *
+   * 唯一例外是还没拆的红包（票 79）：宿主把它做成不依赖访客的常驻卡，
+   * 这里也不能因为访客走了就把它收掉——那等于没有入口。
    */
   function syncGifts () {
     const gifts = Array.isArray(scene.controls.gifts) ? scene.controls.gifts : []
     const alive = new Set()
     for (const gift of gifts) {
       // 卡片跟着访客：访客没被画出来（场景放不下/已经走了）就不单独留一张卡。
-      if (!pets.has('visitor:' + gift.deviceId)) continue
+      if (!pets.has('visitor:' + gift.deviceId) && !giftOutlivesVisitor(gift)) continue
       alive.add(gift.giftId)
       const existing = ui.gifts.get(gift.giftId)
       if (existing === undefined) ui.gifts.set(gift.giftId, buildGiftCard(gift))
@@ -1871,6 +1874,17 @@
     for (const giftId of [...ui.gifts.keys()]) {
       if (!alive.has(giftId)) hideGiftCard(giftId)
     }
+  }
+
+  /**
+   * 访客走了也留在桌面上的卡：只有**还没拆的红包**。
+   *
+   * 字条和文件是访客捎来的一句话/一件东西，看过就走；红包是「已经进了背包的一件东西」，
+   * 没拆之前一直欠着（24 小时才退回寄件人）。卡片跟着访客的话，访客一走这张卡就没了，
+   * 用户既看不到也点不到「拆开」——红包就这么躺到过期。
+   */
+  function giftOutlivesVisitor (gift) {
+    return gift.kind === 'packet' && gift.status === 'received'
   }
 
   // -------------------------------------------------------------------------
@@ -2254,13 +2268,17 @@
     }
 
     // 礼物卡插在放行卡之后：锚点是**那位访客**，不是自己（礼物是“谁捎来的”）。
+    // 访客已经走了的还没拆的红包（票 79）改锚自己——卡留在桌面上，否则这只红包再无入口。
     for (const entry of [...ui.gifts.values()]) {
       const pet = pets.get('visitor:' + entry.deviceId)
-      if (pet === undefined) {
+      let anchor = null
+      if (pet !== undefined) anchor = anchorOfPet(pet)
+      else if (giftOutlivesVisitor(entry)) anchor = promptAnchor()
+      else {
         hideGiftCard(entry.giftId)
         continue
       }
-      const rect = positionFloating(entry.el, anchorOfPet(pet), {
+      const rect = positionFloating(entry.el, anchor, {
         avoid: petRects.concat(occupied),
         gap: UI_GAP
       })

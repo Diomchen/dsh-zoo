@@ -89,6 +89,14 @@ export const MAX_COINS = 1_000_000
 export const MAX_STACK = 999
 /** 农场日志文件最多 200 条；窗口取 100，`/state` 只给最近 20 条。 */
 export const MAX_FARM_LOG = 200
+/**
+ * 红包记录单独存一份，最多 50 条。
+ *
+ * 为什么不能只靠 `log`：自动收菜一分钟就写两条流水，红包 08:35 那条不到一个半小时
+ * 就被挤出 200 条的窗口——用户上午看得到、下午再看就没了。红包本来就稀少（每天限 3 只），
+ * 单独攒一份既不挤占流水，也不会被种下/收获冲掉。
+ */
+export const MAX_PACKET_LOG = 50
 export const FARM_LOG_VIEW_LIMIT = 20
 export const FARM_LOG_WINDOW_LIMIT = 100
 /** 写盘节流：tick 有变化也最多每 30 秒落一次；动作总是立即落盘。 */
@@ -122,7 +130,14 @@ export const MAX_PLOT_VISITORS = 50
 /** 每日访客计数最多记多少位访客；超出的按最旧丢（内存/文件都有界）。 */
 export const MAX_VISIT_STATS_VISITORS = 64
 
-const LOG_KINDS = new Set(['plant', 'harvest', 'clear', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'freeze', 'thaw', 'season', 'event', 'omen'])
+const LOG_KINDS = new Set(['plant', 'harvest', 'clear', 'steal', 'help', 'hire', 'settle', 'unlock', 'wither', 'freeze', 'thaw', 'season', 'event', 'omen', 'packet'])
+/**
+ * 红包记录（票 79 补）：收/发红包写进农场「记录」页。
+ *
+ * 只记「谁、哪个方向、走到哪一步、里面装了什么」，不参与任何账本——
+ * 钱和作物在拆开那一步由 `creditPacket`/`debitPacket` 记，日志只是给人看的。
+ */
+const PACKET_LOG_EVENTS = new Set(['arrived', 'claimed', 'sent', 'returned'])
 const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/
 const WHO_CONTROL_RE = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g
 
@@ -172,7 +187,8 @@ export function initialFarmState () {
     plots: PLOT_IDS.map(emptyPlot),
     hire: { ...DEFAULT_HIRE },
     visitStats: emptyVisitStats(),
-    log: []
+    log: [],
+    packetLog: []
   }
 }
 
@@ -192,7 +208,9 @@ export function farmView (state) {
     dewEarned: state.dewEarned,
     hire: { ...state.hire },
     // 完整日志（≤200）；`/state` 只取最近 20，农场小窗的记录页要的是完整的一份。
-    log: state.log.map(copyLogEntry)
+    log: state.log.map(copyLogEntry),
+    // 红包单独攒的一份（≤50）：流水里埋不住，被挤出去也还在。
+    packetLog: state.packetLog.map(copyLogEntry)
   }
 }
 
@@ -249,6 +267,23 @@ function sanitizeWho (value) {
   if (clean === '') return null
   const chars = Array.from(clean)
   return chars.length > 32 ? chars.slice(0, 32).join('') : clean
+}
+
+/**
+ * 红包记录里「装了什么」的那一行（票 79 补）。
+ *
+ * 内容来自网络（寄件人写进红包的东西 + 作物目名），所以照 `sanitizeWho` 的办法
+ * 只留可显示的字并截断：60 码点够写「200 硬币 · 小番茄 ×20 · 稻米种子 ×20」。
+ */
+function sanitizeLogText (value) {
+  if (typeof value !== 'string') return null
+  const clean = value
+    .replace(WHO_CONTROL_RE, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (clean === '') return null
+  const chars = Array.from(clean)
+  return chars.length > 60 ? chars.slice(0, 60).join('') : clean
 }
 
 function errorName (error) {
@@ -593,6 +628,10 @@ function normalizeLogEntry (value) {
   const plot = finiteNumber(value.plot)
   const wither = finiteNumber(value.wither)
   const freeze = finiteNumber(value.freeze)
+  // 票 79 补：红包记录要能过夜——不写进白名单，重开一次就全丢。
+  const direction = value.direction === 'in' || value.direction === 'out' ? value.direction : null
+  const event = value.kind === 'packet' && PACKET_LOG_EVENTS.has(value.event) ? value.event : null
+  const text = value.kind === 'packet' ? sanitizeLogText(value.text) : null
   return {
     at,
     kind: value.kind,
@@ -605,7 +644,10 @@ function normalizeLogEntry (value) {
     ...(cost === null ? {} : { cost: Math.min(MAX_COINS, Math.max(0, Math.floor(cost))) }),
     ...(plot === null ? {} : { plot: Math.min(MAX_PLOTS, Math.max(1, Math.floor(plot))) }),
     ...(wither === null ? {} : { wither: Math.min(MAX_PLOTS, Math.max(0, Math.floor(wither))) }),
-    ...(freeze === null ? {} : { freeze: Math.min(MAX_PLOTS, Math.max(0, Math.floor(freeze))) })
+    ...(freeze === null ? {} : { freeze: Math.min(MAX_PLOTS, Math.max(0, Math.floor(freeze))) }),
+    ...(event === null ? {} : { event }),
+    ...(direction === null ? {} : { direction }),
+    ...(text === null ? {} : { text })
   }
 }
 
@@ -629,6 +671,40 @@ function normalizeLog (value) {
     log.length = MAX_FARM_LOG
   }
   return { log, repaired }
+}
+
+/**
+ * 红包记录那一份（≤50）。
+ *
+ * 老文件里只有 `log`、没有 `packetLog`：升级时要能把流水里剩下的红包捞回来，
+ * 否则已经发生过的红包会一夜之间全消失。同一件事记了两次（`at` + `event` + `who` 相同）只留一条。
+ */
+function normalizePacketLog (value, logEntries) {
+  const candidates = []
+  if (Array.isArray(value)) candidates.push(...value)
+  for (const entry of logEntries) {
+    if (entry.kind === 'packet') candidates.push(entry)
+  }
+  const packets = []
+  const seen = new Set()
+  let repaired = 0
+  for (const candidate of candidates) {
+    const entry = normalizeLogEntry(candidate)
+    if (entry === null || entry.kind !== 'packet') {
+      repaired += 1
+      continue
+    }
+    const key = [entry.at, entry.event ?? '', entry.direction ?? '', entry.who ?? ''].join('|')
+    if (seen.has(key)) continue
+    seen.add(key)
+    packets.push(entry)
+  }
+  packets.sort((left, right) => right.at - left.at)
+  if (packets.length > MAX_PACKET_LOG) {
+    repaired += packets.length - MAX_PACKET_LOG
+    packets.length = MAX_PACKET_LOG
+  }
+  return { packetLog: packets, repaired }
 }
 
 /**
@@ -656,9 +732,10 @@ export function normalizeFarmFile (value) {
   const hire = normalizeHire(value.hire)
   const visitStats = normalizeVisitStats(value.visitStats)
   const log = normalizeLog(value.log)
+  const packetLog = normalizePacketLog(value.packetLog, log.log)
   repaired += coins.repaired + seeds.repaired + crops.repaired +
     dew.repaired + dewEarned.repaired + plots.repaired + unlocked.repaired + hire.repaired +
-    visitStats.repaired + log.repaired
+    visitStats.repaired + log.repaired + packetLog.repaired
 
   const dewDay = normalizeDayKey(value.dewDay)
   const dewDayEarned = normalizeDayKey(value.dewDayEarned) ?? dewDay
@@ -679,7 +756,8 @@ export function normalizeFarmFile (value) {
       plots: plots.plots,
       hire: hire.hire,
       visitStats: visitStats.stats,
-      log: log.log
+      log: log.log,
+      packetLog: packetLog.packetLog
     },
     corrupt: false,
     repaired
@@ -739,7 +817,8 @@ function toFileState (state) {
     plots: state.plots.map(copyPlot),
     hire: { ...state.hire },
     visitStats: copyVisitStats(state.visitStats),
-    log: state.log.map(copyLogEntry)
+    log: state.log.map(copyLogEntry),
+    packetLog: state.packetLog.map(copyLogEntry)
   }
 }
 
@@ -1035,6 +1114,17 @@ class FarmStore {
     return this.#enqueue(() => this.#noteSettle(raw))
   }
 
+  /**
+   * 红包日志（票 79 补）：收到 / 拆开 / 送出 / 退回各记一条，进农场「记录」页。
+   *
+   * `event`：arrived 刚收到、claimed 拆开到账、sent 随串门送出、returned 没人拆退回来。
+   * `direction`：in 别人给我、out 我给别人的（退回算 in——东西回到我手上）。
+   * 只显示，不动钱：硬币与作物的进出仍由拆开那一步的账本负责。
+   */
+  notePacket (raw) {
+    return this.#enqueue(() => this.#notePacket(raw))
+  }
+
   /** 帮人之前先扣 1 露水；不够就明确 no-dew（不进入发送）。 */
   spendDew (qty = 1) {
     return this.#enqueue(() => this.#spendDew(qty))
@@ -1181,6 +1271,10 @@ class FarmStore {
   #appendLog (entry) {
     this.#state.log.unshift(entry)
     if (this.#state.log.length > MAX_FARM_LOG) this.#state.log.length = MAX_FARM_LOG
+    // 红包另存一份：流水一分钟两条，红包攒在这里才不会被种下/收获挤掉。
+    if (entry.kind !== 'packet') return
+    this.#state.packetLog.unshift(entry)
+    if (this.#state.packetLog.length > MAX_PACKET_LOG) this.#state.packetLog.length = MAX_PACKET_LOG
   }
 
   /** 已解锁地块的下标；未知或锁着的地块统一 -1（种/收/浇/施肥/偷/帮共用）。 */
@@ -1861,6 +1955,22 @@ class FarmStore {
     this.#appendLog(entry)
     const persisted = await this.#persist(true)
     return { ok: true, action: 'note-settle', persisted }
+  }
+
+  async #notePacket (raw) {
+    const event = PACKET_LOG_EVENTS.has(raw?.event) ? raw.event : null
+    if (event === null) return farmError('bad-action')
+    const direction = raw?.direction === 'out' ? 'out' : 'in'
+    const now = this.#nowMs()
+    this.#advance(now)
+    const entry = { at: now, kind: 'packet', qty: 0, event, direction }
+    const who = sanitizeWho(raw?.who)
+    if (who !== null) entry.who = who
+    const text = sanitizeLogText(raw?.text)
+    if (text !== null) entry.text = text
+    this.#appendLog(entry)
+    const persisted = await this.#persist(true)
+    return { ok: true, action: 'note-packet', persisted }
   }
 
   async #spendCoins (rawQty) {

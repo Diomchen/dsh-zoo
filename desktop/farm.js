@@ -29,6 +29,9 @@ const omenCardEl = document.getElementById('omen-card')
 const seedBagEl = document.getElementById('seed-bag')
 const cropWarehouseEl = document.getElementById('crop-warehouse')
 const logEl = document.getElementById('log')
+/** 置顶的红包记录（票 79 补）：流水里埋不住，单独钉一块。 */
+const packetSectionEl = document.getElementById('log-packets')
+const packetListEl = document.getElementById('log-packet-list')
 const marketRowsEl = document.getElementById('market-rows')
 const tradesEl = document.getElementById('trades')
 const marketWalletEl = document.getElementById('market-wallet')
@@ -154,7 +157,8 @@ const LOG_TEXT = {
   wither: '枯萎',
   freeze: '冻住',
   thaw: '解冻',
-  omen: '来客'
+  omen: '来客',
+  packet: '红包'
 }
 const MARKET_SIDE_TEXT = { buy: '买种', sell: '卖出' }
 /** 访客模式的固定错误码 → 窗口兜底文案（宿主 notice 优先，这里是拿不到 notice 时）。 */
@@ -929,10 +933,113 @@ function renderInventory () {
   }
 }
 
+/**
+ * 红包那一行的文字（票 79 补）：四种 event 各一句，尾巴跟上里面装了什么。
+ * 置顶的红包记录与下面的流水共用这一份，两处说法不会走岔。
+ */
+function packetLogText (entry) {
+  const contents = typeof entry.text === 'string' && entry.text !== '' ? entry.text : '空红包'
+  const who = typeof entry.who === 'string' && entry.who !== '' ? '「' + entry.who + '」' : ''
+  if (entry.event === 'claimed') return '拆开' + (who === '' ? '一只红包' : who + '的红包') + ' · ' + contents
+  if (entry.event === 'sent') return (who === '' ? '给邻居' : '给' + who) + '送出一只红包 · ' + contents
+  if (entry.event === 'returned') return (who === '' ? '对方' : who) + '没拆，红包退回来了 · ' + contents
+  return (who === '' ? '收到' : who + '送来') + '一只红包 · ' + contents + '（还没拆）'
+}
+
+/** 一条记录画成一句话：左边这句，右边是时间。 */
+function logText (entry) {
+  const crop = cropMeta(entry.crop)
+  const kind = LOG_TEXT[entry.kind] ?? '动作'
+  const who = typeof entry.who === 'string' && entry.who !== '' ? '「' + entry.who + '」' : ''
+  if (entry.kind === 'packet') {
+    return packetLogText(entry)
+  }
+  if (entry.kind === 'hire') {
+    const hours = Number(entry.hours)
+    const wage = Number(entry.wage)
+    return (who === '' ? '' : who + ' ') + '雇工' +
+      (Number.isFinite(hours) && hours > 0 ? ' ' + hours + ' 小时' : '') +
+      (Number.isFinite(wage) && wage > 0 ? ' · ' + wage + ' 硬币' : '')
+  }
+  if (entry.kind === 'settle') {
+    const earned = Number(entry.earned)
+    return (who === '' ? '' : who + ' ') + '结算' +
+      (Number.isFinite(earned) ? ' · ' + earned + ' 硬币' : '')
+  }
+  if (entry.kind === 'unlock') {
+    const cost = Number(entry.cost)
+    const plot = Number(entry.plot) || Number(entry.qty)
+    return '解锁了第 ' + (plot || '?') + ' 块地' +
+      (Number.isFinite(cost) && cost > 0 ? ' · ' + cost + ' 硬币' : '')
+  }
+  if (entry.kind === 'season') {
+    return '换季 · 入' + (typeof entry.name === 'string' ? entry.name : '下一季')
+  }
+  if (entry.kind === 'event') {
+    const coins = Number(entry.coins)
+    const dew = Number(entry.dew)
+    return (typeof entry.name === 'string' ? entry.name : '节日') + '完成' +
+      (Number.isFinite(coins) && coins > 0 ? ' · +' + coins + ' 硬币' : '') +
+      (Number.isFinite(dew) && dew > 0 ? ' · +' + dew + ' 露水' : '')
+  }
+  if (entry.kind === 'wither') return '换季枯萎了 ' + (Number(entry.qty) || 1) + ' 株四季作物'
+  if (entry.kind === 'freeze') return '冻住了 ' + (Number(entry.qty) || 1) + ' 块地，要生火解冻'
+  if (entry.kind === 'thaw') return '生火解冻了一块地'
+  if (entry.kind === 'clear') return '铲除了' + (crop === null ? '一株作物' : '一株' + crop.name)
+  if (entry.kind === 'omen') {
+    const lost = Number(entry.qty) || 0
+    const wither = Number(entry.wither) || 0
+    const freeze = Number(entry.freeze) || 0
+    const name = who === '' ? '来客' : who
+    const choice = entry.choice === 'feed'
+      ? '安抚了' + name
+      : entry.choice === 'guard' ? '赶走了' + name : name + '没被处理'
+    const damage = []
+    if (lost > 0) damage.push('被拿走 ' + lost + ' 个作物')
+    if (wither > 0) damage.push(wither + ' 块地枯萎')
+    if (freeze > 0) damage.push(freeze + ' 块地冻住')
+    return choice +
+      (entry.success === true ? '，平安过关' : damage.length > 0 ? '，' + damage.join('，') : '，没有损失')
+  }
+  if (entry.kind === 'steal' && Number(entry.qty) === 0) {
+    return who === '' ? '被抓住了' : who + '被抓住了'
+  }
+  if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
+    return who + (entry.kind === 'steal' ? '偷了 ' : '帮了 ') +
+      (crop === null ? '1 个作物' : '1 个' + crop.name)
+  }
+  return kind + (crop === null ? '' : ' ' + crop.name) +
+    (Number(entry.qty) > 0 && entry.kind !== 'plant' ? ' ×' + entry.qty : '')
+}
+
+/** 画一行：左边一句话，右边时间。 */
+function logRow (entry) {
+  const item = document.createElement('li')
+  const text = document.createElement('span')
+  text.textContent = logText(entry)
+  const when = document.createElement('span')
+  when.className = 'when'
+  when.textContent = formatTime(entry.at)
+  item.appendChild(text)
+  item.appendChild(when)
+  return item
+}
+
 function renderLog () {
   logEl.textContent = ''
+  packetListEl.textContent = ''
   // 记录页（ticket 45/48）：宿主给最近 100 条；列表自己滚动，不把窗口撑高。
   const entries = farm === null || !Array.isArray(farm.log) ? [] : farm.log.slice(0, 100)
+  // 红包（票 79 补）：流水里全是种下/收货，一天也就几只红包，埋在几十行下面等于没有。
+  // 所以在记录页顶上钉一块「红包记录」，没有红包时整块不出现。
+  // 取宿主的 `packets`（单独攒的一份，≤50）——不能只在最近 100 条里筛：
+  // 自动收菜一分钟写两条流水，红包半天就被挤出去了（用户「刚才还能看到，现在又没了」）。
+  // 老宿主没有这一项时，退回到在流水里筛。
+  const packets = farm !== null && Array.isArray(farm.packets)
+    ? farm.packets
+    : entries.filter((entry) => entry.kind === 'packet')
+  packetSectionEl.hidden = packets.length === 0
+  for (const entry of packets) packetListEl.appendChild(logRow(entry))
   if (entries.length === 0) {
     const empty = document.createElement('li')
     empty.className = 'empty'
@@ -940,73 +1047,7 @@ function renderLog () {
     logEl.appendChild(empty)
     return
   }
-  for (const entry of entries) {
-    const item = document.createElement('li')
-    const text = document.createElement('span')
-    const crop = cropMeta(entry.crop)
-    const kind = LOG_TEXT[entry.kind] ?? '动作'
-    const who = typeof entry.who === 'string' && entry.who !== '' ? '「' + entry.who + '」' : ''
-    if (entry.kind === 'hire') {
-      const hours = Number(entry.hours)
-      const wage = Number(entry.wage)
-      text.textContent = (who === '' ? '' : who + ' ') + '雇工' +
-        (Number.isFinite(hours) && hours > 0 ? ' ' + hours + ' 小时' : '') +
-        (Number.isFinite(wage) && wage > 0 ? ' · ' + wage + ' 硬币' : '')
-    } else if (entry.kind === 'settle') {
-      const earned = Number(entry.earned)
-      text.textContent = (who === '' ? '' : who + ' ') + '结算' +
-        (Number.isFinite(earned) ? ' · ' + earned + ' 硬币' : '')
-    } else if (entry.kind === 'unlock') {
-      const cost = Number(entry.cost)
-      const plot = Number(entry.plot) || Number(entry.qty)
-      text.textContent = '解锁了第 ' + (plot || '?') + ' 块地' +
-        (Number.isFinite(cost) && cost > 0 ? ' · ' + cost + ' 硬币' : '')
-    } else if (entry.kind === 'season') {
-      text.textContent = '换季 · 入' + (typeof entry.name === 'string' ? entry.name : '下一季')
-    } else if (entry.kind === 'event') {
-      const coins = Number(entry.coins)
-      const dew = Number(entry.dew)
-      text.textContent = (typeof entry.name === 'string' ? entry.name : '节日') + '完成' +
-        (Number.isFinite(coins) && coins > 0 ? ' · +' + coins + ' 硬币' : '') +
-        (Number.isFinite(dew) && dew > 0 ? ' · +' + dew + ' 露水' : '')
-    } else if (entry.kind === 'wither') {
-      text.textContent = '换季枯萎了 ' + (Number(entry.qty) || 1) + ' 株四季作物'
-    } else if (entry.kind === 'freeze') {
-      text.textContent = '冻住了 ' + (Number(entry.qty) || 1) + ' 块地，要生火解冻'
-    } else if (entry.kind === 'thaw') {
-      text.textContent = '生火解冻了一块地'
-    } else if (entry.kind === 'clear') {
-      text.textContent = '铲除了' + (crop === null ? '一株作物' : '一株' + crop.name)
-    } else if (entry.kind === 'omen') {
-      const lost = Number(entry.qty) || 0
-      const wither = Number(entry.wither) || 0
-      const freeze = Number(entry.freeze) || 0
-      const name = who === '' ? '来客' : who
-      const choice = entry.choice === 'feed'
-        ? '安抚了' + name
-        : entry.choice === 'guard' ? '赶走了' + name : name + '没被处理'
-      const damage = []
-      if (lost > 0) damage.push('被拿走 ' + lost + ' 个作物')
-      if (wither > 0) damage.push(wither + ' 块地枯萎')
-      if (freeze > 0) damage.push(freeze + ' 块地冻住')
-      text.textContent = choice +
-        (entry.success === true ? '，平安过关' : damage.length > 0 ? '，' + damage.join('，') : '，没有损失')
-    } else if (entry.kind === 'steal' && Number(entry.qty) === 0) {
-      text.textContent = who === '' ? '被抓住了' : who + '被抓住了'
-    } else if ((entry.kind === 'steal' || entry.kind === 'help') && who !== '') {
-      text.textContent = who + (entry.kind === 'steal' ? '偷了 ' : '帮了 ') +
-        (crop === null ? '1 个作物' : '1 个' + crop.name)
-    } else {
-      text.textContent = kind + (crop === null ? '' : ' ' + crop.name) +
-        (Number(entry.qty) > 0 && entry.kind !== 'plant' ? ' ×' + entry.qty : '')
-    }
-    const when = document.createElement('span')
-    when.className = 'when'
-    when.textContent = formatTime(entry.at)
-    item.appendChild(text)
-    item.appendChild(when)
-    logEl.appendChild(item)
-  }
+  for (const entry of entries) logEl.appendChild(logRow(entry))
 }
 
 /**
@@ -2610,3 +2651,4 @@ document.addEventListener('visibilitychange', () => {
 
 setInterval(tick, 1000)
 api?.ready()
+

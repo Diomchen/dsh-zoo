@@ -15,7 +15,7 @@
 
 import shared from '../desktop/shared.js'
 import { awayText } from './away-text.js'
-import { isGiftStatus, giftStatusText, giftTitleText } from './gift-text.js'
+import { isGiftStatus, giftStatusText, giftTitleText, packetSummaryText } from './gift-text.js'
 import { isDeviceId, isVisitId, sanitizeGiftName } from './protocol.js'
 import { MAX_STREET, isBlockedReason } from './street.js'
 import { isVisitReason, visitReasonText } from './visit-copy.js'
@@ -165,16 +165,44 @@ function streetFromSnapshot (snapshot) {
 }
 
 /**
- * 访客身上的礼物 → 桌面卡片（ticket 23 / 25）。
+ * 红包卡（票 79）。访客身上的红包与「访客走了但还没拆」的常驻红包必须是同一个形状——
+ * 两处各写一遍字段，迟早一边多一个 note、一边少一个 packet。
  *
- * 卡片**跟着访客**：这里按 `snapshot.visitors` 走，访客一走这张卡自然就不输出了，
+ * `expiresAt` 只有常驻卡带（24 小时退回的时刻，渲染端拿它显示还剩多久）；
+ * 访客卡不带，因为那时访客就在眼前，卡不会先过期而是随访客一起走。
+ */
+function packetCard ({ deviceId, giftId, status, label, packet, note = '', expiresAt = 0, statusText = null }) {
+  return {
+    deviceId,
+    giftId,
+    kind: 'packet',
+    status,
+    title: giftTitleText(label, 'packet'),
+    text: packetSummaryText(packet),
+    packet,
+    ...(note === '' ? {} : { note }),
+    ...(Number.isFinite(expiresAt) && expiresAt > 0 ? { expiresAt } : {}),
+    ...(statusText === null ? {} : { statusText })
+  }
+}
+
+/**
+ * 访客身上的礼物 + 还没拆的红包 → 桌面卡片（ticket 23 / 25 / 79）。
+ *
+ * 字条/文件卡**跟着访客**：这里按 `snapshot.visitors` 走，访客一走这张卡自然就不输出了，
  * 渲染端不需要另一套“什么时候收起卡片”的规则。标题与状态文案在宿主算好，
  * 渲染端只画（`gift-text.js` 是唯一文案表）。
+ *
+ * 红包是例外：它是「进了背包的一件东西」，没拆之前一直欠着，24 小时才退回。
+ * 只贴访客的话，访客一走（通常几秒）卡片就没了，红包在 `gifts/` 里躺到过期——
+ * 用户既看不到也点不到「拆开」。所以 service 把还没拆的红包（`gifts.pendingPackets()`）
+ * 走 `packetInbox` 传进来，这些卡**不依赖访客在场**；已经贴在访客身上的同一只红包按
+ * `giftId` 去重，不画两张。
  *
  * 文件礼物额外带 name/size；`thumb` 只在**真的收下**且扩展名是 jpg/png/gif/webp 时给，
  * 地址由 service 注入的 `thumbOf(giftId)` 算（目录名+文件名都来自礼物 store）。
  */
-function giftsFromSnapshot (snapshot, { thumbOf = null } = {}) {
+function giftsFromSnapshot (snapshot, { thumbOf = null, packetInbox = null } = {}) {
   const gifts = []
   const visitors = Array.isArray(snapshot.visitors) ? snapshot.visitors : []
   for (const visitor of visitors) {
@@ -211,6 +239,14 @@ function giftsFromSnapshot (snapshot, { thumbOf = null } = {}) {
       })
       continue
     }
+    if (gift.kind === 'packet') {
+      // 红包卡（票 79）：正文是“里面装了什么”，祝福语另起一行；内容坏掉就整张丢掉
+      // （画一只拆不开的空红包比不画更糟）。上限与形状用渲染端同一份规则，不另写一套。
+      const packet = shared.normalizePacketContents(gift.packet)
+      if (packet === null) continue
+      gifts.push(packetCard({ deviceId, giftId, status: gift.status, label, packet, note: noteOf(gift), statusText }))
+      continue
+    }
     if (gift.kind !== 'text') continue
     gifts.push({
       deviceId,
@@ -223,7 +259,39 @@ function giftsFromSnapshot (snapshot, { thumbOf = null } = {}) {
       ...(statusText === null ? {} : { statusText })
     })
   }
+
+  // 还没拆的红包（见函数头注释）：不依赖访客在场。已经贴在上面的访客卡里的同一只按 giftId 去重。
+  const pending = Array.isArray(packetInbox) ? packetInbox : []
+  const shown = new Set(gifts.map((card) => card.giftId))
+  for (const record of pending) {
+    if (gifts.length >= shared.MAX_GIFT_ITEMS) break
+    if (record === null || typeof record !== 'object') continue
+    if (record.kind !== 'packet') continue
+    if (!isVisitId(record.id)) continue
+    const giftId = record.id.toLowerCase()
+    if (shown.has(giftId)) continue
+    const deviceId = deviceIdOf(record.from?.deviceId)
+    if (deviceId === null) continue
+    const packet = shared.normalizePacketContents(record.packet)
+    if (packet === null) continue
+    shown.add(giftId)
+    gifts.push(packetCard({
+      deviceId,
+      giftId,
+      // 待拆就是已经到手、还没拆：状态只可能是 received（pending 阶段的记录还在访客身上）。
+      status: 'received',
+      label: shared.normalizeLabel(record.from?.nickname, '邻居'),
+      packet,
+      note: noteOf(record),
+      expiresAt: record.expiresAt
+    }))
+  }
   return gifts
+}
+
+/** 红包的祝福语：空白等于没写（不给字段），省得渲染端画一行空的引号。 */
+function noteOf (gift) {
+  return typeof gift.note === 'string' ? gift.note.trim() : ''
 }
 
 /** 只有这四种扩展名能在卡片上画缩略图（与 desktop/main.js 的协议白名单同一个口径）。 */

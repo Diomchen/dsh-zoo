@@ -111,7 +111,7 @@ import {
   isFreshPeerDigest,
   marketView
 } from './market.js'
-import { backpackErrorText, giftPrepareFailedText, packetErrorText } from './gift-text.js'
+import { backpackErrorText, giftPrepareFailedText, packetErrorText, packetSummaryText } from './gift-text.js'
 import { createGiftFetcher } from './gift-fetch.js'
 import {
   GIFT_RATE_PER_DAY,
@@ -2299,6 +2299,8 @@ export function createService (ctx, options = {}) {
       season: seasonView(view),
       // 记录页要完整的一份（≤100）；`/state.farm.log` 仍按 SPEC 只给 20。
       log: view.log.slice(0, FARM_LOG_WINDOW_LIMIT),
+      // 红包单独攒的一份（≤50）：流水会被种下/收获挤掉，红包记录不能跟着没。
+      packets: view.packetLog ?? [],
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
       carried: carriedView()
     }
@@ -4683,6 +4685,13 @@ export function createService (ctx, options = {}) {
       if (!claimed.ok) {
         return { ok: false, error: claimed.error, notice: packetErrorText(claimed.error) }
       }
+      // 记录页（票 79 补）：拆开这一笔也要留痕，不然卡片一收就查不到收过谁的红包。
+      await farm.notePacket({
+        direction: 'in',
+        event: 'claimed',
+        who: claimed.gift.from?.nickname,
+        text: packetSummary(claimed.gift.packet)
+      })
       refreshFarmWindow()
       return {
         ok: true,
@@ -4736,19 +4745,9 @@ export function createService (ctx, options = {}) {
     return { ok: false, error: 'not-implemented', action }
   }
 
-  /** 红包内容的可读摘要：`20 硬币 · 小番茄 ×3 · 稻米种子 ×1`。 */
-  function packetSummary (packet) {
-    if (packet === null || typeof packet !== 'object') return '空红包'
-    const parts = []
-    if (packet.coins > 0) parts.push(packet.coins + ' 硬币')
-    for (const [cropId, qty] of Object.entries(packet.crops ?? {})) {
-      parts.push((CROPS[cropId]?.name ?? cropId) + ' ×' + qty)
-    }
-    for (const [cropId, qty] of Object.entries(packet.seeds ?? {})) {
-      parts.push((CROPS[cropId]?.name ?? cropId) + '种子 ×' + qty)
-    }
-    return parts.length === 0 ? '空红包' : parts.join(' · ')
-  }
+  // 红包内容的可读摘要住 gift-text.js：桌面卡片、串门气泡和这里的回执说的必须是
+  // 同一句话（一处改了另一处没改，用户就会看到“12 硬币”和“3 硬币”两种说法）。
+  const packetSummary = packetSummaryText
 
   /** 红包每日限额：一天最多寄 3 只，本地午夜重置。 */
   const PACKET_DAILY_LIMIT = 3
@@ -5864,7 +5863,11 @@ export function createService (ctx, options = {}) {
     const dropped = droppedVisitors(snapshot)
     if (dropped > 0) room.noteSceneOverflow(dropped)
     // 缩略图地址由宿主算好（目录名 + 清洗过的文件名），渲染端只拿到 dshzoo:// URL。
-    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, { thumbOf: giftThumb })
+    // 还没拆的红包也得进场景（票 79）：卡片只贴访客的话，访客一走红包就彻底没有入口。
+    const controls = controlsFromSnapshot(dropped > 0 ? room.snapshot() : snapshot, {
+      thumbOf: giftThumb,
+      packetInbox: gifts === null ? null : gifts.pendingPackets()
+    })
     // 签名必须包含控件状态：串门按钮的可用性/放行卡/失败提示都可能在没有宠物增删时变化。
     const assetRoots = assetRootsFor(activeSkin)
     // 目录也进签名：两张皮的素材同名但不同目录时，换皮必须让渲染端跟着换根（ticket 33）。
@@ -7771,6 +7774,17 @@ export function createService (ctx, options = {}) {
       if (backpack !== null) await backpack.releaseOut(carried.id, visitId)
       carried = null
     }
+    // 记录页（票 79 补）：红包**真的上路**了才记一笔——被「对方版本不支持」扣在背包、
+    // 或整包超 4 KiB 被编码层丢掉，都不该在记录里写成「已送出」。
+    if (sent.ok && !sent.giftDropped && sent.gift?.kind === 'packet' && farm !== null) {
+      await farm.notePacket({
+        direction: 'out',
+        event: 'sent',
+        who: begun.visit.nickname,
+        text: packetSummary(sent.gift.packet)
+      })
+      refreshFarmWindow()
+    }
     // 字条没带上（太长/坏形状/整包超 4 KiB）或背包那件文件读不出来：串门照常，
     // 但必须在本机说一句，不能让人以为东西已经送出去了。
     const notice = sent.giftDropped ? room.noteGiftDropped() : skipped
@@ -7916,6 +7930,16 @@ export function createService (ctx, options = {}) {
     }
     sendGiftReceipt(packet.deviceId, packet.visitId, gift.id)
     notifyPacketArrived(saved.gift)
+    // 记录页（票 79 补）：收到的红包也要留一条，不然卡片被拆掉/退掉之后就查不到是谁什么时候给的。
+    if (farm !== null) {
+      await farm.notePacket({
+        direction: 'in',
+        event: 'arrived',
+        who: saved.gift.from?.nickname,
+        text: packetSummary(saved.gift.packet)
+      })
+      refreshFarmWindow()
+    }
   }
 
   /** 收到红包时在桌面场景里亮一张卡（卡片本身来自 /state 的 gifts）。 */
@@ -8288,6 +8312,18 @@ export function createService (ctx, options = {}) {
     }
     log.info('红包退回来了：' + packetSummary(contents))
     sendPacketReturned(packet.deviceId, giftId)
+    // 记录页（票 79 补）：东西回到我手上，记成「退回」——谁没拆就用对方昵称说清楚。
+    if (farm !== null) {
+      const neighbor = (room.snapshot().neighbors ?? [])
+        .find((entry) => entry.deviceId === packet.deviceId)
+      await farm.notePacket({
+        direction: 'in',
+        event: 'returned',
+        who: neighbor?.nickname,
+        text: packetSummary(contents)
+      })
+      refreshFarmWindow()
+    }
     refreshBringWindow()
     return true
   }

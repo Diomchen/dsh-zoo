@@ -106,15 +106,41 @@ test('新邻居声明了 packet：红包照常送到，并能拆开', async (t) 
   assert.notEqual(visit.body.packetHeld, true, '新邻居不该被扣红包')
   assert.equal(typeof visit.body.giftId, 'string')
 
+  // 发件侧记录页（票 79 补）：红包真的上路了，农场「记录」里要有一笔「给谁送出一只红包」。
+  const bNickname = (await b.state()).self.nickname
+  const sentLog = await until(async () => {
+    const log = (await a.state()).farm.log ?? []
+    return log.find((entry) => entry.kind === 'packet' && entry.event === 'sent') ?? false
+  }, { label: 'A 记录页出现「送出红包」', timeoutMs: 15000 })
+  assert.equal(sentLog.direction, 'out')
+  assert.equal(sentLog.who, bNickname)
+  assert.equal(sentLog.text, '5 硬币')
+
   const gift = await until(async () => {
     const sb = await b.state()
     return (sb.gifts ?? []).find((g) => g.kind === 'packet') ?? false
   }, { label: 'B 收到 packet', timeoutMs: 20000 })
   assert.equal(gift.packet.coins, 5)
 
+  // 收件侧记录页：先有一条「谁送来一只红包（还没拆）」。
+  const arrivedLog = await until(async () => {
+    const log = (await b.state()).farm.log ?? []
+    return log.find((entry) => entry.kind === 'packet' && entry.event === 'arrived') ?? false
+  }, { label: 'B 记录页出现「收到红包」', timeoutMs: 15000 })
+  assert.equal(arrivedLog.direction, 'in')
+  assert.equal(arrivedLog.text, '5 硬币')
+
   const before = (await b.state()).farm.coins
   const claimed = await b.action('gift-claim', { giftId: gift.id })
   assert.equal(claimed.body.ok, true, JSON.stringify(claimed.body))
   const after = (await b.state()).farm.coins
   assert.equal(after, before + 5, '拆开后硬币应该到账')
+
+  // 拆开也要留痕：卡片拆完会消失，记录页是唯一还能查到「收过谁的红包」的地方。
+  const claimedLog = await until(async () => {
+    const log = (await b.state()).farm.log ?? []
+    return log.find((entry) => entry.kind === 'packet' && entry.event === 'claimed') ?? false
+  }, { label: 'B 记录页出现「拆开红包」', timeoutMs: 15000 })
+  assert.equal(claimedLog.text, '5 硬币')
+  assert.equal(claimedLog.who, (await a.state()).self.nickname)
 })

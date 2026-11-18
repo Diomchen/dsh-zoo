@@ -21,7 +21,7 @@ const FARM_JS = readFileSync(new URL('../../desktop/farm.js', import.meta.url), 
 
 /** 替身元素：够 farm.js 与 farm-view.js 画东西、改文本。 */
 export function fakeElement (tag) {
-  return {
+  const element = {
     tagName: String(tag).toUpperCase(),
     className: '',
     dataset: {},
@@ -33,7 +33,6 @@ export function fakeElement (tag) {
     title: '',
     value: '',
     type: '',
-    textContent: '',
     classList: { toggle () {}, add () {}, remove () {}, contains () { return false } },
     appendChild (child) { this.children.push(child); return child },
     setAttribute (name, value) { this.attributes[name] = String(value) },
@@ -51,6 +50,16 @@ export function fakeElement (tag) {
     matches () { return false },
     getBoundingClientRect () { return { width: 0, height: 0, x: 0, y: 0, top: 0, left: 0 } }
   }
+  // 真 DOM 里给容器赋空 textContent 会把子节点清掉，列表渲染全靠这一点；替身不能只当普通属性存。
+  let text = ''
+  Object.defineProperty(element, 'textContent', {
+    get () { return text },
+    set (value) {
+      text = value === null || value === undefined ? '' : String(value)
+      if (text === '') element.children.length = 0
+    }
+  })
+  return element
 }
 
 /**
@@ -158,6 +167,10 @@ export function bootFarm () {
       const el = tabs.find((tab) => tab.dataset.tab === name)
       assert.ok(el, '应该有 ' + name + ' 页签')
       el._listeners.click?.()
+    },
+    /** 按 id 拿窗口里的元素（`document.getElementById` 的那个替身，带 hidden/textContent）。 */
+    element (id) {
+      return document.getElementById(id)
     },
     /** 按条件找窗口画过的节点（找按钮并点它用）。 */
     find (predicate) {

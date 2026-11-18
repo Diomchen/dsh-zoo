@@ -175,6 +175,36 @@ test('room 的 in / out 两条结束路径都把礼物摘要写进记录（不�
   assert.deepEqual(room.drainVisitRecords()[0].gift, { kind: 'text' })
 })
 
+test('红包的记录摘要：发出去和收进来都只留 {kind:"packet"}，不记金额与作物', () => {
+  const room = createRoom({ clock: () => T0 })
+  room.setIdentity({ deviceId: 'me-1', nickname: '我' })
+  room.observeBeacon({ deviceId: PEER, nickname: '甲', port: 40001 }, T0)
+  room.admit(PEER)
+
+  // out：红包真正随串门出发之后，记录里必须有这一笔（不然“我发出去的记录”是空的）。
+  assert.equal(room.beginVisit(PEER, { at: T0, visitId: VISIT_A }).ok, true)
+  assert.equal(room.markOutboundGift(VISIT_A, {
+    kind: 'packet', packet: { coins: 12, crops: { tomato: 2 } }, note: '买糖'
+  }), true)
+  assert.equal(room.observeVisitAck({ deviceId: PEER, visitId: VISIT_A }, T0 + 100).ok, true)
+  room.tick(T0 + 100 + MAX_VISIT_RECORD_MS)
+  assert.deepEqual(room.snapshot().visits[0].gift, { kind: 'packet' })
+  assert.equal(JSON.stringify(room.snapshot().visits[0]).includes('买糖'), false)
+  assert.deepEqual(room.drainVisitRecords()[0].gift, { kind: 'packet' })
+
+  // in：访客身上那只红包在送客时落进记录，同样只有 kind。
+  room.observeVisitRequest({
+    deviceId: PEER,
+    visitId: VISIT_B,
+    nickname: '甲',
+    anim: null,
+    gift: { id: GIFT_A, kind: 'packet', packet: { coins: 3, seeds: { pea: 1 } } }
+  }, T0 + 200)
+  room.endInboundVisit(PEER, T0 + 300)
+  assert.deepEqual(room.snapshot().visits[0].gift, { kind: 'packet' })
+  assert.equal(JSON.stringify(room.snapshot().visits[0]).includes('coins'), false)
+})
+
 test('markOutboundGift 只认当前这次 visitId，且不污染快照里的出门形状', () => {
   const room = createRoom({ clock: () => T0 })
   room.setIdentity({ deviceId: 'me-1', nickname: '我' })

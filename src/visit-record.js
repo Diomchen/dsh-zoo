@@ -19,8 +19,8 @@ export const MAX_VISIT_RECORD_MS = VISIT_MAX_MS
 export const VISIT_RECORD_LIMIT = 200
 
 /**
- * 一条记录里的礼物摘要（ticket 27）：`{ kind: 'text' }` 或
- * `{ kind: 'file'[, name] }`。**不记字条正文**，也不记 id/路径/大小——历史文件会被翻看。
+ * 一条记录里的礼物摘要（ticket 27）：`{ kind: 'text' }` / `{ kind: 'file'[, name] }` /
+ * `{ kind: 'packet' }`（票 79）。**不记字条正文，也不记红包里装了什么**——历史文件会被翻看。
  *
  * 宽容规则与整条记录一致：不是对象、kind 不认识 → 返回 null，调用方只丢 gift 字段；
  * 文件名清洗失败 → 只丢 name，保留 kind（文件名只是给人看的，不该让整条记录作废）。
@@ -28,6 +28,8 @@ export const VISIT_RECORD_LIMIT = 200
 export function normalizeVisitGift (raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
   if (raw.kind === 'text') return { kind: 'text' }
+  // 红包只留“是一只红包”：金额与作物是收件人的事，记录里写下来只会泄露给翻文件的人。
+  if (raw.kind === 'packet') return { kind: 'packet' }
   if (raw.kind !== 'file') return null
   const name = sanitizeGiftName(raw.name)
   return name === null ? { kind: 'file' } : { kind: 'file', name }
