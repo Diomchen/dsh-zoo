@@ -793,3 +793,36 @@ test('futures-window 这一包 < 64 KiB（helper 单行不是瓶颈）', async (
   assert.notEqual(line, null)
   assert.ok(Buffer.byteLength(line, 'utf8') < 64 * 1024)
 })
+
+test('视图模型：1.12.8 房主没确认档位时窗口直说，而不是让人以为按钮坏了', () => {
+  const draft = { side: 'long', margin: 50, leverage: 20, cropId: 'tomato' }
+
+  // 房主认了：文案干净，不带那句提醒。
+  const confirmed = view.build(
+    sampleView({ role: 'peer', mode: 'live', accountMode: 'live', accountConfirmed: true }),
+    draft,
+    TUESDAY
+  )
+  assert.equal(confirmed.account.kind, 'live')
+  assert.equal(confirmed.account.unconfirmed, false)
+  assert.doesNotMatch(confirmed.account.text, /房主还没确认/)
+
+  // 房主没认：本机仍是 live（以本机为准），但文案里点明「还没确认」。
+  const unconfirmed = view.build(
+    sampleView({ role: 'peer', mode: 'live', accountMode: 'live', accountConfirmed: false }),
+    draft,
+    TUESDAY
+  )
+  assert.equal(unconfirmed.account.kind, 'live')
+  assert.equal(unconfirmed.account.unconfirmed, true)
+  assert.match(unconfirmed.account.text, /房主还没确认这个档位/)
+
+  // 房主自己（role: host）没有「认不认」这回事。
+  const host = view.build(
+    sampleView({ role: 'host', mode: 'live', accountMode: 'live', accountConfirmed: false }),
+    draft,
+    TUESDAY
+  )
+  assert.equal(host.account.unconfirmed, false)
+  assert.doesNotMatch(host.account.text, /房主还没确认/)
+})

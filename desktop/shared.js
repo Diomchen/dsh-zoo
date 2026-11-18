@@ -2635,6 +2635,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       disabled: raw.disabled === true,
       // 1.12.0：这个账户自己按的暂停（房主按下去也停不了别人，所以只看自己）。
       paused: raw.paused === true,
+      // 1.12.8：房主认没认这个档位。没认时窗口要直说，不能只让人看见「点了没反应」。
+      accountConfirmed: raw.accountConfirmed === true,
       pending: nonNegative(raw.pending),
       dayCap: num(raw.dayCap),
       dayNotional: nonNegative(raw.dayNotional),

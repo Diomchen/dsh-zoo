@@ -173,6 +173,22 @@
     font-size: 12px; opacity: 0; transition: opacity .15s; pointer-events: none; max-width: 560px;
   }
   #toast.show { opacity: .95; }
+  /* 1.12.7：窗内确认条——顶上不来、底下的 #toast 也不挡，放在它上面一层。 */
+  .ask {
+    position: absolute; left: 50%; bottom: 44px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 8px; max-width: 620px;
+    background: var(--paper); color: var(--ink); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 6px 10px; font-size: 12px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .16);
+  }
+  .ask[hidden] { display: none; }
+  .ask button {
+    padding: 2px 10px; border-radius: var(--radius); cursor: pointer; font: inherit;
+    border: 1px solid var(--line); background: transparent; color: var(--ink);
+  }
+  .ask #askYes { background: var(--ink); color: var(--paper); border-color: var(--ink); }
+  .ask #askInput { width: 84px; padding: 2px 6px; font: inherit; }
+  .ask #askInput[hidden] { display: none; }
   .mono { font-variant-numeric: tabular-nums; }
 </style>
 </head>
@@ -285,6 +301,14 @@
       </div>
     </section>
   </div>
+</div>
+<!-- 1.12.7：确认条。以前这些确认用 `window.confirm()`，无边框透明窗口上弹原生模态会让
+     整扇窗短暂消失（看着像「切真钱把窗口关了」），所以改成窗内的两段式确认。 -->
+<div class="ask" id="ask" hidden>
+  <span id="askText"></span>
+  <input id="askInput" type="number" min="1" step="1" hidden aria-label="数量">
+  <button type="button" id="askYes">确定</button>
+  <button type="button" id="askNo">取消</button>
 </div>
 <div id="toast"></div>
 <script src="futures-view.js"></script>

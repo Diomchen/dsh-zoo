@@ -503,23 +503,31 @@
   /**
    * 1.10.0：这本账自己的档位——自己决定跟不跟真钱玩，房主管不着。
    * 纸面不是看客：它有独立的一本账、独立盈亏，只是只跟做市商成交。
+   * 1.12.8：房主那边还没认这个档位时（它没升级 / 重启丢了账），在文案后面直说一句，
+   * 否则用户只会看到「点了没反应」，以为按钮坏了。
    */
   function accountModeOf (view) {
+    const unconfirmed = view?.role === 'peer' && view?.accountConfirmed === false
+    const suffix = unconfirmed
+      ? '（房主还没确认这个档位：它可能没升级或刚重启，本机每 30 秒会重发一次。）'
+      : ''
     if (view?.accountMode === 'live') {
       return {
         kind: 'live',
         label: '真钱',
-        text: '这本账用真硬币：充值/提现都动农场，盈亏也是真的。',
+        text: '这本账用真硬币：充值/提现都动农场，盈亏也是真的。' + suffix,
         toggleLabel: '切到纸面',
-        next: 'shadow'
+        next: 'shadow',
+        unconfirmed
       }
     }
     return {
       kind: 'shadow',
       label: '纸面',
-      text: '这本账是纸面的：撮合与结算照跑，但不动农场硬币，只跟做市商成交。',
+      text: '这本账是纸面的：撮合与结算照跑，但不动农场硬币，只跟做市商成交。' + suffix,
       toggleLabel: '切到真钱',
-      next: 'live'
+      next: 'live',
+      unconfirmed
     }
   }
 

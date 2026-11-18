@@ -7494,6 +7494,11 @@ export function createService (ctx, options = {}) {
       ? replica.accountMode
       : null
     const accountMode = localAccountMode ?? replicaAccountMode ?? FUTURES_DEFAULT_ACCOUNT_MODE
+    // 1.12.8：房主到底认没认这个档位？它没升级/重启丢账时，本机点「切到真钱」会一直重发却
+    // 永远得不到确认——窗口必须直说，不能只让用户看见「按钮没反应」。
+    const accountConfirmed = localAccountMode === null
+      ? replicaAccountMode !== null
+      : replicaAccountMode === localAccountMode
     const session = mode === 'off' ? { kind: 'off', text: '期货未开放' } : view.session
     const upgraded = futuresPeerIds().length > 0
     const stale = room.snapshot().neighbors.some((neighbor) => {
@@ -7520,6 +7525,7 @@ export function createService (ctx, options = {}) {
       // 票 98：影子/关闭状态与待提取余额以房主副本为准。
       mode,
       accountMode,
+      accountConfirmed,
       session,
       pending: replica === null ? 0 : (replica.pending ?? 0),
       liquidationCount: replica === null

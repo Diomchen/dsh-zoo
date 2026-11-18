@@ -29,7 +29,10 @@
     // 1.12.0：上一拍画出来的暂停状态（按钮用它算「切到哪一档」）。
     pause: null,
     // 票 109：「全部转」要提交的持仓清单（id + 张数），每拍重算。
-    convertTargets: []
+    convertTargets: [],
+    // 1.12.7：窗内确认条（`{ text, payload }`）。不用 `window.confirm()`——无边框透明窗口上
+    // 弹原生模态会让整扇窗短暂消失，看着就像「切个档把窗口关掉了」。
+    ask: null
   }
 
   function toast (text) {
@@ -71,6 +74,27 @@
       toast('这个操作发不出去：窗口的动作白名单里没有它，更新插件后重开窗口试试。')
     }
     return accepted
+  }
+
+  /**
+   * 1.12.7：窗内两段式确认——第一次点只把后果说清楚，点「确定」才真的发。
+   * `build(n)` 返回要提交给宿主的动作（要填数字的用 `{ input: true }`），所以确认条不碰业务逻辑。
+   * 不用 `window.confirm()` / `window.prompt()`：无边框透明窗口上弹原生模态会让整扇窗短暂消失，
+   * 看着就像「点一下把窗口关掉了」。
+   */
+  function ask (text, build, options = {}) {
+    const input = options.input === true ? true : null
+    if (input === true) el('askInput').value = String(options.value ?? 1)
+    el('askInput').hidden = input === null
+    state.ask = { text, build, input }
+    render()
+  }
+
+  function clearAsk () {
+    el('askInput').hidden = true
+    if (state.ask === null) return
+    state.ask = null
+    render()
   }
 
   /** 重建杠杆按钮与作物下拉（清单来自宿主，不硬编码）。 */
@@ -305,6 +329,12 @@
     el('submit').textContent = state.draft.side === 'short' ? '做空' : '做多'
     paintMode(built)
 
+    // 1.12.7：确认条（切真钱 / 提现 / 全部转 / 转现货 / 退出都走它）。
+    const pendingAsk = state.ask
+    el('ask').hidden = pendingAsk === null
+    el('askText').textContent = pendingAsk === null ? '' : pendingAsk.text
+    el('askInput').hidden = pendingAsk === null || pendingAsk.input !== true
+
     if (built.countdown.atEnd) askRefresh()
   }
 
@@ -378,16 +408,8 @@
   })
 
   el('withdraw').addEventListener('click', () => {
-    const raw = window.prompt('提现多少币回农场？', '100')
-    if (raw === null) return
-    const coins = Math.trunc(Number(raw))
-    if (!Number.isFinite(coins) || coins <= 0) {
-      toast('提现要是正整数币')
-      return
-    }
-    state.busy = true
-    send({ action: 'futures-withdraw', coins })
-    setTimeout(() => { state.busy = false; render() }, 3000)
+    // 1.12.7：不再用 `window.prompt`——原生模态在透明窗口上会让整扇窗闪掉。
+    ask('提现多少币回农场？', (coins) => ({ action: 'futures-withdraw', coins }), { input: true, value: 100 })
   })
 
   el('positions').addEventListener('click', (event) => {
@@ -402,17 +424,12 @@
     const convertId = event.target?.dataset?.convertId
     if (typeof convertId === 'string' && convertId !== '') {
       const held = Number(event.target.dataset.convertLots)
-      const raw = window.prompt('转多少张成现货？（这批持仓共 ' + (Number.isFinite(held) ? held : '?') + ' 张）', String(held > 0 ? held : 1))
-      if (raw === null) return
-      const lots = Math.trunc(Number(raw))
-      if (!Number.isFinite(lots) || lots <= 0) {
-        toast('张数要是正整数')
-        return
-      }
-      if (state.busy) return
-      state.busy = true
-      send({ action: 'futures-convert', positionId: convertId, lots })
-      setTimeout(() => { state.busy = false; render() }, 3000)
+      const most = Number.isFinite(held) && held > 0 ? Math.trunc(held) : 1
+      ask(
+        '转多少张成现货？（这批持仓共 ' + (Number.isFinite(held) ? held : '?') + ' 张）',
+        (lots) => ({ action: 'futures-convert', positionId: convertId, lots }),
+        { input: true, value: most }
+      )
     }
   })
 
@@ -421,10 +438,10 @@
     if (state.busy) return
     const targets = Array.isArray(state.convertTargets) ? state.convertTargets : []
     if (targets.length === 0) return
-    if (!window.confirm('把这 ' + targets.length + ' 笔持仓全部按公允价转成现货？')) return
-    state.busy = true
-    send({ action: 'futures-convert-all', positions: targets })
-    setTimeout(() => { state.busy = false; render() }, 3000)
+    ask('把这 ' + targets.length + ' 笔持仓全部按公允价转成现货？', () => ({
+      action: 'futures-convert-all',
+      positions: targets
+    }))
   })
 
   el('orders').addEventListener('click', (event) => {
@@ -476,7 +493,13 @@
     if (state.busy) return
     const account = state.account
     if (!account || (account.next !== 'live' && account.next !== 'shadow')) return
-    if (account.next === 'live' && !window.confirm('把这本账切到真钱？之后充值/提现都动农场硬币，盈亏也是真的。')) return
+    if (account.next === 'live') {
+      ask('把这本账切到真钱？之后充值/提现都动农场硬币，盈亏也是真的。', () => ({
+        action: 'futures-account-mode',
+        accountMode: 'live'
+      }))
+      return
+    }
     state.busy = true
     send({ action: 'futures-account-mode', accountMode: account.next })
     setTimeout(() => { state.busy = false; render() }, 3000)
@@ -494,11 +517,49 @@
   // 1.12.0：退出——强平自己的仓位、余额退回自己的农场，别人的账一分不动。
   el('rollback').addEventListener('click', () => {
     if (state.busy) return
-    if (!window.confirm('退出会把你的仓位按当前价强平、余额退回你的农场，并关掉你这本账。继续？')) return
+    ask('退出会把你的仓位按当前价强平、余额退回你的农场，并关掉你这本账。继续？', () => ({
+      action: 'futures-rollback'
+    }))
+  })
+
+  // 1.12.7：确认条的「确定」——把攒下的那个动作原样发出去。窗口不关。
+  el('askYes').addEventListener('click', () => {
+    const pending = state.ask
+    state.ask = null
+    if (pending === null || pending === undefined) {
+      render()
+      return
+    }
+    let payload
+    if (pending.input === true) {
+      const amount = Math.trunc(Number(el('askInput').value))
+      if (!Number.isFinite(amount) || amount <= 0) {
+        toast('填一个正整数')
+        state.ask = pending
+        render()
+        return
+      }
+      payload = pending.build(amount)
+    } else {
+      payload = pending.build()
+    }
+    if (payload === null || payload === undefined) {
+      render()
+      return
+    }
+    if (state.busy) return
     state.busy = true
-    send({ action: 'futures-rollback' })
+    const accepted = send(payload)
+    if (accepted === false) {
+      state.busy = false
+      render()
+      return
+    }
+    render()
     setTimeout(() => { state.busy = false; render() }, 3000)
   })
+
+  el('askNo').addEventListener('click', () => { clearAsk() })
 
   // 顶栏的「×」：无边框窗口没有系统关闭按钮，这颗是唯一看得见的出口（Esc 仍可用）。
   el('close').addEventListener('click', () => {
@@ -509,6 +570,11 @@
   document.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return
     if (state.composing) return
+    // 1.12.7：确认条开着时，Esc 先撤确认，不关窗——别让「手滑按 Esc」把窗关了。
+    if (state.ask !== null) {
+      clearAsk()
+      return
+    }
     bridge.close()
   })
 

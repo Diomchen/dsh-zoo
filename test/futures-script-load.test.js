@@ -282,3 +282,121 @@ test('desktop/futures.js 把宿主给的拒绝原因显示出来，而不是「�
   onResult({ ok: false, code: 'daily-cap' })
   assert.match(document.getElementById('toast').textContent, /明天 00:00/)
 })
+test('desktop/futures.js 切真钱走窗内确认条：第一次点不发，点「确定」才发，窗口一直开着', () => {
+  const view = require(join(ROOT, 'desktop', 'futures-view.js'))
+  const submitted = []
+  const handlers = new Map()
+  let onState = null
+  let closed = 0
+  const document = fakeDocument()
+  const originalGet = document.getElementById.bind(document)
+  document.getElementById = (id) => {
+    const node = originalGet(id)
+    if (!node.__wired) {
+      node.__wired = true
+      node.addEventListener = (event, fn) => handlers.set(id + ':' + event, fn)
+    }
+    return node
+  }
+  const sandbox = {
+    console,
+    document,
+    // 1.12.7 之后窗口不该再碰原生模态：`confirm` / `prompt` 一旦被调用就直接炸测试。
+    window: {
+      dshZooFuturesView: view,
+      dshZooFutures: {
+        onState (fn) { onState = fn },
+        onResult () {},
+        onComposing () {},
+        submit (message) { submitted.push(message); return true },
+        close () { closed += 1 },
+        ready () {}
+      },
+      confirm () { throw new Error('不该用 window.confirm：透明窗口上弹原生模态会让窗口消失') },
+      prompt () { throw new Error('不该用 window.prompt：透明窗口上弹原生模态会让窗口消失') },
+      addEventListener () {}
+    },
+    setTimeout: () => 1,
+    clearTimeout () {},
+    setInterval: () => 1,
+    clearInterval () {}
+  }
+  sandbox.globalThis = sandbox
+  vm.runInNewContext(readFileSync(join(ROOT, 'desktop', 'futures.js'), 'utf8'), sandbox, { filename: 'futures.js' })
+
+  // 纸面账户 → 按钮写「切到真钱」。
+  onState({ ...sampleView(), accountMode: 'shadow' })
+  submitted.length = 0
+
+  const toggle = handlers.get('accountSwitch:click')
+  assert.equal(typeof toggle, 'function', '切档按钮应该有监听')
+  toggle()
+
+  assert.equal(submitted.length, 0, '第一次点只弹确认条，不该直接发出去')
+  assert.equal(originalGet('ask').hidden, false, '确认条要露出来')
+  assert.match(originalGet('askText').textContent, /切到真钱/)
+
+  const yes = handlers.get('askYes:click')
+  assert.equal(typeof yes, 'function', '确认条要有「确定」')
+  yes()
+
+  assert.equal(submitted.length, 1)
+  // vm 里造的对象跨 realm，`deepStrictEqual` 会判「结构一样但不同引用」，先过一遍 JSON。
+  assert.deepEqual(JSON.parse(JSON.stringify(submitted[0])), { action: 'futures-account-mode', accountMode: 'live' })
+  assert.equal(closed, 0, '切档不该碰关窗')
+  assert.equal(originalGet('ask').hidden, true, '发完确认条要收起来')
+})
+
+test('desktop/futures.js 提现用窗内输入框，不再弹原生 prompt', () => {
+  const view = require(join(ROOT, 'desktop', 'futures-view.js'))
+  const submitted = []
+  const handlers = new Map()
+  let onState = null
+  const document = fakeDocument()
+  const originalGet = document.getElementById.bind(document)
+  document.getElementById = (id) => {
+    const node = originalGet(id)
+    if (!node.__wired) {
+      node.__wired = true
+      node.addEventListener = (event, fn) => handlers.set(id + ':' + event, fn)
+    }
+    return node
+  }
+  const sandbox = {
+    console,
+    document,
+    window: {
+      dshZooFuturesView: view,
+      dshZooFutures: {
+        onState (fn) { onState = fn },
+        onResult () {},
+        onComposing () {},
+        submit (message) { submitted.push(message); return true },
+        close () {},
+        ready () {}
+      },
+      confirm () { throw new Error('不该用 window.confirm') },
+      prompt () { throw new Error('不该用 window.prompt') },
+      addEventListener () {}
+    },
+    setTimeout: () => 1,
+    clearTimeout () {},
+    setInterval: () => 1,
+    clearInterval () {}
+  }
+  sandbox.globalThis = sandbox
+  vm.runInNewContext(readFileSync(join(ROOT, 'desktop', 'futures.js'), 'utf8'), sandbox, { filename: 'futures.js' })
+
+  onState(sampleView())
+  submitted.length = 0
+
+  handlers.get('withdraw:click')()
+  assert.equal(submitted.length, 0, '点提现先弹输入条')
+  assert.equal(originalGet('askInput').hidden, false, '输入框要露出来')
+  assert.equal(originalGet('askInput').value, '100')
+
+  originalGet('askInput').value = '250'
+  handlers.get('askYes:click')()
+  assert.equal(submitted.length, 1)
+  assert.deepEqual(JSON.parse(JSON.stringify(submitted[0])), { action: 'futures-withdraw', coins: 250 })
+})
