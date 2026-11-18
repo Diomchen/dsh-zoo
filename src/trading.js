@@ -1,9 +1,9 @@
 /**
- * 盘口账本（票 79/80）：`<dataDir>/trading.json` v1。
+ * 盘口账本（票 79/80）：`<dataDir>/trading.json` v2。
  *
  * 形状（SPEC v10「硬币与账本」）：
  *   {
- *     "version": 1,
+ *     "version": 2,
  *     "week": { "start": 1763308800000, "pnl": 0, "base": 30 },
  *     "positions": [
  *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
@@ -18,7 +18,8 @@
  *     "history": [
  *       { "id": "…", "crop": "tomato", "side": "long", "margin": 50, "leverage": 5,
  *         "entry": 5.12, "exit": 5.3, "pnl": 8, "reason": "liquidate", "at": 1763309700000 }
- *     ]
+ *     ],
+ *     "flow": { "base": {}, "tape": [], "seq": 0 }
  *   }
  *
  * 三条产品规则决定这里的形状：
@@ -31,12 +32,14 @@
  *     只补后半段，绝不重复铸币（与 `src/contracts.js` 的 beginSettle/finishSettle 同源，
  *     宁可少退一次也不重复发钱）。
  *
- * 票 80 只做**加法**（`version` 还是 1）：每个仓位多存一个 `stopLoss` 档位；
+ * 票 80/83 是**加法**（当时 `version` 仍为 1）：仓位多存 `stopLoss`，账本多存 `orders`；
+ * 票 103 把 `version` 升到 2：v1 的未平仓位按 `board-v5` 现价 re-base 入场价、写 `rebasedAt`，
+ * 路径检查与「活到哪一根」从 re-base 时刻起算；`openedAt`/顺序不动。
  * 强平价不落盘——它由 `side + entry + leverage` 现算（`liquidationPriceOf`），
  * 存一份就会和改过的 entry/杠杆对不上。逐分钟的强平/止损检查全在 `pathScan()`：
  * tick、插针、快进时钟、离线补算走同一条路，账本这里只负责「先写意图再动钱」。
  *
- * 票 83 的到价挂单同样是**加法**（`version` 仍为 1，老文件 orders 缺省 = 空数组）：
+ * 票 83 的到价挂单同样是**加法**（当时 `version` 仍为 1，老文件 orders 缺省 = 空数组）：
  * 挂单在**下单那一刻**就 `spendCoins(margin)` 把保证金锁进农场，所以成交时不用再动钱，
  * 也不可能出现「到价了但硬币不够」；成交只把订单换成仓位（同一次写盘，原子）。
  * 退款是跨文件的（farm.json），照抄结算的意图模式：先写 `refunding` 再 `addCoins`，
@@ -57,10 +60,25 @@ import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import { MAX_COINS } from './farm.js'
+import {
+  FLOW_MAX_BATCH,
+  FLOW_MINUTE_MS,
+  FLOW_SLOT_MS,
+  effectiveImpactOf,
+  flowEventView,
+  flowEventsForView,
+  flowEventsSince as flowTapeSince,
+  flowLevelAt,
+  flowNetBetween,
+  mergeFlowEvents,
+  normalizeFlowEvent,
+  pruneTape
+} from './board-flow.js'
 import { parseJsonText } from './json-text.js'
 import {
   MAX_MARGIN,
   SLOT_MS,
+  SLOT_TICKS,
   TRADING_CLOSE_REASONS,
   boardCrops,
   isBoardCrop,
@@ -86,7 +104,7 @@ import {
 export { TRADING_CLOSE_REASONS }
 
 export const TRADING_FILE = 'trading.json'
-export const TRADING_VERSION = 1
+export const TRADING_VERSION = 2
 /** 结算历史最多 200 条；`/state` 与盘口窗只取最近 50 条。 */
 export const MAX_TRADING_HISTORY = 200
 export const TRADING_VIEW_HISTORY = 50
@@ -154,8 +172,26 @@ function initialTradingState (now, base) {
     week: { start: weekStartOf(now) ?? 0, pnl: 0, base },
     positions: [],
     orders: [],
-    history: []
+    history: [],
+    // B 期的 LAN 资金流带：A 期只落一个空壳，版本 1 → 2 的迁移也把它补上。
+    flow: { base: {}, tape: [], seq: 0 }
   }
+}
+
+/** 资金流账本的空壳/归一化：A 期不写、不读；B 期才有内容。坏形状一律退回空壳。 */
+function normalizeFlow (value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return { flow: { base: {}, tape: [], seq: 0 }, repaired: value === undefined ? 0 : 1 }
+  }
+  const base = value.base !== null && typeof value.base === 'object' && !Array.isArray(value.base)
+    ? { ...value.base }
+    : {}
+  const tape = (Array.isArray(value.tape) ? value.tape : [])
+    .map(normalizeFlowEvent)
+    .filter((event) => event !== null)
+    .slice(-500)
+  const seq = Number.isInteger(value.seq) && value.seq >= 0 ? value.seq : 0
+  return { flow: { base, tape, seq }, repaired: 0 }
 }
 
 function copyHistory (entry) {
@@ -241,6 +277,15 @@ function normalizePosition (value) {
   if (openedAt === null) return null
   const settling = normalizeSettling(value.settling)
   const stopLoss = normalizeStopLoss(value.stopLoss)
+  // v1 → v2 的 re-base 时刻：路径检查与「活到哪一根」都从这一刻起算；
+  // 开仓时间/顺序仍用 openedAt，列表不会因为迁移乱掉。
+  let rebasedAt = null
+  let rebasedRepaired = 0
+  if (value.rebasedAt !== undefined) {
+    rebasedAt = timestamp(value.rebasedAt)
+    if (rebasedAt === null) rebasedRepaired = 1
+  }
+  const effectiveStart = rebasedAt ?? openedAt
   return {
     position: {
       id,
@@ -250,12 +295,13 @@ function normalizePosition (value) {
       leverage: value.leverage,
       entry,
       openedAt,
-      // slot 是**派生字段**：按 openedAt 重算，文件里写错了也不信。
-      slot: slotIndexAt(openedAt),
+      // slot 是**派生字段**：按有效起点（re-base 时刻优先）重算，文件里写错了也不信。
+      slot: slotIndexAt(effectiveStart),
       stopLoss: stopLoss.level,
+      ...(rebasedAt === null ? {} : { rebasedAt }),
       ...(settling.settling === null ? {} : { settling: settling.settling })
     },
-    repaired: settling.repaired + stopLoss.repaired
+    repaired: settling.repaired + stopLoss.repaired + rebasedRepaired
   }
 }
 
@@ -417,25 +463,30 @@ function normalizeOrders (value) {
  */
 export function normalizeTradingFile (value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0 }
+    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0, migrated: false }
   }
-  if (value.version !== undefined && value.version !== TRADING_VERSION) {
-    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0 }
+  // v1 → v2：v1 没有 flow 字段，未平仓位的 entry 是 v4 行情的价；load 里会按 v5 re-base。
+  const migrated = value.version === undefined || value.version === 1
+  if (!migrated && value.version !== TRADING_VERSION) {
+    return { state: initialTradingState(0, 0), corrupt: true, repaired: 0, migrated: false }
   }
   const week = normalizeWeek(value.week)
   const positions = normalizePositions(value.positions)
   const orders = normalizeOrders(value.orders)
   const history = normalizeHistory(value.history)
+  const flow = normalizeFlow(value.flow)
   return {
     state: {
       version: TRADING_VERSION,
       week: week.week,
       positions: positions.positions,
       orders: orders.orders,
-      history: history.history
+      history: history.history,
+      flow: flow.flow
     },
     corrupt: false,
-    repaired: week.repaired + positions.repaired + orders.repaired + history.repaired
+    repaired: week.repaired + positions.repaired + orders.repaired + history.repaired + flow.repaired,
+    migrated
   }
 }
 
@@ -449,7 +500,12 @@ function toFileState (state) {
     },
     positions: state.positions.map(copyPosition),
     orders: state.orders.map(copyOrder),
-    history: state.history.map(copyHistory)
+    history: state.history.map(copyHistory),
+    flow: {
+      base: { ...(state.flow?.base ?? {}) },
+      tape: Array.isArray(state.flow?.tape) ? state.flow.tape.slice(0, 500) : [],
+      seq: Number.isInteger(state.flow?.seq) && state.flow.seq >= 0 ? state.flow.seq : 0
+    }
   }
 }
 
@@ -459,9 +515,16 @@ function toFileState (state) {
  *
  * `farm` 是农场 store（硬币是唯一钱包）：给它才能开仓/结算；不给时开仓回 `starting`。
  */
-export async function createTradingStore (dir, { log, now = Date.now, farm = null } = {}) {
+export async function createTradingStore (dir, {
+  log,
+  now = Date.now,
+  farm = null,
+  deviceId = 'local',
+  onFlow = null,
+  flow = false
+} = {}) {
   if (typeof dir !== 'string' || dir === '') throw new Error('trading: missing data directory')
-  const store = new TradingStore({ dir, log, now, farm })
+  const store = new TradingStore({ dir, log, now, farm, deviceId, onFlow, flow })
   await store.load()
   return store
 }
@@ -471,6 +534,9 @@ class TradingStore {
   #log
   #farm
   #now
+  #deviceId
+  #onFlow
+  #flowEnabled
   #state = initialTradingState(0, 0)
   #warned = new Set()
   /**
@@ -493,15 +559,160 @@ class TradingStore {
   #chain = Promise.resolve()
   #lastWriteAt = Number.NEGATIVE_INFINITY
 
-  constructor ({ dir, log, now, farm }) {
+  constructor ({ dir, log, now, farm, deviceId = 'local', onFlow = null, flow = false }) {
     this.#dir = dir
     this.#log = log
     this.#farm = farm
+    this.#deviceId = typeof deviceId === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(deviceId)
+      ? deviceId
+      : 'local'
+    this.#onFlow = typeof onFlow === 'function' ? onFlow : null
+    // 老用例/老调用方默认关：真实宿主显式传 flow:true；B 期测试也显式开。
+    this.#flowEnabled = flow === true
     const clock = typeof now === 'function' ? now : () => now
     this.#now = () => {
       const stamp = Number(clock())
       return Number.isFinite(stamp) ? stamp : Date.now()
     }
+  }
+
+  /** 第 `minute` 分钟的资金流水平（绝对分钟）；A 期没有 tape 时恒 0。 */
+  #flowLevel (crop, minute) {
+    return flowLevelAt({ events: this.#state.flow?.tape ?? [], crop, minute })
+  }
+
+  /** 给宿主画图/结算用的公开入口：第 `minute` 分钟的资金流水平。 */
+  flowLevelAt (crop, minute) {
+    return this.#flowLevel(crop, minute)
+  }
+
+  /** 此刻的资金流水平。 */
+  #flowLevelNow (crop, now = this.#nowMs()) {
+    return this.#flowLevel(crop, Math.floor(now / FLOW_MINUTE_MS))
+  }
+
+  /** 给 `pathScan` / `limitFillScan` 的分钟注入。 */
+  #flowAt (crop) {
+    return (minute) => this.#flowLevel(crop, minute)
+  }
+
+  /**
+   * 预览一条本机资金流事件：只算，不写 tape。
+   * 桶/限速/单根/单日上限都交给 `mergeFlowEvents()`；本机事件用 `sync` 模式，
+   * 因为强平/止损的触发时刻可能已经过去一两分钟，不能被「实时 15 秒窗口」丢掉。
+   */
+  #previewFlowEvent ({ crop, action, side, reason, notional, at }) {
+    if (this.#flowEnabled !== true) {
+      return { accepted: false, event: null, effective: 0, tape: this.#state.flow?.tape ?? [], seq: this.#state.flow?.seq ?? 0 }
+    }
+    const seq = (this.#state.flow?.seq ?? 0) + 1
+    const raw = {
+      id: this.#deviceId + ':' + seq,
+      deviceId: this.#deviceId,
+      at,
+      crop,
+      action,
+      side,
+      reason,
+      notional,
+      source: 'board'
+    }
+    const tape = this.#state.flow?.tape ?? []
+    const merged = mergeFlowEvents({ tape, incoming: [raw], now: this.#nowMs(), mode: 'sync' })
+    if (merged.accepted.length === 0) {
+      return { accepted: false, event: null, effective: 0, tape, seq: this.#state.flow?.seq ?? 0 }
+    }
+    const event = merged.accepted[0]
+    const effective = effectiveImpactOf({
+      events: tape,
+      crop,
+      minute: Math.floor(at / FLOW_MINUTE_MS),
+      event
+    })
+    return { accepted: true, event, effective, tape: merged.tape, seq }
+  }
+
+  /** 成交/结算成功后才把预览写进 tape；失败的交易不会推动行情。 */
+  #commitFlowPreview (preview) {
+    if (preview === null || preview.accepted !== true) return false
+    this.#state.flow.tape = preview.tape
+    this.#state.flow.seq = preview.seq
+    return true
+  }
+
+  #notifyFlow (event) {
+    if (this.#onFlow === null || event === null) return
+    try {
+      this.#onFlow(event)
+    } catch {
+      this.#warnOnce('flow-notify', '资金流事件广播失败，下一次同步会补上')
+    }
+  }
+
+  /**
+   * 接收邻居的资金流事件（票 107）：白名单/去重/限速/单根/单日上限在
+   * `mergeFlowEvents()` 里复算一遍，不信发送端；收下就落盘。
+   */
+  acceptFlow (incoming, options = {}) {
+    // 和开/平仓走同一条串行链：邻居的两包流水、或流水与本地成交同时到，
+    // 不能各自读同一份 tape 再互相写掉。
+    return this.#enqueue(() => this.#acceptFlow(incoming, options))
+  }
+
+  async #acceptFlow (incoming, { now = this.#nowMs(), mode = 'live' } = {}) {
+    const merged = mergeFlowEvents({
+      tape: this.#state.flow?.tape ?? [],
+      incoming,
+      now,
+      mode
+    })
+    if (merged.accepted.length === 0) {
+      return { ok: true, accepted: 0, rejected: merged.rejected, persisted: false }
+    }
+    this.#state.flow.tape = merged.tape
+    const persisted = await this.#persist(true)
+    return { ok: true, accepted: merged.accepted.length, rejected: merged.rejected, persisted }
+  }
+
+  /** 同步请求：`since` 之后的资金流事件（最多 16 条）。 */
+  flowEventsSince (since, limit = FLOW_MAX_BATCH) {
+    return flowTapeSince({ tape: this.#state.flow?.tape ?? [], since, limit })
+  }
+
+  /** 窗口要的当前作物资金流：水平、本根净流、最近 24 根的事件。 */
+  flowView ({ now = this.#nowMs(), crop, limit = 20 } = {}) {
+    if (typeof crop !== 'string' || crop === '') return { level: 0, net: 0, events: [] }
+    const minute = Math.floor(now / FLOW_MINUTE_MS)
+    const slotStart = Math.floor(now / FLOW_SLOT_MS) * FLOW_SLOT_MS
+    const tape = this.#state.flow?.tape ?? []
+    return {
+      level: this.#flowLevel(crop, minute),
+      net: flowNetBetween({ tape, crop, from: slotStart, to: now + 1 }),
+      events: flowEventsForView({
+        tape,
+        crop,
+        from: now - 24 * FLOW_SLOT_MS,
+        to: now + 1,
+        limit
+      }).map(flowEventView).filter((event) => event !== null)
+    }
+  }
+
+  /**
+   * 宿主的 self deviceId 在盘口 store 建好之后才拿到（identity 晚于农场/盘口）。
+   * 这里补上，之后本机资金流事件用真实 deviceId；建 store 时还没有本机事件。
+   */
+  setDeviceId (value) {
+    if (typeof value === 'string' && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value)) {
+      this.#deviceId = value
+      // 建 store 时 identity 还没好：把占位 'local' 的旧事件改成真实 id（id 只是去重键，不改）。
+      if (Array.isArray(this.#state.flow?.tape)) {
+        for (const event of this.#state.flow.tape) {
+          if (event.deviceId === 'local') event.deviceId = value
+        }
+      }
+    }
+    return this.#deviceId
   }
 
   async load () {
@@ -530,10 +741,35 @@ class TradingStore {
 
     const normalized = normalizeTradingFile(raw)
     this.#state = normalized.state
+    // 只保留最近 24 小时；更老的流水对 2 小时半衰期的水平只剩 <0.02%。
+    this.#state.flow.tape = pruneTape(this.#state.flow.tape, now)
     if (normalized.corrupt) {
       this.#warnOnce('shape', '盘口形状不对，先按空盘口运行')
     } else if (normalized.repaired > 0) {
       this.#warnOnce('entries', '盘口里有 ' + normalized.repaired + ' 处格式不对，已按默认值修补')
+    }
+    // v1 → v2：老仓位的 entry 是 v4 行情的价。按 v5 现价重新入场（PnL 从 0 开始），
+    // 而不是让一次行情升级把仓位按一张它们没见过的图结算（ADR-0035 决定 4）。
+    let rebased = 0
+    if (normalized.migrated === true) {
+      for (const position of this.#state.positions) {
+        if (position.settling !== undefined) continue
+        const entry = markPrice({
+          crop: position.crop,
+          now,
+          flowLevel: this.#flowLevelNow(position.crop, now)
+        })
+        if (entry === null) continue
+        position.entry = entry
+        // 开仓时间/顺序不动（列表按它排序）；路径检查改从 re-base 时刻起算。
+        position.rebasedAt = now
+        // slot 是「活到哪一根」的派生字段：不挪到当前根，load 会把老仓位当收盘仓位结掉。
+        position.slot = slotIndexAt(now)
+        rebased += 1
+      }
+      if (rebased > 0) {
+        this.#warnOnce('price-v5', '行情升级到 v5，' + rebased + ' 个未平仓位按新行情重新入场')
+      }
     }
 
     // 先跨周（只清本周盈亏，硬币不动），再补结算：这次补出来的盈亏算本周的。
@@ -563,7 +799,7 @@ class TradingStore {
     const closed = await this.#settleDue(now)
     // 坏文件不覆盖（等下一次动作/tick 再写）；补出来的补结算、跨周与修补要立刻落盘。
     if (!normalized.corrupt &&
-      (resumed || refunded || matched || rolled || closed || normalized.repaired > 0)) {
+      (resumed || refunded || matched || rolled || closed || normalized.repaired > 0 || rebased > 0 || normalized.migrated === true)) {
       await this.#persist(true)
     }
   }
@@ -664,12 +900,21 @@ class TradingStore {
     if (spent?.ok !== true) {
       return tradingError(spent?.error === 'no-coin' ? 'no-coin' : 'action-failed')
     }
-    // 成交价 = 扣钱那一刻的现价；算不出来（作物底价坏了）就把保证金和手续费退回去。
-    const entry = markPrice({ crop, now })
-    if (entry === null) {
+    // 成交价 = 扣钱那一刻的现价 + 一半自身冲击（票 107）；算不出来就退保证金。
+    const pre = markPrice({ crop, now, flowLevel: this.#flowLevelNow(crop, now) })
+    if (pre === null) {
       await farm.addCoins(raw.margin)
       return tradingError('action-failed')
     }
+    const preview = this.#previewFlowEvent({
+      crop,
+      action: 'open',
+      side,
+      reason: 'manual',
+      notional: raw.margin * leverage,
+      at: now
+    })
+    const entry = preview.accepted ? pre * Math.exp(preview.effective / 2) : pre
     const position = {
       id: randomUUID(),
       crop,
@@ -682,14 +927,22 @@ class TradingStore {
       // 止损默认关（SPEC：玩家工具，不是系统强加的风控）；开仓时不接受档位，只走 setStopLoss。
       stopLoss: 0
     }
+    this.#commitFlowPreview(preview)
     this.#state.positions.push(position)
     const persisted = await this.#persist(true)
+    if (preview.accepted) this.#notifyFlow(preview.event)
     return {
       ok: true,
       action: 'trading-open-position',
       position: this.#positionView(position, now),
       coins: this.#coinBase(),
-      persisted
+      persisted,
+      flow: {
+        recorded: preview.accepted,
+        impact: preview.effective,
+        slippage: preview.effective / 2,
+        level: this.#flowLevelNow(crop, now)
+      }
     }
   }
 
@@ -700,10 +953,33 @@ class TradingStore {
     if (position === undefined) return tradingError('no-position')
     if (position.settling !== undefined) return tradingError('settling')
     const now = this.#nowMs()
-    const exit = markPrice({ crop: position.crop, now })
-    if (exit === null) return tradingError('action-failed')
+    const pre = markPrice({ crop: position.crop, now, flowLevel: this.#flowLevelNow(position.crop, now) })
+    if (pre === null) return tradingError('action-failed')
     const safeReason = TRADING_CLOSE_REASONS.includes(reason) ? reason : 'close'
-    return this.#settle(position, { exit, reason: safeReason, at: now })
+    const preview = this.#previewFlowEvent({
+      crop: position.crop,
+      action: 'close',
+      side: position.side,
+      reason: safeReason,
+      notional: position.margin * position.leverage,
+      at: now
+    })
+    const exit = preview.accepted ? pre * Math.exp(preview.effective / 2) : pre
+    const result = await this.#settle(position, { exit, reason: safeReason, at: now })
+    if (result.ok !== true) return result
+    if (this.#commitFlowPreview(preview)) {
+      await this.#persist(true)
+      this.#notifyFlow(preview.event)
+    }
+    return {
+      ...result,
+      flow: {
+        recorded: preview.accepted,
+        impact: preview.effective,
+        slippage: preview.effective / 2,
+        level: this.#flowLevelNow(position.crop, now)
+      }
+    }
   }
 
   async #setStopLoss (positionId, level) {
@@ -826,7 +1102,22 @@ class TradingStore {
       if (trigger !== null) {
         this.#forgetCheck(position.id)
         const result = await this.#settle(position, trigger)
-        if (result.ok === true) settled = true
+        if (result.ok === true) {
+          settled = true
+          // 强平/止损是系统市价单：按触发价成交后，再补一条资金流并推动行情。
+          const preview = this.#previewFlowEvent({
+            crop: position.crop,
+            action: 'close',
+            side: position.side,
+            reason: trigger.reason === 'liquidate' ? 'liquidate' : 'stop',
+            notional: position.margin * position.leverage,
+            at: trigger.at
+          })
+          if (this.#commitFlowPreview(preview)) {
+            await this.#persist(true)
+            this.#notifyFlow(preview.event)
+          }
+        }
         continue
       }
       // 这一根还没收盘：仓位照常开着，记住这次检查到哪，等下一拍或收盘。
@@ -834,7 +1125,12 @@ class TradingStore {
         this.#rememberCheck(position, horizon)
         continue
       }
-      const exit = slotClosePrice(position.crop, position.slot)
+      // 收盘结算不补资金流：按公开收盘价结，避免系统结算自己推动收盘价。
+      const exit = slotClosePrice(
+        position.crop,
+        position.slot,
+        this.#flowLevel(position.crop, (position.slot + 1) * SLOT_TICKS)
+      )
       if (exit === null) continue
       const result = await this.#settle(position, {
         exit,
@@ -857,6 +1153,7 @@ class TradingStore {
    */
   async #matchOrders (now) {
     let filled = false
+    const flowEvents = []
     for (const order of [...this.#state.orders]) {
       // 已经在退款中的单由 `load()` 补完删单，这里不重复动钱。
       if (order.refunding !== undefined) continue
@@ -867,7 +1164,8 @@ class TradingStore {
         side: order.side,
         target: order.target,
         from: order.placedAt,
-        to: horizon
+        to: horizon,
+        flowAt: this.#flowAt(order.crop)
       })
       if (crossing !== null) {
         const index = this.#state.orders.indexOf(order)
@@ -878,13 +1176,22 @@ class TradingStore {
           side: order.side,
           margin: order.margin,
           leverage: order.leverage,
-          // SPEC：成交价 = 目标价，不是越过那一刻的现价。
+          // SPEC：成交价 = 目标价，不是越过那一刻的现价；资金流只推公开行情。
           entry: order.target,
           openedAt: crossing.at,
           slot: crossing.slot,
           // 止损默认关；挂单成交的仓位也一样，玩家可以成交后再设。
           stopLoss: 0
         })
+        const preview = this.#previewFlowEvent({
+          crop: order.crop,
+          action: 'open',
+          side: order.side,
+          reason: 'manual',
+          notional: order.margin * order.leverage,
+          at: crossing.at
+        })
+        if (this.#commitFlowPreview(preview)) flowEvents.push(preview.event)
         filled = true
         continue
       }
@@ -894,7 +1201,10 @@ class TradingStore {
       }
     }
     // 成交必须立刻落盘（订单和仓位一起）；退款在 #refundOrder 里各自写过意图与删单。
-    if (filled) await this.#persist(true)
+    if (filled) {
+      await this.#persist(true)
+      for (const event of flowEvents) this.#notifyFlow(event)
+    }
     return filled
   }
 
@@ -955,13 +1265,14 @@ class TradingStore {
    * `pathScan` 的 3 天上限在账本里永远碰不到（它防的是别处传入的离谱区间）。
    */
   #triggerOf (position, horizon) {
+    const baseFrom = position.rebasedAt ?? position.openedAt
     const liquidationFrom = Math.max(
-      position.openedAt,
-      this.#checked.get(position.id) ?? position.openedAt
+      baseFrom,
+      this.#checked.get(position.id) ?? baseFrom
     )
     const stopFrom = Math.max(
-      position.openedAt,
-      this.#stopFrom.get(position.id) ?? position.openedAt
+      baseFrom,
+      this.#stopFrom.get(position.id) ?? baseFrom
     )
     return pathScan({
       crop: position.crop,
@@ -972,13 +1283,14 @@ class TradingStore {
       stopLoss: position.stopLoss,
       from: liquidationFrom,
       to: horizon,
-      stopFrom
+      stopFrom,
+      flowAt: this.#flowAt(position.crop)
     })
   }
 
   /** 记住「这手仓位的强平已经检查到这个时刻」；时钟往后退时不倒着走。 */
   #rememberCheck (position, horizon) {
-    const previous = this.#checked.get(position.id) ?? position.openedAt
+    const previous = this.#checked.get(position.id) ?? position.rebasedAt ?? position.openedAt
     if (horizon > previous) this.#checked.set(position.id, horizon)
   }
 
@@ -1091,7 +1403,9 @@ class TradingStore {
 
   #positionView (position, now) {
     const settling = position.settling
-    const mark = settling === undefined ? markPrice({ crop: position.crop, now }) : settling.exit
+    const mark = settling === undefined
+      ? markPrice({ crop: position.crop, now, flowLevel: this.#flowLevelNow(position.crop, now) })
+      : settling.exit
     const pnl = settling === undefined
       ? (mark === null
           ? null

@@ -77,6 +77,8 @@ function makeService (t, dir, options = {}) {
     network: false,
     desktop: false,
     petBridge: false,
+    // 这些用例钉的是 v5 结算口径；B 期资金流另有专门用例。
+    tradingFlow: false,
     ...options
   })
   service.routes = routes
@@ -201,7 +203,7 @@ test('票 79 e2e：看价 → 开一手 → 收盘结算 → 硬币/历史/存�
 
   // 4) 存档就是契约形状；硬币余额不在盘口文件里。
   const file = await readTrading(dir)
-  assert.equal(file.version, 1)
+  assert.equal(file.version, 2)
   assert.equal(file.week.start, weekStartOf(OPEN_AT))
   assert.deepEqual(file.positions, [])
   assert.deepEqual(file.orders, [])
@@ -291,7 +293,7 @@ const AFTER_80 = (BAR_80.slot + 1) * SLOT_MS + 1000
 const TICK_80 = BAR_80.breachTick
 const EXIT_80 = boardPrice({ crop: 'tomato', slot: BAR_80.slot, tick: TICK_80 })
 
-// 票 101：下单杠杆收到 1×/5×，但盘上还有别人昨天开的 20×。它们的强平线是
+// 票 101/2026-11-18：下单杠杆 1×/5×/20×/100×；盘上 20× 仓位的强平线是
 // (1 − 5%) / 20 = 0.9525，比原来的 −100% 保证金线早一点点，所以单独挑一根行情。
 const BAR_LEGACY = breachBar(Math.floor(SLOT_EDGE / SLOT_MS) + 1, 1 - 0.95 / 20)
 const OPEN_LEGACY = BAR_LEGACY.slot * SLOT_MS + 5 * TICK_MS
@@ -299,7 +301,7 @@ const AFTER_LEGACY = (BAR_LEGACY.slot + 1) * SLOT_MS + 1000
 const TICK_LEGACY = BAR_LEGACY.breachTick
 const EXIT_LEGACY = boardPrice({ crop: 'tomato', slot: BAR_LEGACY.slot, tick: TICK_LEGACY })
 
-test('票 80 e2e：杠杆白名单是 [1,5]；盘上老 20× 仓位照旧强平，只亏保证金', async (t) => {
+test('票 80 e2e：杠杆白名单是 [1,5,20,50,100]；盘上 20× 仓位照旧强平，只亏保证金', async (t) => {
   const dir = await tempDir(t)
   // 保证金在开仓那一刻就扣过了，所以农场先记 450。
   await seedFarm(dir, 450)
@@ -324,9 +326,9 @@ test('票 80 e2e：杠杆白名单是 [1,5]；盘上老 20× 仓位照旧强平�
   const service = makeService(t, dir, { farmNow: () => clock.value })
   await service.ready
 
-  // 1) 白名单：宿主只下发 1×/5× 与四档止损，窗口不自己复制一份。
+  // 1) 白名单：宿主下发 1×/5×/20×/100× 与四档止损，窗口不自己复制一份。
   const before = await state(service)
-  assert.deepEqual(before.body.trading.limits.leverages, [1, 5])
+  assert.deepEqual(before.body.trading.limits.leverages, [1, 5, 20, 50, 100])
   assert.equal(before.body.farm.coins, 450)
   // 老仓位读得回来，杠杆保持 20，强平价按 5% 维持保证金算。
   const legacy = before.body.trading.positions[0]
@@ -337,12 +339,12 @@ test('票 80 e2e：杠杆白名单是 [1,5]；盘上老 20× 仓位照旧强平�
     leverage: 20
   }))
 
-  // 2) 现在想再开 20×：拒单，硬币一分不动。
+  // 2) 现在想开不在白名单里的 10×：拒单，硬币一分不动。
   const rejected = await action(service, {
     action: 'trading-open-position',
     side: 'long',
     margin: 50,
-    leverage: 20,
+    leverage: 10,
     cropId: 'tomato'
   })
   assert.equal(rejected.body.ok, false)

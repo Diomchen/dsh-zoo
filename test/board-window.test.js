@@ -126,6 +126,8 @@ function makeService (t, options = {}) {
     network: false,
     petBridge: false,
     skinServer: false,
+    // 这些用例钉的是 v5 结算口径；B 期资金流另有专门用例。
+    tradingFlow: false,
     ...options
   })
   service.routes = routes
@@ -486,8 +488,8 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   // 窗口 / helper / 宿主三处的止损四档是同一组数（改档位时一起改）。
   assert.deepEqual(shared.BOARD_STOP_LEVELS, boardView.stopLevels())
   assert.deepEqual(shared.BOARD_STOP_LEVELS, TRADING_STOP_LEVELS)
-  // 杠杆的形状上限也同源（helper 不再各写一个 20）。
-  assert.equal(shared.BOARD_MAX_LEVERAGE, 20)
+  // 杠杆的形状上限也同源（helper 不再各写一个 100）。
+  assert.equal(shared.BOARD_MAX_LEVERAGE, 100)
   // 票 83：到价挂单 / 撤单的字段白名单。
   assert.deepEqual(
     shared.normalizeBoardAction({
@@ -498,6 +500,7 @@ test('shared 白名单：board-window 命令、board-submit、status 字段、�
   assert.deepEqual(shared.normalizeBoardAction({ action: 'trading-cancel-order', orderId: positionId }),
     { action: 'trading-cancel-order', orderId: positionId })
   for (const bad of [
+    { action: 'trading-place-order', side: 'short', margin: 250, leverage: 101, cropId: 'tomato' },
     { action: 'trading-place-order', side: 'short', margin: 250, leverage: 20, cropId: 'tomato' },
     // 2× 是形状合法、宿主按白名单拒（和开仓同一条分工）；这里只测形状。
     { action: 'trading-place-order', side: 'short', margin: 0, cropId: 'tomato', target: 5.5 },
@@ -954,7 +957,12 @@ test('票 90：首包只带当前作物的图与风向，limits 仍列全部作�
   assert.equal(charts.body.ok, true)
   assert.equal(charts.body.action, 'trading-charts')
   assert.equal(charts.body.crop, 'tomato')
-  assert.deepEqual(Object.keys(charts.body), ['ok', 'action', 'crop', 'timeframes', 'hint'])
+  assert.deepEqual(Object.keys(charts.body).filter((key) => key !== 'news'), ['ok', 'action', 'crop', 'timeframes', 'hint'])
+  // 票 105：消息面可能随图一起下发；有就校验形状，没有也不影响。
+  if (charts.body.news !== undefined) {
+    assert.ok(Array.isArray(charts.body.news.items))
+    assert.ok(Array.isArray(charts.body.news.calendar))
+  }
   assert.deepEqual(Object.keys(charts.body.timeframes), ['15m', '1h', '1d', '1w'])
   for (const id of ['15m', '1h', '1d', '1w']) {
     assert.deepEqual(Object.keys(charts.body.timeframes[id]), ['tomato'], id + ' 只回请求的作物')
@@ -1669,8 +1677,8 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.match(html, /grid-template-rows: 40px 268px 104px minmax\(0, 1fr\)/)
   assert.match(html, /grid-template-columns: minmax\(0, 1fr\) 300px/)
   assert.match(html, /\.crop-strip \{[\s\S]*?height: 40px/)
-  assert.match(html, /viewBox="0 0 720 228"/)
-  assert.match(html, /\.chart-svg \{[\s\S]*?height: 228px/)
+  assert.match(html, /viewBox="0 0 720 212"/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 212px/)
   assert.doesNotMatch(html, /viewBox="0 0 384 188"/)
   // 760×700 内不整页滚动：页面本身 overflow hidden，只有列表内部滚。
   assert.match(html, /html,\s*\n\s*body \{[\s\S]*?overflow: hidden/)
@@ -1681,7 +1689,7 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.match(html, /repeat\(4, 42px\)/)
   // 票 101：杠杆白名单收到 1×/5×，横条里就两列（方向也是两列）。
   assert.match(html, /\.chip-row\.side \{[\s\S]*?repeat\(2, 42px\)/)
-  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(2, 42px\)/)
+  assert.match(html, /\.chip-row\.leverages \{[\s\S]*?repeat\(5, 32px\)/)
   assert.doesNotMatch(html, /repeat\(3, 42px\)/)
   const orderBar = /\.order-bar \{([\s\S]*?)\}/.exec(html)
   assert.ok(orderBar, '应有 .order-bar 规则')
@@ -1771,7 +1779,7 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.equal(boardView.BOARD_WIDTH, 760)
   assert.equal(boardView.BOARD_HEIGHT, 700)
   assert.equal(boardView.CHART_WIDTH, 720)
-  assert.equal(boardView.CHART_HEIGHT, 228)
+  assert.equal(boardView.CHART_HEIGHT, 212)
   assert.equal(boardView.LAYOUT.headerHeight, 50)
   assert.equal(boardView.LAYOUT.cropStripHeight, 40)
   assert.equal(boardView.LAYOUT.chartCardHeight, 268)
@@ -1779,4 +1787,25 @@ test('票 91：盘口版面上图卡 + 下单横条 + 下两列，手绘/十字�
   assert.equal(boardView.LAYOUT.bottom.rightWidth, 300)
   assert.deepEqual(boardView.LAYOUT.columns.left, ['positions', 'history'])
   assert.deepEqual(boardView.LAYOUT.columns.right, ['league'])
+})
+
+test('票 106：盘口窗有快讯条、消息详情卡与消息标记层', async () => {
+  const html = await readFile(new URL('../desktop/board.html', import.meta.url), 'utf8')
+  assert.match(html, /id="ticker"/)
+  assert.match(html, /id="ticker-text"/)
+  assert.match(html, /id="news-pop"/)
+  assert.match(html, /id="news-pop-calendar"/)
+  assert.match(html, /\.chart-ticker \{[\s\S]*?height: 16px/)
+  assert.match(html, /\.chart-svg \{[\s\S]*?height: 212px/)
+  assert.match(html, /\.chart-svg \.news-dot/)
+  assert.match(html, /\.news-pop \{/)
+
+  const script = await readFile(new URL('../desktop/board.js', import.meta.url), 'utf8')
+  assert.match(script, /function showNewsDetail/)
+  assert.match(script, /function hideNewsDetail/)
+  assert.match(script, /class: 'chart-news'/)
+  assert.match(script, /class: 'crosshair-news-text'/)
+  assert.match(script, /tickerEl\.addEventListener/)
+  assert.match(script, /newsPopCloseEl/)
+  assert.match(script, /hideNewsDetail\(\)/)
 })

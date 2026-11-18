@@ -115,7 +115,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` / `futures-ledger` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` / `futures-ledger` / `board-flow` / `board-flow-sync` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -138,7 +138,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `reason`（访客） | `visit-deny` | 固定枚举 `not-admitted` / `visits-off`；缺失按 `not-admitted`，其他值整包丢弃 |
 | `reason`（合同结束） | `work-end` | 固定枚举 `expired` / `offline` / `recall` / `employer-end` / `denied` / `cancelled` / `shutdown` / `restart` / `completed` |
 | `reason`（结算） | `work-settle` | 固定枚举 `completed` / `recall` / `employer-end` / `offline` / `expired` |
-| `at` | `market-digest`、`trading-digest` | 发起方时钟的正整数毫秒；接收方只认与本机时钟相差 ≤2 分钟的样本 |
+| `at` | `market-digest`、`trading-digest`、`board-flow`、`board-flow-sync` | 发起方时钟的正整数毫秒；行情/周报接收方只认与本机时钟相差 ≤2 分钟的样本；资金流实时包只认 [now−15s, now+5s]，同步包允许 24 小时 |
 | `prices` | `market-digest` | `{ <cropId>: number }`；只认作物表里的六种、有限数、夹在 `[base×0.5, base×2]`；坏条目只丢那一种 |
 | `hire` | `market-digest` | `{ enabled, wagePerHour, minHours, maxHours, guard, available, reason }`；`reason` 为 `ready`/`off`/`visiting`/`working`（旧版本可能给 `null`）；`available` 只在这只宠物真的能被雇时为 true；坏形状整包丢 |
 | `contractId` | `work-ack`、`work-recall`、`work-end`、`work-settle` | 合同 UUID；`work-end` 在取消一笔还没 ack 的请求时可改用 `requestId` |
@@ -148,7 +148,10 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `servedMs` / `earned` | `work-settle` | 服务毫秒 0..8 小时；工钱 0..800 的整数；`work-settle-ack` 回的 `earned` 同一范围 |
 | `weekPnl` | `trading-digest` | 本机本周交易盈亏（金币，含未实现，四舍五入到整数）；范围 `[-1,000,000, 1,000,000]` |
 | `weekPnlPct` | `trading-digest` | 可选收益率**比率**（`0.035` = +3.5%）；范围 `[-1000, 1000]`；缺省表示本机没有可用的周起点硬币 |
-| `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20；没有仓位就是空数组 |
+| `positions` | `trading-digest` | 最多 8 条，每条只有 `{ crop, side, leverage }`；作物必须是三个盘口作物之一，`side` 是 `long`/`short`，`leverage` 是 1/5/20/50/100；没有仓位就是空数组 |
+| `events` | `board-flow` | 0..16 条资金流事件，每条只有 `{ id, at, crop, action, side, reason, notional, source }`；`action` 只认 `open`/`close`，`side` 只认 `long`/`short`，`reason` 只认 `manual`/`settle`/`liquidate`/`stop`，`source` 只认 `board`/`futures`/`farm`；事件里的 `deviceId` 一律盖成包上的发送端 |
+| `sync` | `board-flow` | 缺省 `false`；`true` 表示这是同步补历史的包，接收端放宽 15 秒实时窗口 |
+| `since` | `board-flow-sync` | 请求方要「这个时刻之后」的事件，非负整数毫秒；接收端回 `board-flow`（`sync:true`），最多 64 条 |
 | `at`（期货） | `futures-hello`、`futures-order`、`futures-cancel`、`futures-settle`、`futures-sync` | 发起方时钟的正整数毫秒；只有 `futures-settle` 拿它当账目的时间戳，「这份账旧不旧」只看 `(epoch, seq)` |
 | `kind` | `futures-order` | `open` / `close` / `deposit` / `place`；别的值整包丢 |
 | `crop` / `side` / `margin` / `leverage`（期货） | `futures-order`（`kind:'open'`） | 作物必须在作物表里；`side` 是 `long`/`short`；`margin` 是 1–1,000,000 的整数金币；`leverage` 是 1/3/10/20 |
@@ -171,7 +174,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
-`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 8 种 `futures-*`）旧端不认识时整包
+`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 8 种 `futures-*` / `board-flow` / `board-flow-sync`）旧端不认识时整包
 静默丢弃，既不回复也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
@@ -805,6 +808,35 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 - 不做强防作弊：邻居可以改自己的 `trading.json` / 报文；榜是社交信任（与 ADR-0016 一致）。
   伪造的 digest 只能骗到榜上的数字，改不了本机硬币、持仓或 `trading.json`。
 
+### 盘口资金流（`board-flow` / `board-flow-sync`，票 107）
+
+盘口的第二类上线报文。本机开/平/止损/强平/到价成交各发一条事件，**只带动作和名义**，
+不带价格、盈亏、余额、名字；影响由接收端用同一套 `src/board-flow.js` 现算：
+
+```json
+{ "v": 1, "type": "board-flow", "deviceId": "<uuid>", "at": 1700000000000,
+  "sync": false,
+  "events": [{ "id": "flow:1", "at": 1700000000000, "crop": "tomato",
+               "action": "open", "side": "long", "reason": "manual",
+               "notional": 500, "source": "board" }] }
+{ "v": 1, "type": "board-flow-sync", "deviceId": "<uuid>", "at": 1700000000000,
+  "since": 1699990000000 }
+```
+
+- **冲击**：`u = 0.003 × dir × sqrt(min(notional,5000)/500) × sourceWeight`，单笔夹 ±0.6%；
+  `dir` = 开多/平空 +1、开空/平多 −1。资金流水平按 2 小时半衰期衰减，每作物累计夹 ±1.5%。
+- **上限（接收端复算，不信发送端）**：单设备 6 条/分钟、40 条/根；单设备单根 Σ|u| ≤1.2%、
+  单日 ≤4%；超出丢这一条，不阻塞别的。盘口窗据此画「资金流 +0.42%」、K 线下方的点和便签里的流水行。
+- **成交价含一半自身冲击**：开/平仓成交价是「事前价 × exp(u/2)」，公开价跳到 exp(u)；
+  往返自身冲击净额 ≈0。收盘结算**不补**流水，直接按公开收盘价结。
+- **传播**：本机事件广播给所有心跳目标；新邻居/重连时发 `board-flow-sync`（60 秒节流），
+  对端回最多 64 条（`board-flow` + `sync:true`）。接收端按 id 去重，实时包 15 秒窗口、
+  同步包 24 小时窗口；坏事件丢自己，整包空也合法。旧 peer 按未知类型丢掉，盘口不崩，
+  只是看不到他们的流水。
+- **不需要房主**：P2P 最终一致；正常 1–2 秒内所有机器看到同一笔；极端丢包时窗口内可能差
+  一笔，下一次同步补。单设备/单日上限把恶意伪造的破坏限制在 ±1.2%/根（LAN 无签名，
+  与 ADR-0032 的期货口径一致）。
+
 ### 盘口状态与动作（本机，票 79–83）
 
 `GET /dsh-zoo/state` 的 `trading` 字段（窗口拿的是同一份视图，只是经 `board-window` 下发）：
@@ -819,7 +851,8 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
   positions: [{ id, crop, side, margin, leverage, entry, openedAt, slot, liquidation, stopLoss, mark, pnl }],
   orders: [{ id, crop, side, target, margin, leverage, placedAt, slot, remainingMs }],
   history: [{ id, crop, side, margin, leverage, entry, exit, pnl, reason, at }],   // reason: close/settle/liquidate/stop
-  league: { rows: [{ deviceId, nickname, weekPnl, weekPnlPct, positions, me }], sentiment: { long, short, flat }, self },
+  flow: { level, net, events: [{ id, at, deviceId, name, action, side, reason, notional, impact, source }] },
+  league: { rows: [{ deviceId, nickname, weekPnl, weekPnlPct, positions, me }], sentiment: { long, short, flat, flowText? }, self },
   limits: { margins, leverages, crops, historyLimit, allIn, targetRatio: { floor, ceil } }
 }
 ```
@@ -1006,9 +1039,11 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 | 幂等缓存 | `farm-action` 200 条/10 分钟；`work-*` ack 200 条/10 分钟 |
 | 守卫 | 0.3（主人在家）/ 0.5（雇工）/ 0.8（两者），宠物出门/打工时自家 0 |
 | 快照 | HTTP ≤64 KiB；访客宿主 2 秒超时、60 秒冷却 |
-| 盘口 | 杠杆 1×/5×/20×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
+| 盘口 | 杠杆 1×/5×/20×/50×/100×；保证金 1–1,000,000 的整数（预设 50/100/250/全下）；挂单只活一根 |
 | 盘口广播 | `trading-digest` 1 条/30 秒/peer；`at` 2 分钟内；`weekPnl` ±1,000,000；`weekPnlPct` ±1000；positions ≤8 |
 | 盘口价格 | 盘口价与到价目标价都夹在 `[base×0.55, base×1.75]` |
+| 盘口资金流 | 单笔 ≤0.6%；单设备单根 ≤1.2%、单日 ≤4%；每作物水平 ≤1.5%；6 条/分钟、40 条/根；同步包 ≤16 条/包、最多 64 条/次 |
+| 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符；`insurance`/`shortfall` ≥0；`mode` 只认 `off`/`shadow`/`live`；`pending` ≥0 |
 | 期货账户 | 单账户持仓 ≤8、挂单 ≤8；余额/保证金到分；`seq` 0..2^31-1；`epoch` ≤64 字符；`insurance`/`shortfall` ≥0；`house` 为有限数（**可以为负**）；`mode` 只认 `off`/`shadow`/`live`；`pending` ≥0 |
 | 期货限额 | 单账户日交易额 `max(5,000, 5 × 权益)`（1.12.2 起随权益放大，权益 = 余额 + 已占保证金）、持仓名义 20,000；同源地址 20 包/10 秒 |
 | 期货广播 | `futures-settle` 每账户每根 1 条；`futures-sync` 1 条/30 秒；整包 ≤4 KiB（8 条持仓 + 8 条挂单仍在内） |
@@ -1018,7 +1053,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 ### 4 KiB、白名单与旧邻居
 
 - **4 KiB**：所有 UDP 报文都是单个 JSON，超过 4 KiB 在解析前丢弃；不回复、不报错。
-  `market-digest`、`trading-digest`、8 种 `work-*` 和 5 种 `futures-*` 都很小（价格 3 个数、
+  `market-digest`、`trading-digest`、`board-flow`、8 种 `work-*` 和 5 种 `futures-*` 都很小（价格 3 个数、
   合同 6 个字段、榜上最多 8 条持仓、一份期货账户最多 8 条持仓 + 8 条挂单 ≈3 KiB），正常触不到上限。
   农场快照走 HTTP，不受 UDP 4 KiB 限制，但访客客户端仍只收 ≤64 KiB。
 - **字段白名单**：每种类型只重建自己的字段；未知字段、未知作物、未知枚举、越界数字
@@ -1026,7 +1061,7 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
 - **旧邻居**：旧版本只认识自己的报文类型，`market-digest` / `trading-digest` /
   `farm-action(-result)` / `work-*` / `futures-*` 会被当成未知类型静默丢掉，不报错、不崩。新端收到旧端：
   缺 `action`/`skin*`/`gift` 都按本文的兼容口径降级；没有农场报文时，本地农场照常运行，
-  只是不能跨机偷/帮/雇；没有盘口报文时，盘口照常运行，只是榜上只有自己；没有 `futures`
+  只是不能跨机偷/帮/雇；没有盘口报文时，盘口照常运行，只是榜上只有自己；没有 `board-flow` 时，新闻/K 线照常，只是没有真人流；没有 `futures`
   能力位时两边都不发期货包，本机窗口写「对端未升级，期货不可用」，本地账本照常。
 - **降级**：旧邻居 → 串门/礼物/记录照常，没有农场入口；对方没开局域网端口 → 串门照常、
   快照取不到、偷/帮/雇不可用；对方离线 → 不能偷/帮/雇，行情过期，合同按最后心跳结束；

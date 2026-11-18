@@ -19,6 +19,7 @@
  */
 
 import { CROP_IDS, CROPS } from './farm-rules.js'
+import { compactNewsEvent, newsForBar, newsStepAt, newsVolMultAt } from './board-news.js'
 
 /** 一根 = 15 分钟 = 1 个 slot；一根里有 15 个 1 分钟 tick。 */
 export const SLOT_MS = 15 * 60 * 1000
@@ -42,7 +43,7 @@ export const MAX_PATH_SCAN_MS = MAX_PATH_SCAN_SLOTS * SLOT_MS
  * 于是 v4 换成**分钟级随机游走**——所有可观察尺度上都是鞅，任何策略的期望只剩 −手续费。
  * 旧图作废；确定性不变，所有机器仍是同一张图。
  */
-export const PRICE_SALT = 'board-v4'
+export const PRICE_SALT = 'board-v5'
 /** 价格锚在作物底价，夹在 [0.55, 1.75] 倍（SPEC v10「行情」）。 */
 export const PRICE_FLOOR_RATIO = 0.55
 export const PRICE_CEIL_RATIO = 1.75
@@ -55,22 +56,20 @@ export const PRICE_CEIL_RATIO = 1.75
  */
 export const TRADING_MARGINS = Object.freeze([50, 100, 250])
 /**
- * 1× / 5×（SPEC v10「交易与结算」；票 101 把 20× 拿掉了）。
+ * 1× / 5× / 20× / 50× / 100×（SPEC v10「交易与结算」，2026-11-18 用户要求加 50× 并把上限开到 100×）。
  *
- * 20× 的问题是单根内 ±1.9% 的抖动就能翻倍或爆仓，而底价被夹在 [0.55, 1.75] 倍，
- * 一天的高杠杆收益能把整片农场比下去。白名单只留 1× 和 5×：想赌可以，但杠上开花的
- * 速度不再压过种地。
+ * 50×/100× 的强平线分别只有约 1.9%/0.95% 的逆行，单根 15 分钟 σ ≈2.3% 下很容易被扫；高杠杆是
+ * 玩家的选择，不是默认推荐。窗口的边框特效只提示风险，不改变定价、强平线或手续费。
+ * 白名单仍是唯一真相：宿主随 payload 下发，窗口不复制一份。
  */
-export const TRADING_LEVERAGES = Object.freeze([1, 5])
+export const TRADING_LEVERAGES = Object.freeze([1, 5, 20, 50, 100])
 /** 下单白名单里的最高档：就是上面那张表的最大值。 */
-export const MAX_LEVERAGE = 5
+export const MAX_LEVERAGE = 100
 /**
- * 读盘时杠杆的形状上限（票 101）：**只给老仓位用**。
- *
- * 20× 已经不能新开，但盘上还有 20× 的仓位要能读回来、能结算、能强平。所以
- * 「形状」放到 20，「下单白名单」留在 `TRADING_LEVERAGES`——两者别再共用一个常量。
+ * 读盘时杠杆的形状上限：与当前白名单同宽（100），同时兼容盘上遗留的 20×。
+ * 更老的文件最多只出现过 20×；这里放宽到 100 是为了新仓位重启后能读回来。
  */
-export const LEGACY_MAX_LEVERAGE = 20
+export const LEGACY_MAX_LEVERAGE = 100
 /**
  * 手续费（票 101）：按**名义价值**（保证金 × 杠杆）双边各收 0.2%。
  *
@@ -103,42 +102,34 @@ export const TRADING_STOP_LEVELS = Object.freeze([0, 0.25, 0.5, 1])
 /** 结算原因（SPEC v10「交易与结算」）：手动 / 收盘 / 强平 / 止损。 */
 export const TRADING_CLOSE_REASONS = Object.freeze(['close', 'settle', 'liquidate', 'stop'])
 
-/**
- * 盘口价格过程 v4（票 102）：**分钟级随机游走**。
- *
- * 为什么既不是正弦、也不是多八度值噪声：
- *   - 正弦是时间的光滑函数，一根之内的斜率是确定的 → `hintOf` 直接读出「下一根往哪走」，
- *     跟随做单实测胜率 96%、每手期望 +7% 保证金，盘口变成印钞机（票 102 的原始 bug）。
- *   - 值噪声把格点值改成散列，但每个八度都是**桥**（格点之间插值）：单根内几乎没有波动，
- *     且任何尺度上都带均值回复——实测 σ_bar 2.07% 时反着做仍有约 +0.23%/根 的可预测收益。
- *
- * 随机游走是唯一在**所有可观察尺度**上都是鞅的过程：第 m 分钟的增量与历史独立，
- * 所以「下一分钟 / 下一根」的期望漂移都是 0，任何策略的期望只剩 −手续费。
- *   · 每个 1 分钟 tick 一个增量（±均匀分布，σ = WALK_MINUTE_SIGMA）；
- *   · 单根（15 分钟）σ = 0.0052 × √15 ≈ 2.0%，盘面动得起来、又能被 0.4% 名义费覆盖；
- *   · 价格在 1 分钟之内**是常数**（不插值）：插值等于把下一分钟的走向提前印在图上。
- *
- * 确定性：增量只由（PRICE_SALT、作物、绝对分钟序号）决定，所有机器、任何时刻同一张图；
- * 累计值按 64 分钟一个检查点缓存（每作物约 130KB/年），单次查询是 O(64) 次整数散列。
- */
 const WALK_EPOCH_MINUTE = Math.floor(Date.UTC(2025, 0, 1) / 60_000)
-const WALK_MINUTE_SIGMA = 0.0052
 /**
- * 每分钟的回归系数（OU 过程）：`level ← (1 - WALK_PULL) × level + 增量`。
+ * 票 103 的底盘 v5：分钟级随机游走，但 σ 会变。
  *
- * 纯随机游走没有锚，几百天下来必然漂到 [0.55, 1.75] 的夹子上——夹子会变成「可预测的顶/底」，
- * 反过来制造套利（实测贴夹子的采样占 7–17%，还出现过整段价格纹丝不动）。
- * 这里给一个弱回归把稳态压进夹子内部：半衰期 ≈ ln2 / 0.0009 ≈ 770 分钟（约 13 小时），
- * 稳态 σ = 0.0052 / √(2 × 0.0009) ≈ 0.12（对数），价格大致在 0.79–1.27 倍底价之间呼吸；
- * 0.55 的下夹是 5σ 以外，实测一年贴夹率 < 0.1%。
- * 回归本身带来的可预测漂移：1σ 偏离时每根回拉 ≈ 0.0009 × 0.12 × 15 ≈ 0.16%，
- * 小于 0.4% 的名义费（5× 时相当于保证金的 2%），照着做仍然亏。
+ * v4 的「常方差」是温和、单一的直接原因；v5 在**不改方向**的前提下加三种乘子：
+ *   · session：固定市场时间（UTC+8）的双峰，早/晚高、凌晨低；
+ *   · regime：多尺度平滑的波动率聚集（约 47 分钟 / 3 小时 / 11 小时 / 30 小时）；
+ *   · storm：消息「不确定性」事件期间 1.6–2.2，持续 15–45 分钟。
+ * 再叠一层罕见的肥尾跳跃（平时 1–2 天一次 3–6%，稀有 6–10% 黑天鹅）。
+ * 这些都只改幅度/跳跃，不改增量的符号对称性；所以「下一分钟/下一根」的期望仍是 0。
+ *
+ * 消息面是**另一条序列** `N`：公布分钟一次性加上阶跃，之后按 72 小时半衰期缓慢淡去。
+ * 它不跟 `W` 的 OU 回拉走——否则「消息后反着做」会变成可预测回撤（票 102 的洞）。
+ * `W` 和 `N` 各自按 64 分钟检查点缓存，单次查询各 O(64)。
  */
-const WALK_PULL = 0.0009
-const WALK_CHECKPOINT = 64
-const WALK_CACHE = new Map()
-const WALK_SEEDS = new Map()
-
+const WALK_MINUTE_SIGMA = 0.0057
+/** 底盘 OU 回拉的每分钟系数：半衰期约 13 小时，单根回拉 < 手续费。 */
+const WALK_PULL = 0.0012
+/** 消息阶跃的慢衰减：72 小时半衰期，单根 < 0.01%，远低于手续费。 */
+const NEWS_PULL = 1 - Math.pow(0.5, 1 / (72 * 60))
+/** `N + F` 合计偏离帽：6%（提案口径），保证慢衰减带来的回拉也不足以覆盖手续费。 */
+const OVERLAY_CAP = 0.06
+/** 波动率乘子的夹取范围：只改幅度，不改方向。 */
+const VOL_MIN = 0.55
+const VOL_MAX = 2.0
+/** 肥尾跳跃：每 2 天一次 3–6%，每 14 天一次 6–10%（每作物每条独立序列）。 */
+const TAIL_PROB = 1 / (3 * 1440)
+const TAIL_PROB_BIG = 1 / (21 * 1440)
 /**
  * K 线显示最近 24 根 + 当前形成中的一根（SPEC v10「行情」）。
  * 根数只在这里定一份：窗口按 payload 画，不自己算也不自己截。
@@ -171,10 +162,9 @@ const TIMEFRAME_SAMPLE_MS = Object.freeze({
   '1w': 3 * 60 * TICK_MS
 })
 /**
- * 风向 = 慢趋势在本根的斜率（本根起点 → 下一根起点），**快噪声不参与**。
+ * 风向 = 最近三根的**已实现动量**（票 102 改口径），快噪声不参与。
  * 置信度 55–68% 是产品口径：慢趋势的斜率越陡越可信，但快噪声随时能把弱信号打反，
- * 所以封顶 68%，UI 必须写「不是保证」（SPEC v10「行情」）。
- * 取本根起点而不是「此刻」，是为了让一根之内风向不闪。
+ * 所以封顶 68%，UI 必须写「不是保证」。
  */
 const HINT_FLAT_MOMENTUM = 0.004
 const HINT_MIN_CONFIDENCE = 0.55
@@ -184,6 +174,11 @@ const HINT_MAX_CONFIDENCE = 0.68
  * 误以为这是预测（票 102 之后它只是描述过去，不是概率）。
  */
 const HINT_FULL_MOMENTUM = 0.06
+const WALK_CHECKPOINT = 64
+const WALK_CACHE = new Map()
+const WALK_SEEDS = new Map()
+const NEWS_CACHE = new Map()
+const REGIME_PHASES = new Map()
 
 function finiteNumber (value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null
@@ -194,10 +189,7 @@ function finiteNumber (value) {
   return null
 }
 
-/**
- * FNV-1a 32 位散列（与 `season-omens.js` 的私有实现同款，但各写一份：
- * 那个只服务来客时间窗，盘口要随手改种子文本，不该互相牵连）。
- */
+/** FNV-1a 32 位散列；与 `board-news.js` / `futures-rules.js` 同一条口径。 */
 export function hash32 (text) {
   let hash = 0x811c9dc5
   for (let index = 0; index < text.length; index += 1) {
@@ -208,12 +200,8 @@ export function hash32 (text) {
 }
 
 /**
- * 散列到 [0, 1)：只用来当噪声格点值与相位，绝不参与钱的取整。
- *
- * 必须再过一道雪崩（票 102 的第二个坑）：FNV-1a 对「只差最后一位」的字符串
- * 输出恰好相差常量 0x01000193——格点 ":1" 和 ":2" 的值于是只差 0.4%，
- * 插值出来的曲线像一条被周期性折断的直线，单根内几乎没有波动，
- * 而且这种结构本身可预测。xor-shift + 乘法混合把这点相关性彻底打散。
+ * 散列到 [0, 1)：只用来当噪声相位，绝不参与钱的取整。
+ * 先过一道雪崩：FNV-1a 对末位只差一个字符的串输出只差常量，直接插值会出周期。
  */
 function unitHash (text) {
   let hash = hash32(text)
@@ -238,13 +226,7 @@ function baseOf (crop) {
 
 /**
  * 盘口作物 = 当前目录里有有效底价的全部作物，顺序**同目录**（票 88 / ADR-0031）。
- *
- * 为什么不再写死三个：`CROPS` 是运行时目录（`applyCropCatalog()` / LAN 同步都会原地改），
- * 写死的清单会让新作物永远上不了盘口、下单与 `trading-digest` 也拒掉它。这里每次
- * 按 `CROP_IDS` 现算，调用点不需要跟着改；底价坏掉的作物跳过——价格算不出来，
- * 画到盘口上只会是一张空图（与 `baseOf()` 同一条口径）。
- *
- * 返回新数组（不是目录本身）：调用方可能切片/映射，别让人顺手改到 `CROP_IDS`。
+ * 每次按 `CROP_IDS` 现算，新作物不用改调用点；底价坏掉的跳过（价格算不出来）。
  */
 export function boardCrops () {
   const crops = []
@@ -254,11 +236,7 @@ export function boardCrops () {
   return crops
 }
 
-/**
-
- * 32 位雪崩混合：整数输入 → [0, 1)。整数散列比字符串散列快一个量级，
- * 随机游走要逐分钟推进，这一步不能省。
- */
+/** 32 位雪崩混合：整数输入 → [0, 1)。随机游走逐分钟推进，整数散列比字符串快一个量级。 */
 function mix32 (value) {
   let x = value | 0
   x ^= x >>> 16
@@ -279,10 +257,77 @@ function walkSeed (crop) {
   return seed
 }
 
-/** 第 `minute` 分钟的对数增量：均值 0、标准差 WALK_MINUTE_SIGMA（均匀分布）。 */
+/** 每个作物的 regime 相位：同一作物在所有机器一致，不同作物性格不同。 */
+function regimePhases (crop) {
+  let phases = REGIME_PHASES.get(crop)
+  if (phases === undefined) {
+    const seed = PRICE_SALT + ':regime:' + crop
+    phases = [
+      unitHash(seed + ':1') * Math.PI * 2,
+      unitHash(seed + ':2') * Math.PI * 2,
+      unitHash(seed + ':3') * Math.PI * 2,
+      unitHash(seed + ':4') * Math.PI * 2
+    ]
+    REGIME_PHASES.set(crop, phases)
+  }
+  return phases
+}
+
+/**
+ * 时段乘子：固定市场时间 UTC+8，不跟本机时区（否则不同时区的机器不是同一张图）。
+ * 双峰（10:00 / 21:00）+ 午休小坑；范围约 0.88–1.17。
+ */
+function sessionFactor (absoluteMinute) {
+  const marketMinute = ((absoluteMinute + 8 * 60) % 1440 + 1440) % 1440
+  const hour = marketMinute / 60
+  return 0.86 +
+    0.12 * Math.exp(-((hour - 10) ** 2) / 8) +
+    0.16 * Math.exp(-((hour - 21) ** 2) / 6) +
+    0.06 * Math.exp(-((hour - 15) ** 2) / 10)
+}
+
+/** 多尺度平滑的波动率聚集：四条正弦叠加，exp 后夹在 0.62–1.55。 */
+function regimeFactor (crop, absoluteMinute) {
+  const [p1, p2, p3, p4] = regimePhases(crop)
+  const twoPi = Math.PI * 2
+  const value =
+    0.08 * Math.sin(twoPi * absoluteMinute / 47 + p1) +
+    0.14 * Math.sin(twoPi * absoluteMinute / 187 + p2) +
+    0.34 * Math.sin(twoPi * absoluteMinute / 660 + p3) +
+    0.28 * Math.sin(twoPi * absoluteMinute / 1800 + p4)
+  return clampNumber(Math.exp(value), 0.55, 1.65)
+}
+
+/** 第 `minute` 分钟（相对纪元）的波动率乘子；storm 来自消息表。 */
+function volMultAt (crop, minute) {
+  const absoluteMinute = minute + WALK_EPOCH_MINUTE
+  const storm = newsVolMultAt({ crop, minute: absoluteMinute })
+  return clampNumber(
+    sessionFactor(absoluteMinute) * regimeFactor(crop, absoluteMinute) * storm,
+    VOL_MIN,
+    VOL_MAX
+  )
+}
+
+/**
+ * 肥尾跳跃：均值 0、方向对称；只给「完全没有消息」的流动性空洞用。
+ * 消息事件自己的阶跃在 `N` 里，不在这里重复。
+ */
+function tailJump (crop, minute) {
+  const absoluteMinute = minute + WALK_EPOCH_MINUTE
+  const key = PRICE_SALT + ':tail:' + crop + ':' + absoluteMinute
+  const roll = unitHash(key)
+  let magnitude = 0
+  if (roll < TAIL_PROB_BIG) magnitude = 0.06 + unitHash(key + ':mag') * 0.03
+  else if (roll < TAIL_PROB) magnitude = 0.03 + unitHash(key + ':mag') * 0.03
+  if (magnitude === 0) return 0
+  return (unitHash(key + ':sign') < 0.5 ? -1 : 1) * magnitude
+}
+
+/** 第 `minute` 分钟（相对纪元）的对数增量：均值 0、σ 随乘子变化。 */
 function walkStep (crop, minute) {
   const unit = mix32(Math.imul(walkSeed(crop) ^ minute, 0x9e3779b1))
-  return (unit * 2 - 1) * Math.sqrt(3) * WALK_MINUTE_SIGMA
+  return (unit * 2 - 1) * Math.sqrt(3) * WALK_MINUTE_SIGMA * volMultAt(crop, minute) + tailJump(crop, minute)
 }
 
 /**
@@ -316,7 +361,7 @@ function ensureWalk (crop, check) {
   return series
 }
 
-/** 第 `minute` 分钟（相对纪元）的对数价格偏移。 */
+/** 第 `minute` 分钟（相对纪元）的底盘对数偏移。 */
 function walkLevel (crop, minute) {
   const index = Math.max(0, Math.floor(minute))
   const check = Math.floor(index / WALK_CHECKPOINT)
@@ -328,9 +373,52 @@ function walkLevel (crop, minute) {
   return value
 }
 
+/** 消息序列的检查点：和 `W` 一样 64 分钟一格，但不带回拉，只有 72 小时慢衰减。 */
+function ensureNews (crop, check) {
+  let series = NEWS_CACHE.get(crop)
+  if (series === undefined) {
+    series = { values: new Float64Array(256), length: 1 }
+    series.values[0] = 0
+    NEWS_CACHE.set(crop, series)
+  }
+  if (check < series.length) return series
+  if (check >= series.values.length) {
+    let size = series.values.length
+    while (size <= check) size *= 2
+    const grown = new Float64Array(size)
+    grown.set(series.values.subarray(0, series.length))
+    series.values = grown
+  }
+  for (let k = series.length; k <= check; k += 1) {
+    let value = series.values[k - 1]
+    const start = (k - 1) * WALK_CHECKPOINT
+    for (let i = 0; i < WALK_CHECKPOINT; i += 1) {
+      const absoluteMinute = start + i + WALK_EPOCH_MINUTE
+      value = value * (1 - NEWS_PULL) + newsStepAt({ crop, minute: absoluteMinute })
+    }
+    series.values[k] = value
+  }
+  series.length = check + 1
+  return series
+}
+
+/** 第 `minute` 分钟（相对纪元）的消息累积偏移（含 72 小时慢衰减）。 */
+function newsLevel (crop, minute) {
+  const index = Math.max(0, Math.floor(minute))
+  const check = Math.floor(index / WALK_CHECKPOINT)
+  const series = ensureNews(crop, check)
+  let value = series.values[check]
+  for (let i = check * WALK_CHECKPOINT; i < index; i += 1) {
+    const absoluteMinute = i + WALK_EPOCH_MINUTE
+    value = value * (1 - NEWS_PULL) + newsStepAt({ crop, minute: absoluteMinute })
+  }
+  return value
+}
+
 /** 对数价格偏移：`x` 以「根」为单位，1 根 = 15 分钟 = 15 个 tick。 */
-function noiseLevel (crop, x) {
-  return walkLevel(crop, Math.floor(x * SLOT_TICKS) - WALK_EPOCH_MINUTE)
+function levelAt (crop, x) {
+  const minute = Math.floor(x * SLOT_TICKS) - WALK_EPOCH_MINUTE
+  return { walk: walkLevel(crop, minute), news: newsLevel(crop, minute) }
 }
 
 /**
@@ -340,7 +428,7 @@ function noiseLevel (crop, x) {
  * `tick = 0` 是这根的开盘，`tick = 15` 是收盘（= 下一根的开盘）。
  * 认不出作物或参数不是有限数时返回 null。
  */
-export function boardPrice ({ crop, slot, tick = 0 } = {}) {
+export function boardPrice ({ crop, slot, tick = 0, flowLevel = 0 } = {}) {
   const base = baseOf(crop)
   if (base === null) return null
   const slotNumber = finiteNumber(slot)
@@ -349,13 +437,17 @@ export function boardPrice ({ crop, slot, tick = 0 } = {}) {
   const slotIndex = Math.floor(slotNumber)
   const ticks = clampNumber(tickNumber, 0, SLOT_TICKS)
   const x = slotIndex + ticks / SLOT_TICKS
-  const raw = base * Math.exp(noiseLevel(crop, x))
+  const { walk, news } = levelAt(crop, x)
+  const flow = finiteNumber(flowLevel) ?? 0
+  // 消息 + 资金流合计偏离帽：6%。两层各自有上限，但叠加后不能无限远。
+  const overlay = clampNumber(news + flow, -OVERLAY_CAP, OVERLAY_CAP)
+  const raw = base * Math.exp(walk + overlay)
   return clampNumber(raw, base * PRICE_FLOOR_RATIO, base * PRICE_CEIL_RATIO)
 }
 
 /** 收盘价 = 下一根的开盘价；结算（收盘/离线补算）只认这一个数。 */
-export function slotClosePrice (crop, slot) {
-  return boardPrice({ crop, slot, tick: SLOT_TICKS })
+export function slotClosePrice (crop, slot, flowLevel = 0) {
+  return boardPrice({ crop, slot, tick: SLOT_TICKS, flowLevel })
 }
 
 /** 现在这一根是哪个 slot。 */
@@ -371,16 +463,30 @@ export function slotBounds (now) {
   return { slot, start: slot * SLOT_MS, end: (slot + 1) * SLOT_MS }
 }
 
+/** `flowAt` 是 B 期的可选注射：把「绝对分钟」换成当时的资金流对数偏移；A 期没有。 */
+function flowAtMinute (flowAt, minute) {
+  if (typeof flowAt !== 'function') return 0
+  const value = finiteNumber(flowAt(minute))
+  return value === null ? 0 : value
+}
+
+/** 一根 bar 的 lite 消息：标题/方向/影响/第几分钟，正文在窗口顶层查。 */
+function barNews (crop, start, end) {
+  return newsForBar({ crop, start, end })
+    .map((event) => compactNewsEvent(event, start))
+    .filter((event) => event !== null)
+}
+
 /**
  * 此刻的价格：把真实时间换成 `slot + tick / 15` 再交给 `boardPrice()`。
  * 开仓成交价、持仓现价、手动平仓价全走它；`tick` 用小数，价格不会一分钟一跳。
  */
-export function markPrice ({ crop, now } = {}) {
+export function markPrice ({ crop, now, flowLevel = 0 } = {}) {
   const stamp = finiteNumber(now)
   if (stamp === null) return null
   const slot = Math.floor(stamp / SLOT_MS)
   const tick = (stamp - slot * SLOT_MS) / TICK_MS
-  return boardPrice({ crop, slot, tick })
+  return boardPrice({ crop, slot, tick, flowLevel })
 }
 
 /**
@@ -392,24 +498,28 @@ export function markPrice ({ crop, now } = {}) {
  * `start`/`end` 是这一根的真实毫秒边界（票 84）：窗口用它写时间标签，
  * 不再打印「自 1970 起的第几根」这种玩家看不懂的绝对序号。
  */
-function barAt (crop, slot) {
-  const open = boardPrice({ crop, slot, tick: 0 })
-  const close = boardPrice({ crop, slot, tick: SLOT_TICKS })
+function barAt (crop, slot, flowAt = null) {
+  const at = (tick) => flowAtMinute(flowAt, slot * SLOT_TICKS + tick)
+  const open = boardPrice({ crop, slot, tick: 0, flowLevel: at(0) })
+  const close = boardPrice({ crop, slot, tick: SLOT_TICKS, flowLevel: at(SLOT_TICKS) })
   let high = Math.max(open, close)
   let low = Math.min(open, close)
   for (let tick = 1; tick < SLOT_TICKS; tick += 1) {
-    const price = boardPrice({ crop, slot, tick })
+    const price = boardPrice({ crop, slot, tick, flowLevel: at(tick) })
     if (price > high) high = price
     if (price < low) low = price
   }
+  const start = slot * SLOT_MS
+  const end = (slot + 1) * SLOT_MS
   return {
     slot,
-    start: slot * SLOT_MS,
-    end: (slot + 1) * SLOT_MS,
+    start,
+    end,
     open,
     high,
     low,
-    close
+    close,
+    news: barNews(crop, start, end)
   }
 }
 
@@ -424,7 +534,7 @@ function barAt (crop, slot) {
  *
  * 认不出作物 / 时间不是有限数时返回 null：窗口画空态，绝不算出另一张图。
  */
-export function barsFor ({ crop, now, count = BOARD_BAR_COUNT } = {}) {
+export function barsFor ({ crop, now, count = BOARD_BAR_COUNT, flowAt = null } = {}) {
   if (baseOf(crop) === null) return null
   const stamp = finiteNumber(now)
   if (stamp === null) return null
@@ -435,10 +545,10 @@ export function barsFor ({ crop, now, count = BOARD_BAR_COUNT } = {}) {
     : BOARD_BAR_COUNT
   const bars = []
   for (let offset = total; offset >= 1; offset -= 1) {
-    bars.push(barAt(crop, bounds.slot - offset))
+    bars.push(barAt(crop, bounds.slot - offset, flowAt))
   }
-  const open = boardPrice({ crop, slot: bounds.slot, tick: 0 })
-  const price = markPrice({ crop, now: stamp })
+  const open = boardPrice({ crop, slot: bounds.slot, tick: 0, flowLevel: flowAtMinute(flowAt, bounds.slot * SLOT_TICKS) })
+  const price = markPrice({ crop, now: stamp, flowLevel: flowAtMinute(flowAt, Math.floor(stamp / TICK_MS)) })
   // 底价坏了/时钟坏了在上面的 baseOf/slotBounds 已经挡掉；这里只防一条窄路：
   // 价格算不出来时宁可返回 null 让窗口画空态，也不往 payload 里塞 NaN。
   if (open === null || price === null) return null
@@ -447,7 +557,7 @@ export function barsFor ({ crop, now, count = BOARD_BAR_COUNT } = {}) {
   let low = Math.min(open, price)
   // 已经走完的整分钟也参与高低点；加上此刻的现价（可能落在半分钟上）。
   for (let step = 1; step <= Math.floor(tick); step += 1) {
-    const sampled = boardPrice({ crop, slot: bounds.slot, tick: step })
+    const sampled = boardPrice({ crop, slot: bounds.slot, tick: step, flowLevel: flowAtMinute(flowAt, bounds.slot * SLOT_TICKS + step) })
     if (sampled > high) high = sampled
     if (sampled < low) low = sampled
   }
@@ -463,7 +573,8 @@ export function barsFor ({ crop, now, count = BOARD_BAR_COUNT } = {}) {
       low,
       price,
       tick: Math.round(tick * 100) / 100,
-      remainingMs: Math.max(0, bounds.end - stamp)
+      remainingMs: Math.max(0, bounds.end - stamp),
+      news: barNews(crop, bounds.start, Math.min(stamp, bounds.end))
     }
   }
 }
@@ -521,14 +632,14 @@ function previousBucketStartOf (timeframe, start) {
  * （起点是开盘、终点是收盘）。终点不落在整步上时补最后一针，所以本地日/周在夏令时
  * 那天也照样首尾对齐；形成中的桶把 `limit = now`，只采到此刻。
  */
-function sampledPrices (crop, start, limit, stepMs) {
+function sampledPrices (crop, start, limit, stepMs, flowAt = null) {
   const prices = []
   for (let at = start; at < limit; at += stepMs) {
-    const price = markPrice({ crop, now: at })
+    const price = markPrice({ crop, now: at, flowLevel: flowAtMinute(flowAt, Math.floor(at / TICK_MS)) })
     if (price === null) return null
     prices.push(price)
   }
-  const last = markPrice({ crop, now: limit })
+  const last = markPrice({ crop, now: limit, flowLevel: flowAtMinute(flowAt, Math.floor(limit / TICK_MS)) })
   if (last === null) return null
   prices.push(last)
   return prices
@@ -539,9 +650,9 @@ function sampledPrices (crop, start, limit, stepMs) {
  * 采样只用于画图（显示用近似）；`close` 仍然只是 `boardPrice()` 在那一刻的价，
  * 不是第二种结算公式——合约结算只认 15 分钟收盘（`slotClosePrice()`）。
  */
-function coarseBarAt (crop, timeframe, start, limit) {
+function coarseBarAt (crop, timeframe, start, limit, flowAt = null) {
   const stepMs = TIMEFRAME_SAMPLE_MS[timeframe]
-  const prices = sampledPrices(crop, start, limit, stepMs)
+  const prices = sampledPrices(crop, start, limit, stepMs, flowAt)
   if (prices === null) return null
   let high = prices[0]
   let low = prices[0]
@@ -554,7 +665,8 @@ function coarseBarAt (crop, timeframe, start, limit) {
     open: prices[0],
     high,
     low,
-    close: prices[prices.length - 1]
+    close: prices[prices.length - 1],
+    news: barNews(crop, start, limit)
   }
 }
 
@@ -569,8 +681,8 @@ function coarseBarAt (crop, timeframe, start, limit) {
  * 返回形状与 `barsFor()` 一致（`base` + `bars` + `current`），只是每根多带
  * `start`/`end` 毫秒边界；窗口按 payload 画，不自己算桶。
  */
-export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_BAR_COUNT } = {}) {
-  if (timeframe === '15m') return barsFor({ crop, now, count })
+export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_BAR_COUNT, flowAt = null } = {}) {
+  if (timeframe === '15m') return barsFor({ crop, now, count, flowAt })
   if (baseOf(crop) === null) return null
   if (TIMEFRAME_SAMPLE_MS[timeframe] === undefined) return null
   const stamp = finiteNumber(now)
@@ -591,12 +703,12 @@ export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_
   for (let index = starts.length - 1; index >= 1; index -= 1) {
     const barStart = starts[index]
     const barEnd = starts[index - 1]
-    const bar = coarseBarAt(crop, timeframe, barStart, barEnd)
+    const bar = coarseBarAt(crop, timeframe, barStart, barEnd, flowAt)
     if (bar === null) return null
     bars.push({ ...bar, start: barStart, end: barEnd })
   }
-  const forming = coarseBarAt(crop, timeframe, bounds.start, stamp)
-  const price = markPrice({ crop, now: stamp })
+  const forming = coarseBarAt(crop, timeframe, bounds.start, stamp, flowAt)
+  const price = markPrice({ crop, now: stamp, flowLevel: flowAtMinute(flowAt, Math.floor(stamp / TICK_MS)) })
   if (forming === null || price === null) return null
   return {
     base: baseOf(crop),
@@ -611,7 +723,8 @@ export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_
       price,
       // 粗周期没有「本根第几分钟」：`第 m/15 分钟` 只属于 15 分钟合约。
       tick: null,
-      remainingMs: Math.max(0, bounds.end - stamp)
+      remainingMs: Math.max(0, bounds.end - stamp),
+      news: barNews(crop, bounds.start, Math.min(stamp, bounds.end))
     }
   }
 }
@@ -625,14 +738,14 @@ export function barsForTimeframe ({ crop, now, timeframe = '15m', count = BOARD_
  * 是因为「追涨杀跌」本身就是玩法，但文案必须写清：**这只是最近的走势，不预示下一根**。
  * 同一根内返回值恒定（只取已收盘的根），窗口每秒重画也不会闪。
  */
-export function hintOf ({ crop, now } = {}) {
+export function hintOf ({ crop, now, flowLevel = 0 } = {}) {
   if (baseOf(crop) === null) return null
   const slot = slotIndexAt(now)
   if (slot === null) return null
   // 前 3 根还没有「最近三根」可比：给 flat（不是 null——时钟是好的，只是历史不够）。
   if (slot < 3) return { direction: 'flat', confidence: 0.5 }
-  const latest = slotClosePrice(crop, slot - 1)
-  const earlier = slotClosePrice(crop, slot - 4)
+  const latest = slotClosePrice(crop, slot - 1, flowLevel)
+  const earlier = slotClosePrice(crop, slot - 4, flowLevel)
   if (latest === null || earlier === null || earlier <= 0) return { direction: 'flat', confidence: 0.5 }
   const momentum = latest / earlier - 1
   const strength = Math.min(1, Math.abs(momentum) / HINT_FULL_MOMENTUM)
@@ -822,7 +935,8 @@ export function pathScan ({
   stopLoss = 0,
   from,
   to,
-  stopFrom
+  stopFrom,
+  flowAt = null
 } = {}) {
   if (!isBoardSide(side)) return null
   const start = finiteNumber(from)
@@ -836,7 +950,7 @@ export function pathScan ({
   // 同一根里的 15 分钟也先算好：强平线一次算清，循环里不再重复求值。
   const liquidation = liquidationPriceOf({ side, entry: entryPrice, leverage })
   const checkAt = (at) => {
-    const exit = markPrice({ crop, now: at })
+    const exit = markPrice({ crop, now: at, flowLevel: flowAtMinute(flowAt, Math.floor(at / TICK_MS)) })
     if (exit === null) return null
     // 强平先判：它是交易所的规则，撞到线上就是强平，玩家的止损不可能「抢在强平前面」
     // 成交（票 102 之后 20× 老仓与 −100% 档正好同价，谁先判谁写原因）。平仓价用
@@ -883,7 +997,7 @@ export function pathScan ({
  * 与 `pathScan()` 一样从**下一个整数分钟**开始看，端点是开区间外的最后一刻
  * （可能是收盘那一刻，也可能不是整分钟）。参数不成立返回 null。
  */
-export function limitFillScan ({ crop, side, target, from, to } = {}) {
+export function limitFillScan ({ crop, side, target, from, to, flowAt = null } = {}) {
   if (!isBoardSide(side)) return null
   if (baseOf(crop) === null) return null
   const targetPrice = finiteNumber(target)
@@ -892,7 +1006,7 @@ export function limitFillScan ({ crop, side, target, from, to } = {}) {
   if (targetPrice === null || targetPrice <= 0) return null
   if (start === null || end === null || end <= start) return null
   const crossedAt = (at) => {
-    const mark = markPrice({ crop, now: at })
+    const mark = markPrice({ crop, now: at, flowLevel: flowAtMinute(flowAt, Math.floor(at / TICK_MS)) })
     if (mark === null) return false
     return side === 'long' ? mark <= targetPrice : mark >= targetPrice
   }

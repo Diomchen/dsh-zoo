@@ -155,7 +155,7 @@ test('票 82：持仓最多 8 条；坏一条就整包丢（不是丢那一条�
   for (const bad of [
     { crop: 'dragonfruit', side: 'long', leverage: 1 }, // 目录里没有的作物（票 88）
     { crop: 'tomato', side: 'up', leverage: 1 }, // 方向只有 long/short
-    { crop: 'tomato', side: 'long', leverage: 21 }, // 杠杆形状只到 20（票 101 之后下单只给 1/5）
+    { crop: 'tomato', side: 'long', leverage: 101 }, // 杠杆形状只到 100（1×/5×/20×/100×）
     { crop: 'tomato', side: 'long' }, // 缺杠杆
     { crop: 'tomato', side: 'long', leverage: '5' }, // 字符串不是数字
     { crop: 'tomato', side: 'long', leverage: 5, margin: 50 }, // 多余字段本身不坏…

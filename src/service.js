@@ -65,6 +65,7 @@ import {
   stealSucceeds
 } from './farm-rules.js'
 import { createTradingStore, initialTradingView, TRADING_VIEW_HISTORY } from './trading.js'
+import { FLOW_LIVE_WINDOW_MS } from './board-flow.js'
 import {
   createFuturesStore,
   FUTURES_DEFAULT_ACCOUNT_MODE,
@@ -85,6 +86,7 @@ import {
   takerFeeOf
 } from './futures-rules.js'
 import { buildLeague, watcherCounts } from './trading-league.js'
+import { calendarForDay, newsForWindow } from './board-news.js'
 import {
   BOARD_TIMEFRAMES,
   PRICE_CEIL_RATIO,
@@ -95,6 +97,8 @@ import {
   TRADING_MARGINS,
   boardCrops,
   boardPrice,
+  SLOT_TICKS,
+  TICK_MS,
   barsFor,
   barsForTimeframe,
   hintOf,
@@ -162,6 +166,8 @@ import {
   encodeFarmActionResult,
   encodeMarketDigest,
   encodeTradingDigest,
+  encodeBoardFlow,
+  encodeBoardFlowSync,
   encodeFuturesHello,
   encodeFuturesOrder,
   encodeFuturesCancel,
@@ -389,6 +395,8 @@ export function createService (ctx, options = {}) {
    * 免得两个服务的 deviceId 随机导致角色对调。
    */
   const futuresHostOverride = typeof options.futuresHost === 'boolean' ? options.futuresHost : null
+  // 票 107：真人资金流默认开；老用例/老调用方可以显式关掉，保持 v4 的结算口径。
+  const tradingFlow = options.tradingFlow !== false
   const farmNow = typeof options.farmNow === 'function' ? options.farmNow : undefined
   // 季节与节日跟农场共用测试时钟；生产就是 Date.now。
   const seasonNow = farmNow ?? (() => Date.now())
@@ -486,6 +494,8 @@ export function createService (ctx, options = {}) {
   let futuresSyncAt = 0
   /** 票 94：最近一次给我们发账目的房主（窗口上显示用；只在内存里）。 */
   let futuresHostSeen = null
+  /** 票 107：每个 peer 最近一次资金流同步请求的时刻（5 分钟节流）。 */
+  const boardFlowSyncAt = new Map()
   /** 票 98：同源地址的期货报文计数：address → { start, count }（10 秒窗口）。 */
   const futuresRate = createFuturesRateLimiter({
     limit: futuresRateLimit,
@@ -1053,6 +1063,17 @@ export function createService (ctx, options = {}) {
     }
   }))
 
+  /** 票 107：把本机资金流影响写成一句 toast，和原有 notice 拼在一起。 */
+  function withFlowNotice (result) {
+    if (result === null || typeof result !== 'object' || result.ok !== true) return result
+    const flow = result.flow
+    if (flow === null || typeof flow !== 'object' || flow.recorded !== true) return result
+    const impact = Number(flow.impact)
+    if (!Number.isFinite(impact) || Math.abs(impact) < 1e-9) return result
+    const text = '你的这一单把行情推了 ' + (impact > 0 ? '+' : '') + (impact * 100).toFixed(2) + '%。'
+    return { ...result, notice: result.notice ? result.notice + ' ' + text : text }
+  }
+
   /**
    * 1.12.3：期货的每个失败都该带一句人话。
    *
@@ -1290,13 +1311,13 @@ export function createService (ctx, options = {}) {
         crop: body?.cropId
       })
       if (result?.ok === true) refreshTradingWindow()
-      return result
+      return withFlowNotice(result)
     }
     if (action === 'trading-close-position') {
       if (trading === null) return { ok: false, error: 'starting' }
       const result = await trading.closePosition(body?.positionId)
       if (result?.ok === true) refreshTradingWindow()
-      return result
+      return withFlowNotice(result)
     }
     // 止损档位循环（票 81 的持仓卡按钮，票 80 的 store 校验并落地）：
     // 窗口只报「哪一手 + 下一档」，白名单校验、落盘与「现在是哪一档」都由账本给。
@@ -2494,6 +2515,8 @@ export function createService (ctx, options = {}) {
   function tradingBarView (now, crop) {
     const bounds = slotBounds(now)
     if (bounds === null || typeof crop !== 'string' || crop === '') return null
+    const openFlow = trading === null ? 0 : trading.flowLevelAt(crop, bounds.slot * SLOT_TICKS)
+    const nowFlow = trading === null ? 0 : trading.flowLevelAt(crop, Math.floor(now / TICK_MS))
     return {
       crop,
       cropName: CROPS[crop]?.name ?? crop,
@@ -2502,8 +2525,8 @@ export function createService (ctx, options = {}) {
       end: bounds.end,
       remainingMs: Math.max(0, bounds.end - now),
       // 本根的涨跌基准就是开盘价（= 上一根的收盘价）。
-      open: boardPrice({ crop, slot: bounds.slot, tick: 0 }),
-      price: markPrice({ crop, now })
+      open: boardPrice({ crop, slot: bounds.slot, tick: 0, flowLevel: openFlow }),
+      price: markPrice({ crop, now, flowLevel: nowFlow })
     }
   }
 
@@ -2540,7 +2563,8 @@ export function createService (ctx, options = {}) {
   function tradingChartsView (now, crops) {
     const charts = {}
     for (const crop of crops) {
-      const chart = compactBoardChart(barsFor({ crop, now }))
+      const flowAt = trading === null ? null : (minute) => trading.flowLevelAt(crop, minute)
+      const chart = compactBoardChart(barsFor({ crop, now, flowAt }))
       if (chart !== null) charts[crop] = chart
     }
     return charts
@@ -2560,7 +2584,8 @@ export function createService (ctx, options = {}) {
       if (id === '15m') continue
       const period = {}
       for (const crop of crops) {
-        const chart = compactBoardChart(barsForTimeframe({ crop, now, timeframe: id }))
+        const flowAt = trading === null ? null : (minute) => trading.flowLevelAt(crop, minute)
+        const chart = compactBoardChart(barsForTimeframe({ crop, now, timeframe: id, flowAt }))
         if (chart !== null) period[crop] = chart
       }
       timeframes[id] = period
@@ -2572,10 +2597,80 @@ export function createService (ctx, options = {}) {
   function tradingHintView (now, crops) {
     const hints = {}
     for (const crop of crops) {
-      const hint = hintOf({ crop, now })
+      const hint = hintOf({
+        crop,
+        now,
+        flowLevel: trading === null ? 0 : trading.flowLevelAt(crop, Math.floor(now / TICK_MS))
+      })
       if (hint !== null) hints[crop] = hint
     }
     return hints
+  }
+
+  /** 票 107：资金流事件上显示的「谁」——本机名字或邻居昵称；坏名字退回「邻居」。 */
+  function flowNameOf (deviceId, snapshot = room.snapshot()) {
+    if (identity !== null && (deviceId === identity.deviceId || deviceId === 'local')) {
+      return identity.nickname ?? snapshot.self?.nickname ?? '我'
+    }
+    const neighbors = Array.isArray(snapshot.neighbors) ? snapshot.neighbors : []
+    const neighbor = neighbors.find((entry) => entry !== null && typeof entry === 'object' &&
+      entry.deviceId === deviceId)
+    const name = neighbor?.nickname
+    return typeof name === 'string' && name.trim() !== '' ? name.trim().slice(0, 12) : '邻居'
+  }
+
+  /**
+   * 盘口窗的资金流（票 107）：当前作物的资金流水平、本根净流、最近 24 根的事件。
+   * 没有交易也没有邻居流水时返回空表；窗口据此不画资金流胶囊。
+   */
+  function tradingFlowView (now, crop) {
+    if (trading === null || typeof crop !== 'string' || crop === '') {
+      return { level: 0, net: 0, events: [] }
+    }
+    const view = trading.flowView({ now, crop })
+    const snapshot = room.snapshot()
+    return {
+      level: view.level,
+      net: view.net,
+      events: view.events.map((event) => ({
+        ...event,
+        name: flowNameOf(event.deviceId, snapshot)
+      }))
+    }
+  }
+
+  /**
+   * 盘口窗的消息面（票 104/105）：当前作物最近 24 小时 + 未来 1 小时的消息全文，
+   * 以及今日 5 条日程。bar 上的 lite 事件只带标题/方向/影响；详情卡用这里的正文。
+   */
+  function tradingNewsView (now, crop) {
+    const items = typeof crop !== 'string' || crop === ''
+      ? []
+      : newsForWindow({ crop, now, limit: 20 }).map((event) => ({
+          id: event.id,
+          at: event.at,
+          crop: event.crop,
+          kind: event.kind,
+          tone: event.tone,
+          mag: event.jump,
+          title: event.title,
+          body: event.body,
+          source: event.source,
+          rarity: event.rarity
+        }))
+    const calendar = calendarForDay({ now }).map((row) => ({
+      id: row.id,
+      at: row.at,
+      crop: row.crop,
+      cropName: row.cropName,
+      title: row.title,
+      source: row.source,
+      mag: row.mag,
+      tone: row.tone,
+      countdownMs: Math.max(0, row.at - now),
+      done: row.at <= now
+    }))
+    return { items, calendar }
   }
 
   /**
@@ -2597,12 +2692,18 @@ export function createService (ctx, options = {}) {
     }
     tradingBoardCrop = crop
     const now = tradingClock()
+    const news = tradingNewsView(now, crop)
+    const flow = tradingFlowView(now, crop)
+    const showFlow = flow.events.length > 0 || Math.abs(flow.level) > 1e-9 || Math.abs(flow.net) > 1e-9
     return {
       ok: true,
       action: 'trading-charts',
       crop,
       timeframes: tradingTimeframesView(now, [crop]),
-      hint: tradingHintView(now, [crop])
+      hint: tradingHintView(now, [crop]),
+      // 没有消息/资金流就不带这些键：老窗口/老测试看到的仍是原来的形状。
+      ...(news.items.length === 0 && news.calendar.length === 0 ? {} : { news }),
+      ...(showFlow ? { flow } : {})
     }
   }
 
@@ -2778,7 +2879,7 @@ export function createService (ctx, options = {}) {
 
   /**
    * 票 98：盘口窗的整份视图，`/state.trading` 用的是同一份：窗口不读 /state，宿主推什么它画什么。
-   * 按钮白名单（50/100、1×/5×/20×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
+   * 按钮白名单（50/100、1×/5×/20×/50×/100×、作物）也由宿主下发，窗口不复制——少一份 drift 测试。
    * 止损档（票 80）不在这份 payload 里：窗口自己循环 0/−25%/−50%/−100%，白名单在
    * `src/trading-rules.js` 的 `TRADING_STOP_LEVELS`（store 与宿主照样按它校验）。
    *
@@ -2805,6 +2906,15 @@ export function createService (ctx, options = {}) {
       bar: tradingBarView(now, activeCrop),
       timeframes: tradingTimeframesView(now, active),
       hint: tradingHintView(now, active),
+      ...(() => {
+        const news = tradingNewsView(now, activeCrop)
+        return news.items.length === 0 && news.calendar.length === 0 ? {} : { news }
+      })(),
+      ...(() => {
+        const flow = tradingFlowView(now, activeCrop)
+        const show = flow.events.length > 0 || Math.abs(flow.level) > 1e-9 || Math.abs(flow.net) > 1e-9
+        return show ? { flow } : {}
+      })(),
       positions: newestFirst(view.positions, 'openedAt'),
       // 总数是**账本里的真实条数**：窗口据此显示「持仓 N · 显示最近 200」，
       // 不会把 240 手假装成 200 手（评审 P1）。
@@ -5167,10 +5277,14 @@ export function createService (ctx, options = {}) {
       // 坏文件只降级成空盘口（锁定的保证金按坏账处理），不挡启动。
       if (farm !== null) {
         try {
-          trading = await createTradingStore(
-            dir,
-            tradingNow === undefined ? { log, farm } : { log, now: tradingNow, farm }
-          )
+          trading = await createTradingStore(dir, {
+            log,
+            ...(tradingNow === undefined ? {} : { now: tradingNow }),
+            farm,
+            flow: tradingFlow,
+            // 本机开/平/强平/到价成交后广播给邻居；identity 还没建好，先由 store 用占位 id。
+            onFlow: (event) => { sendBoardFlow([event]) }
+          })
         } catch (error) {
           trading = null
           warn(ctx, '盘口初始化失败，本次按空盘口运行：' + message(error))
@@ -5222,6 +5336,8 @@ export function createService (ctx, options = {}) {
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
       identity = await createIdentity(dir, { defaultNickname: fallback, log })
       if (disposed) return
+      // 盘口 store 先于 identity 建：补上真实 deviceId，之后本机流水才带得上身份。
+      trading?.setDeviceId(identity.deviceId)
       room.setIdentity(identity)
       // ticket 44：第一拍桌面之前必须把 active 合同恢复成镜像；pending 在这里退款取消。
       await reconcileContractsOnStart()
@@ -5352,6 +5468,11 @@ export function createService (ctx, options = {}) {
               // 盘口周报（票 82）。**不能落到 else**：那会当成 beacon 刷新邻居灯，
               // 不报错，但榜上永远不会有这位邻居。
               handleTradingDigest(packet)
+            } else if (packet.type === 'board-flow') {
+              // 票 107：资金流合并要 await 落盘，不能冒到 socket 循环。
+              void handleBoardFlow(packet)
+            } else if (packet.type === 'board-flow-sync') {
+              handleBoardFlowSync(packet)
             } else if (packet.type === 'farm-action') {
               // ticket 43：主人侧的落账要等磁盘/随机/日志，不能冒到 socket 循环。
               void handleFarmActionPacket(packet)
@@ -5401,6 +5522,8 @@ export function createService (ctx, options = {}) {
               room.observeBeacon(packet)
               // 票 59：beacon 里带着邻居的作物目录指纹，不一致就问一次。
               noteCatalogFingerprint(packet)
+              // 票 107：新邻居/重新上线时补一次资金流同步（5 分钟节流）。
+              requestBoardFlowSync(packet.deviceId)
             }
             flushRoomEffects()
           },
@@ -6665,6 +6788,113 @@ export function createService (ctx, options = {}) {
     marketDigestAt = now
     marketDigestSignature = signature
     return sent
+  }
+
+  // ── 盘口 LAN 资金流（票 107）：P2P 事件带，无房主 ──────────────────────────
+  // 本机开/平/强平/到价成交 → 广播 `board-flow`；邻居收下后合并进本地 tape。
+  // 正常 1–2 秒一致；丢包靠 `board-flow-sync` 补最近 24 小时。旧 peer 按未知类型丢掉。
+
+  /** 一包最多 16 条；`sync` 只用于补历史（接收端放宽 24 小时窗口）。 */
+  function sendBoardFlow (events, { sync = false, target = null } = {}) {
+    if (disposed || discovery === null || identity === null) return 0
+    const clean = (Array.isArray(events) ? events : []).filter((event) => event !== null).slice(0, 16)
+    if (clean.length === 0) return 0
+    const targets = target === null ? room.heartbeatTargets() : [target]
+    if (targets.length === 0) return 0
+    const now = tradingClock()
+    // 强平/止损的触发时刻可能比「现在」早一两分钟；实时包会被 15 秒窗口挡掉，
+    // 这种自动平仓改发 sync 包，邻居仍按事件时刻合并。
+    const stale = clean.some((event) => Number(event.at) < now - FLOW_LIVE_WINDOW_MS)
+    let data
+    try {
+      data = encodeBoardFlow({
+        deviceId: identity.deviceId,
+        at: now,
+        events: clean,
+        sync: sync || stale
+      })
+    } catch {
+      return 0
+    }
+    let sent = 0
+    for (const deviceId of targets) {
+      try {
+        if (discovery.sendTo(deviceId, data)) sent += 1
+      } catch {
+        // 一个坏地址不挡其他邻居
+      }
+    }
+    return sent
+  }
+
+  /** 响应同步请求：一次最多发 4 包（64 条），够覆盖 24 小时里还在影响价格的部分。 */
+  function sendBoardFlowSince (deviceId, since) {
+    if (trading === null || identity === null || discovery === null) return 0
+    const events = trading.flowEventsSince(since, 64)
+    if (events.length === 0) return 0
+    // `flowEventsSince` 是时间正序；只发**最近** 64 条——老事件已经衰减到 <0.02%，
+    // 发最老的 64 条反而会让新邻居错过刚刚推动价格的那些。
+    const latest = events.length > 64 ? events.slice(events.length - 64) : events
+    let sent = 0
+    for (let index = 0; index < latest.length; index += 16) {
+      sent += sendBoardFlow(latest.slice(index, index + 16), { sync: true, target: deviceId })
+    }
+    return sent
+  }
+
+  /** 向某个邻居要一次最近 24 小时的流水；同一邻居 60 秒最多一次（丢包 1 分钟内补回）。 */
+  function requestBoardFlowSync (deviceId) {
+    if (disposed || trading === null || identity === null || discovery === null) return false
+    const now = tradingClock()
+    const last = boardFlowSyncAt.get(deviceId) ?? 0
+    if (now - last < 60 * 1000) return false
+    try {
+      const sent = discovery.sendTo(deviceId, encodeBoardFlowSync({
+        deviceId: identity.deviceId,
+        at: now,
+        since: now - 24 * 60 * 60 * 1000
+      }))
+      // 只有真的发出去了才记节流：刚发现、还没放行时 sendTo 会失败，
+      // 不能因此把「放行后补一次」也挡 5 分钟。
+      if (sent) boardFlowSyncAt.set(deviceId, now)
+      return sent
+    } catch {
+      return false
+    }
+  }
+
+  /** 收包节流：同源 20 包/10 秒；真正的单根/单日上限在 store 里再算一遍。 */
+  const boardFlowRate = new Map()
+  const boardFlowSyncSeen = new Map()
+  function boardFlowRateAllows (deviceId) {
+    const now = tradingClock()
+    const windowStart = now - 10 * 1000
+    const entry = boardFlowRate.get(deviceId)
+    if (entry === undefined || entry.start < windowStart) {
+      boardFlowRate.set(deviceId, { start: now, count: 1 })
+      return true
+    }
+    entry.count += 1
+    return entry.count <= 20
+  }
+
+  async function handleBoardFlow (packet) {
+    if (trading === null) return
+    if (!boardFlowRateAllows(packet.deviceId)) return
+    const result = await trading.acceptFlow(packet.events, {
+      now: tradingClock(),
+      mode: packet.sync === true ? 'sync' : 'live'
+    })
+    if (result.accepted > 0) refreshTradingWindow()
+  }
+
+  function handleBoardFlowSync (packet) {
+    if (trading === null) return
+    const now = tradingClock()
+    const last = boardFlowSyncSeen.get(packet.deviceId) ?? 0
+    if (now - last < 10 * 1000) return
+    boardFlowSyncSeen.set(packet.deviceId, now)
+    sendBoardFlowSince(packet.deviceId, packet.since)
   }
 
   // ── 期货联网（票 94）：房主记账，邻居只拿账目副本 ──────────────────────────
