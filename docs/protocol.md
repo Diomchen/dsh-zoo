@@ -102,12 +102,20 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
   "accountMode": "live" }
 { "v": 1, "type": "futures-pause", "deviceId": "<uuid>", "at": 1700000000000,
   "paused": true }
+{ "v": 1, "type": "futures-ledger", "deviceId": "<uuid>", "at": 1700000000000,
+  "epoch": "<uuid>", "seq": 9, "hostId": "<uuid>", "index": 0, "total": 1,
+  "chunk": "{\"v\":1,\"epoch\":\"…\"}" }
 ```
+
+`futures-ledger` 是整本账快照的分片：`chunk` 是一段 JSON 文本，拼起来才是快照本体
+（`{ v, epoch, seq, at, hostId, insurance, shortfall, liquidationCount, delivered, accounts[] }`）。
+房主每 30 秒广播一轮，peer 只留最新一份、落盘在 `futures.json` 的 `ledger` 字段里，
+换房主时用它接管——最多丢最后半分钟的成交，不会丢钱（1.12.0）。
 
 | 字段 | 适用于 | 约束 |
 | --- | --- | --- |
 | `v` | 全部 | 必须是数字 `1`；其他版本整包忽略，只记一条日志 |
-| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` |
+| `type` | 全部 | `beacon` / `beacon-ack` / `heartbeat` / `visit-request` / `visit-ack` / `visit-deny` / `visit-recall` / `visit-recall-ack` / `gift-received` / `market-digest` / `trading-digest` / `farm-action` / `farm-action-result` / `work-request` / `work-ack` / `work-recall` / `work-recall-ack` / `work-end` / `work-end-ack` / `work-settle` / `work-settle-ack` / `futures-hello` / `futures-order` / `futures-cancel` / `futures-settle` / `futures-sync` / `futures-mode` / `futures-pause` / `futures-ledger` |
 | `deviceId` | 全部 | 本机持久化的 UUID，见 `<dataDir>/identity.json`；不按 IP 认邻居 |
 | `nickname` | `beacon`、`beacon-ack`、`visit-request` | 本地昵称，清洗控制字符后按码点截断到 32 |
 | `port` | `beacon`、`beacon-ack` | 本插件服务端口；串门不再另开 TCP，所以这个字段不参与串门 |
@@ -162,7 +170,7 @@ JSON 对象。**字段集按类型固定**，多出来的字段在解析时丢�
 | `lastSeq` | `futures-sync` | 本机已经收到的最大 `seq`；房主据此回一份当前账户（落后太多就直接重发整份） |
 
 **兼容口径（v 仍为 1）**：以上新字段全部可选。新增的**报文类型**（`market-digest` /
-`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 7 种 `futures-*`）旧端不认识时整包
+`trading-digest` / `farm-action` / `farm-action-result` / 8 种 `work-*` / 8 种 `futures-*`）旧端不认识时整包
 静默丢弃，既不回复也不崩；原有类型的新字段旧端只丢字段。新端收到旧端时，缺字段就按下面的降级规则处理。
 新端缺 `action` 时回退 `anim`，缺 `skinPort`/`skinId` 时只用本机素材或通用小人，
 `say` 过期或形状不对就整条不显示，缺 `gift` 就是一次没有礼物的串门。任何新字段非法都只丢
@@ -974,6 +982,12 @@ GET /dsh-zoo-farm/<visitId>   → 访客视角的快照
    - 切档、暂停都会在 `trades` 里写一条 `kind:'mode'` 审计流水。
    - `futures-reconcile` 返回 `{ farmCoins, custodyTotal, positionsNotional, diff }`，
      纸面账户的流动 `diff` 恒为 0；账户 `disabled` 后入站 `futures-*` 静默丢弃、出站不发。
+10. **账本复制（1.12.0（B））**：房主每 30 秒把所有账户的整本账打包成快照，按 2,800 字符切片、
+    最多 8 片，用 `futures-ledger` 广播给每个 peer。peer 按 `(epoch, seq)` 只留最新一份，
+    落盘在 `futures.json` 的 `ledger` 字段；房主掉线换人时，新房主若自己的账还是空的
+    （余额、持仓、挂单、流水、`remotes` 全空）就用这份快照接管——`epoch`/`seq` 接着上一任，
+    余额与持仓原样回来，最多丢最后半分钟的成交。已经记过账的节点不会被覆盖。
+    快照里任何一处不合法（`hostId` 空、账户超 16 个、金额为负、合约编号不认识）整份丢弃。
 
 ### 限额与边界
 

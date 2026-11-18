@@ -518,6 +518,12 @@ _Avoid_: 回滚, rollback（旧名，指房主替全场退）
 **纸面账户 (Paper Account)**：
 `accountMode: 'shadow'` 的账户：撮合、盯市、强平、交割全跑，钱只在托管账里动，不写自己的 `farm.json`。
 日额与持仓名义上限跟真钱账户一样，只是数是纸面的。
+
+**账本快照 (Ledger Snapshot)**：
+房主每 30 秒打包一次的全量账（`{ epoch, seq, accounts[] }`），按 2,800 字符切片用 `futures-ledger`
+广播，peer 只留最新一份并落盘在 `futures.json` 的 `ledger` 字段。换房主时用它接管：
+余额、持仓、挂单原样回来，最多丢最后半分钟的成交。已经记过账的节点不会被覆盖。
+_Avoid_: 备份, 导出, dump
 _Avoid_: 影子模式（旧名，指整台机器都在纸面）, 模拟盘, 测试模式, dry run
 
 **日额 (Daily Cap)**：

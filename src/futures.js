@@ -159,6 +159,9 @@ export const FUTURES_ERROR_TEXT = Object.freeze({
 
 const MAX_ID_LENGTH = 64
 const MAX_QUANTITY = 1_000_000
+// 1.12.0（B）：一本账最多几个账户。局域网里一台机器一个账户，16 已经是宽松上限；
+// 再大就不该硬塞进 4 KiB 的 UDP 包，宁可让快照分片失败也不把包撑爆。
+const LEDGER_MAX_ACCOUNTS = 16
 /** 本地挂单的 deviceId 占位：真正的设备号只出现在 `remotes` 的键上。 */
 export const LOCAL_ORDER_DEVICE = 'local'
 
@@ -231,7 +234,10 @@ export function initialFuturesState () {
     farmOut: 0,
     // 票 98：模式变更的版本号。模式是全局状态，不挂在某个远端账户上；
     // 推进它并把 peer 的 seq 对齐，切档后的第一份 settle 才不会被当成重复包。
-    modeSeq: 0
+    modeSeq: 0,
+    // 1.12.0（B）：最近一次从房主收到的整本账快照。换房主时用它重建——
+    // 只记一份、只留最新（`(epoch, seq)` 大的那份），别的不攒。
+    ledger: null
   }
 }
 
@@ -452,7 +458,82 @@ function normalizeRemoteAccount (raw) {
       trades.push(trade)
     }
   }
-  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode }
+  // 1.12.0：暂停与退出标记也要跟着落盘，否则房主重启后远端账户会「自己恢复交易」。
+  const paused = raw.paused === undefined ? false : raw.paused
+  if (typeof paused !== 'boolean') return null
+  const disabled = raw.disabled === undefined ? false : raw.disabled
+  if (typeof disabled !== 'boolean') return null
+  return { balance, marginUsed: roundCoin(margin), positions, orders, trades, lastSeq, updatedAt, pending, dayStart, dayNotional, accountMode, paused, disabled }
+}
+
+/**
+ * 1.12.0（B）：房主广播的整本账快照。
+ *
+ * 只有一件事要保证：**换房主时能用它把账重建出来**。所以快照里每个账户都带齐
+ * 余额、仓位、挂单、成交流水、档位、暂停/退出标记；市场层的保险基金、欠账、交割标记
+ * 也一并带走。校验从严——坏一个字段就整份丢掉，宁可不接管也不能接管一份半截账。
+ */
+export function normalizeLedgerSnapshot (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const epoch = typeof raw.epoch === 'string' ? raw.epoch.slice(0, 64) : ''
+  const seq = Number.isInteger(raw.seq) && raw.seq >= 0 ? raw.seq : null
+  const at = finiteNumber(raw.at)
+  if (seq === null || at === null || at < 0) return null
+  const hostId = typeof raw.hostId === 'string' && raw.hostId !== '' && raw.hostId.length <= MAX_ID_LENGTH
+    ? raw.hostId
+    : null
+  if (hostId === null) return null
+  if (!Array.isArray(raw.accounts) || raw.accounts.length === 0 || raw.accounts.length > LEDGER_MAX_ACCOUNTS) return null
+  const accounts = []
+  const seen = new Set()
+  for (const entry of raw.accounts) {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
+    const deviceId = typeof entry.deviceId === 'string' && entry.deviceId !== '' && entry.deviceId.length <= MAX_ID_LENGTH
+      ? entry.deviceId
+      : null
+    if (deviceId === null || seen.has(deviceId)) return null
+    seen.add(deviceId)
+    const account = normalizeRemoteAccount(entry)
+    if (account === null) return null
+    accounts.push({ deviceId, ...account })
+  }
+  const insurance = raw.insurance === undefined ? 0 : nonNegativeCoin(raw.insurance)
+  const shortfall = raw.shortfall === undefined ? 0 : nonNegativeCoin(raw.shortfall)
+  if (insurance === null || shortfall === null) return null
+  const liquidationCount = raw.liquidationCount === undefined
+    ? 0
+    : (Number.isInteger(raw.liquidationCount) && raw.liquidationCount >= 0 ? raw.liquidationCount : null)
+  if (liquidationCount === null) return null
+  const delivered = {}
+  if (raw.delivered !== undefined && raw.delivered !== null) {
+    if (typeof raw.delivered !== 'object' || Array.isArray(raw.delivered)) return null
+    for (const [contractId, value] of Object.entries(raw.delivered)) {
+      const window = contractWindowOf(contractId)
+      const stampedAt = finiteNumber(value)
+      if (window === null || stampedAt === null || stampedAt <= 0) return null
+      delivered[window.id] = stampedAt
+    }
+  }
+  return { v: 1, epoch, seq, at, hostId, insurance, shortfall, liquidationCount, delivered, accounts }
+}
+
+/** 快照里一个账户的线上形状：本地账本和远端账户共用一份序列化，省得两边漂。 */
+function accountSnapshotOf (account) {
+  return {
+    balance: roundCoin(account.balance),
+    marginUsed: roundCoin(account.marginUsed),
+    positions: account.positions.map((position) => ({ ...position })),
+    orders: account.orders.map((order) => ({ ...order })),
+    trades: (account.trades ?? []).slice(0, FUTURES_TRADE_LIMIT).map((trade) => ({ ...trade })),
+    lastSeq: account.lastSeq ?? 0,
+    updatedAt: account.updatedAt ?? 0,
+    pending: roundCoin(account.pending ?? 0),
+    dayStart: account.dayStart ?? 0,
+    dayNotional: roundCoin(account.dayNotional ?? 0),
+    accountMode: account.accountMode ?? null,
+    paused: account.paused === true,
+    disabled: account.disabled === true
+  }
 }
 
 /**
@@ -712,6 +793,14 @@ export function normalizeFuturesFile (value) {
   if (!(Number.isInteger(modeSeq) && modeSeq >= 0)) repaired += 1
   else state.modeSeq = modeSeq
 
+  // 1.12.0（B）：上一次收到的整本账快照。缺字段是旧版本（没这一版就没有快照），
+  // 不算修补；但既然是坏账就必须丢掉——接管一份半截账比不接管更糟。
+  if (value.ledger !== undefined && value.ledger !== null) {
+    const ledger = normalizeLedgerSnapshot(value.ledger)
+    if (ledger === null) repaired += 1
+    else state.ledger = ledger
+  }
+
   // 保证金是「从余额划走的钱」：仓位/挂单丢了、保证金还在，账会凭空多钱或少钱。
   // 仓位 + 挂单冻结的总额才是真相，marginUsed 以它为准（与 farm 的坏账处理同一取舍）。
   const expectedMargin = roundCoin(
@@ -759,7 +848,9 @@ function toFileState (state) {
     farmAnchor: roundCoin(state.farmAnchor),
     farmIn: roundCoin(state.farmIn),
     farmOut: roundCoin(state.farmOut),
-    modeSeq: state.modeSeq
+    modeSeq: state.modeSeq,
+    // 1.12.0（B）：整本账快照（只有 peer 会存，房主这边是 null）。
+    ledger: state.ledger === null ? null : state.ledger
   }
 }
 
@@ -2056,6 +2147,116 @@ class FuturesStore {
       updatedAt: stamp
     }
     return { ok: true, applied: true }
+  }
+
+  /** 1.12.0（B）：把整本账打成一份可广播的快照。 */
+  ledgerSnapshotOf ({ hostId = '', at = this.#nowMs() } = {}) {
+    const state = this.#state
+    const accounts = [{ deviceId: hostId, ...accountSnapshotOf(state) }]
+    for (const [deviceId, account] of Object.entries(state.remotes)) {
+      accounts.push({ deviceId, ...accountSnapshotOf(account) })
+    }
+    return {
+      v: 1,
+      epoch: state.epoch,
+      seq: state.seq,
+      at,
+      hostId,
+      insurance: roundCoin(state.insurance),
+      shortfall: roundCoin(state.shortfall),
+      liquidationCount: state.liquidationCount,
+      delivered: { ...state.delivered },
+      accounts
+    }
+  }
+
+  /** peer 侧收下快照：只留最新的一份，供换房主时接管。 */
+  async applyLedgerSnapshot (raw) {
+    const ledger = normalizeLedgerSnapshot(raw)
+    if (ledger === null) return { ok: false, error: 'bad-ledger' }
+    const current = this.#state.ledger
+    const older = current !== null && current !== undefined &&
+      (current.epoch === ledger.epoch ? current.seq >= ledger.seq : current.at > ledger.at)
+    if (older) {
+      return { ok: true, action: 'futures-ledger', applied: false, epoch: current.epoch, seq: current.seq }
+    }
+    this.#state.ledger = ledger
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-ledger',
+      applied: true,
+      epoch: ledger.epoch,
+      seq: ledger.seq,
+      accounts: ledger.accounts.length,
+      persisted
+    }
+  }
+
+  /** 本机账本还是空的、手上又有一份别人广播的快照 → 该接管了。 */
+  adoptableLedger () {
+    const ledger = this.#state.ledger
+    if (ledger === null || ledger === undefined) return null
+    const state = this.#state
+    // 判断「空」只看账本内容，不看 epoch：`#persist()` 会给空账本补一个随机 epoch。
+    if (Object.keys(state.remotes).length > 0) return null
+    if (state.balance > 0 || state.marginUsed > 0 || state.pending > 0) return null
+    if (state.positions.length > 0 || state.orders.length > 0) return null
+    if (state.trades.length > 0) return null
+    if (state.disabled === true) return null
+    return ledger
+  }
+
+  /**
+   * 1.12.0（B）：接手别人广播的整本账。
+   *
+   * 谁是本机（`selfId`）谁的账就落进本地账本，其余进 `remotes`；认不出的账户直接跳过
+   * （换机器/改 deviceId 之后旧账户就留在快照里，不动它比乱认强）。
+   */
+  async adoptLedger (raw, { selfId = '', at = this.#nowMs() } = {}) {
+    const ledger = normalizeLedgerSnapshot(raw)
+    if (ledger === null) return { ok: false, error: 'bad-ledger' }
+    if (typeof selfId !== 'string' || selfId === '') return { ok: false, error: 'bad-device' }
+    const state = this.#state
+    const own = ledger.accounts.find((account) => account.deviceId === selfId) ?? null
+    const remotes = {}
+    for (const account of ledger.accounts) {
+      if (account.deviceId === selfId) continue
+      remotes[account.deviceId] = normalizeRemoteAccount(account)
+    }
+    state.epoch = ledger.epoch
+    state.seq = Math.max(state.seq, ledger.seq)
+    state.insurance = ledger.insurance
+    state.shortfall = ledger.shortfall
+    state.liquidationCount = ledger.liquidationCount
+    state.delivered = { ...ledger.delivered }
+    state.remotes = remotes
+    if (own !== null) {
+      state.balance = own.balance
+      state.marginUsed = own.marginUsed
+      state.positions = own.positions.map((position) => ({ ...position }))
+      state.orders = own.orders.map((order) => ({ ...order }))
+      state.trades = own.trades.map((trade) => ({ ...trade }))
+      state.pending = own.pending
+      state.dayStart = own.dayStart
+      state.dayNotional = own.dayNotional
+      state.accountMode = own.accountMode
+      state.paused = own.paused === true
+      state.disabled = own.disabled === true
+    }
+    state.tradedAt = at
+    // 接管完就把快照放下：账本已经变成活的，再留一份只会让下一次判断「空不空」变糊。
+    state.ledger = null
+    const persisted = await this.#persist()
+    return {
+      ok: true,
+      action: 'futures-ledger-adopt',
+      epoch: ledger.epoch,
+      seq: ledger.seq,
+      accounts: ledger.accounts.length,
+      adoptedSelf: own !== null,
+      persisted
+    }
   }
 
   /** peer 侧的只读副本；从没收到过 settle 就是 null（窗口据此显示「等对端」）。 */

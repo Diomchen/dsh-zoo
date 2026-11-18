@@ -379,7 +379,9 @@ export const PACKET_TYPES = Object.freeze([
   // 1.10.0：账户自己的档位申报（peer → 房主）。
   'futures-mode',
   // 1.12.0：账户自己按的暂停申报（peer → 房主）。
-  'futures-pause'
+  'futures-pause',
+  // 1.12.0（B）：整本账快照的分片（房主 → peer），换房主时用来重建账本。
+  'futures-ledger'
 ])
 const VISIT_TYPES = new Set([
   'visit-request',
@@ -1714,6 +1716,24 @@ export function encodeFuturesPause ({ deviceId, at, paused, now } = {}) {
   return encodePacket({ type: 'futures-pause', deviceId, at, paused: paused === true, now })
 }
 
+/** 1.12.0（B）：整本账快照的一个分片。`chunk` 是 JSON 字符串的一段，房主按序发、peer 拼。 */
+export const FUTURES_LEDGER_MAX_CHUNK = 2800
+export const FUTURES_LEDGER_MAX_PARTS = 8
+
+export function encodeFuturesLedger ({ deviceId, at, epoch, seq, hostId, index, total, chunk, now } = {}) {
+  return encodePacket({
+    type: 'futures-ledger',
+    deviceId,
+    at,
+    epoch,
+    seq,
+    hostId,
+    index,
+    total,
+    chunk
+  }, { now })
+}
+
 /**
  * 1.10.0：账户申报自己的档位（peer → 房主）。
  * 只带一个白名单值，不带余额/农场/自由文本——房主按它决定这本账按真钱还是纸面结算。
@@ -2311,6 +2331,36 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         deviceId: raw.deviceId.toLowerCase(),
         at,
         paused: raw.paused
+      }
+    }
+  }
+
+  // 1.12.0（B）：整本账快照的分片。房主按序发，peer 按 `(epoch, seq, total)` 拼回来；
+  // 分片本身没有语义，只保证「不超过上限、序号自洽」。
+  if (raw.type === 'futures-ledger') {
+    const at = normalizeDigestAt(raw.at)
+    if (at === null) return fail('at')
+    if (typeof raw.epoch !== 'string' || raw.epoch.length > 64) return fail('epoch')
+    if (!(Number.isInteger(raw.seq) && raw.seq >= 0)) return fail('seq')
+    if (typeof raw.hostId !== 'string' || raw.hostId === '' || raw.hostId.length > 64) return fail('host-id')
+    if (!(Number.isInteger(raw.total) && raw.total >= 1 && raw.total <= FUTURES_LEDGER_MAX_PARTS)) return fail('total')
+    if (!(Number.isInteger(raw.index) && raw.index >= 0 && raw.index < raw.total)) return fail('index')
+    if (typeof raw.chunk !== 'string' || raw.chunk.length === 0 || raw.chunk.length > FUTURES_LEDGER_MAX_CHUNK) {
+      return fail('chunk')
+    }
+    return {
+      ok: true,
+      packet: {
+        v: PROTOCOL_VERSION,
+        type: raw.type,
+        deviceId: raw.deviceId.toLowerCase(),
+        at,
+        epoch: raw.epoch,
+        seq: raw.seq,
+        hostId: raw.hostId,
+        index: raw.index,
+        total: raw.total,
+        chunk: raw.chunk
       }
     }
   }

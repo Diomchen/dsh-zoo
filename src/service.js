@@ -163,6 +163,9 @@ import {
   encodeFuturesSync,
   encodeFuturesMode,
   encodeFuturesPause,
+  encodeFuturesLedger,
+  FUTURES_LEDGER_MAX_CHUNK,
+  FUTURES_LEDGER_MAX_PARTS,
   normalizeSkinId,
   PEER_LOST_MS,
   VISIT_MAX_MS,
@@ -469,6 +472,10 @@ export function createService (ctx, options = {}) {
   const futuresPeers = new Map()
   /** 票 94：对端 hello 的节流表（deviceId → 上次发送时刻）。 */
   const futuresHelloAt = new Map()
+  /** 1.12.0（B）：正在拼装的整本账快照（`epoch:seq:hostId` → 分片），最多留三份。 */
+  const futuresLedgerParts = new Map()
+  /** 1.12.0（B）：15 秒一拍，两拍（30 秒）广播一次整本账。 */
+  let futuresLedgerTick = 0
   /** 票 94：非房主上次 sync 的时刻。 */
   let futuresSyncAt = 0
   /** 票 94：最近一次给我们发账目的房主（窗口上显示用；只在内存里）。 */
@@ -5363,6 +5370,9 @@ export function createService (ctx, options = {}) {
             } else if (packet.type === 'futures-pause') {
               // 1.12.0：邻居申报自己按下的暂停。同样只有房主受账。
               void handleFuturesPause(packet, from)
+            } else if (packet.type === 'futures-ledger') {
+              // 1.12.0（B）：房主广播的整本账快照分片。peer 拼齐了才落盘。
+              handleFuturesLedger(packet)
             } else {
               room.observeBeacon(packet)
               // 票 59：beacon 里带着邻居的作物目录指纹，不一致就问一次。
@@ -6793,7 +6803,67 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 房主侧：每台对端各推**自己的**账目（不是同一个人的账转给别人）。
+   * 1.12.0（B）：房主每 30 秒广播一份**整本账**快照，分片发（一包上限 4 KiB）。
+   *
+   * 目的只有一个：房主掉线、两边改选之后，新房主手上有账可接管，而不是开一本空账。
+   * 快照只保留最新一份，peer 侧落盘在 `futures.json` 的 `ledger` 字段里。
+   */
+  function broadcastFuturesLedger () {
+    if (disposed || futures === null || discovery === null || !isFuturesHost()) return 0
+    const peers = [...futuresPeers.keys()]
+    if (peers.length === 0) return 0
+    let snapshot
+    let json
+    try {
+      snapshot = futures.ledgerSnapshotOf({
+        hostId: room.snapshot().self.deviceId,
+        at: futuresClock()
+      })
+      json = JSON.stringify(snapshot)
+    } catch (error) {
+      warnOnce('futures-ledger-build', '整本账快照打不出来：' + message(error))
+      return 0
+    }
+    const chunks = []
+    for (let index = 0; index < json.length; index += FUTURES_LEDGER_MAX_CHUNK) {
+      chunks.push(json.slice(index, index + FUTURES_LEDGER_MAX_CHUNK))
+    }
+    if (chunks.length === 0 || chunks.length > FUTURES_LEDGER_MAX_PARTS) {
+      warnOnce('futures-ledger-large', '整本账快照太大（' + chunks.length + ' 片），这一轮不发')
+      return 0
+    }
+    let sent = 0
+    for (const deviceId of peers) {
+      for (let index = 0; index < chunks.length; index += 1) {
+        let data
+        try {
+          data = encodeFuturesLedger({
+            deviceId: room.snapshot().self.deviceId,
+            at: futuresClock(),
+            epoch: snapshot.epoch,
+            seq: snapshot.seq,
+            hostId: snapshot.hostId,
+            index,
+            total: chunks.length,
+            chunk: chunks[index],
+            now: Date.now()
+          })
+        } catch (error) {
+          warnOnce('futures-ledger-send', '整本账快照发不出去：' + message(error))
+          break
+        }
+        try {
+          if (discovery.sendTo(deviceId, data) === true) sent += 1
+        } catch (error) {
+          warnOnce('futures-ledger-send', '整本账快照发不出去：' + message(error))
+          break
+        }
+      }
+    }
+    return sent
+  }
+
+  /** 房主侧：每台对端各推**自己的**账目（不是同一个人的账转给别人）。
    * `targets` 只给「这一拍刚结算完的账户」用，避免盯市把所有人的包都重发一遍。
    */
   function broadcastFuturesSettle (targets = null) {
@@ -6948,6 +7018,44 @@ export function createService (ctx, options = {}) {
       return
     }
     sendFuturesSettle(packet.deviceId)
+  }
+
+  /**
+   * 1.12.0（B）：收到房主广播的整本账快照。分片按 `(epoch, seq)` 攒，齐了再落盘；
+   * 只认当前房主的包（换房主期间两个人都可能发，认最后一个也算错，所以宁可丢）。
+   */
+  function handleFuturesLedger (packet) {
+    if (disposed || futures === null || isFuturesHost()) return
+    if (!room.mayTalkTo(packet.deviceId)) return
+    if (futuresHostOverride === null && packet.deviceId !== futuresHostId()) return
+    const key = packet.epoch + ':' + packet.seq + ':' + packet.hostId
+    let slot = futuresLedgerParts.get(key)
+    if (slot === undefined || slot.total !== packet.total) {
+      slot = { total: packet.total, parts: new Array(packet.total).fill(null), at: futuresClock() }
+      futuresLedgerParts.set(key, slot)
+      // 只留最近三份拼装中的快照：换房主时旧片永远拼不齐，攒着就是泄漏。
+      if (futuresLedgerParts.size > 3) {
+        const oldest = [...futuresLedgerParts.keys()][0]
+        if (oldest !== key) futuresLedgerParts.delete(oldest)
+      }
+    }
+    slot.parts[packet.index] = packet.chunk
+    if (slot.parts.some((part) => part === null)) return
+    futuresLedgerParts.delete(key)
+    let snapshot = null
+    try {
+      snapshot = JSON.parse(slot.parts.join(''))
+    } catch (error) {
+      warnOnce('futures-ledger-parse', '整本账快照拼不成 JSON：' + message(error))
+      return
+    }
+    void futures.applyLedgerSnapshot(snapshot).then((result) => {
+      if (result?.ok !== true) {
+        warnOnce('futures-ledger-' + String(result?.error), '整本账快照被拒：' + String(result?.error))
+      }
+    }).catch((error) => {
+      warnOnce('futures-ledger-apply', '整本账快照存不下来：' + message(error))
+    })
   }
 
   /** 票 94：对端每 30 秒对一次账。房主直接回整份账户——gap 再大也不会算错。 */
@@ -7578,6 +7686,40 @@ export function createService (ctx, options = {}) {
     // 票 94：同一班车顺手做「报到」和「对账」。两条都按 30 秒节流，15 秒一拍正好两拍一次。
     announceFutures()
     syncFutures()
+    // 1.12.0（B）：接替房主时先用落盘的那份账本接管，再用整本账向邻居广播。
+    if (isFuturesHost()) {
+      adoptFuturesLedgerIfPossible()
+      futuresLedgerTick += 1
+      if (futuresLedgerTick % 2 === 0) broadcastFuturesLedger()
+    }
+  }
+
+  /**
+   * 1.12.0（B）：本机刚当上房主、自己的账还是空的时候，用上一任房主落盘的快照接管。
+   * 只在「空账本」时接管——已经有账就不覆盖，否则两边会互相打架。
+   */
+  function adoptFuturesLedgerIfPossible () {
+    if (disposed || futures === null) return 0
+    let ledger = null
+    try {
+      ledger = futures.adoptableLedger()
+    } catch (error) {
+      warnOnce('futures-ledger-adoptable', '接管前的检查失败：' + message(error))
+      return 0
+    }
+    if (ledger === null) return 0
+    const selfId = room.snapshot().self.deviceId
+    void futures.adoptLedger(ledger, { selfId, at: futuresClock() }).then((result) => {
+      if (result?.ok !== true) {
+        warnOnce('futures-ledger-adopt', '接管账本失败：' + String(result?.error))
+        return
+      }
+      refreshFuturesWindow()
+      broadcastFuturesSettle()
+    }).catch((error) => {
+      warnOnce('futures-ledger-adopt', '接管账本失败：' + message(error))
+    })
+    return 1
   }
 
   function startFuturesSettleTick () {
