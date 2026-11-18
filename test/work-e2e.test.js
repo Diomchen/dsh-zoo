@@ -18,7 +18,9 @@ function delay (ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-async function waitFor (predicate, timeoutMs = 5000) {
+// 全量并发跑（4 路、2 核）时这两台机器的 UDP 来回会慢到秒级；单跑这一条要 6 秒，
+// 所以默认给 20 秒——它只在真出问题时才等满。
+async function waitFor (predicate, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (await predicate()) return
