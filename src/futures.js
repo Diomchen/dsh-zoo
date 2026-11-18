@@ -1079,6 +1079,17 @@ class FuturesStore {
     return this.#accountModeOf(this.#state)
   }
 
+  /**
+   * 1.12.6：本机**自己选过**的档位；没选过回 null。
+   *
+   * 和 `accountMode()` 的区别：那个会按 1.9 的老语义跟着市场档位走，所以「房主开的是
+   * live」会被算成「每个 peer 都想玩真钱」。房主那边只需要知道我们自己选过什么，
+   * 没选过就别去申报（否则每次报到都白推一格 seq）。
+   */
+  chosenAccountMode () {
+    return isFuturesAccountMode(this.#state.accountMode) ? this.#state.accountMode : null
+  }
+
   /** 账户权益：余额 + 已占保证金（不含浮盈——浮盈每 15 秒变，额度不该跟着抖）。 */
   #equityOf (account) {
     const target = account ?? this.#state

@@ -378,6 +378,8 @@ export function createService (ctx, options = {}) {
   // 期货（票 92）：结算节拍。15 秒 = OU 的一步，整根到点时窗口不用等农活那一拍。
   const futuresTickMs = positiveOption(options.futuresTickMs, FUTURES_SETTLE_MS, 10)
   const futuresSyncMs = positiveOption(options.futuresSyncMs, FUTURES_SYNC_MS, 10)
+  // 1.12.6：把自己的档位按期申报一遍（房主重启后会忘，peer 没法察觉）。
+  const futuresModeHeartbeatMs = positiveOption(options.futuresModeHeartbeatMs, 30_000, 10)
   const futuresHelloMs = positiveOption(options.futuresHelloMs, FUTURES_HELLO_MS, 10)
   // 票 98：同源 20 包/10 秒。测试 harness 把 hello/sync 调到几十毫秒，
   // 会瞬间打满默认配额；这里让测试单独调高阈值，生产保持 20/10s。
@@ -6816,6 +6818,29 @@ export function createService (ctx, options = {}) {
     }
   }
 
+  /**
+   * 1.12.6：本机档位和房主副本对不上时，按 `futuresModeHeartbeatMs` 的节流再申报一次。
+   *
+   * 为什么需要：档位是每个人自己的事，可房主的副本才是它结算时用的口径。房主重启、
+   * 或者它比我们老、不认识这条报文，副本就会停在 `shadow`——本机窗口显示真钱，房主却按
+   * 纸面给你结算。只在**对不上**的时候重发（房主记的是 null 也算对不上），否则就是每拍
+   * 一包 settle 风暴。
+   */
+  let futuresModeSentAt = 0
+  function reannounceFuturesMode (now = futuresClock()) {
+    if (disposed || futures === null || isFuturesHost()) return false
+    // 只申报自己选过的档位：`accountMode()` 会按 1.9 老语义跟着市场档位走，房主开 live
+    // 时会把「没选过」也算成 live，白推一格 seq。
+    const mine = futures.chosenAccountMode()
+    if (mine === null) return false
+    const replica = futures.replicaOf()
+    const theirs = typeof replica?.accountMode === 'string' ? replica.accountMode : null
+    if (theirs === mine) return false
+    if (now - futuresModeSentAt < futuresModeHeartbeatMs) return false
+    futuresModeSentAt = now
+    return sendFuturesMode(mine)
+  }
+
   /** 1.12.0：peer 把自己按的暂停申报给房主；发不出去就等下一拍 sync 重来。 */
   function sendFuturesPause (paused) {
     if (disposed || futures === null) return false
@@ -7231,9 +7256,14 @@ export function createService (ctx, options = {}) {
     // 1.12.4：档位只看**自己这一本账**。以前 `mode === 'shadow'`（房主自己是纸面）会被写成
     // 「影子模式：只记账」，看起来像「房主决定你能不能玩真钱」——现在房主的 `mode` 只表示
     // 它自己那本账，别人的档位由 `accountMode` 单独带过来。
-    const accountMode = replica !== null && isFuturesAccountMode(replica.accountMode)
+    // 1.12.6：档位以**本机**为准。房主的副本只当参考——它要是还没升级、或者重启后把
+    // 账户档位弄丢了，窗口就不该跟着说「你是纸面」，否则用户点了「切到真钱」看到画面
+    // 还是纸面，会以为没生效，再点一下就又切回去了。
+    const localAccountMode = isFuturesAccountMode(view.accountMode) ? view.accountMode : null
+    const replicaAccountMode = replica !== null && isFuturesAccountMode(replica.accountMode)
       ? replica.accountMode
-      : (isFuturesAccountMode(view.accountMode) ? view.accountMode : FUTURES_DEFAULT_ACCOUNT_MODE)
+      : null
+    const accountMode = localAccountMode ?? replicaAccountMode ?? FUTURES_DEFAULT_ACCOUNT_MODE
     const session = mode === 'off' ? { kind: 'off', text: '期货未开放' } : view.session
     const upgraded = futuresPeerIds().length > 0
     const stale = room.snapshot().neighbors.some((neighbor) => {
@@ -7730,6 +7760,8 @@ export function createService (ctx, options = {}) {
     // 票 94：同一班车顺手做「报到」和「对账」。两条都按 30 秒节流，15 秒一拍正好两拍一次。
     announceFutures()
     syncFutures()
+    // 1.12.6：房主那本账要是把我们的档位弄丢了（重启、或它还不认识这条报文），再申报一次。
+    reannounceFuturesMode()
     // 1.12.0（B）：接替房主时先用落盘的那份账本接管，再用整本账向邻居广播。
     if (isFuturesHost()) {
       adoptFuturesLedgerIfPossible()
@@ -8814,6 +8846,8 @@ export function createService (ctx, options = {}) {
     futuresHost: () => futuresHostId(),
     /** 票 94 的测试/诊断缝：房主账本里某个 deviceId 的账户（没有 = 零账户）。 */
     futuresAccountOf: (deviceId) => (futures === null ? null : futures.accountOf(deviceId, { at: futuresClock() })),
+    /** 1.12.6 的测试/诊断缝：底层账本本身（只在测试里模拟「房主把别人的档位弄丢了」）。 */
+    futuresStore: () => futures,
     farmGuard: () => farmGuard(),
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),

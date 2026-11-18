@@ -130,6 +130,8 @@ function optionsFor (dir, port, targetPort, overrides = {}) {
     futuresTickMs: 20,
     futuresHelloMs: 40,
     futuresSyncMs: 40,
+    // 1.12.6：档位心跳也调快，否则「房主忘了档位」这类用例要真等半分钟。
+    futuresModeHeartbeatMs: 40,
     // 票 98：40ms 一次的 hello/sync 会远超「20 包/10 秒」；这组用例验的是账本同步，
     // 限速本身另有用例，所以把配额放大，避免控制包把业务包挤掉。
     futuresRateLimit: 10000,
@@ -235,6 +237,24 @@ test('1.12.4：房主自己那本账的档位不再画成 peer 的「影子模�
   const after = a.futuresWindow()
   assert.equal(after.session.kind, 'trading', '房主暂停自己不该把邻居的市场关掉')
   assert.equal(after.canTrade, true)
+})
+
+test('1.12.6：房主把 peer 的档位弄丢了，本机窗口照旧是真钱，下一拍再申报回去', async (t) => {
+  const { a, b, aId } = await connectedPair(t)
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+  await callAction(a, { action: 'futures-account-mode', accountMode: 'live' })
+  await waitFor(() => b.futuresAccountOf(aId).accountMode === 'live')
+
+  // 房主重启（或者它是老版本、根本不认识这条报文）：它那本账退回缺省纸面。
+  // 1.12.6 之前，peer 窗口显示的是房主副本 —— 用户会看到「还是纸面」，再点一下又切回去。
+  // 房主那边的「丢了」只存在一个 tick（本机马上会再申报），所以这里断言的是**结果**：
+  // ① 本机窗口显示的是自己选的 live；② 没人再点一次，房主也自己收敛回 live。
+  await b.futuresStore().setRemoteAccountMode(aId, 'shadow', Date.now())
+
+  assert.equal(a.futures().accountMode, 'live', '档位是自己选的，房主丢了也不该改本机')
+  assert.equal(a.futuresWindow().accountMode, 'live', '窗口不能跟着房主副本说「你是纸面」')
+
+  await waitFor(() => b.futuresAccountOf(aId).accountMode === 'live')
 })
 
 test('票 94：房主替 peer 充值 + 开仓，peer 窗口的余额/持仓与房主账本一致', async (t) => {
