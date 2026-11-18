@@ -87,6 +87,8 @@ import { isDeviceId, FUTURES_MAX_POSITIONS, FUTURES_MAX_ORDERS } from './protoco
 import {
   DAY_MS,
   DAILY_NOTIONAL_CAP,
+  DAILY_NOTIONAL_MULTIPLE,
+  dailyNotionalCapFor,
   DELIVERY_FEE_RATE,
   FUTURES_ACCOUNT_MODES,
   FUTURES_DEFAULT_ACCOUNT_MODE,
@@ -133,6 +135,8 @@ export const FUTURES_VIEW_TRADES = 20
 // 票 98：灰度模式与敞口限额都由规则层定义，账本层与协议层共用同一份，避免三处各写一套。
 export {
   DAILY_NOTIONAL_CAP,
+  DAILY_NOTIONAL_MULTIPLE,
+  dailyNotionalCapFor,
   FUTURES_ACCOUNT_MODES,
   FUTURES_DEFAULT_ACCOUNT_MODE,
   FUTURES_DEFAULT_MODE,
@@ -779,6 +783,12 @@ export function normalizeFuturesFile (value) {
   if (typeof paused !== 'boolean') repaired += 1
   else state.paused = paused
 
+  // 1.12.2：账户档位落盘了就以盘上为准；老存档没有这个字段，留 null 走 `mode` 反推。
+  if (value.accountMode !== undefined && value.accountMode !== null) {
+    if (isFuturesAccountMode(value.accountMode)) state.accountMode = value.accountMode
+    else repaired += 1
+  }
+
   const farmAnchor = value.farmAnchor === undefined ? 0 : nonNegativeCoin(value.farmAnchor)
   const farmIn = value.farmIn === undefined ? 0 : nonNegativeCoin(value.farmIn)
   const farmOut = value.farmOut === undefined ? 0 : nonNegativeCoin(value.farmOut)
@@ -845,6 +855,9 @@ function toFileState (state) {
     pending: roundCoin(state.pending),
     disabled: state.disabled,
     paused: state.paused === true,
+    // 1.12.2：档位要落盘。以前只靠 `mode` 反推，一按暂停（mode 变 off）就退回「纸面」，
+    // 重启后更是直接丢——充值、提现、结算都会按错档位走。
+    accountMode: isFuturesAccountMode(state.accountMode) ? state.accountMode : null,
     farmAnchor: roundCoin(state.farmAnchor),
     farmIn: roundCoin(state.farmIn),
     farmOut: roundCoin(state.farmOut),
@@ -867,7 +880,11 @@ function remoteFileState (remotes) {
       updatedAt: account.updatedAt,
       pending: roundCoin(account.pending ?? 0),
       dayStart: account.dayStart ?? 0,
-      dayNotional: roundCoin(account.dayNotional ?? 0)
+      dayNotional: roundCoin(account.dayNotional ?? 0),
+      // 1.12.2：这三样以前都没落盘，房主一重启，邻居就自动变回「纸面、没暂停、没退出」。
+      accountMode: isFuturesAccountMode(account.accountMode) ? account.accountMode : null,
+      paused: account.paused === true,
+      disabled: account.disabled === true
     }
   }
   return out
@@ -1004,6 +1021,19 @@ class FuturesStore {
     return this.#accountModeOf(this.#state)
   }
 
+  /** 账户权益：余额 + 已占保证金（不含浮盈——浮盈每 15 秒变，额度不该跟着抖）。 */
+  #equityOf (account) {
+    const target = account ?? this.#state
+    const balance = Number.isFinite(target?.balance) ? target.balance : 0
+    const used = Number.isFinite(target?.marginUsed) ? target.marginUsed : 0
+    return roundCoin(balance + used)
+  }
+
+  /** 1.12.2：今天的日额上限——地板 5,000，权益多的人按 5 × 权益放大。 */
+  #dayCapOf (account) {
+    return dailyNotionalCapFor(this.#equityOf(account))
+  }
+
   #disabled (account = this.#state) {
     return account?.disabled === true
   }
@@ -1069,7 +1099,7 @@ class FuturesStore {
     if (amount === null || amount <= 0) return null
     const owner = account ?? this.#state
     this.#rollDayFor(owner, stamp)
-    const cap = DAILY_NOTIONAL_CAP
+    const cap = this.#dayCapOf(owner)
     const usedDay = roundCoin(owner.dayNotional)
     if (owner.dayNotional + amount >= cap) {
       // 说清楚「还剩多少」：光一句「已到上限」看不出差多少，窗口也没法提示下一单该缩到多小。
@@ -1139,7 +1169,7 @@ class FuturesStore {
       mode: this.modeOf(),
       accountMode: this.accountMode(),
       dayNotional: roundCoin(this.#state.dayNotional),
-      dayCap: DAILY_NOTIONAL_CAP,
+      dayCap: this.#dayCapOf(this.#state),
       positionCap: POSITION_NOTIONAL_CAP,
       pending: roundCoin(this.#state.pending),
       disabled: this.#state.disabled,
@@ -1178,7 +1208,9 @@ class FuturesStore {
       return { ok: false, error: 'disabled', notice: FUTURES_ERROR_TEXT.disabled }
     }
     this.#state.paused = rawPaused
-    this.#state.mode = rawPaused ? 'off' : 'live'
+    // 1.12.2：`mode` 只是市场闸门的投影；暂停/继续都不该把账户自己的档位抹成纸面。
+    if (rawPaused) this.#state.mode = 'off'
+    else if (this.#state.mode === 'off') this.#state.mode = this.accountMode() === 'live' ? 'live' : 'shadow'
     this.#state.tradedAt = stamp
     this.#recordTrade({ at: stamp, kind: 'mode', note: rawPaused ? 'off' : 'live', lots: 0, price: 0, fee: 0 })
     this.#state.modeSeq += 1
@@ -1239,12 +1271,14 @@ class FuturesStore {
     }
     const result = await this.setPaused(rawMode === 'off', at)
     if (result.ok !== true) return result
-    if (rawMode !== 'off') {
-      this.#state.mode = rawMode
-      const persisted = await this.#persist()
-      return { ...result, action: 'futures-mode', mode: rawMode, persisted }
-    }
-    return { ...result, action: 'futures-mode' }
+    if (rawMode === 'off') return { ...result, action: 'futures-mode' }
+    // 1.12.2：老入口 `futures-mode` 以前是「市场档位」，现在等价于「把这个账户自己设成那个档位」。
+    // 只改 `mode` 不改 `accountMode` 的话，账户档位仍然是纸面，充值也就仍然不碰农场。
+    const applied = await this.setAccountMode(rawMode === 'live' ? 'live' : 'shadow', at)
+    if (applied.ok !== true) return applied
+    this.#state.mode = rawMode
+    const persisted = await this.#persist()
+    return { ...result, action: 'futures-mode', mode: rawMode, accountMode: this.accountMode(), persisted }
   }
 
   /**

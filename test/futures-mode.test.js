@@ -24,6 +24,7 @@ import { createFuturesStore } from '../src/futures.js'
 import {
   SLOT_MS,
   contractOf,
+  dailyNotionalCapFor,
   fillPriceOf,
   lotsFor,
   notionalOf
@@ -203,33 +204,56 @@ test('票 98：影子对账 diff 恒为 0；切 live 充提一笔后仍为 0', a
   assert.equal(live.diff, 0)
 })
 
-test('票 98：日额 4,999 通过、5,000 拒', async (t) => {
+test('1.12.2：日额地板 5,000，权益大了按 5 倍放大', async (t) => {
+  assert.equal(dailyNotionalCapFor(0), 5_000)
+  assert.equal(dailyNotionalCapFor(999), 5_000, '小账户仍是地板')
+  assert.equal(dailyNotionalCapFor(2_000), 10_000)
+  assert.equal(dailyNotionalCapFor(20_000), 100_000)
+
   const { store } = await makeStore(t, { coins: 20_000, mode: 'live' })
   await store.deposit(20_000)
-  const first = await store.open({ crop: CROP, side: 'long', margin: 4999, leverage: 1, at: NOW })
-  assert.equal(first.ok, true, JSON.stringify(first))
-  assert.equal(store.snapshot().dayNotional, 4999)
-  assert.equal(store.snapshot().dayCap, 5000)
+  assert.equal(store.snapshot().dayCap, 100_000, '权益 20,000 的账户日额是 100,000')
+})
 
-  const second = await store.open({ crop: CROP, side: 'long', margin: 1, leverage: 1, at: NOW })
+test('1.12.2：日额用满了就拒，拒单不累计', async (t) => {
+  const { store } = await makeStore(t, { coins: 1_000, mode: 'live' })
+  await store.deposit(1_000)
+  const first = await store.open({ crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(first.ok, true, JSON.stringify(first))
+  const used = store.snapshot().dayNotional
+  assert.ok(used > 4_000 && used < 5_000, `第一笔应吃掉大半地板的日额，实际 ${used}`)
+
+  const second = await store.open({ crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
   assert.equal(second.ok, false)
   assert.equal(second.error, 'daily-cap')
   assert.match(second.notice, /^今日交易额已到上限：/)
-  assert.equal(store.snapshot().dayNotional, 4999, '拒单不累计日额')
+  assert.equal(store.snapshot().dayNotional, used, '拒单不累计日额')
 })
 
-test('票 98：日额按账户各算各的，不会互相吃掉额度', async (t) => {
+test('1.12.2：日额按账户各算各的，小额账户到顶不影响大额账户', async (t) => {
   const { store } = await makeStore(t, { mode: 'live' })
   const other = '22222222-2222-4222-8222-222222222222'
-  await store.hostDeposit(PEER, 6000, NOW)
-  await store.hostDeposit(other, 6000, NOW)
-  const first = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 4000, leverage: 1, at: NOW })
-  assert.equal(first.ok, true, JSON.stringify(first))
-  const second = await store.hostOpen(other, { crop: CROP, side: 'long', margin: 4000, leverage: 1, at: NOW })
-  assert.equal(second.ok, true, '另一个账户的日额应独立')
-  const third = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 1000, leverage: 1, at: NOW })
-  assert.equal(third.ok, false)
-  assert.equal(third.error, 'daily-cap')
+  await store.hostDeposit(PEER, 1_000, NOW)
+  await store.hostDeposit(other, 100_000, NOW)
+  const small = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(small.ok, true, JSON.stringify(small))
+  const smallAgain = await store.hostOpen(PEER, { crop: CROP, side: 'long', margin: 240, leverage: 20, at: NOW })
+  assert.equal(smallAgain.error, 'daily-cap')
+  const big = await store.hostOpen(other, { crop: CROP, side: 'long', margin: 19_000, leverage: 1, at: NOW })
+  assert.equal(big.ok, true, '大额账户的日额是 500,000，不该被小额账户的 5,000 卡住')
+})
+
+test('1.12.2：档位与暂停都落盘，重启后不会被 mode 反推成纸面', async (t) => {
+  const { dir, farm, store } = await makeStore(t, { coins: 5_000, mode: 'live' })
+  await store.setAccountMode('live')
+  await store.setPaused(true, NOW)
+  assert.equal(store.accountMode(), 'live', '暂停不改自己选的档位')
+
+  const again = await reloadStore(t, dir, farm)
+  assert.equal(again.accountMode(), 'live', '重启后仍记得自己选了真钱')
+  assert.equal(again.snapshot().paused, true)
+  await again.setPaused(false, NOW)
+  assert.equal(again.snapshot().mode, 'live', '继续交易之后市场档位也跟着账户档位回来')
 })
 
 test('票 98：持仓名义 19,999 通过、20,000 拒', async (t) => {

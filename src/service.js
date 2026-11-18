@@ -1469,8 +1469,11 @@ export function createService (ctx, options = {}) {
     // 一概不动。房主这一下也不再是「关市」——停不了别人的市，这是分权之后唯一说得通的语义。
     if (action === 'futures-pause' || action === 'futures-mode') {
       if (futures === null) return { ok: false, error: 'starting' }
-      const wanted = action === 'futures-mode' ? body?.mode === 'off' : body?.paused === true
-      const local = await futures.setPaused(wanted, futuresClock())
+      // `futures-mode` 是 1.12.0 之前的老入口：现在它等价于「把这个账户自己设成那个档位」，
+      // 所以要连 `accountMode` 一起改，只翻 `paused` 会留下一个「暂停回来又变纸面」的坑。
+      const local = action === 'futures-mode'
+        ? await futures.setMode(body?.mode, futuresClock())
+        : await futures.setPaused(body?.paused === true, futuresClock())
       if (local?.ok !== true) return local
       if (isFuturesHost()) {
         refreshFuturesWindow()

@@ -11,6 +11,16 @@
 （`gh release edit --notes-file`），所以改文案只要改 `docs/releases/<version>.md`
 再移动 tag 即可。**先写好这一篇再打 tag，能省一次来回。**
 
+## 1.12.2 版本记录
+
+GitHub Release 正文就是 [`releases/1.12.2.md`](releases/1.12.2.md)。
+
+日额跟权益走：上限从死数 5,000 改成 `max(5,000, 5 × 权益)`（权益 = 余额 + 已占保证金），
+`snapshot().dayCap` 与窗口的限额行都按账户实时算。顺带修两个落盘 bug：`accountMode`
+以前不落盘（一按暂停 `mode` 变 `off`，重启后就被反推成纸面，充值/提现会按错档位走），
+远端账户的 `accountMode`/`paused`/`disabled` 也不落盘（房主重启后邻居自动「复活」）；
+老入口 `futures-mode{mode}` 现在等价于「把这个账户自己设成那个档位」，不再只翻闸门。
+
 ## 1.12.1 版本记录
 
 GitHub Release 正文就是 [`releases/1.12.1.md`](releases/1.12.1.md)。
