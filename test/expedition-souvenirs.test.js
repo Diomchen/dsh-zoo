@@ -23,7 +23,8 @@ import {
   SOUVENIRS_BY_ROUTE,
   SOUVENIR_IDS,
   startRun,
-  stepRun
+  stepRun,
+  wipedOut
 } from '../src/expedition.js'
 
 const T0 = 1_700_000_000_000
@@ -33,6 +34,22 @@ const RARITY_COUNTS = {
   mine: { common: 4, rare: 3, precious: 1, legendary: 0 },
   railway: { common: 3, rare: 4, precious: 1, legendary: 0 },
   mistridge: { common: 2, rare: 4, precious: 0, legendary: 2 }
+}
+
+/** 挑一个后山全程不翻车的 runId，让「每段都掉」的用例不受 113 的危险骰干扰。 */
+function cleanBackhillRunId (prefix) {
+  for (let index = 0; index < 10000; index += 1) {
+    const id = prefix + '-' + index
+    let clean = true
+    for (let leg = 1; leg <= 4; leg += 1) {
+      if (wipedOut({ id, routeId: 'backhill' }, leg)) {
+        clean = false
+        break
+      }
+    }
+    if (clean) return id
+  }
+  throw new Error('找不到不翻车的 runId：' + prefix)
 }
 
 test('32 件特产按四条路线各 8 件，稀有度与手册战利品表一致', () => {
@@ -119,7 +136,8 @@ test('权重分布：普通:稀有:珍稀:传说 ≈ 30:12:4:1（大样本，容
 })
 
 test('每段同时掉硬币与特产；一趟之内特产不重复，结算 items 就是它们', () => {
-  for (const runId of ['trip-a', 'trip-b', 'trip-c', 'trip-d']) {
+  for (const prefix of ['trip-a', 'trip-b', 'trip-c', 'trip-d']) {
+    const runId = cleanBackhillRunId(prefix)
     let run = startRun({ routeId: 'backhill', runId, now: T0 })
     const seen = []
     for (let guard = 0; run.ended === null && guard < 10; guard += 1) {
@@ -212,4 +230,38 @@ test('翻车只丢一半特产：硬币原样保留、结果确定、不修改�
   assert.deepEqual(kept, halveSouvenirs(loot, 'run-failed'), '同一趟重放结果一致')
   assert.deepEqual(halveSouvenirs([], 'x'), [])
   assert.deepEqual(halveSouvenirs([{ kind: 'coin', qty: 3 }], 'x'), [{ kind: 'coin', qty: 3 }])
+})
+
+test('113 的翻车分支接上减半：同一趟只留一半特产，硬币与盘缠规则不变', () => {
+  const loot = [
+    { kind: 'coin', qty: 15 },
+    { kind: 'souvenir', id: 'herb' },
+    { kind: 'souvenir', id: 'shard' },
+    { kind: 'coin', qty: 17 },
+    { kind: 'souvenir', id: 'egg' },
+    { kind: 'souvenir', id: 'hawthorn' }
+  ]
+  const before = JSON.parse(JSON.stringify(loot))
+  let wiped = null
+  for (let index = 0; index < 4000 && wiped === null; index += 1) {
+    const candidate = {
+      id: 'wipeout-halve-' + index,
+      routeId: 'backhill',
+      phase: 'deciding',
+      leg: 2,
+      totalLegs: 4,
+      until: T0,
+      loot
+    }
+    const next = stepRun(candidate, T0 + 1000)
+    if (next !== null && next.ended === 'failed') wiped = next
+  }
+  assert.ok(wiped !== null, '应该能找到一个翻车的 runId')
+  assert.equal(wiped.reason, 'wipeout')
+  assert.equal(wiped.loot.filter((item) => item.kind === 'coin').length, 2, '硬币照给')
+  assert.equal(wiped.loot.filter((item) => item.kind === 'souvenir').length, 2, '4 件特产只留 2 件')
+  assert.deepEqual(loot, before, '规则层不能改调用方的 run.loot')
+  assert.equal(settledOf(wiped).items.length, 2, '结算只报留下的特产')
+  assert.equal(settledOf(wiped).coins, 32)
+  assert.equal(settledOf(wiped).fare, 500)
 })

@@ -472,6 +472,8 @@ export function createService (ctx, options = {}) {
     return Number.isFinite(stamp) ? stamp : Date.now()
   }
   const expeditionTickMs = positiveOption(options.expeditionTickMs, 1000, 10)
+  // 测试缝：`expeditionRunId` 让 e2e 用确定的 runId 复现同一趟（翻车/平安都由它派生）。
+  const expeditionRunId = typeof options.expeditionRunId === 'function' ? options.expeditionRunId : null
   // 盘口周报（票 82）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值
   // （与行情 gossip 同款），测试注入更小的值把「等 30 秒」变成几十毫秒。
   const tradingDigestMs = positiveOption(options.tradingDigestMs, TRADING_DIGEST_INTERVAL_MS, 10)
@@ -3300,6 +3302,9 @@ export function createService (ctx, options = {}) {
     const result = await expedition.step(expeditionClock())
     if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
     refreshExpeditionWindow()
+    if (result.settled?.ended === 'failed') {
+      return { ...result, notice: `翻车了：这趟只走到第 ${result.settled.legs} 段，捡到的 ${result.settled.coins} 枚硬币照给，盘缠不退。` }
+    }
     return result
   }
 
@@ -5560,7 +5565,12 @@ export function createService (ctx, options = {}) {
       // 坏文件只让这一趟不能出门，农场/串门/盘口照常；`expeditionNow` 只给测试注入。
       if (farm !== null) {
         try {
-          expedition = await createExpeditionStore(dir, { log, farm, now: expeditionClock })
+          expedition = await createExpeditionStore(dir, {
+            log,
+            farm,
+            now: expeditionClock,
+            ...(expeditionRunId === null ? {} : { newRunId: expeditionRunId })
+          })
         } catch (error) {
           expedition = null
           warn(ctx, '出远门存档初始化失败，本次不能出门：' + message(error))

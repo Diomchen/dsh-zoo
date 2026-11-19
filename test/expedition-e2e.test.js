@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { legCoins, rollSouvenir, routeOf, sumCoins } from '../src/expedition.js'
+import { legCoins, legsFor, rollSouvenir, routeOf, sumCoins, wipedOut } from '../src/expedition.js'
 import { EXPEDITION_FILE } from '../src/expedition-store.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
@@ -102,13 +102,32 @@ async function readExpedition (dir) {
   return JSON.parse(await readFile(join(dir, EXPEDITION_FILE), 'utf8'))
 }
 
+/**
+ * 挑一个「一路平安」/「某段必翻」的 runId：113 起每段都掷翻车，
+ * 事件型的 e2e 不能被骰子搅红。走的是规则层的公共函数，不抄公式。
+ */
+function pickRunId (predicate) {
+  for (let i = 0; i < 2000; i += 1) {
+    const id = 'e2e-' + i
+    if (predicate(id)) return id
+  }
+  throw new Error('没有找到合适的 runId')
+}
+
+function cleanThrough (legs) {
+  return (id) => legsFor(routeOf('backhill'), id) >= legs &&
+    Array.from({ length: legs - 1 }, (_, k) => k + 2)
+      .every((leg) => !wipedOut({ id, routeId: 'backhill' }, leg))
+}
+
 test('e2e：出发扣 500 → 走一段 → 继续 → 见好就收，硬币与存档对得上', async (t) => {
   const dir = await tempDir(t)
   await seedFarm(dir, 500)
   const clock = { value: T0 }
   const service = makeService(t, dir, {
     farmNow: () => clock.value,
-    expeditionNow: () => clock.value
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => pickRunId(cleanThrough(2))
   })
   await service.ready
 
@@ -186,7 +205,8 @@ test('e2e：走满最后一段自动回家，ended=complete', async (t) => {
   const clock = { value: T0 }
   const service = makeService(t, dir, {
     farmNow: () => clock.value,
-    expeditionNow: () => clock.value
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => pickRunId(cleanThrough(4))
   })
   await service.ready
 
@@ -249,23 +269,25 @@ test('e2e：关掉再开，未完成的那趟能继续（113 才要求只推进�
   const dir = await tempDir(t)
   await seedFarm(dir, 500)
   const clock = { value: T0 }
+  const runId = pickRunId(cleanThrough(2))
   const first = makeService(t, dir, {
     farmNow: () => clock.value,
-    expeditionNow: () => clock.value
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => runId
   })
   await first.ready
   const started = await action(first, { action: 'expedition-start', routeId: 'backhill' })
   await first.expeditionStore().tick(T0 + 20000)
-  const runId = started.body.run.id
   first.dispose()
 
   const second = makeService(t, dir, {
     farmNow: () => clock.value,
-    expeditionNow: () => clock.value
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => runId
   })
   await second.ready
   const resumed = await state(second)
-  assert.equal(resumed.body.expedition.run.id, runId)
+  assert.equal(resumed.body.expedition.run.id, started.body.run.id)
   assert.equal(resumed.body.expedition.run.phase, 'deciding')
   const stepped = await action(second, { action: 'expedition-step' })
   assert.equal(stepped.body.ok, true)
@@ -320,4 +342,154 @@ test('e2e：结算的硬币总数就是 loot 之和', async (t) => {
   await service.expeditionStore().tick(run.until)
   const snap = service.expeditionStore().snapshot().run
   assert.equal(sumCoins(snap.loot), legCoins(routeOf('backhill'), started.body.run.id, 1))
+})
+
+test('e2e：继续走翻车 → ended=failed，硬币照给、盘缠不退，窗口能看见', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: T0 }
+  const runId = pickRunId((id) => wipedOut({ id, routeId: 'backhill' }, 2))
+  const service = makeService(t, dir, {
+    farmNow: () => clock.value,
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => runId
+  })
+  await service.ready
+
+  const started = await action(service, { action: 'expedition-start', routeId: 'backhill' })
+  assert.equal(started.body.run.id, runId, '测试注入的 runId 就是这一趟的 id')
+  assert.equal(await service.expeditionStore().tick(T0 + 20000), true)
+  const firstCoin = legCoins(routeOf('backhill'), runId, 1)
+  assert.equal((await state(service)).body.farm.coins, firstCoin)
+
+  clock.value = T0 + 25000
+  const stepped = await action(service, { action: 'expedition-step' })
+  assert.equal(stepped.body.ok, true)
+  assert.equal(stepped.body.run.ended, 'failed')
+  assert.equal(stepped.body.run.reason, 'wipeout')
+  assert.equal(stepped.body.run.phase, null)
+  assert.equal(stepped.body.run.leg, 1)
+  assert.equal(stepped.body.settled.ended, 'failed')
+  assert.equal(stepped.body.settled.coins, firstCoin, '已捡的硬币照给')
+  assert.equal(stepped.body.settled.fare, 500, '盘缠不退')
+  assert.match(stepped.body.notice, /翻车/)
+
+  const after = await state(service)
+  assert.equal(after.body.farm.coins, firstCoin, '翻车不再补钱、也不退盘缠')
+  assert.equal(after.body.expedition.run.ended, 'failed')
+  assert.equal(after.body.expedition.away, null, '翻车后宠物在家')
+
+  // 已经结束的趟不能再操作。
+  assert.equal((await action(service, { action: 'expedition-step' })).body.error, 'not-walking')
+  assert.equal((await action(service, { action: 'expedition-back' })).body.error, 'not-walking')
+
+  const saved = await readExpedition(dir)
+  assert.equal(saved.run.ended, 'failed')
+  assert.equal(saved.run.reason, 'wipeout')
+  assert.equal(saved.run.loot.length, 2, '硬币 + 一件特产')
+})
+
+test('e2e：决策窗 20 秒没人管 → 自动折返 ended=back、reason=timeout', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: T0 }
+  const runId = pickRunId(cleanThrough(2))
+  const service = makeService(t, dir, {
+    farmNow: () => clock.value,
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => runId
+  })
+  await service.ready
+  await action(service, { action: 'expedition-start', routeId: 'backhill' })
+  assert.equal(await service.expeditionStore().tick(T0 + 20000), true)
+  const firstCoin = legCoins(routeOf('backhill'), runId, 1)
+
+  clock.value = T0 + 40000
+  assert.equal(await service.expeditionStore().tick(clock.value), true)
+  const after = await state(service)
+  assert.equal(after.body.expedition.run.ended, 'back')
+  assert.equal(after.body.expedition.run.reason, 'timeout')
+  assert.equal(after.body.expedition.run.phase, null)
+  assert.equal(after.body.expedition.run.leg, 1)
+  assert.equal(after.body.expedition.away, null)
+  assert.equal(after.body.farm.coins, firstCoin, '超时折返不回币、也不退盘缠')
+
+  const saved = await readExpedition(dir)
+  assert.equal(saved.run.ended, 'back')
+  assert.equal(saved.run.reason, 'timeout', '116 的日志靠这个字段')
+})
+
+test('e2e：离线很久再开 → 只推进一个节点，用读档时刻算窗口', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 500)
+  const clock = { value: T0 }
+  const runId = pickRunId(cleanThrough(2))
+  const options = {
+    farmNow: () => clock.value,
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => runId
+  }
+  const first = makeService(t, dir, options)
+  await first.ready
+  const started = await action(first, { action: 'expedition-start', routeId: 'backhill' })
+  assert.equal(started.body.run.phase, 'walking')
+  first.dispose()
+
+  // 离线 10 分钟：只走完第 1 段，不补算「本来能走 30 段」。
+  clock.value = T0 + 600000
+  const second = makeService(t, dir, options)
+  await second.ready
+  const resumed = await state(second)
+  assert.equal(resumed.body.expedition.run.id, started.body.run.id)
+  assert.equal(resumed.body.expedition.run.leg, 1)
+  assert.equal(resumed.body.expedition.run.phase, 'deciding')
+  assert.equal(resumed.body.expedition.run.loot.length, 2, '硬币 + 一件特产')
+  assert.equal(resumed.body.expedition.codexView.owned, 1, '读档补走的那段也要记进图鉴')
+  assert.equal(resumed.body.expedition.run.until, clock.value + 20000)
+  assert.equal(resumed.body.farm.coins, legCoins(routeOf('backhill'), runId, 1), '回币只记一次')
+  second.dispose()
+
+  // 再离线 10 分钟：决策窗早过了，回家（timeout），不会补掷翻车。
+  clock.value = T0 + 1200000
+  const third = makeService(t, dir, options)
+  await third.ready
+  const home = await state(third)
+  assert.equal(home.body.expedition.run.ended, 'back')
+  assert.equal(home.body.expedition.run.reason, 'timeout')
+  assert.equal(home.body.expedition.run.leg, 1)
+  assert.equal(home.body.farm.coins, legCoins(routeOf('backhill'), runId, 1))
+})
+
+test('e2e：同一个 runId 在两份存档里重放出同一趟（掉落/结局逐段一致）', async (t) => {
+  async function trip (dir) {
+    await seedFarm(dir, 500)
+    const clock = { value: T0 }
+    const service = makeService(t, dir, {
+      farmNow: () => clock.value,
+      expeditionNow: () => clock.value,
+      expeditionRunId: () => 'replay-fixed'
+    })
+    await service.ready
+    const store = service.expeditionStore()
+    await action(service, { action: 'expedition-start', routeId: 'backhill' })
+    for (let guard = 0; guard < 10; guard += 1) {
+      const snap = store.snapshot().run
+      if (snap.ended !== null) break
+      clock.value = snap.until
+      if (snap.phase === 'walking') await store.tick(clock.value)
+      else await action(service, { action: 'expedition-step' })
+    }
+    const run = store.snapshot().run
+    return {
+      ended: run.ended,
+      reason: run.reason,
+      leg: run.leg,
+      loot: run.loot,
+      coins: (await state(service)).body.farm.coins
+    }
+  }
+  const one = await trip(await tempDir(t))
+  const two = await trip(await tempDir(t))
+  assert.deepEqual(one, two)
+  assert.ok(one.loot.length >= 1)
 })

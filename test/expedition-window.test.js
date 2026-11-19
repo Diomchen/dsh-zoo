@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { codexView } from '../src/expedition.js'
+import { codexView, legsFor, routeOf, wipedOut } from '../src/expedition.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
 
@@ -298,7 +298,7 @@ function desktopDouble () {
   }
 }
 
-async function makeService (t, dir, desktop, clock) {
+async function makeService (t, dir, desktop, clock, runId = null) {
   const { ctx, routes } = fakeCtx()
   await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 620 }), 'utf8')
   const service = createService(ctx, {
@@ -309,12 +309,33 @@ async function makeService (t, dir, desktop, clock) {
     skinServer: false,
     desktopFactory: desktop.factory,
     farmNow: () => clock.value,
-    expeditionNow: () => clock.value
+    expeditionNow: () => clock.value,
+    // 113 起每段都会掷翻车：窗口测试固定一个一路平安的 runId。
+    expeditionRunId: () => runId ?? cleanRunId()
   })
   service.routes = routes
   t.after(() => service.dispose())
   await service.ready
   return service
+}
+
+/** 走 4 段都不翻车的 runId（规则层公共函数探，不抄掷骰公式）。 */
+function cleanRunId () {
+  for (let i = 0; i < 2000; i += 1) {
+    const id = 'window-' + i
+    if (legsFor(routeOf('backhill'), id) < 4) continue
+    if (![2, 3, 4].some((leg) => wipedOut({ id, routeId: 'backhill' }, leg))) return id
+  }
+  throw new Error('没有找到一路平安的 runId')
+}
+
+/** 第 2 段必翻车的 runId。 */
+function doomedRunId () {
+  for (let i = 0; i < 2000; i += 1) {
+    const id = 'window-doomed-' + i
+    if (wipedOut({ id, routeId: 'backhill' }, 2)) return id
+  }
+  throw new Error('没有找到会翻车的 runId')
 }
 
 test('宿主：开窗下发整份视图；再点一次关窗；× 之后能重开', async (t) => {
@@ -402,6 +423,59 @@ test('宿主：见好就收只结算已走段数，盘缠不退', async (t) => {
   assert.equal(settled.run.coins, undefined)
   // 盘缠 500 不退；回币等于这一段捡到的那一笔。
   assert.equal(settled.coins, 120 + back.body.settled.coins)
+})
+
+test('宿主：翻车后窗口收到 ended=failed + reason=wipeout，硬币照给', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock, doomedRunId())
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  const started = await callAction(service, { action: 'expedition-start', routeId: 'backhill' })
+  const firstCoin = started.body.run.loot.length === 0 ? null : started.body.run.loot[0].qty
+
+  clock.value = T0 + 20_001
+  await callAction(service, { action: 'expedition-refresh' })
+  const deciding = desktop.calls.expedition.at(-1).state
+  assert.equal(deciding.run.phase, 'deciding')
+  const coin = deciding.run.loot[0].qty
+  assert.equal(deciding.coins, 120 + coin, '第 1 段的钱到点就进农场')
+  assert.equal(firstCoin, null, '出发时还没有战利品')
+
+  const stepped = await callAction(service, { action: 'expedition-step' })
+  assert.equal(stepped.body.ok, true)
+  assert.equal(stepped.body.run.ended, 'failed')
+  const wiped = desktop.calls.expedition.at(-1).state
+  assert.equal(wiped.run.ended, 'failed')
+  assert.equal(wiped.run.reason, 'wipeout')
+  assert.equal(wiped.run.phase, null)
+  assert.equal(wiped.run.leg, 1, '翻车不推进段数')
+  assert.equal(wiped.away, null, '宠物已经回家')
+  assert.equal(wiped.coins, 120 + coin, '硬币照给、盘缠不退')
+})
+
+test('宿主：决策窗超时后刷新，窗口收到 ended=back + reason=timeout', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  await callAction(service, { action: 'expedition-start', routeId: 'backhill' })
+
+  clock.value = T0 + 20_001
+  await callAction(service, { action: 'expedition-refresh' })
+  assert.equal(desktop.calls.expedition.at(-1).state.run.phase, 'deciding')
+
+  clock.value = T0 + 40_001
+  const refreshed = await callAction(service, { action: 'expedition-refresh' })
+  assert.equal(refreshed.body.ok, true)
+  const timedOut = desktop.calls.expedition.at(-1).state
+  assert.equal(timedOut.run.ended, 'back')
+  assert.equal(timedOut.run.reason, 'timeout')
+  assert.equal(timedOut.run.phase, null)
+  assert.equal(timedOut.away, null)
 })
 
 test('宿主：没有桌面层是 desktop-off，不写任何窗口命令', async (t) => {
