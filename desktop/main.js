@@ -236,6 +236,8 @@ let futuresPositionTimer = null
 let expeditionWin = null
 /** 宿主交下来的整份出远门视图（阶段/已走段数/回币/路线），打开或刷新时原样转发。 */
 let expeditionState = null
+/** 票 120：这次开窗要落在哪个页签（只有 'shelf' 一种，发一次就清掉）。 */
+let expeditionTab = null
 /** 正在等宿主答复的那次出远门动作（action id）与它的计时器。 */
 let expeditionPending = null
 let expeditionTimer = null
@@ -2996,7 +2998,12 @@ function clearExpeditionTimer () {
 function sendExpeditionState () {
   if (expeditionWin === null || expeditionWin.isDestroyed()) return
   try {
-    expeditionWin.webContents.send('dsh-zoo:expedition-state', expeditionState)
+    // 票 120：`tab` 只随开窗那一次命令下发，送到就清掉，之后刷新仍停在玩家自己选的页签。
+    expeditionWin.webContents.send('dsh-zoo:expedition-state', {
+      ...(expeditionState === null ? {} : expeditionState),
+      ...(expeditionTab === 'shelf' ? { tab: 'shelf' } : {})
+    })
+    expeditionTab = null
   } catch {
     // 页面还没挂上：ready 会再来一次
   }
@@ -3348,6 +3355,8 @@ function applyCommand (command) {
         return
       }
       expeditionState = command.state ?? null
+      // 票 120：陈列架入口带来的落点，等 did-finish-load 或 flush 时随 state 一起发。
+      if (command.tab === 'shelf') expeditionTab = 'shelf'
       if (command.open === true) {
         if (!openExpeditionWindow()) {
           writeEvent({ type: 'error', id: command.id, code: 'expedition-window-failed', message: 'cannot open expedition window' })

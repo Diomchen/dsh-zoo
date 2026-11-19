@@ -16,6 +16,7 @@ import {
   plotStage,
   visitLimitsFor
 } from './farm-rules.js'
+import { SHELF_BASE_SLOTS, SOUVENIRS, SOUVENIR_IDS } from './expedition.js'
 
 export const FARM_OPEN_VERSION = 1
 
@@ -29,6 +30,8 @@ export const FARM_OPEN_VERSION = 1
  * @param {{ownerHome: boolean, worker: boolean}} input.guardParts
  * @param {number} input.usedByViewer 这位今天在这个农场已经偷过几次
  * @param {string[]} input.caps 主人的能力声明
+ * @param {object|null} input.expedition 主人的出远门状态（`expedition-store` 的 snapshot 形状）
+ * @param {boolean} input.expeditionLogBodies 串门视图才给 true：日志多带正文
  * @param {number} input.now
  */
 export function openFarmView ({
@@ -40,6 +43,8 @@ export function openFarmView ({
   guardParts,
   usedByViewer,
   caps,
+  expedition = null,
+  expeditionLogBodies = false,
   now = Date.now()
 } = {}) {
   const viewer = typeof viewerDeviceId === 'string' ? viewerDeviceId.toLowerCase() : null
@@ -73,7 +78,50 @@ export function openFarmView ({
       perTripLeft: Math.max(0, perTrip - used)
     },
     caps: Array.isArray(caps) ? caps.filter((entry) => typeof entry === 'string') : [],
+    expedition: openExpeditionView(expedition, { withLogBodies: expeditionLogBodies === true }),
     at: Number.isFinite(now) ? Math.floor(now) : 0
+  }
+}
+
+/**
+ * 票 120：出远门的公开块。只答三件事——图鉴到哪、陈列架前 8 格摆了谁、最近三篇日志的标题。
+ * 日志正文是串门才有的东西，这里默认一个字都不给；未开的格用 null 占位，不暴露格后内容。
+ */
+export function openExpeditionView (raw, { withLogBodies = false } = {}) {
+  const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : null
+  const shelf = new Array(SHELF_BASE_SLOTS).fill(null)
+  const slots = Number.isInteger(source?.shelf?.slots) ? source.shelf.slots : 0
+  const items = Array.isArray(source?.shelf?.items) ? source.shelf.items : []
+  const seen = new Set()
+  for (let index = 0; index < Math.min(SHELF_BASE_SLOTS, slots, items.length); index += 1) {
+    const id = typeof items[index] === 'string' ? items[index] : null
+    if (id === null || seen.has(id)) continue
+    const souvenir = SOUVENIRS[id]
+    if (souvenir === undefined) continue
+    seen.add(id)
+    shelf[index] = { id: souvenir.id, name: souvenir.name, emoji: souvenir.emoji }
+  }
+
+  const codex = source?.codex !== null && typeof source?.codex === 'object' && !Array.isArray(source.codex)
+    ? source.codex
+    : {}
+  const owned = SOUVENIR_IDS.filter((id) => Object.hasOwn(codex, id)).length
+
+  const logs = []
+  for (const entry of Array.isArray(source?.logs) ? source.logs : []) {
+    if (logs.length >= 3) break
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+    const title = typeof entry.title === 'string' ? entry.title.trim() : ''
+    if (title.length === 0 || !Number.isFinite(entry.at)) continue
+    const log = { title: title.slice(0, 120), at: Math.floor(entry.at) }
+    if (withLogBodies === true && typeof entry.body === 'string') log.body = entry.body
+    logs.push(log)
+  }
+
+  return {
+    codex: { owned, total: SOUVENIR_IDS.length },
+    shelf,
+    logs
   }
 }
 

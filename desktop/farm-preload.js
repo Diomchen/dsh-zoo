@@ -63,7 +63,9 @@ contextBridge.exposeInMainWorld('dshZooFarm', {
       wagePerHour: action.wagePerHour,
       minHours: action.minHours,
       maxHours: action.maxHours,
-      enabled: action.enabled
+      enabled: action.enabled,
+      // 票 120：陈列架入口要求开窗后直接落在陈列架页签（主进程仍会再白名单一遍）。
+      tab: action.tab
     })
   },
   close () {

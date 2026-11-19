@@ -247,3 +247,62 @@ test('open：打到 /open/<viewerId>，白名单重建，硬币与多余字段�
     error: 'bad-shape'
   })
 })
+
+test('票 120：公开视图收远征块，远端硬塞的正文被剥掉', () => {
+  const viewer = '22222222-2222-4222-8222-222222222222'
+  const view = normalizeOpenView({
+    v: 1,
+    deviceId: '11111111-1111-4111-8111-111111111111',
+    host: { nickname: '小黄' },
+    expedition: {
+      codex: { owned: 3, total: 32 },
+      shelf: [
+        { id: 'herb', name: '草药', emoji: '🌿' },
+        null,
+        { id: 'alien', name: '烂草', emoji: '💀' },
+        { id: 'oddstone', name: '怪石', emoji: '🪨' }
+      ],
+      logs: [
+        { title: '第一趟', at: 1700000000000, body: '正文别过来' },
+        { title: '第二趟', at: 1700000001000 }
+      ]
+    },
+    coins: 999
+  })
+  assert.deepEqual(view.expedition.codex, { owned: 3, total: 32 })
+  assert.equal(view.expedition.shelf.length, 8)
+  assert.deepEqual(view.expedition.shelf[0], { id: 'herb', name: '草药', emoji: '🌿' })
+  assert.equal(view.expedition.shelf[1], null)
+  assert.deepEqual(view.expedition.shelf[2], null, '认不出的特产 id 不能占格')
+  assert.deepEqual(view.expedition.shelf[3], { id: 'oddstone', name: '怪石', emoji: '🪨' })
+  assert.deepEqual(view.expedition.shelf.slice(4), Array.from({ length: 4 }, () => null))
+  assert.deepEqual(view.expedition.logs, [
+    { title: '第一趟', at: 1700000000000 },
+    { title: '第二趟', at: 1700000001000 }
+  ])
+  assert.equal(JSON.stringify(view).includes('正文'), false)
+  assert.equal(view.coins, undefined)
+  // 远端塞进来的 visited 之类也进不来。
+  assert.equal(JSON.stringify(view).includes('"visited"'), false)
+})
+
+test('票 120：串门视图保留日志正文，老邻居没有这个字段时补零值', () => {
+  const visitId = randomUUID()
+  const view = normalizeVisitView(viewPayload(visitId, {
+    expedition: {
+      codex: { owned: 1, total: 32 },
+      shelf: [{ id: 'herb', name: '草药', emoji: '🌿' }, null, null, null, null, null, null, null],
+      logs: [{ title: '第一趟', at: 1700000000000, body: '进门才给你看' }]
+    }
+  }))
+  assert.equal(view.expedition.logs[0].body, '进门才给你看')
+
+  // 老版本邻居根本没发 expedition：窗口不能崩，给零值形状。
+  const old = normalizeVisitView(viewPayload(visitId))
+  assert.deepEqual(old.expedition, {
+    codex: { owned: 0, total: 32 },
+    shelf: Array.from({ length: 8 }, () => null),
+    logs: []
+  })
+})
+

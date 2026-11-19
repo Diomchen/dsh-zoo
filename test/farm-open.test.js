@@ -52,10 +52,27 @@ function view (overrides = {}) {
   })
 }
 
+const NEXT_MINUTE = NOW + 60_000
+
+function expeditionState (overrides = {}) {
+  return {
+    codex: { herb: NEXT_MINUTE, oddstone: NEXT_MINUTE + 1 },
+    codexView: { total: 32, owned: 2, slots: [] },
+    shelf: { slots: 8, items: ['herb', null, 'oddstone'] },
+    logs: [
+      { at: NOW - 3000, routeId: 'backhill', legs: 7, title: '第一趟', body: '正文秘密甲' },
+      { at: NOW - 2000, routeId: 'backhill', legs: 9, title: '第二趟', body: '正文秘密乙' },
+      { at: NOW - 1000, routeId: 'backhill', legs: 11, title: '第三趟', body: '正文秘密丙' },
+      { at: NOW, routeId: 'backhill', legs: 12, title: '第四趟', body: '正文秘密丁' }
+    ],
+    ...overrides
+  }
+}
+
 test('公开视图：只给地块、守卫和请求者自己的次数', () => {
   const out = view()
   assert.deepEqual(Object.keys(out).sort(), [
-    'at', 'caps', 'deviceId', 'guard', 'guardParts', 'host', 'plots', 'quotas', 'v'
+    'at', 'caps', 'deviceId', 'expedition', 'guard', 'guardParts', 'host', 'plots', 'quotas', 'v'
   ])
   assert.equal(out.v, 1)
   assert.equal(out.deviceId, HOST)
@@ -120,4 +137,67 @@ test('最多 50 块，且按 pN 排序', () => {
   assert.equal(out.plots.length, 50)
   assert.equal(out.plots[0].id, 'p1')
   assert.equal(out.plots[49].id, 'p50')
+})
+
+test('票 120：公开视图的远征块只给图鉴件数、前 8 格和日志标题/时间', () => {
+  const out = view({ expedition: expeditionState() })
+  assert.deepEqual(out.expedition.codex, { owned: 2, total: 32 })
+  assert.equal(out.expedition.shelf.length, 8)
+  assert.deepEqual(out.expedition.shelf[0], { id: 'herb', name: '草药', emoji: '🌿' })
+  assert.equal(out.expedition.shelf[1], null)
+  assert.deepEqual(out.expedition.shelf[2], { id: 'oddstone', name: '怪石', emoji: '🪨' })
+  assert.equal(out.expedition.shelf[7], null)
+  assert.deepEqual(out.expedition.logs, [
+    { title: '第一趟', at: NOW - 3000 },
+    { title: '第二趟', at: NOW - 2000 },
+    { title: '第三趟', at: NOW - 1000 }
+  ])
+
+  // 任何正文、路线、段数、图鉴时间戳都不许出现在序列化结果里。
+  const json = JSON.stringify(out)
+  assert.ok(!json.includes('正文秘密'), '日志正文不能出现')
+  assert.ok(!json.includes('backhill'), '路线不能出现')
+  assert.ok(!json.includes(String(NEXT_MINUTE)), '图鉴时间戳不能出现')
+})
+
+test('票 120：未开格的摆放和超长内容不进公开视图', () => {
+  const out = view({
+    expedition: expeditionState({
+      shelf: {
+        slots: 8,
+        // 第 9 件及以后是没开的格：即便状态里混进了，也只能出现在前 8 格之外。
+        items: ['herb', null, null, null, null, null, null, null, 'oddstone', 'herb'],
+        locked: ['oddstone']
+      },
+      codex: { herb: NEXT_MINUTE, 'not-a-souvenir': NEXT_MINUTE },
+      logs: [
+        { at: NOW, title: '  ', body: '空标题不算' },
+        { at: 'yesterday', title: '坏时间', body: '坏时间不算' },
+        { at: NOW - 5, title: '好', body: '正文' },
+        { at: NOW - 4, title: '也好', body: '正文' },
+        { at: NOW - 3, title: '还好', body: '正文' }
+      ]
+    })
+  })
+  assert.deepEqual(out.expedition.shelf.slice(1), [null, null, null, null, null, null, null])
+  assert.equal(out.expedition.codex.owned, 1, '未知图鉴条目不计入')
+  assert.deepEqual(out.expedition.logs.map((entry) => entry.title), ['好', '也好', '还好'])
+  const json = JSON.stringify(out)
+  assert.ok(!json.includes('怪石'), '没开格的特产不能出现')
+  assert.ok(!json.includes('not-a-souvenir'))
+})
+
+test('票 120：对方没玩过时给零值远征块，不报错', () => {
+  const zero = { codex: { owned: 0, total: 32 }, shelf: Array.from({ length: 8 }, () => null), logs: [] }
+  assert.deepEqual(view().expedition, zero)
+  assert.deepEqual(view({ expedition: null }).expedition, zero)
+  assert.deepEqual(view({ expedition: { shelf: 'broken', logs: {}, codex: [] } }).expedition, zero)
+})
+
+test('票 120：只有串门视图问的时候才带日志正文', () => {
+  const quiet = view({ expedition: expeditionState() })
+  assert.ok(!JSON.stringify(quiet).includes('正文秘密'))
+  const loud = view({ expedition: expeditionState(), expeditionLogBodies: true })
+  assert.equal(loud.expedition.logs[0].body, '正文秘密甲')
+  assert.deepEqual(Object.keys(loud.expedition.logs[0]).sort(), ['at', 'body', 'title'])
 })
