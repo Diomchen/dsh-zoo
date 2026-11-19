@@ -36,6 +36,14 @@ export const ROUTE_IDS = Object.freeze(Object.keys(ROUTES))
 /** 112 只认「折返 / 走满」；`failed` 是 113 的翻车，读档时先容下。 */
 const ENDED_KINDS = Object.freeze(['back', 'complete', 'failed'])
 
+/**
+ * 结束原因，给 116 的日志写正文用：
+ * - `wipeout` 继续走时翻车；
+ * - `timeout` 决策窗 20 秒没人管，自己折返。
+ * 正常折返/走满不带原因。
+ */
+export const ENDED_REASONS = Object.freeze(['wipeout', 'timeout'])
+
 /** 规则层说人话的兜底文案；窗口/HTTP 只补宿主没说的那种。 */
 export const EXPEDITION_ERROR_TEXT = Object.freeze({
   'already-away': '它正在出远门（或串门/打工），这一趟走不了。',
@@ -67,9 +75,26 @@ export function hash32 (...parts) {
   return hash >>> 0
 }
 
-/** 由参数派生的确定性随机数，落在 [0,1)。 */
+/** murmur3 的尾混合：让末位的一个字符也能把整个 32 位搅乱。 */
+function fmix32 (value) {
+  let hash = value >>> 0
+  hash ^= hash >>> 16
+  hash = Math.imul(hash, 0x85ebca6b)
+  hash ^= hash >>> 13
+  hash = Math.imul(hash, 0xc2b2ae35)
+  hash ^= hash >>> 16
+  return hash >>> 0
+}
+
+/**
+ * 由参数派生的确定性随机数，落在 [0,1)。
+ *
+ * 必须先过 fmix32：FNV-1a 对「只差最后一个字符」的两个串（`…|danger|2` /
+ * `…|danger|3`）输出只差一个常数，不搅一遍的话「上一段没翻车」会把下一段
+ * 的翻车率压低一个量级，`dangerOf` 的递增就形同虚设。
+ */
 export function roll01 (...parts) {
-  return hash32(...parts) / 4294967296
+  return fmix32(hash32(...parts)) / 4294967296
 }
 
 /** 这一趟走几段：在路线的 [minLegs, maxLegs] 里按 runId 定。 */
@@ -121,7 +146,8 @@ export function startRun ({ routeId, runId, now } = {}) {
     loot: [],
     startedAt: now,
     ended: null,
-    endedAt: null
+    endedAt: null,
+    reason: null
   }
 }
 
@@ -156,11 +182,61 @@ export function advanceRun (run, now) {
   }
 }
 
-/** 「继续走」：只有决策窗合法；段数 +1，重新走 20 秒。 */
+/**
+ * 目标段会不会翻车：从 runId 派生，同一趟同一段永远同一个结果。
+ * 已经走过 leg 段，下一段的危险度是 dangerOf(route, leg + 1)。
+ */
+export function wipedOut (run, leg) {
+  const route = routeOf(run?.routeId)
+  if (route === null || !Number.isInteger(leg)) return false
+  return roll01(run.id, 'danger', leg) < dangerOf(route, leg)
+}
+
+/**
+ * 「继续走」：只有决策窗合法；段数 +1，重新走 20 秒。
+ *
+ * 迈步前先掷一次翻车（基础 5% + 每已走段 3%）：翻了就地回家，
+ * `leg` 不动（这段没走成），`loot` 不动（已捡的硬币照给），盘缠不退。
+ */
 export function stepRun (run, now) {
   if (!isActiveRun(run) || run.phase !== 'deciding') return null
   if (!Number.isFinite(now)) return null
-  return { ...run, phase: 'walking', leg: run.leg + 1, until: now + LEG_MS }
+  const nextLeg = run.leg + 1
+  if (wipedOut(run, nextLeg)) {
+    return { ...run, phase: null, until: null, ended: 'failed', endedAt: now, reason: 'wipeout' }
+  }
+  return { ...run, phase: 'walking', leg: nextLeg, until: now + LEG_MS, reason: null }
+}
+
+/**
+ * 决策窗超时：没人按「继续」也没按「见好就收」，自己折返。
+ * 只有 deciding 且真到点才动，返回新 run；否则 null。
+ */
+export function expireRun (run, now) {
+  if (!isActiveRun(run) || run.phase !== 'deciding') return null
+  if (!Number.isFinite(now) || now < run.until) return null
+  return { ...run, phase: null, until: null, ended: 'back', endedAt: now, reason: 'timeout' }
+}
+
+/**
+ * 读档续走：只推进到「下一个节点」，不补算错过的段数、不补掷。
+ *
+ * - 还没到点 → null（原样留着，到点由 tick 接上）。
+ * - walking 到点 → 走完这一段，进决策窗；新窗口从读档时刻起算，
+ *   而不是 `until + DECISION_MS`，所以离线再久也只多走一段。
+ * - deciding 到点 → 按超时折返，不再掷翻车。
+ *
+ * 返回 `{ run, coins }`（coins 是这一段该入账的钱）；不推进返回 null。
+ */
+export function resumeRun (run, now) {
+  if (!isActiveRun(run) || !Number.isFinite(now)) return null
+  if (now < run.until) return null
+  if (run.phase === 'walking') {
+    const event = advanceRun(run, now)
+    return event === null ? null : { run: event.run, coins: event.coins }
+  }
+  const home = expireRun(run, now)
+  return home === null ? null : { run: home, coins: 0 }
 }
 
 /** 「见好就收」：只有决策窗合法；标记折返，回币由 settledOf 算。 */
@@ -195,7 +271,8 @@ export function settledOf (run) {
     legs: Number.isInteger(run?.leg) ? run.leg : 0,
     coins: sumCoins(run?.loot),
     items: [],
-    ended: run?.ended ?? null
+    ended: run?.ended ?? null,
+    reason: ENDED_REASONS.includes(run?.reason) ? run.reason : null
   }
 }
 
@@ -245,6 +322,7 @@ export function normalizeRun (raw) {
     loot,
     startedAt: raw.startedAt,
     ended: active ? null : ended,
-    endedAt: active ? null : (Number.isFinite(raw.endedAt) ? raw.endedAt : null)
+    endedAt: active ? null : (Number.isFinite(raw.endedAt) ? raw.endedAt : null),
+    reason: active ? null : (ENDED_REASONS.includes(raw.reason) ? raw.reason : null)
   }
 }
