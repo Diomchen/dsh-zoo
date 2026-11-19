@@ -14,6 +14,17 @@ export const LEG_MS = 20000
 /** 每段走完后的决策窗：20 秒。112 里到点不会自动折返，超时留给 113。 */
 export const DECISION_MS = 20000
 
+/** 陈列架：默认 8 格，第 9 格起每格 5,000，最多 32 格（开满共 120,000）。 */
+export const SHELF_BASE_SLOTS = 8
+export const SHELF_MAX_SLOTS = 32
+export const SHELF_SLOT_PRICE = 5000
+
+/**
+ * 提灯（票 118）：一次买断的装备，买了才在决策窗看到下一段的精确危险百分比。
+ * 价格是规则层的数，窗口只负责显示宿主给的这一份。
+ */
+export const LANTERN_PRICE = 10000
+
 /**
  * 路线表。盘缠（fare）入场即扣、永不退；`coinRate` 是每段回币占盘缠的比例，
  * `coinJitter` 是乘在这个比例上的 ± 抖动。
@@ -131,6 +142,7 @@ export const EXPEDITION_ERROR_TEXT = Object.freeze({
   'not-enough-coins': '硬币不够付盘缠，这趟走不了。',
   'no-route': '没有这条路线。',
   'not-walking': '这一趟现在不用做决定。',
+  locked: '这个格子还没开，放不进去。',
   starting: '出远门还没准备好，稍等一下。',
   'save-failed': '存档写不进去，这趟没能出发。',
   'desktop-off': '桌面层没在运行，出远门的窗口开不了。'

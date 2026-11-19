@@ -17,6 +17,10 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
+  LANTERN_PRICE,
+  SHELF_BASE_SLOTS,
+  SHELF_MAX_SLOTS,
+  SHELF_SLOT_PRICE,
   advanceRun,
   appendTripLog,
   backRun,
@@ -29,6 +33,7 @@ import {
   resumeRun,
   routeOf,
   settledOf,
+  souvenirOf,
   startRun,
   stepRun,
   tripLog
@@ -38,13 +43,29 @@ export const EXPEDITION_FILE = 'expedition.json'
 const VERSION = 1
 
 function initialShelf () {
-  return { slots: 8, items: [] }
+  return { slots: SHELF_BASE_SLOTS, items: [] }
 }
 
+/**
+ * `slots` = 已解锁的格数（8 起，最多 32）；`items` 按下标对格，`items[0]` 是第 1 格，
+ * `null`/缺位表示空格。同一件特产最多出现一次（读档时保留第一次、后面的坏位清空）。
+ * 末尾的空格会被剪掉，所以空架子稳定落成 `{ slots: 8, items: [] }`。
+ */
 function normalizeShelf (raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return initialShelf()
-  const slots = Number.isInteger(raw.slots) && raw.slots > 0 && raw.slots <= 64 ? raw.slots : 8
-  const items = Array.isArray(raw.items) ? JSON.parse(JSON.stringify(raw.items.slice(0, slots))) : []
+  const slots = Number.isInteger(raw.slots) && raw.slots >= SHELF_BASE_SLOTS && raw.slots <= SHELF_MAX_SLOTS
+    ? raw.slots
+    : SHELF_BASE_SLOTS
+  const items = []
+  const seen = new Set()
+  if (Array.isArray(raw.items)) {
+    for (const entry of raw.items.slice(0, slots)) {
+      const id = typeof entry === 'string' && souvenirOf(entry) !== null && !seen.has(entry) ? entry : null
+      if (id !== null) seen.add(id)
+      items.push(id)
+    }
+  }
+  while (items.length > 0 && items[items.length - 1] === null) items.pop()
   return { slots, items }
 }
 
@@ -171,6 +192,40 @@ export class ExpeditionStore {
     })
   }
 
+  /**
+   * 提灯（票 118）：一次买断，10,000 枚。已经买过就原样返回，绝不再扣一次钱。
+   * 先扣钱再落盘；写不进去就退款并把 upgrades 回滚——不能出现「钱花了、灯没了」。
+   */
+  buyLantern () {
+    return this.#serial(async () => {
+      if (this.#disposed) return { ok: false, error: 'starting' }
+      if (this.#state.upgrades.lantern === true) {
+        return { ok: true, already: true, upgrades: { ...this.#state.upgrades } }
+      }
+      if (this.#farm === null || typeof this.#farm.spendCoins !== 'function') {
+        return { ok: false, error: 'starting' }
+      }
+      const paid = await this.#farm.spendCoins(LANTERN_PRICE)
+      if (paid === null || typeof paid !== 'object' || paid.ok !== true) {
+        return { ok: false, error: paid?.error === 'no-coin' ? 'not-enough-coins' : 'starting' }
+      }
+
+      const previous = this.#state.upgrades
+      this.#state.upgrades = { ...previous, lantern: true }
+      if (await this.#persist()) return { ok: true, already: false, upgrades: { ...this.#state.upgrades } }
+
+      this.#state.upgrades = previous
+      if (typeof this.#farm.addCoins === 'function') {
+        try {
+          await this.#farm.addCoins(LANTERN_PRICE)
+        } catch (error) {
+          this.#log?.('出远门买提灯失败后退款也失败：' + (error?.message ?? error))
+        }
+      }
+      return { ok: false, error: 'save-failed' }
+    })
+  }
+
   /** 「继续走」：只有决策窗合法；翻车当场结算（硬币照给，盘缠不退）。 */
   step (now = this.#now()) {
     return this.#serial(async () => {
@@ -245,6 +300,95 @@ export class ExpeditionStore {
       if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
       await this.#persist()
       return true
+    })
+  }
+
+  /**
+   * 陈列架：开格、摆件、挪格、取下。
+   *
+   * 三种请求共用一个动作（spec 的 `expedition-shelf`）：
+   * - `{ slot }`：开第 slot 格；只能开下一格，扣 5,000，钱不够报 `not-enough-coins`；
+   * - `{ slot, itemId }`：把一件特产放进已解锁的空格；
+   * - `{ moveFrom, moveTo? }`：挪到另一空格；不给 moveTo 就是取下。移动永远不碰农场。
+   *
+   * 摆/挪/取都只动 `shelf.items`，所以「同一件不能出现在两格」在这里一次判死。
+   * 落盘失败一律回滚内存；开格失败还要把 5,000 退回农场。
+   */
+  shelfAction ({ slot = null, itemId = null, moveFrom = null, moveTo = null } = {}) {
+    return this.#serial(async () => {
+      if (this.#disposed) return { ok: false, error: 'starting' }
+      const slotGiven = slot !== null && slot !== undefined
+      const itemGiven = itemId !== null && itemId !== undefined
+      const fromGiven = moveFrom !== null && moveFrom !== undefined
+      const toGiven = moveTo !== null && moveTo !== undefined
+      const previous = normalizeShelf(this.#state.shelf)
+
+      if (fromGiven || toGiven) {
+        if (slotGiven || itemGiven) return { ok: false, error: 'locked' }
+        if (!Number.isInteger(moveFrom) || moveFrom < 1 || moveFrom > previous.slots) {
+          return { ok: false, error: 'locked' }
+        }
+        const items = previous.items.slice()
+        const carried = items[moveFrom - 1]
+        if (carried === undefined || carried === null) return { ok: false, error: 'locked' }
+        if (toGiven) {
+          if (!Number.isInteger(moveTo) || moveTo < 1 || moveTo > previous.slots || moveTo === moveFrom) {
+            return { ok: false, error: 'locked' }
+          }
+          const target = items[moveTo - 1]
+          if (target !== undefined && target !== null) return { ok: false, error: 'locked' }
+          items[moveFrom - 1] = null
+          items[moveTo - 1] = carried
+        } else {
+          items[moveFrom - 1] = null
+        }
+        this.#state.shelf = normalizeShelf({ slots: previous.slots, items })
+        if (await this.#persist()) return { ok: true, shelf: normalizeShelf(this.#state.shelf) }
+        this.#state.shelf = previous
+        return { ok: false, error: 'save-failed' }
+      }
+
+      if (!slotGiven) return { ok: false, error: 'locked' }
+
+      if (itemGiven) {
+        if (!Number.isInteger(slot) || slot < 1 || slot > previous.slots) return { ok: false, error: 'locked' }
+        if (typeof itemId !== 'string' || souvenirOf(itemId) === null) return { ok: false, error: 'locked' }
+        if (previous.items.includes(itemId)) return { ok: false, error: 'locked' }
+        const occupant = previous.items[slot - 1]
+        if (occupant !== undefined && occupant !== null) return { ok: false, error: 'locked' }
+        const items = previous.items.slice()
+        while (items.length < slot) items.push(null)
+        items[slot - 1] = itemId
+        this.#state.shelf = normalizeShelf({ slots: previous.slots, items })
+        if (await this.#persist()) return { ok: true, shelf: normalizeShelf(this.#state.shelf) }
+        this.#state.shelf = previous
+        return { ok: false, error: 'save-failed' }
+      }
+
+      // 开格：只能按顺序开下一格，不能跳格、不能超过 32。
+      if (!Number.isInteger(slot) || slot !== previous.slots + 1 || slot > SHELF_MAX_SLOTS) {
+        return { ok: false, error: 'locked' }
+      }
+      if (this.#farm === null || typeof this.#farm.spendCoins !== 'function') {
+        return { ok: false, error: 'starting' }
+      }
+      const paid = await this.#farm.spendCoins(SHELF_SLOT_PRICE)
+      if (paid === null || typeof paid !== 'object' || paid.ok !== true) {
+        return { ok: false, error: paid?.error === 'no-coin' ? 'not-enough-coins' : 'starting' }
+      }
+
+      this.#state.shelf = { slots: previous.slots + 1, items: previous.items }
+      if (await this.#persist()) return { ok: true, shelf: normalizeShelf(this.#state.shelf) }
+
+      this.#state.shelf = previous
+      if (typeof this.#farm.addCoins === 'function') {
+        try {
+          await this.#farm.addCoins(SHELF_SLOT_PRICE)
+        } catch (error) {
+          this.#log?.('出远门开格失败后退款也失败：' + (error?.message ?? error))
+        }
+      }
+      return { ok: false, error: 'save-failed' }
     })
   }
 

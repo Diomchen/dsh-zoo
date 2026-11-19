@@ -9,13 +9,14 @@
  */
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { codexView, legsFor, routeOf, wipedOut } from '../src/expedition.js'
+import { codexView, dangerLabel, dangerOf, legsFor, routeOf, wipedOut } from '../src/expedition.js'
+import { EXPEDITION_FILE } from '../src/expedition-store.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
 
@@ -38,6 +39,8 @@ function sampleRun (overrides = {}) {
     ended: null,
     endedAt: 0,
     danger: '中',
+    // 票 118：没买提灯时宿主不下发百分比。
+    dangerPercent: null,
     ...overrides
   }
 }
@@ -50,6 +53,7 @@ function sampleView (overrides = {}) {
     coins: 520,
     now: T0,
     away: 'expedition',
+    lanternPrice: 10_000,
     routes: [{ id: 'backhill', name: '后山', fare: 500, minLegs: 3, maxLegs: 4, coinBase: 15 }],
     shelf: { slots: 8, items: [] },
     codex: { herb: T0 },
@@ -75,6 +79,30 @@ test('视图模型：阶段、已走段数与危险度都是人话', () => {
   assert.equal(view.phaseLabel(sampleRun({ phase: null, ended: 'back' })), '见好就收，已经回家')
   assert.equal(view.progressText(sampleRun({ leg: 2, totalLegs: 4 })), '已走 2 / 4 段')
   assert.equal(view.dangerText(sampleRun({ danger: '低' })), '危险度 低')
+})
+
+test('视图模型：没买提灯画三档，买了画精确百分比', () => {
+  assert.equal(view.dangerText(sampleRun({ danger: '中', dangerPercent: null })), '危险度 中')
+  assert.equal(view.dangerText(sampleRun({ danger: '中', dangerPercent: 37 })), '危险度 37%')
+  assert.equal(view.dangerText(sampleRun({ danger: '', dangerPercent: 5 })), '危险度 5%')
+  assert.equal(view.dangerText(sampleRun({ danger: '高', dangerPercent: undefined })), '危险度 高')
+  assert.equal(view.dangerText(null), '')
+})
+
+test('视图模型：提灯那一行只画宿主给的买没买与价钱', () => {
+  const plain = view.lanternOffer(sampleView())
+  assert.equal(plain.owned, false)
+  assert.equal(plain.label, '买提灯（10,000 枚）')
+  assert.match(plain.hint, /低 \/ 中 \/ 高/)
+
+  const owned = view.lanternOffer(sampleView({ upgrades: { lantern: true } }))
+  assert.equal(owned.owned, true)
+  assert.equal(owned.label, '提灯已买')
+  assert.match(owned.hint, /百分比/)
+
+  // 老宿主没给价钱就不瞎写一个 0。
+  assert.equal(view.lanternOffer({ upgrades: { lantern: false } }).label, '买提灯')
+  assert.equal(view.lanternOffer(null).owned, false)
 })
 
 test('视图模型：见好就收只按已走段数的战利品算钱', () => {
@@ -202,6 +230,137 @@ test('shared：四个提交动作只过白名单字段，坏路线整条拒绝',
   assert.equal(bad.error, 'bad-expedition-action')
 })
 
+test('视图模型：陈列架画满 32 格，锁着的格子带价格', () => {
+  const shelf = { slots: 8, items: [] }
+  const cells = view.shelfCells(shelf)
+  assert.equal(cells.length, 32)
+  assert.equal(cells.filter((cell) => cell.locked).length, 24)
+  assert.deepEqual(
+    cells.slice(0, 8).map((cell) => cell.locked),
+    [false, false, false, false, false, false, false, false]
+  )
+  assert.equal(cells[8].locked, true)
+  assert.equal(cells[8].price, 5000)
+  assert.equal(cells[31].price, 5000)
+  assert.equal(cells[0].empty, true)
+  assert.equal(view.shelfProgress(shelf), '已开 8 / 32 格')
+  assert.equal(view.shelfProgress(null), '已开 8 / 32 格')
+})
+
+test('视图模型：陈列架按位置对格，空格与特产都不串位', () => {
+  const shelf = { slots: 9, items: [null, 'herb'] }
+  const codex = codexView({ herb: T0 })
+  const cells = view.shelfCells(shelf, codex)
+  assert.equal(cells[0].empty, true)
+  assert.equal(cells[1].itemId, 'herb')
+  assert.equal(cells[1].label, '草药')
+  assert.deepEqual(cells[1].emblem, { kind: 'art', src: 'souvenirs/herb.svg' })
+  assert.equal(cells[8].locked, false, '第 9 格已解锁')
+  assert.equal(cells[9].locked, true)
+  assert.equal(view.canUnlock(shelf, 10, 5000), true)
+  assert.equal(view.canUnlock(shelf, 10, 4999), false)
+  assert.equal(view.canUnlock(shelf, 9, 5000), false, '只能按顺序开下一格')
+  assert.equal(view.canUnlock(shelf, 11, 5000), false, '隔一格也不行')
+})
+
+test('视图模型：可摆放的特产只列已获得且还没上架的', () => {
+  const codex = {
+    slots: [
+      { id: 'herb', name: '草药', owned: true, art: 'souvenirs/herb.svg', emoji: '🌿' },
+      { id: 'stone', name: '石子', owned: true, art: '', emoji: '🪨' },
+      { id: 'unknown', name: '???', owned: false, art: '', emoji: '❔' }
+    ]
+  }
+  const placeable = view.placeableSouvenirs({ slots: 8, items: ['herb'] }, codex)
+  assert.deepEqual(placeable.map((slot) => slot.id), ['stone'])
+  assert.deepEqual(view.placeableSouvenirs({ slots: 8, items: [] }, null), [])
+})
+
+test('shared：陈列架视图真正归一，不再写死空架子', () => {
+  const normalized = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c4',
+    open: true,
+    state: sampleView({
+      shelf: { slots: 9, items: [null, 'herb'], unlocked: 9, maxSlots: 32, slotPrice: 5000 }
+    })
+  })
+  assert.equal(normalized.ok, true)
+  assert.deepEqual(normalized.command.state.shelf.items, [null, 'herb'])
+  assert.equal(normalized.command.state.shelf.slots, 9)
+  assert.equal(normalized.command.state.shelf.unlocked, 9)
+  assert.equal(normalized.command.state.shelf.maxSlots, 32)
+  assert.equal(normalized.command.state.shelf.slotPrice, 5000)
+
+  const fallback = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c5',
+    open: true,
+    state: sampleView({ shelf: { slots: 99, items: ['herb', 'herb', 7] } })
+  })
+  assert.equal(fallback.command.state.shelf.slots, 8)
+  assert.deepEqual(fallback.command.state.shelf.items, ['herb'])
+})
+
+test('shared：陈列架动作只过 slot/itemId/moveFrom/moveTo', () => {
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 9, coins: 1 }),
+    { action: 'expedition-shelf', slot: 9 }
+  )
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', itemId: 'herb', slot: 2 }),
+    { action: 'expedition-shelf', itemId: 'herb', slot: 2 }
+  )
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', moveFrom: 1, moveTo: 2 }),
+    { action: 'expedition-shelf', moveFrom: 1, moveTo: 2 }
+  )
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', moveFrom: 1 }),
+    { action: 'expedition-shelf', moveFrom: 1 }
+  )
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf' }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 0 }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 33 }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', itemId: 7 }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', itemId: 'herb' }), null)
+  assert.equal(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 1, moveFrom: 2 }),
+    null
+  )
+  assert.ok(shared.EXPEDITION_SUBMIT_ACTIONS.includes('expedition-shelf'))
+  const event = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'a3',
+    action: 'expedition-shelf',
+    moveFrom: 1,
+    moveTo: 2
+  })
+  assert.equal(event.ok, true)
+  assert.deepEqual(event.event, { type: 'action', id: 'a3', action: 'expedition-shelf', moveFrom: 1, moveTo: 2 })
+})
+
+test('shared：买提灯进提交白名单，百分比只过 0–100 的整数', () => {
+  assert.deepEqual(shared.normalizeExpeditionAction({ action: 'expedition-lantern' }), { action: 'expedition-lantern' })
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-lantern', coins: 1 }).coins, undefined)
+  assert.ok(shared.EXPEDITION_SUBMIT_ACTIONS.includes('expedition-lantern'))
+
+  const exact = shared.normalizeExpeditionView(sampleView({
+    run: sampleRun({ danger: '中', dangerPercent: 37.6 })
+  }))
+  assert.equal(exact.run.dangerPercent, 38)
+  assert.equal(exact.run.danger, '中')
+  assert.equal(exact.lanternPrice, 10_000)
+  // 老宿主没给价钱时不能默认成 0 枚，窗口要能看出「价钱不明」。
+  assert.equal(shared.normalizeExpeditionView(sampleView({ lanternPrice: undefined })).lanternPrice, null)
+
+  const plain = shared.normalizeExpeditionView(sampleView())
+  assert.equal(plain.run.dangerPercent, null, '没买提灯时百分比必须是 null')
+  assert.equal(shared.normalizeExpeditionView(sampleView({ run: sampleRun({ dangerPercent: '37' }) })).run.dangerPercent, null)
+  assert.equal(shared.normalizeExpeditionView(sampleView({ run: sampleRun({ dangerPercent: -3 }) })).run.dangerPercent, 0)
+  assert.equal(shared.normalizeExpeditionView(sampleView({ run: sampleRun({ dangerPercent: 500 }) })).run.dangerPercent, 100)
+})
+
 test('shared：菜单里的「出远门」指向 expedition-open', () => {
   assert.equal(shared.MENU_TOOL_REQUESTS.expedition, 'expedition-open')
   assert.ok(shared.MENU_TOOL_IDS.includes('expedition'))
@@ -298,9 +457,9 @@ function desktopDouble () {
   }
 }
 
-async function makeService (t, dir, desktop, clock, runId = null) {
+async function makeService (t, dir, desktop, clock, runId = null, coins = 620) {
   const { ctx, routes } = fakeCtx()
-  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 620 }), 'utf8')
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins }), 'utf8')
   const service = createService(ctx, {
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
@@ -364,6 +523,35 @@ test('宿主：开窗下发整份视图；再点一次关窗；× 之后能重�
   desktop.userClose()
   const reopened = await callAction(service, { action: 'expedition-open' })
   assert.equal(reopened.body.window, 'opened')
+})
+
+test('宿主：陈列架随窗口下发，挪格后重推且不花硬币', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({
+    version: 1,
+    run: null,
+    shelf: { slots: 9, items: ['herb'] },
+    codex: { herb: T0 },
+    upgrades: { lantern: false }
+  }), 'utf8')
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+
+  const opened = desktop.calls.expedition.at(-1)
+  assert.equal(opened.state.shelf.slots, 9)
+  assert.equal(opened.state.shelf.unlocked, 9)
+  assert.equal(opened.state.shelf.maxSlots, 32)
+  assert.equal(opened.state.shelf.slotPrice, 5000)
+  assert.deepEqual(opened.state.shelf.items, ['herb'])
+
+  const moved = await callAction(service, { action: 'expedition-shelf', moveFrom: 1, moveTo: 2 })
+  assert.equal(moved.body.ok, true)
+  const pushed = desktop.calls.expedition.at(-1).state
+  assert.deepEqual(pushed.shelf.items, [null, 'herb'])
+  assert.equal(pushed.coins, 620, '挪格不花钱')
 })
 
 test('宿主：出发扣盘缠，到点刷新成决策窗，继续走一段', async (t) => {
@@ -503,4 +691,92 @@ test('宿主：没有桌面层是 desktop-off，不写任何窗口命令', async
   const refreshed = await callAction(service, { action: 'expedition-refresh' })
   assert.equal(refreshed.body.ok, false)
   assert.equal(refreshed.body.error, 'desktop-off')
+})
+
+test('宿主：硬币不够买提灯是 not-enough-coins，硬币与存档都不动', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  const before = JSON.parse(await readFile(join(dir, FARM_FILE), 'utf8')).coins
+
+  const bought = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(bought.body.ok, false)
+  assert.equal(bought.body.error, 'not-enough-coins')
+  assert.equal(typeof bought.body.notice, 'string')
+  assert.match(bought.body.notice, /10,000/)
+
+  const stored = JSON.parse(await readFile(join(dir, 'expedition.json'), 'utf8'))
+  assert.equal(stored.upgrades.lantern, false, '买不起就一寸都不许动')
+  const state = desktop.calls.expedition.at(-1).state
+  assert.equal(state.upgrades.lantern, false)
+  assert.equal(state.coins, before)
+})
+
+test('宿主：花 10,000 买提灯，重启还在，再点不二次扣钱', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock, null, 12_345)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+
+  const bought = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(bought.body.ok, true)
+  assert.equal(bought.body.already, false)
+  assert.equal(bought.body.upgrades.lantern, true)
+  const pushed = desktop.calls.expedition.at(-1).state
+  assert.equal(pushed.upgrades.lantern, true)
+  assert.equal(pushed.coins, 2_345)
+
+  const stored = JSON.parse(await readFile(join(dir, 'expedition.json'), 'utf8'))
+  assert.equal(stored.upgrades.lantern, true, '提灯要落在 expedition.json 的 upgrades 里')
+
+  const again = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(again.body.ok, true)
+  assert.equal(again.body.already, true)
+  assert.equal(desktop.calls.expedition.at(-1).state.coins, 2_345, '已经买过就不许再扣钱')
+
+  // 重启：换一个 service 读同一个 dataDir，提灯还在，而且不用再买。
+  service.dispose()
+  const restarted = desktopDouble()
+  const second = await makeService(t, dir, restarted, clock, null, 2_345)
+  restarted.ready()
+  await callAction(second, { action: 'expedition-open' })
+  const view = restarted.calls.expedition.at(-1).state
+  assert.equal(view.upgrades.lantern, true)
+  assert.equal(view.coins, 2_345)
+})
+
+test('宿主：没买提灯只给三档，买了给下一段精确百分比（与 dangerOf 同值）', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock, null, 12_000)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  await callAction(service, { action: 'expedition-start', routeId: 'backhill' })
+  clock.value = T0 + 20_001
+  await callAction(service, { action: 'expedition-refresh' })
+
+  const plain = desktop.calls.expedition.at(-1).state
+  assert.equal(plain.run.phase, 'deciding')
+  assert.equal(plain.upgrades.lantern, false)
+  assert.equal(plain.run.danger, dangerLabel(dangerOf(routeOf('backhill'), 2)))
+  assert.equal(plain.run.dangerPercent, null, '没买提灯就不下发百分比，窗口也就无从泄露')
+
+  const bought = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(bought.body.ok, true)
+  const exact = desktop.calls.expedition.at(-1).state
+  assert.equal(exact.run.phase, 'deciding')
+  assert.equal(exact.run.dangerPercent, Math.round(dangerOf(routeOf('backhill'), 2) * 100))
+  assert.equal(exact.run.danger, dangerLabel(dangerOf(routeOf('backhill'), 2)))
+
+  // 继续走一段：走路中看的是当前段，仍是同一个 dangerOf。
+  await callAction(service, { action: 'expedition-step' })
+  const walking = desktop.calls.expedition.at(-1).state
+  assert.equal(walking.run.phase, 'walking')
+  assert.equal(walking.run.dangerPercent, Math.round(dangerOf(routeOf('backhill'), 2) * 100))
 })
