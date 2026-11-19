@@ -17,6 +17,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 import {
+  LANTERN_PRICE,
   advanceRun,
   backRun,
   codexView,
@@ -180,6 +181,40 @@ export class ExpeditionStore {
           await this.#farm.addCoins(route.fare)
         } catch (error) {
           this.#log?.('出远门出发失败后退款也失败：' + (error?.message ?? error))
+        }
+      }
+      return { ok: false, error: 'save-failed' }
+    })
+  }
+
+  /**
+   * 提灯（票 118）：一次买断，10,000 枚。已经买过就原样返回，绝不再扣一次钱。
+   * 先扣钱再落盘；写不进去就退款并把 upgrades 回滚——不能出现「钱花了、灯没了」。
+   */
+  buyLantern () {
+    return this.#serial(async () => {
+      if (this.#disposed) return { ok: false, error: 'starting' }
+      if (this.#state.upgrades.lantern === true) {
+        return { ok: true, already: true, upgrades: { ...this.#state.upgrades } }
+      }
+      if (this.#farm === null || typeof this.#farm.spendCoins !== 'function') {
+        return { ok: false, error: 'starting' }
+      }
+      const paid = await this.#farm.spendCoins(LANTERN_PRICE)
+      if (paid === null || typeof paid !== 'object' || paid.ok !== true) {
+        return { ok: false, error: paid?.error === 'no-coin' ? 'not-enough-coins' : 'starting' }
+      }
+
+      const previous = this.#state.upgrades
+      this.#state.upgrades = { ...previous, lantern: true }
+      if (await this.#persist()) return { ok: true, already: false, upgrades: { ...this.#state.upgrades } }
+
+      this.#state.upgrades = previous
+      if (typeof this.#farm.addCoins === 'function') {
+        try {
+          await this.#farm.addCoins(LANTERN_PRICE)
+        } catch (error) {
+          this.#log?.('出远门买提灯失败后退款也失败：' + (error?.message ?? error))
         }
       }
       return { ok: false, error: 'save-failed' }

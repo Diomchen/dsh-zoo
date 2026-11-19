@@ -57,11 +57,41 @@
     return '已走 ' + String(num(run.leg)) + ' / ' + String(num(run.totalLegs)) + ' 段'
   }
 
-  /** 决策窗这里说的是「下一段」的危险度；走路时说的是当前段。 */
+  /**
+   * 决策窗这里说的是「下一段」的危险度；走路时说的是当前段。
+   * 买了提灯宿主才会给 `dangerPercent`（票 118）：有它就画精确到个位的百分数，
+   * 没有就画低 / 中 / 高——窗口自己不算概率。
+   */
   function dangerText (run) {
     if (run === null || typeof run !== 'object') return ''
+    if (typeof run.dangerPercent === 'number' && Number.isFinite(run.dangerPercent)) {
+      return '危险度 ' + String(Math.round(run.dangerPercent)) + '%'
+    }
     if (typeof run.danger === 'string' && run.danger !== '') return '危险度 ' + run.danger
     return ''
+  }
+
+  /** 价钱带千分位：10000 → 10,000（仍是整数，不引小数）。 */
+  function formatPrice (value) {
+    return String(Math.max(0, Math.round(num(value)))).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  }
+
+  /**
+   * 提灯那一行（票 118）：买没买、多少钱、按钮写什么，全按宿主给的视图说。
+   * 价钱缺席（老宿主）就不写「0 枚」，只写「买提灯」。
+   */
+  function lanternOffer (state) {
+    const view = state !== null && typeof state === 'object' ? state : {}
+    const upgrades = view.upgrades !== null && typeof view.upgrades === 'object' ? view.upgrades : {}
+    const owned = upgrades.lantern === true
+    const hasPrice = typeof view.lanternPrice === 'number' && Number.isFinite(view.lanternPrice)
+    return {
+      owned,
+      hint: owned
+        ? '提灯已买：决策窗显示下一段精确到个位的危险百分比。'
+        : '还没买提灯：决策窗只显示低 / 中 / 高，看不出下一段到底多险。',
+      label: owned ? '提灯已买' : hasPrice ? '买提灯（' + formatPrice(view.lanternPrice) + ' 枚）' : '买提灯'
+    }
   }
 
   /** 这一趟已经捡到的硬币总数（每段到点就进农场，这里只用于结算文案）。 */
@@ -247,6 +277,7 @@
     phaseLabel,
     progressText,
     dangerText,
+    lanternOffer,
     sumLoot,
     settleText,
     primaryLabel,

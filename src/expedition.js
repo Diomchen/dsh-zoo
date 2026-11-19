@@ -20,6 +20,12 @@ export const SHELF_MAX_SLOTS = 32
 export const SHELF_SLOT_PRICE = 5000
 
 /**
+ * 提灯（票 118）：一次买断的装备，买了才在决策窗看到下一段的精确危险百分比。
+ * 价格是规则层的数，窗口只负责显示宿主给的这一份。
+ */
+export const LANTERN_PRICE = 10000
+
+/**
  * 路线表。盘缠（fare）入场即扣、永不退；`coinRate` 是每段回币占盘缠的比例，
  * `coinJitter` 是乘在这个比例上的 ± 抖动。
  */

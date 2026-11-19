@@ -426,13 +426,15 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   /** 1.10.0：账户自己的档位——纸面还是真钱，每个账户自己选。 */
   const FUTURES_ACCOUNT_MODES = ['shadow', 'live']
   /**
-   * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`
-   * 什么都不带，`refresh` 只请宿主补一拍。钱与段数全在宿主算。
+   * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`/`lantern`
+   * 什么都不带，`refresh` 只请宿主补一拍，`shelf` 带格号与特产 id（票 115）。
+   * 钱与段数全在宿主算。
    */
   const EXPEDITION_SUBMIT_ACTIONS = [
     'expedition-start',
     'expedition-step',
     'expedition-back',
+    'expedition-lantern',
     'expedition-refresh',
     'expedition-shelf'
   ]
@@ -2869,7 +2871,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
           startedAt: num(source.run.startedAt, 0),
           ended,
           endedAt: num(source.run.endedAt, 0),
-          danger: normalizeLabel(source.run.danger, '')
+          danger: normalizeLabel(source.run.danger, ''),
+          // 票 118：只有买了提灯宿主才给这个数；坏值/缺省一律 null，窗口画回三档。
+          dangerPercent: typeof source.run.dangerPercent === 'number' && Number.isFinite(source.run.dangerPercent)
+            ? Math.min(100, Math.max(0, Math.round(source.run.dangerPercent)))
+            : null
         }
       }
     }
@@ -2900,9 +2906,13 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       run,
       coins: nonNegative(source.coins),
       now: num(source.now, 0),
+      // 票 118：提灯的价钱由宿主给，窗口只负责写进按钮；缺省/null 就是「价钱不明」。
+      lanternPrice: typeof source.lanternPrice === 'number' && Number.isFinite(source.lanternPrice) && source.lanternPrice > 0
+        ? Math.round(source.lanternPrice)
+        : null,
       away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
       routes,
-      // 112 不画提灯，但形状留着：118 加窗口时不用再改协议。
+      // 陈列架（115）：slots/items/unlocked 由宿主给，窗口只读；提灯在 upgrades.lantern 里。
       shelf: normalizeExpeditionShelf(source.shelf),
       codex,
       codexView: normalizeExpeditionCodexView(source.codexView),
@@ -2959,7 +2969,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   }
 
   /**
-   * 出远门小窗提交的白名单：只认五个动作，`start` 必须带路线 id。
+   * 出远门小窗提交的白名单：只认六个动作，`start` 必须带路线 id。
    * `expedition-shelf` 的字段在这里逐一拷贝——落到 helper 的农场窄口会被整条削掉。
    */
   function normalizeExpeditionAction (raw) {
@@ -3004,7 +3014,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return routeId === '' ? null : { action, routeId }
   }
 
-  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
+  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
+  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
     if (raw === undefined || raw === null) return null
     if (!Array.isArray(raw)) return false

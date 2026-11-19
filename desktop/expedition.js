@@ -20,6 +20,9 @@
     tabCodex: el('tabCodex'),
     tabShelf: el('tabShelf'),
     travelPane: el('travelPane'),
+    lantern: el('lantern'),
+    lanternText: el('lanternText'),
+    lanternBuy: el('lanternBuy'),
     home: el('home'),
     routeName: el('routeName'),
     routeHint: el('routeHint'),
@@ -359,6 +362,10 @@
       '/' + String(view.SHELF_MAX_SLOTS)
     if (activeTab === 'codex') renderCodex()
     if (activeTab === 'shelf') renderShelf()
+    const offer = view.lanternOffer(state)
+    ui.lanternText.textContent = offer.hint
+    ui.lanternBuy.textContent = offer.label
+    ui.lanternBuy.disabled = pending || offer.owned
     ui.homeNote.textContent = state !== null && (state.away === 'visiting' || state.away === 'working')
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
@@ -456,6 +463,7 @@
   })
   ui.continue.addEventListener('click', () => send({ action: 'expedition-step' }))
   ui.back.addEventListener('click', () => send({ action: 'expedition-back' }))
+  ui.lanternBuy.addEventListener('click', () => send({ action: 'expedition-lantern' }))
   ui.close.addEventListener('click', () => {
     if (bridge !== undefined && typeof bridge.close === 'function') bridge.close()
   })
