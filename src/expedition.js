@@ -16,7 +16,7 @@ export const DECISION_MS = 20000
 
 /**
  * 路线表。盘缠（fare）入场即扣、永不退；`coinRate` 是每段回币占盘缠的比例，
- * `coinJitter` 是乘在这个比例上的 ± 抖动。
+ * `coinJitter` 是乘在这个比例上的 ± 抖动。`unlock` 是 117 的解锁条件，判定在 `unlockStatus`。
  */
 export const ROUTES = Object.freeze({
   backhill: Object.freeze({
@@ -28,7 +28,44 @@ export const ROUTES = Object.freeze({
     coinRate: 0.03,
     coinJitter: 0.25,
     dangerBase: 0.05,
-    dangerPerLeg: 0.03
+    dangerPerLeg: 0.03,
+    unlock: Object.freeze({ kind: 'always' })
+  }),
+  mine: Object.freeze({
+    id: 'mine',
+    name: '废矿',
+    fare: 3000,
+    minLegs: 4,
+    maxLegs: 5,
+    coinRate: 0.03,
+    coinJitter: 0.25,
+    dangerBase: 0.08,
+    dangerPerLeg: 0.03,
+    unlock: Object.freeze({ kind: 'trips', routeId: 'backhill', count: 3 })
+  }),
+  railway: Object.freeze({
+    id: 'railway',
+    name: '老铁路',
+    fare: 15000,
+    minLegs: 5,
+    maxLegs: 6,
+    coinRate: 0.03,
+    coinJitter: 0.25,
+    dangerBase: 0.1,
+    dangerPerLeg: 0.03,
+    unlock: Object.freeze({ kind: 'codex', count: 16 })
+  }),
+  mistridge: Object.freeze({
+    id: 'mistridge',
+    name: '雾岭',
+    fare: 60000,
+    minLegs: 6,
+    maxLegs: 7,
+    coinRate: 0.03,
+    coinJitter: 0.25,
+    dangerBase: 0.12,
+    dangerPerLeg: 0.03,
+    unlock: Object.freeze({ kind: 'codex-trips', count: 24, routeId: 'railway', trips: 1 })
   })
 })
 
@@ -129,6 +166,7 @@ export const ENDED_REASONS = Object.freeze(['wipeout', 'timeout'])
 export const EXPEDITION_ERROR_TEXT = Object.freeze({
   'already-away': '它正在出远门（或串门/打工），这一趟走不了。',
   'not-enough-coins': '硬币不够付盘缠，这趟走不了。',
+  locked: '这条路线还没解锁，先看看灰卡上的条件。',
   'no-route': '没有这条路线。',
   'not-walking': '这一趟现在不用做决定。',
   starting: '出远门还没准备好，稍等一下。',
@@ -140,6 +178,78 @@ export const EXPEDITION_ERROR_TEXT = Object.freeze({
 export function routeOf (routeId) {
   if (typeof routeId !== 'string') return null
   return Object.prototype.hasOwnProperty.call(ROUTES, routeId) ? ROUTES[routeId] : null
+}
+
+function countOf (value) {
+  return Number.isInteger(value) && value > 0 ? value : 0
+}
+
+function routeLabel (routeId) {
+  return ROUTES[routeId]?.name ?? SOUVENIR_ROUTE_NAMES[routeId] ?? String(routeId)
+}
+
+/**
+ * 解锁判定（票 117）：只看「已回家的趟数」与图鉴件数。
+ *
+ * 返回 `{ unlocked, requirement, progress }`——`requirement` 是灰卡上的解锁条件，
+ * `progress` 是当前进度（「还差 2 趟后山」「图鉴 13/16」）；条件满足时 progress 也给出
+ * 满额，窗口不用再换算。`trips` 是各路线已回家的趟数，`codexOwned` 是图鉴已点亮件数。
+ */
+export function unlockStatus (route, { trips = {}, codexOwned = 0 } = {}) {
+  const unlock = route !== null && typeof route === 'object' ? route.unlock : null
+  const kind = unlock !== null && typeof unlock === 'object' ? unlock.kind : 'always'
+  const owned = countOf(codexOwned)
+  const tripCount = (routeId) => countOf(trips !== null && typeof trips === 'object' ? trips[routeId] : 0)
+
+  if (kind === 'trips') {
+    const need = countOf(unlock.count)
+    const done = tripCount(unlock.routeId)
+    const name = routeLabel(unlock.routeId)
+    return {
+      unlocked: done >= need,
+      requirement: `走过 ${need} 趟${name}`,
+      progress: done >= need ? `${name} ${need}/${need} 趟` : `还差 ${need - done} 趟${name}`
+    }
+  }
+  if (kind === 'codex') {
+    const need = countOf(unlock.count)
+    const done = Math.min(owned, need)
+    return {
+      unlocked: owned >= need,
+      requirement: `图鉴 ${need} 件`,
+      progress: `图鉴 ${done}/${need}`
+    }
+  }
+  if (kind === 'codex-trips') {
+    const need = countOf(unlock.count)
+    const needTrips = countOf(unlock.trips)
+    const done = Math.min(owned, need)
+    const doneTrips = Math.min(tripCount(unlock.routeId), needTrips)
+    const name = routeLabel(unlock.routeId)
+    return {
+      unlocked: owned >= need && doneTrips >= needTrips,
+      requirement: `图鉴 ${need} 件 · 走过 ${needTrips} 趟${name}`,
+      progress: `图鉴 ${done}/${need} · ${name} ${doneTrips}/${needTrips}`
+    }
+  }
+  return { unlocked: true, requirement: '默认开放', progress: '已开放' }
+}
+
+/** 这一趟算不算「已回家」：走满与见好就收算，翻车（failed）与还在路上的不算。 */
+export function homedRun (run) {
+  if (run === null || typeof run !== 'object') return false
+  if (run.ended !== 'complete' && run.ended !== 'back') return false
+  return routeOf(run.routeId) !== null
+}
+
+/**
+ * 记一趟「已回家」的行程：只认 complete/back，按路线累加。
+ * 纯函数，返回新的计数对象；不算数的 run 原样返回入参。落盘层负责写回。
+ */
+export function recordTrip (trips, run) {
+  const base = trips !== null && typeof trips === 'object' && !Array.isArray(trips) ? trips : {}
+  if (!homedRun(run)) return base
+  return { ...base, [run.routeId]: countOf(base[run.routeId]) + 1 }
 }
 
 /**

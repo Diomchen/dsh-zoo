@@ -19,9 +19,11 @@
     tabTravel: el('tabTravel'),
     tabCodex: el('tabCodex'),
     travelPane: el('travelPane'),
+    routes: el('routes'),
     home: el('home'),
     routeName: el('routeName'),
     routeHint: el('routeHint'),
+    routeDesc: el('routeDesc'),
     start: el('start'),
     homeNote: el('homeNote'),
     trip: el('trip'),
@@ -37,6 +39,7 @@
     doneTitle: el('doneTitle'),
     settle: el('settle'),
     again: el('again'),
+    browse: el('browse'),
     codex: el('codex'),
     codexCount: el('codexCount'),
     codexProgress: el('codexProgress'),
@@ -48,14 +51,33 @@
   let pending = false
   let toastTimer = null
   let activeTab = 'travel'
+  /** 当前挑中的路线（只在 home 有意义；路上/结算时以 run.routeId 为准）。 */
+  let selectedRoute = null
+  /** 结算后点了「换条路线」：暂时把 home 翻出来挑路线，不等下一次出发。 */
+  let browsing = false
   /** 收到 view 那一刻的本地时间；倒计时按 now 在此之后的增量走。 */
   let receivedAt = 0
   let refreshAsked = false
 
+  /**
+   * 路线选择：优先保留玩家挑的那条；它不存在或锁上了就退回第一条已解锁的。
+   * 条件刚满足时下一次推送会重新算 unlocked，这里自然就挑得中。
+   */
+  function pickRoute (routes, wanted) {
+    const list = Array.isArray(routes) ? routes : []
+    const found = list.find((route) => route !== null && route.id === wanted)
+    if (found !== undefined && found.unlocked !== false) return wanted
+    const open = list.find((route) => route !== null && route.unlocked !== false)
+    if (open !== undefined) return open.id
+    return list.length > 0 ? list[0].id : null
+  }
+
   function activeRoute () {
-    if (state === null || !Array.isArray(state.routes) || state.routes.length === 0) return null
-    const runRouteId = state.run === null || state.run === undefined ? null : state.run.routeId
-    return state.routes.find((route) => route.id === runRouteId) ?? state.routes[0]
+    if (state === null) return null
+    const routes = Array.isArray(state.routes) ? state.routes : []
+    const runRouteId = state.run === null || state.run === undefined || browsing ? null : state.run.routeId
+    const wanted = runRouteId === null ? selectedRoute : runRouteId
+    return routes.find((route) => route !== null && route.id === wanted) ?? routes[0] ?? null
   }
 
   function toast (text) {
@@ -189,6 +211,45 @@
     if (codexActive) renderCodex()
   }
 
+  /** home 的路线卡列表：亮卡可点，灰卡写明解锁条件与进度、点不动。 */
+  function renderRoutes () {
+    ui.routes.textContent = ''
+    if (state === null) return
+    const selected = activeRoute()
+    for (const card of view.routeCards(state)) {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'routeCard'
+      button.dataset.locked = card.locked ? 'true' : 'false'
+      button.dataset.active = selected !== null && card.id === selected.id ? 'true' : 'false'
+
+      const name = document.createElement('span')
+      name.className = 'name'
+      name.textContent = card.name
+      button.appendChild(name)
+
+      const hint = document.createElement('span')
+      hint.className = 'hint'
+      hint.textContent = card.hint
+      button.appendChild(hint)
+
+      if (card.locked) {
+        const lock = document.createElement('span')
+        lock.className = 'lock'
+        lock.textContent = '解锁条件：' + card.requirement + '（' + card.progress + '）'
+        button.appendChild(lock)
+        button.disabled = true
+        button.title = '还没解锁：' + card.progress
+      } else {
+        button.addEventListener('click', () => {
+          selectedRoute = card.id
+          paint()
+        })
+      }
+      ui.routes.appendChild(button)
+    }
+  }
+
   function paint () {
     const run = state === null ? null : state.run
     const route = activeRoute()
@@ -200,17 +261,17 @@
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
 
-    if (run === null) {
+    if (run === null || (browsing && !view.isActiveRun(run))) {
+      browsing = run !== null
       ui.home.hidden = false
       ui.trip.hidden = true
       ui.done.hidden = true
+      renderRoutes()
       if (route !== null) {
         ui.routeName.textContent = route.name
-        ui.routeHint.textContent =
-          '盘缠 ' + view.formatCoins(route.fare) +
-          ' · ' + String(route.minLegs) + '–' + String(route.maxLegs) + ' 段 · 每段回 ' +
-          view.formatCoins(Math.round(route.coinBase * 0.75)) + '–' +
-          view.formatCoins(Math.round(route.coinBase * 1.25)) + ' 枚'
+        ui.routeHint.textContent = view.routeHint(route)
+        ui.routeDesc.textContent =
+          '交一次盘缠，走进' + route.name + '。每走一段掉一笔硬币；见好就收只带回已经走过的段数，盘缠不退。'
         ui.start.textContent = '交 ' + view.formatCoins(route.fare) + ' 盘缠，出发'
       }
       const allowed = route !== null && view.canStart(state, route)
@@ -220,6 +281,7 @@
 
     const active = view.isActiveRun(run)
     if (active) {
+      browsing = false
       ui.home.hidden = true
       ui.trip.hidden = false
       ui.done.hidden = true
@@ -267,6 +329,7 @@
   function applyState (next) {
     if (next === null || typeof next !== 'object') return
     state = next
+    selectedRoute = pickRoute(next.routes, selectedRoute)
     receivedAt = Date.now()
     refreshAsked = false
     paint()
@@ -282,7 +345,12 @@
   ui.again.addEventListener('click', () => {
     const route = activeRoute()
     if (route === null) return
+    browsing = false
     send({ action: 'expedition-start', routeId: route.id })
+  })
+  ui.browse.addEventListener('click', () => {
+    browsing = true
+    paint()
   })
   ui.continue.addEventListener('click', () => send({ action: 'expedition-step' }))
   ui.back.addEventListener('click', () => send({ action: 'expedition-back' }))

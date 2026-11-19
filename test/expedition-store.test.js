@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { legCoins, legsFor, rollSouvenir, routeOf, sumCoins, wipedOut } from '../src/expedition.js'
+import { SOUVENIR_IDS, legCoins, legsFor, rollSouvenir, routeOf, sumCoins, wipedOut } from '../src/expedition.js'
 import { EXPEDITION_FILE, createExpeditionStore } from '../src/expedition-store.js'
 
 const T0 = 1_700_000_000_000
@@ -34,6 +34,16 @@ function doomedRunId (leg = 2) {
     if (wipedOut({ id, routeId: 'backhill' }, leg)) return id
   }
   throw new Error('没有找到会翻车的 runId')
+}
+
+/** 走一趟后山并见好就收：段 1 到点时不会掷翻车，所以这趟必定「已回家」。 */
+async function homedBackhillTrip (store, now) {
+  const started = await store.start({ routeId: 'backhill' })
+  assert.equal(started.ok, true)
+  await store.tick(now)
+  const home = await store.back(now)
+  assert.equal(home.ok, true)
+  assert.equal(home.settled.ended, 'back')
 }
 
 async function tempDir (t) {
@@ -76,8 +86,9 @@ test('初始化：空目录落一份空存档，货架/图鉴/提灯都有完整
   assert.equal(snap.codexView.owned, 0)
   assert.equal(snap.codexView.slots.length, 32)
   assert.deepEqual(snap.upgrades, { lantern: false })
+  assert.deepEqual(snap.trips, {}, '还没回过家的趟')
   assert.equal(store.active(), false)
-  assert.deepEqual(await readState(dir), { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false } })
+  assert.deepEqual(await readState(dir), { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false }, trips: {} })
 })
 
 test('出发先扣 500 盘缠：硬币变 0，run 落盘为 walking', async (t) => {
@@ -109,10 +120,92 @@ test('硬币不足整趟不开始：499 被拒，run 仍是空，文件里没有
 test('没有路线 / 没有农场时的拒绝理由', async (t) => {
   const dir = await tempDir(t)
   const store = await createExpeditionStore(dir, { farm: fakeFarm(500), now: () => T0 })
-  assert.deepEqual(await store.start({ routeId: 'mine' }), { ok: false, error: 'no-route' })
+  assert.deepEqual(await store.start({ routeId: 'nowhere' }), { ok: false, error: 'no-route' })
 
   const bare = await createExpeditionStore(await tempDir(t), { now: () => T0 })
   assert.deepEqual(await bare.start({ routeId: 'backhill' }), { ok: false, error: 'starting' })
+})
+
+test('解锁门控：废矿要 3 趟已回家的后山，第三趟回来当拍就放行', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(10000)
+  const clock = { value: T0 }
+  const store = await createExpeditionStore(dir, { farm, now: () => clock.value })
+
+  assert.deepEqual(await store.start({ routeId: 'mine' }), { ok: false, error: 'locked' })
+  assert.equal(farm.state.coins, 10000, '锁着的路线不扣盘缠')
+
+  await homedBackhillTrip(store, T0 + 20001)
+  await homedBackhillTrip(store, T0 + 40002)
+  assert.deepEqual(store.snapshot().trips, { backhill: 2 })
+  assert.deepEqual(await store.start({ routeId: 'mine' }), { ok: false, error: 'locked' })
+
+  await homedBackhillTrip(store, T0 + 60003)
+  assert.deepEqual(store.snapshot().trips, { backhill: 3 })
+  assert.deepEqual((await readState(dir)).trips, { backhill: 3 }, '趟数必须落盘')
+
+  const before = farm.state.coins
+  const started = await store.start({ routeId: 'mine' })
+  assert.equal(started.ok, true)
+  assert.equal(started.run.routeId, 'mine')
+  assert.equal(started.run.totalLegs, legsFor(routeOf('mine'), started.run.id))
+  assert.equal(farm.state.coins, before - 3000, '废矿的盘缠是 3,000')
+})
+
+test('翻车的趟不进解锁进度：失败两次后废矿仍然锁着', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(10000)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0, newRunId: () => doomedRunId(2) })
+  for (let i = 0; i < 2; i += 1) {
+    assert.equal((await store.start({ routeId: 'backhill' })).ok, true)
+    await store.tick(T0 + 20001)
+    const failed = await store.step(T0 + 20001)
+    assert.equal(failed.ok, true)
+    assert.equal(failed.settled.ended, 'failed')
+  }
+  assert.deepEqual(store.snapshot().trips, {}, '翻车不算回家的趟')
+  assert.deepEqual((await readState(dir)).trips, {})
+  assert.deepEqual(await store.start({ routeId: 'mine' }), { ok: false, error: 'locked' })
+})
+
+test('图鉴 16 件开老铁路；雾岭还要图鉴 24 件加 1 趟回家的老铁路', async (t) => {
+  const dir = await tempDir(t)
+  const codex = Object.fromEntries(SOUVENIR_IDS.slice(0, 16).map((id) => [id, T0]))
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({
+    version: 1,
+    run: null,
+    shelf: { slots: 8, items: [] },
+    codex,
+    upgrades: { lantern: false }
+  }), 'utf8')
+  const farm = fakeFarm(200000)
+  const first = await createExpeditionStore(dir, { farm, now: () => T0 })
+  assert.deepEqual(first.snapshot().trips, {})
+
+  const railway = await first.start({ routeId: 'railway' })
+  assert.equal(railway.ok, true)
+  await first.tick(T0 + 20001)
+  const home = await first.back(T0 + 20001)
+  assert.equal(home.ok, true)
+  assert.deepEqual(first.snapshot().trips, { railway: 1 })
+
+  // 图鉴还差 8 件：雾岭锁着，老铁路可以再走。
+  assert.deepEqual(await first.start({ routeId: 'mistridge' }), { ok: false, error: 'locked' })
+  assert.equal((await first.start({ routeId: 'railway' })).ok, true)
+  await first.tick(T0 + 40002)
+  await first.back(T0 + 40002)
+
+  const state = await readState(dir)
+  state.codex = Object.fromEntries(SOUVENIR_IDS.slice(0, 24).map((id) => [id, T0]))
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify(state), 'utf8')
+
+  const laterFarm = fakeFarm(200000)
+  const reloaded = await createExpeditionStore(dir, { farm: laterFarm, now: () => T0 })
+  assert.deepEqual(reloaded.snapshot().trips, { railway: 2 }, '重启后已回家的趟数还在')
+  const mist = await reloaded.start({ routeId: 'mistridge' })
+  assert.equal(mist.ok, true)
+  assert.equal(mist.run.routeId, 'mistridge')
+  assert.equal(laterFarm.state.coins, 200000 - 60000, '雾岭的盘缠是 60,000')
 })
 
 test('away 期间不能开第二趟：already-away 且不再扣钱', async (t) => {

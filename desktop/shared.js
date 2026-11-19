@@ -2879,7 +2879,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
           fare: nonNegative(route.fare),
           minLegs: nonNegative(route.minLegs),
           maxLegs: nonNegative(route.maxLegs),
-          coinBase: nonNegative(route.coinBase)
+          coinBase: nonNegative(route.coinBase),
+          // 票 117：显式 true 才算解锁；宿主没给就按灰卡画，宁可少开一条也不画错。
+          unlocked: route.unlocked === true,
+          requirement: normalizeLabel(route.requirement, ''),
+          progress: normalizeLabel(route.progress, '')
         }))
         .filter((route) => route.id !== '')
       : []

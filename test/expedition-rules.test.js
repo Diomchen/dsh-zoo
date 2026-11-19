@@ -5,6 +5,7 @@ import {
   DECISION_MS,
   LEG_MS,
   ROUTES,
+  ROUTE_IDS,
   advanceRun,
   backRun,
   dangerOf,
@@ -12,6 +13,7 @@ import {
   legsFor,
   legCoins,
   normalizeRun,
+  recordTrip,
   resumeRun,
   roll01,
   rollSouvenir,
@@ -19,7 +21,8 @@ import {
   settledOf,
   startRun,
   stepRun,
-  sumCoins
+  sumCoins,
+  unlockStatus
 } from '../src/expedition.js'
 
 const T0 = 1_700_000_000_000
@@ -65,17 +68,95 @@ function playRun (runId) {
 /** 后山一趟的段数由 runId 决定：这段取样要同时看到 3 段和 4 段。 */
 const RUN_IDS = Array.from({ length: 200 }, (_, i) => 'run-' + String(i))
 
-test('后山是唯一路线：500 盘缠、3–4 段、每段回币 3% 带 25% 抖动', () => {
-  const route = routeOf('backhill')
-  assert.equal(route, ROUTES.backhill)
-  assert.equal(route.name, '后山')
-  assert.equal(route.fare, 500)
-  assert.equal(route.minLegs, 3)
-  assert.equal(route.maxLegs, 4)
-  assert.equal(route.coinRate, 0.03)
-  assert.equal(route.coinJitter, 0.25)
-  assert.equal(routeOf('mine'), null)
+test('四条路线：盘缠、段数与基础危险照票面/手册，走满一趟净烧 80.5%–89.5%', () => {
+  const backhill = routeOf('backhill')
+  assert.equal(backhill, ROUTES.backhill)
+  assert.equal(backhill.name, '后山')
+  assert.equal(backhill.fare, 500)
+  assert.equal(backhill.minLegs, 3)
+  assert.equal(backhill.maxLegs, 4)
+  assert.equal(backhill.dangerBase, 0.05)
+
+  const expected = {
+    mine: { name: '废矿', fare: 3000, minLegs: 4, maxLegs: 5, dangerBase: 0.08 },
+    railway: { name: '老铁路', fare: 15000, minLegs: 5, maxLegs: 6, dangerBase: 0.1 },
+    mistridge: { name: '雾岭', fare: 60000, minLegs: 6, maxLegs: 7, dangerBase: 0.12 }
+  }
+  assert.deepEqual([...ROUTE_IDS], ['backhill', 'mine', 'railway', 'mistridge'])
+  for (const [id, want] of Object.entries(expected)) {
+    const route = routeOf(id)
+    assert.ok(route !== null, id + ' 应该是已知路线')
+    assert.equal(route.id, id)
+    assert.equal(route.name, want.name)
+    assert.equal(route.fare, want.fare)
+    assert.equal(route.minLegs, want.minLegs)
+    assert.equal(route.maxLegs, want.maxLegs)
+    assert.equal(route.dangerBase, want.dangerBase)
+    assert.equal(route.coinRate, 0.03)
+    assert.equal(route.coinJitter, 0.25)
+    assert.equal(route.dangerPerLeg, 0.03)
+    // 走满一趟的期望净烧：段数取区间中点、每段回 3%。
+    const burn = Math.round((1 - route.coinRate * ((route.minLegs + route.maxLegs) / 2)) * 1000) / 1000
+    assert.ok(burn >= 0.805 && burn <= 0.895, id + ' 净烧越界：' + burn)
+  }
   assert.equal(routeOf(null), null)
+  assert.equal(routeOf('nowhere'), null)
+})
+
+test('解锁链：后山无条件；废矿要 3 趟回家的后山；老铁路要图鉴 16 件', () => {
+  const none = { trips: {}, codexOwned: 0 }
+  assert.deepEqual(unlockStatus(routeOf('backhill'), none), {
+    unlocked: true,
+    requirement: '默认开放',
+    progress: '已开放'
+  })
+
+  assert.deepEqual(unlockStatus(routeOf('mine'), none), {
+    unlocked: false,
+    requirement: '走过 3 趟后山',
+    progress: '还差 3 趟后山'
+  })
+  assert.equal(unlockStatus(routeOf('mine'), { trips: { backhill: 1 }, codexOwned: 0 }).progress, '还差 2 趟后山')
+  assert.deepEqual(unlockStatus(routeOf('mine'), { trips: { backhill: 3 }, codexOwned: 0 }), {
+    unlocked: true,
+    requirement: '走过 3 趟后山',
+    progress: '后山 3/3 趟'
+  })
+
+  assert.deepEqual(unlockStatus(routeOf('railway'), { codexOwned: 13 }), {
+    unlocked: false,
+    requirement: '图鉴 16 件',
+    progress: '图鉴 13/16'
+  })
+  assert.deepEqual(unlockStatus(routeOf('railway'), { codexOwned: 16 }), {
+    unlocked: true,
+    requirement: '图鉴 16 件',
+    progress: '图鉴 16/16'
+  })
+})
+
+test('解锁链：雾岭要图鉴 24 件且走过 1 趟老铁路，缺一不可', () => {
+  const locked = unlockStatus(routeOf('mistridge'), { codexOwned: 23, trips: {} })
+  assert.deepEqual(locked, {
+    unlocked: false,
+    requirement: '图鉴 24 件 · 走过 1 趟老铁路',
+    progress: '图鉴 23/24 · 老铁路 0/1'
+  })
+  const half = unlockStatus(routeOf('mistridge'), { codexOwned: 24, trips: {} })
+  assert.equal(half.unlocked, false)
+  assert.equal(half.progress, '图鉴 24/24 · 老铁路 0/1')
+  const ready = unlockStatus(routeOf('mistridge'), { codexOwned: 30, trips: { railway: 1 } })
+  assert.equal(ready.unlocked, true)
+  assert.equal(ready.progress, '图鉴 24/24 · 老铁路 1/1')
+})
+
+test('回家的趟才计数：走满/见好就收算，翻车与还在路上不算', () => {
+  assert.deepEqual(recordTrip({}, { routeId: 'mine', ended: 'complete' }), { mine: 1 })
+  assert.deepEqual(recordTrip({ mine: 2 }, { routeId: 'mine', ended: 'back' }), { mine: 3 })
+  assert.deepEqual(recordTrip({ mine: 2 }, { routeId: 'mine', ended: 'failed' }), { mine: 2 })
+  assert.deepEqual(recordTrip({ mine: 2 }, { routeId: 'mine', phase: 'walking', ended: null }), { mine: 2 })
+  assert.deepEqual(recordTrip({ mine: 2 }, { routeId: 'nowhere', ended: 'complete' }), { mine: 2 })
+  assert.deepEqual(recordTrip(null, { routeId: 'railway', ended: 'complete' }), { railway: 1 })
 })
 
 test('段数只落在 3–4，且两个值都出现', () => {
