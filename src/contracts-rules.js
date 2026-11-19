@@ -44,6 +44,8 @@ export const WORK_ERRORS = Object.freeze([
   'own-pet',
   'worker-unavailable',
   'already-working',
+  // 票 119：宠物在出远门。只在本地动作里出现；跨机器 work-ack 仍用老码。
+  'already-away',
   'already-hired',
   'bad-wage',
   'bad-hours',

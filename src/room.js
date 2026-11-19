@@ -208,6 +208,21 @@ export function createRoom ({
     discardedGifts: new Set()
   }
 
+  // 票 119：出远门是第三种「宠物不在家」。真相在 expedition-store；room 不存镜像位，
+  // 只持一个惰性询问器——store.tick() 可能被测试或别处直接调用，写死的镜像会残留成
+  // 「已经回家了，看家却还是 0」。互斥判断因此仍然只有 room 这一处。
+  let awayProvider = null
+
+  function expeditionAway () {
+    if (awayProvider === null) return false
+    try {
+      return awayProvider() === true
+    } catch {
+      // 询问器出错时按「在家」处理：宁可少挡一次出门，也不能把看家永久关掉。
+      return false
+    }
+  }
+
   function nowMs () {
     const stamp = clock()
     return Number.isFinite(stamp) ? stamp : Date.now()
@@ -703,7 +718,9 @@ export function createRoom ({
     if (out.phase !== 'requesting') return { ok: false, error: 'already-there' }
     const now = stampOf(at)
     state.out = null
-    const code = reason === 'peer-offline' || reason === 'timeout' || reason === 'denied' || reason === 'visits-off'
+    // 票 119：already-away 是对方家里没人的明确回执，不能塌成 peer-offline。
+    const code = reason === 'peer-offline' || reason === 'timeout' || reason === 'denied' ||
+      reason === 'visits-off' || reason === 'already-away'
       ? reason
       : 'peer-offline'
     const notice = pushNotice(visitReasonText(code, out.nickname), now)
@@ -901,6 +918,15 @@ export function createRoom ({
     setAutoVisits (enabled) {
       if (typeof enabled === 'boolean') state.autoVisits = enabled
       return state.autoVisits
+    },
+
+    /**
+     * 票 119：由 service 注入「宠物是不是在出远门」的询问器（真相在 expedition-store）。
+     * 传 null 摘掉。每次判断都现问，所以出门/回家不需要谁去同步一个镜像位。
+     */
+    setAwayProvider (provider) {
+      awayProvider = typeof provider === 'function' ? provider : null
+      return expeditionAway()
     },
 
     /**
@@ -1219,6 +1245,13 @@ export function createRoom ({
         return { ok: false, error: 'already-working', notice: notice === null ? null : notice.text }
       }
 
+      // 票 119：出远门期间（含自动串门）同样走不出去。前两条已经说清了「串门/打工」，
+      // 这里只剩「远门」，所以文案不重复那两种。
+      if (expeditionAway()) {
+        const notice = pushNotice(visitReasonText('already-away'), now)
+        return { ok: false, error: 'already-away', notice: notice === null ? null : notice.text }
+      }
+
       const deviceId = normalizeDeviceId(rawDeviceId)
       if (deviceId === null) return { ok: false, error: 'bad-device-id' }
       if (!isVisitId(visitId)) return { ok: false, error: 'bad-visit-id' }
@@ -1309,7 +1342,10 @@ export function createRoom ({
       if (out === null || out.deviceId !== deviceId || out.visitId !== visitId) {
         return { ok: false, error: 'no-visit' }
       }
-      const reason = peer?.reason === 'visits-off' ? 'visits-off' : 'denied'
+      // 票 119：already-away 也要原样透出，否则发起方只会看到「没放行你」。
+      const reason = peer?.reason === 'visits-off' || peer?.reason === 'already-away'
+        ? peer.reason
+        : 'denied'
       return failOutbound(reason, at)
     },
 
@@ -1399,6 +1435,12 @@ export function createRoom ({
       if (!raiding && !canTalkTo(deviceId)) {
         // 未知/未放行/已拒绝：给发起方一句明确的 deny，不创建任何本机状态。
         return { reply: 'deny', deviceId, visitId, reason: 'not-admitted' }
+      }
+      // 票 119：宠物出了远门，家里没人待客。放在放行判断之后——不认识的邻居先拿
+      // not-admitted，不能借这个回执探出「家里有没有人」。来偷的不受影响：看家下降
+      // 正是出远门的代价。
+      if (!raiding && expeditionAway()) {
+        return { reply: 'deny', deviceId, visitId, reason: 'already-away' }
       }
 
       const now = stampOf(at)
@@ -1641,6 +1683,11 @@ export function createRoom ({
         return { ok: false, error: 'already-out', notice: notice === null ? null : notice.text }
       }
       if (state.work !== null) return { ok: false, error: 'already-working' }
+      // 票 119：出远门期间（含自动接活）接不了合同。
+      if (expeditionAway()) {
+        const notice = pushNotice(visitReasonText('already-away'), now)
+        return { ok: false, error: 'already-away', notice: notice === null ? null : notice.text }
+      }
       const contractId = normalizeVisitId(contract.contractId)
       const employerDeviceId = normalizeDeviceId(contract.employerDeviceId)
       if (contractId === null || employerDeviceId === null) return { ok: false, error: 'bad-contract' }
@@ -1750,6 +1797,36 @@ export function createRoom ({
     /** 当前出门状态（拷贝），service 的重试计时器用它判断是否还该重发。 */
     outboundVisit () {
       return copyOutbound(state.out)
+    },
+
+    /**
+     * 票 119：宠物是不是在出远门（第三种「不在家」）。串门/打工仍由 out/work 回答，
+     * 这里只指远门；呼叫方要问「三种里任意一种」用 awayReason()。
+     */
+    away () {
+      return expeditionAway()
+    },
+
+    /**
+     * 票 119：出门三种状态的唯一判定处——'visiting' / 'working' / 'expedition' / null。
+     * service 的 expeditionStart 与看家公式都从这里取，不再各写一套。
+     */
+    awayReason () {
+      if (state.out !== null) return 'visiting'
+      if (state.work !== null) return 'working'
+      if (expeditionAway()) return 'expedition'
+      return null
+    },
+
+    /**
+     * 票 119：入站 work-request 的「现在接不了」判定。返回 null 表示可以继续往
+     * 挂牌/工钱那几步走。码沿用合同的老枚举（worker-unavailable / already-working），
+     * 因为这是跨机器 ack：新码对端认不出会整包丢弃，发起方只能等到超时。
+     */
+    incomingWorkError () {
+      if (state.out !== null || expeditionAway()) return 'worker-unavailable'
+      if (state.work !== null) return 'already-working'
+      return null
     },
 
     /** 完成但还没落盘的记录；service 每次 tick/action 后取走写 visits.json。 */
