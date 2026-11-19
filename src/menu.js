@@ -42,6 +42,8 @@ export const MENU_TOOL_LABELS = Object.freeze({
   trading: '盘口',
   // 票 93：打开期货小窗（周合约、房主清算）。数据由宿主随 `futures-window` 命令下发。
   futures: '期货',
+  // 票 112：打开出远门小窗（烧硬币换特产）。数据由宿主随 `expedition-window` 命令下发。
+  expedition: '出远门',
   home: '回到初始位置',
   reload: '重载配置',
   // ticket 37：扫 dsh-pet 的宠物包目录，把没见过的素材加进 skin.json。
@@ -133,6 +135,8 @@ export function menuTools ({ hasOrigin = false } = {}) {
   tools.push({ id: 'trading', label: MENU_TOOL_LABELS.trading })
   // 「期货」（票 93）：做市商给连续报价，一个人也能开仓。
   tools.push({ id: 'futures', label: MENU_TOOL_LABELS.futures })
+  // 「出远门」（票 112）：本机玩法，扣自己的硬币，没有邻居也能走。
+  tools.push({ id: 'expedition', label: MENU_TOOL_LABELS.expedition })
   tools.push({ id: 'home', label: MENU_TOOL_LABELS.home })
   tools.push({ id: 'reload', label: MENU_TOOL_LABELS.reload })
   tools.push({ id: 'scan-skins', label: MENU_TOOL_LABELS['scan-skins'] })

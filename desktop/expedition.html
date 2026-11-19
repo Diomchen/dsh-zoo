@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>出远门</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' dshzoo:">
+<style>
+  :root {
+    --paper: #f1ede6;
+    --card: #fffdf8;
+    --ink: #3f3428;
+    --muted: #857a68;
+    --line: #3f3428;
+    --soft: #e4dac6;
+    --accent: #b87333;
+    --radius: 8px;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    width: 620px; height: 580px; overflow: hidden;
+    background: var(--paper); color: var(--ink);
+    font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  [hidden] { display: none !important; }
+  #app {
+    display: grid; height: 100%;
+    grid-template-rows: 52px minmax(0, 1fr) 26px;
+    border: 2px solid var(--line);
+    border-radius: 20px 18px 22px 16px;
+    background: var(--paper);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .9);
+    overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 0 14px;
+    border-bottom: 2px solid var(--line); background: var(--card);
+    /* 无边框窗口没有系统标题栏：顶栏整条是拖动区，控件单独排除。 */
+    -webkit-app-region: drag;
+  }
+  header button { -webkit-app-region: no-drag; }
+  header .brand { font-weight: 700; letter-spacing: .08em; font-size: 15px; }
+  header .coins { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; }
+  header .coins b { color: var(--ink); font-size: 15px; }
+  .winClose {
+    flex: none; width: 26px; height: 26px; padding: 0; margin-left: 2px;
+    display: grid; place-items: center;
+    border: 2px solid var(--line); border-radius: 50% 46% 52% 48%;
+    background: transparent; color: var(--ink);
+    font: 600 15px/1 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    cursor: pointer;
+  }
+  .winClose:hover { background: var(--ink); color: var(--paper); }
+  main { min-height: 0; overflow: auto; padding: 14px; }
+  .card {
+    border: 1px solid var(--soft); border-radius: var(--radius);
+    background: var(--card); padding: 14px 16px;
+  }
+  .card + .card { margin-top: 12px; }
+  h2 { margin: 0 0 6px; font-size: 18px; letter-spacing: .04em; }
+  .hint { margin: 0 0 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .desc { margin: 0 0 14px; color: var(--muted); }
+  .note { min-height: 1.5em; margin: 10px 0 0; color: var(--accent); }
+  button {
+    border: 2px solid var(--line); border-radius: var(--radius);
+    background: transparent; color: var(--ink);
+    padding: 6px 14px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: var(--ink); color: var(--paper); }
+  button:disabled { opacity: .45; cursor: default; }
+  button.primary { background: var(--accent); border-color: var(--ink); color: #fffdf8; }
+  button.primary:hover:not(:disabled) { background: var(--ink); }
+  .actions { display: flex; gap: 10px; margin-top: 14px; }
+  .tripTop {
+    display: flex; align-items: baseline; gap: 10px;
+    font-variant-numeric: tabular-nums;
+  }
+  .tripTop .clock { margin-left: auto; color: var(--accent); font-size: 20px; font-weight: 700; }
+  .legs { display: flex; gap: 6px; margin: 11px 0 8px; }
+  .leg {
+    flex: 1; height: 10px; border: 1px solid var(--line); border-radius: 999px;
+    background: transparent;
+  }
+  .leg.done { background: var(--accent); }
+  .leg.current { background: #f0d9b8; }
+  .progress { margin: 0; font-variant-numeric: tabular-nums; }
+  .danger { margin: 4px 0 0; color: var(--muted); }
+  .loot { margin: 4px 0 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+  footer {
+    padding: 0 14px; display: flex; align-items: center;
+    color: var(--accent); font-size: 12px;
+    border-top: 1px solid var(--soft); background: var(--card);
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span class="brand">出远门</span>
+    <span class="coins">硬币 <b id="coins">0</b></span>
+    <button class="winClose" id="close" title="关窗">×</button>
+  </header>
+  <main>
+    <section class="card" id="home">
+      <h2 id="routeName">后山</h2>
+      <p class="hint" id="routeHint">盘缠 500 · 3–4 段 · 每段回 11–19 枚</p>
+      <p class="desc">交一次盘缠，走进后山。每走一段掉一笔硬币；见好就收只带回已经走过的段数，盘缠不退。</p>
+      <button class="primary" id="start">交 500 盘缠，出发</button>
+      <p class="note" id="homeNote"></p>
+    </section>
+
+    <section class="card" id="trip" hidden>
+      <div class="tripTop">
+        <b id="phase">正在走路</b>
+        <span class="clock" id="clock">0:20</span>
+      </div>
+      <div class="legs" id="legs"></div>
+      <p class="progress" id="progress">已走 1 / 4 段</p>
+      <p class="danger" id="danger"></p>
+      <p class="loot" id="loot"></p>
+      <div class="actions">
+        <button class="primary" id="continue" disabled>走路中…</button>
+        <button id="back" disabled>见好就收</button>
+      </div>
+    </section>
+
+    <section class="card" id="done" hidden>
+      <h2 id="doneTitle">回家了</h2>
+      <p class="desc" id="settle"></p>
+      <button class="primary" id="again">再走一趟</button>
+    </section>
+  </main>
+  <footer><span id="toast"></span></footer>
+</div>
+<script src="expedition-view.js"></script>
+<script src="expedition.js"></script>
+</body>
+</html>

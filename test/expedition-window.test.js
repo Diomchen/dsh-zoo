@@ -1,0 +1,376 @@
+/**
+ * 票 112：出远门小窗（不开 Electron）。
+ *
+ * 覆盖：
+ *   1. 纯视图模型：倒计时、已走段数、结算文案、按钮可用性；
+ *   2. `desktop/shared.js` 的白名单：`expedition-window` 命令、四个提交动作、
+ *      菜单里的「出远门」、坏形状整条拒绝；
+ *   3. 宿主侧：开窗下发整份视图；再点一次关窗；走一段后刷新；没有桌面层是 `desktop-off`。
+ */
+import assert from 'node:assert/strict'
+import { createRequire } from 'node:module'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import test from 'node:test'
+
+import shared from '../desktop/shared.js'
+import { FARM_FILE } from '../src/farm.js'
+import { createService } from '../src/service.js'
+
+const require = createRequire(import.meta.url)
+const view = require('../desktop/expedition-view.js')
+
+const T0 = 1_700_000_000_000
+
+function sampleRun (overrides = {}) {
+  return {
+    id: 'run-1',
+    routeId: 'backhill',
+    routeName: '后山',
+    phase: 'walking',
+    leg: 1,
+    totalLegs: 4,
+    until: T0 + 20_000,
+    loot: [{ kind: 'coin', qty: 15 }],
+    startedAt: T0,
+    ended: null,
+    endedAt: 0,
+    danger: '中',
+    ...overrides
+  }
+}
+
+function sampleView (overrides = {}) {
+  return {
+    ready: true,
+    version: 1,
+    run: sampleRun(),
+    coins: 520,
+    now: T0,
+    away: 'expedition',
+    routes: [{ id: 'backhill', name: '后山', fare: 500, minLegs: 3, maxLegs: 4, coinBase: 15 }],
+    shelf: { slots: 8, items: [] },
+    codex: {},
+    upgrades: { lantern: false },
+    ...overrides
+  }
+}
+
+test('视图模型：倒计时向上取整，归零就是 0:00', () => {
+  assert.equal(view.formatClock(20_000), '0:20')
+  assert.equal(view.formatClock(19_001), '0:20')
+  assert.equal(view.formatClock(0), '0:00')
+  assert.equal(view.formatClock(-5), '0:00')
+  assert.equal(view.remainingMs(sampleRun(), T0 + 5_000), 15_000)
+  assert.equal(view.remainingMs(sampleRun({ until: null }), T0), 0)
+})
+
+test('视图模型：阶段、已走段数与危险度都是人话', () => {
+  assert.equal(view.phaseLabel(sampleRun()), '正在走路')
+  assert.equal(view.phaseLabel(sampleRun({ phase: 'deciding' })), '想想要不要继续')
+  assert.equal(view.phaseLabel(sampleRun({ phase: null, ended: 'complete' })), '走满了，已经回家')
+  assert.equal(view.phaseLabel(sampleRun({ phase: null, ended: 'back' })), '见好就收，已经回家')
+  assert.equal(view.progressText(sampleRun({ leg: 2, totalLegs: 4 })), '已走 2 / 4 段')
+  assert.equal(view.dangerText(sampleRun({ danger: '低' })), '危险度 低')
+})
+
+test('视图模型：见好就收只按已走段数的战利品算钱', () => {
+  const run = sampleRun({
+    phase: null,
+    ended: 'back',
+    leg: 2,
+    loot: [{ kind: 'coin', qty: 12 }, { kind: 'coin', qty: 14 }]
+  })
+  assert.equal(view.sumLoot(run), 26)
+  assert.equal(view.settleText(run), '见好就收，带回 26 枚硬币')
+  const complete = sampleRun({ phase: null, ended: 'complete', leg: 4, loot: [{ kind: 'coin', qty: 52 }] })
+  assert.equal(view.settleText(complete), '走满全程，带回 52 枚硬币')
+})
+
+test('视图模型：按钮只在决策窗可用，硬币不够不能出发', () => {
+  const route = { fare: 500 }
+  assert.equal(view.canStart({ run: null, coins: 500 }, route), true)
+  assert.equal(view.canStart({ run: null, coins: 499 }, route), false)
+  assert.equal(view.canStart({ run: sampleRun(), coins: 9999 }, route), false)
+  assert.equal(view.canContinue(sampleRun()), false)
+  assert.equal(view.canContinue(sampleRun({ phase: 'deciding' })), true)
+  assert.equal(view.canBack(sampleRun({ phase: 'deciding' })), true)
+  assert.equal(view.primaryLabel(sampleRun()), '走路中…')
+  assert.equal(view.primaryLabel(sampleRun({ phase: 'deciding' })), '继续走一段')
+  assert.equal(view.primaryLabel(sampleRun({ phase: null, ended: 'back' })), '再走一趟')
+})
+
+test('shared：expedition-window 命令与窗口状态事件', () => {
+  const normalized = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c1',
+    open: true,
+    state: sampleView()
+  })
+  assert.equal(normalized.ok, true)
+  assert.equal(normalized.command.open, true)
+  assert.equal('close' in normalized.command, false)
+  assert.equal(normalized.command.state.run.routeId, 'backhill')
+  assert.equal(normalized.command.state.routes.length, 1)
+
+  const closed = shared.normalizeHostCommand({ type: 'expedition-window', id: 'c2', close: true })
+  assert.equal(closed.ok, true)
+  assert.equal(closed.command.close, true)
+
+  const stateEvent = shared.normalizeHelperEvent({ type: 'expedition-window-state', id: 'e1', open: false })
+  assert.equal(stateEvent.ok, true)
+  assert.equal(stateEvent.event.open, false)
+
+  const shot = shared.normalizeHostCommand({ type: 'shot', id: 's1', path: 'C:\\tmp\\a.png', window: 'expedition' })
+  assert.equal(shot.ok, true)
+  assert.equal(shot.command.window, 'expedition')
+})
+
+test('shared：四个提交动作只过白名单字段，坏路线整条拒绝', () => {
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-step' }).action, 'expedition-step')
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-back' }).action, 'expedition-back')
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-refresh' }).action, 'expedition-refresh')
+  const start = shared.normalizeExpeditionAction({ action: 'expedition-start', routeId: 'backhill', coins: 1 })
+  assert.deepEqual(start, { action: 'expedition-start', routeId: 'backhill' })
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-start' }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-start', routeId: '' }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-wipeout' }), null)
+
+  const event = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'a1',
+    action: 'expedition-start',
+    routeId: 'backhill'
+  })
+  assert.equal(event.ok, true)
+  assert.equal(event.event.routeId, 'backhill')
+  const bad = shared.normalizeHelperEvent({ type: 'action', id: 'a2', action: 'expedition-start' })
+  assert.equal(bad.ok, false)
+  assert.equal(bad.error, 'bad-expedition-action')
+})
+
+test('shared：菜单里的「出远门」指向 expedition-open', () => {
+  assert.equal(shared.MENU_TOOL_REQUESTS.expedition, 'expedition-open')
+  assert.ok(shared.MENU_TOOL_IDS.includes('expedition'))
+  assert.ok(shared.MENU_ACTION_IDS.includes('expedition-open'))
+  for (const action of shared.EXPEDITION_SUBMIT_ACTIONS) {
+    assert.ok(shared.DESKTOP_ACTIONS.includes(action), action + ' 应该在 DESKTOP_ACTIONS 里')
+  }
+})
+
+function fakeCtx () {
+  const routes = []
+  return {
+    ctx: {
+      webServer: {
+        register (options) {
+          routes.push(options)
+          return () => {}
+        }
+      },
+      logger: { info () {}, warn () {} }
+    },
+    routes
+  }
+}
+
+async function tempDir (t) {
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-zoo-expedition-window-'))
+  t.after(() => rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }))
+  return dir
+}
+
+async function call (service, path, { method = 'GET', body } = {}) {
+  const route = service.routes.find((candidate) => candidate.path === path)
+  assert.ok(route, '应该注册 ' + path)
+  const res = {
+    statusCode: 0,
+    headers: {},
+    setHeader (key, value) { this.headers[key] = value },
+    end (payload) { this.payload = payload }
+  }
+  const req = {
+    method,
+    _listeners: {},
+    on (event, fn) {
+      this._listeners[event] = fn
+      return this
+    },
+    destroy () {}
+  }
+  const pending = route.handler(req, res)
+  if (body !== undefined) {
+    queueMicrotask(() => req._listeners.data?.(Buffer.from(JSON.stringify(body))))
+    queueMicrotask(() => req._listeners.end?.())
+  }
+  await pending
+  return { status: res.statusCode, body: res.payload ? JSON.parse(res.payload) : null }
+}
+
+function callAction (service, body) {
+  return call(service, '/dsh-zoo/action', { method: 'POST', body })
+}
+
+function desktopDouble () {
+  const calls = { expedition: [] }
+  let onEvent = null
+  let open = false
+  return {
+    calls,
+    factory (factoryOptions) {
+      onEvent = factoryOptions.onEvent
+      return {
+        start () { return { ok: true, pid: 4242 } },
+        update () { return true },
+        resync () { return true },
+        status () { return { expeditionOpen: open } },
+        expeditionWindow (payload) {
+          calls.expedition.push(payload)
+          if (payload.close === true) open = false
+          else if (payload.open === true) open = true
+          return true
+        },
+        lastCommandFailure () { return null },
+        actionResult () {},
+        dispose () {}
+      }
+    },
+    ready (workArea = { x: 0, y: 30, width: 1000, height: 700 }) {
+      onEvent?.({ type: 'ready', pid: 4242, workArea, displays: [{ id: 1, bounds: workArea, workArea, scaleFactor: 1, primary: true }] })
+    },
+    userClose () {
+      open = false
+      onEvent?.({ type: 'expedition-window-state', open: false })
+    }
+  }
+}
+
+async function makeService (t, dir, desktop, clock) {
+  const { ctx, routes } = fakeCtx()
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 620 }), 'utf8')
+  const service = createService(ctx, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    petBridge: false,
+    skinServer: false,
+    desktopFactory: desktop.factory,
+    farmNow: () => clock.value,
+    expeditionNow: () => clock.value
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  await service.ready
+  return service
+}
+
+test('宿主：开窗下发整份视图；再点一次关窗；× 之后能重开', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+
+  const opened = await callAction(service, { action: 'expedition-open' })
+  assert.equal(opened.status, 200)
+  assert.equal(opened.body.ok, true)
+  assert.equal(opened.body.window, 'opened')
+  const command = desktop.calls.expedition.at(-1)
+  assert.equal(command.open, true)
+  assert.equal(command.state.ready, true)
+  assert.equal(command.state.coins, 620)
+  assert.equal(command.state.run, null)
+  assert.deepEqual(command.state.routes.map((route) => route.id), ['backhill'])
+
+  const again = await callAction(service, { action: 'expedition-open' })
+  assert.equal(again.body.ok, true)
+  assert.equal(again.body.window, 'closed')
+  assert.equal(desktop.calls.expedition.at(-1).close, true)
+
+  desktop.userClose()
+  const reopened = await callAction(service, { action: 'expedition-open' })
+  assert.equal(reopened.body.window, 'opened')
+})
+
+test('宿主：出发扣盘缠，到点刷新成决策窗，继续走一段', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+
+  const started = await callAction(service, { action: 'expedition-start', routeId: 'backhill' })
+  assert.equal(started.body.ok, true)
+  assert.equal(started.body.run.phase, 'walking')
+  assert.equal(started.body.run.leg, 1)
+  const pushed = desktop.calls.expedition.at(-1)
+  assert.equal(pushed.open, false)
+  assert.equal(pushed.state.run.phase, 'walking')
+  assert.equal(pushed.state.coins, 120)
+
+  clock.value = T0 + 20_001
+  const refreshed = await callAction(service, { action: 'expedition-refresh' })
+  assert.equal(refreshed.body.ok, true)
+  const deciding = desktop.calls.expedition.at(-1).state.run
+  assert.equal(deciding.phase, 'deciding')
+  assert.equal(deciding.leg, 1)
+  assert.equal(deciding.loot.length, 1)
+  assert.ok(deciding.loot[0].qty >= 11 && deciding.loot[0].qty <= 19)
+
+  const stepped = await callAction(service, { action: 'expedition-step' })
+  assert.equal(stepped.body.ok, true)
+  const walking = desktop.calls.expedition.at(-1).state.run
+  assert.equal(walking.phase, 'walking')
+  assert.equal(walking.leg, 2)
+})
+
+test('宿主：见好就收只结算已走段数，盘缠不退', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  await callAction(service, { action: 'expedition-start', routeId: 'backhill' })
+  clock.value = T0 + 20_001
+  await callAction(service, { action: 'expedition-refresh' })
+
+  const back = await callAction(service, { action: 'expedition-back' })
+  assert.equal(back.body.ok, true)
+  assert.equal(back.body.settled.legs, 1)
+  assert.equal(back.body.settled.ended, 'back')
+  const settled = desktop.calls.expedition.at(-1).state
+  assert.equal(settled.run.ended, 'back')
+  assert.equal(settled.run.coins, undefined)
+  // 盘缠 500 不退；回币等于这一段捡到的那一笔。
+  assert.equal(settled.coins, 120 + back.body.settled.coins)
+})
+
+test('宿主：没有桌面层是 desktop-off，不写任何窗口命令', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const { ctx, routes } = fakeCtx()
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 620 }), 'utf8')
+  const service = createService(ctx, {
+    dataDir: dir,
+    petConfigPath: join(dir, 'missing.jsonc'),
+    network: false,
+    petBridge: false,
+    skinServer: false,
+    desktop: false,
+    farmNow: () => clock.value,
+    expeditionNow: () => clock.value
+  })
+  service.routes = routes
+  t.after(() => service.dispose())
+  await service.ready
+
+  const opened = await callAction(service, { action: 'expedition-open' })
+  assert.equal(opened.body.ok, false)
+  assert.equal(opened.body.error, 'desktop-off')
+  const refreshed = await callAction(service, { action: 'expedition-refresh' })
+  assert.equal(refreshed.body.ok, false)
+  assert.equal(refreshed.body.error, 'desktop-off')
+})

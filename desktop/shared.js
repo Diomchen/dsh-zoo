@@ -85,11 +85,11 @@
    * 一级 = 工具项 + 动作；「动作」下面是分类，分类下面是动画名。
    * 工具项是**固定集合**：渲染端只认这几个 id，不认识的直接丢——宿主不该借菜单下发任意命令。
    */
-  const MAX_MENU_TOOLS = 8
+  const MAX_MENU_TOOLS = 9
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'futures', 'home', 'reload', 'scan-skins']
+  // 票 79：`trading` = 右键「盘口」；票 112：`expedition` = 右键「出远门」。
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'futures', 'expedition', 'home', 'reload', 'scan-skins']
   /**
    * 右键工具项 → 宿主动作申请（评审 P2）：渲染端以前用一条 `id === 'reload' || …` 的
    * 手写链，多一个工具就要改两处。现在只有这一张表，`runMenuTool` 直接查它。
@@ -102,6 +102,7 @@
     farm: 'farm-open',
     trading: 'trading-open',
     futures: 'futures-window',
+    expedition: 'expedition-open',
     reload: 'reload',
     'scan-skins': 'scan-skins'
   })
@@ -375,7 +376,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     // 票 79：右键「盘口」只发一个空动作，开/关与整份视图都在宿主。
     ...BOARD_OPEN_ACTIONS,
     // 票 93：右键「期货」同理——空动作，宿主开窗并推整份视图。
-    'futures-window'
+    'futures-window',
+    // 票 112：右键「出远门」——开/关由宿主按真实窗口状态决定。
+    'expedition-open'
   ]
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
@@ -422,8 +425,26 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const FUTURES_MODES = ['off', 'shadow', 'live']
   /** 1.10.0：账户自己的档位——纸面还是真钱，每个账户自己选。 */
   const FUTURES_ACCOUNT_MODES = ['shadow', 'live']
+  /**
+   * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`
+   * 什么都不带，`refresh` 只请宿主补一拍。钱与段数全在宿主算。
+   */
+  const EXPEDITION_SUBMIT_ACTIONS = [
+    'expedition-start',
+    'expedition-step',
+    'expedition-back',
+    'expedition-refresh'
+  ]
+  /** 出远门的三个阶段 + 两种结局；窗口只画这几个词。 */
+  const EXPEDITION_PHASES = ['walking', 'deciding']
+  const EXPEDITION_ENDED = ['back', 'complete', 'failed']
 
-  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS, FUTURES_SUBMIT_ACTIONS)
+  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(
+    MENU_ACTION_IDS,
+    BOARD_SUBMIT_ACTIONS,
+    FUTURES_SUBMIT_ACTIONS,
+    EXPEDITION_SUBMIT_ACTIONS
+  )
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
   const MAX_ACTION_TEXT = 64
   /**
@@ -2755,8 +2776,96 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { action, side, margin, leverage, cropId }
   }
 
-  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
-  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
+  /**
+   * 出远门整份视图（票 112）：`/state.expedition` 与小窗推的是同一份。
+   * 坏字段一律降级——窗口宁可画「还没出门」，也不要因为一个 undefined 白屏。
+   */
+  function normalizeExpeditionView (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    /** 数字归一：坏值按 0，负数按 0（段数/回币/盘缠都不该为负）。 */
+    const num = (value, fallback = 0) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
+    const nonNegative = (value) => {
+      const result = num(value, 0)
+      return result < 0 ? 0 : result
+    }
+    let run = null
+    if (source.run !== null && typeof source.run === 'object' && !Array.isArray(source.run)) {
+      const phase = EXPEDITION_PHASES.includes(source.run.phase) ? source.run.phase : null
+      const ended = EXPEDITION_ENDED.includes(source.run.ended) ? source.run.ended : null
+      const loot = Array.isArray(source.run.loot)
+        ? source.run.loot
+          .slice(0, 16)
+          .filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item))
+          .map((item) => ({ kind: 'coin', qty: nonNegative(item.qty) }))
+        : []
+      const id = normalizeLabel(source.run.id, '')
+      const routeId = normalizeLabel(source.run.routeId, '')
+      if (id !== '' && routeId !== '') {
+        run = {
+          id,
+          routeId,
+          routeName: normalizeLabel(source.run.routeName, ''),
+          phase,
+          leg: nonNegative(source.run.leg),
+          totalLegs: nonNegative(source.run.totalLegs),
+          until: num(source.run.until, 0),
+          loot,
+          startedAt: num(source.run.startedAt, 0),
+          ended,
+          endedAt: num(source.run.endedAt, 0),
+          danger: normalizeLabel(source.run.danger, '')
+        }
+      }
+    }
+    const routes = Array.isArray(source.routes)
+      ? source.routes
+        .slice(0, 8)
+        .filter((route) => route !== null && typeof route === 'object' && !Array.isArray(route))
+        .map((route) => ({
+          id: normalizeLabel(route.id, ''),
+          name: normalizeLabel(route.name, ''),
+          fare: nonNegative(route.fare),
+          minLegs: nonNegative(route.minLegs),
+          maxLegs: nonNegative(route.maxLegs),
+          coinBase: nonNegative(route.coinBase)
+        }))
+        .filter((route) => route.id !== '')
+      : []
+    return {
+      ready: source.ready === true,
+      version: nonNegative(source.version),
+      run,
+      coins: nonNegative(source.coins),
+      now: num(source.now, 0),
+      away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
+      routes,
+      // 112 不画陈列架/图鉴/提灯，但形状留着：113 加窗口时不用再改协议。
+      shelf: { slots: 8, items: [] },
+      codex: {},
+      upgrades: { lantern: source.upgrades?.lantern === true }
+    }
+  }
+
+  /** `expedition-window` 命令：与期货同形——开/聚焦、刷新、`close:true` 关窗。 */
+  function normalizeExpeditionWindow (raw) {
+    return {
+      open: raw.open === true,
+      ...(raw.close === true ? { close: true } : {}),
+      state: normalizeExpeditionView(raw.state)
+    }
+  }
+
+  /** 出远门小窗提交的白名单：只认四个动作，`start` 必须带路线 id。 */
+  function normalizeExpeditionAction (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+    if (!EXPEDITION_SUBMIT_ACTIONS.includes(action)) return null
+    if (action !== 'expedition-start') return { action }
+    const routeId = normalizeLabel(raw.routeId, '')
+    return routeId === '' ? null : { action, routeId }
+  }
+
+  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
     if (raw === undefined || raw === null) return null
     if (!Array.isArray(raw)) return false
@@ -4076,6 +4185,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
        */
       case 'futures-window':
         return { ok: true, command: { type, id, ...normalizeFuturesWindow(raw) } }
+      /**
+       * 出远门小窗（票 112）：与期货同形——`open:true` 打开/聚焦，`open:false` 刷新，
+       * `close:true` 关窗。段数、回币与结算全在宿主，窗口只拿只读视图。
+       */
+      case 'expedition-window':
+        return { ok: true, command: { type, id, ...normalizeExpeditionWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
@@ -4088,7 +4203,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
               ? 'board'
               : raw.window === 'futures'
                 ? 'futures'
-                : null
+                : raw.window === 'expedition'
+                  ? 'expedition'
+                  : null
         return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
@@ -4445,6 +4562,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       case 'futures-window-state':
         // 票 93：期货小窗同理——关窗后右键「期货」必须能重新打开。
         return { ok: true, event: { type, id, open: raw.open === true } }
+      case 'expedition-window-state':
+        // 票 112：出远门小窗同理——×/Esc 关窗后，右键「出远门」必须能重新打开。
+        return { ok: true, event: { type, id, open: raw.open === true } }
       case 'action': {
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
         if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
@@ -4488,6 +4608,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         if (FUTURES_SUBMIT_ACTIONS.includes(action)) {
           const normalized = normalizeFuturesAction(raw)
           if (normalized === null) return { ok: false, error: 'bad-futures-action' }
+          return { ok: true, event: { type, id, ...normalized } }
+        }
+        // 出远门小窗（票 112）：只认四个动作；start 的 routeId 必须过白名单。
+        if (EXPEDITION_SUBMIT_ACTIONS.includes(action)) {
+          const normalized = normalizeExpeditionAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-expedition-action' }
           return { ok: true, event: { type, id, ...normalized } }
         }
         // 雇佣（ticket 44）：四个动作的字段与窗口提交共用同一条白名单。
@@ -5159,6 +5285,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     normalizeFuturesAction,
     normalizeFuturesWindow,
     normalizeFuturesView,
+    normalizeExpeditionAction,
+    normalizeExpeditionWindow,
+    normalizeExpeditionView,
+    EXPEDITION_SUBMIT_ACTIONS,
     FUTURES_SUBMIT_ACTIONS,
     FUTURES_LEVERAGES,
     normalizeSeason,
