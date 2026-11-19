@@ -14,8 +14,10 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
+import { publicExpeditionBlock } from '../src/farm-open.js'
 import { startLanServer } from '../src/lan-server.js'
 import { EXPEDITION_FILE } from '../src/expedition-store.js'
+import { TRIP_LOG_TITLE_MAX } from '../src/expedition.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
 
@@ -301,7 +303,8 @@ test('农场页宿主数据：自己看自己，陈列架 N 与公开视图同�
   const opened = await callAction(service, { action: 'farm-open' }, routes)
   assert.equal(opened.status, 200)
   const farm = desktop.calls.farm.at(-1).farm
-  assert.deepEqual(farm.expeditionShelf, { owned: 2, total: 32 })
+  // 评审 B4：字段叫 `expeditionCodexOwned`——它给的是**图鉴已集齐件数**，不是已开格数。
+  assert.deepEqual(farm.expeditionCodexOwned, { owned: 2, total: 32 })
   assert.equal(JSON.stringify(farm).includes('正文秘密'), false, '农场页拿不到日志正文')
 })
 
@@ -310,15 +313,15 @@ test('农场页宿主数据：没玩过也是一行零值，不报错', async (t
   const { service, desktop, routes } = await makeDesktopService(t, dir, false)
   const opened = await callAction(service, { action: 'farm-open' }, routes)
   assert.equal(opened.status, 200)
-  assert.deepEqual(desktop.calls.farm.at(-1).farm.expeditionShelf, { owned: 0, total: 32 })
+  assert.deepEqual(desktop.calls.farm.at(-1).farm.expeditionCodexOwned, { owned: 0, total: 32 })
 })
 
 test('白名单：农场窗与邻居视图都只留陈列架计数，缺省零值', () => {
   const farm = shared.normalizeFarm({
-    expeditionShelf: { owned: 5, total: 99, extra: '丢掉' }
+    expeditionCodexOwned: { owned: 5, total: 99, extra: '丢掉' }
   })
-  assert.deepEqual(farm.expeditionShelf, { owned: 5, total: 32 })
-  assert.deepEqual(shared.normalizeFarm({}).expeditionShelf, { owned: 0, total: 32 })
+  assert.deepEqual(farm.expeditionCodexOwned, { owned: 5, total: 32 })
+  assert.deepEqual(shared.normalizeFarm({}).expeditionCodexOwned, { owned: 0, total: 32 })
 
   const look = shared.normalizeFarmLook({
     deviceId: '11111111-1111-4111-8111-111111111111',
@@ -351,7 +354,7 @@ test('农场页入口行：顶栏「陈列架 N/32 · 点开看」，点开落�
 
   const farmJs = await readDesktop('farm.js')
   assert.match(farmJs, /function renderExpeditionEntry \(/)
-  assert.match(farmJs, /expeditionShelf/)
+  assert.match(farmJs, /expeditionCodexOwned/)
   assert.match(farmJs, /submit\(\{ action: 'expedition-open', tab: 'shelf' \}\)/)
 })
 
@@ -397,4 +400,77 @@ test('开窗落点的接线：命令、helper、窗口三处都认 tab', async (
 
   const farmPreload = await readDesktop('farm-preload.js')
   assert.match(farmPreload, /tab: action\.tab/)
+})
+
+test('日志标题上限：公开视图与窗口都截到 80 码点（三处同一口径）', async (t) => {
+  // 评审 B1：以前宿主写 80、公开视图（farm-open）与窗口（farm-fetch / shared）各截 120。
+  // 现在三处都读同一个 `TRIP_LOG_TITLE_MAX`。
+  assert.equal(TRIP_LOG_TITLE_MAX, 80)
+  const long = '远'.repeat(200)
+  const dir = await tempDir(t)
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({
+    version: 1,
+    run: null,
+    shelf: { slots: 8, items: [] },
+    codex: { herb: T0 },
+    upgrades: { lantern: false },
+    logs: [
+      { at: T0 - 1000, routeId: 'backhill', legs: 6, ended: 'back', title: long, body: long }
+    ]
+  }), 'utf8')
+  const service = await makeService(t, dir, false)
+  const published = service.openFarm(VIEWER).expedition.logs[0]
+  assert.equal(Array.from(published.title).length, TRIP_LOG_TITLE_MAX)
+
+  // 桌面侧同一份上限：长标题到了窗口也不会画成两屏。
+  const window = shared.normalizePublicExpedition({
+    codex: { owned: 1, total: 32 },
+    shelf: [],
+    logs: [{ title: long, at: T0 }]
+  })
+  assert.equal(Array.from(window.logs[0].title).length, TRIP_LOG_TITLE_MAX)
+})
+
+test('公开远征块：宿主与桌面的白名单 key 集合逐字一致（评审 B3）', () => {
+  // 白名单重建过三份（farm-open / farm-fetch / desktop shared）。src 侧已经并成
+  // `publicExpeditionBlock` 一份，桌面侧留自己那份，字段必须逐字对齐——多一个少一个都是漂移。
+  const raw = {
+    codex: { owned: 1, herb: T0 },
+    shelf: { slots: 8, items: ['herb', null] },
+    logs: [{ at: T0, routeId: 'backhill', legs: 6, ended: 'back', title: '第一趟', body: '正文秘密甲' }]
+  }
+  const host = publicExpeditionBlock(raw)
+  // 桌面侧吃的是**线上块**（shelf 已经是 8 个格子），不是快照。
+  const window = shared.normalizePublicExpedition(host)
+  assert.deepEqual(Object.keys(host).sort(), Object.keys(window).sort())
+  assert.deepEqual(Object.keys(host.codex).sort(), Object.keys(window.codex).sort())
+  assert.deepEqual(Object.keys(host.logs[0]).sort(), Object.keys(window.logs[0]).sort())
+  assert.deepEqual(Object.keys(host.shelf[0]).sort(), Object.keys(window.shelf[0]).sort())
+  assert.equal(host.shelf.length, window.shelf.length)
+  assert.equal(host.shelf[1], window.shelf[1], '空格子两边都是 null')
+})
+
+test('公开视图不泄漏：没有正文、没有未开格内容、没有图鉴时间戳（评审 E2）', async (t) => {
+  const dir = await tempDir(t)
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({
+    version: 1,
+    run: null,
+    // 明明只开了 8 格却塞了 12 件：第 9 件往后属于「未开格」，公开视图一件都不该带出去。
+    shelf: {
+      slots: 8,
+      items: ['herb', null, 'oddstone', null, null, null, null, null, 'amber', 'feather', 'ore', 'reed']
+    },
+    codex: { herb: T0, oddstone: T0 + 1, amber: T0 + 2 },
+    upgrades: { lantern: false },
+    logs: [{ at: T0 - 1000, routeId: 'backhill', legs: 6, ended: 'back', title: '第一趟', body: '正文秘密甲' }]
+  }), 'utf8')
+  const service = await makeService(t, dir, false)
+  const block = service.openFarm(VIEWER).expedition
+  const wire = JSON.stringify(block)
+  assert.equal('body' in block.logs[0], false, '公开日志没有正文')
+  assert.equal(wire.includes('正文秘密甲'), false)
+  assert.equal(block.shelf.length, 8, '公开视图只发前 8 格')
+  assert.equal(wire.includes('amber'), false, '未开格的件不能出现在公开视图')
+  assert.deepEqual(Object.keys(block.codex).sort(), ['owned', 'total'], '图鉴只发件数，不发时间戳')
+  assert.equal(wire.includes(String(T0)), false, '图鉴时间戳不外泄')
 })

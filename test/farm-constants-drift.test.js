@@ -20,6 +20,13 @@ import {
   WORK_FEE_RATE
 } from '../src/contracts-rules.js'
 import {
+  SHELF_BASE_SLOTS,
+  SHELF_MAX_SLOTS,
+  SHELF_SLOT_PRICE,
+  TRIP_LOG_BODY_MAX,
+  TRIP_LOG_TITLE_MAX
+} from '../src/expedition.js'
+import {
   MAX_COINS,
   MAX_FARM_LOG,
   MAX_STACK
@@ -44,6 +51,7 @@ import shared from '../desktop/shared.js'
 
 const FARM_JS = new URL('../desktop/farm.js', import.meta.url)
 const SHARED_JS = new URL('../desktop/shared.js', import.meta.url)
+const EXPEDITION_VIEW_JS = new URL('../desktop/expedition-view.js', import.meta.url)
 const require = createRequire(import.meta.url)
 // desktop/ 是 CommonJS：ticket 47 把作物显示表放进纯视图层，Node 与渲染页共用同一份。
 const farmView = require('../desktop/farm-view.js')
@@ -168,4 +176,40 @@ test('票 81/评审 P2：helper 与窗口的盘口杠杆/止损档与宿主同�
       (TRADING_STOP_LEVELS.indexOf(level) + 1) % TRADING_STOP_LEVELS.length
     ])
   }
+})
+
+test('票 120/评审 B2：陈列架 8 / 32 / 5000 在 desktop 只有一份，窗口引用它', async () => {
+  // 三处各写一份（shared.js、expedition-view.js、farm.js 内联 32）就是票 115/120 的口径漂移源。
+  // 收敛后桌面侧只有 `desktop/shared.js` 写数字：expedition-view.js 从它拿，farm.js 用宿主
+  // 随窗下发的 `expeditionCodexOwned.total`。这条断言盯着「别再抄回去」。
+  const sharedSource = await readFile(SHARED_JS, 'utf8')
+  assert.equal(numberConstant(sharedSource, 'SHELF_BASE_SLOTS'), SHELF_BASE_SLOTS)
+  assert.equal(numberConstant(sharedSource, 'EXPEDITION_SHELF_MAX'), SHELF_MAX_SLOTS)
+  assert.equal(numberConstant(sharedSource, 'EXPEDITION_SHELF_PRICE'), SHELF_SLOT_PRICE)
+  assert.equal(numberConstant(sharedSource, 'TRIP_LOG_TITLE_MAX'), TRIP_LOG_TITLE_MAX)
+  assert.equal(numberConstant(sharedSource, 'TRIP_LOG_BODY_MAX'), TRIP_LOG_BODY_MAX)
+
+  // 导出的值就是源码里那两个常量（helper 与渲染页都从 module.exports 拿）。
+  assert.equal(shared.SHELF_BASE_SLOTS, SHELF_BASE_SLOTS)
+  assert.equal(shared.EXPEDITION_SHELF_MAX, SHELF_MAX_SLOTS)
+  assert.equal(shared.EXPEDITION_SHELF_PRICE, SHELF_SLOT_PRICE)
+  assert.equal(shared.TRIP_LOG_TITLE_MAX, TRIP_LOG_TITLE_MAX)
+  assert.equal(shared.TRIP_LOG_BODY_MAX, TRIP_LOG_BODY_MAX)
+
+  // expedition-view.js 不再自己写 32 / 5000，而是从 shared 拿同一份。
+  const viewSource = await readFile(EXPEDITION_VIEW_JS, 'utf8')
+  assert.equal(/SHELF_MAX_SLOTS\s*=\s*32/.test(viewSource), false, 'expedition-view 别再写一份 32')
+  assert.equal(/SHELF_SLOT_PRICE\s*=\s*5000/.test(viewSource), false, 'expedition-view 别再写一份 5000')
+  assert.match(viewSource, /shared\.EXPEDITION_SHELF_MAX/)
+  assert.match(viewSource, /shared\.EXPEDITION_SHELF_PRICE/)
+  const view = require('../desktop/expedition-view.js')
+  assert.equal(view.SHELF_MAX_SLOTS, shared.EXPEDITION_SHELF_MAX)
+  assert.equal(view.SHELF_SLOT_PRICE, shared.EXPEDITION_SHELF_PRICE)
+  assert.equal(view.shelfCells({ slots: 8, items: [] }).length, SHELF_MAX_SLOTS)
+  assert.equal(view.shelfCells({ slots: 8, items: [] })[SHELF_BASE_SLOTS].price, SHELF_SLOT_PRICE)
+
+  // farm.js 的顶栏计数上限跟宿主下发的 total 走，不写字面 32。
+  const farmSource = await readFile(FARM_JS, 'utf8')
+  assert.equal(/Math\.min\(\s*32/.test(farmSource), false, 'farm.js 别再内联 32')
+  assert.match(farmSource, /expeditionCodexOwned/)
 })

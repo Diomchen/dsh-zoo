@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { codexView, dangerLabel, dangerOf, legsFor, routeOf, wipedOut } from '../src/expedition.js'
+import { codexView, dangerLabel, dangerOf, legsFor, routeOf, tripLog, wipedOut } from '../src/expedition.js'
 import { EXPEDITION_FILE } from '../src/expedition-store.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
@@ -116,6 +116,26 @@ test('视图模型：见好就收只按已走段数的战利品算钱', () => {
   assert.equal(view.settleText(run), '见好就收，带回 26 枚硬币')
   const complete = sampleRun({ phase: null, ended: 'complete', leg: 4, loot: [{ kind: 'coin', qty: 52 }] })
   assert.equal(view.settleText(complete), '走满全程，带回 52 枚硬币')
+})
+
+test('视图模型：结算页标题按四种结局各说一句（评审 A4）', async () => {
+  const back = sampleRun({ phase: null, ended: 'back', reason: null })
+  const timeout = sampleRun({ phase: null, ended: 'back', reason: 'timeout' })
+  const complete = sampleRun({ phase: null, ended: 'complete', reason: null })
+  const failed = sampleRun({ phase: null, ended: 'failed', reason: 'wipeout' })
+  assert.equal(view.settleTitle(back, '后山'), '见好就收')
+  assert.equal(view.settleTitle(complete, '后山'), '走满了全程')
+  assert.equal(view.settleTitle(failed, '后山'), '翻车了')
+  // 超时不是「见好就收」：措辞与 116 的日志标题同一句。
+  const log = tripLog(timeout, { at: T0 })
+  assert.equal(log.title, '在后山超时，它自己回来了')
+  assert.equal(view.settleTitle(timeout, '后山'), log.title)
+  assert.equal(view.settleTitle(timeout, ''), '超时，它自己回来了')
+  // 没有路线名时也不许退回「见好就收」。
+  assert.notEqual(view.settleTitle(timeout, null), '见好就收')
+
+  const source = await readFile(new URL('../desktop/expedition.js', import.meta.url), 'utf8')
+  assert.match(source, /ui\.doneTitle\.textContent = view\.settleTitle\(/)
 })
 
 test('视图模型：按钮只在决策窗可用，硬币不够不能出发', () => {

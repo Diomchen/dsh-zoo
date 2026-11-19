@@ -4,14 +4,13 @@
  * 这里只有纯函数：路线表、段数、每段回币、危险度、状态迁移与结算。不读盘、不看系统时钟，
  * `now` 与随机都由调用方传进来——段数和抖动从 `runId` 派生，所以同一趟在重启后走的是同一条路。
  *
- * 112 只开后山一条路线；另外三条、翻车、陈列架是 113 及以后的事。114 先把四条路线的
- * 32 件特产与图鉴放在这里：掉落只由 `routeId + runId + 段号 + 已捡清单` 决定，翻车减半
- * 也是纯函数，真正的翻车判定留给 113。
+ * 四条路线、32 件特产与图鉴都在这里：掉落只由 `routeId + runId + 段号 + 已捡/已集清单` 决定，
+ * 翻车减半也是纯函数；翻车判定、段落推进与结算的时机由 `expedition-store` 按这套纯函数驱动。
  */
 
 /** 走一段的时间：20 秒（手册《出远门》的节奏）。 */
 export const LEG_MS = 20000
-/** 每段走完后的决策窗：20 秒。112 里到点不会自动折返，超时留给 113。 */
+/** 每段走完后的决策窗：20 秒。到点没选就自动折返（`expireRun`，算「已回家」）。 */
 export const DECISION_MS = 20000
 
 /** 陈列架：默认 8 格，第 9 格起每格 5,000，最多 32 格（开满共 120,000）。 */
@@ -97,7 +96,7 @@ export const RARITIES = Object.freeze({
  * 32 件特产目录，路线与稀有度照抄 `docs/play-expedition.md` 的战利品表。
  *
  * `art` 是窗口里的相对路径（`file://` 加载，CSP 放行 'self'）；`emoji` 是缺图时的兜底。
- * 后山以外的三条路线 114 只建目录，路线本身由 113 开。
+ * 四条路线各有 8 件，掉落表与解锁链见手册《出远门》。
  */
 export const SOUVENIRS = Object.freeze({
   herb: Object.freeze({ id: 'herb', name: '草药', routeId: 'backhill', rarity: 'common', emoji: '🌿', art: 'souvenirs/herb.svg' }),
@@ -140,6 +139,9 @@ export const SOUVENIRS = Object.freeze({
 /** 图鉴的顺序：目录的插入顺序，按路线分成四组。 */
 export const SOUVENIR_IDS = Object.freeze(Object.keys(SOUVENIRS))
 
+/** 图鉴满这么多件以后，掉落只从「还没集齐」的件里抽（评审 C3，手册《出远门》同一句）。 */
+export const CODEX_FRESH_AT = 8
+
 /** 每条路线可掉的特产；没开的路线的目录也在这里，窗口图鉴照样显示。 */
 export const SOUVENIRS_BY_ROUTE = Object.freeze({
   backhill: Object.freeze(SOUVENIR_IDS.filter((id) => SOUVENIRS[id].routeId === 'backhill').map((id) => SOUVENIRS[id])),
@@ -148,7 +150,7 @@ export const SOUVENIRS_BY_ROUTE = Object.freeze({
   mistridge: Object.freeze(SOUVENIR_IDS.filter((id) => SOUVENIRS[id].routeId === 'mistridge').map((id) => SOUVENIRS[id]))
 })
 
-/** 图鉴的路线名：113 开路线之前 ROUTES 里还没有它们，这里先给窗口一份稳定的名字。 */
+/** 图鉴的路线名：窗口只认这份稳定名字，不自己从 ROUTES 里翻。 */
 export const SOUVENIR_ROUTE_NAMES = Object.freeze({
   backhill: '后山',
   mine: '废矿',
@@ -162,7 +164,7 @@ export function souvenirOf (id) {
   return Object.prototype.hasOwnProperty.call(SOUVENIRS, id) ? SOUVENIRS[id] : null
 }
 
-/** 112 只认「折返 / 走满」；`failed` 是 113 的翻车，读档时先容下。 */
+/** 三种结局都认：`back`（折返/超时）、`complete`（走满）、`failed`（翻车）。读档按这个白名单收。 */
 const ENDED_KINDS = Object.freeze(['back', 'complete', 'failed'])
 
 /**
@@ -248,7 +250,10 @@ export function unlockStatus (route, { trips = {}, codexOwned = 0 } = {}) {
   return { unlocked: true, requirement: '默认开放', progress: '已开放' }
 }
 
-/** 这一趟算不算「已回家」：走满与见好就收算，翻车（failed）与还在路上的不算。 */
+/**
+ * 这一趟算不算「已回家」：走满、见好就收、超时自己回来都算（超时的 `ended` 也是 `back`，
+ * 只有 `reason` 是 `timeout`）；翻车（`failed`）与还在路上的不算。
+ */
 export function homedRun (run) {
   if (run === null || typeof run !== 'object') return false
   if (run.ended !== 'complete' && run.ended !== 'back') return false
@@ -256,7 +261,7 @@ export function homedRun (run) {
 }
 
 /**
- * 记一趟「已回家」的行程：只认 complete/back，按路线累加。
+ * 记一趟「已回家」的行程：只认 complete/back（超时也是 back），按路线累加。
  * 纯函数，返回新的计数对象；不算数的 run 原样返回入参。落盘层负责写回。
  */
 export function recordTrip (trips, run) {
@@ -312,13 +317,25 @@ export function legsFor (route, runId) {
  *
  * 种子里带着「剩余池子」的快照，所以同一趟重放、跨重启都掉同一件；池子空了返回 null，
  * 让 8 件上限自然封顶（一趟最多 7 段，正常抽不空，这里只是兜底）。
+ *
+ * 图鉴规则（评审 C3，手册《出远门》同一句）：
+ * - 图鉴不满 `CODEX_FRESH_AT` 件时按老规矩抽——已拥有的件还可能再掉，早期重复是设计的一部分；
+ * - 满了以后只从**还没集齐**的件里抽（已见过的件不再重复掉）；
+ * - 32 件全齐之后不再掉已见过的件：返回 null，这一趟只带硬币回家。
+ *   本路线的新件抽完了但别处还有没集齐的，退回老规矩（还能掉本路线的重复件）。
  */
-export function rollSouvenir (routeId, runId, leg, takenIds = []) {
+export function rollSouvenir (routeId, runId, leg, takenIds = [], ownedIds = []) {
   const pool = SOUVENIRS_BY_ROUTE[routeId]
   if (!Array.isArray(pool)) return null
   const taken = new Set(Array.isArray(takenIds) ? takenIds : [])
-  const open = pool.filter((entry) => !taken.has(entry.id))
-  if (open.length === 0) return null
+  const owned = new Set(Array.isArray(ownedIds) ? ownedIds : [])
+  if (owned.size >= SOUVENIR_IDS.length) return null
+  const openAll = pool.filter((entry) => !taken.has(entry.id))
+  if (openAll.length === 0) return null
+  const fresh = owned.size >= CODEX_FRESH_AT
+    ? openAll.filter((entry) => !owned.has(entry.id))
+    : []
+  const open = fresh.length > 0 ? fresh : openAll
   const total = open.reduce((sum, entry) => sum + RARITIES[entry.rarity].weight, 0)
   let point = roll01(routeId, runId, 'souvenir', leg, open.map((entry) => entry.id).join(',')) * total
   for (const entry of open) {
@@ -339,7 +356,7 @@ export function legCoins (route, runId, leg) {
   return Math.max(1, Math.round(baseLegCoins(route) * factor))
 }
 
-/** 第 `leg` 段的危险度：基础 + 每段累加（只用于显示，翻车在 113）。 */
+/** 第 `leg` 段的危险度：基础 + 每段累加（显示用；判定在 `wipedOut`）。 */
 export function dangerOf (route, leg) {
   return Math.min(0.95, route.dangerBase + route.dangerPerLeg * (leg - 1))
 }
@@ -384,9 +401,9 @@ export function startRun ({ routeId, runId, now } = {}) {
  * - 否则进决策窗，`until` 再给 20 秒。
  *
  * 返回 `{ run, leg, coins, souvenir }`；`run` 是新对象，不改入参。`souvenir` 是特产 id，
- * 池子空了才会是 null（落盘层按 id 记图鉴）。
+ * 池子空了才会是 null（落盘层按 id 记图鉴）。`ownedIds` 是图鉴已集齐的件，用来避开重复掉落。
  */
-export function advanceRun (run, now) {
+export function advanceRun (run, now, ownedIds = []) {
   if (!isActiveRun(run) || run.phase !== 'walking') return null
   if (!Number.isFinite(now) || now < run.until) return null
   const route = routeOf(run.routeId)
@@ -394,7 +411,7 @@ export function advanceRun (run, now) {
   const coins = legCoins(route, run.id, run.leg)
   const leg = run.leg
   const taken = run.loot.filter((item) => item.kind === 'souvenir').map((item) => item.id)
-  const souvenir = rollSouvenir(route.id, run.id, leg, taken)
+  const souvenir = rollSouvenir(route.id, run.id, leg, taken, ownedIds)
   const loot = [...run.loot, { kind: 'coin', qty: coins }]
   if (souvenir !== null) loot.push({ kind: 'souvenir', id: souvenir })
   if (leg >= run.totalLegs) {
@@ -500,7 +517,7 @@ export function sumCoins (loot) {
 
 /**
  * 回家结算：盘缠是沉没成本，把已走段数掉出来的硬币与特产带回去。
- * 翻车减半由 113 在调用这里之前处理（`halveSouvenirs`）。
+ * 翻车减半由结束迁移在调用这里之前处理（`halveSouvenirs`）。
  */
 export function settledOf (run) {
   const route = isActiveRun(run) || (run !== null && typeof run === 'object') ? routeOf(run.routeId) : null
@@ -522,8 +539,12 @@ export function settledOf (run) {
 /** 旅行日志的上限（票 116）：最多留 30 篇，超出丢最旧的。 */
 export const TRIP_LOG_LIMIT = 30
 
-const TRIP_LOG_TITLE_MAX = 80
-const TRIP_LOG_BODY_MAX = 400
+/**
+ * 一篇日志的标题 / 正文上限（票 116）。**公开视图（`farm-open`/`farm-fetch`）与窗口共用这一份**：
+ * 以前三处各写一个数（80 / 120 / 120），同一篇日志在农场页和邻居页长短不一。
+ */
+export const TRIP_LOG_TITLE_MAX = 80
+export const TRIP_LOG_BODY_MAX = 400
 
 function routeNameOf (routeId) {
   return ROUTES[routeId]?.name ?? SOUVENIR_ROUTE_NAMES[routeId] ?? ''
@@ -711,7 +732,7 @@ export function codexView (codex) {
 }
 
 /**
- * 翻车时特产随机丢一半（向下取整），硬币原样保留。113 的翻车分支只调这个纯函数，
+ * 翻车时特产随机丢一半（向下取整），硬币原样保留。翻车分支只调这个纯函数，
  * 不自己实现减半。`seed` 用 runId，保证同一趟重放丢的是同样那几件。
  */
 export function halveSouvenirs (loot, seed = '') {
@@ -722,6 +743,7 @@ export function halveSouvenirs (loot, seed = '') {
       indexes.push(index)
     }
   })
+  // 向下取整：1 件时丢 0 件——只有一件还给人留一件，算手气好（手册《出远门》翻车一节照这个说法）。
   const dropCount = Math.floor(indexes.length / 2)
   const dropped = new Set()
   if (dropCount > 0) {

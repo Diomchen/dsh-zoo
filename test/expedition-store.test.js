@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -487,6 +487,113 @@ test('读档补记回币失败：这一趟原样留着，等下一次 tick 再�
   assert.equal(second.snapshot().run.phase, 'deciding')
   assert.equal(farm.state.coins, legCoins(routeOf('backhill'), runId, 1))
   assert.equal(second.snapshot().run.loot.length, 2, '硬币 + 一件特产')
+})
+
+test('tick 回币写盘失败：硬币退回、run 不前进，重试后只入账一次', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(500)
+  const runId = safeRunId(4)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0, newRunId: () => runId })
+  await store.start({ routeId: 'backhill' })
+
+  // 存档路径换成同名目录：临时文件 rename 不上去，persist 必失败。
+  const file = join(dir, EXPEDITION_FILE)
+  await rm(file)
+  await mkdir(file)
+
+  assert.equal(await store.tick(T0 + 20000), false, '写不进去就不算推进')
+  const snap = store.snapshot()
+  assert.equal(snap.run.phase, 'walking', 'run 留在原地，等下一拍重试')
+  assert.equal(snap.run.leg, 1)
+  assert.deepEqual(snap.run.loot, [], '战利品不能留在内存里')
+  assert.equal(snap.codexView.owned, 0, '图鉴也不能记')
+  assert.equal(farm.state.coins, 0, '硬币要退回去，不能「钱到了、档没落」')
+
+  // 修好存档路径再重试：这一段的回币只入账一次。
+  await rm(file, { recursive: true })
+  assert.equal(await store.tick(T0 + 20001), true)
+  assert.equal(farm.state.coins, legCoins(routeOf('backhill'), runId, 1), '重试只入账一次')
+  assert.equal((await readState(dir)).run.phase, 'deciding')
+  assert.equal((await readState(dir)).run.loot.length, 2)
+
+  // 重启后也不会再补一次：已经落盘的那段不再回币。
+  store.dispose()
+  const farm2 = fakeFarm(0)
+  const second = await createExpeditionStore(dir, { farm: farm2, now: () => T0 + 30000 })
+  assert.equal(farm2.state.coins, 0, '重启不补账')
+  assert.equal(second.snapshot().run.phase, 'deciding')
+})
+
+test('tick 自动折返写盘失败：留在决策窗，下一拍重试', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(500)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0, newRunId: () => safeRunId(2) })
+  await store.start({ routeId: 'backhill' })
+  await store.tick(T0 + 20000)
+
+  const file = join(dir, EXPEDITION_FILE)
+  await rm(file)
+  await mkdir(file)
+  assert.equal(await store.tick(T0 + 40000), false, '写不进去就不算结束')
+  assert.equal(store.snapshot().run.phase, 'deciding', '还在决策窗，别在内存里说回家了')
+  assert.equal(store.snapshot().run.ended, null)
+  assert.deepEqual(store.snapshot().trips, {}, '趟数也不能记')
+
+  await rm(file, { recursive: true })
+  assert.equal(await store.tick(T0 + 40001), true)
+  const snap = store.snapshot()
+  assert.equal(snap.run.ended, 'back')
+  assert.equal(snap.run.reason, 'timeout')
+  assert.equal((await readState(dir)).trips.backhill, 1)
+})
+
+test('落盘用带 pid/counter 的临时名：旧固定名 .tmp 被占住也照样写盘', async (t) => {
+  const dir = await tempDir(t)
+  // 旧写法是 `expedition.json.tmp` 固定名；两个进程同时写就会互相踩。这里把它占成目录，
+  // 新写法必须换名字（`<file>.tmp-<pid>-<n>`），不然一写就失败。
+  await mkdir(join(dir, EXPEDITION_FILE + '.tmp'))
+  const farm = fakeFarm(500)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0 })
+  const started = await store.start({ routeId: 'backhill' })
+  assert.equal(started.ok, true, '写盘不能被旧固定名挡住')
+  assert.equal((await readState(dir)).run.id, started.run.id)
+})
+
+/** 卡住 addCoins 的农场：让 tick 停在「钱已记、还没落盘」的那一拍。 */
+function gatedFarm (coins) {
+  const farm = fakeFarm(coins)
+  const addCoins = farm.addCoins
+  let release = null
+  let entered = null
+  const gate = new Promise((resolve) => { release = resolve })
+  const started = new Promise((resolve) => { entered = resolve })
+  farm.addCoins = async (qty) => {
+    entered()
+    await gate
+    return addCoins(qty)
+  }
+  farm.release = () => release()
+  farm.entered = started
+  return farm
+}
+
+test('dispose 是异步的：等排队的写盘落完再返回', async (t) => {
+  const dir = await tempDir(t)
+  const farm = gatedFarm(500)
+  const runId = safeRunId(2)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0, newRunId: () => runId })
+  await store.start({ routeId: 'backhill' })
+
+  const pending = store.tick(T0 + 20000)
+  await farm.entered
+  const disposed = store.dispose()
+  assert.equal(typeof disposed?.then, 'function', 'dispose 必须返回 Promise，调用方才能等它')
+
+  farm.release()
+  await disposed
+  await pending
+  assert.equal(farm.state.coins, legCoins(routeOf('backhill'), runId, 1), '硬币已经真的入账')
+  assert.equal((await readState(dir)).run.phase, 'deciding', 'dispose 返回时那一拍必须已经落盘')
 })
 
 test('陈列架开格：第 9 格起每格 5,000，扣农场的硬币并落盘', async (t) => {

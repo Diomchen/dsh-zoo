@@ -613,21 +613,29 @@ function renderExpeditionLog () {
 /**
  * 票 120：顶栏「陈列架 N/32 · 点开看」。
  *
- * N 与公开视图同口径（图鉴已集齐件数 / 32）：自己看自己用宿主下发的本地计数，
- * 看邻居用邻居公开视图里的 codex.owned。串门（visitor）时不显示——那是别人的门。
+ * N 与公开视图同口径（图鉴已集齐件数 / 32）：自己看自己用宿主下发的本地计数
+ * `farm.expeditionCodexOwned`（字段名照实：它是图鉴件数，不是已开格数），看邻居用邻居公开
+ * 视图里的 codex.owned。上限也走宿主下发的 `total`（`desktop/shared.js` 的 32 一份，
+ * 评审 B2），窗口不另写一个 32。串门（visitor）时不显示——那是别人的门。
  */
 function renderExpeditionEntry () {
   if (expeditionEntryEl === null) return
   expeditionEntryEl.hidden = mode === 'visitor'
   if (expeditionEntryEl.hidden) return
+  const counter = mode === 'owner' && farm !== null ? farm.expeditionCodexOwned : null
   const raw = mode === 'look' && look !== null
     ? look.expedition?.codex?.owned
-    : (mode === 'owner' && farm !== null ? farm.expeditionShelf?.owned : 0)
-  const owned = Number.isFinite(Number(raw)) ? Math.max(0, Math.min(32, Math.floor(Number(raw)))) : 0
+    : (counter === null || counter === undefined ? 0 : counter.owned)
+  const max = counter === null || counter === undefined ? NaN : Number(counter.total)
+  const value = Math.floor(Number(raw))
+  const owned = Number.isFinite(value)
+    ? Math.max(0, Number.isFinite(max) && max > 0 ? Math.min(max, value) : value)
+    : 0
   if (expeditionOwnedEl !== null) expeditionOwnedEl.textContent = String(owned)
 }
 
-/** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */function renderVisitorPlots () {
+/** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */
+function renderVisitorPlots () {
   const plots = visit !== null && Array.isArray(visit.plots) ? visit.plots : []
   if (plots.length === 0) {
     const message = document.createElement('p')
@@ -2573,7 +2581,8 @@ if (expeditionEntryEl !== null) {
   expeditionEntryEl.addEventListener('click', () => submit({ action: 'expedition-open', tab: 'shelf' }))
 }
 
-if (pinButton !== null) {  pinButton.addEventListener('click', () => {
+if (pinButton !== null) {
+  pinButton.addEventListener('click', () => {
     if (typeof api?.setPinned !== 'function') {
       showToast('这个窗口还是旧版本，关掉农场窗再打开就能置顶。', 'error')
       return

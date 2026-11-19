@@ -103,6 +103,31 @@ test('四条路线：盘缠、段数与基础危险照票面/手册，走满一�
   assert.equal(routeOf('nowhere'), null)
 })
 
+test('评审 E1：固定种子跑 200/100 趟，平均净烧落在手册表格的 ±2% 内（纯函数，不起服务）', () => {
+  const table = [
+    { id: 'backhill', trips: 200, burn: 0.895 },
+    { id: 'mine', trips: 100, burn: 0.865 },
+    { id: 'railway', trips: 100, burn: 0.835 },
+    { id: 'mistridge', trips: 100, burn: 0.805 }
+  ]
+  for (const want of table) {
+    const route = routeOf(want.id)
+    assert.ok(route !== null, want.id + ' 应该是已知路线')
+    let coins = 0
+    for (let i = 0; i < want.trips; i++) {
+      const runId = 'stats-' + want.id + '-' + String(i)
+      const legs = legsFor(route, runId)
+      for (let leg = 1; leg <= legs; leg++) coins += legCoins(route, runId, leg)
+    }
+    // 走满、不翻车：净烧 = 1 − 回币 / 盘缠，段数与每段回币都按 runId 复算。
+    const burn = 1 - coins / (want.trips * route.fare)
+    assert.ok(
+      Math.abs(burn - want.burn) <= 0.02,
+      want.id + ' 平均净烧 ' + (burn * 100).toFixed(2) + '%，手册 ' + (want.burn * 100).toFixed(1) + '%'
+    )
+  }
+})
+
 test('解锁链：后山无条件；废矿要 3 趟回家的后山；老铁路要图鉴 16 件', () => {
   const none = { trips: {}, codexOwned: 0 }
   assert.deepEqual(unlockStatus(routeOf('backhill'), none), {

@@ -450,9 +450,17 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const EXPEDITION_ENDED = ['back', 'complete', 'failed']
   /** 票 116：只有两种「不好」的结局写原因，其余是 null。 */
   const EXPEDITION_REASONS = ['wipeout', 'timeout']
-  /** 陈列架（票 115）：窗口按 32 格画，开格价与宿主同一个数。 */
+  /**
+   * 票 116：旅行日志的标题 / 正文上限（码点）。与 `src/expedition.js` 的 `TRIP_LOG_TITLE_MAX` /
+   * `TRIP_LOG_BODY_MAX` 同值，靠 `test/farm-constants-drift.test.js` 盯漂移——
+   * 窗口这边不截，对面发多长就画多长。
+   */
+  const TRIP_LOG_TITLE_MAX = 80
+  const TRIP_LOG_BODY_MAX = 400
+  /** 陈列架（票 115）：窗口按 32 格画，开格价与宿主同一个数；票 120 的前 8 格与 `src/expedition.js` 同值。 */
   const EXPEDITION_SHELF_MAX = 32
   const EXPEDITION_SHELF_PRICE = 5000
+  const SHELF_BASE_SLOTS = 8
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(
     MENU_ACTION_IDS,
@@ -528,8 +536,6 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const MAX_FARM_DEW = 48
   const MAX_FARM_CONTRACTS = 20
   const MAX_FARM_LOG = 200
-  /** 票 120：陈列架公开的前 8 格（与 `src/expedition.js` 的 `SHELF_BASE_SLOTS` 同值）。 */
-  const SHELF_BASE_SLOTS = 8
   /** 红包记录那一份的上限，与 `src/farm.js` 的 `MAX_PACKET_LOG` 同值。 */
   const MAX_FARM_PACKETS = 50
   /**
@@ -1386,13 +1392,13 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { titles }
   }
 
-  /** 票 120：陈列架计数（`codex.owned` / 32），农场页顶栏与公开视图同一口径。 */
+  /** 票 120：陈列架计数（`codex.owned` / 32 格），农场页顶栏与公开视图同一口径。 */
   function normalizeShelfCount (raw) {
     const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
     const owned = Number(source.owned)
     return {
-      owned: Number.isFinite(owned) ? Math.min(32, Math.max(0, Math.floor(owned))) : 0,
-      total: 32
+      owned: Number.isFinite(owned) ? Math.min(EXPEDITION_SHELF_MAX, Math.max(0, Math.floor(owned))) : 0,
+      total: EXPEDITION_SHELF_MAX
     }
   }
 
@@ -1421,7 +1427,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     for (const candidate of Array.isArray(source.logs) ? source.logs : []) {
       if (logs.length >= 3) break
       if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
-      const title = normalizeLabel(candidate.title, '')
+      const title = normalizeText(candidate.title, '', TRIP_LOG_TITLE_MAX)
       const at = Number(candidate.at)
       if (title === '' || !Number.isFinite(at) || at <= 0) continue
       logs.push({ title, at: Math.floor(at) })
@@ -1507,8 +1513,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       ...(packets.length === 0 ? {} : { packets }),
       carried: normalizeFarmCarried(raw.carried),
       expeditionLog: normalizeExpeditionLogTitles(raw.expeditionLog),
-      // 票 120：顶栏「陈列架 N/32」的 N，和公开视图的 codex.owned 同口径。
-      expeditionShelf: normalizeShelfCount(raw.expeditionShelf)
+      // 票 120：顶栏「陈列架 N/32」的 N——**图鉴已集齐件数**（票面文案照旧，字段名照实），
+      // 和公开视图的 codex.owned 同口径。
+      expeditionCodexOwned: normalizeShelfCount(raw.expeditionCodexOwned)
     }
   }
 
@@ -2908,8 +2915,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       if (logs.length >= 30) break
       if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
       const routeId = normalizeLabel(entry.routeId, '')
-      const title = normalizeLabel(entry.title, '')
-      const body = normalizeText(entry.body, '', 400)
+      const title = normalizeText(entry.title, '', TRIP_LOG_TITLE_MAX)
+      const body = normalizeText(entry.body, '', TRIP_LOG_BODY_MAX)
       const legs = Number(entry.legs)
       if (routeId === '' || title === '' || body === '') continue
       if (!Number.isInteger(legs) || legs < 1) continue
@@ -5536,6 +5543,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     MAX_FARM_CONTRACTS,
     MAX_FARM_GUARD,
     MAX_FARM_LOG,
+    // 票 115/116/120：陈列架与旅行日志的三个数，desktop 侧只有这一份（src 侧同名常量靠漂移测试对齐）。
+    EXPEDITION_SHELF_MAX,
+    EXPEDITION_SHELF_PRICE,
+    SHELF_BASE_SLOTS,
+    TRIP_LOG_TITLE_MAX,
+    TRIP_LOG_BODY_MAX,
     MAX_FARM_MARKET_HISTORY,
     MARKET_MIN_QTY,
     MARKET_MAX_QTY,

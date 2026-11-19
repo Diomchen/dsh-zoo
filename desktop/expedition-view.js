@@ -3,11 +3,14 @@
  *
  * 这里不读盘、不看时钟、不算钱：宿主已经把「走到第几段、还有多少毫秒、回了几枚」
  * 算好放进 view。窗口只负责把这些数字变成人话，所以可以单独用 Node 测。
+ *
+ * 唯一的例外是陈列架的 32 格 / 5,000 一枚（票 115）：那两个数只在 `desktop/shared.js`
+ * 写一份（评审 B2），窗口从它拿——`expedition.html` 里 shared.js 先加载。
  */
 (function (root, factory) {
-  if (typeof module === 'object' && module.exports) module.exports = factory()
-  else root.dshZooExpeditionView = factory()
-})(typeof globalThis !== 'undefined' ? globalThis : this, function () {
+  if (typeof module === 'object' && module.exports) module.exports = factory(require('./shared.js'))
+  else root.dshZooExpeditionView = factory(root.DshZooShared)
+})(typeof globalThis !== 'undefined' ? globalThis : this, function (shared) {
   'use strict'
 
   const ACTIVE_PHASES = ['walking', 'deciding']
@@ -103,6 +106,20 @@
       total += Math.max(0, Math.round(num(item.qty)))
     }
     return total
+  }
+
+  /**
+   * 结算页的大标题（评审 A4）：四种结局各一句，措辞与 116 的日志标题对齐
+   * （`src/expedition.js` 的 `tripLog`：折返 / 翻车 / 走满 / 超时）。超时的 `ended`
+   * 也是 `back`，只有 `reason` 是 `timeout`，所以必须先看 reason 再看 ended。
+   */
+  function settleTitle (run, routeName) {
+    if (run === null || typeof run !== 'object') return '出远门回来了'
+    const name = typeof routeName === 'string' ? routeName : ''
+    if (run.ended === 'complete') return '走满了全程'
+    if (run.ended === 'failed') return '翻车了'
+    if (run.reason === 'timeout') return name === '' ? '超时，它自己回来了' : '在' + name + '超时，它自己回来了'
+    return '见好就收'
   }
 
   /** 结算那句：只回已经走过的段数对应的钱，盘缠不退。 */
@@ -265,9 +282,10 @@
   /**
    * 陈列架（票 115）：宿主给的是 `{slots, items, ...}`，`items[i]` 对第 i+1 格。
    * 窗口按 32 格的总宽度画，锁着的格子也画出来并标上开格价。
+   * 这两个数只从 `desktop/shared.js` 拿（那边一份，评审 B2），窗口不另写。
    */
-  const SHELF_MAX_SLOTS = 32
-  const SHELF_SLOT_PRICE = 5000
+  const SHELF_MAX_SLOTS = shared.EXPEDITION_SHELF_MAX
+  const SHELF_SLOT_PRICE = shared.EXPEDITION_SHELF_PRICE
 
   function shelfLayout (shelf) {
     const raw = shelf !== null && typeof shelf === 'object' ? shelf : {}
@@ -348,6 +366,7 @@
     lanternOffer,
     sumLoot,
     settleText,
+    settleTitle,
     primaryLabel,
     canContinue,
     canBack,

@@ -123,7 +123,7 @@ import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
 import { GUARD_HIRE_COST, GUARD_HIRE_STEP, MAX_TEMP_GUARDS } from './season-omens.js'
 import { FARM_FETCH_COOLDOWN_MS, createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
-import { openExpeditionView, openFarmView } from './farm-open.js'
+import { openFarmView, publicExpeditionBlock } from './farm-open.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
@@ -2398,9 +2398,13 @@ export function createService (ctx, options = {}) {
     return expedition.snapshot().logs.slice(0, limit).map((entry) => entry.title)
   }
 
-  /** 票 120：农场页顶栏那行「陈列架 N/32」的 N；和公开视图共用同一份白名单重建。 */
-  function expeditionShelfCount () {
-    const block = openExpeditionView(expedition?.snapshot() ?? null)
+  /**
+   * 票 120：顶栏那行「陈列架 N/32」的 N——**N 是图鉴已集齐的件数，不是已开的格数**。
+   * 名字照实叫 `expeditionCodexOwned`：票面文案不改，但字段名不能骗下一个人。
+   * 和公开视图共用同一份白名单重建（`publicExpeditionBlock`）。
+   */
+  function expeditionCodexOwned () {
+    const block = publicExpeditionBlock(expedition?.snapshot() ?? null)
     return { owned: block.codex.owned, total: block.codex.total }
   }
 
@@ -2466,8 +2470,8 @@ export function createService (ctx, options = {}) {
       carried: carriedView(),
       // 票 116：最近三篇出远门日志的标题；正文不出农场页。
       expeditionLog: { titles: expeditionLogTitles(3) },
-      // 票 120：顶栏「陈列架 N/32」的 N，与公开视图同一个数（图鉴已集齐件数）。
-      expeditionShelf: expeditionShelfCount()
+      // 票 120：顶栏「陈列架 N/32」的 N，与公开视图同一个数——**图鉴已集齐的件数**（不是开的格数）。
+      expeditionCodexOwned: expeditionCodexOwned()
     }
   }
 
@@ -4933,7 +4937,7 @@ export function createService (ctx, options = {}) {
       // 行情摘要（ticket 41/42）：只给窗口画价目与局域网指数，不转发历史。
       market: marketVisitView(),
       // 票 120：串门进门后，日志正文跟着访客视图走（公开视图那条路仍然只有标题）。
-      expedition: openExpeditionView(expedition?.snapshot() ?? null, { withLogBodies: true }),
+      expedition: publicExpeditionBlock(expedition?.snapshot() ?? null, { withLogBodies: true }),
       at: Date.now()
     }
   }
@@ -9643,7 +9647,9 @@ export function createService (ctx, options = {}) {
       contracts = null
       farm = null
       // 出远门：先放开队列再丢引用，卸载后不再写 expedition.json。
-      expedition?.dispose()
+      // dispose 是异步的（等排队的写盘落完）；服务卸载本身是同步的，这里只能放手——
+      // 队列里那一拍会自己落完，不必让卸载等它。
+      void expedition?.dispose()
       expedition = null
       // tick 会随 farmTimer 一起停，但 store 引用也要放开：卸载后不该再写盘。
       trading = null

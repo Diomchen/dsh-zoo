@@ -528,9 +528,11 @@
     ui.routes.hidden = true
     ui.trip.hidden = true
     ui.done.hidden = false
-    ui.doneTitle.textContent = run.ended === 'complete'
-      ? '走满了全程'
-      : run.ended === 'failed' ? '翻车了' : '见好就收'
+    // 评审 A4：四种结局各一句，超时不再并进「见好就收」。
+    const settledName = typeof run.routeName === 'string' && run.routeName !== ''
+      ? run.routeName
+      : (route === null ? '' : route.name)
+    ui.doneTitle.textContent = view.settleTitle(run, settledName)
     ui.settle.textContent = view.settleText(run)
     const souvenirs = view.souvenirNames(run, codexView)
     if (souvenirs.length > 0) ui.settle.textContent += '，带回特产：' + souvenirs.join('、')

@@ -9,11 +9,12 @@
  * 结束迁移只走一个记账点（`#recordTrip`）：同一笔结束要么「run/trips/logs 一起落盘」，
  * 要么写失败时一起回滚，不会出现趟数记上了、日志没记（或反过来）的半截状态。
  *
- * 钱与状态顺序：
+ * 钱与状态顺序（一律「落盘成功才算数」）：
  *   出发：先扣盘缠再写 run（写失败退款并回滚）；
- *   到点：先记回币再写 run（记不上就下一拍重试，不会重复掉币）；
+ *   到点：先记账（硬币 + run + 图鉴 + 趟数）再写盘，写失败把硬币与 run 一起退回，
+ *         下一拍重来——记不上就下次补，绝不会「钱已到、档没落」导致重启后重复入账；
  *   折返/走满：钱在到点时就已进农场，这里只落 run 的结束标记。
- * 这样任何一步失败都不会出现「硬币已回、run 还在外面」的重复结算。
+ * tick 与 step/back 同一套事务语义：任何一步写盘失败都整拍回滚，不留半截状态。
  */
 
 import { randomUUID } from 'node:crypto'
@@ -48,6 +49,11 @@ import {
 
 export const EXPEDITION_FILE = 'expedition.json'
 const VERSION = 1
+/**
+ * 临时文件名的自增尾巴（与 `season-store.js` 同一套写法）：`<dir>/.expedition.json.tmp-<pid>-<n>`。
+ * 固定名 `.tmp` 会让两个进程同时写时互相踩：一边刚写一半，另一边 rename 走了。
+ */
+let tempCounter = 0
 
 function initialShelf () {
   return { slots: SHELF_BASE_SLOTS, items: [] }
@@ -148,10 +154,18 @@ export class ExpeditionStore {
     const state = normalizeState(raw)
     this.#state = state
     // 关门期间到点的，读档时只推进一个节点；推进了也要写回磁盘。
-    const resumed = await this.#resume(this.#now())
+    const beforeResume = { run: state.run, codex: state.codex, trips: state.trips, logs: state.logs }
+    const { advanced: resumed, credited } = await this.#resume(this.#now())
     // 坏文件/缺文件/旧形状都在启动时修一次，别等下一拍才写。
     if (missing || raw === null || resumed || JSON.stringify(state) !== JSON.stringify(raw)) {
-      await this.#persist()
+      if (!(await this.#persist()) && resumed) {
+        // 读档那一拍写不回去：连同硬币一起撤掉，等下一拍 tick 重来，别让重启重复入账。
+        this.#state.run = beforeResume.run
+        this.#state.codex = beforeResume.codex
+        this.#state.trips = beforeResume.trips
+        this.#state.logs = beforeResume.logs
+        if (credited > 0) await this.#refund(credited)
+      }
     }
     return this
   }
@@ -303,6 +317,10 @@ export class ExpeditionStore {
    * 到点走完一段，回币进农场、特产记进图鉴；走满最后一段直接 complete。
    *
    * 返回是否真的推进了（服务层据此决定要不要重推窗口）。
+   *
+   * 写法与 step/back 一致：先把这一拍的变更全记在内存里，落盘成功才算数；
+   * 落盘失败就把 run / 图鉴 / 趟数 / 日志一起退回，已经进农场的硬币也用 `#refund` 收回来。
+   * 否则「钱到了、档没落」，重启后同一段会再入账一次。
    */
   tick (now = this.#now()) {
     return this.#serial(async () => {
@@ -310,26 +328,41 @@ export class ExpeditionStore {
       const expired = expireRun(this.#state.run, now)
       if (expired !== null) {
         const previous = this.#state.run
+        const previousLedger = { trips: this.#state.trips, logs: this.#state.logs }
         this.#state.run = expired
         this.#recordTrip(previous, expired, now)
-        await this.#persist()
-        return true
+        if (await this.#persist()) return true
+        // 写不进去就还留在决策窗：下一拍再超时一次，不会只落一半。
+        this.#state.run = previous
+        this.#state.trips = previousLedger.trips
+        this.#state.logs = previousLedger.logs
+        return false
       }
-      const event = advanceRun(this.#state.run, now)
+      const event = advanceRun(this.#state.run, now, Object.keys(this.#state.codex))
       if (event === null) return false
-      if (event.coins > 0) {
-        const credited = await this.#credit(event.coins)
-        if (!credited) return false
-      }
       const previous = this.#state.run
+      const previousLedger = { trips: this.#state.trips, logs: this.#state.logs }
+      const previousCodex = this.#state.codex
+      let credited = 0
+      if (event.coins > 0) {
+        const landed = await this.#credit(event.coins)
+        if (landed === null) return false
+        credited = landed
+      }
       this.#state.run = event.run
       if (event.souvenir !== null && event.souvenir !== undefined) {
         // 只记第一次见到的时刻；重复获得时 recordSouvenir 原样返回。
         this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
       }
       if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
-      await this.#persist()
-      return true
+      if (await this.#persist()) return true
+      // 写不进去：这一拍整个撤掉，硬币也退回农场，下一拍重来。
+      this.#state.run = previous
+      this.#state.codex = previousCodex
+      this.#state.trips = previousLedger.trips
+      this.#state.logs = previousLedger.logs
+      if (credited > 0) await this.#refund(credited)
+      return false
     })
   }
 
@@ -422,20 +455,29 @@ export class ExpeditionStore {
     })
   }
 
-  dispose () {
+  /**
+   * 卸载：不再接收新动作，等队列里已经排上的那一拍落完盘再返回（与 `season-store.dispose` 同款）。
+   * 所以调用方要 `await`——只丢掉引用的话，最后那一次写盘可能跟着进程一起没了。
+   */
+  async dispose () {
     this.#disposed = true
+    await this.#queue.catch(() => {})
   }
 
   /**
    * 读档续走：最多推进一个节点，不补算离线期间错过的段数、不补掷。
    * 钱先记、记不上就原样留着（下一拍 tick 再补），避免「硬币没到账、run 却往前走了」。
+   *
+   * 返回 `{ advanced, credited }`：`credited` 是真实到账的数额，`init` 落盘失败时按它退钱。
    */
   async #resume (now) {
     const event = resumeRun(this.#state.run, now)
-    if (event === null) return false
+    if (event === null) return { advanced: false, credited: 0 }
+    let credited = 0
     if (event.coins > 0) {
-      const credited = await this.#credit(event.coins)
-      if (!credited) return false
+      const landed = await this.#credit(event.coins)
+      if (landed === null) return { advanced: false, credited: 0 }
+      credited = landed
     }
     const previous = this.#state.run
     this.#state.run = event.run
@@ -443,13 +485,14 @@ export class ExpeditionStore {
       this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
     }
     if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
-    return true
+    return { advanced: true, credited }
   }
 
   /**
    * 一趟结束的唯一记账点：117 的趟数与 116 的日志在这里一起落账，只由结束迁移调用一次。
    *
-   * - 趟数只认 `complete`/`back`（117：翻车与超时不算「已回家」），`recordTrip` 自己会过滤；
+   * - 趟数只认 `complete`/`back`：翻车（`failed`）不算，**超时算**——超时的 `ended` 也是
+   *   `back`（`reason: 'timeout'`），宠物自己走回来了，跟见好就收同一档。`recordTrip` 自己会过滤；
    * - 日志四种结局都写一篇（116），`before` 只用于翻车丢件清单。
    *
    * 两个账本都要么留在原处、要么一起前进；写盘失败由调用方按同一份旧引用一起回滚。
@@ -462,10 +505,35 @@ export class ExpeditionStore {
     return entry !== null
   }
 
+  /**
+   * 记一笔硬币，返回**真实到账**的数额（农场会按上限截断，所以未必等于 `qty`）；
+   * 农场没有口子或记不上时返回 `null`，调用方据此决定不推进这一拍。
+   */
   async #credit (qty) {
-    if (this.#farm === null || typeof this.#farm.addCoins !== 'function') return false
+    if (this.#farm === null || typeof this.#farm.addCoins !== 'function') return null
     const result = await this.#farm.addCoins(qty)
-    return result !== null && typeof result === 'object' && result.ok === true
+    if (result === null || typeof result !== 'object' || result.ok !== true) return null
+    const landed = Number(result.qty)
+    return Number.isFinite(landed) && landed > 0 ? Math.trunc(landed) : 0
+  }
+
+  /**
+   * 把已经记进去的硬币收回来（落盘失败时的回滚）。农场只有 `spendCoins` 一个减法口子，
+   * 钱刚记进去就在账上，正常必成功；真收不回来只能记日志——宁可多一次，也不能丢钱。
+   */
+  async #refund (qty) {
+    if (this.#farm === null || typeof this.#farm.spendCoins !== 'function') return false
+    try {
+      const result = await this.#farm.spendCoins(qty)
+      if (result === null || typeof result !== 'object' || result.ok !== true) {
+        this.#log?.('出远门结算回滚没能收回硬币，可能多记一次：' + qty)
+        return false
+      }
+      return true
+    } catch (error) {
+      this.#log?.('出远门结算回滚退款失败：' + (error?.message ?? error))
+      return false
+    }
   }
 
   /** 串行化：start/step/back/tick 都可能 await 农场，不能让两个迁移交错。 */
@@ -477,7 +545,7 @@ export class ExpeditionStore {
 
   async #persist () {
     const file = join(this.#dir, EXPEDITION_FILE)
-    const tmp = file + '.tmp'
+    const tmp = join(this.#dir, '.' + EXPEDITION_FILE + '.tmp-' + process.pid + '-' + tempCounter++)
     try {
       await writeFile(tmp, JSON.stringify(this.#state, null, 2) + '\n', 'utf8')
       await rename(tmp, file)

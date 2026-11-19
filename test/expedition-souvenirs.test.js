@@ -101,6 +101,34 @@ test('掉落由 runId + 段号决定的随机数选出：可复现，且避开�
   assert.equal(rollSouvenir('nowhere', 'r', 1, []), null)
 })
 
+test('评审 C3：图鉴满 8 件后只掉没集齐的件，32 件集齐后不再掉已见过的件', () => {
+  // 手册《出远门》的图鉴规则：满 8 件后掉落改为重掷其它未见过的件；全 32 件集齐后不再掉落
+  // 已见过件（以前文档承诺「改发硬币 ×2」，代码里从来没有这回事，评审 C3 把两边对齐到这句）。
+  const routeId = 'backhill'
+  const pool = SOUVENIRS_BY_ROUTE[routeId]
+  const ownedHalf = pool.slice(0, 4).map((entry) => entry.id)
+
+  // 不满 8 件：老规矩，已拥有的件还可能再掉（早期重复是设计的一部分）。
+  const early = new Set()
+  for (let index = 0; index < 60; index += 1) {
+    early.add(rollSouvenir(routeId, 'early-' + index, 1, [], ownedHalf))
+  }
+
+  // 满 8 件：池子里只要有没集齐的，就只掉没集齐的。
+  const owned8 = [...ownedHalf, ...SOUVENIRS_BY_ROUTE.mine.slice(0, 4).map((entry) => entry.id)]
+  assert.equal(owned8.length, 8)
+  const fresh = pool.slice(4).map((entry) => entry.id)
+  const late = new Set()
+  for (let index = 0; index < 80; index += 1) {
+    late.add(rollSouvenir(routeId, 'late-' + index, 1, [], owned8))
+  }
+  for (const id of late) assert.ok(fresh.includes(id), '满 8 件后不该再掉已集齐的 ' + id)
+
+  // 32 件集齐：不再掉任何已见过的件（本路线全见过 → null，硬币照发）。
+  assert.equal(rollSouvenir(routeId, 'all', 1, [], SOUVENIR_IDS), null)
+  assert.equal(rollSouvenir('nowhere', 'r', 1, [], SOUVENIR_IDS), null)
+})
+
 test('权重分布：普通:稀有:珍稀:传说 ≈ 30:12:4:1（大样本，容差放宽）', () => {
   const samples = 2500
   for (const routeId of ROUTE_IDS) {

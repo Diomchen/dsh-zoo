@@ -5,7 +5,7 @@ import {
   MIN_CONTRACT_WAGE
 } from './contracts-rules.js'
 import { CROP_IDS, MAX_GUARD, MAX_PLOTS, isCropId } from './farm-rules.js'
-import { SHELF_BASE_SLOTS, SOUVENIRS } from './expedition.js'
+import { publicExpeditionBlock } from './farm-open.js'
 import { isPrivateAddress } from './skin-fetch.js'
 import { PLOT_ID_RE, isDeviceId, isVisitId, normalizeNickname } from './protocol.js'
 
@@ -281,45 +281,13 @@ export function normalizeOpenView (raw) {
 /**
  * 票 120：把远端的「出远门」展示块收成窗口能画的那几个字段。
  *
- * 名字/表情一律用本地图鉴（`SOUVENIRS`）按 id 反查，远端塞进来的 name/emoji 不采信；
+ * 白名单重建只有一份（`farm-open.publicExpeditionBlock`）：发视图与收视图必须同一口径，
+ * 不然同一篇日志在自家农场页和邻居页会长短不一、格子数也会对不上。
+ * 远端塞进来的 name/emoji 不采信，一律按本地图鉴的 id 反查；
  * 老版本邻居没发这个字段、或者形状不对时给零值块——窗口照常画，不整包失败。
  */
 export function normalizeExpeditionBlock (raw, { withBodies = false } = {}) {
-  const total = Object.keys(SOUVENIRS).length
-  const block = {
-    codex: { owned: 0, total },
-    shelf: Array.from({ length: SHELF_BASE_SLOTS }, () => null),
-    logs: []
-  }
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return block
-
-  if (raw.codex !== null && typeof raw.codex === 'object' && !Array.isArray(raw.codex)) {
-    const owned = Number(raw.codex.owned)
-    if (Number.isInteger(owned) && owned >= 0) {
-      block.codex.owned = Math.min(owned, total)
-    }
-  }
-
-  const slots = Array.isArray(raw.shelf) ? raw.shelf : []
-  for (let index = 0; index < SHELF_BASE_SLOTS; index += 1) {
-    const entry = slots[index]
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
-    const souvenir = typeof entry.id === 'string' ? SOUVENIRS[entry.id] : null
-    if (souvenir === undefined || souvenir === null) continue
-    block.shelf[index] = { id: souvenir.id, name: souvenir.name, emoji: souvenir.emoji }
-  }
-
-  for (const entry of Array.isArray(raw.logs) ? raw.logs : []) {
-    if (block.logs.length >= 3) break
-    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
-    const title = typeof entry.title === 'string' ? entry.title.trim().slice(0, 120) : ''
-    const at = Number(entry.at)
-    if (title === '' || !Number.isFinite(at) || at <= 0) continue
-    const log = { title, at: Math.floor(at) }
-    if (withBodies === true && typeof entry.body === 'string') log.body = entry.body.slice(0, 400)
-    block.logs.push(log)
-  }
-  return block
+  return publicExpeditionBlock(raw, { withLogBodies: withBodies === true })
 }
 
 function normalizeVisitPlot (raw) {

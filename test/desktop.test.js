@@ -2485,12 +2485,12 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   assert.equal('close' in command, false)
   // 完整农场多一个只显示的驮包；没有在途物品时是空数组（helper 只画有值的那几条）。
   // 票 116：日志细条固定带一份标题列表，没日志时是空数组。
-  // 票 120：顶栏陈列架计数与公开视图同口径，缺省零值。
+  // 票 120：顶栏陈列架计数与公开视图同口径，缺省零值（评审 B4：字段是图鉴件数）。
   assert.deepEqual(command.farm, {
     ...farm,
     carried: [],
     expeditionLog: { titles: [] },
-    expeditionShelf: { owned: 0, total: 32 }
+    expeditionCodexOwned: { owned: 0, total: 32 }
   })
 
   // 票 55：这条白名单以前会吃掉 look / neighbors / contracts——宿主发了、窗口收不到。
