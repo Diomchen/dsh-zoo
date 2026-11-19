@@ -2776,6 +2776,51 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { action, side, margin, leverage, cropId }
   }
 
+  /** 特产 SVG 只允许 `souvenirs/<小写 id>.svg`：坏路径一律当缺图，窗口回退 emoji。 */
+  function normalizeSouvenirArt (value) {
+    const text = normalizeLabel(value, '')
+    return /^souvenirs\/[a-z0-9-]+\.svg$/.test(text) ? text : ''
+  }
+
+  /**
+   * 图鉴的 32 格视图（票 114）：宿主已经把目录展开好，这里只做白名单清洗。
+   * 顺序原样保留，所以窗口画出来始终是 4 条路线 × 8 件的固定位置。
+   */
+  function normalizeExpeditionCodexView (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const slots = Array.isArray(source.slots)
+      ? source.slots
+        .slice(0, 32)
+        .filter((slot) => slot !== null && typeof slot === 'object' && !Array.isArray(slot))
+        .map((slot) => {
+          const id = normalizeLabel(slot.id, '')
+          if (id === '') return null
+          const firstSeenAt = typeof slot.firstSeenAt === 'number' && Number.isFinite(slot.firstSeenAt) ? slot.firstSeenAt : null
+          const owned = firstSeenAt !== null
+          const name = normalizeLabel(slot.name, '')
+          return {
+            id,
+            name,
+            emoji: normalizeLabel(slot.emoji, ''),
+            rarity: normalizeLabel(slot.rarity, ''),
+            rarityLabel: normalizeLabel(slot.rarityLabel, ''),
+            routeId: normalizeLabel(slot.routeId, ''),
+            routeName: normalizeLabel(slot.routeName, ''),
+            owned,
+            firstSeenAt,
+            art: normalizeSouvenirArt(slot.art),
+            label: owned ? normalizeLabel(slot.label, name) : '???'
+          }
+        })
+        .filter((slot) => slot !== null)
+      : []
+    return {
+      total: slots.length,
+      owned: slots.filter((slot) => slot.owned).length,
+      slots
+    }
+  }
+
   /**
    * 出远门整份视图（票 112）：`/state.expedition` 与小窗推的是同一份。
    * 坏字段一律降级——窗口宁可画「还没出门」，也不要因为一个 undefined 白屏。
@@ -2794,9 +2839,16 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       const ended = EXPEDITION_ENDED.includes(source.run.ended) ? source.run.ended : null
       const loot = Array.isArray(source.run.loot)
         ? source.run.loot
-          .slice(0, 16)
+          .slice(0, 32)
           .filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item))
-          .map((item) => ({ kind: 'coin', qty: nonNegative(item.qty) }))
+          .map((item) => {
+            if (item.kind === 'souvenir') {
+              const id = normalizeLabel(item.id, '')
+              return id === '' ? null : { kind: 'souvenir', id }
+            }
+            return { kind: 'coin', qty: nonNegative(item.qty) }
+          })
+          .filter((item) => item !== null)
         : []
       const id = normalizeLabel(source.run.id, '')
       const routeId = normalizeLabel(source.run.routeId, '')
@@ -2831,6 +2883,13 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         }))
         .filter((route) => route.id !== '')
       : []
+    const codex = {}
+    if (source.codex !== null && typeof source.codex === 'object' && !Array.isArray(source.codex)) {
+      for (const [id, firstSeenAt] of Object.entries(source.codex).slice(0, 64)) {
+        const key = normalizeLabel(id, '')
+        if (key !== '' && typeof firstSeenAt === 'number' && Number.isFinite(firstSeenAt)) codex[key] = firstSeenAt
+      }
+    }
     return {
       ready: source.ready === true,
       version: nonNegative(source.version),
@@ -2839,9 +2898,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       now: num(source.now, 0),
       away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
       routes,
-      // 112 不画陈列架/图鉴/提灯，但形状留着：113 加窗口时不用再改协议。
+      // 112 不画陈列架/提灯，但形状留着：115/118 加窗口时不用再改协议。
       shelf: { slots: 8, items: [] },
-      codex: {},
+      codex,
+      codexView: normalizeExpeditionCodexView(source.codexView),
       upgrades: { lantern: source.upgrades?.lantern === true }
     }
   }

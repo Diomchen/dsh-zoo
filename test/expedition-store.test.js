@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { legCoins, routeOf, sumCoins } from '../src/expedition.js'
+import { legCoins, rollSouvenir, routeOf, sumCoins } from '../src/expedition.js'
 import { EXPEDITION_FILE, createExpeditionStore } from '../src/expedition-store.js'
 
 const T0 = 1_700_000_000_000
@@ -45,6 +45,9 @@ test('初始化：空目录落一份空存档，货架/图鉴/提灯都有完整
   assert.equal(snap.run, null)
   assert.deepEqual(snap.shelf, { slots: 8, items: [] })
   assert.deepEqual(snap.codex, {})
+  assert.equal(snap.codexView.total, 32)
+  assert.equal(snap.codexView.owned, 0)
+  assert.equal(snap.codexView.slots.length, 32)
   assert.deepEqual(snap.upgrades, { lantern: false })
   assert.equal(store.active(), false)
   assert.deepEqual(await readState(dir), { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false } })
@@ -109,9 +112,14 @@ test('tick 到点才回币；一段回币进 loot 并进决策窗', async (t) =>
   assert.equal(snap.run.phase, 'deciding')
   assert.equal(snap.run.until, T0 + 40000)
   const expected = legCoins(routeOf('backhill'), started.run.id, 1)
-  assert.deepEqual(snap.run.loot, [{ kind: 'coin', qty: expected }])
+  const souvenir = rollSouvenir('backhill', started.run.id, 1, [])
+  assert.deepEqual(snap.run.loot, [{ kind: 'coin', qty: expected }, { kind: 'souvenir', id: souvenir }])
+  assert.equal(snap.codex[souvenir], T0 + 20000, '首次获得时间就是掉出来的那一拍')
+  assert.equal(snap.codexView.owned, 1)
+  assert.equal(snap.codexView.slots.find((slot) => slot.id === souvenir).owned, true)
   assert.equal(farm.state.coins, expected, '回币要当场进农场')
   assert.equal((await readState(dir)).run.phase, 'deciding')
+  assert.equal((await readState(dir)).codex[souvenir], T0 + 20000, '图鉴要落盘')
 })
 
 test('走一段 → 继续 → 见好就收：只回已走两段的钱，盘缠不退', async (t) => {
@@ -159,7 +167,8 @@ test('走满最后一段自动回家：complete，回币覆盖全部段', async 
   }
   const snap = store.snapshot()
   assert.equal(snap.run.ended, 'complete')
-  assert.equal(snap.run.loot.length, snap.run.totalLegs)
+  assert.equal(snap.run.loot.length, snap.run.totalLegs * 2, '每段一硬币一特产')
+  assert.equal(snap.codexView.owned, snap.run.totalLegs, '走满一趟图鉴至少多这么多件')
   assert.equal(farm.state.coins, sumCoins(snap.run.loot))
   assert.equal(farm.state.coins, sumCoins(snap.run.loot))
   assert.equal(sumCoins(snap.run.loot), Array.from({ length: started.run.totalLegs }, (_, i) => legCoins(route, started.run.id, i + 1)).reduce((a, b) => a + b, 0))
@@ -191,6 +200,24 @@ test('重启后未完成的那趟能继续：读档、再走一段', async (t) =
   assert.equal(stepped.ok, true)
   assert.equal(stepped.run.leg, 2)
   assert.equal((await readState(dir)).run.leg, 2)
+})
+
+test('图鉴只记第一次：重开存档后同一件再掉，时间不被覆盖', async (t) => {
+  const dir = await tempDir(t)
+  const first = await createExpeditionStore(dir, { farm: fakeFarm(500), now: () => T0 })
+  const started = await first.start({ routeId: 'backhill' })
+  const souvenir = rollSouvenir('backhill', started.run.id, 1, [])
+  const saved = await readState(dir)
+  saved.codex = { [souvenir]: T0 - 5000 }
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify(saved), 'utf8')
+  first.dispose()
+
+  const second = await createExpeditionStore(dir, { farm: fakeFarm(0), now: () => T0 + 1000 })
+  assert.equal(second.snapshot().codex[souvenir], T0 - 5000)
+  assert.equal(await second.tick(T0 + 20000), true)
+  const snap = second.snapshot()
+  assert.equal(snap.codex[souvenir], T0 - 5000, '重复获得不能覆盖首次时间')
+  assert.equal(snap.codexView.slots.find((slot) => slot.id === souvenir).firstSeenAt, T0 - 5000)
 })
 
 test('坏存档只降级，不挡启动；坏 run 被丢掉', async (t) => {

@@ -4,8 +4,9 @@
  * 这里只有纯函数：路线表、段数、每段回币、危险度、状态迁移与结算。不读盘、不看系统时钟，
  * `now` 与随机都由调用方传进来——段数和抖动从 `runId` 派生，所以同一趟在重启后走的是同一条路。
  *
- * 112 只开后山一条路线；另外三条、翻车、特产与陈列架是 113 及以后的事，这里不预留会误导人的
- * 半成品字段。`loot` 现在只产生 `{ kind: 'coin', qty }`，以后掉特产时再加另一种 kind。
+ * 112 只开后山一条路线；另外三条、翻车、陈列架是 113 及以后的事。114 先把四条路线的
+ * 32 件特产与图鉴放在这里：掉落只由 `routeId + runId + 段号 + 已捡清单` 决定，翻车减半
+ * 也是纯函数，真正的翻车判定留给 113。
  */
 
 /** 走一段的时间：20 秒（手册《出远门》的节奏）。 */
@@ -32,6 +33,86 @@ export const ROUTES = Object.freeze({
 })
 
 export const ROUTE_IDS = Object.freeze(Object.keys(ROUTES))
+
+/**
+ * 稀有度档位与权重。手册《战利品》按普通/稀有/珍稀/传说标注，权重在同一档内平均分配，
+ * 所以单件特产的期望比就是 30 : 12 : 4 : 1。
+ */
+export const RARITIES = Object.freeze({
+  common: Object.freeze({ id: 'common', label: '普通', weight: 30 }),
+  rare: Object.freeze({ id: 'rare', label: '稀有', weight: 12 }),
+  precious: Object.freeze({ id: 'precious', label: '珍稀', weight: 4 }),
+  legendary: Object.freeze({ id: 'legendary', label: '传说', weight: 1 })
+})
+
+/**
+ * 32 件特产目录，路线与稀有度照抄 `docs/play-expedition.md` 的战利品表。
+ *
+ * `art` 是窗口里的相对路径（`file://` 加载，CSP 放行 'self'）；`emoji` 是缺图时的兜底。
+ * 后山以外的三条路线 114 只建目录，路线本身由 113 开。
+ */
+export const SOUVENIRS = Object.freeze({
+  herb: Object.freeze({ id: 'herb', name: '草药', routeId: 'backhill', rarity: 'common', emoji: '🌿', art: 'souvenirs/herb.svg' }),
+  oddstone: Object.freeze({ id: 'oddstone', name: '怪石', routeId: 'backhill', rarity: 'common', emoji: '🪨', art: 'souvenirs/oddstone.svg' }),
+  pinecone: Object.freeze({ id: 'pinecone', name: '松果', routeId: 'backhill', rarity: 'common', emoji: '🌰', art: 'souvenirs/pinecone.svg' }),
+  feather: Object.freeze({ id: 'feather', name: '羽毛', routeId: 'backhill', rarity: 'common', emoji: '🪶', art: 'souvenirs/feather.svg' }),
+  mushroom: Object.freeze({ id: 'mushroom', name: '蘑菇', routeId: 'backhill', rarity: 'common', emoji: '🍄', art: 'souvenirs/mushroom.svg' }),
+  shard: Object.freeze({ id: 'shard', name: '陶片', routeId: 'backhill', rarity: 'rare', emoji: '🏺', art: 'souvenirs/shard.svg' }),
+  hawthorn: Object.freeze({ id: 'hawthorn', name: '山楂', routeId: 'backhill', rarity: 'rare', emoji: '🍒', art: 'souvenirs/hawthorn.svg' }),
+  egg: Object.freeze({ id: 'egg', name: '鸟蛋', routeId: 'backhill', rarity: 'precious', emoji: '🥚', art: 'souvenirs/egg.svg' }),
+
+  ore: Object.freeze({ id: 'ore', name: '矿石', routeId: 'mine', rarity: 'common', emoji: '⛏️', art: 'souvenirs/ore.svg' }),
+  coal: Object.freeze({ id: 'coal', name: '煤块', routeId: 'mine', rarity: 'common', emoji: '🪵', art: 'souvenirs/coal.svg' }),
+  gear: Object.freeze({ id: 'gear', name: '齿轮', routeId: 'mine', rarity: 'common', emoji: '⚙️', art: 'souvenirs/gear.svg' }),
+  bone: Object.freeze({ id: 'bone', name: '兽骨', routeId: 'mine', rarity: 'common', emoji: '🦴', art: 'souvenirs/bone.svg' }),
+  oldtool: Object.freeze({ id: 'oldtool', name: '旧工具', routeId: 'mine', rarity: 'rare', emoji: '🔧', art: 'souvenirs/oldtool.svg' }),
+  oldcoin: Object.freeze({ id: 'oldcoin', name: '锈钱', routeId: 'mine', rarity: 'rare', emoji: '🪙', art: 'souvenirs/oldcoin.svg' }),
+  crystal: Object.freeze({ id: 'crystal', name: '晶簇', routeId: 'mine', rarity: 'rare', emoji: '💎', art: 'souvenirs/crystal.svg' }),
+  moonstone: Object.freeze({ id: 'moonstone', name: '月光石', routeId: 'mine', rarity: 'precious', emoji: '🌙', art: 'souvenirs/moonstone.svg' }),
+
+  bell: Object.freeze({ id: 'bell', name: '铜铃', routeId: 'railway', rarity: 'common', emoji: '🔔', art: 'souvenirs/bell.svg' }),
+  flag: Object.freeze({ id: 'flag', name: '信号旗', routeId: 'railway', rarity: 'common', emoji: '🚩', art: 'souvenirs/flag.svg' }),
+  key: Object.freeze({ id: 'key', name: '铜钥匙', routeId: 'railway', rarity: 'common', emoji: '🗝️', art: 'souvenirs/key.svg' }),
+  watch: Object.freeze({ id: 'watch', name: '怀表', routeId: 'railway', rarity: 'rare', emoji: '⏱️', art: 'souvenirs/watch.svg' }),
+  ticket: Object.freeze({ id: 'ticket', name: '车票', routeId: 'railway', rarity: 'rare', emoji: '🎫', art: 'souvenirs/ticket.svg' }),
+  sign: Object.freeze({ id: 'sign', name: '站台牌', routeId: 'railway', rarity: 'rare', emoji: '🪧', art: 'souvenirs/sign.svg' }),
+  badge: Object.freeze({ id: 'badge', name: '徽章', routeId: 'railway', rarity: 'rare', emoji: '🎖️', art: 'souvenirs/badge.svg' }),
+  tag: Object.freeze({ id: 'tag', name: '行李牌', routeId: 'railway', rarity: 'precious', emoji: '🏷️', art: 'souvenirs/tag.svg' }),
+
+  mistlamp: Object.freeze({ id: 'mistlamp', name: '雾灯', routeId: 'mistridge', rarity: 'common', emoji: '🏮', art: 'souvenirs/mistlamp.svg' }),
+  antler: Object.freeze({ id: 'antler', name: '白鹿角', routeId: 'mistridge', rarity: 'common', emoji: '🦌', art: 'souvenirs/antler.svg' }),
+  cloudjade: Object.freeze({ id: 'cloudjade', name: '云纹佩', routeId: 'mistridge', rarity: 'rare', emoji: '🧿', art: 'souvenirs/cloudjade.svg' }),
+  starsand: Object.freeze({ id: 'starsand', name: '星砂瓶', routeId: 'mistridge', rarity: 'rare', emoji: '✨', art: 'souvenirs/starsand.svg' }),
+  frostbranch: Object.freeze({ id: 'frostbranch', name: '雾凇枝', routeId: 'mistridge', rarity: 'rare', emoji: '🌿', art: 'souvenirs/frostbranch.svg' }),
+  whistle: Object.freeze({ id: 'whistle', name: '银哨', routeId: 'mistridge', rarity: 'rare', emoji: '📯', art: 'souvenirs/whistle.svg' }),
+  stele: Object.freeze({ id: 'stele', name: '石敢当', routeId: 'mistridge', rarity: 'legendary', emoji: '🗿', art: 'souvenirs/stele.svg' }),
+  seal: Object.freeze({ id: 'seal', name: '山神印', routeId: 'mistridge', rarity: 'legendary', emoji: '🔮', art: 'souvenirs/seal.svg' })
+})
+
+/** 图鉴的顺序：目录的插入顺序，按路线分成四组。 */
+export const SOUVENIR_IDS = Object.freeze(Object.keys(SOUVENIRS))
+
+/** 每条路线可掉的特产；没开的路线的目录也在这里，窗口图鉴照样显示。 */
+export const SOUVENIRS_BY_ROUTE = Object.freeze({
+  backhill: Object.freeze(SOUVENIR_IDS.filter((id) => SOUVENIRS[id].routeId === 'backhill').map((id) => SOUVENIRS[id])),
+  mine: Object.freeze(SOUVENIR_IDS.filter((id) => SOUVENIRS[id].routeId === 'mine').map((id) => SOUVENIRS[id])),
+  railway: Object.freeze(SOUVENIR_IDS.filter((id) => SOUVENIRS[id].routeId === 'railway').map((id) => SOUVENIRS[id])),
+  mistridge: Object.freeze(SOUVENIR_IDS.filter((id) => SOUVENIRS[id].routeId === 'mistridge').map((id) => SOUVENIRS[id]))
+})
+
+/** 图鉴的路线名：113 开路线之前 ROUTES 里还没有它们，这里先给窗口一份稳定的名字。 */
+export const SOUVENIR_ROUTE_NAMES = Object.freeze({
+  backhill: '后山',
+  mine: '废矿',
+  railway: '老铁路',
+  mistridge: '雾岭'
+})
+
+/** 特产对象；未知 id 返回 null。 */
+export function souvenirOf (id) {
+  if (typeof id !== 'string') return null
+  return Object.prototype.hasOwnProperty.call(SOUVENIRS, id) ? SOUVENIRS[id] : null
+}
 
 /** 112 只认「折返 / 走满」；`failed` 是 113 的翻车，读档时先容下。 */
 const ENDED_KINDS = Object.freeze(['back', 'complete', 'failed'])
@@ -76,6 +157,27 @@ export function roll01 (...parts) {
 export function legsFor (route, runId) {
   const span = route.maxLegs - route.minLegs + 1
   return route.minLegs + Math.floor(roll01(runId, 'legs') * span)
+}
+
+/**
+ * 第 `leg` 段掉哪件特产：在本路线还没捡过的池子里按稀有度权重抽。
+ *
+ * 种子里带着「剩余池子」的快照，所以同一趟重放、跨重启都掉同一件；池子空了返回 null，
+ * 让 8 件上限自然封顶（一趟最多 7 段，正常抽不空，这里只是兜底）。
+ */
+export function rollSouvenir (routeId, runId, leg, takenIds = []) {
+  const pool = SOUVENIRS_BY_ROUTE[routeId]
+  if (!Array.isArray(pool)) return null
+  const taken = new Set(Array.isArray(takenIds) ? takenIds : [])
+  const open = pool.filter((entry) => !taken.has(entry.id))
+  if (open.length === 0) return null
+  const total = open.reduce((sum, entry) => sum + RARITIES[entry.rarity].weight, 0)
+  let point = roll01(routeId, runId, 'souvenir', leg, open.map((entry) => entry.id).join(',')) * total
+  for (const entry of open) {
+    point -= RARITIES[entry.rarity].weight
+    if (point < 0) return entry.id
+  }
+  return open[open.length - 1].id
 }
 
 /** 每段回币的基数：round(盘缠 × 3%)——后山是 15。 */
@@ -126,13 +228,14 @@ export function startRun ({ routeId, runId, now } = {}) {
 }
 
 /**
- * 到点推进：走完当前段，掉一笔回币。
+ * 到点推进：走完当前段，掉一笔回币和一件特产。
  *
  * - 没到点、不在 walking、或这一趟已结束 → null（调用方不用写盘）。
  * - 走的是最后一段 → 直接 `ended: 'complete'`，回家。
  * - 否则进决策窗，`until` 再给 20 秒。
  *
- * 返回 `{ run, leg, coins }`；`run` 是新对象，不改入参。
+ * 返回 `{ run, leg, coins, souvenir }`；`run` 是新对象，不改入参。`souvenir` 是特产 id，
+ * 池子空了才会是 null（落盘层按 id 记图鉴）。
  */
 export function advanceRun (run, now) {
   if (!isActiveRun(run) || run.phase !== 'walking') return null
@@ -140,19 +243,24 @@ export function advanceRun (run, now) {
   const route = routeOf(run.routeId)
   if (route === null) return null
   const coins = legCoins(route, run.id, run.leg)
-  const loot = [...run.loot, { kind: 'coin', qty: coins }]
   const leg = run.leg
+  const taken = run.loot.filter((item) => item.kind === 'souvenir').map((item) => item.id)
+  const souvenir = rollSouvenir(route.id, run.id, leg, taken)
+  const loot = [...run.loot, { kind: 'coin', qty: coins }]
+  if (souvenir !== null) loot.push({ kind: 'souvenir', id: souvenir })
   if (leg >= run.totalLegs) {
     return {
       run: { ...run, phase: null, until: null, loot, ended: 'complete', endedAt: now },
       leg,
-      coins
+      coins,
+      souvenir
     }
   }
   return {
     run: { ...run, phase: 'deciding', until: now + DECISION_MS, loot },
     leg,
-    coins
+    coins,
+    souvenir
   }
 }
 
@@ -183,20 +291,91 @@ export function sumCoins (loot) {
 }
 
 /**
- * 回家结算：盘缠是沉没成本，只把已走段数掉出来的硬币带回去。
- * 112 没有特产，`items` 固定是空数组，但形状先留着给 113 填。
+ * 回家结算：盘缠是沉没成本，把已走段数掉出来的硬币与特产带回去。
+ * 翻车减半由 113 在调用这里之前处理（`halveSouvenirs`）。
  */
 export function settledOf (run) {
   const route = isActiveRun(run) || (run !== null && typeof run === 'object') ? routeOf(run.routeId) : null
+  const items = Array.isArray(run?.loot)
+    ? run.loot.filter((item) => item !== null && typeof item === 'object' && item.kind === 'souvenir' && souvenirOf(item.id) !== null).map((item) => item.id)
+    : []
   return {
     runId: run?.id ?? null,
     routeId: run?.routeId ?? null,
     fare: route === null ? 0 : route.fare,
     legs: Number.isInteger(run?.leg) ? run.leg : 0,
     coins: sumCoins(run?.loot),
-    items: [],
+    items,
     ended: run?.ended ?? null
   }
+}
+
+/**
+ * 图鉴记一笔：只记第一次见到的时刻，重复获得不覆盖。
+ *
+ * 纯函数，返回新的 codex 对象；未知 id 或坏时间原样返回。落盘层负责传 `now`。
+ */
+export function recordSouvenir (codex, id, now) {
+  const base = codex !== null && typeof codex === 'object' && !Array.isArray(codex) ? codex : {}
+  if (souvenirOf(id) === null || !Number.isFinite(now)) return base
+  if (Object.prototype.hasOwnProperty.call(base, id)) return base
+  return { ...base, [id]: now }
+}
+
+/**
+ * 窗口直接渲染的 32 格图鉴视图：固定的目录顺序，已获得的亮显名字，没获得的显示 `???`。
+ * `art` 为空或坏路径时窗口回退 `emoji`。
+ */
+export function codexView (codex) {
+  const seen = codex !== null && typeof codex === 'object' && !Array.isArray(codex) ? codex : {}
+  const slots = SOUVENIR_IDS.map((id) => {
+    const entry = SOUVENIRS[id]
+    const firstSeenAt = Number.isFinite(seen[id]) ? seen[id] : null
+    const owned = firstSeenAt !== null
+    return {
+      id,
+      name: entry.name,
+      emoji: entry.emoji,
+      rarity: entry.rarity,
+      rarityLabel: RARITIES[entry.rarity].label,
+      routeId: entry.routeId,
+      routeName: ROUTES[entry.routeId]?.name ?? SOUVENIR_ROUTE_NAMES[entry.routeId] ?? entry.routeId,
+      owned,
+      firstSeenAt,
+      art: entry.art,
+      label: owned ? entry.name : '???'
+    }
+  })
+  return {
+    total: slots.length,
+    owned: slots.filter((slot) => slot.owned).length,
+    slots
+  }
+}
+
+/**
+ * 翻车时特产随机丢一半（向下取整），硬币原样保留。113 的翻车分支只调这个纯函数，
+ * 不自己实现减半。`seed` 用 runId，保证同一趟重放丢的是同样那几件。
+ */
+export function halveSouvenirs (loot, seed = '') {
+  if (!Array.isArray(loot)) return []
+  const indexes = []
+  loot.forEach((item, index) => {
+    if (item !== null && typeof item === 'object' && item.kind === 'souvenir' && souvenirOf(item.id) !== null) {
+      indexes.push(index)
+    }
+  })
+  const dropCount = Math.floor(indexes.length / 2)
+  const dropped = new Set()
+  if (dropCount > 0) {
+    const ranked = indexes
+      .map((index, ordinal) => ({ index, key: roll01(seed, 'halve', ordinal, loot[index].id) }))
+      .sort((left, right) => left.key - right.key || left.index - right.index)
+    for (const entry of ranked.slice(0, dropCount)) dropped.add(entry.index)
+  }
+  return loot
+    .filter((item, index) => !dropped.has(index))
+    .map((item) => (item !== null && typeof item === 'object' ? { ...item } : item))
 }
 
 /**
@@ -226,12 +405,24 @@ export function normalizeRun (raw) {
   }
 
   const loot = []
+  const seenSouvenirs = new Set()
   if (!Array.isArray(raw.loot)) return null
   for (const item of raw.loot) {
     if (item === null || typeof item !== 'object' || Array.isArray(item)) return null
-    if (item.kind !== 'coin') return null
-    if (!Number.isInteger(item.qty) || item.qty < 1) return null
-    loot.push({ kind: 'coin', qty: item.qty })
+    if (item.kind === 'coin') {
+      if (!Number.isInteger(item.qty) || item.qty < 1) return null
+      loot.push({ kind: 'coin', qty: item.qty })
+      continue
+    }
+    if (item.kind === 'souvenir') {
+      const souvenir = souvenirOf(item.id)
+      if (souvenir === null || souvenir.routeId !== route.id) return null
+      if (seenSouvenirs.has(item.id)) continue
+      seenSouvenirs.add(item.id)
+      loot.push({ kind: 'souvenir', id: item.id })
+      continue
+    }
+    return null
   }
 
   const active = walking || deciding

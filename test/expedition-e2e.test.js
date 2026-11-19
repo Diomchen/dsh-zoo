@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
-import { legCoins, routeOf, sumCoins } from '../src/expedition.js'
+import { legCoins, rollSouvenir, routeOf, sumCoins } from '../src/expedition.js'
 import { EXPEDITION_FILE } from '../src/expedition-store.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
@@ -142,8 +142,15 @@ test('e2e：出发扣 500 → 走一段 → 继续 → 见好就收，硬币与�
   assert.equal(afterLeg.body.expedition.run.phase, 'deciding')
   assert.equal(afterLeg.body.expedition.run.leg, 1)
   const firstCoin = legCoins(routeOf('backhill'), runId, 1)
+  const firstSouvenir = rollSouvenir('backhill', runId, 1, [])
   assert.equal(afterLeg.body.farm.coins, firstCoin)
-  assert.deepEqual(afterLeg.body.expedition.run.loot, [{ kind: 'coin', qty: firstCoin }])
+  assert.deepEqual(afterLeg.body.expedition.run.loot, [
+    { kind: 'coin', qty: firstCoin },
+    { kind: 'souvenir', id: firstSouvenir }
+  ])
+  assert.equal(afterLeg.body.expedition.codexView.total, 32)
+  assert.equal(afterLeg.body.expedition.codexView.owned, 1)
+  assert.equal(afterLeg.body.expedition.codex[firstSouvenir], T0 + 20000)
 
   // 5) 继续走：第二段开始。
   clock.value = T0 + 25000
@@ -199,7 +206,8 @@ test('e2e：走满最后一段自动回家，ended=complete', async (t) => {
   const snap = store.snapshot().run
   assert.equal(snap.ended, 'complete')
   assert.equal(snap.leg, totalLegs)
-  assert.equal(snap.loot.length, totalLegs)
+  assert.equal(snap.loot.length, totalLegs * 2)
+  assert.equal(store.snapshot().codexView.owned, totalLegs)
   const expected = Array.from({ length: totalLegs }, (_, i) => legCoins(routeOf('backhill'), runId, i + 1)).reduce((a, b) => a + b, 0)
   assert.equal((await state(service)).body.farm.coins, expected)
   assert.equal((await state(service)).body.expedition.run.ended, 'complete')

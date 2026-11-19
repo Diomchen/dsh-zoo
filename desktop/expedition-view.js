@@ -108,6 +108,64 @@
     return fare > 0 && coins >= fare
   }
 
+  /** 图鉴 32 格：宿主没送或送坏了就当全空，窗口仍然画 32 个灰格。 */
+  function codexSlots (view) {
+    if (view === null || typeof view !== 'object' || !Array.isArray(view.slots)) return []
+    return view.slots.filter((slot) => slot !== null && typeof slot === 'object')
+  }
+
+  /** 「已获得 / 全部」，用于图鉴页标题与 tab 角标。视图还没到时也画 0/32。 */
+  function codexProgress (view) {
+    const slots = codexSlots(view)
+    const total = slots.length === 0 ? 32 : slots.length
+    const owned = slots.filter((slot) => slot.owned === true).length
+    return String(owned) + '/' + String(total)
+  }
+
+  /** 按路线分组，保持宿主给的顺序（后山 → 废矿 → 老铁路 → 雾岭）。 */
+  function codexGroups (view) {
+    const groups = []
+    const byRoute = new Map()
+    for (const slot of codexSlots(view)) {
+      const routeId = typeof slot.routeId === 'string' && slot.routeId !== '' ? slot.routeId : 'unknown'
+      let group = byRoute.get(routeId)
+      if (group === undefined) {
+        group = {
+          routeId,
+          routeName: typeof slot.routeName === 'string' && slot.routeName !== '' ? slot.routeName : routeId,
+          slots: []
+        }
+        byRoute.set(routeId, group)
+        groups.push(group)
+      }
+      group.slots.push(slot)
+    }
+    return groups
+  }
+
+  /**
+   * 一格画什么：有合法 SVG 就用图，缺图/坏路径回退 emoji。
+   * 返回描述对象而不是 DOM，窗口与测试各自决定怎么落地。
+   */
+  function slotEmblem (slot) {
+    const art = slot !== null && typeof slot === 'object' && typeof slot.art === 'string' ? slot.art.trim() : ''
+    if (/^souvenirs\/[a-z0-9-]+\.svg$/.test(art)) return { kind: 'art', src: art }
+    const emoji = slot !== null && typeof slot === 'object' && typeof slot.emoji === 'string' ? slot.emoji.trim() : ''
+    return { kind: 'emoji', text: emoji === '' ? '❔' : emoji }
+  }
+
+  /** 结算页列出这一趟捡到的特产名字（图鉴里没有的 id 原样显示）。 */
+  function souvenirNames (run, view) {
+    if (run === null || typeof run !== 'object' || !Array.isArray(run.loot)) return []
+    const names = new Map()
+    for (const slot of codexSlots(view)) {
+      if (typeof slot.id === 'string' && typeof slot.name === 'string') names.set(slot.id, slot.name)
+    }
+    return run.loot
+      .filter((item) => item !== null && typeof item === 'object' && item.kind === 'souvenir' && typeof item.id === 'string')
+      .map((item) => names.get(item.id) || item.id)
+  }
+
   return {
     ACTIVE_PHASES,
     isActiveRun,
@@ -122,6 +180,11 @@
     primaryLabel,
     canContinue,
     canBack,
-    canStart
+    canStart,
+    codexSlots,
+    codexProgress,
+    codexGroups,
+    slotEmblem,
+    souvenirNames
   }
 })
