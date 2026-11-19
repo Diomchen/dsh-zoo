@@ -19,8 +19,10 @@ import { join } from 'node:path'
 import {
   advanceRun,
   backRun,
+  expireRun,
   isActiveRun,
   normalizeRun,
+  resumeRun,
   routeOf,
   settledOf,
   startRun,
@@ -72,15 +74,17 @@ export class ExpeditionStore {
   #log
   #farm
   #now
+  #newRunId
   #state = normalizeState(null)
   #queue = Promise.resolve()
   #disposed = false
 
-  constructor (dir, { log = null, farm = null, now = () => Date.now() } = {}) {
+  constructor (dir, { log = null, farm = null, now = () => Date.now(), newRunId = randomUUID } = {}) {
     this.#dir = dir
     this.#log = log
     this.#farm = farm
     this.#now = typeof now === 'function' ? now : () => Date.now()
+    this.#newRunId = typeof newRunId === 'function' ? newRunId : randomUUID
   }
 
   async init () {
@@ -96,8 +100,10 @@ export class ExpeditionStore {
     }
     const state = normalizeState(raw)
     this.#state = state
+    // 关门期间到点的，读档时只推进一个节点；推进了也要写回磁盘。
+    const resumed = await this.#resume(this.#now())
     // 坏文件/缺文件/旧形状都在启动时修一次，别等下一拍才写。
-    if (missing || raw === null || JSON.stringify(state) !== JSON.stringify(raw)) {
+    if (missing || raw === null || resumed || JSON.stringify(state) !== JSON.stringify(raw)) {
       await this.#persist()
     }
     return this
@@ -132,7 +138,7 @@ export class ExpeditionStore {
       if (this.#farm === null || typeof this.#farm.spendCoins !== 'function') {
         return { ok: false, error: 'starting' }
       }
-      const run = startRun({ routeId: route.id, runId: randomUUID(), now: this.#now() })
+      const run = startRun({ routeId: route.id, runId: this.#newRunId(), now: this.#now() })
       if (run === null) return { ok: false, error: 'starting' }
 
       const paid = await this.#farm.spendCoins(route.fare)
@@ -157,15 +163,18 @@ export class ExpeditionStore {
     })
   }
 
-  /** 「继续走」：只有决策窗合法。 */
+  /** 「继续走」：只有决策窗合法；翻车当场结算（硬币照给，盘缠不退）。 */
   step (now = this.#now()) {
     return this.#serial(async () => {
       if (this.#disposed) return { ok: false, error: 'starting' }
       const next = stepRun(this.#state.run, now)
       if (next === null) return { ok: false, error: 'not-walking' }
+      const settled = next.ended === null ? null : settledOf(next)
       const previous = this.#state.run
       this.#state.run = next
-      if (await this.#persist()) return { ok: true, run: copyRun(next) }
+      if (await this.#persist()) {
+        return settled === null ? { ok: true, run: copyRun(next) } : { ok: true, run: copyRun(next), settled }
+      }
       this.#state.run = previous
       return { ok: false, error: 'save-failed' }
     })
@@ -191,14 +200,20 @@ export class ExpeditionStore {
   }
 
   /**
-   * 秒级 tick：只推进走路。到点走完一段，回币进农场；走满最后一段直接 complete。
-   * 决策窗超时（手册里算折返）留给 113——112 到点只停在那里等玩家决定。
+   * 秒级 tick：先看决策窗有没有超时（超时即自动折返），再推走路。
+   * 到点走完一段，回币进农场；走满最后一段直接 complete。
    *
    * 返回是否真的推进了（服务层据此决定要不要重推窗口）。
    */
   tick (now = this.#now()) {
     return this.#serial(async () => {
       if (this.#disposed) return false
+      const expired = expireRun(this.#state.run, now)
+      if (expired !== null) {
+        this.#state.run = expired
+        await this.#persist()
+        return true
+      }
       const event = advanceRun(this.#state.run, now)
       if (event === null) return false
       if (event.coins > 0) {
@@ -213,6 +228,21 @@ export class ExpeditionStore {
 
   dispose () {
     this.#disposed = true
+  }
+
+  /**
+   * 读档续走：最多推进一个节点，不补算离线期间错过的段数、不补掷。
+   * 钱先记、记不上就原样留着（下一拍 tick 再补），避免「硬币没到账、run 却往前走了」。
+   */
+  async #resume (now) {
+    const event = resumeRun(this.#state.run, now)
+    if (event === null) return false
+    if (event.coins > 0) {
+      const credited = await this.#credit(event.coins)
+      if (!credited) return false
+    }
+    this.#state.run = event.run
+    return true
   }
 
   async #credit (qty) {
