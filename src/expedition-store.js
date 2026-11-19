@@ -2,8 +2,12 @@
  * 「出远门」的存档（票 112）：`<dataDir>/expedition.json`。
  *
  * 只做三件事：把规则层的纯迁移落到内存、把硬币变动交给农场、把结果原子地写回磁盘。
- * 文件里有 run / shelf / codex / upgrades / trips 五块。114 起每到一段同时记一笔图鉴（首次获得时间），
- * 图鉴与陈列架共用这份 codex，不需要再迁一次格式；117 的 trips 只记每条路线平安回家的趟数。
+ * 文件里有 run / shelf / codex / upgrades / trips / logs 六块。114 起每到一段同时记一笔图鉴
+ * （首次获得时间），图鉴与陈列架共用这份 codex，不需要再迁一次格式；117 的 trips 只记每条路线
+ * 平安回家的趟数；116 起每趟结束再追一篇旅行日志（最多 30 篇）。
+ *
+ * 结束迁移只走一个记账点（`#recordTrip`）：同一笔结束要么「run/trips/logs 一起落盘」，
+ * 要么写失败时一起回滚，不会出现趟数记上了、日志没记（或反过来）的半截状态。
  *
  * 钱与状态顺序：
  *   出发：先扣盘缠再写 run（写失败退款并回滚）；
@@ -19,12 +23,17 @@ import { join } from 'node:path'
 import {
   LANTERN_PRICE,
   ROUTE_IDS,
+  SHELF_BASE_SLOTS,
+  SHELF_MAX_SLOTS,
+  SHELF_SLOT_PRICE,
   advanceRun,
+  appendTripLog,
   backRun,
   codexView,
   expireRun,
   isActiveRun,
   normalizeRun,
+  normalizeTripLogs,
   recordSouvenir,
   recordTrip,
   resumeRun,
@@ -33,9 +42,7 @@ import {
   souvenirOf,
   startRun,
   stepRun,
-  SHELF_BASE_SLOTS,
-  SHELF_MAX_SLOTS,
-  SHELF_SLOT_PRICE,
+  tripLog,
   unlockStatus
 } from './expedition.js'
 
@@ -100,7 +107,8 @@ function normalizeState (raw) {
     shelf: normalizeShelf(raw?.shelf),
     codex: normalizeCodex(raw?.codex),
     upgrades: { lantern: raw?.upgrades?.lantern === true },
-    trips: normalizeTrips(raw?.trips)
+    trips: normalizeTrips(raw?.trips),
+    logs: normalizeTripLogs(raw?.logs)
   }
 }
 
@@ -157,7 +165,8 @@ export class ExpeditionStore {
       codex: { ...this.#state.codex },
       codexView: codexView(this.#state.codex),
       upgrades: { ...this.#state.upgrades },
-      trips: { ...this.#state.trips }
+      trips: { ...this.#state.trips },
+      logs: this.#state.logs.map((entry) => ({ ...entry }))
     }
   }
 
@@ -252,14 +261,16 @@ export class ExpeditionStore {
       if (next === null) return { ok: false, error: 'not-walking' }
       const settled = next.ended === null ? null : settledOf(next)
       const previous = this.#state.run
-      const previousTrips = this.#state.trips
+      const previousLedger = { trips: this.#state.trips, logs: this.#state.logs }
       this.#state.run = next
-      this.#state.trips = recordTrip(this.#state.trips, next)
+      if (settled !== null) this.#recordTrip(previous, next, now)
       if (await this.#persist()) {
         return settled === null ? { ok: true, run: copyRun(next) } : { ok: true, run: copyRun(next), settled }
       }
+      // 写不进去：run、趟数、日志一起退回，绝不能只落一半。
       this.#state.run = previous
-      this.#state.trips = previousTrips
+      this.#state.trips = previousLedger.trips
+      this.#state.logs = previousLedger.logs
       return { ok: false, error: 'save-failed' }
     })
   }
@@ -275,13 +286,14 @@ export class ExpeditionStore {
       if (next === null) return { ok: false, error: 'not-walking' }
       const settled = settledOf(next)
       const previous = this.#state.run
-      const previousTrips = this.#state.trips
+      const previousLedger = { trips: this.#state.trips, logs: this.#state.logs }
       this.#state.run = next
-      this.#state.trips = recordTrip(this.#state.trips, next)
+      this.#recordTrip(previous, next, now)
       if (await this.#persist()) return { ok: true, run: copyRun(next), settled }
       // 写不进去就留在决策窗，让玩家能再点一次，而不是内存说回家了、重启又在外头。
       this.#state.run = previous
-      this.#state.trips = previousTrips
+      this.#state.trips = previousLedger.trips
+      this.#state.logs = previousLedger.logs
       return { ok: false, error: 'save-failed' }
     })
   }
@@ -297,8 +309,9 @@ export class ExpeditionStore {
       if (this.#disposed) return false
       const expired = expireRun(this.#state.run, now)
       if (expired !== null) {
+        const previous = this.#state.run
         this.#state.run = expired
-        this.#state.trips = recordTrip(this.#state.trips, expired)
+        this.#recordTrip(previous, expired, now)
         await this.#persist()
         return true
       }
@@ -308,12 +321,13 @@ export class ExpeditionStore {
         const credited = await this.#credit(event.coins)
         if (!credited) return false
       }
+      const previous = this.#state.run
       this.#state.run = event.run
-      this.#state.trips = recordTrip(this.#state.trips, event.run)
       if (event.souvenir !== null && event.souvenir !== undefined) {
         // 只记第一次见到的时刻；重复获得时 recordSouvenir 原样返回。
         this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
       }
+      if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
       await this.#persist()
       return true
     })
@@ -423,12 +437,29 @@ export class ExpeditionStore {
       const credited = await this.#credit(event.coins)
       if (!credited) return false
     }
+    const previous = this.#state.run
     this.#state.run = event.run
-    this.#state.trips = recordTrip(this.#state.trips, event.run)
     if (event.souvenir !== null && event.souvenir !== undefined) {
       this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
     }
+    if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
     return true
+  }
+
+  /**
+   * 一趟结束的唯一记账点：117 的趟数与 116 的日志在这里一起落账，只由结束迁移调用一次。
+   *
+   * - 趟数只认 `complete`/`back`（117：翻车与超时不算「已回家」），`recordTrip` 自己会过滤；
+   * - 日志四种结局都写一篇（116），`before` 只用于翻车丢件清单。
+   *
+   * 两个账本都要么留在原处、要么一起前进；写盘失败由调用方按同一份旧引用一起回滚。
+   */
+  #recordTrip (before, run, now) {
+    if (run === null || typeof run !== 'object' || run.ended === null) return false
+    const entry = tripLog(run, { at: Number.isFinite(run.endedAt) ? run.endedAt : now, before })
+    this.#state.trips = recordTrip(this.#state.trips, run)
+    if (entry !== null) this.#state.logs = appendTripLog(this.#state.logs, entry)
+    return entry !== null
   }
 
   async #credit (qty) {

@@ -82,6 +82,8 @@ const unlockCloseEl = document.getElementById('unlock-modal-close')
 const closeButton = document.getElementById('close')
 const pinButton = document.getElementById('pin')
 const boardButton = document.getElementById('board')
+const expeditionLogEl = document.getElementById('expedition-log')
+const expeditionLogTitlesEl = document.getElementById('expedition-log-titles')
 
 /** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
 const HIRE_WAGE_MIN = 1
@@ -588,6 +590,22 @@ function renderBatchBar () {
   const locked = busy || batch !== null
   if (batchPlantEl !== null) batchPlantEl.disabled = locked
   if (batchHarvestEl !== null) batchHarvestEl.disabled = locked
+}
+
+/** 票 116：顶栏旁那行「最近三篇出远门日志」。只放标题，点开去出远门窗口看正文。 */
+function renderExpeditionLog () {
+  if (expeditionLogEl === null) return
+  const titles = mode === 'owner' && farm !== null && Array.isArray(farm.expeditionLog?.titles)
+    ? farm.expeditionLog.titles.filter((title) => typeof title === 'string' && title !== '').slice(0, 3)
+    : []
+  expeditionLogEl.hidden = titles.length === 0
+  if (expeditionLogTitlesEl === null) return
+  expeditionLogTitlesEl.textContent = ''
+  for (const title of titles) {
+    const span = document.createElement('span')
+    span.textContent = title
+    expeditionLogTitlesEl.appendChild(span)
+  }
 }
 
 /** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */
@@ -2037,6 +2055,7 @@ function renderFarmSurface () {
   renderSeason()
   renderSeasonCards(currentSeason())
   renderBatchBar()
+  renderExpeditionLog()
   renderPlots()
   renderInventory()
   renderCarried()
@@ -2517,6 +2536,17 @@ closeButton.addEventListener('click', () => api?.close())
 // 走和种地/买种一样的 farm-submit → action-result 回路，失败会冒一句人话。
 if (boardButton !== null) {
   boardButton.addEventListener('click', () => submit({ action: 'trading-open' }))
+}
+
+// 票 116：日志细条也只是**开窗申请**；正文只在出远门窗口里看。
+if (expeditionLogEl !== null) {
+  const openExpeditionLog = () => submit({ action: 'expedition-open' })
+  expeditionLogEl.addEventListener('click', openExpeditionLog)
+  expeditionLogEl.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    openExpeditionLog()
+  })
 }
 
 if (pinButton !== null) {

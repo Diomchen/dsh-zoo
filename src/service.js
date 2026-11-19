@@ -2390,6 +2390,15 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 票 116：农场页顶栏旁只放最近三篇标题，正文只在出远门窗口里出现。
+   * 这里按「新的在前」取，读不到存档就给空数组。
+   */
+  function expeditionLogTitles (limit = 3) {
+    if (expedition === null) return []
+    return expedition.snapshot().logs.slice(0, limit).map((entry) => entry.title)
+  }
+
+  /**
    * 农场小窗的完整视图（ticket 40）。
    *
    * 和 `/state.farm` 是两个形状，别混：
@@ -2448,7 +2457,9 @@ export function createService (ctx, options = {}) {
       // 红包单独攒的一份（≤50）：流水会被种下/收获挤掉，红包记录不能跟着没。
       packets: view.packetLog ?? [],
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
-      carried: carriedView()
+      carried: carriedView(),
+      // 票 116：最近三篇出远门日志的标题；正文不出农场页。
+      expeditionLog: { titles: expeditionLogTitles(3) }
     }
   }
 
@@ -3213,7 +3224,8 @@ export function createService (ctx, options = {}) {
           codex: {},
           codexView: { total: 0, owned: 0, slots: [] },
           upgrades: { lantern: false },
-          trips: {}
+          trips: {},
+          logs: []
         }
       : expedition.snapshot()
     // 陈列架：`slots` = 已解锁格数，`items[i]` 对第 i+1 格（null = 空格）。

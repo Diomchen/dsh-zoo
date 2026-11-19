@@ -519,6 +519,154 @@ export function settledOf (run) {
   }
 }
 
+/** 旅行日志的上限（票 116）：最多留 30 篇，超出丢最旧的。 */
+export const TRIP_LOG_LIMIT = 30
+
+const TRIP_LOG_TITLE_MAX = 80
+const TRIP_LOG_BODY_MAX = 400
+
+function routeNameOf (routeId) {
+  return ROUTES[routeId]?.name ?? SOUVENIR_ROUTE_NAMES[routeId] ?? ''
+}
+
+/** 特产 id 列表 → 名字列表（未知 id 跳过，正文里不写看不懂的编号）。 */
+function souvenirNamesOf (ids) {
+  return ids.map((id) => souvenirOf(id)?.name).filter((name) => typeof name === 'string' && name !== '')
+}
+
+/** 战利品里的特产 id，按出现顺序。 */
+function souvenirIdsOf (loot) {
+  if (!Array.isArray(loot)) return []
+  return loot
+    .filter((item) => item !== null && typeof item === 'object' && item.kind === 'souvenir')
+    .map((item) => item.id)
+    .filter((id) => souvenirOf(id) !== null)
+}
+
+/** 翻车丢了哪几件：walking → failed 前后 loot 里特产 id 的差集（重复件按次数算）。 */
+function lostSouvenirs (before, after) {
+  const remaining = new Map()
+  for (const id of souvenirIdsOf(after)) remaining.set(id, (remaining.get(id) ?? 0) + 1)
+  const lost = []
+  for (const id of souvenirIdsOf(before === null || typeof before !== 'object' ? null : before.loot)) {
+    const count = remaining.get(id) ?? 0
+    if (count > 0) remaining.set(id, count - 1)
+    else lost.push(id)
+  }
+  return lost
+}
+
+/**
+ * 一趟的结局 → 日志种类（票 116 的四种模板）。`back` 分「见好就收」与「超时折返」，
+ * `failed` 只能是翻车；原因与结局对不上就当作没有日志，不猜。
+ */
+export function tripLogKind (run) {
+  if (run === null || typeof run !== 'object' || Array.isArray(run)) return null
+  if (isActiveRun(run) || !ENDED_KINDS.includes(run.ended)) return null
+  if (run.ended === 'complete') return run.reason === null || run.reason === undefined ? 'complete' : null
+  if (run.ended === 'failed') return run.reason === 'wipeout' ? 'wipeout' : null
+  if (run.reason === 'timeout') return 'timeout'
+  return run.reason === null || run.reason === undefined ? 'back' : null
+}
+
+/**
+ * 写一篇旅行日志（票 116）。纯模板拼装，不调用任何模型、不掷骰。
+ *
+ * 四种结局各一句固定标题：折返 / 翻车 / 走满 / 超时；正文写清路线、段数、捡到的特产、
+ * 翻车丢了哪几件，超时补一句「没等到你，自己回来了」。`before` 是这一趟翻车前的 run，
+ * 只用来算丢件；不是翻车时给不给都一样。
+ */
+export function tripLog (run, { at = null, before = null } = {}) {
+  const kind = tripLogKind(run)
+  if (kind === null) return null
+  const route = routeOf(run.routeId)
+  if (route === null) return null
+  const time = Number.isFinite(at) ? at : run.endedAt
+  if (!Number.isFinite(time)) return null
+  const legs = Number.isInteger(run.leg) ? run.leg : 0
+  if (legs < 1) return null
+
+  const routeName = routeNameOf(route.id)
+  const names = souvenirNamesOf(souvenirIdsOf(run.loot))
+  const coins = sumCoins(run.loot)
+  const head = '交 ' + String(route.fare) + ' 枚盘缠去' + routeName + '，'
+  const lootText = names.length === 0 ? '路上没捡到特产' : '路上捡到' + names.join('、')
+  const coinText = '，带回 ' + String(coins) + ' 枚硬币。'
+
+  let middle = '走了 ' + String(legs) + ' 段'
+  let tail = ''
+  let title = ''
+  if (kind === 'complete') {
+    title = '走满' + routeName + '，' + String(legs) + ' 段全程'
+    middle = String(legs) + ' 段全程走完'
+  } else if (kind === 'back') {
+    title = '从' + routeName + '折返，走了 ' + String(legs) + ' 段'
+    middle = '走了 ' + String(legs) + ' 段就折返'
+  } else if (kind === 'wipeout') {
+    title = '在' + routeName + '翻车，只走了 ' + String(legs) + ' 段'
+    middle = '走了 ' + String(legs) + ' 段就翻了车'
+    const lost = souvenirNamesOf(lostSouvenirs(before, run.loot))
+    tail = lost.length === 0 ? '翻车时特产一件没丢。' : '翻车时丢了' + lost.join('、') + '。'
+  } else {
+    title = '在' + routeName + '超时，它自己回来了'
+    tail = String(Math.round(DECISION_MS / 1000)) + ' 秒没等到你，自己回来了。'
+  }
+
+  return {
+    at: time,
+    routeId: route.id,
+    legs,
+    title,
+    body: head + middle + '，' + lootText + coinText + tail,
+    ended: run.ended,
+    reason: ENDED_REASONS.includes(run.reason) ? run.reason : null
+  }
+}
+
+/** 新的一篇放最前；超过 30 篇丢最旧的。 */
+export function appendTripLog (logs, entry) {
+  const list = Array.isArray(logs) ? logs : []
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+    return list.slice(0, TRIP_LOG_LIMIT)
+  }
+  return [entry, ...list].slice(0, TRIP_LOG_LIMIT)
+}
+
+/** 读档时的日志清洗：只认形状对的篇目，坏数据不挡启动。 */
+function normalizeTripLog (raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const route = routeOf(raw.routeId)
+  if (route === null) return null
+  if (!Number.isFinite(raw.at)) return null
+  if (!Number.isInteger(raw.legs) || raw.legs < 1) return null
+  if (!ENDED_KINDS.includes(raw.ended)) return null
+  const text = (value, max) => (typeof value === 'string' ? value.trim().slice(0, max) : '')
+  const title = text(raw.title, TRIP_LOG_TITLE_MAX)
+  const body = text(raw.body, TRIP_LOG_BODY_MAX)
+  if (title === '' || body === '') return null
+  return {
+    at: raw.at,
+    routeId: route.id,
+    legs: raw.legs,
+    title,
+    body,
+    ended: raw.ended,
+    reason: ENDED_REASONS.includes(raw.reason) ? raw.reason : null
+  }
+}
+
+/** 日志列表：新在前，最多 30 篇。 */
+export function normalizeTripLogs (raw) {
+  if (!Array.isArray(raw)) return []
+  const logs = []
+  for (const entry of raw) {
+    if (logs.length >= TRIP_LOG_LIMIT) break
+    const log = normalizeTripLog(entry)
+    if (log !== null) logs.push(log)
+  }
+  return logs
+}
+
 /**
  * 图鉴记一笔：只记第一次见到的时刻，重复获得不覆盖。
  *

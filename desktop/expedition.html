@@ -144,6 +144,16 @@
   .codexRarity { font-size: 10px; color: var(--muted); }
   .codexRarity[data-rarity="precious"] { color: #7a5bb5; }
   .codexRarity[data-rarity="legendary"] { color: var(--accent); font-weight: 700; }
+  .logEntry { padding: 9px 0; border-top: 1px dashed var(--soft); }
+  .logEntry:first-child { border-top: 0; padding-top: 0; }
+  .logHead { display: flex; align-items: baseline; gap: 8px; }
+  .logTitle { font-size: 13px; font-weight: 600; }
+  .logWhen {
+    margin-left: auto; color: var(--muted); font-size: 11px;
+    font-variant-numeric: tabular-nums; white-space: nowrap;
+  }
+  .logBody { margin: 5px 0 0; color: var(--muted); line-height: 1.55; }
+  .logEmpty { margin: 0; color: var(--muted); }
   .shelfGrid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; }
   .shelfCell {
     position: relative; display: grid; justify-items: center; align-content: center; gap: 1px;
@@ -188,6 +198,7 @@
   </header>
   <nav class="tabs" id="tabs">
     <button class="tab active" id="tabTravel" data-tab="travel">出远门</button>
+    <button class="tab" id="tabLog" data-tab="log">日志</button>
     <button class="tab" id="tabCodex" data-tab="codex">图鉴 <span class="badge" id="codexCount">0/32</span></button>
     <button class="tab" id="tabShelf" data-tab="shelf">陈列架 <span class="badge" id="shelfCount">8/32</span></button>
   </nav>
@@ -232,6 +243,15 @@
       </div>
     </section>
     </div>
+
+    <section class="card" id="logPane" hidden>
+      <div class="codexHead">
+        <h2>旅行日志</h2>
+        <span class="hint" id="logCount">0 篇</span>
+      </div>
+      <p class="desc">每趟回来写一篇，最多留 30 篇；新的在最前面。</p>
+      <div id="logList"></div>
+    </section>
 
     <section class="card" id="codex" hidden>
       <div class="codexHead">

@@ -237,6 +237,48 @@
         background: var(--emerald-soft);
         color: var(--emerald-deep);
       }
+      /* 票 116：顶栏旁一行「最近三篇出远门日志」，只放标题；正文点开窗口才看得到。 */
+      .expedition-log {
+        flex: none;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 6px 12px;
+        border-top: 1px solid var(--line);
+        background: #fbf8f3;
+        color: var(--ink-soft);
+        font-size: 11.5px;
+        cursor: pointer;
+      }
+      .expedition-log[hidden] {
+        display: none !important;
+      }
+      .expedition-log:hover {
+        background: #f6f1e8;
+      }
+      .exp-log-label {
+        flex: none;
+        color: var(--amber-ink);
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .exp-log-titles {
+        flex: 1 1 auto;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .exp-log-titles span + span::before {
+        content: ' · ';
+        color: var(--line);
+      }
+      .exp-log-open {
+        flex: none;
+        color: var(--amber-ink);
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        white-space: nowrap;
+      }
 
       /* 2. 分段页签 */
       /* 票 55：农场窗头部的邻居切换器（我的农场 / 各邻居）。 */
@@ -2347,6 +2389,13 @@
           <span class="tab-emoji" aria-hidden="true">📜</span>记录
         </button>
       </nav>
+
+      <!-- 票 116：最近三篇出远门日志的标题。正文只在出远门窗口里，点这一行去开窗。 -->
+      <div class="expedition-log" id="expedition-log" role="button" tabindex="0" aria-label="最近三篇出远门日志，点开看全文" hidden>
+        <span class="exp-log-label">📔 最近三篇</span>
+        <span class="exp-log-titles" id="expedition-log-titles"></span>
+        <span class="exp-log-open">看全文</span>
+      </div>
 
       <div class="batch-bar" id="batch-bar" hidden>
         <button class="batch-btn plant" id="batch-plant" type="button">＋ 一键种满</button>

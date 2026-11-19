@@ -87,8 +87,9 @@ test('初始化：空目录落一份空存档，货架/图鉴/提灯都有完整
   assert.equal(snap.codexView.slots.length, 32)
   assert.deepEqual(snap.upgrades, { lantern: false })
   assert.deepEqual(snap.trips, {}, '还没回过家的趟')
+  assert.deepEqual(snap.logs, [], '还没出过门，日志是空的')
   assert.equal(store.active(), false)
-  assert.deepEqual(await readState(dir), { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false }, trips: {} })
+  assert.deepEqual(await readState(dir), { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false }, trips: {}, logs: [] })
 })
 
 test('出发先扣 500 盘缠：硬币变 0，run 落盘为 walking', async (t) => {

@@ -17,10 +17,14 @@
     close: el('close'),
     tabs: el('tabs'),
     tabTravel: el('tabTravel'),
+    tabLog: el('tabLog'),
     tabCodex: el('tabCodex'),
     tabShelf: el('tabShelf'),
     travelPane: el('travelPane'),
     routes: el('routes'),
+    logPane: el('logPane'),
+    logCount: el('logCount'),
+    logList: el('logList'),
     lantern: el('lantern'),
     lanternText: el('lanternText'),
     lanternBuy: el('lanternBuy'),
@@ -215,6 +219,40 @@
     }
   }
 
+  /** 日志页（票 116）：全部正文都只在这里出现，农场页只有标题。 */
+  function renderLogs () {
+    const entries = view.tripLogEntries(state)
+    ui.logCount.textContent = String(entries.length) + ' 篇'
+    ui.logList.textContent = ''
+    if (entries.length === 0) {
+      const empty = document.createElement('p')
+      empty.className = 'logEmpty'
+      empty.textContent = '还没有日志。出趟门回来，这里会记下这一趟。'
+      ui.logList.appendChild(empty)
+      return
+    }
+    for (const entry of entries) {
+      const article = document.createElement('article')
+      article.className = 'logEntry'
+      const head = document.createElement('div')
+      head.className = 'logHead'
+      const title = document.createElement('span')
+      title.className = 'logTitle'
+      title.textContent = entry.title
+      const when = document.createElement('span')
+      when.className = 'logWhen'
+      when.textContent = entry.when
+      head.appendChild(title)
+      head.appendChild(when)
+      article.appendChild(head)
+      const body = document.createElement('p')
+      body.className = 'logBody'
+      body.textContent = entry.body
+      article.appendChild(body)
+      ui.logList.appendChild(article)
+    }
+  }
+
   function shelfArt (cell) {
     const art = document.createElement('span')
     art.className = 'shelfArt'
@@ -357,18 +395,29 @@
   }
 
   function setTab (name) {
-    activeTab = name === 'codex' ? 'codex' : name === 'shelf' ? 'shelf' : 'travel'
+    activeTab = name === 'codex'
+      ? 'codex'
+      : name === 'log'
+        ? 'log'
+        : name === 'shelf'
+          ? 'shelf'
+          : 'travel'
+    const logActive = activeTab === 'log'
     const codexActive = activeTab === 'codex'
     const shelfActive = activeTab === 'shelf'
-    ui.travelPane.hidden = codexActive || shelfActive
+    ui.travelPane.hidden = logActive || codexActive || shelfActive
+    ui.logPane.hidden = !logActive
     ui.codex.hidden = !codexActive
     ui.shelf.hidden = !shelfActive
     ui.tabTravel.classList.toggle('active', activeTab === 'travel')
+    ui.tabLog.classList.toggle('active', logActive)
     ui.tabCodex.classList.toggle('active', codexActive)
     ui.tabShelf.classList.toggle('active', shelfActive)
     ui.tabTravel.setAttribute('aria-selected', String(activeTab === 'travel'))
+    ui.tabLog.setAttribute('aria-selected', String(logActive))
     ui.tabCodex.setAttribute('aria-selected', String(codexActive))
     ui.tabShelf.setAttribute('aria-selected', String(shelfActive))
+    if (logActive) renderLogs()
     if (codexActive) renderCodex()
     if (shelfActive) renderShelf()
   }
@@ -422,6 +471,7 @@
     ui.shelfCount.textContent = String(shelf === null || typeof shelf !== 'object' ? 8 : shelf.slots) +
       '/' + String(view.SHELF_MAX_SLOTS)
     if (activeTab === 'codex') renderCodex()
+    if (activeTab === 'log') renderLogs()
     if (activeTab === 'shelf') renderShelf()
     const offer = view.lanternOffer(state)
     ui.lanternText.textContent = offer.hint
@@ -509,6 +559,7 @@
   }
 
   ui.tabTravel.addEventListener('click', () => setTab('travel'))
+  ui.tabLog.addEventListener('click', () => setTab('log'))
   ui.tabCodex.addEventListener('click', () => setTab('codex'))
   ui.tabShelf.addEventListener('click', () => setTab('shelf'))
   ui.shelfRemove.addEventListener('click', () => {
