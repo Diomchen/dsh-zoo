@@ -20,6 +20,9 @@
     tabCodex: el('tabCodex'),
     travelPane: el('travelPane'),
     routes: el('routes'),
+    lantern: el('lantern'),
+    lanternText: el('lanternText'),
+    lanternBuy: el('lanternBuy'),
     home: el('home'),
     routeName: el('routeName'),
     routeHint: el('routeHint'),
@@ -257,6 +260,10 @@
     ui.coins.textContent = view.formatCoins(state === null ? 0 : state.coins)
     ui.codexCount.textContent = view.codexProgress(codexView)
     if (activeTab === 'codex') renderCodex()
+    const offer = view.lanternOffer(state)
+    ui.lanternText.textContent = offer.hint
+    ui.lanternBuy.textContent = offer.label
+    ui.lanternBuy.disabled = pending || offer.owned
     ui.homeNote.textContent = state !== null && (state.away === 'visiting' || state.away === 'working')
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
@@ -266,6 +273,7 @@
       ui.home.hidden = false
       ui.trip.hidden = true
       ui.done.hidden = true
+      ui.routes.hidden = false
       renderRoutes()
       if (route !== null) {
         ui.routeName.textContent = route.name
@@ -283,6 +291,7 @@
     if (active) {
       browsing = false
       ui.home.hidden = true
+      ui.routes.hidden = true
       ui.trip.hidden = false
       ui.done.hidden = true
       ui.phase.textContent = view.phaseLabel(run)
@@ -303,6 +312,7 @@
 
     // 结算：run 还在，但 phase 已经 null、ended 有值。
     ui.home.hidden = true
+    ui.routes.hidden = true
     ui.trip.hidden = true
     ui.done.hidden = false
     ui.doneTitle.textContent = run.ended === 'complete'
@@ -354,6 +364,7 @@
   })
   ui.continue.addEventListener('click', () => send({ action: 'expedition-step' }))
   ui.back.addEventListener('click', () => send({ action: 'expedition-back' }))
+  ui.lanternBuy.addEventListener('click', () => send({ action: 'expedition-lantern' }))
   ui.close.addEventListener('click', () => {
     if (bridge !== undefined && typeof bridge.close === 'function') bridge.close()
   })

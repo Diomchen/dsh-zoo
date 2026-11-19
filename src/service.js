@@ -41,6 +41,7 @@ import { createDesktop } from './desktop.js'
 import { createExpeditionStore } from './expedition-store.js'
 import {
   EXPEDITION_ERROR_TEXT,
+  LANTERN_PRICE,
   ROUTES as EXPEDITION_ROUTES,
   dangerLabel,
   dangerOf,
@@ -1316,13 +1317,14 @@ export function createService (ctx, options = {}) {
     // 票 52 回归：窗口里「我的农场」那颗圆片——从只读视图切回自己农场的唯一出口。
     if (action === 'farm-own') return handleFarmOwn()
 
-    // 出远门（票 112）：右键菜单「出远门」是对开/关的同一入口。窗口只发 start/step/back，
+    // 出远门（票 112）：右键菜单「出远门」是对开/关的同一入口。窗口只发 start/step/back/lantern，
     // 扣盘缠、到点掉币、段数迁移全在 expedition-store 里；这里只做 away 门控与人话兜底。
     if (action === 'expedition-open') return handleExpeditionOpen()
     if (action === 'expedition-close') return closeExpeditionWindow('expedition-close')
     if (action === 'expedition-start') return expeditionStart(body?.routeId)
     if (action === 'expedition-step') return expeditionStep()
     if (action === 'expedition-back') return expeditionBack()
+    if (action === 'expedition-lantern') return expeditionLantern()
     if (action === 'expedition-refresh') return expeditionRefresh()
 
     // 盘口（票 79）：右键菜单和农场窗的「盘口」是同一个开/关入口；HTTP/脚本可以用
@@ -3217,20 +3219,27 @@ export function createService (ctx, options = {}) {
     const dangerLeg = snap.run === null
       ? 1
       : Math.min(snap.run.phase === 'deciding' ? snap.run.leg + 1 : snap.run.leg, snap.run.totalLegs)
+    // 危险度只在这里算一次：三档文字与精确百分比都出自同一个 dangerOf，
+    // 也就是下一次真正掷骰用的那个函数。没买提灯就不下发百分比。
+    const dangerRate = route === null ? null : dangerOf(route, dangerLeg)
+    const lantern = snap.upgrades?.lantern === true
     return {
       ...snap,
       ready: expedition !== null,
       now,
       coins: farmStateView().coins,
       away: expeditionAwayReason(),
+      lanternPrice: LANTERN_PRICE,
       routes: expeditionRoutesView(snap),
-      ...(snap.run === null || route === null
+      ...(snap.run === null || dangerRate === null
         ? {}
         : {
             run: {
               ...snap.run,
               routeName: route.name,
-              danger: dangerLabel(dangerOf(route, dangerLeg))
+              danger: dangerLabel(dangerRate),
+              // 没买提灯时显式给 null：字段形状恒定，但窗口拿不到任何数字。
+              dangerPercent: lantern ? Math.round(dangerRate * 100) : null
             }
           })
     }
@@ -3348,6 +3357,30 @@ export function createService (ctx, options = {}) {
     if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
     refreshExpeditionWindow()
     return { ...result, notice: `见好就收：带回 ${result.settled.coins} 枚硬币。` }
+  }
+
+  /**
+   * 提灯（票 118）：窗口里的「买提灯」。钱在 store 里扣，这里只管文案与刷新。
+   * 买不起时状态一点不动；已经买过时只是再说一声，不再扣钱。
+   */
+  async function expeditionLantern () {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.buyLantern()
+    if (!result.ok) {
+      const notice = result.error === 'not-enough-coins'
+        ? `提灯要 ${LANTERN_PRICE.toLocaleString('en-US')} 枚硬币，现在还不够。`
+        : EXPEDITION_ERROR_TEXT[result.error] ?? null
+      return { ...result, notice }
+    }
+    refreshExpeditionWindow()
+    return {
+      ...result,
+      notice: result.already === true
+        ? '提灯已经在你手里了，不用再买。'
+        : `买了提灯，花了 ${LANTERN_PRICE.toLocaleString('en-US')} 枚硬币：往后每段都能看清危险度。`
+    }
   }
 
   /**

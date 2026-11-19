@@ -87,6 +87,7 @@
   button.primary:hover:not(:disabled) { background: var(--ink); }
   .actions { display: flex; gap: 10px; margin-top: 14px; }
   .routes { display: grid; gap: 8px; margin-bottom: 12px; }
+  .routes[hidden] { display: none; }
   .routeCard {
     display: grid; gap: 1px; width: 100%; padding: 8px 12px; text-align: left;
     border: 1px solid var(--soft); border-radius: var(--radius);
@@ -164,6 +165,12 @@
   <main>
     <div id="travelPane">
     <div class="routes" id="routes"></div>
+    <section class="card" id="lantern">
+      <h2>提灯</h2>
+      <p class="desc" id="lanternText">还没买提灯：决策窗只显示低 / 中 / 高，看不出下一段到底多险。</p>
+      <button id="lanternBuy">买提灯</button>
+    </section>
+
     <section class="card" id="home">
       <h2 id="routeName">后山</h2>
       <p class="hint" id="routeHint">盘缠 500 · 3–4 段 · 每段回 11–19 枚</p>

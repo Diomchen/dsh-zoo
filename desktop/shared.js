@@ -426,13 +426,14 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   /** 1.10.0：账户自己的档位——纸面还是真钱，每个账户自己选。 */
   const FUTURES_ACCOUNT_MODES = ['shadow', 'live']
   /**
-   * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`
+   * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`/`lantern`
    * 什么都不带，`refresh` 只请宿主补一拍。钱与段数全在宿主算。
    */
   const EXPEDITION_SUBMIT_ACTIONS = [
     'expedition-start',
     'expedition-step',
     'expedition-back',
+    'expedition-lantern',
     'expedition-refresh'
   ]
   /** 出远门的三个阶段 + 两种结局；窗口只画这几个词。 */
@@ -2865,7 +2866,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
           startedAt: num(source.run.startedAt, 0),
           ended,
           endedAt: num(source.run.endedAt, 0),
-          danger: normalizeLabel(source.run.danger, '')
+          danger: normalizeLabel(source.run.danger, ''),
+          // 票 118：只有买了提灯宿主才给这个数；坏值/缺省一律 null，窗口画回三档。
+          dangerPercent: typeof source.run.dangerPercent === 'number' && Number.isFinite(source.run.dangerPercent)
+            ? Math.min(100, Math.max(0, Math.round(source.run.dangerPercent)))
+            : null
         }
       }
     }
@@ -2900,9 +2905,13 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       run,
       coins: nonNegative(source.coins),
       now: num(source.now, 0),
+      // 票 118：提灯的价钱由宿主给，窗口只负责写进按钮；缺省/null 就是「价钱不明」。
+      lanternPrice: typeof source.lanternPrice === 'number' && Number.isFinite(source.lanternPrice) && source.lanternPrice > 0
+        ? Math.round(source.lanternPrice)
+        : null,
       away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
       routes,
-      // 112 不画陈列架/提灯，但形状留着：115/118 加窗口时不用再改协议。
+      // 陈列架（115）还没画，但形状留着；118 的提灯已经在 upgrades.lantern 里。
       shelf: { slots: 8, items: [] },
       codex,
       codexView: normalizeExpeditionCodexView(source.codexView),

@@ -9,13 +9,13 @@
  */
 import assert from 'node:assert/strict'
 import { createRequire } from 'node:module'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { codexView, legsFor, routeOf, wipedOut } from '../src/expedition.js'
+import { codexView, dangerLabel, dangerOf, legsFor, routeOf, wipedOut } from '../src/expedition.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
 
@@ -38,6 +38,8 @@ function sampleRun (overrides = {}) {
     ended: null,
     endedAt: 0,
     danger: '中',
+    // 票 118：没买提灯时宿主不下发百分比。
+    dangerPercent: null,
     ...overrides
   }
 }
@@ -50,6 +52,7 @@ function sampleView (overrides = {}) {
     coins: 520,
     now: T0,
     away: 'expedition',
+    lanternPrice: 10_000,
     routes: [{ id: 'backhill', name: '后山', fare: 500, minLegs: 3, maxLegs: 4, coinBase: 15 }],
     shelf: { slots: 8, items: [] },
     codex: { herb: T0 },
@@ -75,6 +78,30 @@ test('视图模型：阶段、已走段数与危险度都是人话', () => {
   assert.equal(view.phaseLabel(sampleRun({ phase: null, ended: 'back' })), '见好就收，已经回家')
   assert.equal(view.progressText(sampleRun({ leg: 2, totalLegs: 4 })), '已走 2 / 4 段')
   assert.equal(view.dangerText(sampleRun({ danger: '低' })), '危险度 低')
+})
+
+test('视图模型：没买提灯画三档，买了画精确百分比', () => {
+  assert.equal(view.dangerText(sampleRun({ danger: '中', dangerPercent: null })), '危险度 中')
+  assert.equal(view.dangerText(sampleRun({ danger: '中', dangerPercent: 37 })), '危险度 37%')
+  assert.equal(view.dangerText(sampleRun({ danger: '', dangerPercent: 5 })), '危险度 5%')
+  assert.equal(view.dangerText(sampleRun({ danger: '高', dangerPercent: undefined })), '危险度 高')
+  assert.equal(view.dangerText(null), '')
+})
+
+test('视图模型：提灯那一行只画宿主给的买没买与价钱', () => {
+  const plain = view.lanternOffer(sampleView())
+  assert.equal(plain.owned, false)
+  assert.equal(plain.label, '买提灯（10,000 枚）')
+  assert.match(plain.hint, /低 \/ 中 \/ 高/)
+
+  const owned = view.lanternOffer(sampleView({ upgrades: { lantern: true } }))
+  assert.equal(owned.owned, true)
+  assert.equal(owned.label, '提灯已买')
+  assert.match(owned.hint, /百分比/)
+
+  // 老宿主没给价钱就不瞎写一个 0。
+  assert.equal(view.lanternOffer({ upgrades: { lantern: false } }).label, '买提灯')
+  assert.equal(view.lanternOffer(null).owned, false)
 })
 
 test('视图模型：见好就收只按已走段数的战利品算钱', () => {
@@ -310,6 +337,27 @@ test('shared：四个提交动作只过白名单字段，坏路线整条拒绝',
   assert.equal(bad.error, 'bad-expedition-action')
 })
 
+test('shared：买提灯进提交白名单，百分比只过 0–100 的整数', () => {
+  assert.deepEqual(shared.normalizeExpeditionAction({ action: 'expedition-lantern' }), { action: 'expedition-lantern' })
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-lantern', coins: 1 }).coins, undefined)
+  assert.ok(shared.EXPEDITION_SUBMIT_ACTIONS.includes('expedition-lantern'))
+
+  const exact = shared.normalizeExpeditionView(sampleView({
+    run: sampleRun({ danger: '中', dangerPercent: 37.6 })
+  }))
+  assert.equal(exact.run.dangerPercent, 38)
+  assert.equal(exact.run.danger, '中')
+  assert.equal(exact.lanternPrice, 10_000)
+  // 老宿主没给价钱时不能默认成 0 枚，窗口要能看出「价钱不明」。
+  assert.equal(shared.normalizeExpeditionView(sampleView({ lanternPrice: undefined })).lanternPrice, null)
+
+  const plain = shared.normalizeExpeditionView(sampleView())
+  assert.equal(plain.run.dangerPercent, null, '没买提灯时百分比必须是 null')
+  assert.equal(shared.normalizeExpeditionView(sampleView({ run: sampleRun({ dangerPercent: '37' }) })).run.dangerPercent, null)
+  assert.equal(shared.normalizeExpeditionView(sampleView({ run: sampleRun({ dangerPercent: -3 }) })).run.dangerPercent, 0)
+  assert.equal(shared.normalizeExpeditionView(sampleView({ run: sampleRun({ dangerPercent: 500 }) })).run.dangerPercent, 100)
+})
+
 test('shared：菜单里的「出远门」指向 expedition-open', () => {
   assert.equal(shared.MENU_TOOL_REQUESTS.expedition, 'expedition-open')
   assert.ok(shared.MENU_TOOL_IDS.includes('expedition'))
@@ -406,9 +454,9 @@ function desktopDouble () {
   }
 }
 
-async function makeService (t, dir, desktop, clock, runId = null) {
+async function makeService (t, dir, desktop, clock, runId = null, coins = 620) {
   const { ctx, routes } = fakeCtx()
-  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins: 620 }), 'utf8')
+  await writeFile(join(dir, FARM_FILE), JSON.stringify({ version: 1, coins }), 'utf8')
   const service = createService(ctx, {
     dataDir: dir,
     petConfigPath: join(dir, 'missing.jsonc'),
@@ -615,4 +663,92 @@ test('宿主：没有桌面层是 desktop-off，不写任何窗口命令', async
   const refreshed = await callAction(service, { action: 'expedition-refresh' })
   assert.equal(refreshed.body.ok, false)
   assert.equal(refreshed.body.error, 'desktop-off')
+})
+
+test('宿主：硬币不够买提灯是 not-enough-coins，硬币与存档都不动', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  const before = JSON.parse(await readFile(join(dir, FARM_FILE), 'utf8')).coins
+
+  const bought = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(bought.body.ok, false)
+  assert.equal(bought.body.error, 'not-enough-coins')
+  assert.equal(typeof bought.body.notice, 'string')
+  assert.match(bought.body.notice, /10,000/)
+
+  const stored = JSON.parse(await readFile(join(dir, 'expedition.json'), 'utf8'))
+  assert.equal(stored.upgrades.lantern, false, '买不起就一寸都不许动')
+  const state = desktop.calls.expedition.at(-1).state
+  assert.equal(state.upgrades.lantern, false)
+  assert.equal(state.coins, before)
+})
+
+test('宿主：花 10,000 买提灯，重启还在，再点不二次扣钱', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock, null, 12_345)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+
+  const bought = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(bought.body.ok, true)
+  assert.equal(bought.body.already, false)
+  assert.equal(bought.body.upgrades.lantern, true)
+  const pushed = desktop.calls.expedition.at(-1).state
+  assert.equal(pushed.upgrades.lantern, true)
+  assert.equal(pushed.coins, 2_345)
+
+  const stored = JSON.parse(await readFile(join(dir, 'expedition.json'), 'utf8'))
+  assert.equal(stored.upgrades.lantern, true, '提灯要落在 expedition.json 的 upgrades 里')
+
+  const again = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(again.body.ok, true)
+  assert.equal(again.body.already, true)
+  assert.equal(desktop.calls.expedition.at(-1).state.coins, 2_345, '已经买过就不许再扣钱')
+
+  // 重启：换一个 service 读同一个 dataDir，提灯还在，而且不用再买。
+  service.dispose()
+  const restarted = desktopDouble()
+  const second = await makeService(t, dir, restarted, clock, null, 2_345)
+  restarted.ready()
+  await callAction(second, { action: 'expedition-open' })
+  const view = restarted.calls.expedition.at(-1).state
+  assert.equal(view.upgrades.lantern, true)
+  assert.equal(view.coins, 2_345)
+})
+
+test('宿主：没买提灯只给三档，买了给下一段精确百分比（与 dangerOf 同值）', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock, null, 12_000)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+  await callAction(service, { action: 'expedition-start', routeId: 'backhill' })
+  clock.value = T0 + 20_001
+  await callAction(service, { action: 'expedition-refresh' })
+
+  const plain = desktop.calls.expedition.at(-1).state
+  assert.equal(plain.run.phase, 'deciding')
+  assert.equal(plain.upgrades.lantern, false)
+  assert.equal(plain.run.danger, dangerLabel(dangerOf(routeOf('backhill'), 2)))
+  assert.equal(plain.run.dangerPercent, null, '没买提灯就不下发百分比，窗口也就无从泄露')
+
+  const bought = await callAction(service, { action: 'expedition-lantern' })
+  assert.equal(bought.body.ok, true)
+  const exact = desktop.calls.expedition.at(-1).state
+  assert.equal(exact.run.phase, 'deciding')
+  assert.equal(exact.run.dangerPercent, Math.round(dangerOf(routeOf('backhill'), 2) * 100))
+  assert.equal(exact.run.danger, dangerLabel(dangerOf(routeOf('backhill'), 2)))
+
+  // 继续走一段：走路中看的是当前段，仍是同一个 dangerOf。
+  await callAction(service, { action: 'expedition-step' })
+  const walking = desktop.calls.expedition.at(-1).state
+  assert.equal(walking.run.phase, 'walking')
+  assert.equal(walking.run.dangerPercent, Math.round(dangerOf(routeOf('backhill'), 2) * 100))
 })
