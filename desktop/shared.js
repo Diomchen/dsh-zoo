@@ -433,11 +433,15 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     'expedition-start',
     'expedition-step',
     'expedition-back',
-    'expedition-refresh'
+    'expedition-refresh',
+    'expedition-shelf'
   ]
   /** 出远门的三个阶段 + 两种结局；窗口只画这几个词。 */
   const EXPEDITION_PHASES = ['walking', 'deciding']
   const EXPEDITION_ENDED = ['back', 'complete', 'failed']
+  /** 陈列架（票 115）：窗口按 32 格画，开格价与宿主同一个数。 */
+  const EXPEDITION_SHELF_MAX = 32
+  const EXPEDITION_SHELF_PRICE = 5000
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(
     MENU_ACTION_IDS,
@@ -2898,11 +2902,45 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       now: num(source.now, 0),
       away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
       routes,
-      // 112 不画陈列架/提灯，但形状留着：115/118 加窗口时不用再改协议。
-      shelf: { slots: 8, items: [] },
+      // 112 不画提灯，但形状留着：118 加窗口时不用再改协议。
+      shelf: normalizeExpeditionShelf(source.shelf),
       codex,
       codexView: normalizeExpeditionCodexView(source.codexView),
       upgrades: { lantern: source.upgrades?.lantern === true }
+    }
+  }
+
+  /**
+   * 陈列架（票 115）：`items[i]` 对第 i+1 格。窗口只读，不在这里判「能不能开」；
+   * 但坏 id、重复件与超长数组必须先清掉，免得渲染端画出两个同样的特产。
+   */
+  function normalizeExpeditionShelf (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const slots = Number.isInteger(source.slots) && source.slots >= 8 && source.slots <= EXPEDITION_SHELF_MAX
+      ? source.slots
+      : 8
+    const items = []
+    if (Array.isArray(source.items)) {
+      const seen = new Set()
+      for (const entry of source.items.slice(0, slots)) {
+        const id = typeof entry === 'string' ? entry.trim() : ''
+        if (!/^[a-z0-9-]+$/.test(id) || seen.has(id)) {
+          items.push(null)
+          continue
+        }
+        seen.add(id)
+        items.push(id)
+      }
+      while (items.length > 0 && items[items.length - 1] === null) items.pop()
+    }
+    return {
+      slots,
+      unlocked: slots,
+      maxSlots: EXPEDITION_SHELF_MAX,
+      slotPrice: typeof source.slotPrice === 'number' && Number.isFinite(source.slotPrice) && source.slotPrice > 0
+        ? Math.round(source.slotPrice)
+        : EXPEDITION_SHELF_PRICE,
+      items
     }
   }
 
@@ -2915,11 +2953,52 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     }
   }
 
-  /** 出远门小窗提交的白名单：只认四个动作，`start` 必须带路线 id。 */
+  /** 陈列架动作的合法格号：1..32。 */
+  function normalizeShelfSlot (value) {
+    return Number.isInteger(value) && value >= 1 && value <= EXPEDITION_SHELF_MAX ? value : null
+  }
+
+  /**
+   * 出远门小窗提交的白名单：只认五个动作，`start` 必须带路线 id。
+   * `expedition-shelf` 的字段在这里逐一拷贝——落到 helper 的农场窄口会被整条削掉。
+   */
   function normalizeExpeditionAction (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
     if (!EXPEDITION_SUBMIT_ACTIONS.includes(action)) return null
+    if (action === 'expedition-shelf') {
+      const out = { action }
+      let touched = false
+      if (raw.slot !== undefined && raw.slot !== null) {
+        const slot = normalizeShelfSlot(raw.slot)
+        if (slot === null) return null
+        out.slot = slot
+        touched = true
+      }
+      if (raw.itemId !== undefined && raw.itemId !== null) {
+        const itemId = normalizeLabel(raw.itemId, '')
+        if (!/^[a-z0-9-]+$/.test(itemId)) return null
+        out.itemId = itemId
+        touched = true
+      }
+      if (raw.moveFrom !== undefined && raw.moveFrom !== null) {
+        const moveFrom = normalizeShelfSlot(raw.moveFrom)
+        if (moveFrom === null) return null
+        out.moveFrom = moveFrom
+        touched = true
+      }
+      if (raw.moveTo !== undefined && raw.moveTo !== null) {
+        const moveTo = normalizeShelfSlot(raw.moveTo)
+        if (moveTo === null) return null
+        out.moveTo = moveTo
+        touched = true
+      }
+      if (!touched) return null
+      const moving = out.moveFrom !== undefined || out.moveTo !== undefined
+      if (moving && (out.moveFrom === undefined || out.slot !== undefined || out.itemId !== undefined)) return null
+      if (out.itemId !== undefined && out.slot === undefined) return null
+      return out
+    }
     if (action !== 'expedition-start') return { action }
     const routeId = normalizeLabel(raw.routeId, '')
     return routeId === '' ? null : { action, routeId }

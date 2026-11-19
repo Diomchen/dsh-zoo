@@ -18,6 +18,7 @@
     tabs: el('tabs'),
     tabTravel: el('tabTravel'),
     tabCodex: el('tabCodex'),
+    tabShelf: el('tabShelf'),
     travelPane: el('travelPane'),
     home: el('home'),
     routeName: el('routeName'),
@@ -41,6 +42,14 @@
     codexCount: el('codexCount'),
     codexProgress: el('codexProgress'),
     codexGroups: el('codexGroups'),
+    shelf: el('shelf'),
+    shelfCount: el('shelfCount'),
+    shelfProgress: el('shelfProgress'),
+    shelfPicker: el('shelfPicker'),
+    shelfGrid: el('shelfGrid'),
+    shelfTools: el('shelfTools'),
+    shelfPick: el('shelfPick'),
+    shelfRemove: el('shelfRemove'),
     toast: el('toast')
   }
 
@@ -48,6 +57,10 @@
   let pending = false
   let toastTimer = null
   let activeTab = 'travel'
+  /** 陈列架上选中的源格；再点空格就是挪过去。 */
+  let selectedSlot = null
+  /** 图鉴里选中、准备摆进空格的特产 id。 */
+  let pendingItem = null
   /** 收到 view 那一刻的本地时间；倒计时按 now 在此之后的增量走。 */
   let receivedAt = 0
   let refreshAsked = false
@@ -177,16 +190,162 @@
     }
   }
 
+  function shelfArt (cell) {
+    const art = document.createElement('span')
+    art.className = 'shelfArt'
+    if (cell.emblem.kind === 'art') {
+      const img = document.createElement('img')
+      img.src = cell.emblem.src
+      img.alt = ''
+      img.draggable = false
+      img.addEventListener('error', () => {
+        if (img.parentNode === art) art.replaceChildren(emojiNode('❔'))
+      })
+      art.appendChild(img)
+    } else {
+      art.appendChild(emojiNode(cell.emblem.text))
+    }
+    return art
+  }
+
+  function onShelfCell (cell) {
+    if (pending) return
+    const shelf = state === null ? null : state.shelf
+    if (cell.locked) {
+      // 只有下一格能开；后排的锁格只显示价格，避免窗口自己绕开顺序校验。
+      if (shelf === null || cell.slot !== shelf.slots + 1) {
+        toast('按顺序开，先把前面一格打开。')
+        return
+      }
+      if (!view.canUnlock(shelf, cell.slot, state === null ? 0 : state.coins)) {
+        toast('硬币不够开这一格。')
+        return
+      }
+      send({ action: 'expedition-shelf', slot: cell.slot })
+      return
+    }
+    if (cell.empty) {
+      if (selectedSlot !== null) {
+        const from = selectedSlot
+        selectedSlot = null
+        pendingItem = null
+        send({ action: 'expedition-shelf', moveFrom: from, moveTo: cell.slot })
+        return
+      }
+      if (pendingItem !== null) {
+        const itemId = pendingItem
+        pendingItem = null
+        send({ action: 'expedition-shelf', slot: cell.slot, itemId })
+        return
+      }
+      toast('先点一件特产。')
+      return
+    }
+    pendingItem = null
+    selectedSlot = selectedSlot === cell.slot ? null : cell.slot
+    renderShelf()
+  }
+
+  function renderShelf () {
+    const shelf = state === null ? null : state.shelf
+    const cells = view.shelfCells(shelf, state === null ? null : state.codexView)
+    const slots = shelf === null || typeof shelf !== 'object' ? 8 : shelf.slots
+    ui.shelfCount.textContent = String(slots) + '/' + String(view.SHELF_MAX_SLOTS)
+    ui.shelfProgress.textContent = view.shelfProgress(shelf)
+    const placeable = view.placeableSouvenirs(shelf, state === null ? null : state.codexView)
+    if (pendingItem !== null && !placeable.some((slot) => slot.id === pendingItem)) pendingItem = null
+    ui.shelfPicker.textContent = ''
+    const pickLabel = document.createElement('span')
+    pickLabel.className = 'pickLabel'
+    pickLabel.textContent = '可摆放：'
+    ui.shelfPicker.appendChild(pickLabel)
+    if (placeable.length === 0) {
+      const none = document.createElement('span')
+      none.className = 'pickLabel'
+      none.textContent = '图鉴里还没有没上架的特产。'
+      ui.shelfPicker.appendChild(none)
+    }
+    for (const slot of placeable) {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'shelfPickItem'
+      button.dataset.selected = String(pendingItem === slot.id)
+      button.textContent = slot.name || slot.id
+      button.title = '选中后点一个空格摆上去'
+      button.addEventListener('click', () => {
+        if (pending) return
+        selectedSlot = null
+        pendingItem = pendingItem === slot.id ? null : slot.id
+        renderShelf()
+      })
+      ui.shelfPicker.appendChild(button)
+    }
+    ui.shelfGrid.textContent = ''
+    for (const cell of cells) {
+      const button = document.createElement('button')
+      button.type = 'button'
+      button.className = 'shelfCell'
+      button.dataset.slot = String(cell.slot)
+      button.dataset.locked = String(cell.locked)
+      button.dataset.empty = String(cell.empty)
+      button.dataset.selected = String(selectedSlot === cell.slot)
+      const no = document.createElement('span')
+      no.className = 'shelfSlotNo'
+      no.textContent = String(cell.slot)
+      button.appendChild(no)
+      if (cell.locked) {
+        button.dataset.next = String(cell.slot === slots + 1)
+        button.title = cell.slot === slots + 1
+          ? '花 ' + view.formatCoins(cell.price) + ' 硬币开这一格'
+          : '先把前面一格打开'
+        const lock = document.createElement('span')
+        lock.className = 'shelfLock'
+        lock.textContent = '🔒'
+        button.appendChild(lock)
+        const price = document.createElement('span')
+        price.className = 'shelfPrice'
+        price.textContent = view.formatCoins(cell.price)
+        button.appendChild(price)
+      } else if (cell.empty) {
+        button.title = selectedSlot === null ? '空格' : '把选中的特产挪到这一格'
+        const empty = document.createElement('span')
+        empty.className = 'shelfPrice'
+        empty.textContent = '空'
+        button.appendChild(empty)
+      } else {
+        button.title = selectedSlot === cell.slot ? '取消选择' : '点一下选中，再点空格挪过去'
+        button.appendChild(shelfArt(cell))
+        const label = document.createElement('span')
+        label.className = 'shelfLabel'
+        label.textContent = cell.label
+        button.appendChild(label)
+      }
+      button.addEventListener('click', () => onShelfCell(cell))
+      ui.shelfGrid.appendChild(button)
+    }
+    const selected = selectedSlot === null
+      ? null
+      : cells.find((cell) => cell.slot === selectedSlot && !cell.empty) ?? null
+    if (selected === null) selectedSlot = null
+    ui.shelfTools.hidden = selected === null
+    if (selected !== null) ui.shelfPick.textContent = '已选「' + selected.label + '」（第 ' + String(selected.slot) + ' 格）'
+  }
+
   function setTab (name) {
-    activeTab = name === 'codex' ? 'codex' : 'travel'
+    activeTab = name === 'codex' ? 'codex' : name === 'shelf' ? 'shelf' : 'travel'
     const codexActive = activeTab === 'codex'
-    ui.travelPane.hidden = codexActive
+    const shelfActive = activeTab === 'shelf'
+    ui.travelPane.hidden = codexActive || shelfActive
     ui.codex.hidden = !codexActive
-    ui.tabTravel.classList.toggle('active', !codexActive)
+    ui.shelf.hidden = !shelfActive
+    ui.tabTravel.classList.toggle('active', activeTab === 'travel')
     ui.tabCodex.classList.toggle('active', codexActive)
-    ui.tabTravel.setAttribute('aria-selected', String(!codexActive))
+    ui.tabShelf.classList.toggle('active', shelfActive)
+    ui.tabTravel.setAttribute('aria-selected', String(activeTab === 'travel'))
     ui.tabCodex.setAttribute('aria-selected', String(codexActive))
+    ui.tabShelf.setAttribute('aria-selected', String(shelfActive))
     if (codexActive) renderCodex()
+    if (shelfActive) renderShelf()
   }
 
   function paint () {
@@ -195,7 +354,11 @@
     const codexView = state === null ? null : state.codexView
     ui.coins.textContent = view.formatCoins(state === null ? 0 : state.coins)
     ui.codexCount.textContent = view.codexProgress(codexView)
+    const shelf = state === null ? null : state.shelf
+    ui.shelfCount.textContent = String(shelf === null || typeof shelf !== 'object' ? 8 : shelf.slots) +
+      '/' + String(view.SHELF_MAX_SLOTS)
     if (activeTab === 'codex') renderCodex()
+    if (activeTab === 'shelf') renderShelf()
     ui.homeNote.textContent = state !== null && (state.away === 'visiting' || state.away === 'working')
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
@@ -274,6 +437,13 @@
 
   ui.tabTravel.addEventListener('click', () => setTab('travel'))
   ui.tabCodex.addEventListener('click', () => setTab('codex'))
+  ui.tabShelf.addEventListener('click', () => setTab('shelf'))
+  ui.shelfRemove.addEventListener('click', () => {
+    if (selectedSlot === null || pending) return
+    const from = selectedSlot
+    selectedSlot = null
+    send({ action: 'expedition-shelf', moveFrom: from })
+  })
   ui.start.addEventListener('click', () => {
     const route = activeRoute()
     if (route === null) return

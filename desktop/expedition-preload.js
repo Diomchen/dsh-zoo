@@ -1,19 +1,20 @@
 /**
  * 出远门小窗的 preload（票 112）。
  *
- * 和期货窗同一套纪律：渲染端只能发白名单里的四个动作，字段由 `pick` 显式拷贝，
- * 不能把任意对象塞给主进程。
+ * 和期货窗同一套纪律：渲染端只能发白名单里的动作，字段由 `pick` 显式拷贝，
+ * 不能把任意对象塞给主进程。陈列架（票 115）只多开四个字段。
  */
 'use strict'
 
 const { contextBridge, ipcRenderer } = require('electron')
 
-/** 动作 → 允许过桥的字段。`start` 只带路线 id；其余动作什么都不带。 */
+/** 动作 → 允许过桥的字段。`start` 只带路线 id；陈列架带格号与特产 id。 */
 const FIELDS = {
   'expedition-start': ['routeId'],
   'expedition-step': [],
   'expedition-back': [],
-  'expedition-refresh': []
+  'expedition-refresh': [],
+  'expedition-shelf': ['slot', 'itemId', 'moveFrom', 'moveTo']
 }
 
 function pick (action, raw) {

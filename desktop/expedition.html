@@ -126,6 +126,34 @@
   .codexRarity { font-size: 10px; color: var(--muted); }
   .codexRarity[data-rarity="precious"] { color: #7a5bb5; }
   .codexRarity[data-rarity="legendary"] { color: var(--accent); font-weight: 700; }
+  .shelfGrid { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 6px; }
+  .shelfCell {
+    position: relative; display: grid; justify-items: center; align-content: center; gap: 1px;
+    min-width: 0; min-height: 66px; padding: 12px 2px 4px;
+    border: 1px solid var(--soft); border-radius: 7px;
+    background: var(--paper); color: var(--ink); font: inherit; cursor: pointer; overflow: hidden;
+  }
+  .shelfCell:hover { border-color: var(--line); }
+  .shelfCell[data-locked="true"] { border-style: dashed; background: #ece5d7; color: var(--muted); }
+  .shelfCell[data-next="true"] { border-color: var(--accent); border-style: solid; }
+  .shelfCell[data-selected="true"] { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .shelfSlotNo { position: absolute; top: 1px; left: 4px; font-size: 9px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .shelfArt { display: grid; place-items: center; width: 34px; height: 34px; }
+  .shelfArt img { width: 34px; height: 34px; object-fit: contain; }
+  .shelfArt .emoji { font-size: 24px; line-height: 1; }
+  .shelfLabel { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; font-weight: 600; }
+  .shelfLock { font-size: 17px; line-height: 1.1; }
+  .shelfPrice { font-size: 10px; font-variant-numeric: tabular-nums; }
+  .shelfTools {
+    display: flex; align-items: center; gap: 10px; margin-top: 12px;
+    padding-top: 10px; border-top: 1px dashed var(--soft);
+  }
+  .shelfTools span { color: var(--muted); }
+  .shelfTools button { margin-left: auto; }
+  .shelfPicker { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 10px; }
+  .shelfPicker .pickLabel { color: var(--muted); }
+  .shelfPickItem { padding: 3px 8px; border-width: 1px; font-size: 11px; }
+  .shelfPickItem[data-selected="true"] { background: var(--accent); border-color: var(--ink); color: #fffdf8; }
   footer {
     padding: 0 14px; display: flex; align-items: center;
     color: var(--accent); font-size: 12px;
@@ -143,6 +171,7 @@
   <nav class="tabs" id="tabs">
     <button class="tab active" id="tabTravel" data-tab="travel">出远门</button>
     <button class="tab" id="tabCodex" data-tab="codex">图鉴 <span class="badge" id="codexCount">0/32</span></button>
+    <button class="tab" id="tabShelf" data-tab="shelf">陈列架 <span class="badge" id="shelfCount">8/32</span></button>
   </nav>
   <main>
     <div id="travelPane">
@@ -183,6 +212,19 @@
       </div>
       <p class="desc">四条路线各 8 件。捡到过就点亮并记下名字，没见过的只剩灰色剪影。</p>
       <div id="codexGroups"></div>
+    </section>
+    <section class="card" id="shelf" hidden>
+      <div class="codexHead">
+        <h2>陈列架</h2>
+        <span class="hint" id="shelfProgress">已开 8 / 32 格</span>
+      </div>
+      <p class="desc">摆捡回来的特产。开一格 5,000 硬币；点可摆放的特产再点空格摆上去，点架上的特产再点空格挪过去，点「取下」收回。</p>
+      <div class="shelfPicker" id="shelfPicker"></div>
+      <div class="shelfGrid" id="shelfGrid"></div>
+      <div class="shelfTools" id="shelfTools" hidden>
+        <span id="shelfPick"></span>
+        <button id="shelfRemove">取下</button>
+      </div>
     </section>
   </main>
   <footer><span id="toast"></span></footer>

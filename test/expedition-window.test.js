@@ -16,6 +16,7 @@ import test from 'node:test'
 
 import shared from '../desktop/shared.js'
 import { codexView, legsFor, routeOf, wipedOut } from '../src/expedition.js'
+import { EXPEDITION_FILE } from '../src/expedition-store.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
 
@@ -202,6 +203,116 @@ test('shared：四个提交动作只过白名单字段，坏路线整条拒绝',
   assert.equal(bad.error, 'bad-expedition-action')
 })
 
+test('视图模型：陈列架画满 32 格，锁着的格子带价格', () => {
+  const shelf = { slots: 8, items: [] }
+  const cells = view.shelfCells(shelf)
+  assert.equal(cells.length, 32)
+  assert.equal(cells.filter((cell) => cell.locked).length, 24)
+  assert.deepEqual(
+    cells.slice(0, 8).map((cell) => cell.locked),
+    [false, false, false, false, false, false, false, false]
+  )
+  assert.equal(cells[8].locked, true)
+  assert.equal(cells[8].price, 5000)
+  assert.equal(cells[31].price, 5000)
+  assert.equal(cells[0].empty, true)
+  assert.equal(view.shelfProgress(shelf), '已开 8 / 32 格')
+  assert.equal(view.shelfProgress(null), '已开 8 / 32 格')
+})
+
+test('视图模型：陈列架按位置对格，空格与特产都不串位', () => {
+  const shelf = { slots: 9, items: [null, 'herb'] }
+  const codex = codexView({ herb: T0 })
+  const cells = view.shelfCells(shelf, codex)
+  assert.equal(cells[0].empty, true)
+  assert.equal(cells[1].itemId, 'herb')
+  assert.equal(cells[1].label, '草药')
+  assert.deepEqual(cells[1].emblem, { kind: 'art', src: 'souvenirs/herb.svg' })
+  assert.equal(cells[8].locked, false, '第 9 格已解锁')
+  assert.equal(cells[9].locked, true)
+  assert.equal(view.canUnlock(shelf, 10, 5000), true)
+  assert.equal(view.canUnlock(shelf, 10, 4999), false)
+  assert.equal(view.canUnlock(shelf, 9, 5000), false, '只能按顺序开下一格')
+  assert.equal(view.canUnlock(shelf, 11, 5000), false, '隔一格也不行')
+})
+
+test('视图模型：可摆放的特产只列已获得且还没上架的', () => {
+  const codex = {
+    slots: [
+      { id: 'herb', name: '草药', owned: true, art: 'souvenirs/herb.svg', emoji: '🌿' },
+      { id: 'stone', name: '石子', owned: true, art: '', emoji: '🪨' },
+      { id: 'unknown', name: '???', owned: false, art: '', emoji: '❔' }
+    ]
+  }
+  const placeable = view.placeableSouvenirs({ slots: 8, items: ['herb'] }, codex)
+  assert.deepEqual(placeable.map((slot) => slot.id), ['stone'])
+  assert.deepEqual(view.placeableSouvenirs({ slots: 8, items: [] }, null), [])
+})
+
+test('shared：陈列架视图真正归一，不再写死空架子', () => {
+  const normalized = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c4',
+    open: true,
+    state: sampleView({
+      shelf: { slots: 9, items: [null, 'herb'], unlocked: 9, maxSlots: 32, slotPrice: 5000 }
+    })
+  })
+  assert.equal(normalized.ok, true)
+  assert.deepEqual(normalized.command.state.shelf.items, [null, 'herb'])
+  assert.equal(normalized.command.state.shelf.slots, 9)
+  assert.equal(normalized.command.state.shelf.unlocked, 9)
+  assert.equal(normalized.command.state.shelf.maxSlots, 32)
+  assert.equal(normalized.command.state.shelf.slotPrice, 5000)
+
+  const fallback = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c5',
+    open: true,
+    state: sampleView({ shelf: { slots: 99, items: ['herb', 'herb', 7] } })
+  })
+  assert.equal(fallback.command.state.shelf.slots, 8)
+  assert.deepEqual(fallback.command.state.shelf.items, ['herb'])
+})
+
+test('shared：陈列架动作只过 slot/itemId/moveFrom/moveTo', () => {
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 9, coins: 1 }),
+    { action: 'expedition-shelf', slot: 9 }
+  )
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', itemId: 'herb', slot: 2 }),
+    { action: 'expedition-shelf', itemId: 'herb', slot: 2 }
+  )
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', moveFrom: 1, moveTo: 2 }),
+    { action: 'expedition-shelf', moveFrom: 1, moveTo: 2 }
+  )
+  assert.deepEqual(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', moveFrom: 1 }),
+    { action: 'expedition-shelf', moveFrom: 1 }
+  )
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf' }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 0 }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 33 }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', itemId: 7 }), null)
+  assert.equal(shared.normalizeExpeditionAction({ action: 'expedition-shelf', itemId: 'herb' }), null)
+  assert.equal(
+    shared.normalizeExpeditionAction({ action: 'expedition-shelf', slot: 1, moveFrom: 2 }),
+    null
+  )
+  assert.ok(shared.EXPEDITION_SUBMIT_ACTIONS.includes('expedition-shelf'))
+  const event = shared.normalizeHelperEvent({
+    type: 'action',
+    id: 'a3',
+    action: 'expedition-shelf',
+    moveFrom: 1,
+    moveTo: 2
+  })
+  assert.equal(event.ok, true)
+  assert.deepEqual(event.event, { type: 'action', id: 'a3', action: 'expedition-shelf', moveFrom: 1, moveTo: 2 })
+})
+
 test('shared：菜单里的「出远门」指向 expedition-open', () => {
   assert.equal(shared.MENU_TOOL_REQUESTS.expedition, 'expedition-open')
   assert.ok(shared.MENU_TOOL_IDS.includes('expedition'))
@@ -364,6 +475,35 @@ test('宿主：开窗下发整份视图；再点一次关窗；× 之后能重�
   desktop.userClose()
   const reopened = await callAction(service, { action: 'expedition-open' })
   assert.equal(reopened.body.window, 'opened')
+})
+
+test('宿主：陈列架随窗口下发，挪格后重推且不花硬币', async (t) => {
+  const dir = await tempDir(t)
+  const clock = { value: T0 }
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({
+    version: 1,
+    run: null,
+    shelf: { slots: 9, items: ['herb'] },
+    codex: { herb: T0 },
+    upgrades: { lantern: false }
+  }), 'utf8')
+  const desktop = desktopDouble()
+  const service = await makeService(t, dir, desktop, clock)
+  desktop.ready()
+  await callAction(service, { action: 'expedition-open' })
+
+  const opened = desktop.calls.expedition.at(-1)
+  assert.equal(opened.state.shelf.slots, 9)
+  assert.equal(opened.state.shelf.unlocked, 9)
+  assert.equal(opened.state.shelf.maxSlots, 32)
+  assert.equal(opened.state.shelf.slotPrice, 5000)
+  assert.deepEqual(opened.state.shelf.items, ['herb'])
+
+  const moved = await callAction(service, { action: 'expedition-shelf', moveFrom: 1, moveTo: 2 })
+  assert.equal(moved.body.ok, true)
+  const pushed = desktop.calls.expedition.at(-1).state
+  assert.deepEqual(pushed.shelf.items, [null, 'herb'])
+  assert.equal(pushed.coins, 620, '挪格不花钱')
 })
 
 test('宿主：出发扣盘缠，到点刷新成决策窗，继续走一段', async (t) => {

@@ -394,3 +394,97 @@ test('读档补记回币失败：这一趟原样留着，等下一次 tick 再�
   assert.equal(farm.state.coins, legCoins(routeOf('backhill'), runId, 1))
   assert.equal(second.snapshot().run.loot.length, 2, '硬币 + 一件特产')
 })
+
+test('陈列架开格：第 9 格起每格 5,000，扣农场的硬币并落盘', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(5000)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0 })
+  assert.deepEqual(store.snapshot().shelf, { slots: 8, items: [] })
+
+  const result = await store.shelfAction({ slot: 9 })
+  assert.equal(result.ok, true)
+  assert.equal(result.shelf.slots, 9)
+  assert.deepEqual(result.shelf.items, [])
+  assert.equal(farm.state.coins, 0, '开一格必须是 5,000')
+  assert.equal((await readState(dir)).shelf.slots, 9, '格数要落盘')
+})
+
+test('陈列架开格：硬币不够报 not-enough-coins，格数与硬币都不变', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(4999)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0 })
+
+  const result = await store.shelfAction({ slot: 9 })
+  assert.deepEqual(result, { ok: false, error: 'not-enough-coins' })
+  assert.equal(store.snapshot().shelf.slots, 8)
+  assert.equal(farm.state.coins, 4999, '失败了不能扣钱')
+  assert.equal((await readState(dir)).shelf.slots, 8)
+})
+
+test('陈列架开满 32 格共花 120,000；第 33 格报 locked', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(120000)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0 })
+
+  for (let slot = 9; slot <= 32; slot += 1) {
+    const result = await store.shelfAction({ slot })
+    assert.equal(result.ok, true, '开第 ' + String(slot) + ' 格')
+    assert.equal(result.shelf.slots, slot)
+  }
+  assert.equal(farm.state.coins, 0, '8 格 + 24 × 5,000 = 120,000')
+  const beyond = await store.shelfAction({ slot: 33 })
+  assert.deepEqual(beyond, { ok: false, error: 'locked' })
+  assert.equal(store.snapshot().shelf.slots, 32)
+  assert.equal(farm.state.coins, 0)
+})
+
+test('陈列架摆放/挪格/取下：同一件不能进两格，移动不花硬币', async (t) => {
+  const dir = await tempDir(t)
+  const farm = fakeFarm(0)
+  const store = await createExpeditionStore(dir, { farm, now: () => T0 })
+
+  const placed = await store.shelfAction({ slot: 1, itemId: 'herb' })
+  assert.equal(placed.ok, true)
+  assert.equal(placed.shelf.items[0], 'herb')
+  assert.equal(farm.state.coins, 0, '摆放不花钱')
+
+  const duplicate = await store.shelfAction({ slot: 2, itemId: 'herb' })
+  assert.equal(duplicate.ok, false)
+  assert.equal(duplicate.error, 'locked')
+  assert.equal(store.snapshot().shelf.items.filter((id) => id === 'herb').length, 1, '同一件只能占一格')
+
+  const moved = await store.shelfAction({ moveFrom: 1, moveTo: 2 })
+  assert.equal(moved.ok, true)
+  assert.equal(moved.shelf.items[0], null)
+  assert.equal(moved.shelf.items[1], 'herb')
+  assert.equal(farm.state.coins, 0, '挪格不花钱')
+
+  const removed = await store.shelfAction({ moveFrom: 2 })
+  assert.equal(removed.ok, true)
+  assert.equal(removed.shelf.items.includes('herb'), false, '取下的格子空了')
+  assert.equal(farm.state.coins, 0, '取下不花钱')
+})
+
+test('陈列架挪格：目标格没解锁就报 locked，原样不动', async (t) => {
+  const dir = await tempDir(t)
+  const store = await createExpeditionStore(dir, { farm: fakeFarm(0), now: () => T0 })
+  await store.shelfAction({ slot: 1, itemId: 'herb' })
+
+  const result = await store.shelfAction({ moveFrom: 1, moveTo: 9 })
+  assert.deepEqual(result, { ok: false, error: 'locked' })
+  assert.equal(store.snapshot().shelf.items[0], 'herb')
+})
+
+test('陈列架重开进程后内容与格数都还在', async (t) => {
+  const dir = await tempDir(t)
+  const first = await createExpeditionStore(dir, { farm: fakeFarm(10000), now: () => T0 })
+  await first.shelfAction({ slot: 9 })
+  await first.shelfAction({ slot: 10 })
+  await first.shelfAction({ slot: 9, itemId: 'herb' })
+  first.dispose()
+
+  const second = await createExpeditionStore(dir, { farm: fakeFarm(0), now: () => T0 })
+  const shelf = second.snapshot().shelf
+  assert.equal(shelf.slots, 10)
+  assert.equal(shelf.items[8], 'herb')
+})

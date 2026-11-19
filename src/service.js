@@ -42,6 +42,8 @@ import { createExpeditionStore } from './expedition-store.js'
 import {
   EXPEDITION_ERROR_TEXT,
   ROUTES as EXPEDITION_ROUTES,
+  SHELF_MAX_SLOTS,
+  SHELF_SLOT_PRICE,
   dangerLabel,
   dangerOf,
   routeOf
@@ -1322,6 +1324,7 @@ export function createService (ctx, options = {}) {
     if (action === 'expedition-start') return expeditionStart(body?.routeId)
     if (action === 'expedition-step') return expeditionStep()
     if (action === 'expedition-back') return expeditionBack()
+    if (action === 'expedition-shelf') return expeditionShelf(body)
     if (action === 'expedition-refresh') return expeditionRefresh()
 
     // 盘口（票 79）：右键菜单和农场窗的「盘口」是同一个开/关入口；HTTP/脚本可以用
@@ -3189,8 +3192,22 @@ export function createService (ctx, options = {}) {
    */
   function expeditionView () {
     const snap = expedition === null
-      ? { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false } }
+      ? {
+          version: 1,
+          run: null,
+          shelf: { slots: 8, items: [] },
+          codex: {},
+          upgrades: { lantern: false }
+        }
       : expedition.snapshot()
+    // 陈列架：`slots` = 已解锁格数，`items[i]` 对第 i+1 格（null = 空格）。
+    // 窗口再要一个 32 格的总宽度与开格价，才画得出锁着的格子与价格。
+    const shelf = {
+      ...snap.shelf,
+      unlocked: snap.shelf.slots,
+      maxSlots: SHELF_MAX_SLOTS,
+      slotPrice: SHELF_SLOT_PRICE
+    }
     const now = expeditionClock()
     const route = snap.run === null ? null : routeOf(snap.run.routeId)
     // walking 显示这一段的危险；deciding 显示下一段；走满时封顶在最后一段。
@@ -3199,6 +3216,7 @@ export function createService (ctx, options = {}) {
       : Math.min(snap.run.phase === 'deciding' ? snap.run.leg + 1 : snap.run.leg, snap.run.totalLegs)
     return {
       ...snap,
+      shelf,
       ready: expedition !== null,
       now,
       coins: farmStateView().coins,
@@ -3314,6 +3332,30 @@ export function createService (ctx, options = {}) {
     if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
     refreshExpeditionWindow()
     return { ...result, notice: `见好就收：带回 ${result.settled.coins} 枚硬币。` }
+  }
+
+  /**
+   * 陈列架（票 115）：开格、摆件、挪格、取下都走这一个动作。
+   * 开格的钱在 store 里经农场扣；这里只把失败翻成人话并重推窗口。
+   */
+  async function expeditionShelf (body) {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.shelfAction({
+      slot: body?.slot,
+      itemId: body?.itemId,
+      moveFrom: body?.moveFrom,
+      moveTo: body?.moveTo
+    })
+    if (!result.ok) {
+      const notice = result.error === 'not-enough-coins'
+        ? '硬币不够开这一格。'
+        : EXPEDITION_ERROR_TEXT[result.error] ?? null
+      return { ...result, notice }
+    }
+    refreshExpeditionWindow()
+    return result
   }
 
   /**
