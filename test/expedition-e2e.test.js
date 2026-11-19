@@ -493,3 +493,54 @@ test('e2e：同一个 runId 在两份存档里重放出同一趟（掉落/结局
   assert.deepEqual(one, two)
   assert.ok(one.loot.length >= 1)
 })
+
+test('e2e：陈列架开格扣 5,000、钱不够报错且格数不变，快照与窗口都带 shelf', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 5000)
+  const service = makeService(t, dir, { expeditionNow: () => T0 })
+  await service.ready
+
+  const opened = await action(service, { action: 'expedition-shelf', slot: 9 })
+  assert.equal(opened.status, 200)
+  assert.equal(opened.body.ok, true)
+  assert.equal(opened.body.shelf.slots, 9)
+
+  const snap = await state(service)
+  assert.equal(snap.body.expedition.shelf.slots, 9)
+  assert.equal(snap.body.expedition.shelf.unlocked, 9)
+  assert.equal(snap.body.expedition.shelf.maxSlots, 32)
+  assert.equal(snap.body.expedition.shelf.slotPrice, 5000)
+  assert.equal(snap.body.farm.coins, 0, '开格走农场的硬币')
+  assert.equal((await readExpedition(dir)).shelf.slots, 9)
+
+  const denied = await action(service, { action: 'expedition-shelf', slot: 10 })
+  assert.equal(denied.body.ok, false)
+  assert.equal(denied.body.error, 'not-enough-coins')
+  const after = await state(service)
+  assert.equal(after.body.expedition.shelf.slots, 9, '失败后格数不变')
+  assert.equal(after.body.farm.coins, 0, '失败后硬币不变')
+})
+
+test('e2e：陈列架挪格不花硬币，窗口推来的 shelf 与快照一致', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 0)
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({
+    version: 1,
+    run: null,
+    shelf: { slots: 8, items: ['herb'] },
+    codex: { herb: T0 },
+    upgrades: { lantern: false }
+  }), 'utf8')
+  const service = makeService(t, dir, { expeditionNow: () => T0 })
+  await service.ready
+
+  const moved = await action(service, { action: 'expedition-shelf', moveFrom: 1, moveTo: 2 })
+  assert.equal(moved.body.ok, true)
+  assert.equal(moved.body.shelf.items[0], null)
+  assert.equal(moved.body.shelf.items[1], 'herb')
+
+  const snap = await state(service)
+  assert.deepEqual(snap.body.expedition.shelf.items, [null, 'herb'])
+  assert.equal(snap.body.farm.coins, 0, '挪格不花钱')
+  assert.deepEqual((await readExpedition(dir)).shelf.items, [null, 'herb'])
+})

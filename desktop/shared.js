@@ -427,18 +427,23 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const FUTURES_ACCOUNT_MODES = ['shadow', 'live']
   /**
    * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`/`lantern`
-   * 什么都不带，`refresh` 只请宿主补一拍。钱与段数全在宿主算。
+   * 什么都不带，`refresh` 只请宿主补一拍，`shelf` 带格号与特产 id（票 115）。
+   * 钱与段数全在宿主算。
    */
   const EXPEDITION_SUBMIT_ACTIONS = [
     'expedition-start',
     'expedition-step',
     'expedition-back',
     'expedition-lantern',
-    'expedition-refresh'
+    'expedition-refresh',
+    'expedition-shelf'
   ]
   /** 出远门的三个阶段 + 两种结局；窗口只画这几个词。 */
   const EXPEDITION_PHASES = ['walking', 'deciding']
   const EXPEDITION_ENDED = ['back', 'complete', 'failed']
+  /** 陈列架（票 115）：窗口按 32 格画，开格价与宿主同一个数。 */
+  const EXPEDITION_SHELF_MAX = 32
+  const EXPEDITION_SHELF_PRICE = 5000
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(
     MENU_ACTION_IDS,
@@ -2907,11 +2912,45 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         : null,
       away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
       routes,
-      // 陈列架（115）还没画，但形状留着；118 的提灯已经在 upgrades.lantern 里。
-      shelf: { slots: 8, items: [] },
+      // 陈列架（115）：slots/items/unlocked 由宿主给，窗口只读；提灯在 upgrades.lantern 里。
+      shelf: normalizeExpeditionShelf(source.shelf),
       codex,
       codexView: normalizeExpeditionCodexView(source.codexView),
       upgrades: { lantern: source.upgrades?.lantern === true }
+    }
+  }
+
+  /**
+   * 陈列架（票 115）：`items[i]` 对第 i+1 格。窗口只读，不在这里判「能不能开」；
+   * 但坏 id、重复件与超长数组必须先清掉，免得渲染端画出两个同样的特产。
+   */
+  function normalizeExpeditionShelf (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const slots = Number.isInteger(source.slots) && source.slots >= 8 && source.slots <= EXPEDITION_SHELF_MAX
+      ? source.slots
+      : 8
+    const items = []
+    if (Array.isArray(source.items)) {
+      const seen = new Set()
+      for (const entry of source.items.slice(0, slots)) {
+        const id = typeof entry === 'string' ? entry.trim() : ''
+        if (!/^[a-z0-9-]+$/.test(id) || seen.has(id)) {
+          items.push(null)
+          continue
+        }
+        seen.add(id)
+        items.push(id)
+      }
+      while (items.length > 0 && items[items.length - 1] === null) items.pop()
+    }
+    return {
+      slots,
+      unlocked: slots,
+      maxSlots: EXPEDITION_SHELF_MAX,
+      slotPrice: typeof source.slotPrice === 'number' && Number.isFinite(source.slotPrice) && source.slotPrice > 0
+        ? Math.round(source.slotPrice)
+        : EXPEDITION_SHELF_PRICE,
+      items
     }
   }
 
@@ -2924,17 +2963,59 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     }
   }
 
-  /** 出远门小窗提交的白名单：只认四个动作，`start` 必须带路线 id。 */
+  /** 陈列架动作的合法格号：1..32。 */
+  function normalizeShelfSlot (value) {
+    return Number.isInteger(value) && value >= 1 && value <= EXPEDITION_SHELF_MAX ? value : null
+  }
+
+  /**
+   * 出远门小窗提交的白名单：只认六个动作，`start` 必须带路线 id。
+   * `expedition-shelf` 的字段在这里逐一拷贝——落到 helper 的农场窄口会被整条削掉。
+   */
   function normalizeExpeditionAction (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
     if (!EXPEDITION_SUBMIT_ACTIONS.includes(action)) return null
+    if (action === 'expedition-shelf') {
+      const out = { action }
+      let touched = false
+      if (raw.slot !== undefined && raw.slot !== null) {
+        const slot = normalizeShelfSlot(raw.slot)
+        if (slot === null) return null
+        out.slot = slot
+        touched = true
+      }
+      if (raw.itemId !== undefined && raw.itemId !== null) {
+        const itemId = normalizeLabel(raw.itemId, '')
+        if (!/^[a-z0-9-]+$/.test(itemId)) return null
+        out.itemId = itemId
+        touched = true
+      }
+      if (raw.moveFrom !== undefined && raw.moveFrom !== null) {
+        const moveFrom = normalizeShelfSlot(raw.moveFrom)
+        if (moveFrom === null) return null
+        out.moveFrom = moveFrom
+        touched = true
+      }
+      if (raw.moveTo !== undefined && raw.moveTo !== null) {
+        const moveTo = normalizeShelfSlot(raw.moveTo)
+        if (moveTo === null) return null
+        out.moveTo = moveTo
+        touched = true
+      }
+      if (!touched) return null
+      const moving = out.moveFrom !== undefined || out.moveTo !== undefined
+      if (moving && (out.moveFrom === undefined || out.slot !== undefined || out.itemId !== undefined)) return null
+      if (out.itemId !== undefined && out.slot === undefined) return null
+      return out
+    }
     if (action !== 'expedition-start') return { action }
     const routeId = normalizeLabel(raw.routeId, '')
     return routeId === '' ? null : { action, routeId }
   }
 
-  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
+  /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
+  /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
     if (raw === undefined || raw === null) return null
     if (!Array.isArray(raw)) return false

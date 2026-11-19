@@ -196,8 +196,80 @@
       .map((item) => names.get(item.id) || item.id)
   }
 
+  /**
+   * 陈列架（票 115）：宿主给的是 `{slots, items, ...}`，`items[i]` 对第 i+1 格。
+   * 窗口按 32 格的总宽度画，锁着的格子也画出来并标上开格价。
+   */
+  const SHELF_MAX_SLOTS = 32
+  const SHELF_SLOT_PRICE = 5000
+
+  function shelfLayout (shelf) {
+    const raw = shelf !== null && typeof shelf === 'object' ? shelf : {}
+    const maxSlots = Math.min(
+      SHELF_MAX_SLOTS,
+      Math.max(8, Math.round(num(raw.maxSlots) || SHELF_MAX_SLOTS))
+    )
+    const slots = Math.min(maxSlots, Math.max(8, Math.round(num(raw.slots) || 8)))
+    const price = Math.max(0, Math.round(num(raw.slotPrice) || SHELF_SLOT_PRICE))
+    return { slots, maxSlots, price, items: Array.isArray(raw.items) ? raw.items : [] }
+  }
+
+  /** 一格一个描述对象；特产的显示名与图案从图鉴视图里取，取不到就原样显示 id。 */
+  function shelfCells (shelf, codex) {
+    const layout = shelfLayout(shelf)
+    const byId = new Map()
+    for (const slot of codexSlots(codex)) {
+      if (typeof slot.id === 'string') byId.set(slot.id, slot)
+    }
+    const cells = []
+    for (let index = 0; index < layout.maxSlots; index += 1) {
+      const locked = index >= layout.slots
+      const raw = locked ? null : layout.items[index]
+      const itemId = typeof raw === 'string' && raw !== '' ? raw : null
+      const meta = itemId === null ? null : byId.get(itemId)
+      cells.push({
+        slot: index + 1,
+        locked,
+        price: locked ? layout.price : 0,
+        empty: itemId === null,
+        itemId,
+        label: meta === null ? (itemId === null ? '' : itemId) : meta.name,
+        emblem: meta === null ? { kind: 'emoji', text: '❔' } : slotEmblem(meta)
+      })
+    }
+    return cells
+  }
+
+  function shelfProgress (shelf) {
+    const layout = shelfLayout(shelf)
+    return '已开 ' + String(layout.slots) + ' / ' + String(layout.maxSlots) + ' 格'
+  }
+
+  /** 已获得、但还没上架的特产：给「摆进空格」的选择器用。 */
+  function placeableSouvenirs (shelf, codex) {
+    const layout = shelfLayout(shelf)
+    const placed = new Set()
+    for (const entry of layout.items) {
+      if (typeof entry === 'string' && entry !== '') placed.add(entry)
+    }
+    return codexSlots(codex).filter((slot) =>
+      slot.owned === true && typeof slot.id === 'string' && slot.id !== '' && !placed.has(slot.id)
+    )
+  }
+
+  /**
+   * 只有「下一格」能点开，且硬币要够。后排的锁格只显示价格，点了也不该扣钱，
+   * 免得窗口替宿主把顺序校验又实现一遍。
+   */
+  function canUnlock (shelf, slot, coins) {
+    const layout = shelfLayout(shelf)
+    return Number.isInteger(slot) && slot === layout.slots + 1 && num(coins) >= layout.price
+  }
+
   return {
     ACTIVE_PHASES,
+    SHELF_MAX_SLOTS,
+    SHELF_SLOT_PRICE,
     isActiveRun,
     formatCoins,
     formatClock,
@@ -216,6 +288,10 @@
     codexProgress,
     codexGroups,
     slotEmblem,
-    souvenirNames
+    souvenirNames,
+    shelfCells,
+    shelfProgress,
+    canUnlock,
+    placeableSouvenirs
   }
 })
