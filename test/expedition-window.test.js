@@ -148,6 +148,50 @@ test('视图模型：图鉴 32 格按路线分组，缺图/坏路径回退 emoji
   assert.equal(view.codexProgress(null), '0/32', '没有视图也要画满 32 个空格')
 })
 
+test('视图模型：路线卡带解锁进度，灰卡不能出发', () => {
+  const cards = view.routeCards({
+    run: null,
+    coins: 10000,
+    routes: [
+      {
+        id: 'backhill',
+        name: '后山',
+        fare: 500,
+        minLegs: 3,
+        maxLegs: 4,
+        coinBase: 15,
+        unlocked: true,
+        requirement: '默认开放',
+        progress: '已开放'
+      },
+      {
+        id: 'mine',
+        name: '废矿',
+        fare: 3000,
+        minLegs: 4,
+        maxLegs: 5,
+        coinBase: 90,
+        unlocked: false,
+        requirement: '走过 3 趟后山',
+        progress: '还差 2 趟后山'
+      }
+    ]
+  })
+  assert.deepEqual(cards.map((card) => card.id), ['backhill', 'mine'])
+  assert.equal(cards[0].locked, false)
+  assert.equal(cards[0].hint, '盘缠 500 · 3–4 段 · 每段回 11–19 枚')
+  assert.equal(cards[0].requirement, '')
+  assert.equal(cards[0].canStart, true)
+  assert.equal(cards[1].locked, true)
+  assert.equal(cards[1].hint, '盘缠 3000 · 4–5 段 · 每段回 68–113 枚')
+  assert.equal(cards[1].requirement, '走过 3 趟后山')
+  assert.equal(cards[1].progress, '还差 2 趟后山')
+  assert.equal(cards[1].canStart, false, '钱够也不给走锁着的路线')
+  assert.equal(view.canStart({ run: null, coins: 999999 }, { fare: 3000, unlocked: false }), false)
+  assert.equal(view.canStart({ run: null, coins: 500 }, { fare: 500 }), true, '老视图没有 unlocked 字段时照旧')
+  assert.deepEqual(view.routeCards(null), [])
+})
+
 test('shared：窗口视图保留特产 loot，并清洗 32 格图鉴', () => {
   const codex = codexView({ herb: T0 })
   codex.slots[0].art = '../evil.svg'
@@ -179,6 +223,70 @@ test('shared：窗口视图保留特产 loot，并清洗 32 格图鉴', () => {
   assert.equal(viewState.slots[1].art, '')
   assert.equal(viewState.slots.find((slot) => slot.id === 'herb').label, '草药')
   assert.equal(viewState.slots.find((slot) => slot.id === 'oddstone').label, '???')
+})
+
+test('shared：路线卡放行 unlocked/requirement/progress，缺省按未解锁', () => {
+  const normalized = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c9',
+    open: true,
+    state: sampleView({
+      routes: [
+        {
+          id: 'backhill',
+          name: '后山',
+          fare: 500,
+          minLegs: 3,
+          maxLegs: 4,
+          coinBase: 15,
+          unlocked: true,
+          requirement: '默认开放',
+          progress: '已开放',
+          extra: '丢掉'
+        },
+        {
+          id: 'mine',
+          name: '废矿',
+          fare: 3000,
+          minLegs: 4,
+          maxLegs: 5,
+          coinBase: 90,
+          unlocked: false,
+          requirement: '走过 3 趟后山',
+          progress: '还差 2 趟后山'
+        }
+      ]
+    })
+  })
+  assert.equal(normalized.ok, true)
+  const routes = normalized.command.state.routes
+  assert.deepEqual(routes[0], {
+    id: 'backhill',
+    name: '后山',
+    fare: 500,
+    minLegs: 3,
+    maxLegs: 4,
+    coinBase: 15,
+    unlocked: true,
+    requirement: '默认开放',
+    progress: '已开放'
+  })
+  assert.deepEqual(routes[1], {
+    id: 'mine',
+    name: '废矿',
+    fare: 3000,
+    minLegs: 4,
+    maxLegs: 5,
+    coinBase: 90,
+    unlocked: false,
+    requirement: '走过 3 趟后山',
+    progress: '还差 2 趟后山'
+  })
+
+  const legacy = shared.normalizeExpeditionView({ routes: [{ id: 'backhill', name: '后山', fare: 500 }] })
+  assert.equal(legacy.routes[0].unlocked, false, '宿主没给 unlocked 时按灰卡处理，避免错开')
+  assert.equal(legacy.routes[0].requirement, '')
+  assert.equal(legacy.routes[0].progress, '')
 })
 
 test('shared：expedition-window 命令与窗口状态事件', () => {
@@ -513,7 +621,11 @@ test('宿主：开窗下发整份视图；再点一次关窗；× 之后能重�
   assert.equal(command.state.ready, true)
   assert.equal(command.state.coins, 620)
   assert.equal(command.state.run, null)
-  assert.deepEqual(command.state.routes.map((route) => route.id), ['backhill'])
+  assert.deepEqual(command.state.routes.map((route) => route.id), ['backhill', 'mine', 'railway', 'mistridge'])
+  const mine = command.state.routes.find((route) => route.id === 'mine')
+  assert.equal(mine.unlocked, false)
+  assert.equal(mine.requirement, '走过 3 趟后山')
+  assert.equal(mine.progress, '还差 3 趟后山')
 
   const again = await callAction(service, { action: 'expedition-open' })
   assert.equal(again.body.ok, true)

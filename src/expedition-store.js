@@ -2,8 +2,8 @@
  * 「出远门」的存档（票 112）：`<dataDir>/expedition.json`。
  *
  * 只做三件事：把规则层的纯迁移落到内存、把硬币变动交给农场、把结果原子地写回磁盘。
- * 文件里有 run / shelf / codex / upgrades 四块。114 起每到一段同时记一笔图鉴（首次获得时间），
- * 图鉴与陈列架共用这份 codex，不需要再迁一次格式。
+ * 文件里有 run / shelf / codex / upgrades / trips 五块。114 起每到一段同时记一笔图鉴（首次获得时间），
+ * 图鉴与陈列架共用这份 codex，不需要再迁一次格式；117 的 trips 只记每条路线平安回家的趟数。
  *
  * 钱与状态顺序：
  *   出发：先扣盘缠再写 run（写失败退款并回滚）；
@@ -18,6 +18,7 @@ import { join } from 'node:path'
 
 import {
   LANTERN_PRICE,
+  ROUTE_IDS,
   advanceRun,
   backRun,
   codexView,
@@ -25,6 +26,7 @@ import {
   isActiveRun,
   normalizeRun,
   recordSouvenir,
+  recordTrip,
   resumeRun,
   routeOf,
   settledOf,
@@ -33,7 +35,8 @@ import {
   stepRun,
   SHELF_BASE_SLOTS,
   SHELF_MAX_SLOTS,
-  SHELF_SLOT_PRICE
+  SHELF_SLOT_PRICE,
+  unlockStatus
 } from './expedition.js'
 
 export const EXPEDITION_FILE = 'expedition.json'
@@ -77,6 +80,18 @@ function normalizeCodex (raw) {
   return codex
 }
 
+/** 已回家的趟数（票 117 的解锁进度）：只认四条已知路线与非负整数，坏数据当 0。 */
+function normalizeTrips (raw) {
+  const trips = {}
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return trips
+  for (const [id, count] of Object.entries(raw)) {
+    if (!ROUTE_IDS.includes(id)) continue
+    if (!Number.isInteger(count) || count <= 0) continue
+    trips[id] = count
+  }
+  return trips
+}
+
 /** 空文件/坏文件/旧字段都收敛到这一份完整形状。 */
 function normalizeState (raw) {
   return {
@@ -84,7 +99,8 @@ function normalizeState (raw) {
     run: normalizeRun(raw?.run),
     shelf: normalizeShelf(raw?.shelf),
     codex: normalizeCodex(raw?.codex),
-    upgrades: { lantern: raw?.upgrades?.lantern === true }
+    upgrades: { lantern: raw?.upgrades?.lantern === true },
+    trips: normalizeTrips(raw?.trips)
   }
 }
 
@@ -140,7 +156,8 @@ export class ExpeditionStore {
       shelf: normalizeShelf(this.#state.shelf),
       codex: { ...this.#state.codex },
       codexView: codexView(this.#state.codex),
-      upgrades: { ...this.#state.upgrades }
+      upgrades: { ...this.#state.upgrades },
+      trips: { ...this.#state.trips }
     }
   }
 
@@ -151,7 +168,8 @@ export class ExpeditionStore {
 
   /**
    * 出发：`expedition-start` 的唯一落点。
-   * 拒绝顺序是「已经在外面 → 没有这条路线 → 还没准备好 → 钱不够」，先在内存里判完再动钱。
+   * 拒绝顺序是「已经在外面 → 没有这条路线 → 还没解锁 → 还没准备好 → 钱不够」，
+   * 先在内存里判完再动钱——锁着的路线一分盘缠都不该扣。
    */
   start ({ routeId } = {}) {
     return this.#serial(async () => {
@@ -159,6 +177,11 @@ export class ExpeditionStore {
       if (isActiveRun(this.#state.run)) return { ok: false, error: 'already-away' }
       const route = routeOf(routeId)
       if (route === null) return { ok: false, error: 'no-route' }
+      const unlocked = unlockStatus(route, {
+        trips: this.#state.trips,
+        codexOwned: codexView(this.#state.codex).owned
+      })
+      if (!unlocked.unlocked) return { ok: false, error: 'locked' }
       if (this.#farm === null || typeof this.#farm.spendCoins !== 'function') {
         return { ok: false, error: 'starting' }
       }
@@ -229,11 +252,14 @@ export class ExpeditionStore {
       if (next === null) return { ok: false, error: 'not-walking' }
       const settled = next.ended === null ? null : settledOf(next)
       const previous = this.#state.run
+      const previousTrips = this.#state.trips
       this.#state.run = next
+      this.#state.trips = recordTrip(this.#state.trips, next)
       if (await this.#persist()) {
         return settled === null ? { ok: true, run: copyRun(next) } : { ok: true, run: copyRun(next), settled }
       }
       this.#state.run = previous
+      this.#state.trips = previousTrips
       return { ok: false, error: 'save-failed' }
     })
   }
@@ -249,10 +275,13 @@ export class ExpeditionStore {
       if (next === null) return { ok: false, error: 'not-walking' }
       const settled = settledOf(next)
       const previous = this.#state.run
+      const previousTrips = this.#state.trips
       this.#state.run = next
+      this.#state.trips = recordTrip(this.#state.trips, next)
       if (await this.#persist()) return { ok: true, run: copyRun(next), settled }
       // 写不进去就留在决策窗，让玩家能再点一次，而不是内存说回家了、重启又在外头。
       this.#state.run = previous
+      this.#state.trips = previousTrips
       return { ok: false, error: 'save-failed' }
     })
   }
@@ -269,6 +298,7 @@ export class ExpeditionStore {
       const expired = expireRun(this.#state.run, now)
       if (expired !== null) {
         this.#state.run = expired
+        this.#state.trips = recordTrip(this.#state.trips, expired)
         await this.#persist()
         return true
       }
@@ -279,6 +309,7 @@ export class ExpeditionStore {
         if (!credited) return false
       }
       this.#state.run = event.run
+      this.#state.trips = recordTrip(this.#state.trips, event.run)
       if (event.souvenir !== null && event.souvenir !== undefined) {
         // 只记第一次见到的时刻；重复获得时 recordSouvenir 原样返回。
         this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
@@ -393,6 +424,7 @@ export class ExpeditionStore {
       if (!credited) return false
     }
     this.#state.run = event.run
+    this.#state.trips = recordTrip(this.#state.trips, event.run)
     if (event.souvenir !== null && event.souvenir !== undefined) {
       this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
     }

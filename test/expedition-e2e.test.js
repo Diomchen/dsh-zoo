@@ -131,13 +131,14 @@ test('e2e：出发扣 500 → 走一段 → 继续 → 见好就收，硬币与�
   })
   await service.ready
 
-  // 1) 还没出门：状态块形状完整，路线只有后山。
+  // 1) 还没出门：状态块形状完整，四条路线按后山→废矿→老铁路→雾岭排。
   const before = await state(service)
   assert.equal(before.body.farm.coins, 500)
   assert.equal(before.body.expedition.run, null)
   assert.equal(before.body.expedition.coins, 500)
-  assert.deepEqual(before.body.expedition.routes.map((route) => route.id), ['backhill'])
+  assert.deepEqual(before.body.expedition.routes.map((route) => route.id), ['backhill', 'mine', 'railway', 'mistridge'])
   assert.equal(before.body.expedition.routes[0].fare, 500)
+  assert.equal(before.body.expedition.routes[0].unlocked, true)
 
   // 2) 出发：盘缠当场扣，run 进 walking。
   const started = await action(service, { action: 'expedition-start', routeId: 'backhill' })
@@ -326,10 +327,64 @@ test('e2e：未知路线回 no-route', async (t) => {
   await seedFarm(dir, 500)
   const service = makeService(t, dir, { expeditionNow: () => T0 })
   await service.ready
-  const result = await action(service, { action: 'expedition-start', routeId: 'mine' })
+  const result = await action(service, { action: 'expedition-start', routeId: 'nowhere' })
   assert.equal(result.body.ok, false)
   assert.equal(result.body.error, 'no-route')
   assert.equal((await state(service)).body.farm.coins, 500)
+})
+
+test('e2e：锁着的路线被拒 locked 且不扣钱；三趟后山回家后下一次快照就解锁', async (t) => {
+  const dir = await tempDir(t)
+  await seedFarm(dir, 10000)
+  const clock = { value: T0 }
+  const service = makeService(t, dir, {
+    farmNow: () => clock.value,
+    expeditionNow: () => clock.value,
+    expeditionRunId: () => pickRunId(cleanThrough(2))
+  })
+  await service.ready
+
+  const before = await state(service)
+  const mine = before.body.expedition.routes.find((route) => route.id === 'mine')
+  assert.deepEqual(mine, {
+    id: 'mine',
+    name: '废矿',
+    fare: 3000,
+    minLegs: 4,
+    maxLegs: 5,
+    coinBase: 90,
+    unlocked: false,
+    requirement: '走过 3 趟后山',
+    progress: '还差 3 趟后山'
+  })
+
+  const refused = await action(service, { action: 'expedition-start', routeId: 'mine' })
+  assert.equal(refused.body.ok, false)
+  assert.equal(refused.body.error, 'locked')
+  assert.match(refused.body.notice, /还差 3 趟后山/)
+  assert.equal((await state(service)).body.farm.coins, 10000, '锁着的路线不扣盘缠')
+  assert.equal((await state(service)).body.expedition.run, null)
+
+  // 三趟后山见好就收：每趟 tick 一段就回家，段 1 不会翻车。
+  for (let trip = 0; trip < 3; trip += 1) {
+    assert.equal((await action(service, { action: 'expedition-start', routeId: 'backhill' })).body.ok, true)
+    clock.value += 20000
+    assert.equal(await service.expeditionStore().tick(clock.value), true)
+    const home = await action(service, { action: 'expedition-back' })
+    assert.equal(home.body.ok, true)
+    assert.equal(home.body.run.ended, 'back')
+  }
+
+  const after = await state(service)
+  const unlocked = after.body.expedition.routes.find((route) => route.id === 'mine')
+  assert.equal(unlocked.unlocked, true, '条件刚满足，下一次快照就该变亮')
+  assert.equal(unlocked.progress, '后山 3/3 趟')
+
+  const coinsBefore = after.body.farm.coins
+  const started = await action(service, { action: 'expedition-start', routeId: 'mine' })
+  assert.equal(started.body.ok, true)
+  assert.equal(started.body.run.routeId, 'mine')
+  assert.equal((await state(service)).body.farm.coins, coinsBefore - 3000)
 })
 
 test('e2e：结算的硬币总数就是 loot 之和', async (t) => {

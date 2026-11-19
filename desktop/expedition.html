@@ -86,6 +86,24 @@
   button.primary { background: var(--accent); border-color: var(--ink); color: #fffdf8; }
   button.primary:hover:not(:disabled) { background: var(--ink); }
   .actions { display: flex; gap: 10px; margin-top: 14px; }
+  .routes { display: grid; gap: 8px; margin-bottom: 12px; }
+  .routes[hidden] { display: none; }
+  .routeCard {
+    display: grid; gap: 1px; width: 100%; padding: 8px 12px; text-align: left;
+    border: 1px solid var(--soft); border-radius: var(--radius);
+    background: var(--card); color: var(--ink); font: inherit; cursor: pointer;
+  }
+  .routeCard .name { font-weight: 700; letter-spacing: .04em; }
+  .routeCard .hint {
+    margin: 0; color: var(--muted); font-size: 12px;
+    font-variant-numeric: tabular-nums;
+  }
+  .routeCard .lock { color: var(--accent); font-size: 12px; }
+  .routeCard[data-active="true"] { border-color: var(--line); box-shadow: inset 0 0 0 1px var(--line); }
+  .routeCard[data-locked="true"] {
+    filter: grayscale(1); opacity: .6; cursor: default; background: var(--paper);
+  }
+  .routeCard[data-locked="true"]:hover { background: var(--paper); color: var(--ink); }
   .tripTop {
     display: flex; align-items: baseline; gap: 10px;
     font-variant-numeric: tabular-nums;
@@ -175,6 +193,7 @@
   </nav>
   <main>
     <div id="travelPane">
+    <div class="routes" id="routes"></div>
     <section class="card" id="lantern">
       <h2>提灯</h2>
       <p class="desc" id="lanternText">还没买提灯：决策窗只显示低 / 中 / 高，看不出下一段到底多险。</p>
@@ -184,7 +203,7 @@
     <section class="card" id="home">
       <h2 id="routeName">后山</h2>
       <p class="hint" id="routeHint">盘缠 500 · 3–4 段 · 每段回 11–19 枚</p>
-      <p class="desc">交一次盘缠，走进后山。每走一段掉一笔硬币；见好就收只带回已经走过的段数，盘缠不退。</p>
+      <p class="desc" id="routeDesc">交一次盘缠，走进后山。每走一段掉一笔硬币；见好就收只带回已经走过的段数，盘缠不退。</p>
       <button class="primary" id="start">交 500 盘缠，出发</button>
       <p class="note" id="homeNote"></p>
     </section>
@@ -207,7 +226,10 @@
     <section class="card" id="done" hidden>
       <h2 id="doneTitle">回家了</h2>
       <p class="desc" id="settle"></p>
-      <button class="primary" id="again">再走一趟</button>
+      <div class="actions">
+        <button class="primary" id="again">再走一趟</button>
+        <button id="browse">换条路线</button>
+      </div>
     </section>
     </div>
 

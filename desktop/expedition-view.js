@@ -130,12 +130,47 @@
     return isActiveRun(run) && run.phase === 'deciding'
   }
 
-  /** 能不能出发：没有进行中的趟、硬币够盘缠。 */
+  /**
+   * 能不能出发：没有进行中的趟、路线已解锁、硬币够盘缠。
+   * `unlocked` 缺省视为已解锁（112 的老视图没有这个字段），显式 false 才是灰卡。
+   */
   function canStart (view, route) {
     if (isActiveRun(view === null ? null : view.run)) return false
+    if (route !== null && route !== undefined && route.unlocked === false) return false
     const fare = route === null || route === undefined ? 0 : num(route.fare)
     const coins = num(view === null ? 0 : view.coins)
     return fare > 0 && coins >= fare
+  }
+
+  /** 一盘路线的摘要：盘缠、段数、每段回币。窗口和灰卡都画这一行。 */
+  function routeHint (route) {
+    if (route === null || typeof route !== 'object') return ''
+    const base = num(route.coinBase)
+    return '盘缠 ' + formatCoins(route.fare) +
+      ' · ' + String(num(route.minLegs)) + '–' + String(num(route.maxLegs)) + ' 段 · 每段回 ' +
+      formatCoins(Math.round(base * 0.75)) + '–' + formatCoins(Math.round(base * 1.25)) + ' 枚'
+  }
+
+  /**
+   * home 的路线卡（票 117）：锁着的卡带解锁条件与进度，但盘缠/段数照旧写出来，
+   * 好让玩家知道解锁后能走多远。窗口只照着画，不再自己算条件。
+   */
+  function routeCards (view) {
+    const routes = view !== null && typeof view === 'object' && Array.isArray(view.routes) ? view.routes : []
+    return routes
+      .filter((route) => route !== null && typeof route === 'object' && typeof route.id === 'string' && route.id !== '')
+      .map((route) => {
+        const locked = route.unlocked === false
+        return {
+          id: route.id,
+          name: typeof route.name === 'string' ? route.name : route.id,
+          locked,
+          hint: routeHint(route),
+          requirement: locked && typeof route.requirement === 'string' ? route.requirement : '',
+          progress: locked && typeof route.progress === 'string' ? route.progress : '',
+          canStart: canStart(view, route)
+        }
+      })
   }
 
   /** 图鉴 32 格：宿主没送或送坏了就当全空，窗口仍然画 32 个灰格。 */
@@ -284,6 +319,8 @@
     canContinue,
     canBack,
     canStart,
+    routeHint,
+    routeCards,
     codexSlots,
     codexProgress,
     codexGroups,

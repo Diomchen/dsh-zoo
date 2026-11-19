@@ -47,7 +47,8 @@ import {
   SHELF_SLOT_PRICE,
   dangerLabel,
   dangerOf,
-  routeOf
+  routeOf,
+  unlockStatus
 } from './expedition.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
@@ -3176,16 +3177,27 @@ export function createService (ctx, options = {}) {
     return room.awayReason()
   }
 
-  /** 路线表只下发窗口要显示的那几项；数值真相仍在规则层。 */
-  function expeditionRoutesView () {
-    return Object.values(EXPEDITION_ROUTES).map((route) => ({
-      id: route.id,
-      name: route.name,
-      fare: route.fare,
-      minLegs: route.minLegs,
-      maxLegs: route.maxLegs,
-      coinBase: Math.round(route.fare * route.coinRate)
-    }))
+  /**
+   * 路线表只下发窗口要显示的那几项；数值真相仍在规则层。
+   * 票 117 起每条路线带 `unlocked/requirement/progress`，窗口直接照着画灰卡，不再自己判。
+   */
+  function expeditionRoutesView (snap) {
+    const trips = snap?.trips ?? {}
+    const codexOwned = snap?.codexView?.owned ?? 0
+    return Object.values(EXPEDITION_ROUTES).map((route) => {
+      const status = unlockStatus(route, { trips, codexOwned })
+      return {
+        id: route.id,
+        name: route.name,
+        fare: route.fare,
+        minLegs: route.minLegs,
+        maxLegs: route.maxLegs,
+        coinBase: Math.round(route.fare * route.coinRate),
+        unlocked: status.unlocked,
+        requirement: status.requirement,
+        progress: status.progress
+      }
+    })
   }
 
   /**
@@ -3199,7 +3211,9 @@ export function createService (ctx, options = {}) {
           run: null,
           shelf: { slots: 8, items: [] },
           codex: {},
-          upgrades: { lantern: false }
+          codexView: { total: 0, owned: 0, slots: [] },
+          upgrades: { lantern: false },
+          trips: {}
         }
       : expedition.snapshot()
     // 陈列架：`slots` = 已解锁格数，`items[i]` 对第 i+1 格（null = 空格）。
@@ -3228,7 +3242,7 @@ export function createService (ctx, options = {}) {
       coins: farmStateView().coins,
       away: expeditionAwayReason(),
       lanternPrice: LANTERN_PRICE,
-      routes: expeditionRoutesView(),
+      routes: expeditionRoutesView(snap),
       ...(snap.run === null || dangerRate === null
         ? {}
         : {
@@ -3311,7 +3325,21 @@ export function createService (ctx, options = {}) {
       return { ok: false, error: 'already-away', notice: EXPEDITION_ERROR_TEXT['already-away'] }
     }
     const result = await expedition.start({ routeId })
-    if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    if (!result.ok) {
+      // 锁着的路线要说清还差多少，让玩家知道去刷哪一项，而不是只看到「没成」。
+      if (result.error === 'locked') {
+        const route = routeOf(routeId)
+        if (route !== null) {
+          const snap = expedition.snapshot()
+          const status = unlockStatus(route, {
+            trips: snap.trips,
+            codexOwned: snap.codexView.owned
+          })
+          return { ...result, notice: `还没解锁：${status.progress}。` }
+        }
+      }
+      return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    }
     refreshExpeditionWindow()
     const route = routeOf(result.run.routeId)
     return {
@@ -3358,9 +3386,12 @@ export function createService (ctx, options = {}) {
       moveTo: body?.moveTo
     })
     if (!result.ok) {
+      // `locked` 与路线解锁共用一个 error code，架子这边必须用格子的说法。
       const notice = result.error === 'not-enough-coins'
         ? '硬币不够开这一格。'
-        : EXPEDITION_ERROR_TEXT[result.error] ?? null
+        : result.error === 'locked'
+          ? '这个格子还没开，放不进去。'
+          : EXPEDITION_ERROR_TEXT[result.error] ?? null
       return { ...result, notice }
     }
     refreshExpeditionWindow()
