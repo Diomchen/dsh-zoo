@@ -84,6 +84,8 @@ const pinButton = document.getElementById('pin')
 const boardButton = document.getElementById('board')
 const expeditionLogEl = document.getElementById('expedition-log')
 const expeditionLogTitlesEl = document.getElementById('expedition-log-titles')
+const expeditionEntryEl = document.getElementById('expedition-entry')
+const expeditionOwnedEl = document.getElementById('expedition-owned')
 
 /** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
 const HIRE_WAGE_MIN = 1
@@ -608,8 +610,24 @@ function renderExpeditionLog () {
   }
 }
 
-/** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */
-function renderVisitorPlots () {
+/**
+ * 票 120：顶栏「陈列架 N/32 · 点开看」。
+ *
+ * N 与公开视图同口径（图鉴已集齐件数 / 32）：自己看自己用宿主下发的本地计数，
+ * 看邻居用邻居公开视图里的 codex.owned。串门（visitor）时不显示——那是别人的门。
+ */
+function renderExpeditionEntry () {
+  if (expeditionEntryEl === null) return
+  expeditionEntryEl.hidden = mode === 'visitor'
+  if (expeditionEntryEl.hidden) return
+  const raw = mode === 'look' && look !== null
+    ? look.expedition?.codex?.owned
+    : (mode === 'owner' && farm !== null ? farm.expeditionShelf?.owned : 0)
+  const owned = Number.isFinite(Number(raw)) ? Math.max(0, Math.min(32, Math.floor(Number(raw)))) : 0
+  if (expeditionOwnedEl !== null) expeditionOwnedEl.textContent = String(owned)
+}
+
+/** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */function renderVisitorPlots () {
   const plots = visit !== null && Array.isArray(visit.plots) ? visit.plots : []
   if (plots.length === 0) {
     const message = document.createElement('p')
@@ -2056,6 +2074,7 @@ function renderFarmSurface () {
   renderSeasonCards(currentSeason())
   renderBatchBar()
   renderExpeditionLog()
+  renderExpeditionEntry()
   renderPlots()
   renderInventory()
   renderCarried()
@@ -2549,8 +2568,12 @@ if (expeditionLogEl !== null) {
   })
 }
 
-if (pinButton !== null) {
-  pinButton.addEventListener('click', () => {
+// 票 120：陈列架入口也只发开窗申请，开窗后直接落在「陈列架」页签（tab 由宿主透传）。
+if (expeditionEntryEl !== null) {
+  expeditionEntryEl.addEventListener('click', () => submit({ action: 'expedition-open', tab: 'shelf' }))
+}
+
+if (pinButton !== null) {  pinButton.addEventListener('click', () => {
     if (typeof api?.setPinned !== 'function') {
       showToast('这个窗口还是旧版本，关掉农场窗再打开就能置顶。', 'error')
       return

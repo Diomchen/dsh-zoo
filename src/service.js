@@ -123,7 +123,7 @@ import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
 import { GUARD_HIRE_COST, GUARD_HIRE_STEP, MAX_TEMP_GUARDS } from './season-omens.js'
 import { FARM_FETCH_COOLDOWN_MS, createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
-import { openFarmView } from './farm-open.js'
+import { openExpeditionView, openFarmView } from './farm-open.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
@@ -1321,7 +1321,7 @@ export function createService (ctx, options = {}) {
 
     // 出远门（票 112）：右键菜单「出远门」是对开/关的同一入口。窗口只发 start/step/back/lantern，
     // 扣盘缠、到点掉币、段数迁移全在 expedition-store 里；这里只做 away 门控与人话兜底。
-    if (action === 'expedition-open') return handleExpeditionOpen()
+    if (action === 'expedition-open') return handleExpeditionOpen(body?.tab === 'shelf' ? 'shelf' : null)
     if (action === 'expedition-close') return closeExpeditionWindow('expedition-close')
     if (action === 'expedition-start') return expeditionStart(body?.routeId)
     if (action === 'expedition-step') return expeditionStep()
@@ -2398,6 +2398,12 @@ export function createService (ctx, options = {}) {
     return expedition.snapshot().logs.slice(0, limit).map((entry) => entry.title)
   }
 
+  /** 票 120：农场页顶栏那行「陈列架 N/32」的 N；和公开视图共用同一份白名单重建。 */
+  function expeditionShelfCount () {
+    const block = openExpeditionView(expedition?.snapshot() ?? null)
+    return { owned: block.codex.owned, total: block.codex.total }
+  }
+
   /**
    * 农场小窗的完整视图（ticket 40）。
    *
@@ -2459,7 +2465,9 @@ export function createService (ctx, options = {}) {
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
       carried: carriedView(),
       // 票 116：最近三篇出远门日志的标题；正文不出农场页。
-      expeditionLog: { titles: expeditionLogTitles(3) }
+      expeditionLog: { titles: expeditionLogTitles(3) },
+      // 票 120：顶栏「陈列架 N/32」的 N，与公开视图同一个数（图鉴已集齐件数）。
+      expeditionShelf: expeditionShelfCount()
     }
   }
 
@@ -3273,12 +3281,16 @@ export function createService (ctx, options = {}) {
    * 菜单「出远门」：开着就关，否则打开/聚焦。
    * 和期货窗一样以 helper 报的真实开关为准，测试替身退回本地记录。
    */
-  function handleExpeditionOpen () {
+  function handleExpeditionOpen (tab = null) {
     if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
       return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
     }
     if (expeditionWindowOpenNow()) return closeExpeditionWindow('expedition-open')
-    const opened = desktop.expeditionWindow({ open: true, state: expeditionView() })
+    const opened = desktop.expeditionWindow({
+      open: true,
+      ...(tab === 'shelf' ? { tab: 'shelf' } : {}),
+      state: expeditionView()
+    })
     if (opened !== true) return boardSendFailed('expedition-open')
     expeditionWindowOpened = true
     return { ok: true, action: 'expedition-open', window: 'opened' }
@@ -4863,6 +4875,8 @@ export function createService (ctx, options = {}) {
       guardParts: { ownerHome: guard.ownerHome, worker: guard.worker },
       usedByViewer,
       caps: CAPS,
+      // 票 120：公开视图只带「图鉴 N/32 + 陈列架前 8 格 + 最近三篇标题」，正文只走串门。
+      expedition: expedition?.snapshot() ?? null,
       now: Date.now()
     })
   }
@@ -4918,6 +4932,8 @@ export function createService (ctx, options = {}) {
       },
       // 行情摘要（ticket 41/42）：只给窗口画价目与局域网指数，不转发历史。
       market: marketVisitView(),
+      // 票 120：串门进门后，日志正文跟着访客视图走（公开视图那条路仍然只有标题）。
+      expedition: openExpeditionView(expedition?.snapshot() ?? null, { withLogBodies: true }),
       at: Date.now()
     }
   }
@@ -9554,6 +9570,10 @@ export function createService (ctx, options = {}) {
     expeditionWindow: () => expeditionView(),
     /** 票 112 的测试/诊断缝：底层 store（e2e 用它把假时钟推到下一段）。 */
     expeditionStore: () => expedition,
+    /** 票 120 的测试/诊断缝：公开只读视图（与 `/dsh-zoo-farm/open/<viewerId>` 同源）。 */
+    openFarm: (viewer) => openFarmLookup(viewer),
+    /** 票 120 的测试/诊断缝：串门视图（与 `/dsh-zoo-farm/<visitId>` 同源）。 */
+    visitFarm: (visitId) => lookupFarmView(visitId),
     farmGuard: () => farmGuard(),
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),

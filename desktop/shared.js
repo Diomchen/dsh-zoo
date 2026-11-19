@@ -528,6 +528,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const MAX_FARM_DEW = 48
   const MAX_FARM_CONTRACTS = 20
   const MAX_FARM_LOG = 200
+  /** 票 120：陈列架公开的前 8 格（与 `src/expedition.js` 的 `SHELF_BASE_SLOTS` 同值）。 */
+  const SHELF_BASE_SLOTS = 8
   /** 红包记录那一份的上限，与 `src/farm.js` 的 `MAX_PACKET_LOG` 同值。 */
   const MAX_FARM_PACKETS = 50
   /**
@@ -1384,6 +1386,49 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { titles }
   }
 
+  /** 票 120：陈列架计数（`codex.owned` / 32），农场页顶栏与公开视图同一口径。 */
+  function normalizeShelfCount (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const owned = Number(source.owned)
+    return {
+      owned: Number.isFinite(owned) ? Math.min(32, Math.max(0, Math.floor(owned))) : 0,
+      total: 32
+    }
+  }
+
+  /**
+   * 票 120：邻居公开视图里的「出远门」展示块。
+   *
+   * 只认三样：图鉴件数、前 8 格（id/名字/表情）、最近三篇标题与时间。
+   * 日志正文在公开视图里**不存在**，这里也不接——串门视图走另一条 normalize。
+   */
+  function normalizePublicExpedition (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const entries = Array.isArray(source.shelf) ? source.shelf : []
+    const shelf = []
+    for (let index = 0; index < SHELF_BASE_SLOTS; index += 1) {
+      const entry = entries[index]
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        shelf.push(null)
+        continue
+      }
+      const id = normalizeLabel(entry.id, '')
+      shelf.push(id === ''
+        ? null
+        : { id, name: normalizeLabel(entry.name, ''), emoji: normalizeLabel(entry.emoji, '') })
+    }
+    const logs = []
+    for (const candidate of Array.isArray(source.logs) ? source.logs : []) {
+      if (logs.length >= 3) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const title = normalizeLabel(candidate.title, '')
+      const at = Number(candidate.at)
+      if (title === '' || !Number.isFinite(at) || at <= 0) continue
+      logs.push({ title, at: Math.floor(at) })
+    }
+    return { codex: normalizeShelfCount(source.codex), shelf, logs }
+  }
+
   function normalizeFarm (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const plots = []
@@ -1461,7 +1506,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       log,
       ...(packets.length === 0 ? {} : { packets }),
       carried: normalizeFarmCarried(raw.carried),
-      expeditionLog: normalizeExpeditionLogTitles(raw.expeditionLog)
+      expeditionLog: normalizeExpeditionLogTitles(raw.expeditionLog),
+      // 票 120：顶栏「陈列架 N/32」的 N，和公开视图的 codex.owned 同口径。
+      expeditionShelf: normalizeShelfCount(raw.expeditionShelf)
     }
   }
 
@@ -1767,7 +1814,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       nickname: nickname === '' ? '邻居' : nickname,
       guard: Number.isFinite(guard) ? Math.min(1, Math.max(0, guard)) : 0,
       plots,
-      quotas: { perTrip: int(query.perTrip), perTripLeft: int(query.perTripLeft) }
+      quotas: { perTrip: int(query.perTrip), perTripLeft: int(query.perTripLeft) },
+      // 票 120：邻居的陈列架（公开视图口径）；顶栏那行只读 codex.owned。
+      expedition: normalizePublicExpedition(raw.expedition)
     }
   }
 
@@ -3016,6 +3065,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return {
       open: raw.open === true,
       ...(raw.close === true ? { close: true } : {}),
+      // 票 120：只有「陈列架」这一个落点会被转给窗口；别的页签走默认。
+      ...(raw.tab === 'shelf' ? { tab: 'shelf' } : {}),
       state: normalizeExpeditionView(raw.state)
     }
   }
@@ -3144,7 +3195,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     // 票 79：农场窗的「盘口」按钮只是开窗申请，不带字段。
     if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
     // 票 116：农场页的日志细条也只是开窗申请。
-    if (EXPEDITION_OPEN_ACTIONS.includes(action)) return { action }
+    if (EXPEDITION_OPEN_ACTIONS.includes(action)) {
+      // 票 120：陈列架入口要求开窗直接落陈列架页签；其它值一律当作普通开窗。
+      return raw.tab === 'shelf' ? { action, tab: 'shelf' } : { action }
+    }
     // 票 93：右键「期货」与农场窗的「期货」按钮同样是开窗申请。
     if (action === 'futures-window') return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
@@ -5486,6 +5540,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     MARKET_MIN_QTY,
     MARKET_MAX_QTY,
     normalizeFarm,
+    normalizePublicExpedition,
+    normalizeShelfCount,
     normalizeFarmPlot,
     normalizeFarmLogEntry,
     normalizeFarmWindow,

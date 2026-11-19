@@ -555,6 +555,9 @@
     selectedRoute = pickRoute(next.routes, selectedRoute)
     receivedAt = Date.now()
     refreshAsked = false
+    // 票 120：农场页的陈列架入口要求开窗后直接落这一页；只在带 tab 的那一拍切，
+    // 之后玩家自己点的页签不会被后续刷新抢回去。
+    if (next.tab === 'shelf') setTab('shelf')
     paint()
   }
 
