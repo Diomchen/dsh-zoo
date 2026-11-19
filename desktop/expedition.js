@@ -7,7 +7,9 @@
  */
 'use strict'
 
-(function () {
+// 开头的分号不是装饰：上一行是指令，`(` 在新行会被当成调用，整个窗口脚本会当场抛
+// `"use strict" is not a function`（`test/desktop-script-boot.test.js` 守着这条）。
+;(function () {
   const bridge = window.dshZooExpedition
   const view = window.dshZooExpeditionView
 
