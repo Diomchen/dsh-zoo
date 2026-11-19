@@ -2,8 +2,8 @@
  * 「出远门」的存档（票 112）：`<dataDir>/expedition.json`。
  *
  * 只做三件事：把规则层的纯迁移落到内存、把硬币变动交给农场、把结果原子地写回磁盘。
- * 文件里有 run / shelf / codex / upgrades 四块。114 起每到一段同时记一笔图鉴（首次获得时间），
- * 图鉴与陈列架共用这份 codex，不需要再迁一次格式。
+ * 文件里有 run / shelf / codex / upgrades / logs 五块。114 起每到一段同时记一笔图鉴（首次获得时间），
+ * 图鉴与陈列架共用这份 codex，不需要再迁一次格式；116 起每趟结束再追一篇旅行日志（最多 30 篇）。
  *
  * 钱与状态顺序：
  *   出发：先扣盘缠再写 run（写失败退款并回滚）；
@@ -18,17 +18,20 @@ import { join } from 'node:path'
 
 import {
   advanceRun,
+  appendTripLog,
   backRun,
   codexView,
   expireRun,
   isActiveRun,
   normalizeRun,
+  normalizeTripLogs,
   recordSouvenir,
   resumeRun,
   routeOf,
   settledOf,
   startRun,
-  stepRun
+  stepRun,
+  tripLog
 } from './expedition.js'
 
 export const EXPEDITION_FILE = 'expedition.json'
@@ -63,7 +66,8 @@ function normalizeState (raw) {
     run: normalizeRun(raw?.run),
     shelf: normalizeShelf(raw?.shelf),
     codex: normalizeCodex(raw?.codex),
-    upgrades: { lantern: raw?.upgrades?.lantern === true }
+    upgrades: { lantern: raw?.upgrades?.lantern === true },
+    logs: normalizeTripLogs(raw?.logs)
   }
 }
 
@@ -119,7 +123,8 @@ export class ExpeditionStore {
       shelf: normalizeShelf(this.#state.shelf),
       codex: { ...this.#state.codex },
       codexView: codexView(this.#state.codex),
-      upgrades: { ...this.#state.upgrades }
+      upgrades: { ...this.#state.upgrades },
+      logs: this.#state.logs.map((entry) => ({ ...entry }))
     }
   }
 
@@ -174,11 +179,14 @@ export class ExpeditionStore {
       if (next === null) return { ok: false, error: 'not-walking' }
       const settled = next.ended === null ? null : settledOf(next)
       const previous = this.#state.run
+      const logsBefore = this.#state.logs
       this.#state.run = next
+      if (settled !== null) this.#recordTrip(previous, next, now)
       if (await this.#persist()) {
         return settled === null ? { ok: true, run: copyRun(next) } : { ok: true, run: copyRun(next), settled }
       }
       this.#state.run = previous
+      this.#state.logs = logsBefore
       return { ok: false, error: 'save-failed' }
     })
   }
@@ -194,10 +202,13 @@ export class ExpeditionStore {
       if (next === null) return { ok: false, error: 'not-walking' }
       const settled = settledOf(next)
       const previous = this.#state.run
+      const logsBefore = this.#state.logs
       this.#state.run = next
+      this.#recordTrip(previous, next, now)
       if (await this.#persist()) return { ok: true, run: copyRun(next), settled }
       // 写不进去就留在决策窗，让玩家能再点一次，而不是内存说回家了、重启又在外头。
       this.#state.run = previous
+      this.#state.logs = logsBefore
       return { ok: false, error: 'save-failed' }
     })
   }
@@ -213,7 +224,9 @@ export class ExpeditionStore {
       if (this.#disposed) return false
       const expired = expireRun(this.#state.run, now)
       if (expired !== null) {
+        const previous = this.#state.run
         this.#state.run = expired
+        this.#recordTrip(previous, expired, now)
         await this.#persist()
         return true
       }
@@ -223,11 +236,13 @@ export class ExpeditionStore {
         const credited = await this.#credit(event.coins)
         if (!credited) return false
       }
+      const previous = this.#state.run
       this.#state.run = event.run
       if (event.souvenir !== null && event.souvenir !== undefined) {
         // 只记第一次见到的时刻；重复获得时 recordSouvenir 原样返回。
         this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
       }
+      if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
       await this.#persist()
       return true
     })
@@ -248,10 +263,23 @@ export class ExpeditionStore {
       const credited = await this.#credit(event.coins)
       if (!credited) return false
     }
+    const previous = this.#state.run
     this.#state.run = event.run
     if (event.souvenir !== null && event.souvenir !== undefined) {
       this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
     }
+    if (event.run.ended !== null) this.#recordTrip(previous, event.run, now)
+    return true
+  }
+
+  /**
+   * 一趟结束时追一篇日志（票 116）：正文是纯模板，钱与掉落都已经定好，这里只负责落盘。
+   * `before` 只用于翻车丢件清单。
+   */
+  #recordTrip (before, run, now) {
+    const entry = tripLog(run, { at: Number.isFinite(run.endedAt) ? run.endedAt : now, before })
+    if (entry === null) return false
+    this.#state.logs = appendTripLog(this.#state.logs, entry)
     return true
   }
 

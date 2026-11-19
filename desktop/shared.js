@@ -221,6 +221,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
    */
   const BOARD_OPEN_ACTIONS = ['trading-open']
   /**
+   * 票 116：农场页顶栏旁那行「最近三篇出远门日志」也是一条开窗申请——
+   * 农场页只显示标题，正文要点进出远门窗口才看得到。
+   */
+  const EXPEDITION_OPEN_ACTIONS = ['expedition-open']
+  /**
    * 盘口小窗能提交的动作（票 79 / 票 81 / 票 83）。字段窄到不能再窄：
    *   trading-open-position  { side, margin, leverage, cropId }
    *   trading-close-position { positionId }
@@ -338,7 +343,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     FARM_EVENT_ACTIONS,
     FARM_OMEN_ACTIONS,
     // 票 79：农场窗头部的「盘口」按钮（无字段，只是开窗申请）。
-    BOARD_OPEN_ACTIONS
+    BOARD_OPEN_ACTIONS,
+    // 票 116：农场页的日志细条（无字段，只是开窗申请）。
+    EXPEDITION_OPEN_ACTIONS
   )
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
@@ -438,6 +445,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   /** 出远门的三个阶段 + 两种结局；窗口只画这几个词。 */
   const EXPEDITION_PHASES = ['walking', 'deciding']
   const EXPEDITION_ENDED = ['back', 'complete', 'failed']
+  /** 票 116：只有两种「不好」的结局写原因，其余是 null。 */
+  const EXPEDITION_REASONS = ['wipeout', 'timeout']
 
   const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(
     MENU_ACTION_IDS,
@@ -1355,6 +1364,20 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     }
   }
 
+  /** 农场页那行「最近三篇日志」：只留标题，最多三篇；正文一律不进农场视图（票 116）。 */
+  function normalizeExpeditionLogTitles (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const titles = []
+    if (Array.isArray(source.titles)) {
+      for (const candidate of source.titles) {
+        if (titles.length >= 3) break
+        const title = normalizeLabel(candidate, '')
+        if (title !== '') titles.push(title)
+      }
+    }
+    return { titles }
+  }
+
   function normalizeFarm (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const plots = []
@@ -1431,7 +1454,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       ...(Number.isFinite(guard) ? { guard: Math.min(MAX_FARM_GUARD, Math.max(0, guard)) } : {}),
       log,
       ...(packets.length === 0 ? {} : { packets }),
-      carried: normalizeFarmCarried(raw.carried)
+      carried: normalizeFarmCarried(raw.carried),
+      expeditionLog: normalizeExpeditionLogTitles(raw.expeditionLog)
     }
   }
 
@@ -2821,6 +2845,34 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     }
   }
 
+  /** 旅行日志（票 116）：新在前、最多 30 篇；正文只走窗口，不进场景。 */
+  function normalizeExpeditionLogs (raw) {
+    if (!Array.isArray(raw)) return []
+    const logs = []
+    for (const entry of raw) {
+      if (logs.length >= 30) break
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+      const routeId = normalizeLabel(entry.routeId, '')
+      const title = normalizeLabel(entry.title, '')
+      const body = normalizeText(entry.body, '', 400)
+      const legs = Number(entry.legs)
+      if (routeId === '' || title === '' || body === '') continue
+      if (!Number.isInteger(legs) || legs < 1) continue
+      if (typeof entry.at !== 'number' || !Number.isFinite(entry.at)) continue
+      if (!EXPEDITION_ENDED.includes(entry.ended)) continue
+      logs.push({
+        at: entry.at,
+        routeId,
+        legs,
+        title,
+        body,
+        ended: entry.ended,
+        reason: EXPEDITION_REASONS.includes(entry.reason) ? entry.reason : null
+      })
+    }
+    return logs
+  }
+
   /**
    * 出远门整份视图（票 112）：`/state.expedition` 与小窗推的是同一份。
    * 坏字段一律降级——窗口宁可画「还没出门」，也不要因为一个 undefined 白屏。
@@ -2902,7 +2954,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       shelf: { slots: 8, items: [] },
       codex,
       codexView: normalizeExpeditionCodexView(source.codexView),
-      upgrades: { lantern: source.upgrades?.lantern === true }
+      upgrades: { lantern: source.upgrades?.lantern === true },
+      logs: normalizeExpeditionLogs(source.logs)
     }
   }
 
@@ -2996,6 +3049,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (action === 'farm-refresh' || action === 'farm-own') return { action }
     // 票 79：农场窗的「盘口」按钮只是开窗申请，不带字段。
     if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
+    // 票 116：农场页的日志细条也只是开窗申请。
+    if (EXPEDITION_OPEN_ACTIONS.includes(action)) return { action }
     // 票 93：右键「期货」与农场窗的「期货」按钮同样是开窗申请。
     if (action === 'futures-window') return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
@@ -5290,6 +5345,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     GIFT_ACTIONS,
     FARM_ACTIONS,
     BOARD_OPEN_ACTIONS,
+    EXPEDITION_OPEN_ACTIONS,
     BOARD_SUBMIT_ACTIONS,
     BOARD_SIDES,
     BOARD_STOP_LEVELS,

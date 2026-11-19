@@ -166,11 +166,44 @@
       .map((item) => names.get(item.id) || item.id)
   }
 
+  /** 日志时间：`MM-DD HH:mm`（本地时区）；坏时间画空串。 */
+  function formatLogAt (at) {
+    const time = num(at)
+    if (time <= 0) return ''
+    const date = new Date(time)
+    const pad = (value) => String(value).padStart(2, '0')
+    return pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + ' ' + pad(date.getHours()) + ':' + pad(date.getMinutes())
+  }
+
+  /** 日志页（票 116）：只画形状对的篇目，新在前，最多 30 篇。 */
+  function tripLogEntries (view) {
+    if (view === null || typeof view !== 'object' || !Array.isArray(view.logs)) return []
+    const entries = []
+    for (const log of view.logs) {
+      if (entries.length >= 30) break
+      if (log === null || typeof log !== 'object') continue
+      const title = typeof log.title === 'string' ? log.title.trim() : ''
+      const body = typeof log.body === 'string' ? log.body.trim() : ''
+      if (title === '' || body === '') continue
+      entries.push({
+        at: num(log.at),
+        when: formatLogAt(log.at),
+        title,
+        body,
+        ended: typeof log.ended === 'string' ? log.ended : '',
+        reason: typeof log.reason === 'string' ? log.reason : null
+      })
+    }
+    return entries
+  }
+
   return {
     ACTIVE_PHASES,
     isActiveRun,
     formatCoins,
     formatClock,
+    formatLogAt,
+    tripLogEntries,
     remainingMs,
     phaseLabel,
     progressText,

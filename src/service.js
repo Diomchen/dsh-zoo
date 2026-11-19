@@ -2398,6 +2398,15 @@ export function createService (ctx, options = {}) {
    * 窗口是 file:// 页面，没有 Node、没有网络、读不到 `/state`，所以这份必须随
    * `farm-window` 命令一起下发；**绝不**把它塞进场景（controls 每帧比较，日志/仓库会污染签名）。
    */
+  /**
+   * 票 116：农场页顶栏旁只放最近三篇标题，正文只在出远门窗口里出现。
+   * 这里按「新的在前」取，读不到存档就给空数组。
+   */
+  function expeditionLogTitles (limit = 3) {
+    if (expedition === null) return []
+    return expedition.snapshot().logs.slice(0, limit).map((entry) => entry.title)
+  }
+
   function farmWindowView () {
     const view = farm?.snapshot() ?? initialFarmView()
     // 当前这块 + 后续最多 5 块，共 6 个价格：窗口不复制地价公式，宿主算好下发。
@@ -2442,7 +2451,9 @@ export function createService (ctx, options = {}) {
       // 红包单独攒的一份（≤50）：流水会被种下/收获挤掉，红包记录不能跟着没。
       packets: view.packetLog ?? [],
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
-      carried: carriedView()
+      carried: carriedView(),
+      // 票 116：最近三篇出远门日志的标题；正文不出农场页。
+      expeditionLog: { titles: expeditionLogTitles(3) }
     }
   }
 

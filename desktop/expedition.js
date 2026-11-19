@@ -17,8 +17,12 @@
     close: el('close'),
     tabs: el('tabs'),
     tabTravel: el('tabTravel'),
+    tabLog: el('tabLog'),
     tabCodex: el('tabCodex'),
     travelPane: el('travelPane'),
+    logPane: el('logPane'),
+    logCount: el('logCount'),
+    logList: el('logList'),
     home: el('home'),
     routeName: el('routeName'),
     routeHint: el('routeHint'),
@@ -177,16 +181,53 @@
     }
   }
 
+  /** 日志页（票 116）：全部正文都只在这里出现，农场页只有标题。 */
+  function renderLogs () {
+    const entries = view.tripLogEntries(state)
+    ui.logCount.textContent = String(entries.length) + ' 篇'
+    ui.logList.textContent = ''
+    if (entries.length === 0) {
+      const empty = document.createElement('p')
+      empty.className = 'logEmpty'
+      empty.textContent = '还没有日志。出趟门回来，这里会记下这一趟。'
+      ui.logList.appendChild(empty)
+      return
+    }
+    for (const entry of entries) {
+      const article = document.createElement('article')
+      article.className = 'logEntry'
+      const head = document.createElement('div')
+      head.className = 'logHead'
+      const title = document.createElement('span')
+      title.className = 'logTitle'
+      title.textContent = entry.title
+      const when = document.createElement('span')
+      when.className = 'logWhen'
+      when.textContent = entry.when
+      head.appendChild(title)
+      head.appendChild(when)
+      article.appendChild(head)
+      const body = document.createElement('p')
+      body.className = 'logBody'
+      body.textContent = entry.body
+      article.appendChild(body)
+      ui.logList.appendChild(article)
+    }
+  }
+
   function setTab (name) {
-    activeTab = name === 'codex' ? 'codex' : 'travel'
-    const codexActive = activeTab === 'codex'
-    ui.travelPane.hidden = codexActive
-    ui.codex.hidden = !codexActive
-    ui.tabTravel.classList.toggle('active', !codexActive)
-    ui.tabCodex.classList.toggle('active', codexActive)
-    ui.tabTravel.setAttribute('aria-selected', String(!codexActive))
-    ui.tabCodex.setAttribute('aria-selected', String(codexActive))
-    if (codexActive) renderCodex()
+    activeTab = name === 'codex' ? 'codex' : name === 'log' ? 'log' : 'travel'
+    ui.travelPane.hidden = activeTab !== 'travel'
+    ui.logPane.hidden = activeTab !== 'log'
+    ui.codex.hidden = activeTab !== 'codex'
+    ui.tabTravel.classList.toggle('active', activeTab === 'travel')
+    ui.tabLog.classList.toggle('active', activeTab === 'log')
+    ui.tabCodex.classList.toggle('active', activeTab === 'codex')
+    ui.tabTravel.setAttribute('aria-selected', String(activeTab === 'travel'))
+    ui.tabLog.setAttribute('aria-selected', String(activeTab === 'log'))
+    ui.tabCodex.setAttribute('aria-selected', String(activeTab === 'codex'))
+    if (activeTab === 'codex') renderCodex()
+    if (activeTab === 'log') renderLogs()
   }
 
   function paint () {
@@ -196,6 +237,7 @@
     ui.coins.textContent = view.formatCoins(state === null ? 0 : state.coins)
     ui.codexCount.textContent = view.codexProgress(codexView)
     if (activeTab === 'codex') renderCodex()
+    if (activeTab === 'log') renderLogs()
     ui.homeNote.textContent = state !== null && (state.away === 'visiting' || state.away === 'working')
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
@@ -273,6 +315,7 @@
   }
 
   ui.tabTravel.addEventListener('click', () => setTab('travel'))
+  ui.tabLog.addEventListener('click', () => setTab('log'))
   ui.tabCodex.addEventListener('click', () => setTab('codex'))
   ui.start.addEventListener('click', () => {
     const route = activeRoute()
