@@ -14,6 +14,7 @@ import {
   normalizeRun,
   resumeRun,
   roll01,
+  rollSouvenir,
   routeOf,
   settledOf,
   startRun,
@@ -144,7 +145,11 @@ test('早于 until 不推进；到点掉一笔回币并进入决策窗', () => {
   assert.equal(result.run.phase, 'deciding')
   assert.equal(result.run.leg, 1)
   assert.equal(result.run.until, at + DECISION_MS)
-  assert.deepEqual(result.run.loot, [{ kind: 'coin', qty: result.coins }])
+  assert.deepEqual(result.run.loot, [
+    { kind: 'coin', qty: result.coins },
+    { kind: 'souvenir', id: rollSouvenir('backhill', 'r-advance', 1, []) }
+  ])
+  assert.equal(result.souvenir, rollSouvenir('backhill', 'r-advance', 1, []))
 
   // 决策窗里再 tick 不会重复掉币（112 不做超时自动折返）。
   assert.equal(advanceRun(result.run, at + DECISION_MS - 1), null)
@@ -159,7 +164,7 @@ test('继续走：只有 deciding 能走，段数 +1 并重新走 20 秒', () =>
   assert.equal(next.phase, 'walking')
   assert.equal(next.leg, 2)
   assert.equal(next.until, T0 + LEG_MS + 1000 + LEG_MS)
-  assert.equal(next.loot.length, 1)
+  assert.equal(next.loot.length, 2)
 })
 
 test('见好就收：只有 deciding 能收，只认已走段数的钱', () => {
@@ -178,7 +183,8 @@ test('见好就收：只有 deciding 能收，只认已走段数的钱', () => {
   assert.equal(settled.fare, 500)
   assert.equal(settled.legs, 2)
   assert.equal(settled.coins, sumCoins(home.loot))
-  assert.deepEqual(settled.items, [])
+  assert.deepEqual(settled.items, home.loot.filter((item) => item.kind === 'souvenir').map((item) => item.id))
+  assert.equal(settled.items.length, 2)
   assert.equal(settled.ended, 'back')
 })
 
@@ -188,7 +194,8 @@ test('走满最后一段自动回家，标记 complete，战利品按段数齐',
   const run = playRun(runId)
   assert.equal(run.phase, null)
   assert.equal(run.ended, 'complete')
-  assert.equal(run.loot.length, run.totalLegs)
+  assert.equal(run.loot.length, run.totalLegs * 2)
+  assert.equal(settledOf(run).items.length, run.totalLegs)
   assert.equal(settledOf(run).legs, run.totalLegs)
   assert.equal(settledOf(run).coins, sumCoins(run.loot))
 })

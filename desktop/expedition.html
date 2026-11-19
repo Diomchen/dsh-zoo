@@ -26,7 +26,7 @@
   [hidden] { display: none !important; }
   #app {
     display: grid; height: 100%;
-    grid-template-rows: 52px minmax(0, 1fr) 26px;
+    grid-template-rows: 52px 38px minmax(0, 1fr) 26px;
     border: 2px solid var(--line);
     border-radius: 20px 18px 22px 16px;
     background: var(--paper);
@@ -52,6 +52,20 @@
     cursor: pointer;
   }
   .winClose:hover { background: var(--ink); color: var(--paper); }
+  .tabs {
+    display: flex; align-items: stretch; gap: 4px; padding: 4px 10px 0;
+    border-bottom: 2px solid var(--line); background: var(--card);
+    -webkit-app-region: drag;
+  }
+  .tab {
+    -webkit-app-region: no-drag;
+    border: 2px solid var(--line); border-bottom: 0;
+    border-radius: 8px 8px 0 0; background: transparent; color: var(--muted);
+    padding: 3px 14px; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  .tab:hover { background: var(--soft); color: var(--ink); }
+  .tab.active { background: var(--paper); color: var(--ink); }
+  .tab .badge { margin-left: 4px; color: var(--accent); font-variant-numeric: tabular-nums; }
   main { min-height: 0; overflow: auto; padding: 14px; }
   .card {
     border: 1px solid var(--soft); border-radius: var(--radius);
@@ -87,6 +101,31 @@
   .progress { margin: 0; font-variant-numeric: tabular-nums; }
   .danger { margin: 4px 0 0; color: var(--muted); }
   .loot { margin: 4px 0 0; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .codexHead { display: flex; align-items: baseline; gap: 10px; }
+  .codexHead h2 { margin: 0; }
+  .codexHead .hint { margin: 0 0 0 auto; }
+  .codexGroup + .codexGroup { margin-top: 14px; }
+  .codexGroup h3 {
+    display: flex; align-items: baseline; gap: 8px;
+    margin: 0 0 7px; font-size: 13px; letter-spacing: .06em;
+  }
+  .codexGroup h3 span { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+  .codexGrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 7px; }
+  .codexCell {
+    position: relative; display: grid; justify-items: center; gap: 2px;
+    min-height: 86px; padding: 7px 4px 5px;
+    border: 1px solid var(--soft); border-radius: var(--radius);
+    background: var(--paper); text-align: center; overflow: hidden;
+  }
+  .codexCell[data-owned="false"] { filter: grayscale(1); opacity: .5; }
+  .codexArt { display: grid; place-items: center; width: 44px; height: 44px; }
+  .codexArt img { width: 44px; height: 44px; object-fit: contain; }
+  .codexArt .emoji { font-size: 30px; line-height: 1; }
+  .codexName { font-size: 12px; font-weight: 600; line-height: 1.25; }
+  .codexCell[data-owned="false"] .codexName { color: var(--muted); letter-spacing: .14em; }
+  .codexRarity { font-size: 10px; color: var(--muted); }
+  .codexRarity[data-rarity="precious"] { color: #7a5bb5; }
+  .codexRarity[data-rarity="legendary"] { color: var(--accent); font-weight: 700; }
   footer {
     padding: 0 14px; display: flex; align-items: center;
     color: var(--accent); font-size: 12px;
@@ -101,7 +140,12 @@
     <span class="coins">硬币 <b id="coins">0</b></span>
     <button class="winClose" id="close" title="关窗">×</button>
   </header>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" id="tabTravel" data-tab="travel">出远门</button>
+    <button class="tab" id="tabCodex" data-tab="codex">图鉴 <span class="badge" id="codexCount">0/32</span></button>
+  </nav>
   <main>
+    <div id="travelPane">
     <section class="card" id="home">
       <h2 id="routeName">后山</h2>
       <p class="hint" id="routeHint">盘缠 500 · 3–4 段 · 每段回 11–19 枚</p>
@@ -129,6 +173,16 @@
       <h2 id="doneTitle">回家了</h2>
       <p class="desc" id="settle"></p>
       <button class="primary" id="again">再走一趟</button>
+    </section>
+    </div>
+
+    <section class="card" id="codex" hidden>
+      <div class="codexHead">
+        <h2>特产图鉴</h2>
+        <span class="hint" id="codexProgress">0/32</span>
+      </div>
+      <p class="desc">四条路线各 8 件。捡到过就点亮并记下名字，没见过的只剩灰色剪影。</p>
+      <div id="codexGroups"></div>
     </section>
   </main>
   <footer><span id="toast"></span></footer>

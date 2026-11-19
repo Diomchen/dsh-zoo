@@ -2,8 +2,8 @@
  * 「出远门」的存档（票 112）：`<dataDir>/expedition.json`。
  *
  * 只做三件事：把规则层的纯迁移落到内存、把硬币变动交给农场、把结果原子地写回磁盘。
- * 文件里有 run / shelf / codex / upgrades 四块——112 只写 run，另外三块先占位，
- * 读档时原样保留，113 的图鉴与陈列架不需要再迁一次格式。
+ * 文件里有 run / shelf / codex / upgrades 四块。114 起每到一段同时记一笔图鉴（首次获得时间），
+ * 图鉴与陈列架共用这份 codex，不需要再迁一次格式。
  *
  * 钱与状态顺序：
  *   出发：先扣盘缠再写 run（写失败退款并回滚）；
@@ -19,9 +19,11 @@ import { join } from 'node:path'
 import {
   advanceRun,
   backRun,
+  codexView,
   expireRun,
   isActiveRun,
   normalizeRun,
+  recordSouvenir,
   resumeRun,
   routeOf,
   settledOf,
@@ -109,13 +111,14 @@ export class ExpeditionStore {
     return this
   }
 
-  /** 只读快照：调用方拿到的对象改了也不会影响存档。 */
+  /** 只读快照：调用方拿到的对象改了也不会影响存档。`codexView` 是窗口直接渲染的 32 格。 */
   snapshot () {
     return {
       version: this.#state.version,
       run: copyRun(this.#state.run),
       shelf: normalizeShelf(this.#state.shelf),
       codex: { ...this.#state.codex },
+      codexView: codexView(this.#state.codex),
       upgrades: { ...this.#state.upgrades }
     }
   }
@@ -201,7 +204,7 @@ export class ExpeditionStore {
 
   /**
    * 秒级 tick：先看决策窗有没有超时（超时即自动折返），再推走路。
-   * 到点走完一段，回币进农场；走满最后一段直接 complete。
+   * 到点走完一段，回币进农场、特产记进图鉴；走满最后一段直接 complete。
    *
    * 返回是否真的推进了（服务层据此决定要不要重推窗口）。
    */
@@ -221,6 +224,10 @@ export class ExpeditionStore {
         if (!credited) return false
       }
       this.#state.run = event.run
+      if (event.souvenir !== null && event.souvenir !== undefined) {
+        // 只记第一次见到的时刻；重复获得时 recordSouvenir 原样返回。
+        this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
+      }
       await this.#persist()
       return true
     })
@@ -242,6 +249,9 @@ export class ExpeditionStore {
       if (!credited) return false
     }
     this.#state.run = event.run
+    if (event.souvenir !== null && event.souvenir !== undefined) {
+      this.#state.codex = recordSouvenir(this.#state.codex, event.souvenir, now)
+    }
     return true
   }
 

@@ -15,7 +15,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 
 import shared from '../desktop/shared.js'
-import { legsFor, routeOf, wipedOut } from '../src/expedition.js'
+import { codexView, legsFor, routeOf, wipedOut } from '../src/expedition.js'
 import { FARM_FILE } from '../src/farm.js'
 import { createService } from '../src/service.js'
 
@@ -33,7 +33,7 @@ function sampleRun (overrides = {}) {
     leg: 1,
     totalLegs: 4,
     until: T0 + 20_000,
-    loot: [{ kind: 'coin', qty: 15 }],
+    loot: [{ kind: 'coin', qty: 15 }, { kind: 'souvenir', id: 'herb' }],
     startedAt: T0,
     ended: null,
     endedAt: 0,
@@ -52,7 +52,8 @@ function sampleView (overrides = {}) {
     away: 'expedition',
     routes: [{ id: 'backhill', name: '后山', fare: 500, minLegs: 3, maxLegs: 4, coinBase: 15 }],
     shelf: { slots: 8, items: [] },
-    codex: {},
+    codex: { herb: T0 },
+    codexView: codexView({ herb: T0 }),
     upgrades: { lantern: false },
     ...overrides
   }
@@ -100,6 +101,56 @@ test('视图模型：按钮只在决策窗可用，硬币不够不能出发', ()
   assert.equal(view.primaryLabel(sampleRun()), '走路中…')
   assert.equal(view.primaryLabel(sampleRun({ phase: 'deciding' })), '继续走一段')
   assert.equal(view.primaryLabel(sampleRun({ phase: null, ended: 'back' })), '再走一趟')
+})
+
+test('视图模型：图鉴 32 格按路线分组，缺图/坏路径回退 emoji', () => {
+  const codex = codexView({ herb: T0 })
+  assert.equal(view.codexProgress(codex), '1/32')
+  const groups = view.codexGroups(codex)
+  assert.deepEqual(groups.map((group) => group.routeName), ['后山', '废矿', '老铁路', '雾岭'])
+  assert.deepEqual(groups.map((group) => group.slots.length), [8, 8, 8, 8])
+  assert.equal(groups.reduce((sum, group) => sum + group.slots.filter((slot) => slot.owned).length, 0), 1)
+
+  const herb = codex.slots.find((slot) => slot.id === 'herb')
+  assert.deepEqual(view.slotEmblem(herb), { kind: 'art', src: 'souvenirs/herb.svg' })
+  assert.deepEqual(view.slotEmblem({ art: '', emoji: '🌿' }), { kind: 'emoji', text: '🌿' })
+  assert.deepEqual(view.slotEmblem({ art: '../evil.svg', emoji: '' }), { kind: 'emoji', text: '❔' })
+  assert.deepEqual(view.souvenirNames(sampleRun(), codex), ['草药'])
+  assert.deepEqual(view.souvenirNames(sampleRun({ loot: [] }), codex), [])
+  assert.equal(view.codexProgress(null), '0/32', '没有视图也要画满 32 个空格')
+})
+
+test('shared：窗口视图保留特产 loot，并清洗 32 格图鉴', () => {
+  const codex = codexView({ herb: T0 })
+  codex.slots[0].art = '../evil.svg'
+  codex.slots[1].art = ''
+  const normalized = shared.normalizeHostCommand({
+    type: 'expedition-window',
+    id: 'c3',
+    open: true,
+    state: sampleView({
+      run: sampleRun({
+        loot: [
+          { kind: 'coin', qty: 15 },
+          { kind: 'souvenir', id: 'herb' },
+          { kind: 'souvenir', id: '' }
+        ]
+      }),
+      codexView: codex
+    })
+  })
+  assert.equal(normalized.ok, true)
+  assert.deepEqual(normalized.command.state.run.loot, [
+    { kind: 'coin', qty: 15 },
+    { kind: 'souvenir', id: 'herb' }
+  ])
+  const viewState = normalized.command.state.codexView
+  assert.equal(viewState.total, 32)
+  assert.equal(viewState.owned, 1)
+  assert.equal(viewState.slots[0].art, '', '坏路径必须当缺图')
+  assert.equal(viewState.slots[1].art, '')
+  assert.equal(viewState.slots.find((slot) => slot.id === 'herb').label, '草药')
+  assert.equal(viewState.slots.find((slot) => slot.id === 'oddstone').label, '???')
 })
 
 test('shared：expedition-window 命令与窗口状态事件', () => {
@@ -338,8 +389,12 @@ test('宿主：出发扣盘缠，到点刷新成决策窗，继续走一段', as
   const deciding = desktop.calls.expedition.at(-1).state.run
   assert.equal(deciding.phase, 'deciding')
   assert.equal(deciding.leg, 1)
-  assert.equal(deciding.loot.length, 1)
-  assert.ok(deciding.loot[0].qty >= 11 && deciding.loot[0].qty <= 19)
+  assert.equal(deciding.loot.length, 2)
+  const coin = deciding.loot.find((item) => item.kind === 'coin')
+  assert.ok(coin.qty >= 11 && coin.qty <= 19)
+  assert.equal(deciding.loot.find((item) => item.kind === 'souvenir').kind, 'souvenir')
+  assert.equal(desktop.calls.expedition.at(-1).state.codexView.total, 32)
+  assert.equal(desktop.calls.expedition.at(-1).state.codexView.owned, 1)
 
   const stepped = await callAction(service, { action: 'expedition-step' })
   assert.equal(stepped.body.ok, true)

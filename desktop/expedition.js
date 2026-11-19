@@ -15,6 +15,10 @@
   const ui = {
     coins: el('coins'),
     close: el('close'),
+    tabs: el('tabs'),
+    tabTravel: el('tabTravel'),
+    tabCodex: el('tabCodex'),
+    travelPane: el('travelPane'),
     home: el('home'),
     routeName: el('routeName'),
     routeHint: el('routeHint'),
@@ -33,12 +37,17 @@
     doneTitle: el('doneTitle'),
     settle: el('settle'),
     again: el('again'),
+    codex: el('codex'),
+    codexCount: el('codexCount'),
+    codexProgress: el('codexProgress'),
+    codexGroups: el('codexGroups'),
     toast: el('toast')
   }
 
   let state = null
   let pending = false
   let toastTimer = null
+  let activeTab = 'travel'
   /** 收到 view 那一刻的本地时间；倒计时按 now 在此之后的增量走。 */
   let receivedAt = 0
   let refreshAsked = false
@@ -86,10 +95,107 @@
     }
   }
 
+  function emojiNode (text) {
+    const span = document.createElement('span')
+    span.className = 'emoji'
+    span.textContent = text
+    return span
+  }
+
+  /** 一格图鉴：有 SVG 用图（加载失败也回退 emoji），缺图直接用 emoji，没获得只剩剪影 + ???。 */
+  function codexCell (slot) {
+    const cell = document.createElement('div')
+    cell.className = 'codexCell'
+    cell.dataset.owned = slot.owned === true ? 'true' : 'false'
+    cell.dataset.rarity = typeof slot.rarity === 'string' ? slot.rarity : ''
+    cell.title = slot.owned === true
+      ? slot.name + ' · ' + slot.rarityLabel
+      : '还没见过这件特产'
+
+    const art = document.createElement('span')
+    art.className = 'codexArt'
+    const emblem = view.slotEmblem(slot)
+    if (emblem.kind === 'art') {
+      const img = document.createElement('img')
+      img.src = emblem.src
+      img.alt = ''
+      img.draggable = false
+      img.addEventListener('error', () => {
+        if (img.parentNode === art) art.replaceChildren(emojiNode(emblemFallback(slot)))
+      })
+      art.appendChild(img)
+    } else {
+      art.appendChild(emojiNode(emblem.text))
+    }
+    cell.appendChild(art)
+
+    const name = document.createElement('span')
+    name.className = 'codexName'
+    name.textContent = slot.owned === true ? slot.label || slot.name : '???'
+    cell.appendChild(name)
+
+    const rarity = document.createElement('span')
+    rarity.className = 'codexRarity'
+    rarity.textContent = slot.rarityLabel || ''
+    cell.appendChild(rarity)
+    return cell
+  }
+
+  function emblemFallback (slot) {
+    const emoji = typeof slot.emoji === 'string' ? slot.emoji.trim() : ''
+    return emoji === '' ? '❔' : emoji
+  }
+
+  function renderCodex () {
+    const codexView = state === null ? null : state.codexView
+    ui.codexCount.textContent = view.codexProgress(codexView)
+    ui.codexProgress.textContent = view.codexProgress(codexView)
+    ui.codexGroups.textContent = ''
+    const groups = view.codexGroups(codexView)
+    if (groups.length === 0) {
+      const empty = document.createElement('p')
+      empty.className = 'desc'
+      empty.textContent = '图鉴还没准备好，出门走一段再看看。'
+      ui.codexGroups.appendChild(empty)
+      return
+    }
+    for (const group of groups) {
+      const section = document.createElement('section')
+      section.className = 'codexGroup'
+      const title = document.createElement('h3')
+      title.textContent = group.routeName
+      const count = document.createElement('span')
+      const owned = group.slots.filter((slot) => slot.owned === true).length
+      count.textContent = String(owned) + '/' + String(group.slots.length)
+      title.appendChild(count)
+      section.appendChild(title)
+      const grid = document.createElement('div')
+      grid.className = 'codexGrid'
+      for (const slot of group.slots) grid.appendChild(codexCell(slot))
+      section.appendChild(grid)
+      ui.codexGroups.appendChild(section)
+    }
+  }
+
+  function setTab (name) {
+    activeTab = name === 'codex' ? 'codex' : 'travel'
+    const codexActive = activeTab === 'codex'
+    ui.travelPane.hidden = codexActive
+    ui.codex.hidden = !codexActive
+    ui.tabTravel.classList.toggle('active', !codexActive)
+    ui.tabCodex.classList.toggle('active', codexActive)
+    ui.tabTravel.setAttribute('aria-selected', String(!codexActive))
+    ui.tabCodex.setAttribute('aria-selected', String(codexActive))
+    if (codexActive) renderCodex()
+  }
+
   function paint () {
     const run = state === null ? null : state.run
     const route = activeRoute()
+    const codexView = state === null ? null : state.codexView
     ui.coins.textContent = view.formatCoins(state === null ? 0 : state.coins)
+    ui.codexCount.textContent = view.codexProgress(codexView)
+    if (activeTab === 'codex') renderCodex()
     ui.homeNote.textContent = state !== null && (state.away === 'visiting' || state.away === 'working')
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
@@ -121,7 +227,9 @@
       ui.progress.textContent = view.progressText(run)
       ui.danger.textContent = view.dangerText(run)
       const loot = view.sumLoot(run)
-      ui.loot.textContent = '这一趟已捡 ' + view.formatCoins(loot) + ' 枚硬币'
+      const souvenirs = view.souvenirNames(run, codexView)
+      ui.loot.textContent = '这一趟已捡 ' + view.formatCoins(loot) + ' 枚硬币' +
+        (souvenirs.length === 0 ? '' : ' · 特产 ' + souvenirs.join('、'))
       renderLegs(run)
       const continueAllowed = view.canContinue(run)
       ui.continue.disabled = pending || !continueAllowed
@@ -139,6 +247,8 @@
       ? '走满了全程'
       : run.ended === 'failed' ? '翻车了' : '见好就收'
     ui.settle.textContent = view.settleText(run)
+    const souvenirs = view.souvenirNames(run, codexView)
+    if (souvenirs.length > 0) ui.settle.textContent += '，带回特产：' + souvenirs.join('、')
     ui.again.disabled = pending
   }
 
@@ -162,6 +272,8 @@
     paint()
   }
 
+  ui.tabTravel.addEventListener('click', () => setTab('travel'))
+  ui.tabCodex.addEventListener('click', () => setTab('codex'))
   ui.start.addEventListener('click', () => {
     const route = activeRoute()
     if (route === null) return
@@ -180,6 +292,8 @@
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && bridge !== undefined && typeof bridge.close === 'function') bridge.close()
   })
+
+  setTab('travel')
 
   if (bridge !== undefined) {
     if (typeof bridge.onState === 'function') bridge.onState(applyState)
