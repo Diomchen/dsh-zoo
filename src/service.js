@@ -38,6 +38,14 @@ import {
 } from './contracts-rules.js'
 import { dualLayerAdvisory } from './desktop-advisory.js'
 import { createDesktop } from './desktop.js'
+import { createExpeditionStore } from './expedition-store.js'
+import {
+  EXPEDITION_ERROR_TEXT,
+  ROUTES as EXPEDITION_ROUTES,
+  dangerLabel,
+  dangerOf,
+  routeOf
+} from './expedition.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
@@ -456,6 +464,14 @@ export function createService (ctx, options = {}) {
     const stamp = Number(value)
     return Number.isFinite(stamp) ? stamp : Date.now()
   }
+  // 出远门（票 112）：同一套测试时钟；每段 20 秒，服务器 1 秒一拍地看有没有到点。
+  const expeditionNow = typeof options.expeditionNow === 'function' ? options.expeditionNow : farmNow
+  const expeditionClock = () => {
+    const value = expeditionNow === undefined ? Date.now() : expeditionNow()
+    const stamp = Number(value)
+    return Number.isFinite(stamp) ? stamp : Date.now()
+  }
+  const expeditionTickMs = positiveOption(options.expeditionTickMs, 1000, 10)
   // 盘口周报（票 82）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值
   // （与行情 gossip 同款），测试注入更小的值把「等 30 秒」变成几十毫秒。
   const tradingDigestMs = positiveOption(options.tradingDigestMs, TRADING_DIGEST_INTERVAL_MS, 10)
@@ -480,6 +496,11 @@ export function createService (ctx, options = {}) {
   let trading = null
   // 期货账本（票 92）：托管账户同样建在农场之上；读不出来 = 空市场（不影响农场/盘口）。
   let futures = null
+  // 出远门（票 112）：盘缠与回币都走农场硬币；读不出来 = 本次不能出门，别的照常。
+  let expedition = null
+  // 窗口真实开关由 helper 上报；测试替身/老 helper 退回这条本地记录。
+  let expeditionWindowOpened = false
+  let expeditionTimer = null
   /**
    * 票 94 的房主侧开户名册：deviceId → { address, port, at }。
    * 只在**内存**里：hello 那一刻把「这个 deviceId 从哪个 UDP 源来的」钉死，
@@ -1292,6 +1313,15 @@ export function createService (ctx, options = {}) {
     // 票 52 回归：窗口里「我的农场」那颗圆片——从只读视图切回自己农场的唯一出口。
     if (action === 'farm-own') return handleFarmOwn()
 
+    // 出远门（票 112）：右键菜单「出远门」是对开/关的同一入口。窗口只发 start/step/back，
+    // 扣盘缠、到点掉币、段数迁移全在 expedition-store 里；这里只做 away 门控与人话兜底。
+    if (action === 'expedition-open') return handleExpeditionOpen()
+    if (action === 'expedition-close') return closeExpeditionWindow('expedition-close')
+    if (action === 'expedition-start') return expeditionStart(body?.routeId)
+    if (action === 'expedition-step') return expeditionStep()
+    if (action === 'expedition-back') return expeditionBack()
+    if (action === 'expedition-refresh') return expeditionRefresh()
+
     // 盘口（票 79）：右键菜单和农场窗的「盘口」是同一个开/关入口；HTTP/脚本可以用
     // `trading-close` 明确关窗，用 `trading-refresh` 请宿主结这一根并重推一拍。
     if (action === 'trading-open') return handleTradingOpen()
@@ -1811,7 +1841,9 @@ export function createService (ctx, options = {}) {
       // 盘口（票 79）：和盘口窗同一份形状（价格/硬币/持仓/历史/本周 + 按钮白名单）。
       trading: tradingWindowView(),
       // 期货（票 92/93）：托管余额/持仓/报价/费用累计 + 作物目录与白名单（窗口直接用这份）。
-      futures: futuresWindowView()
+      futures: futuresWindowView(),
+      // 出远门（票 112）：这一趟的阶段/已走段数/战利品 + 路线表与硬币；窗口和 /state 同源。
+      expedition: expeditionView()
     }
   }
 
@@ -3122,6 +3154,191 @@ export function createService (ctx, options = {}) {
   function refreshFuturesWindow () {
     if (futuresWindowOpenNow() !== true) return
     pushFuturesWindow()
+  }
+
+  // ---------------------------------------------------------------------------
+  // 出远门（票 112）
+  //
+  // 状态机在 src/expedition.js，落盘与硬币在 src/expedition-store.js；这一层只回答三件事：
+  // 「现在 away 吗」「窗口该画什么」「把动作转给 store」。窗口是 file:// 页面，读不到
+  // /state，所以 /state.expedition 与窗口推的是同一个 expeditionView()。
+  // ---------------------------------------------------------------------------
+
+  /** 宠物现在为什么不在家：串门 / 打工 / 出远门。null = 在家。 */
+  function expeditionAwayReason () {
+    if (room.outboundVisit() !== null) return 'visiting'
+    if (room.outboundWork() !== null) return 'working'
+    if (expedition !== null && expedition.active()) return 'expedition'
+    return null
+  }
+
+  /** 路线表只下发窗口要显示的那几项；数值真相仍在规则层。 */
+  function expeditionRoutesView () {
+    return Object.values(EXPEDITION_ROUTES).map((route) => ({
+      id: route.id,
+      name: route.name,
+      fare: route.fare,
+      minLegs: route.minLegs,
+      maxLegs: route.maxLegs,
+      coinBase: Math.round(route.fare * route.coinRate)
+    }))
+  }
+
+  /**
+   * `/state.expedition` 与窗口共用的整份视图。
+   * `now` 由宿主时钟给，窗口不拿本地时间算倒计时（无边框窗口挂一夜也不会走偏）。
+   */
+  function expeditionView () {
+    const snap = expedition === null
+      ? { version: 1, run: null, shelf: { slots: 8, items: [] }, codex: {}, upgrades: { lantern: false } }
+      : expedition.snapshot()
+    const now = expeditionClock()
+    const route = snap.run === null ? null : routeOf(snap.run.routeId)
+    // walking 显示这一段的危险；deciding 显示下一段；走满时封顶在最后一段。
+    const dangerLeg = snap.run === null
+      ? 1
+      : Math.min(snap.run.phase === 'deciding' ? snap.run.leg + 1 : snap.run.leg, snap.run.totalLegs)
+    return {
+      ...snap,
+      ready: expedition !== null,
+      now,
+      coins: farmStateView().coins,
+      away: expeditionAwayReason(),
+      routes: expeditionRoutesView(),
+      ...(snap.run === null || route === null
+        ? {}
+        : {
+            run: {
+              ...snap.run,
+              routeName: route.name,
+              danger: dangerLabel(dangerOf(route, dangerLeg))
+            }
+          })
+    }
+  }
+
+  /**
+   * 菜单「出远门」：开着就关，否则打开/聚焦。
+   * 和期货窗一样以 helper 报的真实开关为准，测试替身退回本地记录。
+   */
+  function handleExpeditionOpen () {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    if (expeditionWindowOpenNow()) return closeExpeditionWindow('expedition-open')
+    const opened = desktop.expeditionWindow({ open: true, state: expeditionView() })
+    if (opened !== true) return boardSendFailed('expedition-open')
+    expeditionWindowOpened = true
+    return { ok: true, action: 'expedition-open', window: 'opened' }
+  }
+
+  function expeditionWindowOpenNow () {
+    if (desktop !== null && typeof desktop.status === 'function') {
+      const status = desktop.status()
+      if (status !== null && typeof status === 'object' && typeof status.expeditionOpen === 'boolean') {
+        return status.expeditionOpen
+      }
+    }
+    return expeditionWindowOpened === true
+  }
+
+  function closeExpeditionWindow (action = 'expedition-close') {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    let sent = false
+    try {
+      sent = desktop.expeditionWindow({ open: false, close: true }) === true
+    } catch {
+      sent = false
+    }
+    expeditionWindowOpened = false
+    if (sent !== true) return boardSendFailed(action)
+    return { ok: true, action, window: 'closed' }
+  }
+
+  /** 只有窗口开着才推；关窗不影响走路。 */
+  function pushExpeditionWindow () {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') return false
+    try {
+      const sent = desktop.expeditionWindow({ open: false, state: expeditionView() }) === true
+      if (sent !== true) noteBoardSendFailure('expedition-refresh')
+      return sent
+    } catch {
+      return false
+    }
+  }
+
+  function refreshExpeditionWindow () {
+    if (expeditionWindowOpenNow() !== true) return
+    pushExpeditionWindow()
+  }
+
+  async function expeditionStart (routeId) {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    // 串门/打工是 room 的事；出远门自己的 away 由 store 的 already-away 兜底。
+    const away = expeditionAwayReason()
+    if (away !== null && away !== 'expedition') {
+      return { ok: false, error: 'already-away', notice: EXPEDITION_ERROR_TEXT['already-away'] }
+    }
+    const result = await expedition.start({ routeId })
+    if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    refreshExpeditionWindow()
+    const route = routeOf(result.run.routeId)
+    return {
+      ...result,
+      notice: `出发去${route === null ? '后山' : route.name}：盘缠 ${route === null ? 0 : route.fare}，回来见。`
+    }
+  }
+
+  async function expeditionStep () {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.step(expeditionClock())
+    if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    refreshExpeditionWindow()
+    return result
+  }
+
+  async function expeditionBack () {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.back(expeditionClock())
+    if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    refreshExpeditionWindow()
+    return { ...result, notice: `见好就收：带回 ${result.settled.coins} 枚硬币。` }
+  }
+
+  /**
+   * 窗口倒计时到 0 时请宿主补一拍：先 tick 再推视图。
+   * 正常由 1 秒巡检驱动；这个动作让窗口不必自己判定「到点」，也不会出现两个时钟。
+   */
+  async function expeditionRefresh () {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    if (expeditionWindowOpenNow() !== true) {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    if (expedition !== null) await expedition.tick(expeditionClock())
+    pushExpeditionWindow()
+    return { ok: true, action: 'expedition-refresh' }
+  }
+
+  /** 秒级巡检：到点就推进一段并重推窗口；关着窗也照走。 */
+  function startExpeditionTick () {
+    if (expeditionTimer !== null || expedition === null) return
+    expeditionTimer = setInterval(() => {
+      if (disposed || expedition === null) return
+      expedition.tick(expeditionClock()).then((changed) => {
+        if (changed === true) refreshExpeditionWindow()
+      }).catch((error) => warn(ctx, '出远门巡检失败：' + message(error)))
+    }, expeditionTickMs)
+    expeditionTimer.unref?.()
   }
 
   /**
@@ -5339,6 +5556,18 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 出远门（票 112）：盘缠与回币都走农场硬币，所以只在农场起来之后建。
+      // 坏文件只让这一趟不能出门，农场/串门/盘口照常；`expeditionNow` 只给测试注入。
+      if (farm !== null) {
+        try {
+          expedition = await createExpeditionStore(dir, { log, farm, now: expeditionClock })
+        } catch (error) {
+          expedition = null
+          warn(ctx, '出远门存档初始化失败，本次不能出门：' + message(error))
+        }
+      }
+      if (disposed) return
+
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
@@ -5582,6 +5811,8 @@ export function createService (ctx, options = {}) {
       if (!disposed) startFuturesSettleTick()
       // 合同的到期/失联/重试也不依赖网络；没有 discovery 时 sendTo 自然是 no-op。
       if (!disposed) startContractTimer()
+      // 出远门（票 112）：关窗也照走，所以 tick 与窗口开关无关。
+      if (!disposed) startExpeditionTick()
 
       if (!disposed && options.network !== false) {
         startNeighborTick()
@@ -5595,6 +5826,8 @@ export function createService (ctx, options = {}) {
       // 农场已经读出来的话，tick 不陪网络一起降级。
       if (!disposed) startFarmTick()
       if (!disposed) startFuturesSettleTick()
+      // 出远门是纯本机玩法，网络坏了也要能走完这一趟。
+      if (!disposed) startExpeditionTick()
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
       if (options.network !== false) {
         startNeighborTick()
@@ -9184,6 +9417,11 @@ export function createService (ctx, options = {}) {
     futuresAccountOf: (deviceId) => (futures === null ? null : futures.accountOf(deviceId, { at: futuresClock() })),
     /** 1.12.6 的测试/诊断缝：底层账本本身（只在测试里模拟「房主把别人的档位弄丢了」）。 */
     futuresStore: () => futures,
+    /** 票 112 的测试/诊断缝：出远门整份视图（与 `/state.expedition`、窗口同源）。 */
+    expedition: () => expeditionView(),
+    expeditionWindow: () => expeditionView(),
+    /** 票 112 的测试/诊断缝：底层 store（e2e 用它把假时钟推到下一段）。 */
+    expeditionStore: () => expedition,
     farmGuard: () => farmGuard(),
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),
@@ -9222,6 +9460,10 @@ export function createService (ctx, options = {}) {
         clearInterval(contractTimer)
         contractTimer = null
       }
+      if (expeditionTimer !== null) {
+        clearInterval(expeditionTimer)
+        expeditionTimer = null
+      }
       if (cropTimer !== null) {
         clearInterval(cropTimer)
         cropTimer = null
@@ -9248,6 +9490,9 @@ export function createService (ctx, options = {}) {
       contractAttempts.clear()
       contracts = null
       farm = null
+      // 出远门：先放开队列再丢引用，卸载后不再写 expedition.json。
+      expedition?.dispose()
+      expedition = null
       // tick 会随 farmTimer 一起停，但 store 引用也要放开：卸载后不该再写盘。
       trading = null
       season = null
