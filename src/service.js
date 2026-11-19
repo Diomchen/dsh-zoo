@@ -2266,15 +2266,15 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 既没有出门串门，也没有在外打工。
-   * 雇工镜像存在 = 有人在我家打工。`/state.farm.guard`、访客快照的 `guardParts`、
-   * 农场小窗的守卫全部从这里出，绝不三个地方各写一遍 0.3。
+   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 既没有出门串门，也没有在外打工，
+   * 也没有出远门（票 119）。雇工镜像存在 = 有人在我家打工。`/state.farm.guard`、
+   * 访客快照的 `guardParts`、农场小窗的守卫全部从这里出，绝不三个地方各写一遍 0.3。
    */
   function farmGuard () {
     const out = room.outboundVisit()
     const work = room.outboundWork()
     const worker = room.inboundWorker()
-    const ownerHome = out === null && work === null
+    const ownerHome = out === null && work === null && !room.away()
     const hasWorker = worker !== null
     return {
       guard: guardValue({ ownerHome, worker: hasWorker }),
@@ -3166,12 +3166,9 @@ export function createService (ctx, options = {}) {
   // /state，所以 /state.expedition 与窗口推的是同一个 expeditionView()。
   // ---------------------------------------------------------------------------
 
-  /** 宠物现在为什么不在家：串门 / 打工 / 出远门。null = 在家。 */
+  /** 宠物现在为什么不在家：串门 / 打工 / 出远门。null = 在家。判定本身在 room（票 119）。 */
   function expeditionAwayReason () {
-    if (room.outboundVisit() !== null) return 'visiting'
-    if (room.outboundWork() !== null) return 'working'
-    if (expedition !== null && expedition.active()) return 'expedition'
-    return null
+    return room.awayReason()
   }
 
   /** 路线表只下发窗口要显示的那几项；数值真相仍在规则层。 */
@@ -3280,7 +3277,8 @@ export function createService (ctx, options = {}) {
     if (expedition === null) {
       return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
     }
-    // 串门/打工是 room 的事；出远门自己的 away 由 store 的 already-away 兜底。
+    // 串门/打工的互斥由 room.awayReason 回答（票 119 合并成一处）；出远门自己已经在
+    // 路上时由 store 的 already-away 兜底——那种情况不该再进这里。
     const away = expeditionAwayReason()
     if (away !== null && away !== 'expedition') {
       return { ok: false, error: 'already-away', notice: EXPEDITION_ERROR_TEXT['already-away'] }
@@ -3703,6 +3701,8 @@ export function createService (ctx, options = {}) {
     if (hours === null) return workFailure('bad-hours')
     const selfId = identity?.deviceId ?? null
     if (selfId !== null && deviceId === selfId) return workFailure('own-pet')
+    // 票 119：出远门期间雇不了工——宠物不在家，等这一趟回来再说。
+    if (room.away()) return workFailure('already-away')
     if (!room.mayTalkTo(deviceId)) return workFailure('worker-unavailable')
     const neighbor = room.snapshot().neighbors.find((candidate) => candidate.deviceId === deviceId)
     if (neighbor === undefined || !(neighbor.heartbeatAt > 0)) return workFailure('worker-unavailable')
@@ -4022,8 +4022,9 @@ export function createService (ctx, options = {}) {
    * 顺序有讲究：先看「我在不在家/在不在打工」，再看挂牌，最后核钱。
    */
   function validateIncomingWork (packet) {
-    if (room.outboundVisit() !== null) return 'worker-unavailable'
-    if (room.outboundWork() !== null) return 'already-working'
+    // 「我在不在家/在不在打工/在不在远门」由 room 一处回答（票 119），码沿用老枚举。
+    const away = room.incomingWorkError()
+    if (away !== null) return away
     if (contracts.activeIncoming().length > 0) return 'already-working'
     const view = farm?.snapshot() ?? initialFarmView()
     const hire = view.hire
@@ -5575,6 +5576,9 @@ export function createService (ctx, options = {}) {
           expedition = null
           warn(ctx, '出远门存档初始化失败，本次不能出门：' + message(error))
         }
+        // 票 119：room 的互斥与看家判断从这里问「在不在远门」。惰性求值，
+        // 所以 store.tick() 直接结束一趟（测试/其它调用方）也不会留下过期的 away。
+        room.setAwayProvider(() => expedition !== null && expedition.active())
       }
       if (disposed) return
 

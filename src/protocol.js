@@ -402,9 +402,10 @@ const VISIT_TYPES = new Set([
  * visit-deny 的理由是固定枚举，不是自由文本：
  * - not-admitted：本机没放行这位邻居（默认，也兼容不带 reason 的旧报文）
  * - visits-off：本机客厅的“允许串门”开关被关掉了
+ * - already-away：宠物出了远门，家里没人（票 119）
  * 发起方据此给出不同的人话提示，但不能借这个字段传任意内容。
  */
-export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off'])
+export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off', 'already-away'])
 const DENY_REASON_SET = new Set(VISIT_DENY_REASONS)
 /** 雇工挂牌原因同样是固定枚举（ticket 44）；42 只发 null。 */
 const HIRE_REASON_SET = new Set(HIRE_REASONS)
