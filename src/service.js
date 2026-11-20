@@ -6589,6 +6589,11 @@ export function createService (ctx, options = {}) {
         itemId: event.itemId ?? undefined,
         moveFrom: event.moveFrom ?? undefined,
         moveTo: event.moveTo ?? undefined,
+        // 票 48 / 120：解锁的乐观锁，与农场页「陈列架」入口要求的落地页签。
+        // 这两个也从 preload 起一路带着，唯独在这里被丢掉：没有 expectedUnlocked 时
+        // 解锁变成「不看窗口里是哪块地」，tab 丢了则点「陈列架 N/32」开出来的是旅行页。
+        expectedUnlocked: event.expectedUnlocked ?? undefined,
+        tab: event.tab ?? undefined,
         // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
         qty: event.qty ?? undefined,
         // 票 53：派它去偷时带的地块列表（`farm-raid` 才用；白名单在 shared 已经过一遍）。

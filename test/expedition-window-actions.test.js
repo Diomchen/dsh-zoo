@@ -82,6 +82,17 @@ function desktopFieldSet (source) {
   return found
 }
 
+/** 农场窗 `submit()` 显式转发给主进程的字段。 */
+function farmForwardedFields (source) {
+  const open = source.indexOf("ipcRenderer.send('dsh-zoo:farm-submit', {")
+  assert.ok(open >= 0, '农场 preload 里找不到 farm-submit 的转发对象')
+  const close = source.indexOf('\n    })', open)
+  assert.ok(close > open, 'farm-submit 的对象没闭合')
+  const found = new Set()
+  for (const match of source.slice(open, close).matchAll(/^\s{6}([A-Za-z]+):/gm)) found.add(match[1])
+  return found
+}
+
 test('窗口能发的字段，服务端这一跳也得原样带上', async () => {
   const declared = preloadFieldMap(await read('expedition-preload.js'))
   const carried = desktopFieldSet(await readFile(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'service.js'), 'utf8'))
@@ -95,6 +106,16 @@ test('窗口能发的字段，服务端这一跳也得原样带上', async () =>
     }
   }
   assert.deepEqual(dropped, [], '这些字段在 handleDesktopAction 里被丢掉，窗口点下去只会收到莫名其妙的错误')
+})
+
+test('农场窗转发的字段同样不能在宿主这一跳不见', async () => {
+  const forwarded = farmForwardedFields(await read('farm-preload.js'))
+  const carried = desktopFieldSet(await readFile(join(dirname(fileURLToPath(import.meta.url)), '..', 'src', 'service.js'), 'utf8'))
+  assert.ok(forwarded.size >= 8, '农场 preload 字段解析失败')
+
+  // `action` 是动作名本身；其余每个字段宿主都得接住。
+  const dropped = [...forwarded].filter((field) => field !== 'action' && !carried.has(field)).sort()
+  assert.deepEqual(dropped, [], '这些字段在 handleDesktopAction 里被丢掉，窗口点了只会没反应或落错页')
 })
 
 test('preload 与宿主白名单一一对应', async () => {
