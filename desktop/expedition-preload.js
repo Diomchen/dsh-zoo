@@ -14,6 +14,7 @@ const FIELDS = {
   'expedition-step': [],
   'expedition-back': [],
   'expedition-refresh': [],
+  'expedition-lantern': [],
   'expedition-shelf': ['slot', 'itemId', 'moveFrom', 'moveTo']
 }
 
