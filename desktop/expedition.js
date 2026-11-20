@@ -483,7 +483,7 @@
       ? '宠物现在不在家（' + (state.away === 'working' ? '打工' : '串门') + '），先等它回来。'
       : ''
 
-    if (run === null || (browsing && !view.isActiveRun(run))) {
+    if (run === null || run === undefined || (browsing && !view.isActiveRun(run))) {
       browsing = run !== null
       ui.home.hidden = false
       ui.trip.hidden = true
@@ -561,7 +561,7 @@
     refreshAsked = false
     // 票 120：农场页的陈列架入口要求开窗后直接落这一页；只在带 tab 的那一拍切，
     // 之后玩家自己点的页签不会被后续刷新抢回去。
-    if (next.tab === 'shelf') setTab('shelf')
+    if (next.tab === 'shelf' || next.tab === 'log' || next.tab === 'codex') setTab(next.tab)
     paint()
   }
 

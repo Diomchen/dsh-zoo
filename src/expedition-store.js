@@ -211,13 +211,17 @@ export class ExpeditionStore {
       const run = startRun({ routeId: route.id, runId: this.#newRunId(), now: this.#now() })
       if (run === null) return { ok: false, error: 'starting' }
 
+      // 先把「出门」立住，再去扣盘缠：`spendCoins` 要写农场档，中间会 await 几十毫秒，
+      // 这段时间 `away()` 若还报 false，一次入站打工/串门就能挤进来，
+      // 结果是「在外面走路」和「在外面打工」同时成立（审计发现）。
+      const previous = this.#state.run
+      this.#state.run = run
       const paid = await this.#farm.spendCoins(route.fare)
       if (paid === null || typeof paid !== 'object' || paid.ok !== true) {
+        this.#state.run = previous
         return { ok: false, error: paid?.error === 'no-coin' ? 'not-enough-coins' : 'starting' }
       }
 
-      const previous = this.#state.run
-      this.#state.run = run
       if (await this.#persist()) return { ok: true, run: copyRun(run) }
 
       // 写不进去就把这一趟整个撤掉：盘缠退回，内存里也不留半个 run。
@@ -272,7 +276,23 @@ export class ExpeditionStore {
     return this.#serial(async () => {
       if (this.#disposed) return { ok: false, error: 'starting' }
       const next = stepRun(this.#state.run, now)
-      if (next === null) return { ok: false, error: 'not-walking' }
+      // 决策窗已经过了（晚于 until 才点）：这一下按「超时折返」结算，和 tick 那条路同口径。
+      // 不这么写，tick 抖动时晚点的那一下点击能白走一段。
+      if (next === null) {
+        const expired = expireRun(this.#state.run, now)
+        if (expired === null) return { ok: false, error: 'not-walking' }
+        const before = this.#state.run
+        const beforeLedger = { trips: this.#state.trips, logs: this.#state.logs }
+        this.#state.run = expired
+        this.#recordTrip(before, expired, now)
+        if (await this.#persist()) {
+          return { ok: true, run: copyRun(expired), settled: settledOf(expired) }
+        }
+        this.#state.run = before
+        this.#state.trips = beforeLedger.trips
+        this.#state.logs = beforeLedger.logs
+        return { ok: false, error: 'save-failed' }
+      }
       const settled = next.ended === null ? null : settledOf(next)
       const previous = this.#state.run
       const previousLedger = { trips: this.#state.trips, logs: this.#state.logs }
@@ -393,13 +413,14 @@ export class ExpeditionStore {
         }
         const items = previous.items.slice()
         const carried = items[moveFrom - 1]
-        if (carried === undefined || carried === null) return { ok: false, error: 'locked' }
+        if (carried === undefined || carried === null) return { ok: false, error: 'empty-slot' }
         if (toGiven) {
-          if (!Number.isInteger(moveTo) || moveTo < 1 || moveTo > previous.slots || moveTo === moveFrom) {
+          if (!Number.isInteger(moveTo) || moveTo < 1 || moveTo > previous.slots) {
             return { ok: false, error: 'locked' }
           }
+          if (moveTo === moveFrom) return { ok: false, error: 'same-slot' }
           const target = items[moveTo - 1]
-          if (target !== undefined && target !== null) return { ok: false, error: 'locked' }
+          if (target !== undefined && target !== null) return { ok: false, error: 'occupied' }
           items[moveFrom - 1] = null
           items[moveTo - 1] = carried
         } else {
@@ -416,9 +437,11 @@ export class ExpeditionStore {
       if (itemGiven) {
         if (!Number.isInteger(slot) || slot < 1 || slot > previous.slots) return { ok: false, error: 'locked' }
         if (typeof itemId !== 'string' || souvenirOf(itemId) === null) return { ok: false, error: 'locked' }
-        if (previous.items.includes(itemId)) return { ok: false, error: 'locked' }
+        // 只能摆自己捡到过的：否则空图鉴也能把架子摆满，邻居看到的「陈列架」就全是假的。
+        if (!Object.hasOwn(this.#state.codex, itemId)) return { ok: false, error: 'not-owned' }
+        if (previous.items.includes(itemId)) return { ok: false, error: 'occupied' }
         const occupant = previous.items[slot - 1]
-        if (occupant !== undefined && occupant !== null) return { ok: false, error: 'locked' }
+        if (occupant !== undefined && occupant !== null) return { ok: false, error: 'occupied' }
         const items = previous.items.slice()
         while (items.length < slot) items.push(null)
         items[slot - 1] = itemId
@@ -471,7 +494,7 @@ export class ExpeditionStore {
    * 返回 `{ advanced, credited }`：`credited` 是真实到账的数额，`init` 落盘失败时按它退钱。
    */
   async #resume (now) {
-    const event = resumeRun(this.#state.run, now)
+    const event = resumeRun(this.#state.run, now, Object.keys(this.#state.codex))
     if (event === null) return { advanced: false, credited: 0 }
     let credited = 0
     if (event.coins > 0) {

@@ -328,8 +328,11 @@ test('normalizeRun 只接受形状完整的 run', () => {
 })
 
 test('继续走会掷翻车：翻车立刻回家，段数不加、战利品不动、盘缠不退', () => {
-  const failedId = probeRunId((id) => stepRun(decidingRun(id, { leg: 2 }), T0 + 2000)?.ended === 'failed')
-  const run = decidingRun(failedId, { leg: 2, loot: [{ kind: 'coin', qty: 15 }] })
+  // 决策窗判定在 2026-11-20 加严：过了 `until` 再点「继续」按超时处理，
+  // 所以这里的 run 要站在窗内（`until` 晚于步进时刻），测的才是翻车。
+  const inWindow = { until: T0 + 5000 }
+  const failedId = probeRunId((id) => stepRun(decidingRun(id, { leg: 2, ...inWindow }), T0 + 2000)?.ended === 'failed')
+  const run = decidingRun(failedId, { leg: 2, loot: [{ kind: 'coin', qty: 15 }], ...inWindow })
   const wiped = stepRun(run, T0 + 2000)
   assert.equal(wiped.phase, null)
   assert.equal(wiped.until, null)

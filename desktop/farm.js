@@ -2567,7 +2567,9 @@ if (boardButton !== null) {
 
 // 票 116：日志细条也只是**开窗申请**；正文只在出远门窗口里看。
 if (expeditionLogEl !== null) {
-  const openExpeditionLog = () => submit({ action: 'expedition-open' })
+  // 落点直接切到日志页：之前只发 `expedition-open`，点「看全文」落在旅行首页，
+  // 还要自己再点一次「日志」（2026-11-20 审计）。
+  const openExpeditionLog = () => submit({ action: 'expedition-open', tab: 'log' })
   expeditionLogEl.addEventListener('click', openExpeditionLog)
   expeditionLogEl.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' && event.key !== ' ') return

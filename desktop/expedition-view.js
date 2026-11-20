@@ -153,6 +153,10 @@
    */
   function canStart (view, route) {
     if (isActiveRun(view === null ? null : view.run)) return false
+    // 宠物正在串门/打工时按钮也该是灰的：宿主必然回 already-away，
+    // 让按钮和上方的「先等它回来」说同一件事（2026-11-20 审计）。
+    const away = view === null || view === undefined ? null : view.away
+    if (away === 'visiting' || away === 'working') return false
     if (route !== null && route !== undefined && route.unlocked === false) return false
     const fare = route === null || route === undefined ? 0 : num(route.fare)
     const coins = num(view === null ? 0 : view.coins)

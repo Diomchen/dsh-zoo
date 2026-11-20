@@ -542,5 +542,6 @@ test('农场页：细条在 #batch-bar 上方，点开才进窗口', async () =>
   assert.match(farmJs, /function renderExpeditionLog \(/)
   assert.match(farmJs, /renderExpeditionLog\(\)/)
   assert.match(farmJs, /expeditionLog/)
-  assert.match(farmJs, /submit\(\{ action: 'expedition-open' \}\)/)
+  // 2026-11-20：点「看全文」要直接落在日志页（之前只发 expedition-open，落在旅行首页）。
+  assert.match(farmJs, /submit\(\{ action: 'expedition-open', tab: 'log' \}\)/)
 })

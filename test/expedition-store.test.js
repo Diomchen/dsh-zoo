@@ -74,6 +74,17 @@ async function readState (dir) {
   return JSON.parse(await readFile(join(dir, EXPEDITION_FILE), 'utf8'))
 }
 
+/**
+ * 先把图鉴写成「这几件已经捡到过」。
+ * 陈列架只允许摆自己捡到过的（2026-11-20 审计后的规则），
+ * 所以摆件类用例要先有图鉴，否则拿到的会是 `not-owned`。
+ */
+async function seedCodex (dir, ids) {
+  const codex = {}
+  for (const id of ids) codex[id] = T0
+  await writeFile(join(dir, EXPEDITION_FILE), JSON.stringify({ version: 1, codex }), 'utf8')
+}
+
 test('初始化：空目录落一份空存档，货架/图鉴/提灯都有完整形状', async (t) => {
   const dir = await tempDir(t)
   const store = await createExpeditionStore(dir, { now: () => T0 })
@@ -641,6 +652,7 @@ test('陈列架开满 32 格共花 120,000；第 33 格报 locked', async (t) =>
 
 test('陈列架摆放/挪格/取下：同一件不能进两格，移动不花硬币', async (t) => {
   const dir = await tempDir(t)
+  await seedCodex(dir, ['herb'])
   const farm = fakeFarm(0)
   const store = await createExpeditionStore(dir, { farm, now: () => T0 })
 
@@ -651,7 +663,7 @@ test('陈列架摆放/挪格/取下：同一件不能进两格，移动不花硬
 
   const duplicate = await store.shelfAction({ slot: 2, itemId: 'herb' })
   assert.equal(duplicate.ok, false)
-  assert.equal(duplicate.error, 'locked')
+  assert.equal(duplicate.error, 'occupied')
   assert.equal(store.snapshot().shelf.items.filter((id) => id === 'herb').length, 1, '同一件只能占一格')
 
   const moved = await store.shelfAction({ moveFrom: 1, moveTo: 2 })
@@ -668,6 +680,7 @@ test('陈列架摆放/挪格/取下：同一件不能进两格，移动不花硬
 
 test('陈列架挪格：目标格没解锁就报 locked，原样不动', async (t) => {
   const dir = await tempDir(t)
+  await seedCodex(dir, ['herb'])
   const store = await createExpeditionStore(dir, { farm: fakeFarm(0), now: () => T0 })
   await store.shelfAction({ slot: 1, itemId: 'herb' })
 
@@ -678,6 +691,7 @@ test('陈列架挪格：目标格没解锁就报 locked，原样不动', async (
 
 test('陈列架重开进程后内容与格数都还在', async (t) => {
   const dir = await tempDir(t)
+  await seedCodex(dir, ['herb'])
   const first = await createExpeditionStore(dir, { farm: fakeFarm(10000), now: () => T0 })
   await first.shelfAction({ slot: 9 })
   await first.shelfAction({ slot: 10 })

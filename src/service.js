@@ -3305,13 +3305,25 @@ export function createService (ctx, options = {}) {
     if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
       return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
     }
-    if (expeditionWindowOpenNow()) return closeExpeditionWindow('expedition-open')
+    // 入口带的落点页签：陈列架（票 120）、日志（农场页的「看全文」）。
+    const landing = tab === 'shelf' || tab === 'log' || tab === 'codex' ? tab : null
+    if (expeditionWindowOpenNow()) {
+      // 农场页「陈列架 N/32」的入口带 tab：窗已经开着就别关它——
+      // 之前这里一律走关窗分支，点一下窗口消失、tab 被吞（2026-11-20 审计）。
+      if (landing !== null) {
+        const focused = desktop.expeditionWindow({ open: true, tab: landing, state: expeditionView() })
+        if (focused !== true) return expeditionSendFailed()
+        expeditionWindowOpened = true
+        return { ok: true, action: 'expedition-open', window: 'focused' }
+      }
+      return closeExpeditionWindow('expedition-open')
+    }
     const opened = desktop.expeditionWindow({
       open: true,
-      ...(tab === 'shelf' ? { tab: 'shelf' } : {}),
+      ...(landing === null ? {} : { tab: landing }),
       state: expeditionView()
     })
-    if (opened !== true) return boardSendFailed('expedition-open')
+    if (opened !== true) return expeditionSendFailed()
     expeditionWindowOpened = true
     return { ok: true, action: 'expedition-open', window: 'opened' }
   }
@@ -3337,8 +3349,17 @@ export function createService (ctx, options = {}) {
       sent = false
     }
     expeditionWindowOpened = false
-    if (sent !== true) return boardSendFailed(action)
+    if (sent !== true) return expeditionSendFailed()
     return { ok: true, action, window: 'closed' }
+  }
+
+  /**
+   * 出远门窗口指令没被桌面层接住时的回执。
+   * 之前这里借用了盘口的 `boardSendFailed`，提示语是「盘口窗指令发不出去（盘口数据可能太大）」，
+   * 玩家点出远门没反应，却被指去看盘口——文案与事实完全对不上（2026-11-20 审计）。
+   */
+  function expeditionSendFailed () {
+    return { ok: false, error: 'send-failed', notice: EXPEDITION_ERROR_TEXT['send-failed'] }
   }
 
   /** 只有窗口开着才推；关窗不影响走路。 */
@@ -3430,12 +3451,18 @@ export function createService (ctx, options = {}) {
       moveTo: body?.moveTo
     })
     if (!result.ok) {
-      // `locked` 与路线解锁共用一个 error code，架子这边必须用格子的说法。
-      const notice = result.error === 'not-enough-coins'
-        ? '硬币不够开这一格。'
-        : result.error === 'locked'
-          ? '这个格子还没开，放不进去。'
-          : EXPEDITION_ERROR_TEXT[result.error] ?? null
+      // `locked` 与路线解锁共用一个 error code，架子这边必须用格子的说法；
+      // 另外三种冲突（格被占、格子是空的、挪到原格）以前也挤在 `locked` 里，
+      // 于是「那一格已经有东西了」被说成「这个格子还没开」——审计指出的文案错位。
+      const SHELF_NOTICE = {
+        'not-enough-coins': '硬币不够开这一格。',
+        locked: '这个格子还没开，放不进去。',
+        'not-owned': EXPEDITION_ERROR_TEXT['not-owned'],
+        occupied: '那一格已经有东西了（同一件也不能占两格）。',
+        'empty-slot': '这一格是空的，没有东西可挪。',
+        'same-slot': '挪到同一个格子里没有意义。'
+      }
+      const notice = SHELF_NOTICE[result.error] ?? EXPEDITION_ERROR_TEXT[result.error] ?? null
       return { ...result, notice }
     }
     refreshExpeditionWindow()
@@ -3474,12 +3501,12 @@ export function createService (ctx, options = {}) {
     if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
       return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
     }
-    if (expeditionWindowOpenNow() !== true) {
-      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
-    }
+    // 先 tick：窗口关着时这一拍照样要推进，不能因为「没窗可推」把走路也停掉。
     if (expedition !== null) await expedition.tick(expeditionClock())
+    // 窗没开着不是错误：桌面层好好的，只是没地方推（客户端会在关窗后收到这个）。
+    if (expeditionWindowOpenNow() !== true) return { ok: true, action: 'expedition-refresh', refreshed: false }
     pushExpeditionWindow()
-    return { ok: true, action: 'expedition-refresh' }
+    return { ok: true, action: 'expedition-refresh', refreshed: true }
   }
 
   /** 秒级巡检：到点就推进一段并重推窗口；关着窗也照走。 */
@@ -6441,6 +6468,10 @@ export function createService (ctx, options = {}) {
           } else if (event?.type === 'futures-window-state') {
             // 票 93：期货窗同理——关了之后右键「期货」要能重新打开。
             futuresWindowOpened = event.open === true
+          } else if (event?.type === 'expedition-window-state') {
+            // 票 120：出远门窗真的开了/关了（含用户点 ×/Esc）。
+            // 之前没有这条分支，本地标志只能靠动作改，status() 不可用时就会「以为窗还开着」。
+            expeditionWindowOpened = event.open === true
           } else if (event?.type === 'action') {
             // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
             // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。

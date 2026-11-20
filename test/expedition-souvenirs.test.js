@@ -278,7 +278,9 @@ test('113 的翻车分支接上减半：同一趟只留一半特产，硬币与�
       phase: 'deciding',
       leg: 2,
       totalLegs: 4,
-      until: T0,
+      // 决策窗判定在 2026-11-20 加严：过了 `until` 再点「继续」按超时处理，
+      // 所以这里要站在窗内，测的才是翻车减半。
+      until: T0 + 60_000,
       loot
     }
     const next = stepRun(candidate, T0 + 1000)

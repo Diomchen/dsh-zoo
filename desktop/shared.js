@@ -226,6 +226,15 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
    */
   const EXPEDITION_OPEN_ACTIONS = ['expedition-open']
   /**
+   * 出远门窗口能被「指定落点页签」的入口（票 120 的陈列架、票 116 的日志细条）。
+   * 别的值一律当普通开窗，不把页面切到别处。
+   */
+  const EXPEDITION_TABS = ['shelf', 'log', 'codex']
+  /** 落点页签的合法值；不合法返回 null。 */
+  function normalizeExpeditionTab (value) {
+    return EXPEDITION_TABS.includes(value) ? value : null
+  }
+  /**
    * 盘口小窗能提交的动作（票 79 / 票 81 / 票 83）。字段窄到不能再窄：
    *   trading-open-position  { side, margin, leverage, cropId }
    *   trading-close-position { positionId }
@@ -3072,8 +3081,8 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return {
       open: raw.open === true,
       ...(raw.close === true ? { close: true } : {}),
-      // 票 120：只有「陈列架」这一个落点会被转给窗口；别的页签走默认。
-      ...(raw.tab === 'shelf' ? { tab: 'shelf' } : {}),
+      // 票 120：入口带的落点页签；2026-11-20 起农场页的日志细条也会带 `log`。
+      ...(normalizeExpeditionTab(raw.tab) === null ? {} : { tab: normalizeExpeditionTab(raw.tab) }),
       state: normalizeExpeditionView(raw.state)
     }
   }
@@ -3203,8 +3212,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
     // 票 116：农场页的日志细条也只是开窗申请。
     if (EXPEDITION_OPEN_ACTIONS.includes(action)) {
-      // 票 120：陈列架入口要求开窗直接落陈列架页签；其它值一律当作普通开窗。
-      return raw.tab === 'shelf' ? { action, tab: 'shelf' } : { action }
+      // 票 120：入口要求开窗直接落某个页签（陈列架 / 日志）；其它值一律当作普通开窗。
+      const tab = normalizeExpeditionTab(raw.tab)
+      return tab === null ? { action } : { action, tab }
     }
     // 票 93：右键「期货」与农场窗的「期货」按钮同样是开窗申请。
     if (action === 'futures-window') return { action }

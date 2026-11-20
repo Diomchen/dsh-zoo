@@ -358,11 +358,15 @@ test('农场页入口行：顶栏「陈列架 N/32 · 点开看」，点开落�
   assert.match(farmJs, /submit\(\{ action: 'expedition-open', tab: 'shelf' \}\)/)
 })
 
-test('开窗落点：tab 从农场窗一路带到出远门窗口，只认 shelf', async (t) => {
-  // 农场动作白名单：只放行 tab:'shelf'，夹带别的值就当普通开窗。
+test('开窗落点：tab 从农场窗一路带到出远门窗口，只认已知页签', async (t) => {
+  // 农场动作白名单：只放行 shelf/log/codex，夹带别的值就当普通开窗。
   assert.deepEqual(
     shared.normalizeFarmAction({ action: 'expedition-open', tab: 'shelf' }),
     { action: 'expedition-open', tab: 'shelf' }
+  )
+  assert.deepEqual(
+    shared.normalizeFarmAction({ action: 'expedition-open', tab: 'log' }),
+    { action: 'expedition-open', tab: 'log' }
   )
   assert.deepEqual(shared.normalizeFarmAction({ action: 'expedition-open', tab: 'travel' }), { action: 'expedition-open' })
   assert.deepEqual(shared.normalizeFarmAction({ action: 'expedition-open', tab: 'shelf', title: '夹带' }),
@@ -370,7 +374,8 @@ test('开窗落点：tab 从农场窗一路带到出远门窗口，只认 shelf'
 
   // 宿主命令白名单：tab 跟着 state 一起到 helper。
   assert.equal(shared.normalizeExpeditionWindow({ open: true, tab: 'shelf', state: {} }).tab, 'shelf')
-  assert.equal('tab' in shared.normalizeExpeditionWindow({ open: true, tab: 'log', state: {} }), false)
+  assert.equal(shared.normalizeExpeditionWindow({ open: true, tab: 'log', state: {} }).tab, 'log')
+  assert.equal('tab' in shared.normalizeExpeditionWindow({ open: true, tab: 'nope', state: {} }), false)
 
   // 宿主：把 tab 原样交给 desktop.expeditionWindow。
   const dir = await tempDir(t)
@@ -389,14 +394,17 @@ test('开窗落点：tab 从农场窗一路带到出远门窗口，只认 shelf'
 test('开窗落点的接线：命令、helper、窗口三处都认 tab', async () => {
   const desktopSrc = await readFile(new URL('../src/desktop.js', import.meta.url), 'utf8')
   assert.match(desktopSrc, /payload\?\.tab === 'shelf'/)
+  assert.match(desktopSrc, /payload\?\.tab === 'log'/)
 
   const mainSrc = await readDesktop('main.js')
   assert.match(mainSrc, /command\.tab === 'shelf'/)
+  assert.match(mainSrc, /command\.tab === 'log'/)
   assert.match(mainSrc, /expeditionTab/)
 
   const windowJs = await readDesktop('expedition.js')
   assert.match(windowJs, /next\.tab === 'shelf'/)
-  assert.match(windowJs, /setTab\('shelf'\)/)
+  assert.match(windowJs, /next\.tab === 'log'/)
+  assert.match(windowJs, /setTab\(next\.tab\)/)
 
   const farmPreload = await readDesktop('farm-preload.js')
   assert.match(farmPreload, /tab: action\.tab/)

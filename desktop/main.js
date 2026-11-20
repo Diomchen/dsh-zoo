@@ -3001,7 +3001,7 @@ function sendExpeditionState () {
     // 票 120：`tab` 只随开窗那一次命令下发，送到就清掉，之后刷新仍停在玩家自己选的页签。
     expeditionWin.webContents.send('dsh-zoo:expedition-state', {
       ...(expeditionState === null ? {} : expeditionState),
-      ...(expeditionTab === 'shelf' ? { tab: 'shelf' } : {})
+      ...(expeditionTab === null ? {} : { tab: expeditionTab })
     })
     expeditionTab = null
   } catch {
@@ -3356,7 +3356,7 @@ function applyCommand (command) {
       }
       expeditionState = command.state ?? null
       // 票 120：陈列架入口带来的落点，等 did-finish-load 或 flush 时随 state 一起发。
-      if (command.tab === 'shelf') expeditionTab = 'shelf'
+      if (command.tab === 'shelf' || command.tab === 'log' || command.tab === 'codex') expeditionTab = command.tab
       if (command.open === true) {
         if (!openExpeditionWindow()) {
           writeEvent({ type: 'error', id: command.id, code: 'expedition-window-failed', message: 'cannot open expedition window' })

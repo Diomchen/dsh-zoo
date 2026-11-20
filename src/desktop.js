@@ -754,8 +754,10 @@ export function createDesktop (options = {}) {
       type: 'expedition-window',
       open: payload?.open === true,
       ...(payload?.close === true ? { close: true } : {}),
-      // 票 120：农场页的陈列架入口要求开窗后直接落在陈列架页签。
-      ...(payload?.tab === 'shelf' ? { tab: 'shelf' } : {}),
+      // 票 120：农场页的陈列架入口 / 日志入口要求开窗后直接落在某个页签。
+      ...(payload?.tab === 'shelf' || payload?.tab === 'log' || payload?.tab === 'codex'
+        ? { tab: payload.tab }
+        : {}),
       state: payload?.state ?? null
     })
   }

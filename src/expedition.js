@@ -180,13 +180,15 @@ export const EXPEDITION_ERROR_TEXT = Object.freeze({
   'already-away': '它正在出远门（或串门/打工），这一趟走不了。',
   'not-enough-coins': '硬币不够付盘缠，这趟走不了。',
   locked: '这条路线还没解锁，先看看灰卡上的条件。',
+  'not-owned': '这件特产还没捡到过，摆不上陈列架。',
   'no-route': '没有这条路线。',
   'not-walking': '这一趟现在不用做决定。',
   // 陈列架（115）的 locked 与路线（117）共用同一个 error code；架子那边的文案在
   // service.expeditionShelf 里单独补，这里保留路线的说法。
   starting: '出远门还没准备好，稍等一下。',
   'save-failed': '存档写不进去，这趟没能出发。',
-  'desktop-off': '桌面层没在运行，出远门的窗口开不了。'
+  'desktop-off': '桌面层没在运行，出远门的窗口开不了。',
+  'send-failed': '出远门窗口没打开：桌面层没接住这条指令。'
 })
 
 /** 路线对象；未知 id 返回 null（不抛，读档时坏数据只降级）。 */
@@ -449,6 +451,10 @@ export function wipedOut (run, leg) {
 export function stepRun (run, now) {
   if (!isActiveRun(run) || run.phase !== 'deciding') return null
   if (!Number.isFinite(now)) return null
+  // 决策窗过了就不再算「继续」：这一趟该按超时折返（`expireRun`），
+  // 否则 tick 抖动时晚点的那一下点击能白拿一段，和「超时默认见好就收」相反。
+  // 边界那一毫秒仍归玩家（`now > until` 才算过期），测试与窗口倒计时都按这个边界写。
+  if (Number.isFinite(run.until) && now > run.until) return null
   const nextLeg = run.leg + 1
   if (wipedOut(run, nextLeg)) {
     return {
@@ -485,11 +491,13 @@ export function expireRun (run, now) {
  * 返回 `{ run, coins, souvenir }`（coins 是这一段该入账的钱，souvenir 是这一段掉的特产）；
  * 不推进返回 null。`run.loot` 里已经带着这件特产，落盘层据 `souvenir` 补图鉴。
  */
-export function resumeRun (run, now) {
+export function resumeRun (run, now, ownedIds = []) {
   if (!isActiveRun(run) || !Number.isFinite(now)) return null
   if (now < run.until) return null
   if (run.phase === 'walking') {
-    const event = advanceRun(run, now)
+    // 图鉴已集齐的件要一并传下去：漏传会让读档那一段掉到重复特产，
+    // 同一份存档「重启」与「不重启」掉的东西就不一样了。
+    const event = advanceRun(run, now, ownedIds)
     return event === null ? null : { run: event.run, coins: event.coins, souvenir: event.souvenir }
   }
   const home = expireRun(run, now)
