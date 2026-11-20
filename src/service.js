@@ -3639,19 +3639,23 @@ export function createService (ctx, options = {}) {
     return { ok: false, error }
   }
 
-  function contractFound (id) {
-    if (contracts === null) return null
+  /**
+   * 按 id 找合同。`store` 只给「入口已经抓了局部引用」的在飞路径用（票 122）：
+   * 那些路径里模块级的 `contracts` 可能刚被 dispose() 置空，账本本身却还活着。
+   */
+  function contractFound (id, store = contracts) {
+    if (store === null) return null
     try {
-      return contracts.byId(id)
+      return store.byId(id)
     } catch {
       return null
     }
   }
 
-  function contractByRequest (requestId) {
-    if (contracts === null) return null
+  function contractByRequest (requestId, store = contracts) {
+    if (store === null) return null
     try {
-      return contracts.byRequestId(requestId)
+      return store.byRequestId(requestId)
     } catch {
       return null
     }
@@ -3939,18 +3943,22 @@ export function createService (ctx, options = {}) {
   async function failWorkRequest (requestId, error) {
     const entry = workRequests.get(requestId)
     if (entry === undefined) return
+    // 票 122：入口先抓 store 的局部引用（理由见 handleWorkSettle 的注释）。
+    const store = contracts
+    const farmStore = farm
     workRequests.delete(requestId)
     if (entry.timer !== null) clearTimeout(entry.timer)
     if (!entry.done) {
       entry.done = true
-      const found = contractByRequest(requestId)
+      const found = contractByRequest(requestId, store)
       if (found !== null && found.side === 'outgoing') {
         const record = found.record
         if (record.charged && !record.refunded) {
           // 还没 ack 的雇佣等于没发生：工资和手续费一起退（手续费只在成交后烧）。
-          await refundOutgoingOnce(record, record.wage + record.fee)
+          await refundOutgoingOnce(store, farmStore, record, record.wage + record.fee)
         }
-        await contracts.cancelOutgoing(requestId, 'cancelled')
+        // 关停后模块级 `contracts` 已经是 null，但这一笔取消还是要落盘。
+        if (store !== null) await store.cancelOutgoing(requestId, 'cancelled')
         sendWorkEndPacket(record.workerDeviceId, { requestId, reason: 'cancelled' })
       }
       if (pendingHire === requestId) pendingHire = null
@@ -3960,18 +3968,24 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  /** 退款一次（WAL：先写 refunding，再入账，再写 refunded；重复调用返回 0）。 */
-  async function refundOutgoingOnce (record, amount) {
-    if (contracts === null || farm === null) return 0
+  /**
+   * 退款一次（WAL：先写 refunding，再入账，再写 refunded；重复调用返回 0）。
+   *
+   * 票 122：两个 store 由调用方把入口抓的局部引用传进来，不再读模块级的
+   * `contracts`/`farm`。关停时那两个变量已经是 null——旧写法会在这里静默 `return 0`，
+   * 调用方却接着写 `finishSettle`，于是留下「没退款、"settled"」的半条账。
+   */
+  async function refundOutgoingOnce (store, farmStore, record, amount) {
+    if (store === null || farmStore === null) return 0
     if (refundInFlight.has(record.id)) return 0
     refundInFlight.add(record.id)
     try {
-      const fresh = contractFound(record.id)
+      const fresh = contractFound(record.id, store)
       if (fresh === null || fresh.side !== 'outgoing') return 0
       if (fresh.record.refunded) return 0
       if (fresh.record.refundStartedAt !== null) {
         // 上一次已经写过 refunding 就崩了：钱可能已经到账，fail-closed 不再退。
-        await contracts.markRefunded(fresh.record.id, {
+        await store.markRefunded(fresh.record.id, {
           amount: fresh.record.refundAmount,
           at: contractClock()
         })
@@ -3979,14 +3993,14 @@ export function createService (ctx, options = {}) {
       }
       const cap = fresh.record.wage + fresh.record.fee
       const value = Math.min(cap, Math.max(0, Math.floor(Number(amount) || 0)))
-      await contracts.markRefundStarted(fresh.record.id, value)
-      const added = await farm.addCoins(value)
+      await store.markRefundStarted(fresh.record.id, value)
+      const added = await farmStore.addCoins(value)
       if (added.ok !== true) {
         warnOnce('refund:' + record.id,
           '合同退款没入账（' + (added.error ?? 'unknown') + '），等下一次重试')
         return 0
       }
-      await contracts.markRefunded(fresh.record.id, { amount: value, at: contractClock() })
+      await store.markRefunded(fresh.record.id, { amount: value, at: contractClock() })
       if (value > 0) room.noteFarmEvent('合同结束，退回 ' + value + ' 硬币。')
       return value
     } finally {
@@ -4077,6 +4091,9 @@ export function createService (ctx, options = {}) {
     if (disposed || contracts === null || farm === null) return
     if (identity === null || packet.deviceId === identity.deviceId) return
     if (!room.mayTalkTo(packet.deviceId)) return
+    // 票 122：入口抓局部引用。下面每个 await 之后 dispose() 都可能把模块级变量置空。
+    const store = contracts
+    const farmStore = farm
     noteContractSeen(packet.deviceId)
     const requestId = packet.requestId
     const replayed = replayedWorkResult(packet.deviceId, requestId)
@@ -4104,7 +4121,7 @@ export function createService (ctx, options = {}) {
       const startedAt = now
       const endsAt = now + hours * 60 * 60 * 1000
       const employerNickname = room.peerNickname(packet.deviceId) ?? '邻居'
-      const record = await contracts.beginIncoming({
+      const record = await store.beginIncoming({
         contractId,
         requestId,
         employerDeviceId: packet.deviceId,
@@ -4129,7 +4146,7 @@ export function createService (ctx, options = {}) {
         lastSeen: now
       })
       if (begun.ok !== true) {
-        await contracts.end(contractId, { endedAt: now, reason: 'cancelled' })
+        await store.end(contractId, { endedAt: now, reason: 'cancelled' })
         sendWorkAckPacket(packet.deviceId, requestId, { ok: false, error: begun.error ?? 'already-working' })
         return
       }
@@ -4140,9 +4157,9 @@ export function createService (ctx, options = {}) {
         endsAt,
         guard: WORKER_GUARD
       })
-      if (farm !== null) {
-        await farm.noteHire({ who: employerNickname, hours, wage })
-      }
+      // 合同已经落盘并 ack 了；后面只是本地记账和界面，关停时到此为止。
+      if (disposed) return
+      await farmStore.noteHire({ who: employerNickname, hours, wage })
       room.noteFarmEvent('「' + employerNickname + '」雇了你 ' + hours + ' 小时，去打工啦。')
       refreshContractViews()
       sendMarketDigest({ force: true })
@@ -4172,10 +4189,14 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-ack（我是雇主）：确认合同 + 雇工进镜像，或者退款取消。 */
   async function handleWorkAck (packet) {
+    // 票 122：入口抓局部引用（理由见 handleWorkSettle 的注释）。
+    if (disposed || contracts === null || farm === null) return
+    const store = contracts
+    const farmStore = farm
     const entry = workRequests.get(packet.requestId)
     if (entry === undefined) {
       // 迟到/重复的 ack：合同还活着就什么都不做；完全找不到才补一条 work-end 收尾。
-      const existing = contractByRequest(packet.requestId)
+      const existing = contractByRequest(packet.requestId, store)
       if (existing === null && packet.ok === true) {
         sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
       }
@@ -4194,14 +4215,14 @@ export function createService (ctx, options = {}) {
     // 的绝对时间，带着它的时钟差；直接拿来当自己的到期时刻，倒计时就会凭空多/少一段
     // （快 30 分钟 →「还剩 2 小时 30 分」，慢 2 小时 → 一成交就快到期）。
     // 时长只认自己那份 pending 记录里的 hours：两台机器各有各的锚点，但墙钟上是同一时刻到期。
-    const pendingRecord = contractByRequest(packet.requestId)?.record ?? null
+    const pendingRecord = contractByRequest(packet.requestId, store)?.record ?? null
     const requestedHours = Number(pendingRecord?.hours)
     const contractMs = Number.isFinite(requestedHours) && requestedHours > 0
       ? requestedHours * 60 * 60 * 1000
       : contractMsOf(packet.startedAt, packet.endsAt)
     const startedAt = now
     const endsAt = now + contractMs
-    const confirmed = await contracts.confirmOutgoing(packet.requestId, {
+    const confirmed = await store.confirmOutgoing(packet.requestId, {
       contractId: packet.contractId,
       startedAt,
       endsAt,
@@ -4226,10 +4247,10 @@ export function createService (ctx, options = {}) {
     })
     if (begun.ok !== true) {
       // 本地已经有雇工（例如两笔并发 ack）：结束这份新合同并全额退款。
-      const fresh = contractFound(packet.contractId)
+      const fresh = contractFound(packet.contractId, store)
       if (fresh !== null && fresh.side === 'outgoing') {
-        await endOutgoingContract(fresh.record, 'cancelled', now)
-        await refundOutgoingOnce(fresh.record, fresh.record.wage + fresh.record.fee)
+        await endOutgoingContract(fresh.record, 'cancelled', now, store)
+        await refundOutgoingOnce(store, farmStore, fresh.record, fresh.record.wage + fresh.record.fee)
       }
       sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
       entry.resolve(workFailure(begun.error ?? 'already-hired'))
@@ -4237,14 +4258,14 @@ export function createService (ctx, options = {}) {
     }
     if (pendingHire === packet.requestId) pendingHire = null
     entry.resolve({ ok: true, action: 'hire', contractId: packet.contractId })
-    if (farm !== null) {
-      const hired = contractFound(packet.contractId)?.record ?? null
-      await farm.noteHire({
-        who: workerNickname,
-        hours: hired?.hours,
-        wage: hired?.wage
-      })
-    }
+    // 合同已经成交；后面只是本地记账和界面，关停时到此为止。
+    if (disposed) return
+    const hired = contractFound(packet.contractId, store)?.record ?? null
+    await farmStore.noteHire({
+      who: workerNickname,
+      hours: hired?.hours,
+      wage: hired?.wage
+    })
     room.noteFarmEvent('「' + workerNickname + '」来打工了。')
     refreshContractViews()
     sendMarketDigest({ force: true })
@@ -4252,17 +4273,18 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-recall（我是雇主）：结束合同、启动结算、回一条 recall-ack。 */
   async function handleWorkRecall (packet) {
-    if (contracts === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null) return
+    const store = contracts
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'outgoing') {
       sendRecallAck(packet.deviceId, packet.contractId, false, 'contract-not-found')
       return
     }
     const record = found.record
     if (record.status === 'active') {
-      await endOutgoingContract(record, 'recall', contractClock())
+      await endOutgoingContract(record, 'recall', contractClock(), store)
     }
-    await contracts.markRecallAcked(record.id)
+    await store.markRecallAcked(record.id)
     sendRecallAck(packet.deviceId, record.id, true, null)
     refreshContractViews()
   }
@@ -4284,24 +4306,26 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-recall-ack（我是雇工侧）：对方已结束，本地镜像也该回家。 */
   async function handleWorkRecallAck (packet) {
-    if (contracts === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null) return
+    const store = contracts
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'incoming') return
     const record = found.record
-    await contracts.markRecallAcked(record.id)
+    await store.markRecallAcked(record.id)
     contractRetryAt.delete('recall:' + record.id)
     if (packet.ok === true && record.status === 'active') {
-      await endIncomingContract(record, 'recall', contractClock())
+      await endIncomingContract(record, 'recall', contractClock(), store)
     }
     refreshContractViews()
   }
 
   /** 收到 work-end（我是雇工侧）：幂等结束；找不到也回 ok，避免重试风暴。 */
   async function handleWorkEnd (packet) {
-    if (contracts === null) return
+    if (disposed || contracts === null) return
+    const store = contracts
     const found = packet.contractId !== undefined
-      ? contractFound(packet.contractId)
-      : contractByRequest(packet.requestId)
+      ? contractFound(packet.contractId, store)
+      : contractByRequest(packet.requestId, store)
     if (found === null) {
       sendWorkEndAckPacket(packet.deviceId, {
         contractId: packet.contractId,
@@ -4312,10 +4336,10 @@ export function createService (ctx, options = {}) {
     }
     const record = found.record
     if (found.side === 'incoming' && record.status === 'active') {
-      await endIncomingContract(record, packet.reason === 'cancelled' ? 'cancelled' : packet.reason, contractClock())
+      await endIncomingContract(record, packet.reason === 'cancelled' ? 'cancelled' : packet.reason, contractClock(), store)
     }
     if (found.side === 'outgoing' && record.status === 'active') {
-      await endOutgoingContract(record, packet.reason, contractClock())
+      await endOutgoingContract(record, packet.reason, contractClock(), store)
     }
     sendWorkEndAckPacket(packet.deviceId, {
       contractId: record.id,
@@ -4336,8 +4360,15 @@ export function createService (ctx, options = {}) {
    * 已结算/崩溃窗口（settleStartedAt 存在）都按「已经入过账」处理（fail-closed）。
    */
   async function handleWorkSettle (packet) {
-    if (contracts === null || farm === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null || farm === null) return
+    // 票 122：入口先抓 store 的局部引用，之后整条路径只认这两个局部变量。
+    // 这一笔要跨三个 await（写 settling → 入账 → 写 settled），中途 dispose() 会把
+    // 模块级 `contracts`/`farm` 置空；旧写法在恢复执行后读到 null，抛出
+    // “Cannot read properties of null (reading 'finishSettle')”，成了一笔在用例结束后
+    // 还在跑的悬空调用。现在要么用局部引用把这一整笔写完，要么在入口就不开始。
+    const store = contracts
+    const farmStore = farm
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'incoming') {
       sendWorkSettleAckPacket(packet.deviceId, {
         contractId: packet.contractId,
@@ -4376,20 +4407,20 @@ export function createService (ctx, options = {}) {
       const earned = earnedFor(record.wage, servedMs, contractMs)
       if (record.settleStartedAt !== null) {
         // 上次写完 settling 意图就崩了：按已入账处理，绝不重复铸币。
-        await contracts.finishSettle(record.id, {
+        await store.finishSettle(record.id, {
           earned: record.earned,
           servedMs: record.settleServedMs,
           settledAt: contractClock(),
           reason: settleReasonOf(record.endReason)
         })
       } else {
-        await contracts.beginSettle(record.id, {
+        await store.beginSettle(record.id, {
           requestId: packet.requestId,
           servedMs,
           earned,
           reason: settleReasonOf(record.endReason)
         })
-        const credited = await farm.addCoins(earned)
+        const credited = await farmStore.addCoins(earned)
         if (credited.ok !== true) {
           warnOnce('settle:' + record.id,
             '结算入账失败（' + (credited.error ?? 'unknown') + '），保持 settling 等重试')
@@ -4401,24 +4432,24 @@ export function createService (ctx, options = {}) {
           })
           return
         }
-        await contracts.finishSettle(record.id, {
+        await store.finishSettle(record.id, {
           earned,
           servedMs,
           settledAt: contractClock(),
           reason: settleReasonOf(record.endReason)
         })
       }
-      const settled = contractFound(record.id)?.record ?? record
+      // 钱和账都已写全；后面只是本地镜像、文案和回包，关停时到此收手。
+      if (disposed) return
+      const settled = contractFound(record.id, store)?.record ?? record
       if (room.outboundWork() !== null && room.outboundWork().contractId === record.id) {
         room.endWorking(record.id, { at: contractClock(), reason: 'completed' })
       }
-      if (farm !== null) {
-        await farm.noteSettle({
-          who: record.employerNickname,
-          wage: record.wage,
-          earned: settled.earned
-        })
-      }
+      await farmStore.noteSettle({
+        who: record.employerNickname,
+        wage: record.wage,
+        earned: settled.earned
+      })
       room.noteFarmEvent('结算完成：拿到 ' + settled.earned + ' 硬币。')
       sendWorkSettleAckPacket(packet.deviceId, {
         contractId: record.id,
@@ -4435,8 +4466,13 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-settle-ack（我是雇主）：按雇工主人算出的 earned 退款一次。 */
   async function handleWorkSettleAck (packet) {
-    if (contracts === null || farm === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null || farm === null) return
+    // 票 122：入口抓局部引用（理由见 handleWorkSettle 的注释）。这一笔的退款和
+    // finished 标记必须落在同一个局部账本上，否则关停时会出现「退了款、没 settled」
+    // 或「没退款、标了 settled」的半条账。
+    const store = contracts
+    const farmStore = farm
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'outgoing') return
     const record = found.record
     if (record.settleRequestId !== null && record.settleRequestId !== packet.requestId) return
@@ -4451,7 +4487,7 @@ export function createService (ctx, options = {}) {
     const earned = Math.min(record.wage, Math.max(0, Math.floor(Number(packet.earned) || 0)))
     if (record.refunded) {
       // 退款已经写进 WAL（崩溃在写 settledAt 之前）：只补 settled 标记，不再退款。
-      await contracts.finishSettle(record.id, {
+      await store.finishSettle(record.id, {
         earned,
         servedMs: record.settleServedMs,
         settledAt: contractClock(),
@@ -4461,16 +4497,16 @@ export function createService (ctx, options = {}) {
       refreshContractViews()
       return
     }
-    await refundOutgoingOnce(record, refundFor(record.wage, earned))
-    await contracts.finishSettle(record.id, {
+    await refundOutgoingOnce(store, farmStore, record, refundFor(record.wage, earned))
+    await store.finishSettle(record.id, {
       earned,
       servedMs: record.settleServedMs,
       settledAt: contractClock(),
       reason: settleReasonOf(record.endReason)
     })
-    if (farm !== null) {
-      await farm.noteSettle({ who: record.workerNickname, wage: record.wage, earned })
-    }
+    // 钱和账都已写全；后面只是本地文案和界面，关停时到此收手。
+    if (disposed) return
+    await farmStore.noteSettle({ who: record.workerNickname, wage: record.wage, earned })
     contractRetryAt.delete(record.id)
     refreshContractViews()
     sendMarketDigest({ force: true })
@@ -4480,10 +4516,12 @@ export function createService (ctx, options = {}) {
   // 合同的结束/结算/巡检/重启对账
   // -------------------------------------------------------------------------
 
-  async function endOutgoingContract (record, reason, endedAt) {
-    if (contracts === null) return
+  // endOutgoing/endIncoming 的最后一个参数是入口抓的 store（票 122）：关停后
+  // 模块级 `contracts` 已是 null，但这一笔「结束」还得用局部引用落盘。
+  async function endOutgoingContract (record, reason, endedAt, store = contracts) {
+    if (store === null) return
     const id = record.id
-    const ended = await contracts.end(id, { endedAt, reason })
+    const ended = await store.end(id, { endedAt, reason })
     if (ended) {
       room.endWorker(id, { at: endedAt, reason })
       contractRetryAt.delete(id)
@@ -4493,10 +4531,10 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  async function endIncomingContract (record, reason, endedAt) {
-    if (contracts === null) return
+  async function endIncomingContract (record, reason, endedAt, store = contracts) {
+    if (store === null) return
     const id = record.id
-    const ended = await contracts.end(id, { endedAt, reason })
+    const ended = await store.end(id, { endedAt, reason })
     if (ended) {
       room.endWorking(id, { at: endedAt, reason })
       contractRetryAt.delete(id)
@@ -4520,7 +4558,9 @@ export function createService (ctx, options = {}) {
   async function sendSettle (id) {
     if (contracts === null || discovery === null || identity === null) return false
     if (settleSending.has(id)) return false
-    const found = contractFound(id)
+    // 票 122：抓局部引用——beginSettle 之后还要发报，这期间 dispose 可能把模块级变量置空。
+    const store = contracts
+    const found = contractFound(id, store)
     if (found === null || found.side !== 'outgoing') return false
     const record = found.record
     if (record.status !== 'ended' || record.settledAt !== null) return false
@@ -4530,13 +4570,15 @@ export function createService (ctx, options = {}) {
       let settleRequestId = record.settleRequestId
       if (settleRequestId === null) {
         settleRequestId = randomUUID()
-        await contracts.beginSettle(id, {
+        await store.beginSettle(id, {
           requestId: settleRequestId,
           servedMs: numbers.servedMs,
           earned: numbers.earned,
           reason: numbers.reason
         })
       }
+      // 关停已经开始：settleRequestId 已经落盘，下次启动由重启对账补发，这一拍不再发。
+      if (disposed || discovery === null || identity === null) return false
       try {
         const data = encodeWorkSettle({
           deviceId: identity.deviceId,
@@ -4607,23 +4649,27 @@ export function createService (ctx, options = {}) {
    */
   async function reconcileContractsOnStart () {
     if (contracts === null) return
+    // 票 122：这里的 await 链比启动还长，一律用入口抓的局部引用；宿主在这期间
+    // 调 dispose() 也不会把写了一半的账打断。
+    const store = contracts
+    const farmStore = farm
     const now = contractClock()
     contractsReadyAt = now
-    for (const record of contracts.pendingOutgoing()) {
+    for (const record of store.pendingOutgoing()) {
       if (record.charged && !record.refunded) {
-        await refundOutgoingOnce(record, record.wage + record.fee)
+        await refundOutgoingOnce(store, farmStore, record, record.wage + record.fee)
       } else if (!record.charged) {
         warn(ctx, '有一笔雇佣在扣钱前崩溃：按 fail-closed 不退款，合同已取消')
       }
-      await contracts.cancelOutgoing(record.requestId, 'restart')
+      await store.cancelOutgoing(record.requestId, 'restart')
     }
-    for (const record of contracts.outgoing()) {
+    for (const record of store.outgoing()) {
       if (record.refundStartedAt !== null && record.refunded !== true) {
         // 写了 refunding 就崩：钱可能已经到账，绝不再退一次；结算标记也补齐，
         // 否则 ended 合同会被巡检当成「还没结算」重发到天荒地老。
-        await contracts.markRefunded(record.id, { amount: record.refundAmount, at: now })
+        await store.markRefunded(record.id, { amount: record.refundAmount, at: now })
         if (record.status === 'ended' && record.settledAt === null) {
-          await contracts.finishSettle(record.id, {
+          await store.finishSettle(record.id, {
             earned: record.earned,
             servedMs: record.settleServedMs,
             settledAt: now,
@@ -4632,9 +4678,9 @@ export function createService (ctx, options = {}) {
         }
       }
     }
-    for (const record of contracts.activeOutgoing()) {
+    for (const record of store.activeOutgoing()) {
       if (now >= record.endsAt) {
-        await endOutgoingContract(record, 'expired', record.endsAt)
+        await endOutgoingContract(record, 'expired', record.endsAt, store)
         continue
       }
       const begun = room.beginWorker({
@@ -4648,12 +4694,12 @@ export function createService (ctx, options = {}) {
       })
       if (begun.ok !== true) {
         warn(ctx, '重启后恢复雇工失败（' + begun.error + '），合同按离线结束')
-        await endOutgoingContract(record, 'offline', record.lastSeenAt)
+        await endOutgoingContract(record, 'offline', record.lastSeenAt, store)
       }
     }
-    for (const record of contracts.activeIncoming()) {
+    for (const record of store.activeIncoming()) {
       if (now >= record.endsAt) {
-        await endIncomingContract(record, 'expired', record.endsAt)
+        await endIncomingContract(record, 'expired', record.endsAt, store)
         continue
       }
       const begun = room.beginWorking({
@@ -4667,13 +4713,13 @@ export function createService (ctx, options = {}) {
       })
       if (begun.ok !== true) {
         warn(ctx, '重启后恢复打工状态失败（' + begun.error + '），合同按离线结束')
-        await endIncomingContract(record, 'offline', record.lastSeenAt)
+        await endIncomingContract(record, 'offline', record.lastSeenAt, store)
       }
     }
-    for (const record of contracts.incoming()) {
+    for (const record of store.incoming()) {
       if (record.settleStartedAt !== null && record.settledAt === null && record.status === 'ended') {
         // 崩溃在「写完 settling 意图、还没入账/没写 settledAt」之间：按已入账处理。
-        await contracts.finishSettle(record.id, {
+        await store.finishSettle(record.id, {
           earned: record.earned,
           servedMs: record.settleServedMs,
           settledAt: now,
@@ -9579,6 +9625,8 @@ export function createService (ctx, options = {}) {
     /** 票 120 的测试/诊断缝：串门视图（与 `/dsh-zoo-farm/<visitId>` 同源）。 */
     visitFarm: (visitId) => lookupFarmView(visitId),
     farmGuard: () => farmGuard(),
+    /** 票 122 的测试/诊断缝：合同账本本身（e2e 用它把一笔结算卡在中间，再关停）。 */
+    contractsStore: () => contracts,
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),
     /** 本机 UDP 实际绑定端口（`port:0` 的测试用它拿到临时端口）。 */
@@ -9626,6 +9674,10 @@ export function createService (ctx, options = {}) {
       }
       // ticket 44：先把 active 合同落成 ended（尽力而为；写盘失败也只告警一次），
       // 再放开 store。钱的标记保持不变，下一次启动按对账规则收尾。
+      // 票 122：在飞的结算/退款不会被这里打断——它们各自在入口抓了 store 的局部引用，
+      // 会把「写 settling → 入账 → 写 settled」这一整笔写完；ContractStore 里已经排上
+      // 队的写也会自己落盘（store 没有 close，丢引用只是让新写不再开始）。
+      // 也就是说：dispose 保证「不再开新的一笔」，不保证「等旧的一笔」。
       if (contracts !== null) {
         contracts.endAllActive(contractClock(), 'shutdown').catch((error) => {
           warn(ctx, '卸载时结束合同失败：' + message(error))

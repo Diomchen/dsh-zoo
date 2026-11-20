@@ -329,3 +329,139 @@ test('雇工那台机器时钟快 30 分钟：雇主看到的合同时长仍是 
   assert.ok(remainingMin > 118 && remainingMin <= 120,
     '雇主窗口「还剩」应该 ≈120 分钟，实际 ' + remainingMin.toFixed(1) + ' 分钟')
 })
+
+// ---------------------------------------------------------------------------
+// 票 122：结算跑到一半被关停
+// ---------------------------------------------------------------------------
+
+/** 给等待加个上限：闸门等不到就立刻失败，别把整份文件挂死。 */
+function withTimeout (promise, ms, message) {
+  let timer = null
+  const timeout = new Promise((resolve, reject) => {
+    // 故意不 unref：等的这段时间事件循环里可能只剩这一个定时器了。
+    timer = setTimeout(() => reject(new Error(message)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
+/**
+ * 把账本的某个写方法临时接一段闸门：先跑真方法，再卡住。
+ * 这样「卡在哪一步」是确定的（不靠 sleep 碰运气），闸门由测试手动放开。
+ */
+function gateAfter (store, method) {
+  let open = null
+  const opened = new Promise((resolve) => { open = resolve })
+  let arrived = null
+  const reached = new Promise((resolve) => { arrived = resolve })
+  const original = store[method].bind(store)
+  store[method] = async (...args) => {
+    const result = await original(...args)
+    arrived()
+    await opened
+    return result
+  }
+  return { reached, release: () => open() }
+}
+
+/** 只在本用例里收集 unhandledRejection（不是生产吞异常，是为了把悬空调用抓成断言）。 */
+function collectRejections (t) {
+  const seen = []
+  const listener = (reason) => { seen.push(reason) }
+  process.on('unhandledRejection', listener)
+  t.after(() => process.off('unhandledRejection', listener))
+  return seen
+}
+
+/**
+ * 票 122：关停把模块级的 `contracts`/`farm` 置空，可一笔结算要跨好几个 await
+ * （写 settling → 入账 → 写 settled）。旧写法恢复执行后还去读模块级变量，于是抛出
+ * `Cannot read properties of null (reading 'finishSettle')`——onPeer 里是
+ * `void handleWorkSettleAck(packet)`，没人接这个 promise，它就成了用例结束后才炸的
+ * unhandledRejection，整份文件跟着 not ok。
+ *
+ * 雇主侧：卡在「退款已经落盘、settledAt 还没写」这个 WAL 中间点（紧接着就是
+ * finishSettle），关停后放开闸门。
+ */
+test('结算中途关停（雇主侧）：不留悬空调用，也不留半条账', async (t) => {
+  const rejections = collectRejections(t)
+  const { a, b, bId } = await connectedPair(t)
+  await listOn(b, { wagePerHour: 5, minHours: 2, maxHours: 4 })
+  await hireFrom(a, b, bId, 2)
+
+  const store = a.contractsStore()
+  assert.ok(store, '应该能拿到雇主侧的合同账本')
+  const gate = gateAfter(store, 'markRefunded')
+
+  const incoming = b.snapshot().contracts.incoming[0]
+  const recalled = await callAction(b, { action: 'recall-worker', contractId: incoming.id })
+  assert.equal(recalled.body.ok, true, JSON.stringify(recalled.body))
+  await withTimeout(gate.reached, 10_000, '雇主的结算应该走到「退款已落盘」之后')
+
+  const frozen = store.outgoing()[0]
+  assert.equal(frozen.refunded, true, '卡住时退款已经落盘')
+  assert.equal(frozen.settledAt, null, '卡住时还没写 settledAt')
+
+  a.dispose()
+  gate.release()
+
+  // 修复前：恢复执行后读模块级 contracts（已是 null）→ TypeError → unhandledRejection。
+  await delay(200)
+  assert.deepEqual(rejections.map((error) => String(error)), [], '关停后不该再有悬空调用')
+  // 账要么没动，要么写全：退款标记在，settledAt 也得补上（不留半条）。
+  await waitFor(() => (store.outgoing()[0]?.settledAt ?? null) !== null, 5000)
+  const settled = store.outgoing()[0]
+  assert.equal(settled.refunded, true)
+  assert.ok(settled.refundAmount > 0, '退款额应该留在账上')
+  assert.equal(settled.status, 'ended')
+})
+
+/**
+ * 雇工侧：卡在「settling 意图已经落盘、还没入账」这个 WAL 中间点（紧接着就是
+ * `farm.addCoins`），关停后放开闸门。修复前抛的是 `... (reading 'addCoins')`。
+ *
+ * 这一单的工时几乎为零，earned 就是 0，farm 的 addCoins(0) 本来就返回 bad-qty——
+ * 所以正常跑也不会真的入账，账停 WAL 的 settling 中间点等重试/重启对账收尾。
+ * 关停把重试也一并停掉，于是「关停那一刻的账」必须仍可恢复：settling 意图在、
+ * 钱一分没动；用同一个 dataDir 重开一台，重启对账要按 fail-closed 把 settledAt 补齐
+ * （不重复入账、也不留半条）。
+ */
+test('结算中途关停（雇工侧）：不留悬空调用，也不留半条账', async (t) => {
+  const rejections = collectRejections(t)
+  const { a, b, dirB, bId } = await connectedPair(t)
+  await listOn(b, { wagePerHour: 5, minHours: 2, maxHours: 4 })
+  await hireFrom(a, b, bId, 2)
+
+  const store = b.contractsStore()
+  assert.ok(store, '应该能拿到雇工侧的合同账本')
+  const gate = gateAfter(store, 'beginSettle')
+
+  const incoming = b.snapshot().contracts.incoming[0]
+  const recalled = await callAction(b, { action: 'recall-worker', contractId: incoming.id })
+  assert.equal(recalled.body.ok, true, JSON.stringify(recalled.body))
+  await withTimeout(gate.reached, 10_000, '雇工的结算应该走到「settling 已落盘」之后')
+
+  const frozen = store.incoming()[0]
+  assert.notEqual(frozen.settleStartedAt, null, '卡住时 settling 意图已经落盘')
+  assert.equal(frozen.settledAt, null, '卡住时还没结算')
+
+  b.dispose()
+  gate.release()
+
+  // 修复前：恢复执行后读模块级 farm（已是 null）→ TypeError → unhandledRejection。
+  await delay(200)
+  assert.deepEqual(rejections.map((error) => String(error)), [], '关停后不该再有悬空调用')
+  const left = store.incoming()[0]
+  assert.equal(left.settledAt, null, '关停那一刻：结算标记还没写')
+  assert.notEqual(left.settleStartedAt, null, '关停那一刻：settling 意图留在盘上，重启能收尾')
+  assert.equal(left.earned, 0, '关停那一刻：钱没动')
+
+  // 同一个 dataDir 重开一台：重启对账按 fail-closed 补 settledAt，不重复入账。
+  const again = makeService(t, optionsFor(dirB, 0, 0))
+  await again.ready
+  const store2 = again.contractsStore()
+  assert.ok(store2, '重开的服务也应该有合同账本')
+  await waitFor(() => (store2.incoming()[0]?.settledAt ?? null) !== null, 5000)
+  const recovered = store2.incoming()[0]
+  assert.equal(recovered.status, 'ended')
+  assert.equal(recovered.earned, 0, '补齐的是标记，不是再入一次账')
+})
