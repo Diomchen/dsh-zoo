@@ -194,13 +194,13 @@
   <header>
     <span class="brand">出远门</span>
     <span class="coins">硬币 <b id="coins">0</b></span>
-    <button class="winClose" id="close" title="关窗">×</button>
+    <button class="winClose" id="close" title="关窗" aria-label="关闭出远门窗口">×</button>
   </header>
-  <nav class="tabs" id="tabs">
-    <button class="tab active" id="tabTravel" data-tab="travel">出远门</button>
-    <button class="tab" id="tabLog" data-tab="log">日志</button>
-    <button class="tab" id="tabCodex" data-tab="codex">图鉴 <span class="badge" id="codexCount">0/32</span></button>
-    <button class="tab" id="tabShelf" data-tab="shelf">陈列架 <span class="badge" id="shelfCount">8/32</span></button>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="出远门页签">
+    <button class="tab active" id="tabTravel" data-tab="travel" role="tab" aria-selected="true" aria-controls="travelPane">出远门</button>
+    <button class="tab" id="tabLog" data-tab="log" role="tab" aria-selected="false" aria-controls="logPane">日志</button>
+    <button class="tab" id="tabCodex" data-tab="codex" role="tab" aria-selected="false" aria-controls="codex">图鉴 <span class="badge" id="codexCount">0/32</span></button>
+    <button class="tab" id="tabShelf" data-tab="shelf" role="tab" aria-selected="false" aria-controls="shelf">陈列架 <span class="badge" id="shelfCount">8/32</span></button>
   </nav>
   <main>
     <div id="travelPane">
@@ -275,7 +275,7 @@
       </div>
     </section>
   </main>
-  <footer><span id="toast"></span></footer>
+  <footer><span id="toast" role="status" aria-live="polite"></span></footer>
 </div>
 <script src="shared.js"></script>
 <script src="expedition-view.js"></script>

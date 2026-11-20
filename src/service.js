@@ -9888,8 +9888,9 @@ export function createService (ctx, options = {}) {
       farm = null
       // 出远门：先放开队列再丢引用，卸载后不再写 expedition.json。
       // dispose 是异步的（等排队的写盘落完）；服务卸载本身是同步的，这里只能放手——
-      // 队列里那一拍会自己落完，不必让卸载等它。
-      void expedition?.dispose()
+      // 队列里那一拍会自己落完，不必让卸载等它。挂个 catch 只是别让它变成
+      // 未处理的 rejection；进程立刻退出时最后一拍仍可能丢，已记在文档的已知问题里。
+      Promise.resolve(expedition?.dispose()).catch(() => {})
       expedition = null
       // tick 会随 farmTimer 一起停，但 store 引用也要放开：卸载后不该再写盘。
       trading = null

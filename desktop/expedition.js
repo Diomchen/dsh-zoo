@@ -354,6 +354,7 @@
       button.dataset.locked = String(cell.locked)
       button.dataset.empty = String(cell.empty)
       button.dataset.selected = String(selectedSlot === cell.slot)
+      button.dataset.focusKey = 'shelf:' + String(cell.slot)
       const no = document.createElement('span')
       no.className = 'shelfSlotNo'
       no.textContent = String(cell.slot)
@@ -435,6 +436,7 @@
       button.className = 'routeCard'
       button.dataset.locked = card.locked ? 'true' : 'false'
       button.dataset.active = selected !== null && card.id === selected.id ? 'true' : 'false'
+      button.dataset.focusKey = 'route:' + card.id
 
       const name = document.createElement('span')
       name.className = 'name'
@@ -463,7 +465,30 @@
     }
   }
 
+  /**
+   * 重绘是「清空再建」，键盘焦点会掉回 body（2026-11-20 审计）。
+   * 做法：重建前记下焦点元素的 `data-focus-key`，重建后按同一把钥匙还回去。
+   * 键只给会被重建的可点元素（路线卡、陈列格），页签不重建、不需要。
+   */
+  function focusKeyOf (node) {
+    if (node === null || node === undefined || node.dataset === undefined) return null
+    const key = node.dataset.focusKey
+    return typeof key === 'string' && key !== '' ? key : null
+  }
+
+  function restoreFocus (key) {
+    if (key === null) return
+    const next = document.querySelector('[data-focus-key="' + key + '"]')
+    if (next !== null && typeof next.focus === 'function') next.focus()
+  }
+
   function paint () {
+    const focusKey = focusKeyOf(document.activeElement)
+    paintInner()
+    restoreFocus(focusKey)
+  }
+
+  function paintInner () {
     const run = state === null ? null : state.run
     const route = activeRoute()
     const codexView = state === null ? null : state.codexView
