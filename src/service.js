@@ -6581,6 +6581,14 @@ export function createService (ctx, options = {}) {
         plotId: event.plotId ?? undefined,
         cropId: event.cropId ?? undefined,
         visitId: event.visitId ?? undefined,
+        // 出远门（票 112 / 115）：出发带路线 id；陈列架开格/摆件/挪格/取下带格子与两端。
+        // 少抄这五行，窗口点「交 500 盘缠，出发」只会收到「没有这条路线。」——routeId
+        // 在这一跳变成 undefined，而 HTTP 那条路直读 body，所以 e2e 全绿也照漏（2026-11-20 实测）。
+        routeId: event.routeId ?? undefined,
+        slot: event.slot ?? undefined,
+        itemId: event.itemId ?? undefined,
+        moveFrom: event.moveFrom ?? undefined,
+        moveTo: event.moveTo ?? undefined,
         // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
         qty: event.qty ?? undefined,
         // 票 53：派它去偷时带的地块列表（`farm-raid` 才用；白名单在 shared 已经过一遍）。
