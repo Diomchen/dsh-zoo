@@ -522,8 +522,24 @@ export function createService (ctx, options = {}) {
   let futuresLedgerTick = 0
   /** 票 94：非房主上次 sync 的时刻。 */
   let futuresSyncAt = 0
+  /** 票 121：上次对账的**真实**时刻（假时钟下 game 时钟不走，节流会卡死对账）。 */
+  let futuresSyncWallAt = 0
   /** 票 94：最近一次给我们发账目的房主（窗口上显示用；只在内存里）。 */
   let futuresHostSeen = null
+  /**
+   * 票 121：peer 侧还没被房主确认的申报。`hostId → [{ kind, at, data, sentAt, tries }]`。
+   *
+   * 为什么要有：申报走 UDP、只发一次，丢一包就等于这笔单子悄悄没了——用户看到「已发给房主，
+   * 等一拍回执」，然后永远等不到。现在每笔申报在这里留一份，房主随 settle 带 `ackAt` 回执，
+   * 回执越过它才删；没越过就按 `FUTURES_RETRY_MS` 补发。补发次数只是兜底，真正收口靠回执。
+   */
+  const futuresOutbox = new Map()
+  /** 票 121：房主侧「这个 peer 的申报已经处理到哪个 at」，随 settle 回给对端。 */
+  const futuresAcks = new Map()
+  /** 票 121：房主侧已处理过的申报（`deviceId|kind|at`），补发包进来照样回执、不重复记账。 */
+  const futuresAppliedCommands = new Map()
+  /** 票 121：本机申报的 `at` 单调递增——假时钟下 `futuresClock()` 会停在原地，撞号就分不清两笔。 */
+  let futuresCommandAt = 0
   /** 票 107：每个 peer 最近一次资金流同步请求的时刻（5 分钟节流）。 */
   const boardFlowSyncAt = new Map()
   /** 票 98：同源地址的期货报文计数：address → { start, count }（10 秒窗口）。 */
@@ -7368,9 +7384,105 @@ export function createService (ctx, options = {}) {
     return true
   }
 
+  /**
+   * 票 121：本机申报的 `at` 单调递增。假时钟下 `futuresClock()` 可能停在原地，
+   * 两笔申报撞同一个 at，房主按 at 去重就会把那两笔当成一笔。
+   */
+  function nextFuturesCommandAt () {
+    const now = futuresClock()
+    futuresCommandAt = Math.max(futuresCommandAt + 1, now)
+    return futuresCommandAt
+  }
+
+  /** 票 121：把一笔申报记进 outbox——半路丢了还能补，补到房主回执为止。 */
+  function futuresQueueCommand (hostId, kind, at, data) {
+    if (disposed || hostId === null) return
+    const queue = futuresOutbox.get(hostId) ?? []
+    queue.push({ kind, at, data, sentAt: Date.now(), tries: 0 })
+    // 只留最近 8 笔：更老的申报房主本来也会按新账拒掉，补发只是白费带宽。
+    while (queue.length > 8) queue.shift()
+    futuresOutbox.set(hostId, queue)
+  }
+
+  /** 票 121：房主回执说「处理到 ackAt 了」，那之前的申报可以从 outbox 划掉。 */
+  function futuresPruneOutbox (hostId, ackAt) {
+    if (!Number.isFinite(ackAt) || ackAt <= 0) return
+    const queue = futuresOutbox.get(hostId)
+    if (!Array.isArray(queue) || queue.length === 0) return
+    const kept = queue.filter((entry) => entry.at > ackAt)
+    if (kept.length === 0) futuresOutbox.delete(hostId)
+    else futuresOutbox.set(hostId, kept)
+  }
+
+  /**
+   * 票 121：每个期货 tick 补发还没被确认的申报。回执正常时这里什么都不做——
+   * 让队列变短的是房主带回来的 `ackAt`，不是这个函数。
+   */
+  function retryFuturesCommands () {
+    if (disposed || futuresOutbox.size === 0) return
+    const now = Date.now()
+    for (const [hostId, queue] of futuresOutbox) {
+      const kept = []
+      for (const entry of queue) {
+        if (now - entry.sentAt < FUTURES_RETRY_MS) { kept.push(entry); continue }
+        // 兜底：房主一直不回执（例如它还是老版本），别把同一笔喂到天荒地老。
+        if (entry.tries >= FUTURES_RETRY_MAX) continue
+        entry.tries += 1
+        entry.sentAt = now
+        try {
+          discovery?.sendTo(hostId, entry.data)
+        } catch (error) {
+          warnOnce('futures-retry', '期货申报补发失败：' + message(error))
+        }
+        kept.push(entry)
+      }
+      if (kept.length === 0) futuresOutbox.delete(hostId)
+      else futuresOutbox.set(hostId, kept)
+    }
+  }
+
+  /** 房主侧：记下「这个 peer 的申报处理到哪了」，随下一条 settle 回给对端。 */
+  function futuresAckCommand (deviceId, at) {
+    if (!Number.isFinite(at) || at <= 0) return
+    const seen = futuresAcks.get(deviceId) ?? 0
+    if (at > seen) futuresAcks.set(deviceId, at)
+  }
+
+  /**
+   * 房主侧：对端没收到回执就会重发，所以同一笔申报会来好几次。
+   * 返回 false = 这笔已经处理过，只需要把回执再发一遍，绝不能再落一次账。
+   */
+  function futuresCommandIsNew (deviceId, kind, at) {
+    const key = deviceId + '|' + kind + '|' + at
+    if (futuresAppliedCommands.has(key)) return false
+    futuresAppliedCommands.set(key, at)
+    // 只留最近 256 条：账本本身有 epoch/seq，这里防的只是短时间内的重发。
+    if (futuresAppliedCommands.size > 256) {
+      futuresAppliedCommands.delete(futuresAppliedCommands.keys().next().value)
+    }
+    return true
+  }
+
+  /** 票 121：补发的节流与上限。真实环境 15 秒一拍，40 次就是十分钟的重试窗口。 */
+  const FUTURES_RETRY_MS = 60
+  const FUTURES_RETRY_MAX = 40
+
+  /**
+   * 票 121 的测试缝：`options.futuresDropWire(info)` 返回 true 时这一包**当作丢了**——
+   * 不真发，但 outbox 照记、tick 照补。没有真实丢包网卡的环境靠它验补发。
+   */
+  function futuresSendWire (hostId, data, info) {
+    if (typeof options.futuresDropWire === 'function' && options.futuresDropWire(info) === true) return true
+    try {
+      return discovery.sendTo(hostId, data) === true
+    } catch (error) {
+      warnOnce('futures-wire', '期货报文发不出去：' + message(error))
+      return false
+    }
+  }
+
   /** 房主侧：现算某个 deviceId 的账目，编成一条 `futures-settle`。 */
-  function futuresSettleBytes (deviceId, delta = 0) {
-    const at = futuresClock()
+  function futuresSettleBytes (deviceId, delta = 0) {    const at = futuresClock()
     const account = futures.accountOf(deviceId, { at })
     const positions = account.positions.map((position) => ({
       id: position.id,
@@ -7431,7 +7543,9 @@ export function createService (ctx, options = {}) {
       // 1.12.4：做市商净盈亏（房主账本的全局数），peer 窗口显示「系统净付出」。
       house: fund.house,
       // 1.13.1：还没被这台机器收下的放款。它会跟着后面几拍重复发，peer 按 `at` 去重。
-      payout: account.payout ?? null
+      payout: account.payout ?? null,
+      // 票 121：告诉对端「你的申报我处理到哪个 at 了」，它据此清掉 outbox。
+      ackAt: futuresAcks.get(deviceId) ?? 0
     }
     // 票 96：整包硬上限 4 KiB。满仓 + 满挂单时 8 条流水可能塞不下，逐条减到能发为止。
     for (let keep = trades.length; keep >= 0; keep -= 1) {
@@ -7445,8 +7559,7 @@ export function createService (ctx, options = {}) {
   }
 
   /** 房主侧：把最新账目推给一台 hello 过的对端。没绑定的邻居一个字节都不发。 */
-  function sendFuturesSettle (deviceId, { delta = 0 } = {}) {
-    if (disposed || futures === null || discovery === null) return false
+  function sendFuturesSettle (deviceId, { delta = 0 } = {}) {    if (disposed || futures === null || discovery === null) return false
     // 票 98：off 时出站一律不发，连已经绑定的邻居也不再推账。
     if (!isFuturesHost()) return false
     if (!futuresPeers.has(deviceId)) return false
@@ -7499,10 +7612,11 @@ export function createService (ctx, options = {}) {
     const host = futuresHostId()
     if (host === null || host === room.snapshot().self.deviceId) return false
     let data
+    const at = nextFuturesCommandAt()
     try {
       data = encodeFuturesWithdraw({
         deviceId: room.snapshot().self.deviceId,
-        at: futuresClock(),
+        at,
         coins,
         now: Date.now()
       })
@@ -7510,12 +7624,9 @@ export function createService (ctx, options = {}) {
       warnOnce('futures-withdraw-send', '提现申请发不出去：' + message(error))
       return false
     }
-    try {
-      return discovery.sendTo(host, data) === true
-    } catch (error) {
-      warnOnce('futures-withdraw-send', '提现申请发不出去：' + message(error))
-      return false
-    }
+    // 票 121：提现比别的申报更不能丢——丢了就是「申请了但钱永远不到」。
+    futuresQueueCommand(host, 'withdraw', at, data)
+    return futuresSendWire(host, data, { type: 'futures-withdraw', kind: 'withdraw', at }) === true
   }
 
   /**
@@ -7673,6 +7784,11 @@ export function createService (ctx, options = {}) {
     if (disposed || futures === null || !isFuturesHost()) return
     if (!room.mayTalkTo(packet.deviceId)) return
     if (!futuresBindPeer(packet.deviceId, from)) return
+    // 票 121：补发的同一条申报只落一次账；但回执照样要再发一遍，否则对端会一直补。
+    if (!futuresCommandIsNew(packet.deviceId, 'order:' + String(packet.kind), packet.at)) {
+      sendFuturesSettle(packet.deviceId)
+      return
+    }
     const at = futuresClock()
     let result = null
     try {
@@ -7715,8 +7831,12 @@ export function createService (ctx, options = {}) {
     }
     if (result?.ok !== true) {
       warnOnce('futures-order-' + String(result?.error), '期货指令被拒：' + String(result?.error))
+      // 票 121：拒单也要回执——对端知道「这笔别补了」，账户里一分钱没动。
+      futuresAckCommand(packet.deviceId, packet.at)
+      sendFuturesSettle(packet.deviceId)
       return
     }
+    futuresAckCommand(packet.deviceId, packet.at)
     sendFuturesSettle(packet.deviceId, { delta: futuresOrderDelta(packet, result) })
   }
 
@@ -7729,6 +7849,11 @@ export function createService (ctx, options = {}) {
     if (!room.mayTalkTo(packet.deviceId)) return
     if (!futuresBindPeer(packet.deviceId, from)) return
     if (typeof packet.orderId !== 'string') return
+    // 票 121：撤单同样只落一次账；补发的重发只换回一份新回执。
+    if (!futuresCommandIsNew(packet.deviceId, 'cancel', packet.at)) {
+      sendFuturesSettle(packet.deviceId)
+      return
+    }
     let result = null
     try {
       result = await futures.hostCancel(packet.deviceId, { orderId: packet.orderId, at: futuresClock() })
@@ -7738,8 +7863,11 @@ export function createService (ctx, options = {}) {
     }
     if (result?.ok !== true) {
       warnOnce('futures-cancel-' + String(result?.error), '撤单被拒：' + String(result?.error))
+      futuresAckCommand(packet.deviceId, packet.at)
+      sendFuturesSettle(packet.deviceId)
       return
     }
+    futuresAckCommand(packet.deviceId, packet.at)
     sendFuturesSettle(packet.deviceId, { delta: roundCoin(Number(result.released) || 0) })
   }
 
@@ -7792,6 +7920,11 @@ export function createService (ctx, options = {}) {
     if (disposed || futures === null || !isFuturesHost()) return
     if (!room.mayTalkTo(packet.deviceId)) return
     if (!futuresBindPeer(packet.deviceId, from)) return
+    // 票 121：提现申请补发也只受理一次，否则同一笔会被扣两次。
+    if (!futuresCommandIsNew(packet.deviceId, 'withdraw', packet.at)) {
+      sendFuturesSettle(packet.deviceId)
+      return
+    }
     let result = null
     try {
       result = await futures.requestWithdraw(packet.deviceId, packet.coins, futuresClock())
@@ -7801,8 +7934,11 @@ export function createService (ctx, options = {}) {
     }
     if (result?.ok !== true) {
       warnOnce('futures-withdraw-' + String(result?.error), '提现申请被拒：' + String(result?.error))
+      futuresAckCommand(packet.deviceId, packet.at)
+      sendFuturesSettle(packet.deviceId)
       return
     }
+    futuresAckCommand(packet.deviceId, packet.at)
     // 不管成败都回一份账目：失败时 peer 也会拿到最新余额，窗口不至于停在旧数上。
     sendFuturesSettle(packet.deviceId)
   }
@@ -7889,6 +8025,8 @@ export function createService (ctx, options = {}) {
     }
     if (applied?.applied !== true) return
     futuresHostSeen = packet.deviceId
+    // 票 121：房主处理到哪笔了，就把那之前的申报从 outbox 划掉（补发到此为止）。
+    futuresPruneOutbox(packet.deviceId, packet.ackAt)
     // 1.13.1：放款到了就把币加进自家农场。`settlePayout()` 自己按 `at` 去重，
     // 所以同一笔跟着后面几拍重发也只加一次。
     void futures.settlePayout().then((payout) => {
@@ -7926,12 +8064,16 @@ export function createService (ctx, options = {}) {
   function syncFutures (now = futuresClock()) {
     if (disposed || futures === null || discovery === null) return false
     if (isFuturesHost()) return false
-    if (now - futuresSyncAt < futuresSyncMs) return false
+    // 票 121：对账的节流按**真实时间**算。以前用 game 时钟，测试里时钟是冻住的，
+    // 对完第一次就再也不对了——房主那一拍 settle 恰好丢包，peer 的账目就永远停在旧数。
+    const wall = Date.now()
+    if (wall - futuresSyncWallAt < futuresSyncMs) return false
     const replica = futures.replicaOf()
     const hostId = futuresHostId()
     if (hostId === null) return false
     if (replica === null) return announceFutures(now) > 0
     futuresSyncAt = now
+    futuresSyncWallAt = wall
     try {
       return discovery.sendTo(hostId, encodeFuturesSync({
         deviceId: room.snapshot().self.deviceId,
@@ -8085,20 +8227,20 @@ export function createService (ctx, options = {}) {
     const hostId = futuresHostId()
     if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     let data
+    const at = nextFuturesCommandAt()
     try {
       data = encodeFuturesOrder({
         deviceId: room.snapshot().self.deviceId,
-        at: futuresClock(),
+        at,
         ...order
       })
     } catch (error) {
       warnOnce('futures-order-encode', '期货指令发不出去：' + message(error))
       return { ok: false, error: 'bad-order' }
     }
-    try {
-      if (discovery.sendTo(hostId, data) !== true) return { ok: false, error: 'no-host' }
-    } catch (error) {
-      warnOnce('futures-order-send', '期货指令发不出去：' + message(error))
+    // 票 121：先记账再发。发丢了、回执丢了，tick 都会按 outbox 补发。
+    futuresQueueCommand(hostId, 'order', at, data)
+    if (futuresSendWire(hostId, data, { type: 'futures-order', kind: String(order.kind), at }) !== true) {
       return { ok: false, error: 'no-host' }
     }
     return { ok: true, action, pending: true, notice: '已发给房主，等一拍回执。' }
@@ -8114,20 +8256,20 @@ export function createService (ctx, options = {}) {
     const hostId = futuresHostId()
     if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     let data
+    const at = nextFuturesCommandAt()
     try {
       data = encodeFuturesCancel({
         deviceId: room.snapshot().self.deviceId,
-        at: futuresClock(),
+        at,
         orderId
       })
     } catch (error) {
       warnOnce('futures-cancel-encode', '撤单发不出去：' + message(error))
       return { ok: false, error: 'bad-order' }
     }
-    try {
-      if (discovery.sendTo(hostId, data) !== true) return { ok: false, error: 'no-host' }
-    } catch (error) {
-      warnOnce('futures-cancel-send', '撤单发不出去：' + message(error))
+    // 票 121：撤单也进 outbox，丢一包就等于单子没撤掉。
+    futuresQueueCommand(hostId, 'cancel', at, data)
+    if (futuresSendWire(hostId, data, { type: 'futures-cancel', kind: 'cancel', at }) !== true) {
       return { ok: false, error: 'no-host' }
     }
     return { ok: true, action: 'futures-cancel', pending: true, notice: '已发给房主，等一拍回执。' }
@@ -8483,6 +8625,8 @@ export function createService (ctx, options = {}) {
    */
   async function runFuturesTick () {
     if (futures === null || disposed) return
+    // 票 121：先补发没被确认的申报——它和结算无关，但不能等结算失败就跳过。
+    retryFuturesCommands()
     // 票 98：off 时连定时结算都停（账本保留，重新切回 live 不会被旧行情补刀）。
     let settled = null
     try {
