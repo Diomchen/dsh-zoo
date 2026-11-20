@@ -230,6 +230,24 @@ let futuresSeq = 0
 /** 期货窗拖动后延迟落盘的计时器。 */
 let futuresPositionTimer = null
 /**
+ * 出远门小窗（票 112）。和期货窗同一类独立窗口：同一套失焦收起、位置记忆、动作等待语义。
+ * 不同的是它展示的是「一趟走到哪、走了几段、要不要继续」，只读视图仍由宿主算好再下发。
+ */
+let expeditionWin = null
+/** 宿主交下来的整份出远门视图（阶段/已走段数/回币/路线），打开或刷新时原样转发。 */
+let expeditionState = null
+/** 票 120：这次开窗要落在哪个页签（只有 'shelf' 一种，发一次就清掉）。 */
+let expeditionTab = null
+/** 正在等宿主答复的那次出远门动作（action id）与它的计时器。 */
+let expeditionPending = null
+let expeditionTimer = null
+/** 最近一次报给宿主的出远门窗开关；只在真的变了时发。 */
+let lastExpeditionWindowOpen = null
+/** 出远门申请的流水号，只用于给 action id 起个不重复的名字。 */
+let expeditionSeq = 0
+/** 出远门窗拖动后延迟落盘的计时器。 */
+let expeditionPositionTimer = null
+/**
  * 四扇插件窗里正在输入法合成的 webContents id（ADR-0029 / 票 85）。
  * 候选窗抢焦点会触发 blur；只有 compositionstart..compositionend 之间不收起窗口。
  */
@@ -560,6 +578,7 @@ function pluginWindows () {
   const candidates = [
     { name: 'board', window: boardWin },
     { name: 'futures', window: futuresWin },
+    { name: 'expedition', window: expeditionWin },
     { name: 'farm', window: farmWin },
     { name: 'gift', window: giftWin },
     { name: 'rename', window: renameWin }
@@ -646,6 +665,7 @@ function closeAllPluginWindows (reason) {
   closeFarmWindow(reason)
   closeBoardWindow(reason)
   closeFuturesWindow(reason)
+  closeExpeditionWindow(reason)
 }
 
 /** 失焦后只排一次计时器；新的失焦会顶掉旧的，焦点回来就取消。 */
@@ -1734,6 +1754,36 @@ function isFuturesSender (event) {
   return futuresWin !== null && !futuresWin.isDestroyed() && event.sender === futuresWin.webContents
 }
 
+// ---------------------------------------------------------------------------
+// 出远门小窗的 IPC（票 112）：只认这扇窗自己的 webContents
+// ---------------------------------------------------------------------------
+
+ipcMain.on('dsh-zoo:expedition-ready', (event) => {
+  if (!isExpeditionSender(event)) return
+  sendExpeditionState()
+})
+
+ipcMain.on('dsh-zoo:expedition-close', (event) => {
+  if (!isExpeditionSender(event)) return
+  closeExpeditionWindow('close')
+})
+
+ipcMain.on('dsh-zoo:expedition-submit', (event, payload) => {
+  if (!isExpeditionSender(event)) return
+  // 同一时间只等一条结果：连点两次时，第二条静默落空——窗口的 pending 也会挡住它。
+  if (expeditionPending !== null) return
+  const action = shared.normalizeExpeditionAction(payload)
+  if (action === null) {
+    sendExpeditionResult({ ok: false, code: 'bad-expedition-action' })
+    return
+  }
+  startExpeditionPending(action.action, action)
+})
+
+function isExpeditionSender (event) {
+  return expeditionWin !== null && !expeditionWin.isDestroyed() && event.sender === expeditionWin.webContents
+}
+
 function sendScene () {
   if (win === null || win.isDestroyed()) return
   try {
@@ -1802,6 +1852,14 @@ const FUTURES_WIDTH = 760
 const FUTURES_HEIGHT = 700
 const FUTURES_TIMEOUT_MS = 10000
 const FUTURES_POSITION_SAVE_MS = 250
+/**
+ * 出远门小窗（票 112）：比期货窗窄一圈——只有路线、路段进度、两个按钮和一句结算。
+ * 620×580 能放下「已走 n / m 段 + 本段回币 + 继续/见好就收」而不滚动。
+ */
+const EXPEDITION_WIDTH = 620
+const EXPEDITION_HEIGHT = 580
+const EXPEDITION_TIMEOUT_MS = 10000
+const EXPEDITION_POSITION_SAVE_MS = 250
 /**
  * 农场窗默认不置顶；用户可在窗口右上角自己切换，选择记在 userData 下，
  * 下次开窗沿用。桌面宠物本体的置顶是另一扇窗，不受这里影响。
@@ -2787,6 +2845,202 @@ function startFuturesPending (action, event) {
   }
 }
 
+/**
+ * 出远门窗位置（票 112）：同一条 `pickBounds`，存在自己的 `expedition-window.json`。
+ * 坏文件或离屏回落到居中；保存点还在某块屏里时夹进那块屏。
+ */
+function expeditionBounds () {
+  const area = workArea ?? screen.getPrimaryDisplay().workArea
+  let displays = []
+  try {
+    displays = screen.getAllDisplays().map((display) => display.workArea)
+  } catch {
+    displays = []
+  }
+  return windowBounds.pickBounds({
+    saved: windowBounds.readPosition(expeditionPositionFile()),
+    areas: displays,
+    area,
+    width: EXPEDITION_WIDTH,
+    height: EXPEDITION_HEIGHT
+  })
+}
+
+function expeditionPositionFile () {
+  return path.join(app.getPath('userData'), windowBounds.EXPEDITION_POSITION_FILE)
+}
+
+function clearExpeditionPositionTimer () {
+  if (expeditionPositionTimer === null) return
+  clearTimeout(expeditionPositionTimer)
+  expeditionPositionTimer = null
+}
+
+function saveExpeditionPosition (source) {
+  if (source === null || source.isDestroyed()) return
+  let bounds
+  try {
+    bounds = source.getBounds()
+  } catch {
+    return
+  }
+  windowBounds.writePosition(expeditionPositionFile(), { x: bounds.x, y: bounds.y })
+}
+
+function scheduleExpeditionPositionSave (source) {
+  clearExpeditionPositionTimer()
+  expeditionPositionTimer = setTimeout(() => {
+    expeditionPositionTimer = null
+    saveExpeditionPosition(source)
+  }, EXPEDITION_POSITION_SAVE_MS)
+  expeditionPositionTimer.unref?.()
+}
+
+function openExpeditionWindow () {
+  if (expeditionWin !== null && !expeditionWin.isDestroyed()) {
+    expeditionWin.focus()
+    // 已经开着：把最新视图推一遍（可能刚在宿主那边走了一段）。
+    sendExpeditionState()
+    return true
+  }
+  if (win === null || win.isDestroyed()) return false
+  const created = new BrowserWindow({
+    ...expeditionBounds(),
+    width: EXPEDITION_WIDTH,
+    height: EXPEDITION_HEIGHT,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    alwaysOnTop: false,
+    skipTaskbar: true,
+    hasShadow: true,
+    focusable: true,
+    acceptFirstMouse: true,
+    resizable: false,
+    movable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    webPreferences: {
+      preload: path.join(__dirname, 'expedition-preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      // 倒计时每秒走一格；后台节流会让窗口看起来“卡住”。
+      backgroundThrottling: false,
+      devTools: debugEnabled,
+      spellcheck: false
+    }
+  })
+  expeditionWin = created
+  expeditionPending = null
+  clearExpeditionTimer()
+  notifyExpeditionWindowState()
+  created.webContents.once('did-finish-load', sendExpeditionState)
+  created.webContents.on('context-menu', (event) => event.preventDefault())
+  created.on('moved', () => scheduleExpeditionPositionSave(created))
+  // 和其余插件窗同一条失焦收起规则（ADR-0029），输入法合成期间例外。
+  adoptPluginWindow(created)
+  created.on('closed', () => {
+    if (expeditionWin === created) expeditionWin = null
+    expeditionPending = null
+    clearExpeditionTimer()
+    clearExpeditionPositionTimer()
+    notifyExpeditionWindowState()
+  })
+  created.once('ready-to-show', () => {
+    if (expeditionWin !== created || created.isDestroyed()) return
+    created.show()
+    focusAppForDialog()
+    created.focus()
+  })
+  created.loadFile(path.join(__dirname, 'expedition.html')).catch(() => closeExpeditionWindow('load-failed'))
+  return true
+}
+
+function closeExpeditionWindow (reason) {
+  expeditionPending = null
+  clearExpeditionTimer()
+  clearExpeditionPositionTimer()
+  const target = expeditionWin
+  expeditionWin = null
+  if (target !== null && !target.isDestroyed()) {
+    // 拖完立刻关窗时 250ms 的落盘还没到：先补一次，下次开窗不会回到旧位置。
+    saveExpeditionPosition(target)
+    try {
+      target.destroy()
+    } catch {
+      // 已经没了
+    }
+  }
+  notifyExpeditionWindowState()
+}
+
+/**
+ * 把出远门窗的真实开关报给宿主：×/Esc/宿主 `close:true`/hide/退出都汇到这一条。
+ * 只报变化；宿主据此把右键「出远门」做成开/关切换。
+ */
+function notifyExpeditionWindowState () {
+  const open = expeditionWin !== null && !expeditionWin.isDestroyed()
+  if (open === lastExpeditionWindowOpen) return
+  lastExpeditionWindowOpen = open
+  writeEvent({ type: 'expedition-window-state', open })
+}
+
+function clearExpeditionTimer () {
+  if (expeditionTimer === null) return
+  clearTimeout(expeditionTimer)
+  expeditionTimer = null
+}
+
+/** 整份出远门视图（阶段/已走段数/回币/路线/结算），打开或刷新时原样下发。 */
+function sendExpeditionState () {
+  if (expeditionWin === null || expeditionWin.isDestroyed()) return
+  try {
+    // 票 120：`tab` 只随开窗那一次命令下发，送到就清掉，之后刷新仍停在玩家自己选的页签。
+    expeditionWin.webContents.send('dsh-zoo:expedition-state', {
+      ...(expeditionState === null ? {} : expeditionState),
+      ...(expeditionTab === null ? {} : { tab: expeditionTab })
+    })
+    expeditionTab = null
+  } catch {
+    // 页面还没挂上：ready 会再来一次
+  }
+}
+
+function sendExpeditionResult (result) {
+  if (expeditionWin === null || expeditionWin.isDestroyed()) return
+  try {
+    expeditionWin.webContents.send('dsh-zoo:expedition-result', result)
+  } catch {
+    // 窗口刚被关掉：结果没人接就算了
+  }
+}
+
+/**
+ * 把一次出发/继续/折返/刷新交给宿主，并等 action-result。
+ * 成功**不关窗**（结算由视图里的 `ended` 画出来，渲染端再点一次才重开一趟）。
+ */
+function startExpeditionPending (action, event) {
+  expeditionSeq += 1
+  const id = 'expedition-' + String(expeditionSeq) + '-' + Date.now().toString(36)
+  expeditionPending = { id, action }
+  clearExpeditionTimer()
+  expeditionTimer = setTimeout(() => {
+    if (expeditionPending === null || expeditionPending.id !== id) return
+    expeditionPending = null
+    sendExpeditionResult({ ok: false, code: 'timeout' })
+  }, EXPEDITION_TIMEOUT_MS)
+  expeditionTimer.unref?.()
+  const written = writeEvent({ ...event, type: 'action', id })
+  if (!written) {
+    clearExpeditionTimer()
+    expeditionPending = null
+    sendExpeditionResult({ ok: false, code: 'host-unavailable' })
+  }
+}
+
 function pruneRendererRects () {  if (rendererRects.length === 0) return
   const ids = new Set(scene.items.map((item) => item.id))
   const kept = rendererRects.filter((rect) => rect.id === null || ids.has(rect.id))
@@ -2974,6 +3228,23 @@ function applyCommand (command) {
         }
         return
       }
+      // 出远门小窗（票 112）：同一套按 id 认领；成功后留在窗里，顺便把新视图推回去。
+      if (expeditionPending !== null && command.id === expeditionPending.id) {
+        expeditionPending = null
+        clearExpeditionTimer()
+        sendExpeditionResult({
+          ok: command.ok === true,
+          notice: command.notice,
+          code: command.error,
+          action: command.action ?? null,
+          state: command.state ?? null
+        })
+        if (command.state != null) {
+          expeditionState = command.state
+          sendExpeditionState()
+        }
+        return
+      }
       sendActionResult({
         id: command.id,
         ok: command.ok === true,
@@ -2993,6 +3264,7 @@ function applyCommand (command) {
       closeFarmWindow('hide')
       closeBoardWindow('hide')
       closeFuturesWindow('hide')
+      closeExpeditionWindow('hide')
       if (win !== null && !win.isDestroyed()) win.hide()
       return
     case 'bring-window': {
@@ -3075,6 +3347,25 @@ function applyCommand (command) {
       }
       return
     }
+    case 'expedition-window': {
+      // 宿主交下来的整份出远门视图（票 112）：不落盘、不拼路径。
+      // `open:true` 打开/聚焦；`open:false` 刷新已开着的窗；`close:true` 才是关窗。
+      if (command.close === true) {
+        closeExpeditionWindow('host')
+        return
+      }
+      expeditionState = command.state ?? null
+      // 票 120：陈列架入口带来的落点，等 did-finish-load 或 flush 时随 state 一起发。
+      if (command.tab === 'shelf' || command.tab === 'log' || command.tab === 'codex') expeditionTab = command.tab
+      if (command.open === true) {
+        if (!openExpeditionWindow()) {
+          writeEvent({ type: 'error', id: command.id, code: 'expedition-window-failed', message: 'cannot open expedition window' })
+        }
+      } else if (expeditionWin !== null && !expeditionWin.isDestroyed()) {
+        sendExpeditionState()
+      }
+      return
+    }
     case 'quit':
       shutdown(0)
       return
@@ -3143,14 +3434,17 @@ function applyCommand (command) {
       return
     }
     case 'shot':
-      // 冒烟可以点名抓「带派」/农场/盘口/期货小窗；主窗没就绪不影响那扇窗的截图。
+      // 冒烟可以点名抓「带派」/农场/盘口/期货/出远门小窗；主窗没就绪不影响那扇窗的截图。
       if (command.window === 'bring' || command.window === 'farm' ||
-        command.window === 'board' || command.window === 'futures') {
-        const target = command.window === 'bring'
-          ? giftWin
-          : command.window === 'farm'
-            ? farmWin
-            : command.window === 'board' ? boardWin : futuresWin
+        command.window === 'board' || command.window === 'futures' ||
+        command.window === 'expedition') {
+        const target = command.window === 'expedition'
+          ? expeditionWin
+          : command.window === 'bring'
+            ? giftWin
+            : command.window === 'farm'
+              ? farmWin
+              : command.window === 'board' ? boardWin : futuresWin
         if (target === null || target.isDestroyed()) {
           writeEvent({
             type: 'error',
@@ -3688,6 +3982,10 @@ function statusEvent (id) {
     futuresOpen: futuresWin !== null && !futuresWin.isDestroyed(),
     futuresVisible: futuresWin !== null && !futuresWin.isDestroyed() && futuresWin.isVisible(),
     futuresFocused: futuresWin !== null && !futuresWin.isDestroyed() && futuresWin.isFocused(),
+    /** 出远门小窗（票 112）：同样分开报「开着 / 看得见 / 拿到焦点」。 */
+    expeditionOpen: expeditionWin !== null && !expeditionWin.isDestroyed(),
+    expeditionVisible: expeditionWin !== null && !expeditionWin.isDestroyed() && expeditionWin.isVisible(),
+    expeditionFocused: expeditionWin !== null && !expeditionWin.isDestroyed() && expeditionWin.isFocused(),
     focusable: winFlag((candidate) => candidate.isFocusable()),
     alwaysOnTop: winFlag((candidate) => candidate.isAlwaysOnTop()),
     allWorkspaces: winFlag((candidate) => candidate.isVisibleOnAllWorkspaces()),
@@ -3886,7 +4184,9 @@ async function captureTo (filePath, id, target = 'main') {
       ? farmWin
       : target === 'board'
         ? boardWin
-        : target === 'futures' ? futuresWin : win
+        : target === 'futures'
+          ? futuresWin
+          : target === 'expedition' ? expeditionWin : win
   const image = await capturePage(window)
   if (image === null) {
     writeEvent({ type: 'error', id, code: 'shot-failed', message: 'capturePage failed' })
@@ -4072,6 +4372,7 @@ function shutdown (code) {
   closeFarmWindow('shutdown')
   closeBoardWindow('shutdown')
   closeFuturesWindow('shutdown')
+  closeExpeditionWindow('shutdown')
   unhookWindowMessages()
   try {
     if (win !== null && !win.isDestroyed()) win.destroy()

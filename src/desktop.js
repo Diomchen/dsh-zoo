@@ -135,6 +135,8 @@ export function createDesktop (options = {}) {
   let boardWindowOpen = false
   /** 期货小窗的真实开关状态（票 93）：同上。 */
   let futuresWindowOpen = false
+  /** 出远门小窗的真实开关状态（票 112）：同上。 */
+  let expeditionWindowOpen = false
 
   /**
    * 换了一代 helper（拉起/退出/ready）就把两个"窗开着"的标志清零。
@@ -149,6 +151,7 @@ export function createDesktop (options = {}) {
     farmWindowOpen = false
     boardWindowOpen = false
     futuresWindowOpen = false
+    expeditionWindowOpen = false
   }
 
   let lastError = null
@@ -504,6 +507,8 @@ export function createDesktop (options = {}) {
       boardWindowOpen = event.open === true
     } else if (event.type === 'futures-window-state') {
       futuresWindowOpen = event.open === true
+    } else if (event.type === 'expedition-window-state') {
+      expeditionWindowOpen = event.open === true
     } else if (event.type === 'pong') {
       notePong()
     } else if (event.type === 'error') {
@@ -740,6 +745,23 @@ export function createDesktop (options = {}) {
     })
   }
 
+  /**
+   * 出远门小窗（票 112）：与 `futuresWindow` 同形——`open:true` 打开/聚焦，
+   * `open:false` 只刷新，`close:true` 关窗。整份视图随命令走，窗口拿不到 `/state`。
+   */
+  function expeditionWindow (payload = {}) {
+    return sendHostCommand({
+      type: 'expedition-window',
+      open: payload?.open === true,
+      ...(payload?.close === true ? { close: true } : {}),
+      // 票 120：农场页的陈列架入口 / 日志入口要求开窗后直接落在某个页签。
+      ...(payload?.tab === 'shelf' || payload?.tab === 'log' || payload?.tab === 'codex'
+        ? { tab: payload.tab }
+        : {}),
+      state: payload?.state ?? null
+    })
+  }
+
   function show () {
     try {
       return send({ type: 'show' })
@@ -873,6 +895,8 @@ export function createDesktop (options = {}) {
       boardOpen: ready === true && boardWindowOpen === true,
       // 票 93：期货小窗同理。
       futuresOpen: ready === true && futuresWindowOpen === true,
+      // 票 112：出远门小窗同理。
+      expeditionOpen: ready === true && expeditionWindowOpen === true,
       assetRoots: assetRoots.slice(),
       giftsRoot,
       stderr: stderrLines.slice(),
@@ -943,6 +967,7 @@ export function createDesktop (options = {}) {
     farmWindow,
     boardWindow,
     futuresWindow,
+    expeditionWindow,
     actionResult,
     lastCommandFailure: lastCommandFailureOf,
     shot,

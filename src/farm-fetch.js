@@ -5,6 +5,7 @@ import {
   MIN_CONTRACT_WAGE
 } from './contracts-rules.js'
 import { CROP_IDS, MAX_GUARD, MAX_PLOTS, isCropId } from './farm-rules.js'
+import { publicExpeditionBlock } from './farm-open.js'
 import { isPrivateAddress } from './skin-fetch.js'
 import { PLOT_ID_RE, isDeviceId, isVisitId, normalizeNickname } from './protocol.js'
 
@@ -221,6 +222,8 @@ export function normalizeVisitView (raw) {
     limits,
     hire,
     market,
+    // 票 120：串门进门后才带日志正文；公开视图那条路（normalizeOpenView）永远剥掉 body。
+    expedition: normalizeExpeditionBlock(raw.expedition, { withBodies: true }),
     at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0
   }
 }
@@ -269,8 +272,22 @@ export function normalizeOpenView (raw) {
     caps: Array.isArray(raw.caps)
       ? raw.caps.filter((entry) => entry === 'raid' || entry === 'look')
       : [],
+    // 票 120：公开视图只收标题与时间；就算对面硬塞 body 也不进结果。
+    expedition: normalizeExpeditionBlock(raw.expedition, { withBodies: false }),
     at: Number.isFinite(at) && at > 0 ? Math.floor(at) : 0
   }
+}
+
+/**
+ * 票 120：把远端的「出远门」展示块收成窗口能画的那几个字段。
+ *
+ * 白名单重建只有一份（`farm-open.publicExpeditionBlock`）：发视图与收视图必须同一口径，
+ * 不然同一篇日志在自家农场页和邻居页会长短不一、格子数也会对不上。
+ * 远端塞进来的 name/emoji 不采信，一律按本地图鉴的 id 反查；
+ * 老版本邻居没发这个字段、或者形状不对时给零值块——窗口照常画，不整包失败。
+ */
+export function normalizeExpeditionBlock (raw, { withBodies = false } = {}) {
+  return publicExpeditionBlock(raw, { withLogBodies: withBodies === true })
 }
 
 function normalizeVisitPlot (raw) {

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" role="img" aria-hidden="true">
+  <ellipse cx="50" cy="88" rx="20" ry="5" fill="#000" opacity=".10"/>
+  <circle cx="44" cy="30" r="14" fill="none" stroke="#b8863a" stroke-width="9"/>
+  <circle cx="44" cy="30" r="6" fill="#f1ede6"/>
+  <rect x="40" y="43" width="9" height="34" rx="4" fill="#b8863a"/>
+  <rect x="41.5" y="48" width="3.5" height="22" rx="1.7" fill="#e6c477"/>
+  <rect x="48" y="58" width="16" height="9" rx="3" fill="#b8863a"/>
+  <rect x="48" y="70" width="11" height="8" rx="3" fill="#b8863a"/>
+  <rect x="48" y="58" width="16" height="3" rx="1.5" fill="#e6c477"/>
+</svg>

@@ -2484,7 +2484,14 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
   assert.equal(command.plotId, 'p1')
   assert.equal('close' in command, false)
   // 完整农场多一个只显示的驮包；没有在途物品时是空数组（helper 只画有值的那几条）。
-  assert.deepEqual(command.farm, { ...farm, carried: [] })
+  // 票 116：日志细条固定带一份标题列表，没日志时是空数组。
+  // 票 120：顶栏陈列架计数与公开视图同口径，缺省零值（评审 B4：字段是图鉴件数）。
+  assert.deepEqual(command.farm, {
+    ...farm,
+    carried: [],
+    expeditionLog: { titles: [] },
+    expeditionCodexOwned: { owned: 0, total: 32 }
+  })
 
   // 票 55：这条白名单以前会吃掉 look / neighbors / contracts——宿主发了、窗口收不到。
   assert.equal(manager.farmWindow({
@@ -2530,10 +2537,10 @@ test('manager：farmWindow 把完整农场写进管道，plotId 可选', async (
 // 票 85：点窗口外面收起所有插件窗（ADR-0029）
 // ---------------------------------------------------------------------------
 
-test('票 85/93：五扇插件窗都接上同一条失焦策略，debug-blur 仍走 blur 锁（静态窄口）', async () => {
+test('票 85/93/112：六扇插件窗都接上同一条失焦策略，debug-blur 仍走 blur 锁（静态窄口）', async () => {
   const main = await readFile(new URL('../desktop/main.js', import.meta.url), 'utf8')
-  // 五扇窗各调用一次：盘口 / 期货 / 农场 / 带派 / 改名。
-  assert.equal((main.match(/adoptPluginWindow\(created\)/g) ?? []).length, 5)
+  // 六扇窗各调用一次：盘口 / 期货 / 出远门 / 农场 / 带派 / 改名。
+  assert.equal((main.match(/adoptPluginWindow\(created\)/g) ?? []).length, 6)
   assert.match(main, /created\.on\('focus', \(\) => cancelBlurDismiss\(\)\)/)
   assert.match(main, /created\.on\('blur', \(\) => scheduleBlurDismiss\(\)\)/)
   assert.match(main, /ipcMain\.on\('dsh-zoo:composing'/)

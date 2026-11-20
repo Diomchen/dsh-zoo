@@ -155,7 +155,8 @@ async function connectedPair (t, overrides = {}) {
   await b.ready
   const bPort = b.localPort()
   assert.ok(bPort > 0)
-  const a = makeService(t, optionsFor(dirA, 0, bPort, { futuresHost: false, ...overrides.a }))
+  const peerTarget = bPort
+  const a = makeService(t, optionsFor(dirA, 0, peerTarget, { futuresHost: false, ...overrides.a }))
   await a.ready
   await waitFor(() => a.snapshot().neighbors.length === 1 && b.snapshot().neighbors.length === 1)
   const aId = a.snapshot().self.deviceId
@@ -169,8 +170,7 @@ async function connectedPair (t, overrides = {}) {
   return { a, b, dirA, dirB, aId, bId, bPort }
 }
 
-/** 给某台服务的 UDP 端口直接投一包（模拟「别人拿别人的 deviceId 发指令」）。 */
-async function sendRaw (port, packet) {
+/** 给某台服务的 UDP 端口直接投一包（模拟「别人拿别人的 deviceId 发指令」）。 */async function sendRaw (port, packet) {
   const socket = dgram.createSocket('udp4')
   try {
     await new Promise((resolve, reject) => {
@@ -184,6 +184,32 @@ async function sendRaw (port, packet) {
   }
 }
 
+test('票 121：申报丢一包，补发之后账照样落（而且只落一次）', async (t) => {
+  // 第一包充值申报在半路丢掉（`futuresDropWire` 只吞包、不进 outbox 之外的状态）。
+  let dropped = 0
+  const { a, b, aId } = await connectedPair(t, {
+    a: {
+      futuresDropWire: (info) => {
+        if (info.kind !== 'deposit') return false
+        dropped += 1
+        return true
+      }
+    }
+  })
+  await waitFor(() => a.futuresWindow().peer.ready === true)
+
+  const deposit = await callAction(a, { action: 'futures-deposit', coins: 200 })
+  assert.equal(deposit.body.pending, true)
+
+  // 补发的那包到了房主，账才落下来。
+  await waitFor(() => a.futuresWindow().balance === 200, 10_000)
+  assert.equal(dropped, 1, '应该正好丢了一包申报')
+  // 补发包不能把同一笔充值记两次。
+  await delay(200)
+  assert.equal(a.futuresWindow().balance, 200)
+  assert.equal(b.futuresAccountOf(aId).balance, 200)
+  assert.equal(b.futuresAccountOf(aId).pending, 0)
+})
 test('票 94：peer 报到后房主回一份 settle，窗口认出 role=peer 与房主 id', async (t) => {
   const { a, b, aId, bId } = await connectedPair(t)
 

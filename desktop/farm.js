@@ -82,6 +82,10 @@ const unlockCloseEl = document.getElementById('unlock-modal-close')
 const closeButton = document.getElementById('close')
 const pinButton = document.getElementById('pin')
 const boardButton = document.getElementById('board')
+const expeditionLogEl = document.getElementById('expedition-log')
+const expeditionLogTitlesEl = document.getElementById('expedition-log-titles')
+const expeditionEntryEl = document.getElementById('expedition-entry')
+const expeditionOwnedEl = document.getElementById('expedition-owned')
 
 /** 雇佣（ticket 44）的窄口：与宿主 src/contracts-rules.js 同源。 */
 const HIRE_WAGE_MIN = 1
@@ -588,6 +592,46 @@ function renderBatchBar () {
   const locked = busy || batch !== null
   if (batchPlantEl !== null) batchPlantEl.disabled = locked
   if (batchHarvestEl !== null) batchHarvestEl.disabled = locked
+}
+
+/** 票 116：顶栏旁那行「最近三篇出远门日志」。只放标题，点开去出远门窗口看正文。 */
+function renderExpeditionLog () {
+  if (expeditionLogEl === null) return
+  const titles = mode === 'owner' && farm !== null && Array.isArray(farm.expeditionLog?.titles)
+    ? farm.expeditionLog.titles.filter((title) => typeof title === 'string' && title !== '').slice(0, 3)
+    : []
+  expeditionLogEl.hidden = titles.length === 0
+  if (expeditionLogTitlesEl === null) return
+  expeditionLogTitlesEl.textContent = ''
+  for (const title of titles) {
+    const span = document.createElement('span')
+    span.textContent = title
+    expeditionLogTitlesEl.appendChild(span)
+  }
+}
+
+/**
+ * 票 120：顶栏「陈列架 N/32 · 点开看」。
+ *
+ * N 与公开视图同口径（图鉴已集齐件数 / 32）：自己看自己用宿主下发的本地计数
+ * `farm.expeditionCodexOwned`（字段名照实：它是图鉴件数，不是已开格数），看邻居用邻居公开
+ * 视图里的 codex.owned。上限也走宿主下发的 `total`（`desktop/shared.js` 的 32 一份，
+ * 评审 B2），窗口不另写一个 32。串门（visitor）时不显示——那是别人的门。
+ */
+function renderExpeditionEntry () {
+  if (expeditionEntryEl === null) return
+  expeditionEntryEl.hidden = mode === 'visitor'
+  if (expeditionEntryEl.hidden) return
+  const counter = mode === 'owner' && farm !== null ? farm.expeditionCodexOwned : null
+  const raw = mode === 'look' && look !== null
+    ? look.expedition?.codex?.owned
+    : (counter === null || counter === undefined ? 0 : counter.owned)
+  const max = counter === null || counter === undefined ? NaN : Number(counter.total)
+  const value = Math.floor(Number(raw))
+  const owned = Number.isFinite(value)
+    ? Math.max(0, Number.isFinite(max) && max > 0 ? Math.min(max, value) : value)
+    : 0
+  if (expeditionOwnedEl !== null) expeditionOwnedEl.textContent = String(owned)
 }
 
 /** 访客模式的地块：沿用同一张卡，但按钮只可能是偷/帮与「已偷过/已帮过」。 */
@@ -2037,6 +2081,8 @@ function renderFarmSurface () {
   renderSeason()
   renderSeasonCards(currentSeason())
   renderBatchBar()
+  renderExpeditionLog()
+  renderExpeditionEntry()
   renderPlots()
   renderInventory()
   renderCarried()
@@ -2517,6 +2563,24 @@ closeButton.addEventListener('click', () => api?.close())
 // 走和种地/买种一样的 farm-submit → action-result 回路，失败会冒一句人话。
 if (boardButton !== null) {
   boardButton.addEventListener('click', () => submit({ action: 'trading-open' }))
+}
+
+// 票 116：日志细条也只是**开窗申请**；正文只在出远门窗口里看。
+if (expeditionLogEl !== null) {
+  // 落点直接切到日志页：之前只发 `expedition-open`，点「看全文」落在旅行首页，
+  // 还要自己再点一次「日志」（2026-11-20 审计）。
+  const openExpeditionLog = () => submit({ action: 'expedition-open', tab: 'log' })
+  expeditionLogEl.addEventListener('click', openExpeditionLog)
+  expeditionLogEl.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    openExpeditionLog()
+  })
+}
+
+// 票 120：陈列架入口也只发开窗申请，开窗后直接落在「陈列架」页签（tab 由宿主透传）。
+if (expeditionEntryEl !== null) {
+  expeditionEntryEl.addEventListener('click', () => submit({ action: 'expedition-open', tab: 'shelf' }))
 }
 
 if (pinButton !== null) {

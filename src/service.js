@@ -38,6 +38,18 @@ import {
 } from './contracts-rules.js'
 import { dualLayerAdvisory } from './desktop-advisory.js'
 import { createDesktop } from './desktop.js'
+import { createExpeditionStore } from './expedition-store.js'
+import {
+  EXPEDITION_ERROR_TEXT,
+  LANTERN_PRICE,
+  ROUTES as EXPEDITION_ROUTES,
+  SHELF_MAX_SLOTS,
+  SHELF_SLOT_PRICE,
+  dangerLabel,
+  dangerOf,
+  routeOf,
+  unlockStatus
+} from './expedition.js'
 import { discoverPetPacks } from './dsh-pet-pets.js'
 import { controlsFromSnapshot, droppedVisitors, petsFromSnapshot } from './desktop-pets.js'
 import { createDiscovery } from './discovery.js'
@@ -111,7 +123,7 @@ import { cropSeason, seasonAt, calendarFor } from './season-rules.js'
 import { createSeasonStore } from './season-store.js'
 import { GUARD_HIRE_COST, GUARD_HIRE_STEP, MAX_TEMP_GUARDS } from './season-omens.js'
 import { FARM_FETCH_COOLDOWN_MS, createFarmFetcher, normalizeVisitView } from './farm-fetch.js'
-import { openFarmView } from './farm-open.js'
+import { openFarmView, publicExpeditionBlock } from './farm-open.js'
 import { farmActionResultText, farmErrorText } from './farm-text.js'
 import {
   MARKET_VIEW_HISTORY,
@@ -456,6 +468,16 @@ export function createService (ctx, options = {}) {
     const stamp = Number(value)
     return Number.isFinite(stamp) ? stamp : Date.now()
   }
+  // 出远门（票 112）：同一套测试时钟；每段 20 秒，服务器 1 秒一拍地看有没有到点。
+  const expeditionNow = typeof options.expeditionNow === 'function' ? options.expeditionNow : farmNow
+  const expeditionClock = () => {
+    const value = expeditionNow === undefined ? Date.now() : expeditionNow()
+    const stamp = Number(value)
+    return Number.isFinite(stamp) ? stamp : Date.now()
+  }
+  const expeditionTickMs = positiveOption(options.expeditionTickMs, 1000, 10)
+  // 测试缝：`expeditionRunId` 让 e2e 用确定的 runId 复现同一趟（翻车/平安都由它派生）。
+  const expeditionRunId = typeof options.expeditionRunId === 'function' ? options.expeditionRunId : null
   // 盘口周报（票 82）：发送节拍与接收端「1 peer / 窗口最多 1 条」共用同一个值
   // （与行情 gossip 同款），测试注入更小的值把「等 30 秒」变成几十毫秒。
   const tradingDigestMs = positiveOption(options.tradingDigestMs, TRADING_DIGEST_INTERVAL_MS, 10)
@@ -480,6 +502,11 @@ export function createService (ctx, options = {}) {
   let trading = null
   // 期货账本（票 92）：托管账户同样建在农场之上；读不出来 = 空市场（不影响农场/盘口）。
   let futures = null
+  // 出远门（票 112）：盘缠与回币都走农场硬币；读不出来 = 本次不能出门，别的照常。
+  let expedition = null
+  // 窗口真实开关由 helper 上报；测试替身/老 helper 退回这条本地记录。
+  let expeditionWindowOpened = false
+  let expeditionTimer = null
   /**
    * 票 94 的房主侧开户名册：deviceId → { address, port, at }。
    * 只在**内存**里：hello 那一刻把「这个 deviceId 从哪个 UDP 源来的」钉死，
@@ -495,8 +522,24 @@ export function createService (ctx, options = {}) {
   let futuresLedgerTick = 0
   /** 票 94：非房主上次 sync 的时刻。 */
   let futuresSyncAt = 0
+  /** 票 121：上次对账的**真实**时刻（假时钟下 game 时钟不走，节流会卡死对账）。 */
+  let futuresSyncWallAt = 0
   /** 票 94：最近一次给我们发账目的房主（窗口上显示用；只在内存里）。 */
   let futuresHostSeen = null
+  /**
+   * 票 121：peer 侧还没被房主确认的申报。`hostId → [{ kind, at, data, sentAt, tries }]`。
+   *
+   * 为什么要有：申报走 UDP、只发一次，丢一包就等于这笔单子悄悄没了——用户看到「已发给房主，
+   * 等一拍回执」，然后永远等不到。现在每笔申报在这里留一份，房主随 settle 带 `ackAt` 回执，
+   * 回执越过它才删；没越过就按 `FUTURES_RETRY_MS` 补发。补发次数只是兜底，真正收口靠回执。
+   */
+  const futuresOutbox = new Map()
+  /** 票 121：房主侧「这个 peer 的申报已经处理到哪个 at」，随 settle 回给对端。 */
+  const futuresAcks = new Map()
+  /** 票 121：房主侧已处理过的申报（`deviceId|kind|at`），补发包进来照样回执、不重复记账。 */
+  const futuresAppliedCommands = new Map()
+  /** 票 121：本机申报的 `at` 单调递增——假时钟下 `futuresClock()` 会停在原地，撞号就分不清两笔。 */
+  let futuresCommandAt = 0
   /** 票 107：每个 peer 最近一次资金流同步请求的时刻（5 分钟节流）。 */
   const boardFlowSyncAt = new Map()
   /** 票 98：同源地址的期货报文计数：address → { start, count }（10 秒窗口）。 */
@@ -1292,6 +1335,17 @@ export function createService (ctx, options = {}) {
     // 票 52 回归：窗口里「我的农场」那颗圆片——从只读视图切回自己农场的唯一出口。
     if (action === 'farm-own') return handleFarmOwn()
 
+    // 出远门（票 112）：右键菜单「出远门」是对开/关的同一入口。窗口只发 start/step/back/lantern，
+    // 扣盘缠、到点掉币、段数迁移全在 expedition-store 里；这里只做 away 门控与人话兜底。
+    if (action === 'expedition-open') return handleExpeditionOpen(body?.tab === 'shelf' ? 'shelf' : null)
+    if (action === 'expedition-close') return closeExpeditionWindow('expedition-close')
+    if (action === 'expedition-start') return expeditionStart(body?.routeId)
+    if (action === 'expedition-step') return expeditionStep()
+    if (action === 'expedition-back') return expeditionBack()
+    if (action === 'expedition-shelf') return expeditionShelf(body)
+    if (action === 'expedition-lantern') return expeditionLantern()
+    if (action === 'expedition-refresh') return expeditionRefresh()
+
     // 盘口（票 79）：右键菜单和农场窗的「盘口」是同一个开/关入口；HTTP/脚本可以用
     // `trading-close` 明确关窗，用 `trading-refresh` 请宿主结这一根并重推一拍。
     if (action === 'trading-open') return handleTradingOpen()
@@ -1811,7 +1865,9 @@ export function createService (ctx, options = {}) {
       // 盘口（票 79）：和盘口窗同一份形状（价格/硬币/持仓/历史/本周 + 按钮白名单）。
       trading: tradingWindowView(),
       // 期货（票 92/93）：托管余额/持仓/报价/费用累计 + 作物目录与白名单（窗口直接用这份）。
-      futures: futuresWindowView()
+      futures: futuresWindowView(),
+      // 出远门（票 112）：这一趟的阶段/已走段数/战利品 + 路线表与硬币；窗口和 /state 同源。
+      expedition: expeditionView()
     }
   }
 
@@ -2232,15 +2288,15 @@ export function createService (ctx, options = {}) {
   }
 
   /**
-   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 既没有出门串门，也没有在外打工。
-   * 雇工镜像存在 = 有人在我家打工。`/state.farm.guard`、访客快照的 `guardParts`、
-   * 农场小窗的守卫全部从这里出，绝不三个地方各写一遍 0.3。
+   * 守卫的唯一计算点（ticket 43/44）：主人在家 = 既没有出门串门，也没有在外打工，
+   * 也没有出远门（票 119）。雇工镜像存在 = 有人在我家打工。`/state.farm.guard`、
+   * 访客快照的 `guardParts`、农场小窗的守卫全部从这里出，绝不三个地方各写一遍 0.3。
    */
   function farmGuard () {
     const out = room.outboundVisit()
     const work = room.outboundWork()
     const worker = room.inboundWorker()
-    const ownerHome = out === null && work === null
+    const ownerHome = out === null && work === null && !room.away()
     const hasWorker = worker !== null
     return {
       guard: guardValue({ ownerHome, worker: hasWorker }),
@@ -2350,6 +2406,25 @@ export function createService (ctx, options = {}) {
   }
 
   /**
+   * 票 116：农场页顶栏旁只放最近三篇标题，正文只在出远门窗口里出现。
+   * 这里按「新的在前」取，读不到存档就给空数组。
+   */
+  function expeditionLogTitles (limit = 3) {
+    if (expedition === null) return []
+    return expedition.snapshot().logs.slice(0, limit).map((entry) => entry.title)
+  }
+
+  /**
+   * 票 120：顶栏那行「陈列架 N/32」的 N——**N 是图鉴已集齐的件数，不是已开的格数**。
+   * 名字照实叫 `expeditionCodexOwned`：票面文案不改，但字段名不能骗下一个人。
+   * 和公开视图共用同一份白名单重建（`publicExpeditionBlock`）。
+   */
+  function expeditionCodexOwned () {
+    const block = publicExpeditionBlock(expedition?.snapshot() ?? null)
+    return { owned: block.codex.owned, total: block.codex.total }
+  }
+
+  /**
    * 农场小窗的完整视图（ticket 40）。
    *
    * 和 `/state.farm` 是两个形状，别混：
@@ -2408,7 +2483,11 @@ export function createService (ctx, options = {}) {
       // 红包单独攒的一份（≤50）：流水会被种下/收获挤掉，红包记录不能跟着没。
       packets: view.packetLog ?? [],
       // 驮包只显示「在路上的东西」，不参与仓库/硬币记账（SPEC v5 :107,:142）。
-      carried: carriedView()
+      carried: carriedView(),
+      // 票 116：最近三篇出远门日志的标题；正文不出农场页。
+      expeditionLog: { titles: expeditionLogTitles(3) },
+      // 票 120：顶栏「陈列架 N/32」的 N，与公开视图同一个数——**图鉴已集齐的件数**（不是开的格数）。
+      expeditionCodexOwned: expeditionCodexOwned()
     }
   }
 
@@ -3124,6 +3203,324 @@ export function createService (ctx, options = {}) {
     pushFuturesWindow()
   }
 
+  // ---------------------------------------------------------------------------
+  // 出远门（票 112）
+  //
+  // 状态机在 src/expedition.js，落盘与硬币在 src/expedition-store.js；这一层只回答三件事：
+  // 「现在 away 吗」「窗口该画什么」「把动作转给 store」。窗口是 file:// 页面，读不到
+  // /state，所以 /state.expedition 与窗口推的是同一个 expeditionView()。
+  // ---------------------------------------------------------------------------
+
+  /** 宠物现在为什么不在家：串门 / 打工 / 出远门。null = 在家。判定本身在 room（票 119）。 */
+  function expeditionAwayReason () {
+    return room.awayReason()
+  }
+
+  /**
+   * 路线表只下发窗口要显示的那几项；数值真相仍在规则层。
+   * 票 117 起每条路线带 `unlocked/requirement/progress`，窗口直接照着画灰卡，不再自己判。
+   */
+  function expeditionRoutesView (snap) {
+    const trips = snap?.trips ?? {}
+    const codexOwned = snap?.codexView?.owned ?? 0
+    return Object.values(EXPEDITION_ROUTES).map((route) => {
+      const status = unlockStatus(route, { trips, codexOwned })
+      return {
+        id: route.id,
+        name: route.name,
+        fare: route.fare,
+        minLegs: route.minLegs,
+        maxLegs: route.maxLegs,
+        coinBase: Math.round(route.fare * route.coinRate),
+        unlocked: status.unlocked,
+        requirement: status.requirement,
+        progress: status.progress
+      }
+    })
+  }
+
+  /**
+   * `/state.expedition` 与窗口共用的整份视图。
+   * `now` 由宿主时钟给，窗口不拿本地时间算倒计时（无边框窗口挂一夜也不会走偏）。
+   */
+  function expeditionView () {
+    const snap = expedition === null
+      ? {
+          version: 1,
+          run: null,
+          shelf: { slots: 8, items: [] },
+          codex: {},
+          codexView: { total: 0, owned: 0, slots: [] },
+          upgrades: { lantern: false },
+          trips: {},
+          logs: []
+        }
+      : expedition.snapshot()
+    // 陈列架：`slots` = 已解锁格数，`items[i]` 对第 i+1 格（null = 空格）。
+    // 窗口再要一个 32 格的总宽度与开格价，才画得出锁着的格子与价格。
+    const shelf = {
+      ...snap.shelf,
+      unlocked: snap.shelf.slots,
+      maxSlots: SHELF_MAX_SLOTS,
+      slotPrice: SHELF_SLOT_PRICE
+    }
+    const now = expeditionClock()
+    const route = snap.run === null ? null : routeOf(snap.run.routeId)
+    // walking 显示这一段的危险；deciding 显示下一段；走满时封顶在最后一段。
+    const dangerLeg = snap.run === null
+      ? 1
+      : Math.min(snap.run.phase === 'deciding' ? snap.run.leg + 1 : snap.run.leg, snap.run.totalLegs)
+    // 危险度只在这里算一次：三档文字与精确百分比都出自同一个 dangerOf，
+    // 也就是下一次真正掷骰用的那个函数。没买提灯就不下发百分比。
+    const dangerRate = route === null ? null : dangerOf(route, dangerLeg)
+    const lantern = snap.upgrades?.lantern === true
+    return {
+      ...snap,
+      shelf,
+      ready: expedition !== null,
+      now,
+      coins: farmStateView().coins,
+      away: expeditionAwayReason(),
+      lanternPrice: LANTERN_PRICE,
+      routes: expeditionRoutesView(snap),
+      ...(snap.run === null || dangerRate === null
+        ? {}
+        : {
+            run: {
+              ...snap.run,
+              routeName: route.name,
+              danger: dangerLabel(dangerRate),
+              // 没买提灯时显式给 null：字段形状恒定，但窗口拿不到任何数字。
+              dangerPercent: lantern ? Math.round(dangerRate * 100) : null
+            }
+          })
+    }
+  }
+
+  /**
+   * 菜单「出远门」：开着就关，否则打开/聚焦。
+   * 和期货窗一样以 helper 报的真实开关为准，测试替身退回本地记录。
+   */
+  function handleExpeditionOpen (tab = null) {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    // 入口带的落点页签：陈列架（票 120）、日志（农场页的「看全文」）。
+    const landing = tab === 'shelf' || tab === 'log' || tab === 'codex' ? tab : null
+    if (expeditionWindowOpenNow()) {
+      // 农场页「陈列架 N/32」的入口带 tab：窗已经开着就别关它——
+      // 之前这里一律走关窗分支，点一下窗口消失、tab 被吞（2026-11-20 审计）。
+      if (landing !== null) {
+        const focused = desktop.expeditionWindow({ open: true, tab: landing, state: expeditionView() })
+        if (focused !== true) return expeditionSendFailed()
+        expeditionWindowOpened = true
+        return { ok: true, action: 'expedition-open', window: 'focused' }
+      }
+      return closeExpeditionWindow('expedition-open')
+    }
+    const opened = desktop.expeditionWindow({
+      open: true,
+      ...(landing === null ? {} : { tab: landing }),
+      state: expeditionView()
+    })
+    if (opened !== true) return expeditionSendFailed()
+    expeditionWindowOpened = true
+    return { ok: true, action: 'expedition-open', window: 'opened' }
+  }
+
+  function expeditionWindowOpenNow () {
+    if (desktop !== null && typeof desktop.status === 'function') {
+      const status = desktop.status()
+      if (status !== null && typeof status === 'object' && typeof status.expeditionOpen === 'boolean') {
+        return status.expeditionOpen
+      }
+    }
+    return expeditionWindowOpened === true
+  }
+
+  function closeExpeditionWindow (action = 'expedition-close') {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    let sent = false
+    try {
+      sent = desktop.expeditionWindow({ open: false, close: true }) === true
+    } catch {
+      sent = false
+    }
+    expeditionWindowOpened = false
+    if (sent !== true) return expeditionSendFailed()
+    return { ok: true, action, window: 'closed' }
+  }
+
+  /**
+   * 出远门窗口指令没被桌面层接住时的回执。
+   * 之前这里借用了盘口的 `boardSendFailed`，提示语是「盘口窗指令发不出去（盘口数据可能太大）」，
+   * 玩家点出远门没反应，却被指去看盘口——文案与事实完全对不上（2026-11-20 审计）。
+   */
+  function expeditionSendFailed () {
+    return { ok: false, error: 'send-failed', notice: EXPEDITION_ERROR_TEXT['send-failed'] }
+  }
+
+  /** 只有窗口开着才推；关窗不影响走路。 */
+  function pushExpeditionWindow () {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') return false
+    try {
+      const sent = desktop.expeditionWindow({ open: false, state: expeditionView() }) === true
+      if (sent !== true) noteBoardSendFailure('expedition-refresh')
+      return sent
+    } catch {
+      return false
+    }
+  }
+
+  function refreshExpeditionWindow () {
+    if (expeditionWindowOpenNow() !== true) return
+    pushExpeditionWindow()
+  }
+
+  async function expeditionStart (routeId) {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    // 串门/打工的互斥由 room.awayReason 回答（票 119 合并成一处）；出远门自己已经在
+    // 路上时由 store 的 already-away 兜底——那种情况不该再进这里。
+    const away = expeditionAwayReason()
+    if (away !== null && away !== 'expedition') {
+      return { ok: false, error: 'already-away', notice: EXPEDITION_ERROR_TEXT['already-away'] }
+    }
+    const result = await expedition.start({ routeId })
+    if (!result.ok) {
+      // 锁着的路线要说清还差多少，让玩家知道去刷哪一项，而不是只看到「没成」。
+      if (result.error === 'locked') {
+        const route = routeOf(routeId)
+        if (route !== null) {
+          const snap = expedition.snapshot()
+          const status = unlockStatus(route, {
+            trips: snap.trips,
+            codexOwned: snap.codexView.owned
+          })
+          return { ...result, notice: `还没解锁：${status.progress}。` }
+        }
+      }
+      return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    }
+    refreshExpeditionWindow()
+    const route = routeOf(result.run.routeId)
+    return {
+      ...result,
+      notice: `出发去${route === null ? '后山' : route.name}：盘缠 ${route === null ? 0 : route.fare}，回来见。`
+    }
+  }
+
+  async function expeditionStep () {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.step(expeditionClock())
+    if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    refreshExpeditionWindow()
+    if (result.settled?.ended === 'failed') {
+      return { ...result, notice: `翻车了：这趟只走到第 ${result.settled.legs} 段，捡到的 ${result.settled.coins} 枚硬币照给，盘缠不退。` }
+    }
+    return result
+  }
+
+  async function expeditionBack () {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.back(expeditionClock())
+    if (!result.ok) return { ...result, notice: EXPEDITION_ERROR_TEXT[result.error] ?? null }
+    refreshExpeditionWindow()
+    return { ...result, notice: `见好就收：带回 ${result.settled.coins} 枚硬币。` }
+  }
+
+  /**
+   * 陈列架（票 115）：开格、摆件、挪格、取下都走这一个动作。
+   * 开格的钱在 store 里经农场扣；这里只把失败翻成人话并重推窗口。
+   */
+  async function expeditionShelf (body) {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.shelfAction({
+      slot: body?.slot,
+      itemId: body?.itemId,
+      moveFrom: body?.moveFrom,
+      moveTo: body?.moveTo
+    })
+    if (!result.ok) {
+      // `locked` 与路线解锁共用一个 error code，架子这边必须用格子的说法；
+      // 另外三种冲突（格被占、格子是空的、挪到原格）以前也挤在 `locked` 里，
+      // 于是「那一格已经有东西了」被说成「这个格子还没开」——审计指出的文案错位。
+      const SHELF_NOTICE = {
+        'not-enough-coins': '硬币不够开这一格。',
+        locked: '这个格子还没开，放不进去。',
+        'not-owned': EXPEDITION_ERROR_TEXT['not-owned'],
+        occupied: '那一格已经有东西了（同一件也不能占两格）。',
+        'empty-slot': '这一格是空的，没有东西可挪。',
+        'same-slot': '挪到同一个格子里没有意义。'
+      }
+      const notice = SHELF_NOTICE[result.error] ?? EXPEDITION_ERROR_TEXT[result.error] ?? null
+      return { ...result, notice }
+    }
+    refreshExpeditionWindow()
+    return result
+  }
+
+  /**
+   * 提灯（票 118）：窗口里的「买提灯」。钱在 store 里扣，这里只管文案与刷新。
+   * 买不起时状态一点不动；已经买过时只是再说一声，不再扣钱。
+   */
+  async function expeditionLantern () {
+    if (expedition === null) {
+      return { ok: false, error: 'starting', notice: EXPEDITION_ERROR_TEXT.starting }
+    }
+    const result = await expedition.buyLantern()
+    if (!result.ok) {
+      const notice = result.error === 'not-enough-coins'
+        ? `提灯要 ${LANTERN_PRICE.toLocaleString('en-US')} 枚硬币，现在还不够。`
+        : EXPEDITION_ERROR_TEXT[result.error] ?? null
+      return { ...result, notice }
+    }
+    refreshExpeditionWindow()
+    return {
+      ...result,
+      notice: result.already === true
+        ? '提灯已经在你手里了，不用再买。'
+        : `买了提灯，花了 ${LANTERN_PRICE.toLocaleString('en-US')} 枚硬币：往后每段都能看清危险度。`
+    }
+  }
+
+  /**
+   * 窗口倒计时到 0 时请宿主补一拍：先 tick 再推视图。
+   * 正常由 1 秒巡检驱动；这个动作让窗口不必自己判定「到点」，也不会出现两个时钟。
+   */
+  async function expeditionRefresh () {
+    if (desktop === null || typeof desktop.expeditionWindow !== 'function') {
+      return { ok: false, error: 'desktop-off', notice: EXPEDITION_ERROR_TEXT['desktop-off'] }
+    }
+    // 先 tick：窗口关着时这一拍照样要推进，不能因为「没窗可推」把走路也停掉。
+    if (expedition !== null) await expedition.tick(expeditionClock())
+    // 窗没开着不是错误：桌面层好好的，只是没地方推（客户端会在关窗后收到这个）。
+    if (expeditionWindowOpenNow() !== true) return { ok: true, action: 'expedition-refresh', refreshed: false }
+    pushExpeditionWindow()
+    return { ok: true, action: 'expedition-refresh', refreshed: true }
+  }
+
+  /** 秒级巡检：到点就推进一段并重推窗口；关着窗也照走。 */
+  function startExpeditionTick () {
+    if (expeditionTimer !== null || expedition === null) return
+    expeditionTimer = setInterval(() => {
+      if (disposed || expedition === null) return
+      expedition.tick(expeditionClock()).then((changed) => {
+        if (changed === true) refreshExpeditionWindow()
+      }).catch((error) => warn(ctx, '出远门巡检失败：' + message(error)))
+    }, expeditionTickMs)
+    expeditionTimer.unref?.()
+  }
+
   /**
    * 票 59：窗口只认宿主下发的作物目录。数值一律以宿主为准（窗口只画），
    * 目录里有什么，窗口的种子列表/行情页就有什么。
@@ -3285,19 +3682,23 @@ export function createService (ctx, options = {}) {
     return { ok: false, error }
   }
 
-  function contractFound (id) {
-    if (contracts === null) return null
+  /**
+   * 按 id 找合同。`store` 只给「入口已经抓了局部引用」的在飞路径用（票 122）：
+   * 那些路径里模块级的 `contracts` 可能刚被 dispose() 置空，账本本身却还活着。
+   */
+  function contractFound (id, store = contracts) {
+    if (store === null) return null
     try {
-      return contracts.byId(id)
+      return store.byId(id)
     } catch {
       return null
     }
   }
 
-  function contractByRequest (requestId) {
-    if (contracts === null) return null
+  function contractByRequest (requestId, store = contracts) {
+    if (store === null) return null
     try {
-      return contracts.byRequestId(requestId)
+      return store.byRequestId(requestId)
     } catch {
       return null
     }
@@ -3481,6 +3882,8 @@ export function createService (ctx, options = {}) {
     if (hours === null) return workFailure('bad-hours')
     const selfId = identity?.deviceId ?? null
     if (selfId !== null && deviceId === selfId) return workFailure('own-pet')
+    // 票 119：出远门期间雇不了工——宠物不在家，等这一趟回来再说。
+    if (room.away()) return workFailure('already-away')
     if (!room.mayTalkTo(deviceId)) return workFailure('worker-unavailable')
     const neighbor = room.snapshot().neighbors.find((candidate) => candidate.deviceId === deviceId)
     if (neighbor === undefined || !(neighbor.heartbeatAt > 0)) return workFailure('worker-unavailable')
@@ -3583,18 +3986,22 @@ export function createService (ctx, options = {}) {
   async function failWorkRequest (requestId, error) {
     const entry = workRequests.get(requestId)
     if (entry === undefined) return
+    // 票 122：入口先抓 store 的局部引用（理由见 handleWorkSettle 的注释）。
+    const store = contracts
+    const farmStore = farm
     workRequests.delete(requestId)
     if (entry.timer !== null) clearTimeout(entry.timer)
     if (!entry.done) {
       entry.done = true
-      const found = contractByRequest(requestId)
+      const found = contractByRequest(requestId, store)
       if (found !== null && found.side === 'outgoing') {
         const record = found.record
         if (record.charged && !record.refunded) {
           // 还没 ack 的雇佣等于没发生：工资和手续费一起退（手续费只在成交后烧）。
-          await refundOutgoingOnce(record, record.wage + record.fee)
+          await refundOutgoingOnce(store, farmStore, record, record.wage + record.fee)
         }
-        await contracts.cancelOutgoing(requestId, 'cancelled')
+        // 关停后模块级 `contracts` 已经是 null，但这一笔取消还是要落盘。
+        if (store !== null) await store.cancelOutgoing(requestId, 'cancelled')
         sendWorkEndPacket(record.workerDeviceId, { requestId, reason: 'cancelled' })
       }
       if (pendingHire === requestId) pendingHire = null
@@ -3604,18 +4011,24 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  /** 退款一次（WAL：先写 refunding，再入账，再写 refunded；重复调用返回 0）。 */
-  async function refundOutgoingOnce (record, amount) {
-    if (contracts === null || farm === null) return 0
+  /**
+   * 退款一次（WAL：先写 refunding，再入账，再写 refunded；重复调用返回 0）。
+   *
+   * 票 122：两个 store 由调用方把入口抓的局部引用传进来，不再读模块级的
+   * `contracts`/`farm`。关停时那两个变量已经是 null——旧写法会在这里静默 `return 0`，
+   * 调用方却接着写 `finishSettle`，于是留下「没退款、"settled"」的半条账。
+   */
+  async function refundOutgoingOnce (store, farmStore, record, amount) {
+    if (store === null || farmStore === null) return 0
     if (refundInFlight.has(record.id)) return 0
     refundInFlight.add(record.id)
     try {
-      const fresh = contractFound(record.id)
+      const fresh = contractFound(record.id, store)
       if (fresh === null || fresh.side !== 'outgoing') return 0
       if (fresh.record.refunded) return 0
       if (fresh.record.refundStartedAt !== null) {
         // 上一次已经写过 refunding 就崩了：钱可能已经到账，fail-closed 不再退。
-        await contracts.markRefunded(fresh.record.id, {
+        await store.markRefunded(fresh.record.id, {
           amount: fresh.record.refundAmount,
           at: contractClock()
         })
@@ -3623,14 +4036,14 @@ export function createService (ctx, options = {}) {
       }
       const cap = fresh.record.wage + fresh.record.fee
       const value = Math.min(cap, Math.max(0, Math.floor(Number(amount) || 0)))
-      await contracts.markRefundStarted(fresh.record.id, value)
-      const added = await farm.addCoins(value)
+      await store.markRefundStarted(fresh.record.id, value)
+      const added = await farmStore.addCoins(value)
       if (added.ok !== true) {
         warnOnce('refund:' + record.id,
           '合同退款没入账（' + (added.error ?? 'unknown') + '），等下一次重试')
         return 0
       }
-      await contracts.markRefunded(fresh.record.id, { amount: value, at: contractClock() })
+      await store.markRefunded(fresh.record.id, { amount: value, at: contractClock() })
       if (value > 0) room.noteFarmEvent('合同结束，退回 ' + value + ' 硬币。')
       return value
     } finally {
@@ -3721,6 +4134,9 @@ export function createService (ctx, options = {}) {
     if (disposed || contracts === null || farm === null) return
     if (identity === null || packet.deviceId === identity.deviceId) return
     if (!room.mayTalkTo(packet.deviceId)) return
+    // 票 122：入口抓局部引用。下面每个 await 之后 dispose() 都可能把模块级变量置空。
+    const store = contracts
+    const farmStore = farm
     noteContractSeen(packet.deviceId)
     const requestId = packet.requestId
     const replayed = replayedWorkResult(packet.deviceId, requestId)
@@ -3748,7 +4164,7 @@ export function createService (ctx, options = {}) {
       const startedAt = now
       const endsAt = now + hours * 60 * 60 * 1000
       const employerNickname = room.peerNickname(packet.deviceId) ?? '邻居'
-      const record = await contracts.beginIncoming({
+      const record = await store.beginIncoming({
         contractId,
         requestId,
         employerDeviceId: packet.deviceId,
@@ -3773,7 +4189,7 @@ export function createService (ctx, options = {}) {
         lastSeen: now
       })
       if (begun.ok !== true) {
-        await contracts.end(contractId, { endedAt: now, reason: 'cancelled' })
+        await store.end(contractId, { endedAt: now, reason: 'cancelled' })
         sendWorkAckPacket(packet.deviceId, requestId, { ok: false, error: begun.error ?? 'already-working' })
         return
       }
@@ -3784,9 +4200,9 @@ export function createService (ctx, options = {}) {
         endsAt,
         guard: WORKER_GUARD
       })
-      if (farm !== null) {
-        await farm.noteHire({ who: employerNickname, hours, wage })
-      }
+      // 合同已经落盘并 ack 了；后面只是本地记账和界面，关停时到此为止。
+      if (disposed) return
+      await farmStore.noteHire({ who: employerNickname, hours, wage })
       room.noteFarmEvent('「' + employerNickname + '」雇了你 ' + hours + ' 小时，去打工啦。')
       refreshContractViews()
       sendMarketDigest({ force: true })
@@ -3800,8 +4216,9 @@ export function createService (ctx, options = {}) {
    * 顺序有讲究：先看「我在不在家/在不在打工」，再看挂牌，最后核钱。
    */
   function validateIncomingWork (packet) {
-    if (room.outboundVisit() !== null) return 'worker-unavailable'
-    if (room.outboundWork() !== null) return 'already-working'
+    // 「我在不在家/在不在打工/在不在远门」由 room 一处回答（票 119），码沿用老枚举。
+    const away = room.incomingWorkError()
+    if (away !== null) return away
     if (contracts.activeIncoming().length > 0) return 'already-working'
     const view = farm?.snapshot() ?? initialFarmView()
     const hire = view.hire
@@ -3815,10 +4232,14 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-ack（我是雇主）：确认合同 + 雇工进镜像，或者退款取消。 */
   async function handleWorkAck (packet) {
+    // 票 122：入口抓局部引用（理由见 handleWorkSettle 的注释）。
+    if (disposed || contracts === null || farm === null) return
+    const store = contracts
+    const farmStore = farm
     const entry = workRequests.get(packet.requestId)
     if (entry === undefined) {
       // 迟到/重复的 ack：合同还活着就什么都不做；完全找不到才补一条 work-end 收尾。
-      const existing = contractByRequest(packet.requestId)
+      const existing = contractByRequest(packet.requestId, store)
       if (existing === null && packet.ok === true) {
         sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
       }
@@ -3837,14 +4258,14 @@ export function createService (ctx, options = {}) {
     // 的绝对时间，带着它的时钟差；直接拿来当自己的到期时刻，倒计时就会凭空多/少一段
     // （快 30 分钟 →「还剩 2 小时 30 分」，慢 2 小时 → 一成交就快到期）。
     // 时长只认自己那份 pending 记录里的 hours：两台机器各有各的锚点，但墙钟上是同一时刻到期。
-    const pendingRecord = contractByRequest(packet.requestId)?.record ?? null
+    const pendingRecord = contractByRequest(packet.requestId, store)?.record ?? null
     const requestedHours = Number(pendingRecord?.hours)
     const contractMs = Number.isFinite(requestedHours) && requestedHours > 0
       ? requestedHours * 60 * 60 * 1000
       : contractMsOf(packet.startedAt, packet.endsAt)
     const startedAt = now
     const endsAt = now + contractMs
-    const confirmed = await contracts.confirmOutgoing(packet.requestId, {
+    const confirmed = await store.confirmOutgoing(packet.requestId, {
       contractId: packet.contractId,
       startedAt,
       endsAt,
@@ -3869,10 +4290,10 @@ export function createService (ctx, options = {}) {
     })
     if (begun.ok !== true) {
       // 本地已经有雇工（例如两笔并发 ack）：结束这份新合同并全额退款。
-      const fresh = contractFound(packet.contractId)
+      const fresh = contractFound(packet.contractId, store)
       if (fresh !== null && fresh.side === 'outgoing') {
-        await endOutgoingContract(fresh.record, 'cancelled', now)
-        await refundOutgoingOnce(fresh.record, fresh.record.wage + fresh.record.fee)
+        await endOutgoingContract(fresh.record, 'cancelled', now, store)
+        await refundOutgoingOnce(store, farmStore, fresh.record, fresh.record.wage + fresh.record.fee)
       }
       sendWorkEndPacket(packet.deviceId, { contractId: packet.contractId, reason: 'cancelled' })
       entry.resolve(workFailure(begun.error ?? 'already-hired'))
@@ -3880,14 +4301,14 @@ export function createService (ctx, options = {}) {
     }
     if (pendingHire === packet.requestId) pendingHire = null
     entry.resolve({ ok: true, action: 'hire', contractId: packet.contractId })
-    if (farm !== null) {
-      const hired = contractFound(packet.contractId)?.record ?? null
-      await farm.noteHire({
-        who: workerNickname,
-        hours: hired?.hours,
-        wage: hired?.wage
-      })
-    }
+    // 合同已经成交；后面只是本地记账和界面，关停时到此为止。
+    if (disposed) return
+    const hired = contractFound(packet.contractId, store)?.record ?? null
+    await farmStore.noteHire({
+      who: workerNickname,
+      hours: hired?.hours,
+      wage: hired?.wage
+    })
     room.noteFarmEvent('「' + workerNickname + '」来打工了。')
     refreshContractViews()
     sendMarketDigest({ force: true })
@@ -3895,17 +4316,18 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-recall（我是雇主）：结束合同、启动结算、回一条 recall-ack。 */
   async function handleWorkRecall (packet) {
-    if (contracts === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null) return
+    const store = contracts
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'outgoing') {
       sendRecallAck(packet.deviceId, packet.contractId, false, 'contract-not-found')
       return
     }
     const record = found.record
     if (record.status === 'active') {
-      await endOutgoingContract(record, 'recall', contractClock())
+      await endOutgoingContract(record, 'recall', contractClock(), store)
     }
-    await contracts.markRecallAcked(record.id)
+    await store.markRecallAcked(record.id)
     sendRecallAck(packet.deviceId, record.id, true, null)
     refreshContractViews()
   }
@@ -3927,24 +4349,26 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-recall-ack（我是雇工侧）：对方已结束，本地镜像也该回家。 */
   async function handleWorkRecallAck (packet) {
-    if (contracts === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null) return
+    const store = contracts
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'incoming') return
     const record = found.record
-    await contracts.markRecallAcked(record.id)
+    await store.markRecallAcked(record.id)
     contractRetryAt.delete('recall:' + record.id)
     if (packet.ok === true && record.status === 'active') {
-      await endIncomingContract(record, 'recall', contractClock())
+      await endIncomingContract(record, 'recall', contractClock(), store)
     }
     refreshContractViews()
   }
 
   /** 收到 work-end（我是雇工侧）：幂等结束；找不到也回 ok，避免重试风暴。 */
   async function handleWorkEnd (packet) {
-    if (contracts === null) return
+    if (disposed || contracts === null) return
+    const store = contracts
     const found = packet.contractId !== undefined
-      ? contractFound(packet.contractId)
-      : contractByRequest(packet.requestId)
+      ? contractFound(packet.contractId, store)
+      : contractByRequest(packet.requestId, store)
     if (found === null) {
       sendWorkEndAckPacket(packet.deviceId, {
         contractId: packet.contractId,
@@ -3955,10 +4379,10 @@ export function createService (ctx, options = {}) {
     }
     const record = found.record
     if (found.side === 'incoming' && record.status === 'active') {
-      await endIncomingContract(record, packet.reason === 'cancelled' ? 'cancelled' : packet.reason, contractClock())
+      await endIncomingContract(record, packet.reason === 'cancelled' ? 'cancelled' : packet.reason, contractClock(), store)
     }
     if (found.side === 'outgoing' && record.status === 'active') {
-      await endOutgoingContract(record, packet.reason, contractClock())
+      await endOutgoingContract(record, packet.reason, contractClock(), store)
     }
     sendWorkEndAckPacket(packet.deviceId, {
       contractId: record.id,
@@ -3979,8 +4403,15 @@ export function createService (ctx, options = {}) {
    * 已结算/崩溃窗口（settleStartedAt 存在）都按「已经入过账」处理（fail-closed）。
    */
   async function handleWorkSettle (packet) {
-    if (contracts === null || farm === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null || farm === null) return
+    // 票 122：入口先抓 store 的局部引用，之后整条路径只认这两个局部变量。
+    // 这一笔要跨三个 await（写 settling → 入账 → 写 settled），中途 dispose() 会把
+    // 模块级 `contracts`/`farm` 置空；旧写法在恢复执行后读到 null，抛出
+    // “Cannot read properties of null (reading 'finishSettle')”，成了一笔在用例结束后
+    // 还在跑的悬空调用。现在要么用局部引用把这一整笔写完，要么在入口就不开始。
+    const store = contracts
+    const farmStore = farm
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'incoming') {
       sendWorkSettleAckPacket(packet.deviceId, {
         contractId: packet.contractId,
@@ -4019,20 +4450,20 @@ export function createService (ctx, options = {}) {
       const earned = earnedFor(record.wage, servedMs, contractMs)
       if (record.settleStartedAt !== null) {
         // 上次写完 settling 意图就崩了：按已入账处理，绝不重复铸币。
-        await contracts.finishSettle(record.id, {
+        await store.finishSettle(record.id, {
           earned: record.earned,
           servedMs: record.settleServedMs,
           settledAt: contractClock(),
           reason: settleReasonOf(record.endReason)
         })
       } else {
-        await contracts.beginSettle(record.id, {
+        await store.beginSettle(record.id, {
           requestId: packet.requestId,
           servedMs,
           earned,
           reason: settleReasonOf(record.endReason)
         })
-        const credited = await farm.addCoins(earned)
+        const credited = await farmStore.addCoins(earned)
         if (credited.ok !== true) {
           warnOnce('settle:' + record.id,
             '结算入账失败（' + (credited.error ?? 'unknown') + '），保持 settling 等重试')
@@ -4044,24 +4475,24 @@ export function createService (ctx, options = {}) {
           })
           return
         }
-        await contracts.finishSettle(record.id, {
+        await store.finishSettle(record.id, {
           earned,
           servedMs,
           settledAt: contractClock(),
           reason: settleReasonOf(record.endReason)
         })
       }
-      const settled = contractFound(record.id)?.record ?? record
+      // 钱和账都已写全；后面只是本地镜像、文案和回包，关停时到此收手。
+      if (disposed) return
+      const settled = contractFound(record.id, store)?.record ?? record
       if (room.outboundWork() !== null && room.outboundWork().contractId === record.id) {
         room.endWorking(record.id, { at: contractClock(), reason: 'completed' })
       }
-      if (farm !== null) {
-        await farm.noteSettle({
-          who: record.employerNickname,
-          wage: record.wage,
-          earned: settled.earned
-        })
-      }
+      await farmStore.noteSettle({
+        who: record.employerNickname,
+        wage: record.wage,
+        earned: settled.earned
+      })
       room.noteFarmEvent('结算完成：拿到 ' + settled.earned + ' 硬币。')
       sendWorkSettleAckPacket(packet.deviceId, {
         contractId: record.id,
@@ -4078,8 +4509,13 @@ export function createService (ctx, options = {}) {
 
   /** 收到 work-settle-ack（我是雇主）：按雇工主人算出的 earned 退款一次。 */
   async function handleWorkSettleAck (packet) {
-    if (contracts === null || farm === null) return
-    const found = contractFound(packet.contractId)
+    if (disposed || contracts === null || farm === null) return
+    // 票 122：入口抓局部引用（理由见 handleWorkSettle 的注释）。这一笔的退款和
+    // finished 标记必须落在同一个局部账本上，否则关停时会出现「退了款、没 settled」
+    // 或「没退款、标了 settled」的半条账。
+    const store = contracts
+    const farmStore = farm
+    const found = contractFound(packet.contractId, store)
     if (found === null || found.side !== 'outgoing') return
     const record = found.record
     if (record.settleRequestId !== null && record.settleRequestId !== packet.requestId) return
@@ -4094,7 +4530,7 @@ export function createService (ctx, options = {}) {
     const earned = Math.min(record.wage, Math.max(0, Math.floor(Number(packet.earned) || 0)))
     if (record.refunded) {
       // 退款已经写进 WAL（崩溃在写 settledAt 之前）：只补 settled 标记，不再退款。
-      await contracts.finishSettle(record.id, {
+      await store.finishSettle(record.id, {
         earned,
         servedMs: record.settleServedMs,
         settledAt: contractClock(),
@@ -4104,16 +4540,16 @@ export function createService (ctx, options = {}) {
       refreshContractViews()
       return
     }
-    await refundOutgoingOnce(record, refundFor(record.wage, earned))
-    await contracts.finishSettle(record.id, {
+    await refundOutgoingOnce(store, farmStore, record, refundFor(record.wage, earned))
+    await store.finishSettle(record.id, {
       earned,
       servedMs: record.settleServedMs,
       settledAt: contractClock(),
       reason: settleReasonOf(record.endReason)
     })
-    if (farm !== null) {
-      await farm.noteSettle({ who: record.workerNickname, wage: record.wage, earned })
-    }
+    // 钱和账都已写全；后面只是本地文案和界面，关停时到此收手。
+    if (disposed) return
+    await farmStore.noteSettle({ who: record.workerNickname, wage: record.wage, earned })
     contractRetryAt.delete(record.id)
     refreshContractViews()
     sendMarketDigest({ force: true })
@@ -4123,10 +4559,12 @@ export function createService (ctx, options = {}) {
   // 合同的结束/结算/巡检/重启对账
   // -------------------------------------------------------------------------
 
-  async function endOutgoingContract (record, reason, endedAt) {
-    if (contracts === null) return
+  // endOutgoing/endIncoming 的最后一个参数是入口抓的 store（票 122）：关停后
+  // 模块级 `contracts` 已是 null，但这一笔「结束」还得用局部引用落盘。
+  async function endOutgoingContract (record, reason, endedAt, store = contracts) {
+    if (store === null) return
     const id = record.id
-    const ended = await contracts.end(id, { endedAt, reason })
+    const ended = await store.end(id, { endedAt, reason })
     if (ended) {
       room.endWorker(id, { at: endedAt, reason })
       contractRetryAt.delete(id)
@@ -4136,10 +4574,10 @@ export function createService (ctx, options = {}) {
     }
   }
 
-  async function endIncomingContract (record, reason, endedAt) {
-    if (contracts === null) return
+  async function endIncomingContract (record, reason, endedAt, store = contracts) {
+    if (store === null) return
     const id = record.id
-    const ended = await contracts.end(id, { endedAt, reason })
+    const ended = await store.end(id, { endedAt, reason })
     if (ended) {
       room.endWorking(id, { at: endedAt, reason })
       contractRetryAt.delete(id)
@@ -4163,7 +4601,9 @@ export function createService (ctx, options = {}) {
   async function sendSettle (id) {
     if (contracts === null || discovery === null || identity === null) return false
     if (settleSending.has(id)) return false
-    const found = contractFound(id)
+    // 票 122：抓局部引用——beginSettle 之后还要发报，这期间 dispose 可能把模块级变量置空。
+    const store = contracts
+    const found = contractFound(id, store)
     if (found === null || found.side !== 'outgoing') return false
     const record = found.record
     if (record.status !== 'ended' || record.settledAt !== null) return false
@@ -4173,13 +4613,15 @@ export function createService (ctx, options = {}) {
       let settleRequestId = record.settleRequestId
       if (settleRequestId === null) {
         settleRequestId = randomUUID()
-        await contracts.beginSettle(id, {
+        await store.beginSettle(id, {
           requestId: settleRequestId,
           servedMs: numbers.servedMs,
           earned: numbers.earned,
           reason: numbers.reason
         })
       }
+      // 关停已经开始：settleRequestId 已经落盘，下次启动由重启对账补发，这一拍不再发。
+      if (disposed || discovery === null || identity === null) return false
       try {
         const data = encodeWorkSettle({
           deviceId: identity.deviceId,
@@ -4250,23 +4692,27 @@ export function createService (ctx, options = {}) {
    */
   async function reconcileContractsOnStart () {
     if (contracts === null) return
+    // 票 122：这里的 await 链比启动还长，一律用入口抓的局部引用；宿主在这期间
+    // 调 dispose() 也不会把写了一半的账打断。
+    const store = contracts
+    const farmStore = farm
     const now = contractClock()
     contractsReadyAt = now
-    for (const record of contracts.pendingOutgoing()) {
+    for (const record of store.pendingOutgoing()) {
       if (record.charged && !record.refunded) {
-        await refundOutgoingOnce(record, record.wage + record.fee)
+        await refundOutgoingOnce(store, farmStore, record, record.wage + record.fee)
       } else if (!record.charged) {
         warn(ctx, '有一笔雇佣在扣钱前崩溃：按 fail-closed 不退款，合同已取消')
       }
-      await contracts.cancelOutgoing(record.requestId, 'restart')
+      await store.cancelOutgoing(record.requestId, 'restart')
     }
-    for (const record of contracts.outgoing()) {
+    for (const record of store.outgoing()) {
       if (record.refundStartedAt !== null && record.refunded !== true) {
         // 写了 refunding 就崩：钱可能已经到账，绝不再退一次；结算标记也补齐，
         // 否则 ended 合同会被巡检当成「还没结算」重发到天荒地老。
-        await contracts.markRefunded(record.id, { amount: record.refundAmount, at: now })
+        await store.markRefunded(record.id, { amount: record.refundAmount, at: now })
         if (record.status === 'ended' && record.settledAt === null) {
-          await contracts.finishSettle(record.id, {
+          await store.finishSettle(record.id, {
             earned: record.earned,
             servedMs: record.settleServedMs,
             settledAt: now,
@@ -4275,9 +4721,9 @@ export function createService (ctx, options = {}) {
         }
       }
     }
-    for (const record of contracts.activeOutgoing()) {
+    for (const record of store.activeOutgoing()) {
       if (now >= record.endsAt) {
-        await endOutgoingContract(record, 'expired', record.endsAt)
+        await endOutgoingContract(record, 'expired', record.endsAt, store)
         continue
       }
       const begun = room.beginWorker({
@@ -4291,12 +4737,12 @@ export function createService (ctx, options = {}) {
       })
       if (begun.ok !== true) {
         warn(ctx, '重启后恢复雇工失败（' + begun.error + '），合同按离线结束')
-        await endOutgoingContract(record, 'offline', record.lastSeenAt)
+        await endOutgoingContract(record, 'offline', record.lastSeenAt, store)
       }
     }
-    for (const record of contracts.activeIncoming()) {
+    for (const record of store.activeIncoming()) {
       if (now >= record.endsAt) {
-        await endIncomingContract(record, 'expired', record.endsAt)
+        await endIncomingContract(record, 'expired', record.endsAt, store)
         continue
       }
       const begun = room.beginWorking({
@@ -4310,13 +4756,13 @@ export function createService (ctx, options = {}) {
       })
       if (begun.ok !== true) {
         warn(ctx, '重启后恢复打工状态失败（' + begun.error + '），合同按离线结束')
-        await endIncomingContract(record, 'offline', record.lastSeenAt)
+        await endIncomingContract(record, 'offline', record.lastSeenAt, store)
       }
     }
-    for (const record of contracts.incoming()) {
+    for (const record of store.incoming()) {
       if (record.settleStartedAt !== null && record.settledAt === null && record.status === 'ended') {
         // 崩溃在「写完 settling 意图、还没入账/没写 settledAt」之间：按已入账处理。
-        await contracts.finishSettle(record.id, {
+        await store.finishSettle(record.id, {
           earned: record.earned,
           servedMs: record.settleServedMs,
           settledAt: now,
@@ -4522,6 +4968,8 @@ export function createService (ctx, options = {}) {
       guardParts: { ownerHome: guard.ownerHome, worker: guard.worker },
       usedByViewer,
       caps: CAPS,
+      // 票 120：公开视图只带「图鉴 N/32 + 陈列架前 8 格 + 最近三篇标题」，正文只走串门。
+      expedition: expedition?.snapshot() ?? null,
       now: Date.now()
     })
   }
@@ -4577,6 +5025,8 @@ export function createService (ctx, options = {}) {
       },
       // 行情摘要（ticket 41/42）：只给窗口画价目与局域网指数，不转发历史。
       market: marketVisitView(),
+      // 票 120：串门进门后，日志正文跟着访客视图走（公开视图那条路仍然只有标题）。
+      expedition: publicExpeditionBlock(expedition?.snapshot() ?? null, { withLogBodies: true }),
       at: Date.now()
     }
   }
@@ -5339,6 +5789,26 @@ export function createService (ctx, options = {}) {
       }
       if (disposed) return
 
+      // 出远门（票 112）：盘缠与回币都走农场硬币，所以只在农场起来之后建。
+      // 坏文件只让这一趟不能出门，农场/串门/盘口照常；`expeditionNow` 只给测试注入。
+      if (farm !== null) {
+        try {
+          expedition = await createExpeditionStore(dir, {
+            log,
+            farm,
+            now: expeditionClock,
+            ...(expeditionRunId === null ? {} : { newRunId: expeditionRunId })
+          })
+        } catch (error) {
+          expedition = null
+          warn(ctx, '出远门存档初始化失败，本次不能出门：' + message(error))
+        }
+        // 票 119：room 的互斥与看家判断从这里问「在不在远门」。惰性求值，
+        // 所以 store.tick() 直接结束一趟（测试/其它调用方）也不会留下过期的 away。
+        room.setAwayProvider(() => expedition !== null && expedition.active())
+      }
+      if (disposed) return
+
       const petConfig = await readPetConfig(configPath)
       if (disposed) return
       const fallback = defaultNickname({ petName: petConfig.name, hostname: hostname() })
@@ -5582,6 +6052,8 @@ export function createService (ctx, options = {}) {
       if (!disposed) startFuturesSettleTick()
       // 合同的到期/失联/重试也不依赖网络；没有 discovery 时 sendTo 自然是 no-op。
       if (!disposed) startContractTimer()
+      // 出远门（票 112）：关窗也照走，所以 tick 与窗口开关无关。
+      if (!disposed) startExpeditionTick()
 
       if (!disposed && options.network !== false) {
         startNeighborTick()
@@ -5595,6 +6067,8 @@ export function createService (ctx, options = {}) {
       // 农场已经读出来的话，tick 不陪网络一起降级。
       if (!disposed) startFarmTick()
       if (!disposed) startFuturesSettleTick()
+      // 出远门是纯本机玩法，网络坏了也要能走完这一趟。
+      if (!disposed) startExpeditionTick()
       // 发现可能已经起来了；即使桥接坏掉，邻居灯也必须能按时过期。
       if (options.network !== false) {
         startNeighborTick()
@@ -5994,6 +6468,10 @@ export function createService (ctx, options = {}) {
           } else if (event?.type === 'futures-window-state') {
             // 票 93：期货窗同理——关了之后右键「期货」要能重新打开。
             futuresWindowOpened = event.open === true
+          } else if (event?.type === 'expedition-window-state') {
+            // 票 120：出远门窗真的开了/关了（含用户点 ×/Esc）。
+            // 之前没有这条分支，本地标志只能靠动作改，status() 不可用时就会「以为窗还开着」。
+            expeditionWindowOpened = event.open === true
           } else if (event?.type === 'action') {
             // ticket 11：桌面按钮只能**申请**动作。走和 HTTP /action 完全相同的 handleAction，
             // 结果（含人话 notice）再原样回给 helper，由渲染端冒泡/更新。
@@ -6134,6 +6612,19 @@ export function createService (ctx, options = {}) {
         plotId: event.plotId ?? undefined,
         cropId: event.cropId ?? undefined,
         visitId: event.visitId ?? undefined,
+        // 出远门（票 112 / 115）：出发带路线 id；陈列架开格/摆件/挪格/取下带格子与两端。
+        // 少抄这五行，窗口点「交 500 盘缠，出发」只会收到「没有这条路线。」——routeId
+        // 在这一跳变成 undefined，而 HTTP 那条路直读 body，所以 e2e 全绿也照漏（2026-11-20 实测）。
+        routeId: event.routeId ?? undefined,
+        slot: event.slot ?? undefined,
+        itemId: event.itemId ?? undefined,
+        moveFrom: event.moveFrom ?? undefined,
+        moveTo: event.moveTo ?? undefined,
+        // 票 48 / 120：解锁的乐观锁，与农场页「陈列架」入口要求的落地页签。
+        // 这两个也从 preload 起一路带着，唯独在这里被丢掉：没有 expectedUnlocked 时
+        // 解锁变成「不看窗口里是哪块地」，tab 丢了则点「陈列架 N/32」开出来的是旅行页。
+        expectedUnlocked: event.expectedUnlocked ?? undefined,
+        tab: event.tab ?? undefined,
         // 交易所（ticket 41）：窗口只报数量，单价、总价和余额全由宿主算。
         qty: event.qty ?? undefined,
         // 票 53：派它去偷时带的地块列表（`farm-raid` 才用；白名单在 shared 已经过一遍）。
@@ -6937,9 +7428,105 @@ export function createService (ctx, options = {}) {
     return true
   }
 
+  /**
+   * 票 121：本机申报的 `at` 单调递增。假时钟下 `futuresClock()` 可能停在原地，
+   * 两笔申报撞同一个 at，房主按 at 去重就会把那两笔当成一笔。
+   */
+  function nextFuturesCommandAt () {
+    const now = futuresClock()
+    futuresCommandAt = Math.max(futuresCommandAt + 1, now)
+    return futuresCommandAt
+  }
+
+  /** 票 121：把一笔申报记进 outbox——半路丢了还能补，补到房主回执为止。 */
+  function futuresQueueCommand (hostId, kind, at, data) {
+    if (disposed || hostId === null) return
+    const queue = futuresOutbox.get(hostId) ?? []
+    queue.push({ kind, at, data, sentAt: Date.now(), tries: 0 })
+    // 只留最近 8 笔：更老的申报房主本来也会按新账拒掉，补发只是白费带宽。
+    while (queue.length > 8) queue.shift()
+    futuresOutbox.set(hostId, queue)
+  }
+
+  /** 票 121：房主回执说「处理到 ackAt 了」，那之前的申报可以从 outbox 划掉。 */
+  function futuresPruneOutbox (hostId, ackAt) {
+    if (!Number.isFinite(ackAt) || ackAt <= 0) return
+    const queue = futuresOutbox.get(hostId)
+    if (!Array.isArray(queue) || queue.length === 0) return
+    const kept = queue.filter((entry) => entry.at > ackAt)
+    if (kept.length === 0) futuresOutbox.delete(hostId)
+    else futuresOutbox.set(hostId, kept)
+  }
+
+  /**
+   * 票 121：每个期货 tick 补发还没被确认的申报。回执正常时这里什么都不做——
+   * 让队列变短的是房主带回来的 `ackAt`，不是这个函数。
+   */
+  function retryFuturesCommands () {
+    if (disposed || futuresOutbox.size === 0) return
+    const now = Date.now()
+    for (const [hostId, queue] of futuresOutbox) {
+      const kept = []
+      for (const entry of queue) {
+        if (now - entry.sentAt < FUTURES_RETRY_MS) { kept.push(entry); continue }
+        // 兜底：房主一直不回执（例如它还是老版本），别把同一笔喂到天荒地老。
+        if (entry.tries >= FUTURES_RETRY_MAX) continue
+        entry.tries += 1
+        entry.sentAt = now
+        try {
+          discovery?.sendTo(hostId, entry.data)
+        } catch (error) {
+          warnOnce('futures-retry', '期货申报补发失败：' + message(error))
+        }
+        kept.push(entry)
+      }
+      if (kept.length === 0) futuresOutbox.delete(hostId)
+      else futuresOutbox.set(hostId, kept)
+    }
+  }
+
+  /** 房主侧：记下「这个 peer 的申报处理到哪了」，随下一条 settle 回给对端。 */
+  function futuresAckCommand (deviceId, at) {
+    if (!Number.isFinite(at) || at <= 0) return
+    const seen = futuresAcks.get(deviceId) ?? 0
+    if (at > seen) futuresAcks.set(deviceId, at)
+  }
+
+  /**
+   * 房主侧：对端没收到回执就会重发，所以同一笔申报会来好几次。
+   * 返回 false = 这笔已经处理过，只需要把回执再发一遍，绝不能再落一次账。
+   */
+  function futuresCommandIsNew (deviceId, kind, at) {
+    const key = deviceId + '|' + kind + '|' + at
+    if (futuresAppliedCommands.has(key)) return false
+    futuresAppliedCommands.set(key, at)
+    // 只留最近 256 条：账本本身有 epoch/seq，这里防的只是短时间内的重发。
+    if (futuresAppliedCommands.size > 256) {
+      futuresAppliedCommands.delete(futuresAppliedCommands.keys().next().value)
+    }
+    return true
+  }
+
+  /** 票 121：补发的节流与上限。真实环境 15 秒一拍，40 次就是十分钟的重试窗口。 */
+  const FUTURES_RETRY_MS = 60
+  const FUTURES_RETRY_MAX = 40
+
+  /**
+   * 票 121 的测试缝：`options.futuresDropWire(info)` 返回 true 时这一包**当作丢了**——
+   * 不真发，但 outbox 照记、tick 照补。没有真实丢包网卡的环境靠它验补发。
+   */
+  function futuresSendWire (hostId, data, info) {
+    if (typeof options.futuresDropWire === 'function' && options.futuresDropWire(info) === true) return true
+    try {
+      return discovery.sendTo(hostId, data) === true
+    } catch (error) {
+      warnOnce('futures-wire', '期货报文发不出去：' + message(error))
+      return false
+    }
+  }
+
   /** 房主侧：现算某个 deviceId 的账目，编成一条 `futures-settle`。 */
-  function futuresSettleBytes (deviceId, delta = 0) {
-    const at = futuresClock()
+  function futuresSettleBytes (deviceId, delta = 0) {    const at = futuresClock()
     const account = futures.accountOf(deviceId, { at })
     const positions = account.positions.map((position) => ({
       id: position.id,
@@ -7000,7 +7587,9 @@ export function createService (ctx, options = {}) {
       // 1.12.4：做市商净盈亏（房主账本的全局数），peer 窗口显示「系统净付出」。
       house: fund.house,
       // 1.13.1：还没被这台机器收下的放款。它会跟着后面几拍重复发，peer 按 `at` 去重。
-      payout: account.payout ?? null
+      payout: account.payout ?? null,
+      // 票 121：告诉对端「你的申报我处理到哪个 at 了」，它据此清掉 outbox。
+      ackAt: futuresAcks.get(deviceId) ?? 0
     }
     // 票 96：整包硬上限 4 KiB。满仓 + 满挂单时 8 条流水可能塞不下，逐条减到能发为止。
     for (let keep = trades.length; keep >= 0; keep -= 1) {
@@ -7014,8 +7603,7 @@ export function createService (ctx, options = {}) {
   }
 
   /** 房主侧：把最新账目推给一台 hello 过的对端。没绑定的邻居一个字节都不发。 */
-  function sendFuturesSettle (deviceId, { delta = 0 } = {}) {
-    if (disposed || futures === null || discovery === null) return false
+  function sendFuturesSettle (deviceId, { delta = 0 } = {}) {    if (disposed || futures === null || discovery === null) return false
     // 票 98：off 时出站一律不发，连已经绑定的邻居也不再推账。
     if (!isFuturesHost()) return false
     if (!futuresPeers.has(deviceId)) return false
@@ -7068,10 +7656,11 @@ export function createService (ctx, options = {}) {
     const host = futuresHostId()
     if (host === null || host === room.snapshot().self.deviceId) return false
     let data
+    const at = nextFuturesCommandAt()
     try {
       data = encodeFuturesWithdraw({
         deviceId: room.snapshot().self.deviceId,
-        at: futuresClock(),
+        at,
         coins,
         now: Date.now()
       })
@@ -7079,12 +7668,9 @@ export function createService (ctx, options = {}) {
       warnOnce('futures-withdraw-send', '提现申请发不出去：' + message(error))
       return false
     }
-    try {
-      return discovery.sendTo(host, data) === true
-    } catch (error) {
-      warnOnce('futures-withdraw-send', '提现申请发不出去：' + message(error))
-      return false
-    }
+    // 票 121：提现比别的申报更不能丢——丢了就是「申请了但钱永远不到」。
+    futuresQueueCommand(host, 'withdraw', at, data)
+    return futuresSendWire(host, data, { type: 'futures-withdraw', kind: 'withdraw', at }) === true
   }
 
   /**
@@ -7242,6 +7828,11 @@ export function createService (ctx, options = {}) {
     if (disposed || futures === null || !isFuturesHost()) return
     if (!room.mayTalkTo(packet.deviceId)) return
     if (!futuresBindPeer(packet.deviceId, from)) return
+    // 票 121：补发的同一条申报只落一次账；但回执照样要再发一遍，否则对端会一直补。
+    if (!futuresCommandIsNew(packet.deviceId, 'order:' + String(packet.kind), packet.at)) {
+      sendFuturesSettle(packet.deviceId)
+      return
+    }
     const at = futuresClock()
     let result = null
     try {
@@ -7284,8 +7875,12 @@ export function createService (ctx, options = {}) {
     }
     if (result?.ok !== true) {
       warnOnce('futures-order-' + String(result?.error), '期货指令被拒：' + String(result?.error))
+      // 票 121：拒单也要回执——对端知道「这笔别补了」，账户里一分钱没动。
+      futuresAckCommand(packet.deviceId, packet.at)
+      sendFuturesSettle(packet.deviceId)
       return
     }
+    futuresAckCommand(packet.deviceId, packet.at)
     sendFuturesSettle(packet.deviceId, { delta: futuresOrderDelta(packet, result) })
   }
 
@@ -7298,6 +7893,11 @@ export function createService (ctx, options = {}) {
     if (!room.mayTalkTo(packet.deviceId)) return
     if (!futuresBindPeer(packet.deviceId, from)) return
     if (typeof packet.orderId !== 'string') return
+    // 票 121：撤单同样只落一次账；补发的重发只换回一份新回执。
+    if (!futuresCommandIsNew(packet.deviceId, 'cancel', packet.at)) {
+      sendFuturesSettle(packet.deviceId)
+      return
+    }
     let result = null
     try {
       result = await futures.hostCancel(packet.deviceId, { orderId: packet.orderId, at: futuresClock() })
@@ -7307,8 +7907,11 @@ export function createService (ctx, options = {}) {
     }
     if (result?.ok !== true) {
       warnOnce('futures-cancel-' + String(result?.error), '撤单被拒：' + String(result?.error))
+      futuresAckCommand(packet.deviceId, packet.at)
+      sendFuturesSettle(packet.deviceId)
       return
     }
+    futuresAckCommand(packet.deviceId, packet.at)
     sendFuturesSettle(packet.deviceId, { delta: roundCoin(Number(result.released) || 0) })
   }
 
@@ -7361,6 +7964,11 @@ export function createService (ctx, options = {}) {
     if (disposed || futures === null || !isFuturesHost()) return
     if (!room.mayTalkTo(packet.deviceId)) return
     if (!futuresBindPeer(packet.deviceId, from)) return
+    // 票 121：提现申请补发也只受理一次，否则同一笔会被扣两次。
+    if (!futuresCommandIsNew(packet.deviceId, 'withdraw', packet.at)) {
+      sendFuturesSettle(packet.deviceId)
+      return
+    }
     let result = null
     try {
       result = await futures.requestWithdraw(packet.deviceId, packet.coins, futuresClock())
@@ -7370,8 +7978,11 @@ export function createService (ctx, options = {}) {
     }
     if (result?.ok !== true) {
       warnOnce('futures-withdraw-' + String(result?.error), '提现申请被拒：' + String(result?.error))
+      futuresAckCommand(packet.deviceId, packet.at)
+      sendFuturesSettle(packet.deviceId)
       return
     }
+    futuresAckCommand(packet.deviceId, packet.at)
     // 不管成败都回一份账目：失败时 peer 也会拿到最新余额，窗口不至于停在旧数上。
     sendFuturesSettle(packet.deviceId)
   }
@@ -7458,6 +8069,8 @@ export function createService (ctx, options = {}) {
     }
     if (applied?.applied !== true) return
     futuresHostSeen = packet.deviceId
+    // 票 121：房主处理到哪笔了，就把那之前的申报从 outbox 划掉（补发到此为止）。
+    futuresPruneOutbox(packet.deviceId, packet.ackAt)
     // 1.13.1：放款到了就把币加进自家农场。`settlePayout()` 自己按 `at` 去重，
     // 所以同一笔跟着后面几拍重发也只加一次。
     void futures.settlePayout().then((payout) => {
@@ -7495,12 +8108,16 @@ export function createService (ctx, options = {}) {
   function syncFutures (now = futuresClock()) {
     if (disposed || futures === null || discovery === null) return false
     if (isFuturesHost()) return false
-    if (now - futuresSyncAt < futuresSyncMs) return false
+    // 票 121：对账的节流按**真实时间**算。以前用 game 时钟，测试里时钟是冻住的，
+    // 对完第一次就再也不对了——房主那一拍 settle 恰好丢包，peer 的账目就永远停在旧数。
+    const wall = Date.now()
+    if (wall - futuresSyncWallAt < futuresSyncMs) return false
     const replica = futures.replicaOf()
     const hostId = futuresHostId()
     if (hostId === null) return false
     if (replica === null) return announceFutures(now) > 0
     futuresSyncAt = now
+    futuresSyncWallAt = wall
     try {
       return discovery.sendTo(hostId, encodeFuturesSync({
         deviceId: room.snapshot().self.deviceId,
@@ -7654,20 +8271,20 @@ export function createService (ctx, options = {}) {
     const hostId = futuresHostId()
     if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     let data
+    const at = nextFuturesCommandAt()
     try {
       data = encodeFuturesOrder({
         deviceId: room.snapshot().self.deviceId,
-        at: futuresClock(),
+        at,
         ...order
       })
     } catch (error) {
       warnOnce('futures-order-encode', '期货指令发不出去：' + message(error))
       return { ok: false, error: 'bad-order' }
     }
-    try {
-      if (discovery.sendTo(hostId, data) !== true) return { ok: false, error: 'no-host' }
-    } catch (error) {
-      warnOnce('futures-order-send', '期货指令发不出去：' + message(error))
+    // 票 121：先记账再发。发丢了、回执丢了，tick 都会按 outbox 补发。
+    futuresQueueCommand(hostId, 'order', at, data)
+    if (futuresSendWire(hostId, data, { type: 'futures-order', kind: String(order.kind), at }) !== true) {
       return { ok: false, error: 'no-host' }
     }
     return { ok: true, action, pending: true, notice: '已发给房主，等一拍回执。' }
@@ -7683,20 +8300,20 @@ export function createService (ctx, options = {}) {
     const hostId = futuresHostId()
     if (hostId === null) return { ok: false, error: 'no-host', notice: '对端未升级，期货不可用' }
     let data
+    const at = nextFuturesCommandAt()
     try {
       data = encodeFuturesCancel({
         deviceId: room.snapshot().self.deviceId,
-        at: futuresClock(),
+        at,
         orderId
       })
     } catch (error) {
       warnOnce('futures-cancel-encode', '撤单发不出去：' + message(error))
       return { ok: false, error: 'bad-order' }
     }
-    try {
-      if (discovery.sendTo(hostId, data) !== true) return { ok: false, error: 'no-host' }
-    } catch (error) {
-      warnOnce('futures-cancel-send', '撤单发不出去：' + message(error))
+    // 票 121：撤单也进 outbox，丢一包就等于单子没撤掉。
+    futuresQueueCommand(hostId, 'cancel', at, data)
+    if (futuresSendWire(hostId, data, { type: 'futures-cancel', kind: 'cancel', at }) !== true) {
       return { ok: false, error: 'no-host' }
     }
     return { ok: true, action: 'futures-cancel', pending: true, notice: '已发给房主，等一拍回执。' }
@@ -8052,6 +8669,8 @@ export function createService (ctx, options = {}) {
    */
   async function runFuturesTick () {
     if (futures === null || disposed) return
+    // 票 121：先补发没被确认的申报——它和结算无关，但不能等结算失败就跳过。
+    retryFuturesCommands()
     // 票 98：off 时连定时结算都停（账本保留，重新切回 live 不会被旧行情补刀）。
     let settled = null
     try {
@@ -9184,7 +9803,18 @@ export function createService (ctx, options = {}) {
     futuresAccountOf: (deviceId) => (futures === null ? null : futures.accountOf(deviceId, { at: futuresClock() })),
     /** 1.12.6 的测试/诊断缝：底层账本本身（只在测试里模拟「房主把别人的档位弄丢了」）。 */
     futuresStore: () => futures,
+    /** 票 112 的测试/诊断缝：出远门整份视图（与 `/state.expedition`、窗口同源）。 */
+    expedition: () => expeditionView(),
+    expeditionWindow: () => expeditionView(),
+    /** 票 112 的测试/诊断缝：底层 store（e2e 用它把假时钟推到下一段）。 */
+    expeditionStore: () => expedition,
+    /** 票 120 的测试/诊断缝：公开只读视图（与 `/dsh-zoo-farm/open/<viewerId>` 同源）。 */
+    openFarm: (viewer) => openFarmLookup(viewer),
+    /** 票 120 的测试/诊断缝：串门视图（与 `/dsh-zoo-farm/<visitId>` 同源）。 */
+    visitFarm: (visitId) => lookupFarmView(visitId),
     farmGuard: () => farmGuard(),
+    /** 票 122 的测试/诊断缝：合同账本本身（e2e 用它把一笔结算卡在中间，再关停）。 */
+    contractsStore: () => contracts,
     /** ticket 43/44 的测试/诊断缝：只读驮包（偷来的作物 + 在途工资）。 */
     carried: () => carriedView(),
     /** 本机 UDP 实际绑定端口（`port:0` 的测试用它拿到临时端口）。 */
@@ -9222,12 +9852,20 @@ export function createService (ctx, options = {}) {
         clearInterval(contractTimer)
         contractTimer = null
       }
+      if (expeditionTimer !== null) {
+        clearInterval(expeditionTimer)
+        expeditionTimer = null
+      }
       if (cropTimer !== null) {
         clearInterval(cropTimer)
         cropTimer = null
       }
       // ticket 44：先把 active 合同落成 ended（尽力而为；写盘失败也只告警一次），
       // 再放开 store。钱的标记保持不变，下一次启动按对账规则收尾。
+      // 票 122：在飞的结算/退款不会被这里打断——它们各自在入口抓了 store 的局部引用，
+      // 会把「写 settling → 入账 → 写 settled」这一整笔写完；ContractStore 里已经排上
+      // 队的写也会自己落盘（store 没有 close，丢引用只是让新写不再开始）。
+      // 也就是说：dispose 保证「不再开新的一笔」，不保证「等旧的一笔」。
       if (contracts !== null) {
         contracts.endAllActive(contractClock(), 'shutdown').catch((error) => {
           warn(ctx, '卸载时结束合同失败：' + message(error))
@@ -9248,6 +9886,12 @@ export function createService (ctx, options = {}) {
       contractAttempts.clear()
       contracts = null
       farm = null
+      // 出远门：先放开队列再丢引用，卸载后不再写 expedition.json。
+      // dispose 是异步的（等排队的写盘落完）；服务卸载本身是同步的，这里只能放手——
+      // 队列里那一拍会自己落完，不必让卸载等它。挂个 catch 只是别让它变成
+      // 未处理的 rejection；进程立刻退出时最后一拍仍可能丢，已记在文档的已知问题里。
+      Promise.resolve(expedition?.dispose()).catch(() => {})
+      expedition = null
       // tick 会随 farmTimer 一起停，但 store 引用也要放开：卸载后不该再写盘。
       trading = null
       season = null

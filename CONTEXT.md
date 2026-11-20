@@ -34,12 +34,17 @@
 规格见 [SPEC v12](.scratch/dsh-zoo/SPEC-v12.md)；票 103–108 在
 [`.scratch/dsh-zoo/issues/`](.scratch/dsh-zoo/issues/)。A 期是行情 v5 + 消息面，B 期接 LAN 真人资金流（票 107）。
 
+「出远门（硬币销毁系统）」的决策见 [ADR-0039](docs/adr/0039-expedition-burns-coins.md)，
+玩法手册见 [docs/play-expedition.md](docs/play-expedition.md)。
+
 注：下面的 `_Avoid_` 只约束领域用语；代码与存储里用的是英文标识符 `peer` / `guest` / `nickname` / `skin` / `activeSource`（如 `peers.json`、快照的 `guests`、线路上的 `nickname` 字段、`skin.json`、动作 `use-skin`），它们与这里的“邻居 / 访客 / 名字 / 皮”同义，不算违反。
 农场的标识符同理：`farm` / `plot` / `crop` / `stores` / `coin` / `exchange` / `market` / `steal` / `help` / `worker` / `wage` / `contract` / `guard` / `idle` / `dew`（如 `farm.json`、`market.json`、`contracts.json`、`working` 状态、`market-digest` 报文），与“农场 / 地块 / 作物 / 仓库 / 硬币 / 交易所 / 行情 / 偷菜 / 帮忙 / 雇工 / 工资 / 合同 / 看家 / 在线 / 露水”同义。
 
 盘口的标识符同理：`trading` / `board` / `bar` / `slot` / `tick` / `position` / `order` / `margin` / `leverage` / `liquidation` / `stop` / `entry` / `target` / `weekPnl` / `league` / `sentiment` / `news` / `ticker` / `calendar`（如 `trading.json`、`trading-digest` 报文、`/state.trading`、`week.pnl`、`payload.news`），与“盘口 / 一根 / 一格 / 仓位 / 挂单 / 保证金 / 杠杆 / 强平 / 止损 / 入场价 / 目标价 / 本周交易盈亏 / 周榜 / LAN 情绪 / 消息面 / 快讯条 / 日程 / 资金流 / 冲击 / 资金流带”同义。
 
 期货的标识符同理：`futures` / `contract` / `fair` / `index` / `quote` / `fill` / `lot` / `escrow` / `balance` / `marginUsed` / `settlePrice` / `delivery` / `convert` / `netting` / `insurance` / `epoch` / `seq` / `shadow` / `accountMode` / `paused`（如 `futures.json`、`futures-*` 报文、`/state.futures`），与“期货 / 日合约 / 公允价 / 现货指数 / 报价 / 撮合 / 张 / 托管账户 / 余额 / 保证金占用 / 交割价 / 交割 / 转现货 / 净额结算 / 保险基金 / 纪元 / 序号 / 账户档位 / 暂停”同义。注意 `contract` 在期货线指**日合约**，在农场线指**雇工合同**，靠上下文与模块区分。
+
+出远门的标识符同理：`expedition` / `run` / `route` / `fare` / `leg` / `danger` / `loot` / `souvenir` / `codex` / `shelf` / `lantern` / `log` / `wipeout`（如 `expedition.json`、`expedition-*` 动作、`/state.expedition`、`run.leg`、`shelf.slots`），与“出远门 / 一趟 / 路线 / 盘缠 / 路段 / 危险度 / 战利品 / 特产 / 图鉴 / 陈列架 / 提灯 / 旅行日志 / 翻车”同义。注意 `log` 在这里是**旅行日志**，不是红包记录（`packetLog`）也不是串门记录。
 
 ## Language
 
@@ -346,6 +351,75 @@ _Avoid_: 治疗, 修复, heal, repair
 把生长中或冻住的作物直接清空为草地；免费、不退种子、不产作物，用于换季前止损或清掉冻住的地。
 成熟要先收割，枯萎直接重种。宿主动作 `farm-clear`。
 _Avoid_: 删除, 拔掉, delete, remove
+
+## 出远门（硬币销毁）
+
+**出远门 (Expedition)**：
+花一笔盘缠把宠物送出门、沿一条路线走几段的玩法。它存在的理由是**销毁硬币**：
+盘缠不退、特产不能卖，走一趟就烧掉八成盘缠。捡东西、开图鉴、摆陈列架是它的留存钩子。
+和串门、打工一样占用「出门」状态，看家失效。
+_Avoid_: 出差, 探险, 远征, 旅行, trip, adventure
+
+**一趟 (Run)**：
+一次出远门的完整过程：交盘缠 → 走段 → 回家结算。同一时刻只能有一趟；结束后可以立刻再开，
+没有冷却，也没有每日次数上限。
+_Avoid_: 一局, 一次, session, game
+
+**盘缠 (Fare)**：
+出门前付给这条路线的那笔硬币：**入场即扣、永不退还**，也不随段数结算。四条路线就是四档盘缠。
+它不是押金，也不是门票——押金会退，门票只买进门；盘缠是这趟的燃料。
+_Avoid_: 门票, 押金, 入场费, 路费, cost, deposit
+
+**路段 (Leg)**：
+一趟里推进一次的那一格：走路 20 秒，掉一件特产和一笔硬币，再报下一段的危险度。
+一趟的段数在路线的区间里随机（后山 3–4、雾岭 6–7）。
+_Avoid_: 一步, 阶段, 回合, step, round, stage
+
+**危险度 (Danger)**：
+继续走下一段时翻车的概率：路线基础值 + 每多走一段 +3%。默认只显示「低 / 中 / 高」，
+买了**提灯**才显示精确百分比。
+_Avoid_: 风险, 概率, risk, chance
+
+**折返 (Turn Back)**：
+玩家主动结束这趟、带着已捡的东西回家的动作；按钮写「见好就收」。
+决策窗 20 秒没点也算折返（日志写「没等到你，自己回来了」）。它不是失败。
+_Avoid_: 撤退, 逃跑, 放弃, retreat, quit
+
+**翻车 (Wipeout)**：
+继续走但掷骰失败：特产随机丢一半、硬币按已走段数照给、盘缠不退，立刻回家。没有额外惩罚。
+_Avoid_: 失败, 死亡, 团灭, fail, death
+
+**特产 (Souvenir)**：
+路上捡到的东西：能陈列、能进图鉴、v2 能塞红包送人，**不能卖、不能换硬币**。
+「不可售」是整个玩法的地基——能卖就变成刷钱路线。
+_Avoid_: 战利品, 掉落, 道具, 装备, loot, item, drop
+
+**战利品 (Loot)**：
+一趟里已经到手、还没结算进家的东西：硬币与特产。翻车时特产在这里减半。
+_Avoid_: 收获, 掉落物, reward
+
+**图鉴 (Codex)**：
+32 件特产的收集册，按四条路线分四组。点亮只记「见过」，不记数量，也不能重复卖。
+_Avoid_: 收藏册, 图集, 成就, collection, album
+
+**陈列架 (Shelf)**：
+家里摆特产的那排格子：默认 8 格，最多 32 格，第 9 格起每格 5,000 硬币。
+邻居串门和公开视图都能看见前 8 格。
+_Avoid_: 展示柜, 货架, 展台, showcase, display case
+
+**提灯 (Lantern)**：
+一次性升级（10,000 硬币）：出门后每段显示精确危险百分比。只买一次，永久生效。
+_Avoid_: 灯, 照明, torch
+
+**旅行日志 (Trip Log)**：
+每趟结束写下的一段话（路线、走了几段、捡到什么、怎么回的家），留在农场页最多 30 篇；
+公开视图只露最近三篇的**标题**，正文要串门进来才看。
+_Avoid_: 日记, 游记, diary, journal
+
+**公开视图 (Open View)**：
+邻居不串门也能看的只读页（`/dsh-zoo-farm/open/<viewerDeviceId>`）。出远门这块只放
+「集齐件数 + 陈列架前 8 格 + 最近三篇日志标题」，不放日志正文。
+_Avoid_: 主页, 公开页, profile
 
 ## 盘口（15 分钟合约）
 

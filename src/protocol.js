@@ -402,9 +402,10 @@ const VISIT_TYPES = new Set([
  * visit-deny 的理由是固定枚举，不是自由文本：
  * - not-admitted：本机没放行这位邻居（默认，也兼容不带 reason 的旧报文）
  * - visits-off：本机客厅的“允许串门”开关被关掉了
+ * - already-away：宠物出了远门，家里没人（票 119）
  * 发起方据此给出不同的人话提示，但不能借这个字段传任意内容。
  */
-export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off'])
+export const VISIT_DENY_REASONS = Object.freeze(['not-admitted', 'visits-off', 'already-away'])
 const DENY_REASON_SET = new Set(VISIT_DENY_REASONS)
 /** 雇工挂牌原因同样是固定枚举（ticket 44）；42 只发 null。 */
 const HIRE_REASON_SET = new Set(HIRE_REASONS)
@@ -1119,6 +1120,8 @@ function buildPacket ({
   paused,
   accountMode,
   payout,
+  // 票 121：房主对 peer 申报的确认位（这一拍处理到哪个 at）
+  ackAt,
   lastSeq,
   caps,
   purpose,
@@ -1546,6 +1549,11 @@ function buildPacket ({
       if (payoutAt === null || payoutCoins === null) throw new Error('protocol: invalid futures payout')
       safePayout = { at: payoutAt, coins: payoutCoins }
     }
+    // 票 121：确认位是可选的非负整数毫秒戳（老房主不发 = 0）。
+    const safeAckAt = ackAt === undefined ? 0 : ackAt
+    if (typeof safeAckAt !== 'number' || !Number.isFinite(safeAckAt) || safeAckAt < 0) {
+      throw new Error('protocol: invalid futures ack')
+    }
     packet = {
       ...base,
       at: stamp,
@@ -1566,6 +1574,9 @@ function buildPacket ({
     if (safeAccountMode !== null) packet.accountMode = safeAccountMode
     if (safePaused === true) packet.paused = true
     if (safePayout !== null) packet.payout = safePayout
+    // 票 121：房主确认「这个 peer 的申报已经处理到哪一个 at」。0 表示这一拍没有新确认，
+    // 老房主不带这个字段，peer 就退回「按次数重发」的老路子。
+    if (safeAckAt > 0) packet.ackAt = safeAckAt
   } else if (type === 'futures-sync') {
     // peer：我手上是 (epoch, lastSeq)，缺的请补给我。房主只回一条 settle（整份快照）。
     const stamp = futuresStamp(at, now)
@@ -1782,6 +1793,7 @@ export function encodeFuturesSettle ({
   accountMode = null,
   paused = false,
   payout = null,
+  ackAt = 0,
   pending = 0,
   now
 } = {}) {
@@ -1811,6 +1823,14 @@ export function encodeFuturesSettle ({
   if (paused === true) packet.paused = true
   // 1.13.1：房主批准的一笔放款。它会跟着后面几拍 settle 重复下发，peer 按 `at` 去重。
   if (payout !== null && payout !== undefined) packet.payout = payout
+  // 票 121：确认「这个 peer 的申报处理到哪个 at」。只在有值时才带，老 peer 会忽略。
+  // 坏值不猜：回执决定 peer 何时停止补发，猜错就是「申报永远在路上」。
+  if (ackAt !== undefined && ackAt !== 0) {
+    if (typeof ackAt !== 'number' || !Number.isFinite(ackAt) || ackAt < 0) {
+      throw new Error('protocol: invalid futures ack')
+    }
+    packet.ackAt = ackAt
+  }
   return encodePacket(packet)
 }
 
@@ -2646,6 +2666,12 @@ export function parsePacket (input, { now = Date.now() } = {}) {
       if (payoutAt === null || payoutCoins === null) return fail('payout')
       payout = { at: payoutAt, coins: payoutCoins }
     }
+    // 票 121：确认位可选（老房主不发 = 0）；给了就必须是非负有限数。
+    let ackAt = 0
+    if (raw.ackAt !== undefined) {
+      if (typeof raw.ackAt !== 'number' || !Number.isFinite(raw.ackAt) || raw.ackAt < 0) return fail('ack-at')
+      ackAt = raw.ackAt
+    }
     return {
       ok: true,
       packet: {
@@ -2668,6 +2694,7 @@ export function parsePacket (input, { now = Date.now() } = {}) {
         accountMode,
         paused,
         payout,
+        ackAt,
         pending
       }
     }

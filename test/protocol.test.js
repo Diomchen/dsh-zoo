@@ -244,7 +244,7 @@ function futuresKeys (type) {
     'futures-hello': ['v', 'type', 'deviceId', 'at'],
     'futures-order': ['v', 'type', 'deviceId', 'at', 'kind', 'coins'],
     'futures-cancel': ['v', 'type', 'deviceId', 'at', 'orderId'],
-    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'house', 'mode', 'accountMode', 'paused', 'payout', 'pending'],
+    'futures-settle': ['v', 'type', 'deviceId', 'at', 'epoch', 'seq', 'balance', 'marginUsed', 'delta', 'positions', 'orders', 'trades', 'insurance', 'shortfall', 'house', 'mode', 'accountMode', 'paused', 'payout', 'ackAt', 'pending'],
     'futures-sync': ['v', 'type', 'deviceId', 'at', 'epoch', 'lastSeq'],
     'futures-mode': ['v', 'type', 'deviceId', 'at', 'accountMode'],
     'futures-pause': ['v', 'type', 'deviceId', 'at', 'paused'],
@@ -1237,6 +1237,26 @@ test('票 95：futures-cancel 认 orderId（也留 positionId 给票 96），两
   assert.equal(parsePacket(encodeJson({ ...base, orderId: 'nope' })).reason, 'cancel-target')
 })
 
+test('票 121：futures-settle 带得回 ackAt；缺省 0，坏值整包拒', () => {
+  const body = validFuturesSettle({ ackAt: 1_700_000_000_123 })
+  const parsed = parsePacket(encodeFuturesSettle(body))
+  assert.equal(parsed.ok, true)
+  assert.equal(parsed.packet.ackAt, 1_700_000_000_123)
+
+  // 不带 = 0，老房主的包照样能读（peer 那边退回按次数补发）。
+  assert.equal(parsePacket(encodeFuturesSettle(validFuturesSettle())).packet.ackAt, 0)
+
+  // 负数、NaN、字符串都不认：回执决定 peer 什么时候停止补发，不能猜。
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ ackAt: -1 })), /invalid futures ack/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ ackAt: Number.NaN })), /invalid futures ack/)
+  assert.throws(() => encodeFuturesSettle(validFuturesSettle({ ackAt: '1' })), /invalid futures ack/)
+
+  // 解码路径（别人手搓的 JSON）同样要挡。
+  const raw = JSON.parse(encodeFuturesSettle(validFuturesSettle()).toString('utf8'))
+  raw.ackAt = -5
+  assert.equal(parsePacket(JSON.stringify(raw)).reason, 'ack-at')
+})
+
 test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂单 / 坏字段都整包拒', () => {
   const body = validFuturesSettle({ orders: [validFuturesOrder()] })
   const parsed = parsePacket(encodeFuturesSettle(body))
@@ -1267,7 +1287,9 @@ test('票 95：futures-settle 往返带账目与挂单；9 个持仓 / 9 条挂�
     paused: false,
     // 1.13.1：放款回执可选，缺省 null。
     payout: null,
-    pending: 0
+    pending: 0,
+    // 票 121：房主回执缺省 0（这一拍没有新处理的申报）。
+    ackAt: 0
   })
 
   // 票 95：`orders` 是可选的（票 94 的调用方不带），不带就是空盘口，字段始终在线。

@@ -237,6 +237,48 @@
         background: var(--emerald-soft);
         color: var(--emerald-deep);
       }
+      /* 票 116：顶栏旁一行「最近三篇出远门日志」，只放标题；正文点开窗口才看得到。 */
+      .expedition-log {
+        flex: none;
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 6px 12px;
+        border-top: 1px solid var(--line);
+        background: #fbf8f3;
+        color: var(--ink-soft);
+        font-size: 11.5px;
+        cursor: pointer;
+      }
+      .expedition-log[hidden] {
+        display: none !important;
+      }
+      .expedition-log:hover {
+        background: #f6f1e8;
+      }
+      .exp-log-label {
+        flex: none;
+        color: var(--amber-ink);
+        font-weight: 600;
+        white-space: nowrap;
+      }
+      .exp-log-titles {
+        flex: 1 1 auto;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .exp-log-titles span + span::before {
+        content: ' · ';
+        color: var(--line);
+      }
+      .exp-log-open {
+        flex: none;
+        color: var(--amber-ink);
+        text-decoration: underline;
+        text-underline-offset: 2px;
+        white-space: nowrap;
+      }
 
       /* 2. 分段页签 */
       /* 票 55：农场窗头部的邻居切换器（我的农场 / 各邻居）。 */
@@ -2315,6 +2357,8 @@
             <span class="emoji" aria-hidden="true">💧</span><b id="dew-value">0</b>
           </span>
           <button class="board-entry" id="board" type="button" aria-label="打开盘口" title="打开盘口（15 分钟合约）">盘口</button>
+          <!-- 票 120：陈列架入口。N 与公开视图同口径（图鉴已集齐 / 32），点开落陈列架页。 -->
+          <button class="board-entry" id="expedition-entry" type="button" aria-label="打开出远门的陈列架" title="陈列架 · 打开出远门">陈列架 <b id="expedition-owned">0</b>/32 · 点开看</button>
           <button class="pin" id="pin" type="button" aria-label="置顶窗口" aria-pressed="false" title="置顶窗口">📌</button>
           <button class="close" id="close" type="button" aria-label="关闭农场">×</button>
         </div>
@@ -2347,6 +2391,13 @@
           <span class="tab-emoji" aria-hidden="true">📜</span>记录
         </button>
       </nav>
+
+      <!-- 票 116：最近三篇出远门日志的标题。正文只在出远门窗口里，点这一行去开窗。 -->
+      <div class="expedition-log" id="expedition-log" role="button" tabindex="0" aria-label="最近三篇出远门日志，点开看全文" hidden>
+        <span class="exp-log-label">📔 最近三篇</span>
+        <span class="exp-log-titles" id="expedition-log-titles"></span>
+        <span class="exp-log-open">看全文</span>
+      </div>
 
       <div class="batch-bar" id="batch-bar" hidden>
         <button class="batch-btn plant" id="batch-plant" type="button">＋ 一键种满</button>

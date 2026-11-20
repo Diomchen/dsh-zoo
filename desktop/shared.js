@@ -85,11 +85,11 @@
    * 一级 = 工具项 + 动作；「动作」下面是分类，分类下面是动画名。
    * 工具项是**固定集合**：渲染端只认这几个 id，不认识的直接丢——宿主不该借菜单下发任意命令。
    */
-  const MAX_MENU_TOOLS = 8
+  const MAX_MENU_TOOLS = 9
   const MAX_MENU_GROUPS = 24
   const MAX_MENU_ACTIONS = 256
-  // 票 79：`trading` = 右键「盘口」。与宿主 src/menu.js 的 MENU_TOOL_LABELS 同集合。
-  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'futures', 'home', 'reload', 'scan-skins']
+  // 票 79：`trading` = 右键「盘口」；票 112：`expedition` = 右键「出远门」。
+  const MENU_TOOL_IDS = ['open-site', 'bring', 'farm', 'trading', 'futures', 'expedition', 'home', 'reload', 'scan-skins']
   /**
    * 右键工具项 → 宿主动作申请（评审 P2）：渲染端以前用一条 `id === 'reload' || …` 的
    * 手写链，多一个工具就要改两处。现在只有这一张表，`runMenuTool` 直接查它。
@@ -102,6 +102,7 @@
     farm: 'farm-open',
     trading: 'trading-open',
     futures: 'futures-window',
+    expedition: 'expedition-open',
     reload: 'reload',
     'scan-skins': 'scan-skins'
   })
@@ -220,6 +221,20 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
    */
   const BOARD_OPEN_ACTIONS = ['trading-open']
   /**
+   * 票 116：农场页顶栏旁那行「最近三篇出远门日志」也是一条开窗申请——
+   * 农场页只显示标题，正文要点进出远门窗口才看得到。
+   */
+  const EXPEDITION_OPEN_ACTIONS = ['expedition-open']
+  /**
+   * 出远门窗口能被「指定落点页签」的入口（票 120 的陈列架、票 116 的日志细条）。
+   * 别的值一律当普通开窗，不把页面切到别处。
+   */
+  const EXPEDITION_TABS = ['shelf', 'log', 'codex']
+  /** 落点页签的合法值；不合法返回 null。 */
+  function normalizeExpeditionTab (value) {
+    return EXPEDITION_TABS.includes(value) ? value : null
+  }
+  /**
    * 盘口小窗能提交的动作（票 79 / 票 81 / 票 83）。字段窄到不能再窄：
    *   trading-open-position  { side, margin, leverage, cropId }
    *   trading-close-position { positionId }
@@ -337,7 +352,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     FARM_EVENT_ACTIONS,
     FARM_OMEN_ACTIONS,
     // 票 79：农场窗头部的「盘口」按钮（无字段，只是开窗申请）。
-    BOARD_OPEN_ACTIONS
+    BOARD_OPEN_ACTIONS,
+    // 票 116：农场页的日志细条（无字段，只是开窗申请）。
+    EXPEDITION_OPEN_ACTIONS
   )
   /**
    * 桌面控件能请求的宿主动作白名单。渲染端只能申请，状态仍由宿主快照回灌。
@@ -375,7 +392,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     // 票 79：右键「盘口」只发一个空动作，开/关与整份视图都在宿主。
     ...BOARD_OPEN_ACTIONS,
     // 票 93：右键「期货」同理——空动作，宿主开窗并推整份视图。
-    'futures-window'
+    'futures-window',
+    // 票 112：右键「出远门」——开/关由宿主按真实窗口状态决定。
+    'expedition-open'
   ]
   /** 几张皮的 id 上限与宿主一致：短标识符，不是路径。 */
   const MAX_SKIN_CHOICES = 16
@@ -422,8 +441,42 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
   const FUTURES_MODES = ['off', 'shadow', 'live']
   /** 1.10.0：账户自己的档位——纸面还是真钱，每个账户自己选。 */
   const FUTURES_ACCOUNT_MODES = ['shadow', 'live']
+  /**
+   * 出远门小窗的提交白名单（票 112）：窗口只报意图——`start` 带路线，`step`/`back`/`lantern`
+   * 什么都不带，`refresh` 只请宿主补一拍，`shelf` 带格号与特产 id（票 115）。
+   * 钱与段数全在宿主算。
+   */
+  const EXPEDITION_SUBMIT_ACTIONS = [
+    'expedition-start',
+    'expedition-step',
+    'expedition-back',
+    'expedition-lantern',
+    'expedition-refresh',
+    'expedition-shelf'
+  ]
+  /** 出远门的三个阶段 + 两种结局；窗口只画这几个词。 */
+  const EXPEDITION_PHASES = ['walking', 'deciding']
+  const EXPEDITION_ENDED = ['back', 'complete', 'failed']
+  /** 票 116：只有两种「不好」的结局写原因，其余是 null。 */
+  const EXPEDITION_REASONS = ['wipeout', 'timeout']
+  /**
+   * 票 116：旅行日志的标题 / 正文上限（码点）。与 `src/expedition.js` 的 `TRIP_LOG_TITLE_MAX` /
+   * `TRIP_LOG_BODY_MAX` 同值，靠 `test/farm-constants-drift.test.js` 盯漂移——
+   * 窗口这边不截，对面发多长就画多长。
+   */
+  const TRIP_LOG_TITLE_MAX = 80
+  const TRIP_LOG_BODY_MAX = 400
+  /** 陈列架（票 115）：窗口按 32 格画，开格价与宿主同一个数；票 120 的前 8 格与 `src/expedition.js` 同值。 */
+  const EXPEDITION_SHELF_MAX = 32
+  const EXPEDITION_SHELF_PRICE = 5000
+  const SHELF_BASE_SLOTS = 8
 
-  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(MENU_ACTION_IDS, BOARD_SUBMIT_ACTIONS, FUTURES_SUBMIT_ACTIONS)
+  const DESKTOP_ACTIONS = CONTROL_ACTIONS.concat(
+    MENU_ACTION_IDS,
+    BOARD_SUBMIT_ACTIONS,
+    FUTURES_SUBMIT_ACTIONS,
+    EXPEDITION_SUBMIT_ACTIONS
+  )
   /** 改名正文的长度上限：宿主会按 32 码点再截一次，这里只防止 helper 内存里堆大字符串。 */
   const MAX_ACTION_TEXT = 64
   /**
@@ -1334,6 +1387,63 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     }
   }
 
+  /** 农场页那行「最近三篇日志」：只留标题，最多三篇；正文一律不进农场视图（票 116）。 */
+  function normalizeExpeditionLogTitles (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const titles = []
+    if (Array.isArray(source.titles)) {
+      for (const candidate of source.titles) {
+        if (titles.length >= 3) break
+        const title = normalizeLabel(candidate, '')
+        if (title !== '') titles.push(title)
+      }
+    }
+    return { titles }
+  }
+
+  /** 票 120：陈列架计数（`codex.owned` / 32 格），农场页顶栏与公开视图同一口径。 */
+  function normalizeShelfCount (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const owned = Number(source.owned)
+    return {
+      owned: Number.isFinite(owned) ? Math.min(EXPEDITION_SHELF_MAX, Math.max(0, Math.floor(owned))) : 0,
+      total: EXPEDITION_SHELF_MAX
+    }
+  }
+
+  /**
+   * 票 120：邻居公开视图里的「出远门」展示块。
+   *
+   * 只认三样：图鉴件数、前 8 格（id/名字/表情）、最近三篇标题与时间。
+   * 日志正文在公开视图里**不存在**，这里也不接——串门视图走另一条 normalize。
+   */
+  function normalizePublicExpedition (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const entries = Array.isArray(source.shelf) ? source.shelf : []
+    const shelf = []
+    for (let index = 0; index < SHELF_BASE_SLOTS; index += 1) {
+      const entry = entries[index]
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
+        shelf.push(null)
+        continue
+      }
+      const id = normalizeLabel(entry.id, '')
+      shelf.push(id === ''
+        ? null
+        : { id, name: normalizeLabel(entry.name, ''), emoji: normalizeLabel(entry.emoji, '') })
+    }
+    const logs = []
+    for (const candidate of Array.isArray(source.logs) ? source.logs : []) {
+      if (logs.length >= 3) break
+      if (candidate === null || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+      const title = normalizeText(candidate.title, '', TRIP_LOG_TITLE_MAX)
+      const at = Number(candidate.at)
+      if (title === '' || !Number.isFinite(at) || at <= 0) continue
+      logs.push({ title, at: Math.floor(at) })
+    }
+    return { codex: normalizeShelfCount(source.codex), shelf, logs }
+  }
+
   function normalizeFarm (raw) {
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
     const plots = []
@@ -1410,7 +1520,11 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       ...(Number.isFinite(guard) ? { guard: Math.min(MAX_FARM_GUARD, Math.max(0, guard)) } : {}),
       log,
       ...(packets.length === 0 ? {} : { packets }),
-      carried: normalizeFarmCarried(raw.carried)
+      carried: normalizeFarmCarried(raw.carried),
+      expeditionLog: normalizeExpeditionLogTitles(raw.expeditionLog),
+      // 票 120：顶栏「陈列架 N/32」的 N——**图鉴已集齐件数**（票面文案照旧，字段名照实），
+      // 和公开视图的 codex.owned 同口径。
+      expeditionCodexOwned: normalizeShelfCount(raw.expeditionCodexOwned)
     }
   }
 
@@ -1716,7 +1830,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       nickname: nickname === '' ? '邻居' : nickname,
       guard: Number.isFinite(guard) ? Math.min(1, Math.max(0, guard)) : 0,
       plots,
-      quotas: { perTrip: int(query.perTrip), perTripLeft: int(query.perTripLeft) }
+      quotas: { perTrip: int(query.perTrip), perTripLeft: int(query.perTripLeft) },
+      // 票 120：邻居的陈列架（公开视图口径）；顶栏那行只读 codex.owned。
+      expedition: normalizePublicExpedition(raw.expedition)
     }
   }
 
@@ -2755,6 +2871,273 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     return { action, side, margin, leverage, cropId }
   }
 
+  /** 特产 SVG 只允许 `souvenirs/<小写 id>.svg`：坏路径一律当缺图，窗口回退 emoji。 */
+  function normalizeSouvenirArt (value) {
+    const text = normalizeLabel(value, '')
+    return /^souvenirs\/[a-z0-9-]+\.svg$/.test(text) ? text : ''
+  }
+
+  /**
+   * 图鉴的 32 格视图（票 114）：宿主已经把目录展开好，这里只做白名单清洗。
+   * 顺序原样保留，所以窗口画出来始终是 4 条路线 × 8 件的固定位置。
+   */
+  function normalizeExpeditionCodexView (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const slots = Array.isArray(source.slots)
+      ? source.slots
+        .slice(0, 32)
+        .filter((slot) => slot !== null && typeof slot === 'object' && !Array.isArray(slot))
+        .map((slot) => {
+          const id = normalizeLabel(slot.id, '')
+          if (id === '') return null
+          const firstSeenAt = typeof slot.firstSeenAt === 'number' && Number.isFinite(slot.firstSeenAt) ? slot.firstSeenAt : null
+          const owned = firstSeenAt !== null
+          const name = normalizeLabel(slot.name, '')
+          return {
+            id,
+            name,
+            emoji: normalizeLabel(slot.emoji, ''),
+            rarity: normalizeLabel(slot.rarity, ''),
+            rarityLabel: normalizeLabel(slot.rarityLabel, ''),
+            routeId: normalizeLabel(slot.routeId, ''),
+            routeName: normalizeLabel(slot.routeName, ''),
+            owned,
+            firstSeenAt,
+            art: normalizeSouvenirArt(slot.art),
+            label: owned ? normalizeLabel(slot.label, name) : '???'
+          }
+        })
+        .filter((slot) => slot !== null)
+      : []
+    return {
+      total: slots.length,
+      owned: slots.filter((slot) => slot.owned).length,
+      slots
+    }
+  }
+
+  /** 旅行日志（票 116）：新在前、最多 30 篇；正文只走窗口，不进场景。 */
+  function normalizeExpeditionLogs (raw) {
+    if (!Array.isArray(raw)) return []
+    const logs = []
+    for (const entry of raw) {
+      if (logs.length >= 30) break
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) continue
+      const routeId = normalizeLabel(entry.routeId, '')
+      const title = normalizeText(entry.title, '', TRIP_LOG_TITLE_MAX)
+      const body = normalizeText(entry.body, '', TRIP_LOG_BODY_MAX)
+      const legs = Number(entry.legs)
+      if (routeId === '' || title === '' || body === '') continue
+      if (!Number.isInteger(legs) || legs < 1) continue
+      if (typeof entry.at !== 'number' || !Number.isFinite(entry.at)) continue
+      if (!EXPEDITION_ENDED.includes(entry.ended)) continue
+      logs.push({
+        at: entry.at,
+        routeId,
+        legs,
+        title,
+        body,
+        ended: entry.ended,
+        reason: EXPEDITION_REASONS.includes(entry.reason) ? entry.reason : null
+      })
+    }
+    return logs
+  }
+
+  /**
+   * 出远门整份视图（票 112）：`/state.expedition` 与小窗推的是同一份。
+   * 坏字段一律降级——窗口宁可画「还没出门」，也不要因为一个 undefined 白屏。
+   */
+  function normalizeExpeditionView (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    /** 数字归一：坏值按 0，负数按 0（段数/回币/盘缠都不该为负）。 */
+    const num = (value, fallback = 0) => (typeof value === 'number' && Number.isFinite(value) ? value : fallback)
+    const nonNegative = (value) => {
+      const result = num(value, 0)
+      return result < 0 ? 0 : result
+    }
+    let run = null
+    if (source.run !== null && typeof source.run === 'object' && !Array.isArray(source.run)) {
+      const phase = EXPEDITION_PHASES.includes(source.run.phase) ? source.run.phase : null
+      const ended = EXPEDITION_ENDED.includes(source.run.ended) ? source.run.ended : null
+      const loot = Array.isArray(source.run.loot)
+        ? source.run.loot
+          .slice(0, 32)
+          .filter((item) => item !== null && typeof item === 'object' && !Array.isArray(item))
+          .map((item) => {
+            if (item.kind === 'souvenir') {
+              const id = normalizeLabel(item.id, '')
+              return id === '' ? null : { kind: 'souvenir', id }
+            }
+            return { kind: 'coin', qty: nonNegative(item.qty) }
+          })
+          .filter((item) => item !== null)
+        : []
+      const id = normalizeLabel(source.run.id, '')
+      const routeId = normalizeLabel(source.run.routeId, '')
+      if (id !== '' && routeId !== '') {
+        run = {
+          id,
+          routeId,
+          routeName: normalizeLabel(source.run.routeName, ''),
+          phase,
+          leg: nonNegative(source.run.leg),
+          totalLegs: nonNegative(source.run.totalLegs),
+          until: num(source.run.until, 0),
+          loot,
+          startedAt: num(source.run.startedAt, 0),
+          ended,
+          endedAt: num(source.run.endedAt, 0),
+          danger: normalizeLabel(source.run.danger, ''),
+          // 票 118：只有买了提灯宿主才给这个数；坏值/缺省一律 null，窗口画回三档。
+          dangerPercent: typeof source.run.dangerPercent === 'number' && Number.isFinite(source.run.dangerPercent)
+            ? Math.min(100, Math.max(0, Math.round(source.run.dangerPercent)))
+            : null
+        }
+      }
+    }
+    const routes = Array.isArray(source.routes)
+      ? source.routes
+        .slice(0, 8)
+        .filter((route) => route !== null && typeof route === 'object' && !Array.isArray(route))
+        .map((route) => ({
+          id: normalizeLabel(route.id, ''),
+          name: normalizeLabel(route.name, ''),
+          fare: nonNegative(route.fare),
+          minLegs: nonNegative(route.minLegs),
+          maxLegs: nonNegative(route.maxLegs),
+          coinBase: nonNegative(route.coinBase),
+          // 票 117：显式 true 才算解锁；宿主没给就按灰卡画，宁可少开一条也不画错。
+          unlocked: route.unlocked === true,
+          requirement: normalizeLabel(route.requirement, ''),
+          progress: normalizeLabel(route.progress, '')
+        }))
+        .filter((route) => route.id !== '')
+      : []
+    const codex = {}
+    if (source.codex !== null && typeof source.codex === 'object' && !Array.isArray(source.codex)) {
+      for (const [id, firstSeenAt] of Object.entries(source.codex).slice(0, 64)) {
+        const key = normalizeLabel(id, '')
+        if (key !== '' && typeof firstSeenAt === 'number' && Number.isFinite(firstSeenAt)) codex[key] = firstSeenAt
+      }
+    }
+    return {
+      ready: source.ready === true,
+      version: nonNegative(source.version),
+      run,
+      coins: nonNegative(source.coins),
+      now: num(source.now, 0),
+      // 票 118：提灯的价钱由宿主给，窗口只负责写进按钮；缺省/null 就是「价钱不明」。
+      lanternPrice: typeof source.lanternPrice === 'number' && Number.isFinite(source.lanternPrice) && source.lanternPrice > 0
+        ? Math.round(source.lanternPrice)
+        : null,
+      away: ['visiting', 'working', 'expedition'].includes(source.away) ? source.away : null,
+      routes,
+      // 陈列架（115）：slots/items/unlocked 由宿主给，窗口只读；提灯在 upgrades.lantern 里。
+      shelf: normalizeExpeditionShelf(source.shelf),
+      codex,
+      codexView: normalizeExpeditionCodexView(source.codexView),
+      upgrades: { lantern: source.upgrades?.lantern === true },
+      logs: normalizeExpeditionLogs(source.logs)
+    }
+  }
+
+  /**
+   * 陈列架（票 115）：`items[i]` 对第 i+1 格。窗口只读，不在这里判「能不能开」；
+   * 但坏 id、重复件与超长数组必须先清掉，免得渲染端画出两个同样的特产。
+   */
+  function normalizeExpeditionShelf (raw) {
+    const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+    const slots = Number.isInteger(source.slots) && source.slots >= 8 && source.slots <= EXPEDITION_SHELF_MAX
+      ? source.slots
+      : 8
+    const items = []
+    if (Array.isArray(source.items)) {
+      const seen = new Set()
+      for (const entry of source.items.slice(0, slots)) {
+        const id = typeof entry === 'string' ? entry.trim() : ''
+        if (!/^[a-z0-9-]+$/.test(id) || seen.has(id)) {
+          items.push(null)
+          continue
+        }
+        seen.add(id)
+        items.push(id)
+      }
+      while (items.length > 0 && items[items.length - 1] === null) items.pop()
+    }
+    return {
+      slots,
+      unlocked: slots,
+      maxSlots: EXPEDITION_SHELF_MAX,
+      slotPrice: typeof source.slotPrice === 'number' && Number.isFinite(source.slotPrice) && source.slotPrice > 0
+        ? Math.round(source.slotPrice)
+        : EXPEDITION_SHELF_PRICE,
+      items
+    }
+  }
+
+  /** `expedition-window` 命令：与期货同形——开/聚焦、刷新、`close:true` 关窗。 */
+  function normalizeExpeditionWindow (raw) {
+    return {
+      open: raw.open === true,
+      ...(raw.close === true ? { close: true } : {}),
+      // 票 120：入口带的落点页签；2026-11-20 起农场页的日志细条也会带 `log`。
+      ...(normalizeExpeditionTab(raw.tab) === null ? {} : { tab: normalizeExpeditionTab(raw.tab) }),
+      state: normalizeExpeditionView(raw.state)
+    }
+  }
+
+  /** 陈列架动作的合法格号：1..32。 */
+  function normalizeShelfSlot (value) {
+    return Number.isInteger(value) && value >= 1 && value <= EXPEDITION_SHELF_MAX ? value : null
+  }
+
+  /**
+   * 出远门小窗提交的白名单：只认六个动作，`start` 必须带路线 id。
+   * `expedition-shelf` 的字段在这里逐一拷贝——落到 helper 的农场窄口会被整条削掉。
+   */
+  function normalizeExpeditionAction (raw) {
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
+    if (!EXPEDITION_SUBMIT_ACTIONS.includes(action)) return null
+    if (action === 'expedition-shelf') {
+      const out = { action }
+      let touched = false
+      if (raw.slot !== undefined && raw.slot !== null) {
+        const slot = normalizeShelfSlot(raw.slot)
+        if (slot === null) return null
+        out.slot = slot
+        touched = true
+      }
+      if (raw.itemId !== undefined && raw.itemId !== null) {
+        const itemId = normalizeLabel(raw.itemId, '')
+        if (!/^[a-z0-9-]+$/.test(itemId)) return null
+        out.itemId = itemId
+        touched = true
+      }
+      if (raw.moveFrom !== undefined && raw.moveFrom !== null) {
+        const moveFrom = normalizeShelfSlot(raw.moveFrom)
+        if (moveFrom === null) return null
+        out.moveFrom = moveFrom
+        touched = true
+      }
+      if (raw.moveTo !== undefined && raw.moveTo !== null) {
+        const moveTo = normalizeShelfSlot(raw.moveTo)
+        if (moveTo === null) return null
+        out.moveTo = moveTo
+        touched = true
+      }
+      if (!touched) return null
+      const moving = out.moveFrom !== undefined || out.moveTo !== undefined
+      if (moving && (out.moveFrom === undefined || out.slot !== undefined || out.itemId !== undefined)) return null
+      if (out.itemId !== undefined && out.slot === undefined) return null
+      return out
+    }
+    if (action !== 'expedition-start') return { action }
+    const routeId = normalizeLabel(raw.routeId, '')
+    return routeId === '' ? null : { action, routeId }
+  }
+
   /** 农场小窗提交（`dsh-zoo:farm-submit`）的唯一白名单：坏形状整条拒绝，不半截猜测。 */
   /** `farm-raid` 的可选地块：没给 = null（让主人挑），给了就必须是合法的 pN 数组。 */
   function normalizeRaidPlots (raw) {
@@ -2827,6 +3210,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     if (action === 'farm-refresh' || action === 'farm-own') return { action }
     // 票 79：农场窗的「盘口」按钮只是开窗申请，不带字段。
     if (BOARD_OPEN_ACTIONS.includes(action)) return { action }
+    // 票 116：农场页的日志细条也只是开窗申请。
+    if (EXPEDITION_OPEN_ACTIONS.includes(action)) {
+      // 票 120：入口要求开窗直接落某个页签（陈列架 / 日志）；其它值一律当作普通开窗。
+      const tab = normalizeExpeditionTab(raw.tab)
+      return tab === null ? { action } : { action, tab }
+    }
     // 票 93：右键「期货」与农场窗的「期货」按钮同样是开窗申请。
     if (action === 'futures-window') return { action }
     // 解锁只带可选的 expectedUnlocked；没带就让宿主直接买下一块（HTTP/脚本）。
@@ -4076,6 +4465,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
        */
       case 'futures-window':
         return { ok: true, command: { type, id, ...normalizeFuturesWindow(raw) } }
+      /**
+       * 出远门小窗（票 112）：与期货同形——`open:true` 打开/聚焦，`open:false` 刷新，
+       * `close:true` 关窗。段数、回币与结算全在宿主，窗口只拿只读视图。
+       */
+      case 'expedition-window':
+        return { ok: true, command: { type, id, ...normalizeExpeditionWindow(raw) } }
       case 'shot': {
         const path = normalizePath(raw.path)
         if (path === null) return { ok: false, error: 'bad-path' }
@@ -4088,7 +4483,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
               ? 'board'
               : raw.window === 'futures'
                 ? 'futures'
-                : null
+                : raw.window === 'expedition'
+                  ? 'expedition'
+                  : null
         return { ok: true, command: { type, id, path, ...(window === null ? {} : { window }) } }
       }
       case 'pointer': {
@@ -4445,6 +4842,9 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
       case 'futures-window-state':
         // 票 93：期货小窗同理——关窗后右键「期货」必须能重新打开。
         return { ok: true, event: { type, id, open: raw.open === true } }
+      case 'expedition-window-state':
+        // 票 112：出远门小窗同理——×/Esc 关窗后，右键「出远门」必须能重新打开。
+        return { ok: true, event: { type, id, open: raw.open === true } }
       case 'action': {
         const action = typeof raw.action === 'string' ? raw.action.trim().toLowerCase() : ''
         if (!DESKTOP_ACTIONS.includes(action)) return { ok: false, error: 'bad-action' }
@@ -4488,6 +4888,12 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
         if (FUTURES_SUBMIT_ACTIONS.includes(action)) {
           const normalized = normalizeFuturesAction(raw)
           if (normalized === null) return { ok: false, error: 'bad-futures-action' }
+          return { ok: true, event: { type, id, ...normalized } }
+        }
+        // 出远门小窗（票 112）：只认四个动作；start 的 routeId 必须过白名单。
+        if (EXPEDITION_SUBMIT_ACTIONS.includes(action)) {
+          const normalized = normalizeExpeditionAction(raw)
+          if (normalized === null) return { ok: false, error: 'bad-expedition-action' }
           return { ok: true, event: { type, id, ...normalized } }
         }
         // 雇佣（ticket 44）：四个动作的字段与窗口提交共用同一条白名单。
@@ -5104,6 +5510,7 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     GIFT_ACTIONS,
     FARM_ACTIONS,
     BOARD_OPEN_ACTIONS,
+    EXPEDITION_OPEN_ACTIONS,
     BOARD_SUBMIT_ACTIONS,
     BOARD_SIDES,
     BOARD_STOP_LEVELS,
@@ -5146,10 +5553,18 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     MAX_FARM_CONTRACTS,
     MAX_FARM_GUARD,
     MAX_FARM_LOG,
+    // 票 115/116/120：陈列架与旅行日志的三个数，desktop 侧只有这一份（src 侧同名常量靠漂移测试对齐）。
+    EXPEDITION_SHELF_MAX,
+    EXPEDITION_SHELF_PRICE,
+    SHELF_BASE_SLOTS,
+    TRIP_LOG_TITLE_MAX,
+    TRIP_LOG_BODY_MAX,
     MAX_FARM_MARKET_HISTORY,
     MARKET_MIN_QTY,
     MARKET_MAX_QTY,
     normalizeFarm,
+    normalizePublicExpedition,
+    normalizeShelfCount,
     normalizeFarmPlot,
     normalizeFarmLogEntry,
     normalizeFarmWindow,
@@ -5159,6 +5574,10 @@ const OVERLAY_RECT_MAX_AGE_MS = 3000
     normalizeFuturesAction,
     normalizeFuturesWindow,
     normalizeFuturesView,
+    normalizeExpeditionAction,
+    normalizeExpeditionWindow,
+    normalizeExpeditionView,
+    EXPEDITION_SUBMIT_ACTIONS,
     FUTURES_SUBMIT_ACTIONS,
     FUTURES_LEVERAGES,
     normalizeSeason,

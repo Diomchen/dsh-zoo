@@ -664,6 +664,28 @@ peer 的档位与暂停会以 `futures-mode` / `futures-pause` 报文报给房�
 **已知限制**：`deviceId` 没有签名，只能靠源地址绑定挡冒用；房主自己作恶无法防御（这是局域网
 游戏，不是交易所）；同一台机器上开两个实例会互相抢端口，验双机请用两台机器或两个网络命名空间。
 
+## 出远门
+
+地买满之后，硬币只剩一个去处：出门花掉。点农场顶栏的「出远门」，选一条路线交盘缠，宠物就进入
+出门状态（和串门、打工互斥，看家值归零）；它每 20 秒走一个路段，路上捡硬币与特产，你可以随时
+「见好就收」，也可以继续往前走——继续就有翻车的可能，翻了特产丢一半、盘缠不退。
+
+| 路线 | 盘缠 | 段数 | 基础危险 | 解锁 |
+| --- | --- | --- | --- | --- |
+| 后山 | 500 | 3–4 | 5% | 默认 |
+| 废矿 | 3,000 | 4–5 | 8% | 走过 3 趟后山 |
+| 老铁路 | 15,000 | 5–6 | 10% | 图鉴集齐 16 件 |
+| 雾岭 | 60,000 | 6–7 | 12% | 图鉴 24 件且走过 1 趟老铁路 |
+
+每段只回盘缠的 3% 左右，走满一趟净烧 80%–89%——这是设计目标，不是漏算：硬币总量需要有出口，
+不然一天两万八只能堆到一百万的硬顶上被静默截断。走回来的特产不能卖钱，只能**陈列**（默认 8 格，
+每多开一格 5,000）和**集进图鉴**（32 件），满 8 件之后只掉没见过的；花 10,000 买盏提灯，决策窗
+才会显示下一段精确到个位的危险度。每趟结束会写一篇旅行日志（最多留 30 篇），邻居不串门也能在
+公开视图里看到你的图鉴件数、陈列架前 8 格和最近三篇标题，正文要进门才看得到。
+
+玩法细节、数值与实现落点见 [`docs/play-expedition.md`](docs/play-expedition.md)，为什么这样设计
+见 [`docs/adr/0039-expedition-burns-coins.md`](docs/adr/0039-expedition-burns-coins.md)。
+
 ## 换一张皮
 
 想用其他宠物包的外观，把它的动作目录写进 `~/.dsh/dsh-zoo/skin.json`。
@@ -754,6 +776,7 @@ Windows 首次会弹 Defender 防火墙，需要给**专用网络**放行。文�
 | `POST /dsh-zoo/self-state` | 其他本机插件上报「我现在在干嘛」 |
 | `GET /dsh-zoo/desktop` | 桌面 helper 的实时状态 |
 | `GET /dsh-zoo-farm/<visitId>` | 局域网只读：访客在串门期间拉主人的农场快照（素材端口 45873） |
+| `GET /dsh-zoo-farm/open/<viewerDeviceId>` | 局域网只读：不串门也能看到的公开视图（图鉴件数、陈列架前 8 格、最近三篇日志标题） |
 
 常用动作：
 
@@ -773,11 +796,13 @@ Windows 首次会弹 Defender 防火墙，需要给**专用网络**放行。文�
 | 窗口 | `farm-open` |
 | 盘口 | `trading-open` / `trading-close` / `trading-refresh` / `trading-open-position` / `trading-close-position` / `trading-set-stop` / `trading-place-order` / `trading-cancel-order` / `trading-charts` |
 | 期货 | `futures-open` / `futures-close` / `futures-window` / `futures-refresh` / `futures-deposit` / `futures-withdraw` / `futures-place` / `futures-cancel` / `futures-convert` / `futures-convert-all` / `futures-account-mode` / `futures-pause` / `futures-rollback` / `futures-reconcile` |
+| 出远门 | `expedition-open`（开/关窗口）/ `expedition-close` / `expedition-start` / `expedition-step` / `expedition-back` / `expedition-shelf` / `expedition-lantern` / `expedition-refresh` |
 
 每个 action 的 body、返回值和错误码见 [`docs/protocol.md`](docs/protocol.md)。
 `state` 里最常看的是 `neighbors`、`prompt`、`visitors`、`skin`、`backpack`、`gifts`、
-`farm`、`market`、`contracts`、`trading` 和 `futures`（盘口：硬币、本周盈亏、持仓、挂单、历史、周榜；
-期货：托管余额、持仓、挂单、成交、账户档位/暂停、保险基金）。
+`farm`、`market`、`contracts`、`trading`、`futures` 和 `expedition`（盘口：硬币、本周盈亏、持仓、挂单、历史、周榜；
+期货：托管余额、持仓、挂单、成交、账户档位/暂停、保险基金；出远门：这一趟的路线/阶段/已走段数、
+图鉴、陈列架、日志、升级）。
 
 ```sh
 # 查看邻居和待放行队列
